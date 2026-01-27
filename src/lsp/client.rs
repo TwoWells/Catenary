@@ -7,10 +7,11 @@ use lsp_types::{
     Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
-    ReferenceParams, RenameParams, SignatureHelp, SignatureHelpParams, TextEdit, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
-    WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind,
+    PublishDiagnosticsParams, ReferenceParams, RenameParams, SignatureHelp, SignatureHelpParams,
+    TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,6 +39,7 @@ pub struct LspClient {
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
     diagnostics: DiagnosticsCache,
     alive: Arc<AtomicBool>,
+    encoding: PositionEncodingKind,
     _reader_handle: tokio::task::JoinHandle<()>,
     _child: Child,
 }
@@ -75,6 +77,7 @@ impl LspClient {
             pending,
             diagnostics,
             alive,
+            encoding: PositionEncodingKind::UTF16, // Default per spec
             _reader_handle: reader_handle,
             _child: child,
         })
@@ -263,6 +266,13 @@ impl LspClient {
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             capabilities: ClientCapabilities {
+                general: Some(lsp_types::GeneralClientCapabilities {
+                    position_encodings: Some(vec![
+                        PositionEncodingKind::UTF8,
+                        PositionEncodingKind::UTF16,
+                    ]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             workspace_folders: Some(vec![WorkspaceFolder {
@@ -277,10 +287,24 @@ impl LspClient {
 
         let result: InitializeResult = self.request("initialize", params).await?;
 
+        // Extract negotiated encoding
+        if let Some(capabilities) = &result.capabilities.position_encoding {
+            self.encoding = capabilities.clone();
+            debug!("Negotiated position encoding: {:?}", self.encoding);
+        } else {
+            debug!("Server did not specify position encoding, defaulting to UTF-16");
+            self.encoding = PositionEncodingKind::UTF16;
+        }
+
         // Send initialized notification
         self.notify("initialized", InitializedParams {}).await?;
 
         Ok(result)
+    }
+
+    /// Returns the negotiated position encoding.
+    pub fn encoding(&self) -> PositionEncodingKind {
+        self.encoding.clone()
     }
 
     /// Sends shutdown request and exit notification.

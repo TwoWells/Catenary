@@ -8,17 +8,20 @@ use lsp_types::{
     Diagnostic, DiagnosticSeverity, DocumentChanges, DocumentFormattingParams,
     DocumentRangeFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
     FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, Location,
-    LocationLink, Position, Range, ReferenceContext, ReferenceParams, RenameParams, SignatureHelp,
-    SignatureHelpParams, SymbolInformation, TextDocumentIdentifier, TextDocumentPositionParams,
-    TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    LocationLink, Position, PositionEncodingKind, Range, ReferenceContext, ReferenceParams,
+    RenameParams, SignatureHelp, SignatureHelpParams, SymbolInformation, TextDocumentIdentifier,
+    TextDocumentPositionParams, TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkspaceEdit,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::fs;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::lsp::LspClient;
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
@@ -76,6 +79,8 @@ pub struct RenameInput {
     pub line: u32,
     pub character: u32,
     pub new_name: String,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
 }
 
 /// Input for formatting.
@@ -489,8 +494,8 @@ impl LspBridgeHandler {
         let path = self.validate_absolute_path(&input.file)?;
 
         debug!(
-            "Rename request: {}:{}:{} -> {}",
-            input.file, input.line, input.character, input.new_name
+            "Rename request: {}:{}:{} -> {} (dry_run: {})",
+            input.file, input.line, input.character, input.new_name, input.dry_run
         );
 
         let result = self.runtime.block_on(async {
@@ -511,7 +516,27 @@ impl LspBridgeHandler {
         })?;
 
         match result {
-            Some(edit) => Ok(CallToolResult::text(format_workspace_edit(&edit))),
+            Some(edit) => {
+                let diff_text = format_workspace_edit(&edit);
+                if input.dry_run {
+                    Ok(CallToolResult::text(diff_text))
+                } else {
+                    // Get encoding from client
+                    let encoding = self.runtime.block_on(async {
+                        let client = self.client.lock().await;
+                        client.encoding()
+                    });
+
+                    // Apply changes
+                    self.runtime.block_on(async {
+                        apply_workspace_edit(&edit, encoding).await
+                    })?;
+                    Ok(CallToolResult::text(format!(
+                        "Successfully applied rename. Changes:\n{}",
+                        diff_text
+                    )))
+                }
+            }
             None => Ok(CallToolResult::text(
                 "Rename not supported at this location",
             )),
@@ -906,14 +931,15 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "lsp_rename".to_string(),
-                description: Some("Compute the edits needed to rename a symbol across the codebase.".to_string()),
+                description: Some("Compute the edits needed to rename a symbol across the codebase. Returns a list of changes. If dry_run is false, applies the changes.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Absolute path to the file" },
                         "line": { "type": "integer", "description": "Line number (0-indexed)" },
                         "character": { "type": "integer", "description": "Character position (0-indexed)" },
-                        "new_name": { "type": "string", "description": "New name for the symbol" }
+                        "new_name": { "type": "string", "description": "New name for the symbol" },
+                        "dry_run": { "type": "boolean", "description": "If true (default), only return expected changes. If false, apply changes to disk." }
                     },
                     "required": ["file", "line", "character", "new_name"]
                 }),
@@ -1476,4 +1502,169 @@ fn format_type_hierarchy_items(items: &[TypeHierarchyItem]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKind) -> Result<()> {
+    // Collect all edits by file path
+    let mut file_edits: HashMap<PathBuf, Vec<TextEdit>> = HashMap::new();
+
+    if let Some(changes) = &edit.changes {
+        for (uri, edits) in changes {
+            let url = url::Url::parse(uri.as_str())
+                .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
+            let path = url
+                .to_file_path()
+                .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
+            file_edits.entry(path).or_default().extend(edits.iter().cloned());
+        }
+    }
+
+    if let Some(doc_changes) = &edit.document_changes {
+        match doc_changes {
+            DocumentChanges::Edits(edits) => {
+                for edit in edits {
+                    let uri = &edit.text_document.uri;
+                    let url = url::Url::parse(uri.as_str())
+                        .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
+                    let path = url
+                        .to_file_path()
+                        .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
+                    let changes = edit
+                        .edits
+                        .iter()
+                        .map(|e| match e {
+                            lsp_types::OneOf::Left(te) => te.clone(),
+                            lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
+                        });
+                    file_edits.entry(path).or_default().extend(changes);
+                }
+            }
+            DocumentChanges::Operations(ops) => {
+                // TODO: Support create/rename/delete operations
+                // For now, we only support edits within operations if they map simply
+                warn!("DocumentChange operations (create/rename/delete) are not yet fully supported. Only text edits will be applied.");
+                for op in ops {
+                    if let lsp_types::DocumentChangeOperation::Edit(edit) = op {
+                        let uri = &edit.text_document.uri;
+                        let url = url::Url::parse(uri.as_str())
+                            .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
+                        let path = url
+                            .to_file_path()
+                            .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
+                        let changes = edit.edits.iter().map(|e| match e {
+                            lsp_types::OneOf::Left(te) => te.clone(),
+                            lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
+                        });
+                        file_edits.entry(path).or_default().extend(changes);
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply edits for each file
+    for (path, edits) in file_edits {
+        apply_edits_to_file(&path, edits, encoding.clone()).await?;
+    }
+
+    Ok(())
+}
+
+fn annotated_text_edit_to_text_edit(
+    annotated: &lsp_types::AnnotatedTextEdit,
+) -> TextEdit {
+    TextEdit {
+        range: annotated.text_edit.range,
+        new_text: annotated.text_edit.new_text.clone(),
+    }
+}
+
+async fn apply_edits_to_file(path: &Path, mut edits: Vec<TextEdit>, encoding: PositionEncodingKind) -> Result<()> {
+    let content = fs::read_to_string(path).await?;
+
+    // Sort edits by start position descending to apply from bottom up
+    edits.sort_by(|a, b| {
+        b.range
+            .start
+            .line
+            .cmp(&a.range.start.line)
+            .then(b.range.start.character.cmp(&a.range.start.character))
+    });
+
+    let mut result = content.clone();
+
+    for edit in edits {
+        let start_offset = position_to_offset(&content, edit.range.start, &encoding)?;
+        let end_offset = position_to_offset(&content, edit.range.end, &encoding)?;
+
+        if start_offset > end_offset {
+            return Err(anyhow!(
+                "Invalid range: start {} > end {}",
+                start_offset,
+                end_offset
+            ));
+        }
+
+        result.replace_range(start_offset..end_offset, &edit.new_text);
+    }
+
+    fs::write(path, result).await?;
+    Ok(())
+}
+
+fn position_to_offset(content: &str, position: Position, encoding: &PositionEncodingKind) -> Result<usize> {
+    let mut current_line = 0;
+    let mut line_start_byte = 0;
+
+    // Find the start of the target line
+    if position.line > 0 {
+        let mut lines_found = 0;
+        for (i, b) in content.as_bytes().iter().enumerate() {
+            if *b == b'\n' {
+                lines_found += 1;
+                if lines_found == position.line {
+                    line_start_byte = i + 1;
+                    current_line = lines_found;
+                    break;
+                }
+            }
+        }
+        
+        if current_line != position.line {
+            return Err(anyhow!("Line {} out of bounds", position.line));
+        }
+    }
+
+    let line_content = &content[line_start_byte..];
+    let line_end_byte = line_content.find('\n').map(|i| line_start_byte + i).unwrap_or(content.len());
+    let line_text = &content[line_start_byte..line_end_byte];
+
+    if *encoding == PositionEncodingKind::UTF8 {
+        // Character is a byte offset
+        let char_offset = position.character as usize;
+        if char_offset <= line_text.len() {
+            Ok(line_start_byte + char_offset)
+        } else {
+            Err(anyhow!("Character offset {} out of bounds for line {}", char_offset, position.line))
+        }
+    } else {
+        // Default to UTF-16 logic
+        // Character is a UTF-16 code unit offset
+        let mut utf16_offset = 0;
+        let mut byte_offset = 0;
+        
+        for c in line_text.chars() {
+            if utf16_offset >= position.character as usize {
+                break;
+            }
+            utf16_offset += c.len_utf16();
+            byte_offset += c.len_utf8();
+        }
+        
+        if utf16_offset == position.character as usize {
+            Ok(line_start_byte + byte_offset)
+        } else {
+            Err(anyhow!("Position {:?} lands in the middle of a UTF-16 surrogate pair or out of bounds", position))
+        }
+    }
 }
