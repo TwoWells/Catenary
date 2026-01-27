@@ -1,9 +1,9 @@
 [package]
 name = "catenary-mcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0"
-description = "A bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol)"
+description = "A high-performance multiplexing bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol). Enables LLMs to access IDE-grade code intelligence across multiple languages simultaneously with smart routing and UTF-8 accuracy."
 repository = "https://github.com/Mark-Wells-Dev/Catenary"
 keywords = ["mcp", "lsp", "language-server", "llm", "ai"]
 categories = ["development-tools"]
