@@ -133,41 +133,69 @@ pub struct TypeHierarchyInput {
 
 /// Bridge handler that implements MCP ToolHandler trait.
 pub struct LspBridgeHandler {
-    client: Arc<Mutex<LspClient>>,
+    clients: HashMap<String, Arc<Mutex<LspClient>>>,
     doc_manager: Arc<Mutex<DocumentManager>>,
     runtime: Handle,
 }
 
 impl LspBridgeHandler {
     pub fn new(
-        client: Arc<Mutex<LspClient>>,
+        clients: HashMap<String, Arc<Mutex<LspClient>>>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
     ) -> Self {
         Self {
-            client,
+            clients,
             doc_manager,
             runtime,
         }
     }
 
-    /// Checks if the LSP server is still alive.
+    /// Checks if at least one LSP server is still alive.
     fn check_alive(&self) -> Result<()> {
         let alive = self.runtime.block_on(async {
-            let client = self.client.lock().await;
-            client.is_alive()
+            for client in self.clients.values() {
+                let client = client.lock().await;
+                if client.is_alive() {
+                    return true;
+                }
+            }
+            false
         });
+        
         if !alive {
-            Err(anyhow!("LSP server is no longer running"))
+            Err(anyhow!("No LSP servers are running"))
         } else {
             Ok(())
         }
     }
 
+    /// Gets the appropriate LSP client for the given file path.
+    async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
+        let lang_id = {
+            let doc_manager = self.doc_manager.lock().await;
+            doc_manager.language_id_for_path(path).to_string()
+        };
+
+        if let Some(client) = self.clients.get(&lang_id) {
+            Ok(client.clone())
+        } else {
+            // Try to find a fallback or just error out
+            // For now, if we have only one client, maybe default to it? 
+            // Or just error saying "No server for language X"
+            
+            // If there's a "catch-all" client, we could use it.
+            // But strict strictness is better.
+            
+            Err(anyhow!("No LSP server configured for language '{}' (file: {})", lang_id, path.display()))
+        }
+    }
+
     /// Ensures a document is open and synced with the LSP server.
-    async fn ensure_document_open(&self, path: &Path) -> Result<lsp_types::Uri> {
+    async fn ensure_document_open(&self, path: &Path) -> Result<(lsp_types::Uri, Arc<Mutex<LspClient>>)> {
+        let client_mutex = self.get_client_for_path(path).await?;
         let mut doc_manager = self.doc_manager.lock().await;
-        let client = self.client.lock().await;
+        let client = client_mutex.lock().await;
 
         // Check if LSP is still alive
         if !client.is_alive() {
@@ -185,7 +213,8 @@ impl LspBridgeHandler {
             }
         }
 
-        doc_manager.uri_for_path(path)
+        let uri = doc_manager.uri_for_path(path)?;
+        Ok((uri, client_mutex.clone()))
     }
 
     fn parse_position_input(&self, arguments: Option<serde_json::Value>) -> Result<PositionInput> {
@@ -211,7 +240,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = HoverParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -222,7 +251,7 @@ impl LspBridgeHandler {
                 },
                 work_done_progress_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.hover(params).await
         })?;
 
@@ -242,7 +271,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = GotoDefinitionParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -254,7 +283,7 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.definition(params).await
         })?;
 
@@ -277,7 +306,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = GotoDefinitionParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -289,7 +318,7 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.type_definition(params).await
         })?;
 
@@ -312,7 +341,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = GotoDefinitionParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -324,7 +353,7 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.implementation(params).await
         })?;
 
@@ -347,7 +376,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = ReferenceParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -362,7 +391,7 @@ impl LspBridgeHandler {
                     include_declaration: input.include_declaration,
                 },
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.references(params).await
         })?;
 
@@ -387,13 +416,13 @@ impl LspBridgeHandler {
         debug!("Document symbols request: {}", input.file);
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = DocumentSymbolParams {
                 text_document: TextDocumentIdentifier { uri },
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.document_symbols(params).await
         })?;
 
@@ -422,12 +451,31 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            let client = self.client.lock().await;
-            client.workspace_symbols(params).await
-        })?;
+            
+            // Broadcast to all clients
+            let mut results = Vec::new();
+            for client_mutex in self.clients.values() {
+                let client = client_mutex.lock().await;
+                if let Ok(Some(response)) = client.workspace_symbols(params.clone()).await {
+                    results.push(response);
+                }
+            }
+            
+            // Merge results
+            if results.is_empty() {
+                None
+            } else {
+                // For simplicity, just take the first non-empty result or merge flat lists
+                // Merging nested responses is hard, so we'll just format each response and join strings
+                Some(results)
+            }
+        });
 
         match result {
-            Some(response) => Ok(CallToolResult::text(format_workspace_symbols(&response))),
+            Some(responses) => {
+                let text = responses.iter().map(|r| format_workspace_symbols(r)).collect::<Vec<_>>().join("\n\n---\n\n");
+                Ok(CallToolResult::text(text))
+            }
             None => Ok(CallToolResult::text("No symbols found")),
         }
     }
@@ -449,10 +497,10 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
             // Get diagnostics for the range to include in context
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             let diagnostics = client.get_diagnostics(&uri).await;
 
             let params = CodeActionParams {
@@ -499,7 +547,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = RenameParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -511,7 +559,7 @@ impl LspBridgeHandler {
                 new_name: input.new_name,
                 work_done_progress_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.rename(params).await
         })?;
 
@@ -523,7 +571,8 @@ impl LspBridgeHandler {
                 } else {
                     // Get encoding from client
                     let encoding = self.runtime.block_on(async {
-                        let client = self.client.lock().await;
+                        let client_mutex = self.get_client_for_path(&path).await.unwrap(); // Should succeed as we just opened it
+                        let client = client_mutex.lock().await;
                         client.encoding()
                     });
 
@@ -553,7 +602,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = CompletionParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -566,7 +615,7 @@ impl LspBridgeHandler {
                 partial_result_params: Default::default(),
                 context: None,
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.completion(params).await
         })?;
 
@@ -586,9 +635,9 @@ impl LspBridgeHandler {
         debug!("Diagnostics request: {}", input.file);
 
         let diagnostics = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             Ok::<_, anyhow::Error>(client.get_diagnostics(&uri).await)
         })?;
 
@@ -612,7 +661,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = SignatureHelpParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -624,7 +673,7 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
                 context: None,
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.signature_help(params).await
         })?;
 
@@ -644,7 +693,7 @@ impl LspBridgeHandler {
         debug!("Formatting request: {}", input.file);
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = DocumentFormattingParams {
                 text_document: TextDocumentIdentifier { uri },
                 options: FormattingOptions {
@@ -654,7 +703,7 @@ impl LspBridgeHandler {
                 },
                 work_done_progress_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.formatting(params).await
         })?;
 
@@ -684,7 +733,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = DocumentRangeFormattingParams {
                 text_document: TextDocumentIdentifier { uri },
                 range: Range {
@@ -704,7 +753,7 @@ impl LspBridgeHandler {
                 },
                 work_done_progress_params: Default::default(),
             };
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             client.range_formatting(params).await
         })?;
 
@@ -730,7 +779,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
             // First, prepare the call hierarchy
             let prepare_params = CallHierarchyPrepareParams {
@@ -744,7 +793,7 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
             };
 
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             let items = client.prepare_call_hierarchy(prepare_params).await?;
 
             let Some(items) = items else {
@@ -803,7 +852,7 @@ impl LspBridgeHandler {
         );
 
         let result = self.runtime.block_on(async {
-            let uri = self.ensure_document_open(&path).await?;
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
             // First, prepare the type hierarchy
             let prepare_params = TypeHierarchyPrepareParams {
@@ -817,7 +866,7 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
             };
 
-            let client = self.client.lock().await;
+            let client = client_mutex.lock().await;
             let items = client.prepare_type_hierarchy(prepare_params).await?;
 
             let Some(items) = items else {

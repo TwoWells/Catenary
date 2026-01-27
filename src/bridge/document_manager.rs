@@ -147,6 +147,11 @@ impl DocumentManager {
     pub fn uri_for_path(&self, path: &Path) -> Result<Uri> {
         path_to_uri(&path.canonicalize()?)
     }
+
+    /// Returns the language ID for a given path.
+    pub fn language_id_for_path(&self, path: &Path) -> &'static str {
+        detect_language_id(path)
+    }
 }
 
 /// Notification to send to the LSP server.

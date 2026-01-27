@@ -16,11 +16,12 @@ use mcp::McpServer;
 
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
-#[command(about = "Bridge between MCP and LSP servers")]
+#[command(about = "Multiplexing bridge between MCP and multiple LSP servers")]
 struct Args {
-    /// The LSP server command to spawn (e.g., "gopls" or "rust-analyzer")
-    #[arg(short, long)]
-    command: String,
+    /// LSP servers to spawn in "lang:command" format (e.g., "rust:rust-analyzer")
+    /// Can be specified multiple times.
+    #[arg(short, long = "lsp", required = true)]
+    lsps: Vec<String>,
 
     /// Workspace root directory
     #[arg(short, long, default_value = ".")]
@@ -41,49 +42,58 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let root = args.root.canonicalize()?;
-    info!("Starting catenary bridge");
-    info!("LSP command: {}", args.command);
+    info!("Starting catenary multiplexing bridge");
     info!("Workspace root: {}", root.display());
     info!("Document idle timeout: {}s", args.idle_timeout);
 
-    // Parse command into program and arguments
-    let mut parts = args.command.split_whitespace();
-    let program = parts.next().expect("command cannot be empty");
-    let cmd_args: Vec<&str> = parts.collect();
+    let mut clients = std::collections::HashMap::new();
 
-    // Spawn LSP client
-    let mut client = lsp::LspClient::spawn(program, &cmd_args).await?;
-    let capabilities = client.initialize(&root).await?;
+    for lsp_spec in args.lsps {
+        let (lang, command) = lsp_spec
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("Invalid LSP spec: {}. Expected 'lang:command'", lsp_spec))?;
 
-    info!("LSP server initialized");
-    info!(
-        "Hover support: {}",
-        capabilities.capabilities.hover_provider.is_some()
-    );
-    info!(
-        "Definition support: {}",
-        capabilities.capabilities.definition_provider.is_some()
-    );
+        let lang = lang.trim().to_string();
+        let command = command.trim();
+
+        // Parse command into program and arguments
+        let mut parts = command.split_whitespace();
+        let program = parts.next().expect("command cannot be empty");
+        let cmd_args: Vec<&str> = parts.collect();
+
+        info!("Spawning LSP server for {}: {}", lang, command);
+
+        // Spawn LSP client
+        let mut client = lsp::LspClient::spawn(program, &cmd_args).await?;
+        client.initialize(&root).await?;
+
+        clients.insert(lang, Arc::new(Mutex::new(client)));
+    }
+
+    if clients.is_empty() {
+        return Err(anyhow::anyhow!("No LSP servers configured"));
+    }
+
+    info!("{} LSP server(s) initialized", clients.len());
 
     // Create bridge components
-    let client = Arc::new(Mutex::new(client));
     let doc_manager = Arc::new(Mutex::new(DocumentManager::new()));
     let runtime = tokio::runtime::Handle::current();
 
     // Start document cleanup task if timeout is enabled
     let cleanup_handle = if args.idle_timeout > 0 {
-        let client_clone = client.clone();
+        let clients_clone = clients.clone();
         let doc_manager_clone = doc_manager.clone();
         let idle_timeout = args.idle_timeout;
 
         Some(tokio::spawn(async move {
-            document_cleanup_task(client_clone, doc_manager_clone, idle_timeout).await;
+            document_cleanup_task(clients_clone, doc_manager_clone, idle_timeout).await;
         }))
     } else {
         None
     };
 
-    let handler = LspBridgeHandler::new(client.clone(), doc_manager, runtime);
+    let handler = LspBridgeHandler::new(clients.clone(), doc_manager, runtime);
 
     // Run MCP server (blocking - reads from stdin)
     let mut mcp_server = McpServer::new(handler);
@@ -96,19 +106,27 @@ async fn main() -> Result<()> {
         handle.abort();
     }
 
-    // Shutdown LSP client
-    info!("Shutting down LSP server");
-    let mut client = Arc::try_unwrap(client)
-        .map_err(|_| anyhow::anyhow!("Failed to unwrap client Arc"))?
-        .into_inner();
-    client.shutdown().await?;
+    // Shutdown LSP clients
+    info!("Shutting down LSP servers");
+    for (lang, client_mutex) in clients {
+        let client_result = Arc::try_unwrap(client_mutex);
+        match client_result {
+            Ok(mutex) => {
+                let mut client = mutex.into_inner();
+                if let Err(e) = client.shutdown().await {
+                    warn!("Failed to shutdown LSP server for {}: {}", lang, e);
+                }
+            }
+            Err(_) => warn!("Could not unwrap Arc for {}, skipping shutdown", lang),
+        }
+    }
 
     mcp_result
 }
 
 /// Background task that periodically closes idle documents.
 async fn document_cleanup_task(
-    client: Arc<Mutex<lsp::LspClient>>,
+    clients: std::collections::HashMap<String, Arc<Mutex<lsp::LspClient>>>,
     doc_manager: Arc<Mutex<DocumentManager>>,
     idle_timeout_secs: u64,
 ) {
@@ -117,15 +135,6 @@ async fn document_cleanup_task(
 
     loop {
         tokio::time::sleep(check_interval).await;
-
-        // Check if LSP server is still alive
-        {
-            let client = client.lock().await;
-            if !client.is_alive() {
-                warn!("LSP server is no longer alive, stopping cleanup task");
-                break;
-            }
-        }
 
         // Find and close stale documents
         let stale_paths = {
@@ -137,17 +146,20 @@ async fn document_cleanup_task(
             debug!("Closing {} stale documents", stale_paths.len());
 
             for path in stale_paths {
-                let close_params = {
+                let (lang, close_params) = {
                     let mut doc_manager = doc_manager.lock().await;
-                    doc_manager.close(&path)
+                    let lang = doc_manager.language_id_for_path(&path).to_string();
+                    (lang, doc_manager.close(&path))
                 };
 
                 if let Ok(Some(params)) = close_params {
-                    let client = client.lock().await;
-                    if let Err(e) = client.did_close(params).await {
-                        warn!("Failed to close document {}: {}", path.display(), e);
-                    } else {
-                        debug!("Closed stale document: {}", path.display());
+                    if let Some(client_mutex) = clients.get(&lang) {
+                        let client = client_mutex.lock().await;
+                        if let Err(e) = client.did_close(params).await {
+                            warn!("Failed to close document {}: {}", path.display(), e);
+                        } else {
+                            debug!("Closed stale document: {}", path.display());
+                        }
                     }
                 }
             }

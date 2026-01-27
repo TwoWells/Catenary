@@ -8,6 +8,8 @@ Catenary allows LLM-powered tools to access IDE-quality code intelligence by exp
 
 ## Features
 
+- **LSP Multiplexing** - Run multiple language servers (Rust, Python, Go, etc.) in a single Catenary instance.
+- **Smart Routing** - Automatically routes requests to the correct LSP server based on file extension.
 - **Universal LSP support** - Works with any LSP server (rust-analyzer, gopls, pyright, typescript-language-server, etc.)
 - **Full LSP coverage** - Hover, go-to-definition, find references, completions, diagnostics, rename, formatting, and more
 - **Smart Encoding** - Automatically negotiates UTF-8 position encoding for accurate emoji and multi-byte character support
@@ -30,30 +32,28 @@ cargo build --release
 ## Usage
 
 ```bash
-catenary --command "rust-analyzer" --root /path/to/project
+catenary --lsp "rust:rust-analyzer" --lsp "shellscript:bash-language-server start" --root /path/to/project
 ```
 
 ### Arguments
 
-- `--command, -c` - The LSP server command to spawn (required)
+- `--lsp, -l` - LSP server specification in `lang:command` format (can be specified multiple times)
 - `--root, -r` - Workspace root directory (default: `.`)
 - `--idle-timeout` - Seconds before closing idle documents (default: `300`, set to `0` to disable)
 
-### Examples
+### Example: Multiplexing
+
+You can run one Catenary instance that handles all your project's languages:
 
 ```bash
-# Rust
-catenary --command "rust-analyzer" --root ./my-rust-project
-
-# Go
-catenary --command "gopls" --root ./my-go-project
-
-# Python
-catenary --command "pyright-langserver --stdio" --root ./my-python-project
-
-# TypeScript
-catenary --command "typescript-language-server --stdio" --root ./my-ts-project
+catenary \
+  --lsp "rust:rust-analyzer" \
+  --lsp "python:pyright-langserver --stdio" \
+  --lsp "shellscript:bash-language-server start" \
+  --root .
 ```
+
+Catenary will automatically detect the language of the file you are working on and route the LSP request to the appropriate server. For workspace-wide operations (like `lsp_workspace_symbols`), it queries all servers and merges the results.
 
 ## Available MCP Tools
 

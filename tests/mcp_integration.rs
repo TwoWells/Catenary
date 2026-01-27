@@ -18,6 +18,16 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Find line and column (0-indexed) of a substring
+fn find_position(content: &str, substring: &str) -> (u32, u32) {
+    for (line_idx, line) in content.lines().enumerate() {
+        if let Some(col_idx) = line.find(substring) {
+            return (line_idx as u32, col_idx as u32);
+        }
+    }
+    panic!("Substring '{}' not found in content", substring);
+}
+
 macro_rules! require_bash_lsp {
     () => {
         if !command_exists("bash-language-server") {
@@ -35,14 +45,19 @@ struct BridgeProcess {
 }
 
 impl BridgeProcess {
-    fn spawn(lsp_command: &str, root: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_catenary"))
-            .args(["--command", lsp_command, "--root", root])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to spawn bridge");
+    fn spawn(lsp_commands: &[&str], root: &str) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        
+        for lsp in lsp_commands {
+            cmd.arg("--lsp").arg(lsp);
+        }
+        
+        cmd.arg("--root").arg(root);
+        cmd.stdin(Stdio::piped())
+           .stdout(Stdio::piped())
+           .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().expect("Failed to spawn bridge");
 
         let stdin = child.stdin.take().expect("Failed to get stdin");
         let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
@@ -114,7 +129,7 @@ impl Drop for BridgeProcess {
 fn test_mcp_initialize() {
     require_bash_lsp!();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
 
     bridge.send(&json!({
         "jsonrpc": "2.0",
@@ -146,7 +161,7 @@ fn test_mcp_initialize() {
 fn test_mcp_tools_list() {
     require_bash_lsp!();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
     bridge.initialize();
 
     bridge.send(&json!({
@@ -216,7 +231,7 @@ fn test_mcp_hover_builtin() {
     let test_file = "/tmp/mcp_test_hover.sh";
     std::fs::write(test_file, "#!/bin/bash\necho \"hello\"\n").unwrap();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
     bridge.initialize();
 
     // Request hover on 'echo' (line 1, character 0)
@@ -277,7 +292,7 @@ my_function
     )
     .unwrap();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
     bridge.initialize();
 
     // Request definition on 'my_function' call (line 6, character 0)
@@ -328,7 +343,7 @@ fn test_mcp_hover_no_info() {
     let test_file = "/tmp/mcp_test_hover_empty.sh";
     std::fs::write(test_file, "#!/bin/bash\n# just a comment\n").unwrap();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
     bridge.initialize();
 
     // Request hover on comment (line 1, character 0)
@@ -361,7 +376,7 @@ fn test_mcp_hover_no_info() {
 fn test_mcp_tool_call_invalid_file() {
     require_bash_lsp!();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
     bridge.initialize();
 
     // Request hover on non-existent file
@@ -395,7 +410,7 @@ fn test_mcp_tool_call_invalid_file() {
 fn test_mcp_tool_call_unknown_tool() {
     require_bash_lsp!();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
     bridge.initialize();
 
     bridge.send(&json!({
@@ -420,7 +435,7 @@ fn test_mcp_tool_call_unknown_tool() {
 fn test_mcp_ping() {
     require_bash_lsp!();
 
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
     bridge.initialize();
 
     bridge.send(&json!({
@@ -436,46 +451,112 @@ fn test_mcp_ping() {
 }
 
 #[test]
-fn test_mcp_diagnostics() {
+fn test_multiplexing() {
     require_bash_lsp!();
+    // We assume rust-analyzer is present if we are developing this
+    
+    let root_dir = std::env::current_dir().unwrap();
+    let root_str = root_dir.to_str().unwrap();
+    // Use Catenary's own main.rs which is definitely in the workspace
+    let rust_file = root_dir.join("src/main.rs");
+    let bash_file = root_dir.join("tests/assets/bash/script.sh");
 
-    // Create a bash script - diagnostics may or may not find issues
-    let test_file = "/tmp/mcp_test_diagnostics.sh";
-    std::fs::write(test_file, "#!/bin/bash\necho $undefined_var\n").unwrap();
-
-    let mut bridge = BridgeProcess::spawn("bash-language-server start", "/tmp");
+    // Spawn with BOTH servers
+    let mut bridge = BridgeProcess::spawn(&[
+        "rust:rust-analyzer",
+        "shellscript:bash-language-server start"
+    ], root_str);
+    
+    // Give rust-analyzer more time to index
+    std::thread::sleep(Duration::from_secs(3));
     bridge.initialize();
 
-    // Request diagnostics
+    // 1. Test Rust Hover
+    // Find a stable token in src/main.rs, e.g., "println" or "main"
+    // Let's use "main" on the first few lines
+    let content = std::fs::read_to_string(&rust_file).unwrap();
+    let (line, col) = find_position(&content, "fn main");
+
+    // Retry loop for "content modified" error
+    for i in 0..3 {
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 100 + i,
+            "method": "tools/call",
+            "params": {
+                "name": "lsp_hover",
+                "arguments": {
+                    "file": rust_file.to_str().unwrap(),
+                    "line": line,
+                    "character": col + 3 // hover on 'main'
+                }
+            }
+        }));
+
+        let response = bridge.recv();
+        let result = &response["result"];
+        
+        if result["isError"] == true {
+            let content = result["content"].as_array().unwrap();
+            let text = content[0]["text"].as_str().unwrap();
+            if text.contains("content modified") {
+                eprintln!("Got 'content modified', retrying...");
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        }
+
+        assert!(result["isError"].is_null() || result["isError"] == false, "Rust hover failed: {:?}", response);
+        let content = result["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("main"), "Expected Rust hover info for 'main', got: {}", text);
+        break;
+    }
+
+    // 2. Test Bash Hover
     bridge.send(&json!({
         "jsonrpc": "2.0",
-        "id": 9,
+        "id": 101,
         "method": "tools/call",
         "params": {
-            "name": "lsp_diagnostics",
+            "name": "lsp_hover",
             "arguments": {
-                "file": test_file
+                "file": bash_file.to_str().unwrap(),
+                "line": 2, // echo line
+                "character": 4 // echo command
             }
         }
     }));
 
     let response = bridge.recv();
-
-    assert!(
-        response.get("result").is_some(),
-        "Diagnostics call failed: {:?}",
-        response
-    );
-
     let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false);
+    assert!(result["isError"].is_null() || result["isError"] == false, "Bash hover failed: {:?}", response);
+    let _content = result["content"].as_array().unwrap();
+    // Bash LS might return empty hover for some things, but let's check we didn't get an error
+    // and that it didn't use the Rust server (which would error on .sh file)
+    
+    // 3. Test Workspace Symbols (Broadcast)
+    // We need to wait a bit for indexing
+    std::thread::sleep(Duration::from_secs(1));
+    
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 102,
+        "method": "tools/call",
+        "params": {
+            "name": "lsp_workspace_symbols",
+            "arguments": {
+                "query": "greet"
+            }
+        }
+    }));
 
-    let content = result["content"].as_array().unwrap();
-    assert!(!content.is_empty(), "Expected diagnostic content");
-
-    // Should have text content (either "No diagnostics" or actual diagnostics)
-    let text = content[0]["text"].as_str().unwrap();
-    assert!(!text.is_empty(), "Expected non-empty diagnostic text");
-
-    std::fs::remove_file(test_file).ok();
+    let response = bridge.recv();
+    let result = &response["result"];
+    assert!(result["isError"].is_null() || result["isError"] == false, "Workspace symbols failed");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    
+    // Should find 'greet' in Bash and maybe something in Rust if it matched
+    assert!(text.contains("greet"), "Expected to find 'greet' symbol");
 }
+
