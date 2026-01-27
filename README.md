@@ -1,5 +1,7 @@
 # Catenary
 
+[![CI](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/ci.yml/badge.svg)](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/ci.yml)
+
 A bridge between [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) and [LSP](https://microsoft.github.io/language-server-protocol/) (Language Server Protocol).
 
 Catenary allows LLM-powered tools to access IDE-quality code intelligence by exposing LSP capabilities as MCP tools.
