@@ -159,6 +159,19 @@ Note: `--root` defaults to the current directory, so it can be omitted when runn
 | YAML       | `yaml-language-server --stdio`       |
 | TOML       | `taplo lsp stdio`                    |
 
-## License
+## License & Commercial
 
-GPL-3.0
+### Open Source
+Catenary is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License as published by the Free Software Foundation**, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [GNU General Public License](LICENSE) for more details.
+
+### Commercial Licensing
+For organizations that wish to use Catenary in proprietary applications or require features/modifications without the restrictions of the GPL, **Commercial Licenses** are available.
+
+Commercial licensing includes:
+- Right to link Catenary libraries into proprietary software.
+- Priority support and roadmap influence.
+- Custom feature development.
+
+Please contact **Mark Wells Dev** at `contact@markwells.dev` for pricing and details.
