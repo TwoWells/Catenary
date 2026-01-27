@@ -37,6 +37,15 @@ macro_rules! require_bash_lsp {
     };
 }
 
+macro_rules! require_taplo {
+    () => {
+        if !command_exists("taplo") {
+            eprintln!("Skipping test: taplo not installed");
+            return;
+        }
+    };
+}
+
 /// Helper to spawn the bridge and communicate with it
 struct BridgeProcess {
     child: std::process::Child,
@@ -453,6 +462,7 @@ fn test_mcp_ping() {
 #[test]
 fn test_multiplexing() {
     require_bash_lsp!();
+    require_taplo!();
     // We assume rust-analyzer is present if we are developing this
     
     let root_dir = std::env::current_dir().unwrap();
@@ -460,11 +470,13 @@ fn test_multiplexing() {
     // Use Catenary's own main.rs which is definitely in the workspace
     let rust_file = root_dir.join("src/main.rs");
     let bash_file = root_dir.join("tests/assets/bash/script.sh");
+    let toml_file = root_dir.join("tests/assets/toml/Cargo.toml");
 
-    // Spawn with BOTH servers
+    // Spawn with ALL servers
     let mut bridge = BridgeProcess::spawn(&[
         "rust:rust-analyzer",
-        "shellscript:bash-language-server start"
+        "shellscript:bash-language-server start",
+        "toml:taplo lsp stdio"
     ], root_str);
     
     // Give rust-analyzer more time to index
@@ -472,8 +484,6 @@ fn test_multiplexing() {
     bridge.initialize();
 
     // 1. Test Rust Hover
-    // Find a stable token in src/main.rs, e.g., "println" or "main"
-    // Let's use "main" on the first few lines
     let content = std::fs::read_to_string(&rust_file).unwrap();
     let (line, col) = find_position(&content, "fn main");
 
@@ -516,7 +526,7 @@ fn test_multiplexing() {
     // 2. Test Bash Hover
     bridge.send(&json!({
         "jsonrpc": "2.0",
-        "id": 101,
+        "id": 200,
         "method": "tools/call",
         "params": {
             "name": "lsp_hover",
@@ -531,17 +541,39 @@ fn test_multiplexing() {
     let response = bridge.recv();
     let result = &response["result"];
     assert!(result["isError"].is_null() || result["isError"] == false, "Bash hover failed: {:?}", response);
-    let _content = result["content"].as_array().unwrap();
-    // Bash LS might return empty hover for some things, but let's check we didn't get an error
-    // and that it didn't use the Rust server (which would error on .sh file)
     
-    // 3. Test Workspace Symbols (Broadcast)
-    // We need to wait a bit for indexing
+    // 3. Test TOML Hover (Taplo)
+    // Content is:
+    // [package]
+    // name = "test-toml"
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 300,
+        "method": "tools/call",
+        "params": {
+            "name": "lsp_hover",
+            "arguments": {
+                "file": toml_file.to_str().unwrap(),
+                "line": 1, // name = ...
+                "character": 0 // name
+            }
+        }
+    }));
+
+    let response = bridge.recv();
+    let result = &response["result"];
+    assert!(result["isError"].is_null() || result["isError"] == false, "TOML hover failed: {:?}", response);
+    let content = result["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    // Taplo usually gives info about the schema field "name"
+    assert!(text.contains("name") || text.contains("package"), "Expected TOML hover info, got: {}", text);
+    
+    // 4. Test Workspace Symbols (Broadcast)
     std::thread::sleep(Duration::from_secs(1));
     
     bridge.send(&json!({
         "jsonrpc": "2.0",
-        "id": 102,
+        "id": 400,
         "method": "tools/call",
         "params": {
             "name": "lsp_workspace_symbols",
@@ -556,7 +588,6 @@ fn test_multiplexing() {
     assert!(result["isError"].is_null() || result["isError"] == false, "Workspace symbols failed");
     let text = result["content"][0]["text"].as_str().unwrap();
     
-    // Should find 'greet' in Bash and maybe something in Rust if it matched
     assert!(text.contains("greet"), "Expected to find 'greet' symbol");
 }
 

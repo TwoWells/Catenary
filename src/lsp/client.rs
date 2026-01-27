@@ -65,6 +65,7 @@ impl LspClient {
         let alive = Arc::new(AtomicBool::new(true));
 
         let reader_handle = tokio::spawn(Self::reader_task(
+            stdin.clone(),
             stdout,
             pending.clone(),
             diagnostics.clone(),
@@ -85,6 +86,7 @@ impl LspClient {
 
     /// Background task that reads LSP messages and routes responses to pending requests.
     async fn reader_task(
+        stdin: Arc<Mutex<ChildStdin>>,
         stdout: ChildStdout,
         pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
         diagnostics: DiagnosticsCache,
@@ -114,29 +116,68 @@ impl LspClient {
             while let Ok(Some(message_str)) = protocol::try_parse_message(&mut buffer) {
                 trace!("Received LSP message: {}", message_str);
 
-                // Try to parse as response first (has id + result/error)
-                if let Ok(response) = serde_json::from_str::<ResponseMessage>(&message_str) {
-                    if let Some(id) = &response.id {
-                        let mut pending = pending.lock().await;
-                        if let Some(sender) = pending.remove(id) {
-                            let _ = sender.send(response);
-                        } else {
-                            warn!("Received response for unknown request id: {:?}", id);
+                let value: serde_json::Value = match serde_json::from_str(&message_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Failed to parse JSON: {}", e);
+                        continue;
+                    }
+                };
+
+                // Check message type
+                if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
+                    // Request or Notification
+                    if let Some(id) = value.get("id") {
+                        // Server Request (e.g., workspace/configuration)
+                        debug!("Received server request: {} (id: {})", method, id);
+                        
+                        // Reply with MethodNotFound to unblock server
+                        let response = ResponseMessage {
+                            jsonrpc: "2.0".to_string(),
+                            id: Some(serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0))),
+                            result: None,
+                            error: Some(protocol::ResponseError {
+                                code: -32601, // MethodNotFound
+                                message: format!("Method '{}' not supported by client", method),
+                                data: None,
+                            }),
+                        };
+                        
+                        if let Ok(body) = serde_json::to_string(&response) {
+                            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+                            let mut stdin_guard = stdin.lock().await;
+                            if let Err(e) = stdin_guard.write_all(header.as_bytes()).await {
+                                warn!("Failed to write response header: {}", e);
+                            } else if let Err(e) = stdin_guard.write_all(body.as_bytes()).await {
+                                warn!("Failed to write response body: {}", e);
+                            } else if let Err(e) = stdin_guard.flush().await {
+                                warn!("Failed to flush response: {}", e);
+                            }
+                        }
+                    } else {
+                        // Notification
+                        if let Ok(notification) = serde_json::from_value::<NotificationMessage>(value) {
+                            Self::handle_notification(&notification, &diagnostics).await;
                         }
                     }
-                    continue;
+                } else if value.get("id").is_some() {
+                    // Response
+                    if let Ok(response) = serde_json::from_value::<ResponseMessage>(value) {
+                        if let Some(id) = &response.id {
+                            let mut pending = pending.lock().await;
+                            if let Some(sender) = pending.remove(id) {
+                                let _ = sender.send(response);
+                            } else {
+                                warn!("Received response for unknown request id: {:?}", id);
+                            }
+                        }
+                    }
+                } else {
+                    warn!("Unknown message format: {}", message_str);
                 }
-
-                // Try to parse as notification
-                if let Ok(notification) = serde_json::from_str::<NotificationMessage>(&message_str)
-                {
-                    Self::handle_notification(&notification, &diagnostics).await;
-                    continue;
-                }
-
-                warn!("Could not parse LSP message: {}", message_str);
             }
         }
+
 
         // Mark server as dead
         alive.store(false, Ordering::SeqCst);
