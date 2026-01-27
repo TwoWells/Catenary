@@ -85,26 +85,12 @@ Add to `~/.config/claude/claude_desktop_config.json` (Linux) or `~/Library/Appli
 ```json
 {
   "mcpServers": {
-    "rust-lsp": {
-      "command": "catenary",
-      "args": ["--command", "rust-analyzer", "--root", "/path/to/rust/project"]
-    },
-    "python-lsp": {
+    "lsp": {
       "command": "catenary",
       "args": [
-        "--command",
-        "pyright-langserver --stdio",
-        "--root",
-        "/path/to/python/project"
-      ]
-    },
-    "typescript-lsp": {
-      "command": "catenary",
-      "args": [
-        "--command",
-        "typescript-language-server --stdio",
-        "--root",
-        "/path/to/ts/project"
+        "--lsp", "rust:rust-analyzer",
+        "--lsp", "python:pyright-langserver --stdio",
+        "--lsp", "typescript:typescript-language-server --stdio"
       ]
     }
   }
@@ -120,7 +106,7 @@ Add to `~/.claude/settings.json`:
   "mcpServers": {
     "lsp": {
       "command": "catenary",
-      "args": ["--command", "rust-analyzer"]
+      "args": ["--lsp", "rust:rust-analyzer"]
     }
   }
 }
@@ -135,7 +121,7 @@ Note: `--root` defaults to the current directory, so it can be omitted when runn
   "mcpServers": {
     "catenary": {
       "command": "catenary",
-      "args": ["--command", "<lsp-command>", "--root", "<workspace-path>"]
+      "args": ["--lsp", "rust:rust-analyzer", "--root", "<workspace-path>"]
     }
   }
 }
@@ -153,6 +139,7 @@ Note: `--root` defaults to the current directory, so it can be omitted when runn
 | Lua        | `lua-language-server`                |
 | Bash       | `bash-language-server start`         |
 | YAML       | `yaml-language-server --stdio`       |
+| TOML       | `taplo lsp stdio`                    |
 
 ## License
 
