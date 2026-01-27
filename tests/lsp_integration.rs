@@ -63,7 +63,7 @@ async fn test_bash_lsp_initialize() {
 
     let dir = tempdir().unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("bash-language-server", &["start"])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("bash-language-server", &["start"])
         .await
         .unwrap();
 
@@ -85,7 +85,7 @@ async fn test_bash_lsp_hover() {
     let script_path = dir.path().join("test.sh");
     std::fs::write(&script_path, "#!/bin/bash\necho \"hello\"\n").unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("bash-language-server", &["start"])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("bash-language-server", &["start"])
         .await
         .unwrap();
 
@@ -135,7 +135,7 @@ async fn test_lua_lsp_initialize() {
 
     let dir = tempdir().unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("lua-language-server", &[])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("lua-language-server", &[])
         .await
         .unwrap();
 
@@ -154,7 +154,7 @@ async fn test_document_lifecycle() {
     let script_path = dir.path().join("lifecycle.sh");
     std::fs::write(&script_path, "#!/bin/bash\nMY_VAR=1\n").unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("bash-language-server", &["start"])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("bash-language-server", &["start"])
         .await
         .unwrap();
 
@@ -223,7 +223,7 @@ edition = "2021"
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("rust-analyzer", &[])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("rust-analyzer", &[])
         .await
         .unwrap();
 
@@ -256,7 +256,7 @@ edition = "2021"
     let main_rs = dir.path().join("src/main.rs");
     std::fs::write(&main_rs, "fn main() {\n    let x: i32 = 42;\n}\n").unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("rust-analyzer", &[])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("rust-analyzer", &[])
         .await
         .unwrap();
 
@@ -304,7 +304,7 @@ async fn test_yaml_lsp_initialize() {
 
     let dir = tempdir().unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("yaml-language-server", &["--stdio"])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("yaml-language-server", &["--stdio"])
         .await
         .unwrap();
 
@@ -323,7 +323,7 @@ async fn test_yaml_lsp_hover() {
     let yaml_path = dir.path().join("test.yaml");
     std::fs::write(&yaml_path, "name: test\nversion: 1.0\n").unwrap();
 
-    let mut client = catenary::lsp::LspClient::spawn("yaml-language-server", &["--stdio"])
+    let mut client = catenary_mcp::lsp::LspClient::spawn("yaml-language-server", &["--stdio"])
         .await
         .unwrap();
 

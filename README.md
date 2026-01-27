@@ -15,7 +15,7 @@ Catenary allows LLM-powered tools to access IDE-quality code intelligence by exp
 ## Installation
 
 ```bash
-cargo install catenary
+cargo install catenary-mcp
 ```
 
 Or build from source:
