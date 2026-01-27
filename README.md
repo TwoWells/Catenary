@@ -10,6 +10,7 @@ Catenary allows LLM-powered tools to access IDE-quality code intelligence by exp
 
 - **Universal LSP support** - Works with any LSP server (rust-analyzer, gopls, pyright, typescript-language-server, etc.)
 - **Full LSP coverage** - Hover, go-to-definition, find references, completions, diagnostics, rename, formatting, and more
+- **Smart Encoding** - Automatically negotiates UTF-8 position encoding for accurate emoji and multi-byte character support
 - **MCP-native** - Exposes all features as MCP tools with proper schemas
 
 ## Installation
@@ -66,7 +67,7 @@ catenary --command "typescript-language-server --stdio" --root ./my-ts-project
 | `lsp_document_symbols`  | Get the symbol outline of a file                              |
 | `lsp_workspace_symbols` | Search for symbols across the workspace                       |
 | `lsp_code_actions`      | Get available code actions (quick fixes, refactorings)        |
-| `lsp_rename`            | Compute edits needed to rename a symbol                       |
+| `lsp_rename`            | Rename a symbol (supports dry run or applying to disk)        |
 | `lsp_completion`        | Get completion suggestions at a position                      |
 | `lsp_signature_help`    | Get function signature help                                   |
 | `lsp_diagnostics`       | Get diagnostics (errors, warnings) for a file                 |
