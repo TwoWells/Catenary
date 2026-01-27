@@ -1,0 +1,26 @@
+[package]
+name = "catenary"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+description = "A bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol)"
+repository = "https://github.com/Mark-Wells-Dev/Catenary"
+keywords = ["mcp", "lsp", "language-server", "llm", "ai"]
+categories = ["development-tools"]
+
+[dependencies]
+anyhow = "1.0.100"
+bytes = "1.10"
+clap = { version = "4.5.54", features = ["derive"] }
+lsp-types = "0.97.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tempfile = "3"
+cargo-husky = { version = "1", default-features = false, features = ["run-cargo-test", "run-cargo-clippy", "run-cargo-fmt"] }
