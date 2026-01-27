@@ -112,6 +112,24 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
+### Gemini CLI
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "catenary": {
+      "command": "/path/to/catenary",
+      "args": [
+        "--lsp", "rust:rust-analyzer",
+        "--lsp", "shellscript:bash-language-server start"
+      ]
+    }
+  }
+}
+```
+
 Note: `--root` defaults to the current directory, so it can be omitted when running from the project root.
 
 ### Generic MCP Client
