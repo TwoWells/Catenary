@@ -470,6 +470,8 @@ fn test_multiplexing() {
     // Use Catenary's own main.rs which is definitely in the workspace
     let rust_file = root_dir.join("src/main.rs");
     let bash_file = root_dir.join("tests/assets/bash/script.sh");
+    // We name this Cargo.toml so Taplo automatically detects the schema.
+    // If it were named test.toml, Taplo wouldn't provide rich hover info without extra config.
     let toml_file = root_dir.join("tests/assets/toml/Cargo.toml");
 
     // Spawn with ALL servers
