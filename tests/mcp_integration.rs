@@ -56,15 +56,15 @@ struct BridgeProcess {
 impl BridgeProcess {
     fn spawn(lsp_commands: &[&str], root: &str) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        
+
         for lsp in lsp_commands {
             cmd.arg("--lsp").arg(lsp);
         }
-        
+
         cmd.arg("--root").arg(root);
         cmd.stdin(Stdio::piped())
-           .stdout(Stdio::piped())
-           .stderr(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
 
         let mut child = cmd.spawn().expect("Failed to spawn bridge");
 
@@ -464,7 +464,7 @@ fn test_multiplexing() {
     require_bash_lsp!();
     require_taplo!();
     // We assume rust-analyzer is present if we are developing this
-    
+
     let root_dir = std::env::current_dir().unwrap();
     let root_str = root_dir.to_str().unwrap();
     // Use Catenary's own main.rs which is definitely in the workspace
@@ -475,12 +475,15 @@ fn test_multiplexing() {
     let toml_file = root_dir.join("tests/assets/toml/Cargo.toml");
 
     // Spawn with ALL servers
-    let mut bridge = BridgeProcess::spawn(&[
-        "rust:rust-analyzer",
-        "shellscript:bash-language-server start",
-        "toml:taplo lsp stdio"
-    ], root_str);
-    
+    let mut bridge = BridgeProcess::spawn(
+        &[
+            "rust:rust-analyzer",
+            "shellscript:bash-language-server start",
+            "toml:taplo lsp stdio",
+        ],
+        root_str,
+    );
+
     bridge.initialize();
 
     // 1. Test Rust Hover
@@ -491,7 +494,8 @@ fn test_multiplexing() {
 
     // Retry loop for server startup and indexing
     let mut success = false;
-    for i in 0..20 { // Retry for up to 10 seconds (20 * 500ms)
+    for i in 0..20 {
+        // Retry for up to 10 seconds (20 * 500ms)
         bridge.send(&json!({
             "jsonrpc": "2.0",
             "id": 100 + i,
@@ -508,15 +512,15 @@ fn test_multiplexing() {
 
         let response = bridge.recv();
         let result = &response["result"];
-        
+
         if result["isError"] == true {
             let content = result["content"].as_array().unwrap();
             let text = content[0]["text"].as_str().unwrap();
             if text.contains("content modified") || text.contains("No hover information") {
                 // Ignore errors during warm-up
             } else {
-                 // Genuine error
-                 eprintln!("Unexpected error: {}", text);
+                // Genuine error
+                eprintln!("Unexpected error: {}", text);
             }
         } else {
             let content = result["content"].as_array().unwrap();
@@ -528,10 +532,10 @@ fn test_multiplexing() {
                 break;
             }
         }
-        
+
         std::thread::sleep(Duration::from_millis(500));
     }
-    
+
     assert!(success, "Rust hover failed to return info after warmup");
 
     // 2. Test Bash Hover
@@ -551,8 +555,12 @@ fn test_multiplexing() {
 
     let response = bridge.recv();
     let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false, "Bash hover failed: {:?}", response);
-    
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Bash hover failed: {:?}",
+        response
+    );
+
     // 3. Test TOML Hover (Taplo)
     // Content is:
     // [package]
@@ -575,7 +583,7 @@ fn test_multiplexing() {
 
         let response = bridge.recv();
         let result = &response["result"];
-        
+
         if result["isError"] == true {
             let content = result["content"].as_array().unwrap();
             let text = content[0]["text"].as_str().unwrap();
@@ -596,12 +604,15 @@ fn test_multiplexing() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    
-    assert!(taplo_success, "TOML hover failed to return info after warmup");
-    
+
+    assert!(
+        taplo_success,
+        "TOML hover failed to return info after warmup"
+    );
+
     // 4. Test Workspace Symbols (Broadcast)
     std::thread::sleep(Duration::from_secs(1));
-    
+
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 400,
@@ -616,9 +627,11 @@ fn test_multiplexing() {
 
     let response = bridge.recv();
     let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false, "Workspace symbols failed");
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Workspace symbols failed"
+    );
     let text = result["content"][0]["text"].as_str().unwrap();
-    
+
     assert!(text.contains("greet"), "Expected to find 'greet' symbol");
 }
-

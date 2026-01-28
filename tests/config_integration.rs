@@ -1,7 +1,7 @@
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use serde_json::{Value, json};
 
 #[test]
 fn test_config_loading() {
@@ -13,10 +13,10 @@ fn test_config_loading() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
     cmd.arg("--root").arg(root_dir); // Catenary root
-    
+
     cmd.stdin(Stdio::piped())
-       .stdout(Stdio::piped())
-       .stderr(Stdio::inherit()); // See logs
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit()); // See logs
 
     let mut child = cmd.spawn().expect("Failed to spawn catenary");
     let mut stdin = child.stdin.take().expect("Failed to get stdin");
@@ -37,43 +37,61 @@ fn test_config_loading() {
         }
     });
     writeln!(stdin, "{}", init_req).unwrap();
-    
+
     let mut line = String::new();
     stdout.read_line(&mut line).unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
-    assert!(response.get("result").is_some(), "Init failed: {:?}", response);
+    assert!(
+        response.get("result").is_some(),
+        "Init failed: {:?}",
+        response
+    );
 
     // Initialized notification
-    writeln!(stdin, "{}", json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })
+    )
+    .unwrap();
 
     // Test Bash Hover (should be enabled by config)
-    writeln!(stdin, "{}", json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "lsp_hover",
-            "arguments": {
-                "file": bash_file.to_str().unwrap(),
-                "line": 2,
-                "character": 4
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "lsp_hover",
+                "arguments": {
+                    "file": bash_file.to_str().unwrap(),
+                    "line": 2,
+                    "character": 4
+                }
             }
-        }
-    })).unwrap();
+        })
+    )
+    .unwrap();
 
     line.clear();
     stdout.read_line(&mut line).unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
-    
+
     // Cleanup - drop stdin to signal EOF, then wait for graceful exit
     drop(stdin);
     let _ = child.wait();
 
     let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false, "Bash hover failed: {:?}", response);
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Bash hover failed: {:?}",
+        response
+    );
 }
 
 #[test]
@@ -87,13 +105,13 @@ fn test_config_override() {
     // CLI also overrides idle_timeout to 10 (config has 60)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
-    cmd.arg("--lsp").arg("rust:rust-analyzer"); 
+    cmd.arg("--lsp").arg("rust:rust-analyzer");
     cmd.arg("--idle-timeout").arg("10");
     cmd.arg("--root").arg(root_dir);
-    
+
     cmd.stdin(Stdio::piped())
-       .stdout(Stdio::piped())
-       .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
 
     let mut child = cmd.spawn().expect("Failed to spawn catenary");
     let mut stdin = child.stdin.take().expect("Failed to get stdin");
@@ -114,36 +132,49 @@ fn test_config_override() {
         }
     });
     writeln!(stdin, "{}", init_req).unwrap();
-    
+
     let mut line = String::new();
     stdout.read_line(&mut line).unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
     assert!(response.get("result").is_some(), "Init failed");
 
     // Send initialized
-    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    )
+    .unwrap();
 
     // Test Rust Hover (CLI arg) - should work
-    writeln!(stdin, "{}", json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "lsp_hover",
-            "arguments": {
-                "file": rust_file.to_str().unwrap(),
-                "line": 1,
-                "character": 0
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "lsp_hover",
+                "arguments": {
+                    "file": rust_file.to_str().unwrap(),
+                    "line": 1,
+                    "character": 0
+                }
             }
-        }
-    })).unwrap();
+        })
+    )
+    .unwrap();
 
     line.clear();
     stdout.read_line(&mut line).unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
-    
+
     let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false, "Rust hover failed (CLI arg not merged?)");
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Rust hover failed (CLI arg not merged?)"
+    );
 
     // Cleanup - drop stdin to signal EOF, then wait for graceful exit
     drop(stdin);

@@ -25,8 +25,8 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler};
-use catenary_mcp::mcp::McpServer;
 use catenary_mcp::lsp;
+use catenary_mcp::mcp::McpServer;
 
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
@@ -70,9 +70,9 @@ async fn main() -> Result<()> {
 
     // Merge CLI LSPs into config
     for lsp_spec in args.lsps {
-        let (lang, command_str) = lsp_spec
-            .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("Invalid LSP spec: {}. Expected 'lang:command'", lsp_spec))?;
+        let (lang, command_str) = lsp_spec.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("Invalid LSP spec: {}. Expected 'lang:command'", lsp_spec)
+        })?;
 
         let lang = lang.trim().to_string();
         let command_str = command_str.trim();
@@ -82,11 +82,14 @@ async fn main() -> Result<()> {
         let program = parts.next().expect("command cannot be empty").to_string();
         let cmd_args: Vec<String> = parts.map(|s| s.to_string()).collect();
 
-        config.server.insert(lang, catenary_mcp::config::ServerConfig {
-            command: program,
-            args: cmd_args,
-            initialization_options: None,
-        });
+        config.server.insert(
+            lang,
+            catenary_mcp::config::ServerConfig {
+                command: program,
+                args: cmd_args,
+                initialization_options: None,
+            },
+        );
     }
 
     let root = args.root.canonicalize()?;
@@ -177,7 +180,12 @@ async fn document_cleanup_task(
         }
 
         // Check for idle servers (no open documents) and shut them down
-        let active_langs: Vec<String> = client_manager.active_clients().await.keys().cloned().collect();
+        let active_langs: Vec<String> = client_manager
+            .active_clients()
+            .await
+            .keys()
+            .cloned()
+            .collect();
         for lang in active_langs {
             let has_docs = {
                 let doc_manager = doc_manager.lock().await;
@@ -186,8 +194,8 @@ async fn document_cleanup_task(
 
             if !has_docs {
                 // No open documents for this language? Shut it down.
-                // Note: This might be aggressive if the user just closed the last file 
-                // and intends to open another one soon. 
+                // Note: This might be aggressive if the user just closed the last file
+                // and intends to open another one soon.
                 // But since we check on `idle_timeout` interval (e.g. 60s), it's probably fine.
                 // Ideally we'd track "server idle time" separately, but this is a good start.
                 client_manager.shutdown_client(&lang).await;

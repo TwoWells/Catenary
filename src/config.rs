@@ -55,8 +55,7 @@ impl Config {
         let mut builder = config::Config::builder();
 
         // 1. Start with defaults
-        builder = builder
-            .set_default("idle_timeout", 300)?;
+        builder = builder.set_default("idle_timeout", 300)?;
 
         // 2. Load from user config directory (~/.config/catenary/config.toml)
         if let Some(config_dir) = dirs::config_dir() {
@@ -74,10 +73,10 @@ impl Config {
         // 4. Load from environment variables (CATENARY_IDLE_TIMEOUT, etc.)
         builder = builder.add_source(config::Environment::with_prefix("CATENARY"));
 
-        let config = builder
-            .build()
-            .context("Failed to build configuration")?;
+        let config = builder.build().context("Failed to build configuration")?;
 
-        config.try_deserialize().context("Failed to deserialize configuration")
+        config
+            .try_deserialize()
+            .context("Failed to deserialize configuration")
     }
 }

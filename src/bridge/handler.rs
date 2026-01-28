@@ -180,7 +180,7 @@ impl LspBridgeHandler {
             }
             false
         });
-        
+
         // In lazy mode, "no servers running" is fine, as we spawn on demand.
         // So we should probably always return Ok, unless we want to enforce at least one *configured*?
         // But active_clients() only returns running ones.
@@ -199,7 +199,10 @@ impl LspBridgeHandler {
     }
 
     /// Ensures a document is open and synced with the LSP server.
-    async fn ensure_document_open(&self, path: &Path) -> Result<(lsp_types::Uri, Arc<Mutex<LspClient>>)> {
+    async fn ensure_document_open(
+        &self,
+        path: &Path,
+    ) -> Result<(lsp_types::Uri, Arc<Mutex<LspClient>>)> {
         let client_mutex = self.get_client_for_path(path).await?;
         let mut doc_manager = self.doc_manager.lock().await;
         let client = client_mutex.lock().await;
@@ -458,18 +461,18 @@ impl LspBridgeHandler {
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            
+
             // Broadcast to all active clients
             let clients = self.client_manager.active_clients().await;
             let mut results = Vec::new();
-            
+
             for client_mutex in clients.values() {
                 let client = client_mutex.lock().await;
                 if let Ok(Some(response)) = client.workspace_symbols(params.clone()).await {
                     results.push(response);
                 }
             }
-            
+
             // Merge results
             if results.is_empty() {
                 None
@@ -480,7 +483,11 @@ impl LspBridgeHandler {
 
         match result {
             Some(responses) => {
-                let text = responses.iter().map(|r| format_workspace_symbols(r)).collect::<Vec<_>>().join("\n\n---\n\n");
+                let text = responses
+                    .iter()
+                    .map(|r| format_workspace_symbols(r))
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n");
                 Ok(CallToolResult::text(text))
             }
             None => Ok(CallToolResult::text("No symbols found")),
@@ -584,9 +591,8 @@ impl LspBridgeHandler {
                     });
 
                     // Apply changes
-                    self.runtime.block_on(async {
-                        apply_workspace_edit(&edit, encoding).await
-                    })?;
+                    self.runtime
+                        .block_on(async { apply_workspace_edit(&edit, encoding).await })?;
                     Ok(CallToolResult::text(format!(
                         "Successfully applied rename. Changes:\n{}",
                         diff_text
@@ -1571,7 +1577,10 @@ async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKi
             let path = url
                 .to_file_path()
                 .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
-            file_edits.entry(path).or_default().extend(edits.iter().cloned());
+            file_edits
+                .entry(path)
+                .or_default()
+                .extend(edits.iter().cloned());
         }
     }
 
@@ -1585,20 +1594,19 @@ async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKi
                     let path = url
                         .to_file_path()
                         .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
-                    let changes = edit
-                        .edits
-                        .iter()
-                        .map(|e| match e {
-                            lsp_types::OneOf::Left(te) => te.clone(),
-                            lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
-                        });
+                    let changes = edit.edits.iter().map(|e| match e {
+                        lsp_types::OneOf::Left(te) => te.clone(),
+                        lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
+                    });
                     file_edits.entry(path).or_default().extend(changes);
                 }
             }
             DocumentChanges::Operations(ops) => {
                 // TODO: Support create/rename/delete operations
                 // For now, we only support edits within operations if they map simply
-                warn!("DocumentChange operations (create/rename/delete) are not yet fully supported. Only text edits will be applied.");
+                warn!(
+                    "DocumentChange operations (create/rename/delete) are not yet fully supported. Only text edits will be applied."
+                );
                 for op in ops {
                     if let lsp_types::DocumentChangeOperation::Edit(edit) = op {
                         let uri = &edit.text_document.uri;
@@ -1626,16 +1634,18 @@ async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKi
     Ok(())
 }
 
-fn annotated_text_edit_to_text_edit(
-    annotated: &lsp_types::AnnotatedTextEdit,
-) -> TextEdit {
+fn annotated_text_edit_to_text_edit(annotated: &lsp_types::AnnotatedTextEdit) -> TextEdit {
     TextEdit {
         range: annotated.text_edit.range,
         new_text: annotated.text_edit.new_text.clone(),
     }
 }
 
-async fn apply_edits_to_file(path: &Path, mut edits: Vec<TextEdit>, encoding: PositionEncodingKind) -> Result<()> {
+async fn apply_edits_to_file(
+    path: &Path,
+    mut edits: Vec<TextEdit>,
+    encoding: PositionEncodingKind,
+) -> Result<()> {
     let content = fs::read_to_string(path).await?;
 
     // Sort edits by start position descending to apply from bottom up
@@ -1668,7 +1678,11 @@ async fn apply_edits_to_file(path: &Path, mut edits: Vec<TextEdit>, encoding: Po
     Ok(())
 }
 
-fn position_to_offset(content: &str, position: Position, encoding: &PositionEncodingKind) -> Result<usize> {
+fn position_to_offset(
+    content: &str,
+    position: Position,
+    encoding: &PositionEncodingKind,
+) -> Result<usize> {
     let mut current_line = 0;
     let mut line_start_byte = 0;
 
@@ -1685,14 +1699,17 @@ fn position_to_offset(content: &str, position: Position, encoding: &PositionEnco
                 }
             }
         }
-        
+
         if current_line != position.line {
             return Err(anyhow!("Line {} out of bounds", position.line));
         }
     }
 
     let line_content = &content[line_start_byte..];
-    let line_end_byte = line_content.find('\n').map(|i| line_start_byte + i).unwrap_or(content.len());
+    let line_end_byte = line_content
+        .find('\n')
+        .map(|i| line_start_byte + i)
+        .unwrap_or(content.len());
     let line_text = &content[line_start_byte..line_end_byte];
 
     if *encoding == PositionEncodingKind::UTF8 {
@@ -1701,14 +1718,18 @@ fn position_to_offset(content: &str, position: Position, encoding: &PositionEnco
         if char_offset <= line_text.len() {
             Ok(line_start_byte + char_offset)
         } else {
-            Err(anyhow!("Character offset {} out of bounds for line {}", char_offset, position.line))
+            Err(anyhow!(
+                "Character offset {} out of bounds for line {}",
+                char_offset,
+                position.line
+            ))
         }
     } else {
         // Default to UTF-16 logic
         // Character is a UTF-16 code unit offset
         let mut utf16_offset = 0;
         let mut byte_offset = 0;
-        
+
         for c in line_text.chars() {
             if utf16_offset >= position.character as usize {
                 break;
@@ -1716,11 +1737,14 @@ fn position_to_offset(content: &str, position: Position, encoding: &PositionEnco
             utf16_offset += c.len_utf16();
             byte_offset += c.len_utf8();
         }
-        
+
         if utf16_offset == position.character as usize {
             Ok(line_start_byte + byte_offset)
         } else {
-            Err(anyhow!("Position {:?} lands in the middle of a UTF-16 surrogate pair or out of bounds", position))
+            Err(anyhow!(
+                "Position {:?} lands in the middle of a UTF-16 surrogate pair or out of bounds",
+                position
+            ))
         }
     }
 }

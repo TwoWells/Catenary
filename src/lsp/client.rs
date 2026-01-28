@@ -147,11 +147,13 @@ impl LspClient {
                     if let Some(id) = value.get("id") {
                         // Server Request (e.g., workspace/configuration)
                         debug!("Received server request: {} (id: {})", method, id);
-                        
+
                         // Reply with MethodNotFound to unblock server
                         let response = ResponseMessage {
                             jsonrpc: "2.0".to_string(),
-                            id: Some(serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0))),
+                            id: Some(
+                                serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0)),
+                            ),
                             result: None,
                             error: Some(protocol::ResponseError {
                                 code: -32601, // MethodNotFound
@@ -159,7 +161,7 @@ impl LspClient {
                                 data: None,
                             }),
                         };
-                        
+
                         if let Ok(body) = serde_json::to_string(&response) {
                             let header = format!("Content-Length: {}\r\n\r\n", body.len());
                             let mut stdin_guard = stdin.lock().await;
@@ -173,7 +175,9 @@ impl LspClient {
                         }
                     } else {
                         // Notification
-                        if let Ok(notification) = serde_json::from_value::<NotificationMessage>(value) {
+                        if let Ok(notification) =
+                            serde_json::from_value::<NotificationMessage>(value)
+                        {
                             Self::handle_notification(&notification, &diagnostics).await;
                         }
                     }
@@ -194,7 +198,6 @@ impl LspClient {
                 }
             }
         }
-
 
         // Mark server as dead
         alive.store(false, Ordering::SeqCst);

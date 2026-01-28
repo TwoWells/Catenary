@@ -172,7 +172,9 @@ impl DocumentManager {
 
     /// Checks if there are any open documents for the given language ID.
     pub fn has_open_documents(&self, language_id: &str) -> bool {
-        self.documents.keys().any(|path| detect_language_id(path) == language_id)
+        self.documents
+            .keys()
+            .any(|path| detect_language_id(path) == language_id)
     }
 }
 

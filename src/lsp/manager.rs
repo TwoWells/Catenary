@@ -61,15 +61,26 @@ impl ClientManager {
         }
 
         // Spawn new client
-        let server_config = self.config.server.get(lang).ok_or_else(|| {
-            anyhow!("No LSP server configured for language '{}'", lang)
-        })?;
+        let server_config = self
+            .config
+            .server
+            .get(lang)
+            .ok_or_else(|| anyhow!("No LSP server configured for language '{}'", lang))?;
 
-        info!("Spawning LSP server for {}: {} {}", lang, server_config.command, server_config.args.join(" "));
+        info!(
+            "Spawning LSP server for {}: {} {}",
+            lang,
+            server_config.command,
+            server_config.args.join(" ")
+        );
 
-        let args: Vec<&str> = server_config.args.iter().map(|s: &String| s.as_str()).collect();
+        let args: Vec<&str> = server_config
+            .args
+            .iter()
+            .map(|s: &String| s.as_str())
+            .collect();
         let mut client = LspClient::spawn(&server_config.command, &args).await?;
-        
+
         // Initialize
         // TODO: Pass initialization options from config when supported
         client.initialize(&self.root).await?;
@@ -104,13 +115,13 @@ impl ClientManager {
         let mut clients = self.active_clients.lock().await;
         for (lang, client_mutex) in clients.drain() {
             // We need to unwrap the Arc if possible, or lock and shutdown.
-            // Since we are shutting down the manager, we likely own the last references 
+            // Since we are shutting down the manager, we likely own the last references
             // if other tasks (like handlers) have finished.
             // However, handlers might still hold references.
-            
+
             // Just lock and shutdown. LspClient::shutdown handles repeated calls gracefully?
             // LspClient::shutdown sends "shutdown" request.
-            
+
             // Ideally we try_unwrap, but locking is safer if there are stragglers.
             {
                 let mut client = client_mutex.lock().await;
