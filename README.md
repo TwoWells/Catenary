@@ -6,6 +6,8 @@ A bridge between [MCP](https://modelcontextprotocol.io/) (Model Context Protocol
 
 Catenary allows LLM-powered tools to access IDE-quality code intelligence by exposing LSP capabilities as MCP tools.
 
+📚 **[Documentation Wiki](https://github.com/Mark-Wells-Dev/Catenary/wiki)** — Setup guides for 20+ language servers
+
 ## Features
 
 - **LSP Multiplexing** - Run multiple language servers (Rust, Python, Go, etc.) in a single Catenary instance
@@ -168,22 +170,9 @@ Add to `~/.gemini/settings.json`:
 }
 ```
 
-## Common Language Servers
+## Language Server Guides
 
-| Language   | Config Key     | Command                              | Install                                      |
-| ---------- | -------------- | ------------------------------------ | -------------------------------------------- |
-| Rust       | `rust`         | `rust-analyzer`                      | `rustup component add rust-analyzer`         |
-| Python     | `python`       | `pyright-langserver --stdio`         | `npm i -g pyright`                           |
-| TypeScript | `typescript`   | `typescript-language-server --stdio` | `npm i -g typescript-language-server`        |
-| JavaScript | `javascript`   | `typescript-language-server --stdio` | `npm i -g typescript-language-server`        |
-| Go         | `go`           | `gopls`                              | `go install golang.org/x/tools/gopls@latest` |
-| C/C++      | `c` / `cpp`    | `clangd`                             | Package manager                              |
-| Bash       | `shellscript`  | `bash-language-server start`         | `npm i -g bash-language-server`              |
-| YAML       | `yaml`         | `yaml-language-server --stdio`       | `npm i -g yaml-language-server`              |
-| TOML       | `toml`         | `taplo lsp stdio`                    | `cargo install taplo-cli --locked`           |
-| Lua        | `lua`          | `lua-language-server`                | Package manager                              |
-| Zig        | `zig`          | `zls`                                | Package manager                              |
-| Markdown   | `markdown`     | `marksman server`                    | Package manager                              |
+See the **[Wiki](https://github.com/Mark-Wells-Dev/Catenary/wiki/LSPs)** for setup guides covering Rust, Python, TypeScript, Go, PHP, CSS/HTML/JSON, Julia, and more.
 
 ## License & Commercial
 
