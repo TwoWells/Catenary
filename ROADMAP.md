@@ -70,6 +70,10 @@ The goal is to bridge the gap between stateless Agents and stateful LSPs. Agents
 - [ ] **Status Tool:** Add `catenary_status` tool to report server states (e.g., "rust: Indexing", "bash: Ready").
 
 ### Phase 5: Cleanup & Refinement
+- [ ] **Auto-Fix:** Add `lsp_apply_code_action` tool to apply Quick Fixes (using the existing edit application logic).
 - [ ] Pass `initializationOptions` from config to LSP server (`src/lsp/manager.rs`).
 - [ ] Support `DocumentChange` operations (create/rename/delete) in `apply_workspace_edit` (`src/bridge/handler.rs`).
 - [ ] Update documentation.
+
+## 🚀 v1.0.0 Future Ideas
+- [ ] **Semantic Search:** Integrate local embeddings (RAG) for "fuzzy" code search (e.g., "Find auth logic").
