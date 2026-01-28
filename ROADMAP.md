@@ -69,8 +69,13 @@ The goal is to bridge the gap between stateless Agents and stateful LSPs. Agents
 - [ ] **Internal Retry:** If a server returns `null` shortly after spawn, wait and retry internally before returning empty results to the agent.
 - [ ] **Status Tool:** Add `catenary_status` tool to report server states (e.g., "rust: Indexing", "bash: Ready").
 
-### Phase 5: Cleanup & Refinement
-- [ ] **Auto-Fix:** Add `lsp_apply_code_action` tool to apply Quick Fixes (using the existing edit application logic).
+### Phase 5: High-Level Tools ("Catenary Intelligence")
+Introduce composite tools that provide high-value context beyond raw LSP calls.
+
+- [ ] **Auto-Fix:** Add `catenary_apply_quickfix` tool (chains `codeAction` + `workspaceEdit` application).
+- [ ] **Codebase Map:** Add `catenary_codebase_map` to generate a high-level semantic tree of the project (synthesized from file walk + `documentSymbol`).
+
+### Phase 6: Cleanup & Refinement
 - [ ] Pass `initializationOptions` from config to LSP server (`src/lsp/manager.rs`).
 - [ ] Support `DocumentChange` operations (create/rename/delete) in `apply_workspace_edit` (`src/bridge/handler.rs`).
 - [ ] Update documentation.
