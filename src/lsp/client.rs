@@ -183,14 +183,14 @@ impl LspClient {
                     }
                 } else if value.get("id").is_some() {
                     // Response
-                    if let Ok(response) = serde_json::from_value::<ResponseMessage>(value) {
-                        if let Some(id) = &response.id {
-                            let mut pending = pending.lock().await;
-                            if let Some(sender) = pending.remove(id) {
-                                let _ = sender.send(response);
-                            } else {
-                                warn!("Received response for unknown request id: {:?}", id);
-                            }
+                    if let Ok(response) = serde_json::from_value::<ResponseMessage>(value)
+                        && let Some(id) = &response.id
+                    {
+                        let mut pending = pending.lock().await;
+                        if let Some(sender) = pending.remove(id) {
+                            let _ = sender.send(response);
+                        } else {
+                            warn!("Received response for unknown request id: {:?}", id);
                         }
                     }
                 } else {

@@ -102,10 +102,8 @@ impl ClientManager {
         if let Some(client_mutex) = clients.remove(lang) {
             info!("Shutting down idle LSP server for {}", lang);
             let mut client = client_mutex.lock().await;
-            if client.is_alive() {
-                if let Err(e) = client.shutdown().await {
-                    warn!("Failed to shutdown LSP server for {}: {}", lang, e);
-                }
+            if client.is_alive() && let Err(e) = client.shutdown().await {
+                warn!("Failed to shutdown LSP server for {}: {}", lang, e);
             }
         }
     }
@@ -125,10 +123,8 @@ impl ClientManager {
             // Ideally we try_unwrap, but locking is safer if there are stragglers.
             {
                 let mut client = client_mutex.lock().await;
-                if client.is_alive() {
-                    if let Err(e) = client.shutdown().await {
-                        warn!("Failed to shutdown LSP server for {}: {}", lang, e);
-                    }
+                if client.is_alive() && let Err(e) = client.shutdown().await {
+                    warn!("Failed to shutdown LSP server for {}: {}", lang, e);
                 }
             }
         }

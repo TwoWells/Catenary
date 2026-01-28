@@ -485,7 +485,7 @@ impl LspBridgeHandler {
             Some(responses) => {
                 let text = responses
                     .iter()
-                    .map(|r| format_workspace_symbols(r))
+                    .map(format_workspace_symbols)
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n");
                 Ok(CallToolResult::text(text))
