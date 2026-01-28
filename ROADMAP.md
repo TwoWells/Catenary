@@ -61,8 +61,15 @@ Refactor `LspBridgeHandler` to use a dynamic `ClientManager` instead of a static
 - [x] Update `document_cleanup_task` to communicate with `ClientManager`.
 - [x] Implement server shutdown logic when no documents are open for that language.
 
-### Phase 4: Cleanup & Optimization
+### Phase 4: Context Awareness ("Smart Wait")
+The goal is to bridge the gap between stateless Agents and stateful LSPs. Agents prefer latency over incorrect "No info" responses.
+
+- [ ] **Progress Tracking:** Monitor LSP `$/progress` notifications to detect "Indexing" states.
+- [ ] **Smart Blocking:** Block/Queue requests while the server is initializing or indexing (instead of failing fast).
+- [ ] **Internal Retry:** If a server returns `null` shortly after spawn, wait and retry internally before returning empty results to the agent.
+- [ ] **Status Tool:** Add `catenary_status` tool to report server states (e.g., "rust: Indexing", "bash: Ready").
+
+### Phase 5: Cleanup & Refinement
 - [ ] Pass `initializationOptions` from config to LSP server (`src/lsp/manager.rs`).
 - [ ] Support `DocumentChange` operations (create/rename/delete) in `apply_workspace_edit` (`src/bridge/handler.rs`).
 - [ ] Update documentation.
-- [ ] Final integration tests (verifying lazy spawn behavior).
