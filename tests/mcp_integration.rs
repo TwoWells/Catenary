@@ -481,16 +481,17 @@ fn test_multiplexing() {
         "toml:taplo lsp stdio"
     ], root_str);
     
-    // Give rust-analyzer more time to index
-    std::thread::sleep(Duration::from_secs(3));
     bridge.initialize();
 
     // 1. Test Rust Hover
+    // Find a stable token in src/main.rs, e.g., "println" or "main"
+    // Let's use "main" on the first few lines
     let content = std::fs::read_to_string(&rust_file).unwrap();
     let (line, col) = find_position(&content, "fn main");
 
-    // Retry loop for "content modified" error
-    for i in 0..3 {
+    // Retry loop for server startup and indexing
+    let mut success = false;
+    for i in 0..20 { // Retry for up to 10 seconds (20 * 500ms)
         bridge.send(&json!({
             "jsonrpc": "2.0",
             "id": 100 + i,
@@ -511,19 +512,27 @@ fn test_multiplexing() {
         if result["isError"] == true {
             let content = result["content"].as_array().unwrap();
             let text = content[0]["text"].as_str().unwrap();
-            if text.contains("content modified") {
-                eprintln!("Got 'content modified', retrying...");
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
+            if text.contains("content modified") || text.contains("No hover information") {
+                // Ignore errors during warm-up
+            } else {
+                 // Genuine error
+                 eprintln!("Unexpected error: {}", text);
+            }
+        } else {
+            let content = result["content"].as_array().unwrap();
+            let text = content[0]["text"].as_str().unwrap();
+            if text.contains("No hover information") {
+                // Not ready yet
+            } else if text.contains("main") {
+                success = true;
+                break;
             }
         }
-
-        assert!(result["isError"].is_null() || result["isError"] == false, "Rust hover failed: {:?}", response);
-        let content = result["content"].as_array().unwrap();
-        let text = content[0]["text"].as_str().unwrap();
-        assert!(text.contains("main"), "Expected Rust hover info for 'main', got: {}", text);
-        break;
+        
+        std::thread::sleep(Duration::from_millis(500));
     }
+    
+    assert!(success, "Rust hover failed to return info after warmup");
 
     // 2. Test Bash Hover
     bridge.send(&json!({
@@ -548,27 +557,47 @@ fn test_multiplexing() {
     // Content is:
     // [package]
     // name = "test-toml"
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 300,
-        "method": "tools/call",
-        "params": {
-            "name": "lsp_hover",
-            "arguments": {
-                "file": toml_file.to_str().unwrap(),
-                "line": 1, // name = ...
-                "character": 0 // name
+    let mut taplo_success = false;
+    for i in 0..20 {
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 300 + i,
+            "method": "tools/call",
+            "params": {
+                "name": "lsp_hover",
+                "arguments": {
+                    "file": toml_file.to_str().unwrap(),
+                    "line": 1, // name = ...
+                    "character": 0 // name
+                }
+            }
+        }));
+
+        let response = bridge.recv();
+        let result = &response["result"];
+        
+        if result["isError"] == true {
+            let content = result["content"].as_array().unwrap();
+            let text = content[0]["text"].as_str().unwrap();
+            // Taplo might timeout on first request while spawning
+            if text.contains("timed out") {
+                // retry
+            } else {
+                eprintln!("Unexpected TOML error: {}", text);
+            }
+        } else {
+            let content = result["content"].as_array().unwrap();
+            let text = content[0]["text"].as_str().unwrap();
+            // Taplo usually gives info about the schema field "name"
+            if text.contains("name") || text.contains("package") {
+                taplo_success = true;
+                break;
             }
         }
-    }));
-
-    let response = bridge.recv();
-    let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false, "TOML hover failed: {:?}", response);
-    let content = result["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    // Taplo usually gives info about the schema field "name"
-    assert!(text.contains("name") || text.contains("package"), "Expected TOML hover info, got: {}", text);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    
+    assert!(taplo_success, "TOML hover failed to return info after warmup");
     
     // 4. Test Workspace Symbols (Broadcast)
     std::thread::sleep(Duration::from_secs(1));

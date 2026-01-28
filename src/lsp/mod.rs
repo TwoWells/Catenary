@@ -15,7 +15,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-mod client;
-mod protocol;
+pub mod client;
+pub mod manager;
+pub mod protocol;
 
 pub use client::LspClient;
+pub use manager::ClientManager;

@@ -53,13 +53,13 @@ Refactor `LspBridgeHandler` to use a dynamic `ClientManager` instead of a static
 - [x] Implement config loading from `XDG_CONFIG_HOME` or `--config` flag.
 
 ### Phase 2: Lazy Architecture
-- [ ] Create `ClientManager` struct.
-- [ ] Move `spawn` and `initialize` logic from `main.rs` into `ClientManager::get_or_spawn`.
-- [ ] Update `LspBridgeHandler` to use `ClientManager`.
+- [x] Create `ClientManager` struct.
+- [x] Move `spawn` and `initialize` logic from `main.rs` into `ClientManager::get_or_spawn`.
+- [x] Update `LspBridgeHandler` to use `ClientManager`.
 
 ### Phase 3: Cleanup & Optimization
-- [ ] Update `document_cleanup_task` to communicate with `ClientManager`.
-- [ ] Implement server shutdown logic when no documents are open for that language.
+- [x] Update `document_cleanup_task` to communicate with `ClientManager`.
+- [x] Implement server shutdown logic when no documents are open for that language.
 
 ### Phase 4: Release
 - [ ] Update documentation.

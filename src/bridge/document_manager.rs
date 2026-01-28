@@ -169,6 +169,11 @@ impl DocumentManager {
     pub fn language_id_for_path(&self, path: &Path) -> &'static str {
         detect_language_id(path)
     }
+
+    /// Checks if there are any open documents for the given language ID.
+    pub fn has_open_documents(&self, language_id: &str) -> bool {
+        self.documents.keys().any(|path| detect_language_id(path) == language_id)
+    }
 }
 
 /// Notification to send to the LSP server.

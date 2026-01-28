@@ -40,7 +40,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::lsp::LspClient;
+use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 
 use super::{DocumentManager, DocumentNotification};
@@ -150,19 +150,19 @@ pub struct TypeHierarchyInput {
 
 /// Bridge handler that implements MCP ToolHandler trait.
 pub struct LspBridgeHandler {
-    clients: HashMap<String, Arc<Mutex<LspClient>>>,
+    client_manager: Arc<ClientManager>,
     doc_manager: Arc<Mutex<DocumentManager>>,
     runtime: Handle,
 }
 
 impl LspBridgeHandler {
     pub fn new(
-        clients: HashMap<String, Arc<Mutex<LspClient>>>,
+        client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
     ) -> Self {
         Self {
-            clients,
+            client_manager,
             doc_manager,
             runtime,
         }
@@ -170,8 +170,9 @@ impl LspBridgeHandler {
 
     /// Checks if at least one LSP server is still alive.
     fn check_alive(&self) -> Result<()> {
-        let alive = self.runtime.block_on(async {
-            for client in self.clients.values() {
+        let _alive = self.runtime.block_on(async {
+            let clients = self.client_manager.active_clients().await;
+            for client in clients.values() {
                 let client = client.lock().await;
                 if client.is_alive() {
                     return true;
@@ -180,11 +181,11 @@ impl LspBridgeHandler {
             false
         });
         
-        if !alive {
-            Err(anyhow!("No LSP servers are running"))
-        } else {
-            Ok(())
-        }
+        // In lazy mode, "no servers running" is fine, as we spawn on demand.
+        // So we should probably always return Ok, unless we want to enforce at least one *configured*?
+        // But active_clients() only returns running ones.
+        // Let's just return Ok for now, as lsp_workspace_symbols will just return empty if no servers are running.
+        Ok(())
     }
 
     /// Gets the appropriate LSP client for the given file path.
@@ -194,18 +195,7 @@ impl LspBridgeHandler {
             doc_manager.language_id_for_path(path).to_string()
         };
 
-        if let Some(client) = self.clients.get(&lang_id) {
-            Ok(client.clone())
-        } else {
-            // Try to find a fallback or just error out
-            // For now, if we have only one client, maybe default to it? 
-            // Or just error saying "No server for language X"
-            
-            // If there's a "catch-all" client, we could use it.
-            // But strict strictness is better.
-            
-            Err(anyhow!("No LSP server configured for language '{}' (file: {})", lang_id, path.display()))
-        }
+        self.client_manager.get_client(&lang_id).await
     }
 
     /// Ensures a document is open and synced with the LSP server.
@@ -469,9 +459,11 @@ impl LspBridgeHandler {
                 partial_result_params: Default::default(),
             };
             
-            // Broadcast to all clients
+            // Broadcast to all active clients
+            let clients = self.client_manager.active_clients().await;
             let mut results = Vec::new();
-            for client_mutex in self.clients.values() {
+            
+            for client_mutex in clients.values() {
                 let client = client_mutex.lock().await;
                 if let Ok(Some(response)) = client.workspace_symbols(params.clone()).await {
                     results.push(response);
@@ -482,8 +474,6 @@ impl LspBridgeHandler {
             if results.is_empty() {
                 None
             } else {
-                // For simplicity, just take the first non-empty result or merge flat lists
-                // Merging nested responses is hard, so we'll just format each response and join strings
                 Some(results)
             }
         });

@@ -24,12 +24,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-mod bridge;
-mod lsp;
-mod mcp;
-
-use bridge::{DocumentManager, LspBridgeHandler};
-use mcp::McpServer;
+use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler};
+use catenary_mcp::mcp::McpServer;
+use catenary_mcp::lsp;
 
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
@@ -97,43 +94,25 @@ async fn main() -> Result<()> {
     info!("Workspace root: {}", root.display());
     info!("Document idle timeout: {}s", config.idle_timeout);
 
-    let mut clients = std::collections::HashMap::new();
-
-    for (lang, server_config) in config.server {
-        info!("Spawning LSP server for {}: {} {}", lang, server_config.command, server_config.args.join(" "));
-
-        // Spawn LSP client
-        // TODO: Pass initialization_options when LspClient supports it
-        let mut client = lsp::LspClient::spawn(&server_config.command, &server_config.args.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await?;
-        client.initialize(&root).await?;
-
-        clients.insert(lang, Arc::new(Mutex::new(client)));
-    }
-
-    if clients.is_empty() {
-        return Err(anyhow::anyhow!("No LSP servers configured. Use --lsp or config file."));
-    }
-
-    info!("{} LSP server(s) initialized", clients.len());
-
-    // Create bridge components
+    // Create managers
+    let client_manager = Arc::new(lsp::ClientManager::new(config.clone(), root));
     let doc_manager = Arc::new(Mutex::new(DocumentManager::new()));
     let runtime = tokio::runtime::Handle::current();
 
     // Start document cleanup task if timeout is enabled
     let cleanup_handle = if config.idle_timeout > 0 {
-        let clients_clone = clients.clone();
+        let client_manager_clone = client_manager.clone();
         let doc_manager_clone = doc_manager.clone();
         let idle_timeout = config.idle_timeout;
 
         Some(tokio::spawn(async move {
-            document_cleanup_task(clients_clone, doc_manager_clone, idle_timeout).await;
+            document_cleanup_task(client_manager_clone, doc_manager_clone, idle_timeout).await;
         }))
     } else {
         None
     };
 
-    let handler = LspBridgeHandler::new(clients.clone(), doc_manager, runtime);
+    let handler = LspBridgeHandler::new(client_manager.clone(), doc_manager, runtime);
 
     // Run MCP server (blocking - reads from stdin)
     let mut mcp_server = McpServer::new(handler);
@@ -149,25 +128,14 @@ async fn main() -> Result<()> {
 
     // Shutdown LSP clients
     info!("Shutting down LSP servers");
-    for (lang, client_mutex) in clients {
-        let client_result = Arc::try_unwrap(client_mutex);
-        match client_result {
-            Ok(mutex) => {
-                let mut client = mutex.into_inner();
-                if let Err(e) = client.shutdown().await {
-                    warn!("Failed to shutdown LSP server for {}: {}", lang, e);
-                }
-            }
-            Err(_) => warn!("Could not unwrap Arc for {}, skipping shutdown", lang),
-        }
-    }
+    client_manager.shutdown_all().await;
 
     mcp_result
 }
 
 /// Background task that periodically closes idle documents.
 async fn document_cleanup_task(
-    clients: std::collections::HashMap<String, Arc<Mutex<lsp::LspClient>>>,
+    client_manager: Arc<lsp::ClientManager>,
     doc_manager: Arc<Mutex<DocumentManager>>,
     idle_timeout_secs: u64,
 ) {
@@ -194,7 +162,9 @@ async fn document_cleanup_task(
                 };
 
                 if let Ok(Some(params)) = close_params {
-                    if let Some(client_mutex) = clients.get(&lang) {
+                    // Only try to close if the client is active
+                    let active_clients = client_manager.active_clients().await;
+                    if let Some(client_mutex) = active_clients.get(&lang) {
                         let client = client_mutex.lock().await;
                         if let Err(e) = client.did_close(params).await {
                             warn!("Failed to close document {}: {}", path.display(), e);
@@ -203,6 +173,24 @@ async fn document_cleanup_task(
                         }
                     }
                 }
+            }
+        }
+
+        // Check for idle servers (no open documents) and shut them down
+        let active_langs: Vec<String> = client_manager.active_clients().await.keys().cloned().collect();
+        for lang in active_langs {
+            let has_docs = {
+                let doc_manager = doc_manager.lock().await;
+                doc_manager.has_open_documents(&lang)
+            };
+
+            if !has_docs {
+                // No open documents for this language? Shut it down.
+                // Note: This might be aggressive if the user just closed the last file 
+                // and intends to open another one soon. 
+                // But since we check on `idle_timeout` interval (e.g. 60s), it's probably fine.
+                // Ideally we'd track "server idle time" separately, but this is a good start.
+                client_manager.shutdown_client(&lang).await;
             }
         }
     }
