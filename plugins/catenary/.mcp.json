@@ -1,14 +1,6 @@
 {
   "catenary": {
     "command": "catenary",
-    "args": [
-      "--lsp", "rust:rust-analyzer",
-      "--lsp", "python:pyright-langserver --stdio",
-      "--lsp", "typescript:typescript-language-server --stdio",
-      "--lsp", "javascript:typescript-language-server --stdio",
-      "--lsp", "go:gopls",
-      "--lsp", "c:clangd",
-      "--lsp", "cpp:clangd"
-    ]
+    "args": []
   }
 }

@@ -1,0 +1,87 @@
+# Catenary Configuration
+# Copy to ~/.config/catenary/config.toml and customize
+#
+# Catenary uses lazy loading - servers only start when you open a file
+# of that language, so feel free to add many servers without overhead.
+
+idle_timeout = 300  # Seconds before closing idle documents (0 to disable)
+
+# ─────────────────────────────────────────────────────────────────────
+# Language Servers
+# ─────────────────────────────────────────────────────────────────────
+# Format:
+#   [server.<language-id>]
+#   command = "server-binary"
+#   args = ["arg1", "arg2"]
+#
+# The language-id should match the LSP language identifier (e.g., "rust",
+# "python", "typescript"). Catenary routes requests based on file extension.
+
+[server.rust]
+command = "rust-analyzer"
+
+[server.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[server.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[server.javascript]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[server.go]
+command = "gopls"
+
+[server.c]
+command = "clangd"
+
+[server.cpp]
+command = "clangd"
+
+# ─────────────────────────────────────────────────────────────────────
+# Additional Languages (uncomment as needed)
+# ─────────────────────────────────────────────────────────────────────
+
+# [server.shellscript]
+# command = "bash-language-server"
+# args = ["start"]
+
+# [server.yaml]
+# command = "yaml-language-server"
+# args = ["--stdio"]
+
+# [server.toml]
+# command = "taplo"
+# args = ["lsp", "stdio"]
+
+# [server.json]
+# command = "vscode-json-languageserver"
+# args = ["--stdio"]
+
+# [server.lua]
+# command = "lua-language-server"
+
+# [server.zig]
+# command = "zls"
+
+# [server.haskell]
+# command = "haskell-language-server"
+# args = ["--stdio"]
+
+# [server.markdown]
+# command = "marksman"
+# args = ["server"]
+
+# [server.css]
+# command = "tailwindcss-language-server"
+# args = ["--stdio"]
+
+# [server.dockerfile]
+# command = "docker-langserver"
+# args = ["--stdio"]
+
+# [server.cmake]
+# command = "cmake-language-server"

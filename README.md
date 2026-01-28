@@ -8,8 +8,9 @@ Catenary allows LLM-powered tools to access IDE-quality code intelligence by exp
 
 ## Features
 
-- **LSP Multiplexing** - Run multiple language servers (Rust, Python, Go, etc.) in a single Catenary instance.
-- **Smart Routing** - Automatically routes requests to the correct LSP server based on file extension.
+- **LSP Multiplexing** - Run multiple language servers (Rust, Python, Go, etc.) in a single Catenary instance
+- **Lazy Loading** - Servers only start when you open a file of that language
+- **Smart Routing** - Automatically routes requests to the correct LSP server based on file extension
 - **Universal LSP support** - Works with any LSP server (rust-analyzer, gopls, pyright, typescript-language-server, etc.)
 - **Full LSP coverage** - Hover, go-to-definition, find references, completions, diagnostics, rename, formatting, and more
 - **Smart Encoding** - Automatically negotiates UTF-8 position encoding for accurate emoji and multi-byte character support
@@ -29,31 +30,63 @@ cd catenary
 cargo build --release
 ```
 
-## Usage
+## Configuration
 
-```bash
-catenary --lsp "rust:rust-analyzer" --lsp "shellscript:bash-language-server start" --root /path/to/project
+Catenary reads language server definitions from `~/.config/catenary/config.toml`:
+
+```toml
+idle_timeout = 300  # Seconds before closing idle documents (0 to disable)
+
+[server.rust]
+command = "rust-analyzer"
+
+[server.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[server.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[server.javascript]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[server.go]
+command = "gopls"
+
+[server.c]
+command = "clangd"
+
+[server.cpp]
+command = "clangd"
+
+[server.shellscript]
+command = "bash-language-server"
+args = ["start"]
+
+[server.yaml]
+command = "yaml-language-server"
+args = ["--stdio"]
+
+[server.toml]
+command = "taplo"
+args = ["lsp", "stdio"]
 ```
 
-### Arguments
+See [`plugins/catenary/config.example.toml`](plugins/catenary/config.example.toml) for a complete example with many languages.
 
-- `--lsp, -l` - LSP server specification in `lang:command` format (can be specified multiple times)
-- `--root, -r` - Workspace root directory (default: `.`)
-- `--idle-timeout` - Seconds before closing idle documents (default: `300`, set to `0` to disable)
+**Note:** Catenary uses lazy loading - servers only start when needed, so add as many as you like without overhead.
 
-### Example: Multiplexing
+### CLI Override
 
-You can run one Catenary instance that handles all your project's languages:
+You can also specify servers via CLI (useful for testing or one-off use):
 
 ```bash
-catenary \
-  --lsp "rust:rust-analyzer" \
-  --lsp "python:pyright-langserver --stdio" \
-  --lsp "shellscript:bash-language-server start" \
-  --root .
+catenary --lsp "rust:rust-analyzer" --lsp "python:pyright-langserver --stdio"
 ```
 
-Catenary will automatically detect the language of the file you are working on and route the LSP request to the appropriate server. For workspace-wide operations (like `lsp_workspace_symbols`), it queries all servers and merges the results.
+CLI arguments append to (and override) the config file.
 
 ## Available MCP Tools
 
@@ -76,7 +109,24 @@ Catenary will automatically detect the language of the file you are working on a
 | `lsp_call_hierarchy`    | Get incoming/outgoing calls for a function                    |
 | `lsp_type_hierarchy`    | Get supertypes/subtypes of a type                             |
 
-## MCP Configuration
+## MCP Client Setup
+
+Once you've [configured your language servers](#configuration), add Catenary to your MCP client:
+
+### Claude Code (CLI)
+
+**Option 1: Plugin (recommended)**
+
+```bash
+claude plugin marketplace add Mark-Wells-Dev/Catenary
+claude plugin install catenary@catenary
+```
+
+**Option 2: Manual**
+
+```bash
+claude mcp add catenary -- catenary
+```
 
 ### Claude Desktop
 
@@ -85,37 +135,11 @@ Add to `~/.config/claude/claude_desktop_config.json` (Linux) or `~/Library/Appli
 ```json
 {
   "mcpServers": {
-    "lsp": {
-      "command": "catenary",
-      "args": [
-        "--lsp", "rust:rust-analyzer",
-        "--lsp", "python:pyright-langserver --stdio",
-        "--lsp", "typescript:typescript-language-server --stdio"
-      ]
+    "catenary": {
+      "command": "catenary"
     }
   }
 }
-```
-
-### Claude Code (CLI)
-
-**Option 1: Plugin (recommended)**
-
-```bash
-# Add the Catenary marketplace
-claude plugin marketplace add Mark-Wells-Dev/Catenary
-
-# Install the plugin
-claude plugin install catenary@catenary
-```
-
-**Option 2: Manual MCP server**
-
-```bash
-claude mcp add catenary -- catenary \
-  --lsp "rust:rust-analyzer" \
-  --lsp "python:pyright-langserver --stdio" \
-  --lsp "typescript:typescript-language-server --stdio"
 ```
 
 ### Gemini CLI
@@ -126,17 +150,11 @@ Add to `~/.gemini/settings.json`:
 {
   "mcpServers": {
     "catenary": {
-      "command": "/path/to/catenary",
-      "args": [
-        "--lsp", "rust:rust-analyzer",
-        "--lsp", "shellscript:bash-language-server start"
-      ]
+      "command": "catenary"
     }
   }
 }
 ```
-
-Note: `--root` defaults to the current directory, so it can be omitted when running from the project root.
 
 ### Generic MCP Client
 
@@ -144,26 +162,28 @@ Note: `--root` defaults to the current directory, so it can be omitted when runn
 {
   "mcpServers": {
     "catenary": {
-      "command": "catenary",
-      "args": ["--lsp", "rust:rust-analyzer", "--root", "<workspace-path>"]
+      "command": "catenary"
     }
   }
 }
 ```
 
-### Common LSP Server Commands
+## Common Language Servers
 
-| Language   | Command                              |
-| ---------- | ------------------------------------ |
-| Rust       | `rust-analyzer`                      |
-| Go         | `gopls`                              |
-| Python     | `pyright-langserver --stdio`         |
-| TypeScript | `typescript-language-server --stdio` |
-| C/C++      | `clangd`                             |
-| Lua        | `lua-language-server`                |
-| Bash       | `bash-language-server start`         |
-| YAML       | `yaml-language-server --stdio`       |
-| TOML       | `taplo lsp stdio`                    |
+| Language   | Config Key     | Command                              | Install                                      |
+| ---------- | -------------- | ------------------------------------ | -------------------------------------------- |
+| Rust       | `rust`         | `rust-analyzer`                      | `rustup component add rust-analyzer`         |
+| Python     | `python`       | `pyright-langserver --stdio`         | `npm i -g pyright`                           |
+| TypeScript | `typescript`   | `typescript-language-server --stdio` | `npm i -g typescript-language-server`        |
+| JavaScript | `javascript`   | `typescript-language-server --stdio` | `npm i -g typescript-language-server`        |
+| Go         | `go`           | `gopls`                              | `go install golang.org/x/tools/gopls@latest` |
+| C/C++      | `c` / `cpp`    | `clangd`                             | Package manager                              |
+| Bash       | `shellscript`  | `bash-language-server start`         | `npm i -g bash-language-server`              |
+| YAML       | `yaml`         | `yaml-language-server --stdio`       | `npm i -g yaml-language-server`              |
+| TOML       | `toml`         | `taplo lsp stdio`                    | `cargo install taplo-cli --locked`           |
+| Lua        | `lua`          | `lua-language-server`                | Package manager                              |
+| Zig        | `zig`          | `zls`                                | Package manager                              |
+| Markdown   | `markdown`     | `marksman server`                    | Package manager                              |
 
 ## License & Commercial
 
