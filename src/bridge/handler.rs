@@ -18,6 +18,7 @@
 //! Bridge handler that maps MCP tool calls to LSP requests.
 
 use anyhow::{Result, anyhow};
+use ignore::WalkBuilder;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCall,
     CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, CodeActionContext,
@@ -161,6 +162,40 @@ pub struct TypeHierarchyInput {
     pub character: u32,
     /// "supertypes" or "subtypes"
     pub direction: String,
+}
+
+/// Input for auto-fixing.
+#[derive(Debug, Deserialize)]
+pub struct ApplyQuickFixInput {
+    pub file: String,
+    pub line: u32,
+    pub character: u32,
+    /// Optional filter string to match against action title.
+    pub filter: Option<String>,
+}
+
+/// Input for codebase map.
+#[derive(Debug, Deserialize)]
+pub struct CodebaseMapInput {
+    /// Subdirectory to start from (default: root)
+    pub path: Option<String>,
+    /// Max depth for traversal (default: 5)
+    #[serde(default = "default_depth")]
+    pub max_depth: usize,
+    /// Whether to ask LSP for symbols (default: false)
+    #[serde(default)]
+    pub include_symbols: bool,
+    /// Max lines of output before truncation (default: 2000)
+    #[serde(default = "default_budget")]
+    pub budget: usize,
+}
+
+fn default_depth() -> usize {
+    5
+}
+
+fn default_budget() -> usize {
+    2000
 }
 
 /// Bridge handler that implements MCP ToolHandler trait.
@@ -1003,6 +1038,282 @@ impl LspBridgeHandler {
             _ => Ok(CallToolResult::text("No type hierarchy found")),
         }
     }
+    fn handle_apply_quickfix(
+        &self,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<CallToolResult> {
+        let input: ApplyQuickFixInput =
+            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
+                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+
+        let path = self.validate_absolute_path(&input.file)?;
+
+        debug!(
+            "Apply quickfix request: {}:{}:{} filter={:?}",
+            input.file, input.line, input.character, input.filter
+        );
+
+        let result = self.runtime.block_on(async {
+            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
+            let client = client_mutex.lock().await;
+
+            // 1. Get diagnostics to find the relevant range and context
+            let diagnostics = client.get_diagnostics(&uri).await;
+            
+            // Find diagnostic at cursor
+            let cursor_line = input.line;
+            let cursor_char = input.character;
+            
+            let target_diagnostic = diagnostics.iter().find(|d| {
+                let start = d.range.start;
+                let end = d.range.end;
+                
+                // Check if cursor is within range (inclusive of start, exclusive of end usually, but let's be loose)
+                if cursor_line < start.line || cursor_line > end.line {
+                    return false;
+                }
+                if cursor_line == start.line && cursor_char < start.character {
+                    return false;
+                }
+                if cursor_line == end.line && cursor_char > end.character {
+                    return false;
+                }
+                true
+            });
+
+            let (range, context_diagnostics) = if let Some(d) = target_diagnostic {
+                (d.range, vec![d.clone()])
+            } else {
+                // No diagnostic found at cursor, use cursor position as range
+                (
+                    Range {
+                        start: Position { line: cursor_line, character: cursor_char },
+                        end: Position { line: cursor_line, character: cursor_char },
+                    },
+                    vec![]
+                )
+            };
+
+            // 2. Request Code Actions
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range,
+                context: CodeActionContext {
+                    diagnostics: context_diagnostics,
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+
+            let response = client.code_actions(params).await?;
+            let actions = response.unwrap_or_default();
+
+            if actions.is_empty() {
+                return Err(anyhow!("No code actions available at this location"));
+            }
+
+            // 3. Filter and Pick Action
+            let action_to_apply = if let Some(filter) = &input.filter {
+                actions.into_iter().find(|a| match a {
+                    CodeActionOrCommand::Command(cmd) => cmd.title.contains(filter),
+                    CodeActionOrCommand::CodeAction(ca) => ca.title.contains(filter),
+                })
+            } else {
+                // Prefer "quickfix" kind
+                let quickfix = actions.iter().find(|a| match a {
+                    CodeActionOrCommand::CodeAction(ca) => {
+                        ca.kind.as_ref().map(|k| k.as_str().contains("quickfix")).unwrap_or(false)
+                    },
+                    _ => false,
+                });
+                
+                if let Some(qf) = quickfix {
+                    Some(qf.clone())
+                } else {
+                    actions.into_iter().next()
+                }
+            };
+
+            let Some(action) = action_to_apply else {
+                return Err(anyhow!("No matching code action found"));
+            };
+
+            // 4. Apply Edit
+            match action {
+                CodeActionOrCommand::Command(cmd) => {
+                    // We can't easily execute server-side commands that require client logic
+                    // But some are just "executeCommand".
+                    Err(anyhow!("Selected action is a Command ('{}'), which is not yet supported for auto-apply. Only WorkspaceEdit actions are supported.", cmd.title))
+                }
+                CodeActionOrCommand::CodeAction(ca) => {
+                    if let Some(edit) = ca.edit {
+                        let encoding = client.encoding();
+                        // Drop client lock before applying edit (which might take time)
+                        drop(client);
+                        
+                        apply_workspace_edit(&edit, encoding).await?;
+                        Ok(format!("Applied fix: {}", ca.title))
+                    } else {
+                        // TODO: Resolve code action if edit is missing (data field)
+                        Err(anyhow!("Code action '{}' has no edit attached (lazy resolution not yet supported)", ca.title))
+                    }
+                }
+            }
+        });
+
+        match result {
+            Ok(msg) => Ok(CallToolResult::text(msg)),
+            Err(e) => Ok(CallToolResult::error(e.to_string())),
+        }
+    }
+    fn handle_codebase_map(
+        &self,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<CallToolResult> {
+        let input: CodebaseMapInput =
+            serde_json::from_value(arguments.unwrap_or_else(|| serde_json::json!({})))
+                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+
+        let root_path = if let Some(p) = &input.path {
+            self.validate_absolute_path(p)?
+        } else {
+            std::env::current_dir()?
+        };
+
+        debug!(
+            "Codebase map request: path={:?} depth={} symbols={}",
+            root_path, input.max_depth, input.include_symbols
+        );
+
+        // 1. Walk Directory and collect entries
+        let walker = WalkBuilder::new(&root_path)
+            .max_depth(Some(input.max_depth))
+            .git_ignore(true)
+            .hidden(false)
+            .build();
+
+        struct MapEntry {
+            path: PathBuf,
+            depth: usize,
+            is_dir: bool,
+            symbols: Option<String>,
+        }
+
+        let mut entries = Vec::new();
+
+        for result in walker {
+            match result {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path == root_path {
+                        continue;
+                    } // Skip root itself
+
+                    let rel_path = path.strip_prefix(&root_path).unwrap_or(path);
+                    let depth = rel_path.components().count();
+                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+
+                    entries.push(MapEntry {
+                        path: path.to_path_buf(),
+                        depth,
+                        is_dir,
+                        symbols: None,
+                    });
+                }
+                Err(err) => warn!("Error walking directory: {}", err),
+            }
+        }
+
+        // 2. Fetch Symbols (Async Phase)
+        if input.include_symbols {
+            let entries_len = entries.len();
+            debug!("Fetching symbols for {} files", entries_len);
+
+            self.runtime.block_on(async {
+                for entry in &mut entries {
+                    if entry.is_dir {
+                        continue;
+                    }
+
+                    // Simple extension check to avoid wasted LSP calls
+                    let lang_id = {
+                        let doc_manager = self.doc_manager.lock().await;
+                        doc_manager.language_id_for_path(&entry.path).to_string()
+                    };
+
+                    if lang_id == "plaintext" {
+                        continue;
+                    }
+
+                    if let Ok(client_mutex) = self.client_manager.get_client(&lang_id).await {
+                        // Attempt to open and get symbols with a short timeout
+                        if let Ok((uri, _)) = self.ensure_document_open(&entry.path).await {
+                            let client = client_mutex.lock().await;
+                            let symbols_future = client.document_symbols(DocumentSymbolParams {
+                                text_document: TextDocumentIdentifier { uri },
+                                work_done_progress_params: Default::default(),
+                                partial_result_params: Default::default(),
+                            });
+
+                            // 200ms timeout per file to keep map generation snappy
+                            if let Ok(Ok(Some(response))) = tokio::time::timeout(
+                                std::time::Duration::from_millis(200),
+                                symbols_future,
+                            )
+                            .await
+                            {
+                                entry.symbols = Some(format_compact_symbols(&response));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // 3. Render Output
+        let mut output = String::new();
+        let mut line_count = 0;
+        let budget = input.budget;
+
+        for entry in entries {
+            if line_count >= budget {
+                output.push_str("... (truncated)\n");
+                break;
+            }
+
+            // Indentation
+            let indent = "  ".repeat(entry.depth - 1);
+            let rel_path = entry.path.strip_prefix(&root_path).unwrap_or(&entry.path);
+            let name = rel_path.file_name().unwrap_or_default().to_string_lossy();
+            let marker = if entry.is_dir { "/" } else { "" };
+
+            output.push_str(&format!("{}{}{}\n", indent, name, marker));
+            line_count += 1;
+
+            if let Some(symbols) = &entry.symbols {
+                let sym_indent = "  ".repeat(entry.depth);
+                for line in symbols.lines() {
+                    if line_count >= budget {
+                        break;
+                    }
+                    // Truncate long symbol lines
+                    let max_width = 120;
+                    let display_line = if line.len() > max_width {
+                        format!("{}...", &line[..max_width])
+                    } else {
+                        line.to_string()
+                    };
+                    
+                    output.push_str(&format!("{}{}\n", sym_indent, display_line));
+                    line_count += 1;
+                }
+            }
+        }
+
+        Ok(CallToolResult::text(output))
+    }
 }
 
 impl ToolHandler for LspBridgeHandler {
@@ -1170,8 +1481,38 @@ impl ToolHandler for LspBridgeHandler {
                     "required": []
                 }),
             },
+            Tool {
+                name: "catenary_apply_quickfix".to_string(),
+                description: Some("Automatically find and apply a Code Action (Quick Fix) for a diagnostic at the given position.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Absolute path to the file" },
+                        "line": { "type": "integer", "description": "Line number (0-indexed)" },
+                        "character": { "type": "integer", "description": "Character position (0-indexed)" },
+                        "filter": { "type": "string", "description": "Optional text to match against the action title (e.g. 'Import')" }
+                    },
+                    "required": ["file", "line", "character"]
+                }),
+            },
+            Tool {
+                name: "catenary_codebase_map".to_string(),
+                description: Some("Generate a high-level file tree of the project, optionally including top-level symbols (functions, classes) from LSP.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Subdirectory to map (default: project root)" },
+                        "max_depth": { "type": "integer", "description": "Max depth for traversal (default: 5)" },
+                        "include_symbols": { "type": "boolean", "description": "Ask LSP for symbols in files (default: false)" },
+                        "budget": { "type": "integer", "description": "Max lines of output (default: 2000)" }
+                    },
+                    "required": []
+                }),
+            },
         ]
     }
+
+
 
     fn call_tool(
         &self,
@@ -1230,6 +1571,8 @@ impl ToolHandler for LspBridgeHandler {
             "lsp_range_formatting" => self.handle_range_formatting(arguments),
             "lsp_call_hierarchy" => self.handle_call_hierarchy(arguments),
             "lsp_type_hierarchy" => self.handle_type_hierarchy(arguments),
+            "catenary_apply_quickfix" => self.handle_apply_quickfix(arguments),
+            "catenary_codebase_map" => self.handle_codebase_map(arguments),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         };
 
@@ -1240,6 +1583,52 @@ impl ToolHandler for LspBridgeHandler {
 
         result
     }
+}
+
+// ... (existing schema helpers)
+
+fn format_compact_symbols(response: &DocumentSymbolResponse) -> String {
+    let mut result = Vec::new();
+    match response {
+        DocumentSymbolResponse::Flat(symbols) => {
+            for sym in symbols {
+                // Only show top-level types (Classes, Functions, Structs, Interfaces, Modules)
+                if is_high_level_symbol(sym.kind) {
+                    result.push(format!("{} {:?}", sym.name, sym.kind));
+                }
+            }
+        }
+        DocumentSymbolResponse::Nested(symbols) => {
+            for sym in symbols {
+                if is_high_level_symbol(sym.kind) {
+                    result.push(format!("{} {:?}", sym.name, sym.kind));
+                    // Optional: Recurse one level deeper?
+                    // For now, flat top-level is safest for budget.
+                }
+            }
+        }
+    }
+    result.join("\n")
+}
+
+fn is_high_level_symbol(kind: lsp_types::SymbolKind) -> bool {
+    use lsp_types::SymbolKind;
+    matches!(
+        kind,
+        SymbolKind::FILE
+            | SymbolKind::MODULE
+            | SymbolKind::NAMESPACE
+            | SymbolKind::PACKAGE
+            | SymbolKind::CLASS
+            | SymbolKind::METHOD
+            | SymbolKind::PROPERTY
+            | SymbolKind::CONSTRUCTOR
+            | SymbolKind::ENUM
+            | SymbolKind::INTERFACE
+            | SymbolKind::FUNCTION
+            | SymbolKind::STRUCT
+            | SymbolKind::EVENT
+    )
 }
 
 // Schema helpers

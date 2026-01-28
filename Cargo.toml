@@ -19,6 +19,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
 config = "0.15.19"
 dirs = "6.0.0"
+ignore = "0.4.25"
 libc = "0.2"
 lsp-types = "0.97.0"
 serde = { version = "1.0.228", features = ["derive"] }
