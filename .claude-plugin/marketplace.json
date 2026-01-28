@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "catenary",
+  "description": "LSP bridge for Claude Code - access IDE-quality code intelligence through MCP",
+  "owner": {
+    "name": "Mark Wells Dev",
+    "email": "contact@markwells.dev"
+  },
+  "plugins": [
+    {
+      "name": "catenary",
+      "description": "Bridge between MCP and LSP, providing IDE-quality code intelligence (hover, go-to-definition, references, diagnostics, completions, and more) for any language with an LSP server",
+      "version": "0.3.0",
+      "author": {
+        "name": "Mark Wells Dev",
+        "email": "contact@markwells.dev"
+      },
+      "source": "./plugins/catenary",
+      "category": "development",
+      "homepage": "https://github.com/Mark-Wells-Dev/Catenary"
+    }
+  ]
+}
