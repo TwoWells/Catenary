@@ -8,16 +8,27 @@ A bridge between [MCP](https://modelcontextprotocol.io/) and [LSP](https://micro
 
 ## Quick Start
 
+### 1. Install Catenary
+
 ```bash
-# Install Catenary
 cargo install catenary-mcp
+```
 
-# Add to Claude Code
+### 2. Connect your AI Assistant
+
+**Claude Code**
+```bash
 claude mcp add catenary -- catenary
+```
 
-# Or install as a plugin
-claude plugin marketplace add Mark-Wells-Dev/Catenary
-claude plugin install catenary@catenary
+**Gemini CLI**
+Add to `~/.gemini/settings.json`:
+```json
+{
+  "mcpServers": {
+    "catenary": { "command": "catenary" }
+  }
+}
 ```
 
 Then [configure your language servers](https://github.com/Mark-Wells-Dev/Catenary/wiki/Config) in `~/.config/catenary/config.toml`.
