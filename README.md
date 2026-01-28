@@ -99,17 +99,23 @@ Add to `~/.config/claude/claude_desktop_config.json` (Linux) or `~/Library/Appli
 
 ### Claude Code (CLI)
 
-Add to `~/.claude/settings.json`:
+**Option 1: Plugin (recommended)**
 
-```json
-{
-  "mcpServers": {
-    "lsp": {
-      "command": "catenary",
-      "args": ["--lsp", "rust:rust-analyzer"]
-    }
-  }
-}
+```bash
+# Add the Catenary marketplace
+claude plugin marketplace add Mark-Wells-Dev/Catenary
+
+# Install the plugin
+claude plugin install catenary@catenary
+```
+
+**Option 2: Manual MCP server**
+
+```bash
+claude mcp add catenary -- catenary \
+  --lsp "rust:rust-analyzer" \
+  --lsp "python:pyright-langserver --stdio" \
+  --lsp "typescript:typescript-language-server --stdio"
 ```
 
 ### Gemini CLI
