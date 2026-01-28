@@ -24,20 +24,24 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::lsp::LspClient;
+use crate::lsp::state::ServerStatus;
+use crate::session::EventBroadcaster;
 
 /// Manages the lifecycle of LSP clients (lazy spawning, caching, shutdown).
 pub struct ClientManager {
     config: Config,
     root: PathBuf,
     active_clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
+    broadcaster: EventBroadcaster,
 }
 
 impl ClientManager {
-    pub fn new(config: Config, root: PathBuf) -> Self {
+    pub fn new(config: Config, root: PathBuf, broadcaster: EventBroadcaster) -> Self {
         Self {
             config,
             root,
             active_clients: Mutex::new(HashMap::new()),
+            broadcaster,
         }
     }
 
@@ -79,7 +83,13 @@ impl ClientManager {
             .iter()
             .map(|s: &String| s.as_str())
             .collect();
-        let mut client = LspClient::spawn(&server_config.command, &args).await?;
+        let mut client = LspClient::spawn(
+            &server_config.command,
+            &args,
+            lang,
+            self.broadcaster.clone(),
+        )
+        .await?;
 
         // Initialize
         // TODO: Pass initialization options from config when supported
@@ -94,6 +104,19 @@ impl ClientManager {
     /// Returns a snapshot of all currently active clients.
     pub async fn active_clients(&self) -> HashMap<String, Arc<Mutex<LspClient>>> {
         self.active_clients.lock().await.clone()
+    }
+
+    /// Returns status of all active servers.
+    pub async fn all_server_status(&self) -> Vec<ServerStatus> {
+        let clients = self.active_clients.lock().await;
+        let mut statuses = Vec::new();
+
+        for (lang, client_mutex) in clients.iter() {
+            let client = client_mutex.lock().await;
+            statuses.push(client.status(lang.clone()).await);
+        }
+
+        statuses
     }
 
     /// Shuts down a specific client if it exists.

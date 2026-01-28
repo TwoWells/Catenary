@@ -18,6 +18,8 @@
 pub mod client;
 pub mod manager;
 pub mod protocol;
+pub mod state;
 
 pub use client::LspClient;
 pub use manager::ClientManager;
+pub use state::{ProgressTracker, ServerState, ServerStatus};

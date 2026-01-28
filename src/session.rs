@@ -1,0 +1,456 @@
+/*
+ * Copyright (C) 2026 Mark Wells Dev
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+//! Session management for observability.
+//!
+//! Each Catenary instance creates a session that can be discovered and
+//! monitored from other terminals via `catenary list` and `catenary monitor`.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tracing::warn;
+
+/// Session metadata stored in info.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub pid: u32,
+    pub workspace: String,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub client_name: Option<String>,
+    #[serde(default)]
+    pub client_version: Option<String>,
+}
+
+/// An event that can be broadcast to listeners
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub timestamp: DateTime<Utc>,
+    #[serde(flatten)]
+    pub kind: EventKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventKind {
+    /// Server state changed
+    ServerState { language: String, state: String },
+    /// Progress update from LSP server
+    Progress {
+        language: String,
+        title: String,
+        message: Option<String>,
+        percentage: Option<u32>,
+    },
+    /// Progress completed
+    ProgressEnd { language: String },
+    /// Tool was called
+    ToolCall { tool: String, file: Option<String> },
+    /// Tool call completed
+    ToolResult {
+        tool: String,
+        success: bool,
+        duration_ms: u64,
+    },
+    /// Session started
+    Started,
+    /// Session ending
+    Shutdown,
+    /// Raw MCP message (incoming or outgoing)
+    McpMessage {
+        direction: String, // "in" or "out"
+        message: serde_json::Value,
+    },
+}
+
+/// Returns the base directory for session data
+fn sessions_dir() -> Result<PathBuf> {
+    let state_dir = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    Ok(state_dir.join("catenary").join("sessions"))
+}
+
+/// An active session that broadcasts events
+pub struct Session {
+    pub info: SessionInfo,
+    session_dir: PathBuf,
+    events_file: Arc<Mutex<File>>,
+}
+
+impl Session {
+    /// Create a new session
+    pub fn create(workspace: &str) -> Result<Self> {
+        let id = Self::generate_id();
+        let sessions_base = sessions_dir()?;
+        let session_dir = sessions_base.join(&id);
+
+        fs::create_dir_all(&session_dir)
+            .with_context(|| format!("Failed to create session dir: {}", session_dir.display()))?;
+
+        let info = SessionInfo {
+            id: id.clone(),
+            pid: std::process::id(),
+            workspace: workspace.to_string(),
+            started_at: Utc::now(),
+            client_name: None,
+            client_version: None,
+        };
+
+        // Write info.json
+        let info_path = session_dir.join("info.json");
+        let info_file = File::create(&info_path)?;
+        serde_json::to_writer_pretty(info_file, &info)?;
+
+        // Create events.jsonl
+        let events_path = session_dir.join("events.jsonl");
+        let events_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&events_path)?;
+
+        let session = Self {
+            info,
+            session_dir,
+            events_file: Arc::new(Mutex::new(events_file)),
+        };
+
+        // Broadcast started event
+        session.broadcast(EventKind::Started);
+
+        Ok(session)
+    }
+
+    /// Generate a short unique session ID
+    fn generate_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let pid = std::process::id();
+        // Use thread ID to avoid collisions in tests
+        let tid = format!("{:?}", std::thread::current().id());
+        // Simple hash of tid to keep it short
+        let tid_hash = tid.bytes().fold(0u32, |acc, x| acc.wrapping_add(x as u32));
+
+        format!("{:x}{:x}{:x}", now as u32, pid, tid_hash)
+    }
+
+    /// Update client info (called after MCP initialize)
+    pub fn set_client_info(&mut self, name: &str, version: &str) {
+        self.info.client_name = Some(name.to_string());
+        self.info.client_version = Some(version.to_string());
+
+        // Rewrite info.json
+        let info_path = self.session_dir.join("info.json");
+        if let Ok(file) = File::create(&info_path) {
+            let _ = serde_json::to_writer_pretty(file, &self.info);
+        }
+    }
+
+    /// Broadcast an event to listeners
+    pub fn broadcast(&self, kind: EventKind) {
+        let event = SessionEvent {
+            timestamp: Utc::now(),
+            kind,
+        };
+
+        if let Ok(mut file) = self.events_file.lock()
+            && let Ok(json) = serde_json::to_string(&event)
+        {
+            let _ = writeln!(file, "{}", json);
+            let _ = file.flush();
+        }
+    }
+
+    /// Get a broadcaster that can be cloned and shared
+    pub fn broadcaster(&self) -> EventBroadcaster {
+        EventBroadcaster {
+            events_file: self.events_file.clone(),
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Broadcast shutdown
+        self.broadcast(EventKind::Shutdown);
+
+        // Clean up session directory
+        if let Err(e) = fs::remove_dir_all(&self.session_dir) {
+            warn!("Failed to clean up session directory: {}", e);
+        }
+    }
+}
+
+/// Cloneable broadcaster for sharing across components
+#[derive(Clone)]
+pub struct EventBroadcaster {
+    events_file: Arc<Mutex<File>>,
+}
+
+impl EventBroadcaster {
+    /// Broadcast an event
+    pub fn send(&self, kind: EventKind) {
+        let event = SessionEvent {
+            timestamp: Utc::now(),
+            kind,
+        };
+
+        if let Ok(mut file) = self.events_file.lock()
+            && let Ok(json) = serde_json::to_string(&event)
+        {
+            let _ = writeln!(file, "{}", json);
+            let _ = file.flush();
+        }
+    }
+
+    /// Create a no-op broadcaster (for when session is disabled)
+    pub fn noop() -> Self {
+        // Create a broadcaster that writes to /dev/null
+        let file = OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap_or_else(|_| {
+                // Fallback for non-Unix systems
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(std::env::temp_dir().join(".catenary_null"))
+                    .unwrap()
+            });
+        Self {
+            events_file: Arc::new(Mutex::new(file)),
+        }
+    }
+}
+
+/// List all active sessions
+pub fn list_sessions() -> Result<Vec<SessionInfo>> {
+    let sessions_base = sessions_dir()?;
+
+    if !sessions_base.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut sessions = Vec::new();
+
+    for entry in fs::read_dir(&sessions_base)? {
+        let entry = entry?;
+        let info_path = entry.path().join("info.json");
+
+        if info_path.exists()
+            && let Ok(file) = File::open(&info_path)
+            && let Ok(info) = serde_json::from_reader::<_, SessionInfo>(file)
+        {
+            // Check if process is still alive
+            if is_process_alive(info.pid) {
+                sessions.push(info);
+            } else {
+                // Clean up dead session
+                warn!("Cleaning up dead session {} (pid {})", info.id, info.pid);
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    // Sort by start time (most recent first)
+    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+
+    Ok(sessions)
+}
+
+/// Get a specific session by ID
+pub fn get_session(id: &str) -> Result<Option<SessionInfo>> {
+    let sessions_base = sessions_dir()?;
+    let info_path = sessions_base.join(id).join("info.json");
+
+    if !info_path.exists() {
+        return Ok(None);
+    }
+
+    let file = File::open(&info_path)?;
+    let info: SessionInfo = serde_json::from_reader(file)?;
+
+    if is_process_alive(info.pid) {
+        Ok(Some(info))
+    } else {
+        // Clean up dead session
+        let _ = fs::remove_dir_all(sessions_base.join(id));
+        Ok(None)
+    }
+}
+
+/// Monitor events from a session (blocking iterator)
+pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
+    let sessions_base = sessions_dir()?;
+    let events_path = sessions_base.join(id).join("events.jsonl");
+
+    if !events_path.exists() {
+        anyhow::bail!("Session not found: {}", id);
+    }
+
+    let file = File::open(&events_path)?;
+    let reader = BufReader::new(file);
+
+    Ok(reader.lines().filter_map(|line| {
+        line.ok()
+            .and_then(|l| serde_json::from_str::<SessionEvent>(&l).ok())
+    }))
+}
+
+/// Tail events from a session (follows new events)
+pub fn tail_events(id: &str) -> Result<TailReader> {
+    let sessions_base = sessions_dir()?;
+    let events_path = sessions_base.join(id).join("events.jsonl");
+
+    if !events_path.exists() {
+        anyhow::bail!("Session not found: {}", id);
+    }
+
+    TailReader::new(events_path)
+}
+
+/// Reader that tails a file for new content
+pub struct TailReader {
+    path: PathBuf,
+    reader: BufReader<File>,
+    last_size: u64,
+}
+
+impl TailReader {
+    fn new(path: PathBuf) -> Result<Self> {
+        let file = File::open(&path)?;
+        let metadata = file.metadata()?;
+        let reader = BufReader::new(file);
+
+        Ok(Self {
+            path,
+            reader,
+            last_size: metadata.len(),
+        })
+    }
+
+    /// Read the next event, blocking if necessary
+    pub fn next_event(&mut self) -> Result<Option<SessionEvent>> {
+        loop {
+            let mut line = String::new();
+            let bytes_read = self.reader.read_line(&mut line)?;
+
+            if bytes_read > 0 {
+                let line = line.trim();
+                if !line.is_empty()
+                    && let Ok(event) = serde_json::from_str::<SessionEvent>(line)
+                {
+                    return Ok(Some(event));
+                }
+            } else {
+                // Check if file was truncated or if we should wait
+                if let Ok(metadata) = fs::metadata(&self.path) {
+                    if metadata.len() < self.last_size {
+                        // File was truncated, reopen
+                        let file = File::open(&self.path)?;
+                        self.reader = BufReader::new(file);
+                        self.last_size = 0;
+                        continue;
+                    }
+                    self.last_size = metadata.len();
+                } else {
+                    // File was deleted, session ended
+                    return Ok(None);
+                }
+
+                // Wait a bit before checking again
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// Check if a process is still running
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill with signal 0 just checks if process exists
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On non-Unix, assume alive (could use platform-specific APIs)
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_create_and_list() {
+        let session = Session::create("/tmp/test-workspace").unwrap();
+        let id = session.info.id.clone();
+
+        // Should appear in list
+        let sessions = list_sessions().unwrap();
+        assert!(sessions.iter().any(|s| s.id == id));
+
+        // Should be retrievable
+        let found = get_session(&id).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().workspace, "/tmp/test-workspace");
+
+        // Drop session
+        drop(session);
+
+        // Should be cleaned up
+        let found = get_session(&id).unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_event_broadcast() {
+        let session = Session::create("/tmp/test-events").unwrap();
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Indexing".to_string(),
+        });
+
+        session.broadcast(EventKind::Progress {
+            language: "rust".to_string(),
+            title: "Loading".to_string(),
+            message: Some("crates".to_string()),
+            percentage: Some(50),
+        });
+
+        // Read events back
+        let events: Vec<_> = monitor_events(&id).unwrap().collect();
+        assert!(events.len() >= 2); // Started + our events
+
+        drop(session);
+    }
+}

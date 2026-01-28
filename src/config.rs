@@ -26,9 +26,17 @@ pub struct Config {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
 
+    /// Wait for LSP servers to be ready before executing requests (default: true)
+    #[serde(default = "default_smart_wait")]
+    pub smart_wait: bool,
+
     /// Server definitions keyed by language ID (e.g., "rust", "python")
     #[serde(default)]
     pub server: HashMap<String, ServerConfig>,
+}
+
+fn default_smart_wait() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -56,6 +64,7 @@ impl Config {
 
         // 1. Start with defaults
         builder = builder.set_default("idle_timeout", 300)?;
+        builder = builder.set_default("smart_wait", true)?;
 
         // 2. Load from user config directory (~/.config/catenary/config.toml)
         if let Some(config_dir) = dirs::config_dir() {

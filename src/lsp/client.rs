@@ -24,7 +24,7 @@ use lsp_types::{
     Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind,
+    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
     PublishDiagnosticsParams, ReferenceParams, RenameParams, SignatureHelp, SignatureHelpParams,
     TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
     TypeHierarchySupertypesParams, Uri, WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
@@ -34,20 +34,25 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, error, trace, warn};
 
 use super::protocol::{self, NotificationMessage, RequestId, RequestMessage, ResponseMessage};
+use super::state::{ProgressTracker, ServerState, ServerStatus};
+use crate::session::{EventBroadcaster, EventKind};
 
 /// Cached diagnostics for a file.
 pub type DiagnosticsCache = Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>;
 
 /// Default timeout for LSP requests.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time after spawn during which we consider the server to be "warming up".
+const WARMUP_PERIOD: Duration = Duration::from_secs(10);
 
 /// Manages communication with an LSP server process.
 pub struct LspClient {
@@ -57,13 +62,24 @@ pub struct LspClient {
     diagnostics: DiagnosticsCache,
     alive: Arc<AtomicBool>,
     encoding: PositionEncodingKind,
+    /// Progress tracking for `$/progress` notifications.
+    progress: Arc<Mutex<ProgressTracker>>,
+    /// Time when this client was spawned.
+    spawn_time: Instant,
+    /// Current server state (0=Initializing, 1=Indexing, 2=Ready, 3=Dead).
+    state: Arc<AtomicU8>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _child: Child,
 }
 
 impl LspClient {
     /// Spawns the LSP server process and starts the response reader task.
-    pub async fn spawn(program: &str, args: &[&str]) -> Result<Self> {
+    pub async fn spawn(
+        program: &str,
+        args: &[&str],
+        language: &str,
+        broadcaster: EventBroadcaster,
+    ) -> Result<Self> {
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())
@@ -80,6 +96,14 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: DiagnosticsCache = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let progress = Arc::new(Mutex::new(ProgressTracker::new()));
+        let state = Arc::new(AtomicU8::new(ServerState::Initializing.as_u8()));
+
+        // Broadcast initial state
+        broadcaster.send(EventKind::ServerState {
+            language: language.to_string(),
+            state: "Initializing".to_string(),
+        });
 
         let reader_handle = tokio::spawn(Self::reader_task(
             stdin.clone(),
@@ -87,6 +111,10 @@ impl LspClient {
             pending.clone(),
             diagnostics.clone(),
             alive.clone(),
+            progress.clone(),
+            state.clone(),
+            language.to_string(),
+            broadcaster,
         ));
 
         Ok(Self {
@@ -96,18 +124,26 @@ impl LspClient {
             diagnostics,
             alive,
             encoding: PositionEncodingKind::UTF16, // Default per spec
+            progress,
+            spawn_time: Instant::now(),
+            state,
             _reader_handle: reader_handle,
             _child: child,
         })
     }
 
     /// Background task that reads LSP messages and routes responses to pending requests.
+    #[allow(clippy::too_many_arguments)]
     async fn reader_task(
         stdin: Arc<Mutex<ChildStdin>>,
         stdout: ChildStdout,
         pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
         diagnostics: DiagnosticsCache,
         alive: Arc<AtomicBool>,
+        progress: Arc<Mutex<ProgressTracker>>,
+        state: Arc<AtomicU8>,
+        language: String,
+        broadcaster: EventBroadcaster,
     ) {
         let mut reader = BufReader::new(stdout);
         let mut buffer = BytesMut::with_capacity(8192);
@@ -178,7 +214,15 @@ impl LspClient {
                         if let Ok(notification) =
                             serde_json::from_value::<NotificationMessage>(value)
                         {
-                            Self::handle_notification(&notification, &diagnostics).await;
+                            Self::handle_notification(
+                                &notification,
+                                &diagnostics,
+                                &progress,
+                                &state,
+                                &language,
+                                &broadcaster,
+                            )
+                            .await;
                         }
                     }
                 } else if value.get("id").is_some() {
@@ -201,6 +245,7 @@ impl LspClient {
 
         // Mark server as dead
         alive.store(false, Ordering::SeqCst);
+        state.store(ServerState::Dead.as_u8(), Ordering::SeqCst);
         warn!("LSP reader task exiting - server connection lost");
     }
 
@@ -208,6 +253,10 @@ impl LspClient {
     async fn handle_notification(
         notification: &NotificationMessage,
         diagnostics: &DiagnosticsCache,
+        progress: &Arc<Mutex<ProgressTracker>>,
+        state: &Arc<AtomicU8>,
+        language: &str,
+        broadcaster: &EventBroadcaster,
     ) {
         match notification.method.as_str() {
             "textDocument/publishDiagnostics" => {
@@ -223,6 +272,41 @@ impl LspClient {
                     cache.insert(params.uri, params.diagnostics);
                 } else {
                     warn!("Failed to parse publishDiagnostics params");
+                }
+            }
+            "$/progress" => {
+                if let Ok(params) =
+                    serde_json::from_value::<ProgressParams>(notification.params.clone())
+                {
+                    let mut tracker = progress.lock().await;
+                    tracker.update(&params);
+
+                    // Update state based on progress
+                    let current_state = ServerState::from_u8(state.load(Ordering::SeqCst));
+                    if current_state != ServerState::Dead {
+                        if tracker.is_busy() {
+                            state.store(ServerState::Indexing.as_u8(), Ordering::SeqCst);
+                            if let Some(p) = tracker.primary_progress() {
+                                debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
+                                // Broadcast progress event
+                                broadcaster.send(EventKind::Progress {
+                                    language: language.to_string(),
+                                    title: p.title.clone(),
+                                    message: p.message.clone(),
+                                    percentage: p.percentage,
+                                });
+                            }
+                        } else {
+                            state.store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+                            debug!("Server ready (progress completed)");
+                            // Broadcast ready event
+                            broadcaster.send(EventKind::ProgressEnd {
+                                language: language.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    warn!("Failed to parse $/progress params");
                 }
             }
             "window/logMessage" | "window/showMessage" => {
@@ -359,6 +443,10 @@ impl LspClient {
 
         // Send initialized notification
         self.notify("initialized", InitializedParams {}).await?;
+
+        // Mark as ready (server may later report progress if indexing)
+        self.state
+            .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
 
         Ok(result)
     }
@@ -545,5 +633,56 @@ impl LspClient {
     /// Returns true if the LSP server connection is still alive.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Returns the current server state.
+    pub fn server_state(&self) -> ServerState {
+        ServerState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    /// Returns time since server spawned.
+    pub fn uptime(&self) -> Duration {
+        self.spawn_time.elapsed()
+    }
+
+    /// Returns true if server is in warmup period (recently spawned).
+    pub fn is_warming_up(&self) -> bool {
+        self.spawn_time.elapsed() < WARMUP_PERIOD
+    }
+
+    /// Returns true if server is ready to handle requests.
+    pub fn is_ready(&self) -> bool {
+        matches!(self.server_state(), ServerState::Ready) && self.is_alive()
+    }
+
+    /// Returns detailed status for this server.
+    pub async fn status(&self, language: String) -> ServerStatus {
+        let progress = self.progress.lock().await;
+        let primary = progress.primary_progress();
+
+        ServerStatus {
+            language,
+            state: self.server_state(),
+            progress_title: primary.map(|p| p.title.clone()),
+            progress_message: primary.and_then(|p| p.message.clone()),
+            progress_percentage: primary.and_then(|p| p.percentage),
+            uptime_secs: self.uptime().as_secs(),
+        }
+    }
+
+    /// Waits until server is ready (not indexing).
+    /// Returns true if ready, false if server died.
+    pub async fn wait_ready(&self) -> bool {
+        let poll_interval = Duration::from_millis(100);
+
+        loop {
+            if self.is_ready() {
+                return true;
+            }
+            if !self.is_alive() {
+                return false;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 }

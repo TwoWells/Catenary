@@ -40,8 +40,23 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::lsp::{ClientManager, LspClient};
+use crate::config::Config;
+use crate::lsp::{ClientManager, LspClient, ServerState};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
+use crate::session::{EventBroadcaster, EventKind};
+
+/// Methods that should wait for server readiness before executing.
+const METHODS_WAIT_FOR_READY: &[&str] = &[
+    "lsp_hover",
+    "lsp_definition",
+    "lsp_type_definition",
+    "lsp_implementation",
+    "lsp_references",
+    "lsp_document_symbols",
+    "lsp_code_actions",
+    "lsp_completion",
+    "lsp_diagnostics",
+];
 
 use super::{DocumentManager, DocumentNotification};
 
@@ -153,6 +168,8 @@ pub struct LspBridgeHandler {
     client_manager: Arc<ClientManager>,
     doc_manager: Arc<Mutex<DocumentManager>>,
     runtime: Handle,
+    config: Config,
+    broadcaster: EventBroadcaster,
 }
 
 impl LspBridgeHandler {
@@ -160,11 +177,15 @@ impl LspBridgeHandler {
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
+        config: Config,
+        broadcaster: EventBroadcaster,
     ) -> Self {
         Self {
             client_manager,
             doc_manager,
             runtime,
+            config,
+            broadcaster,
         }
     }
 
@@ -196,6 +217,67 @@ impl LspBridgeHandler {
         };
 
         self.client_manager.get_client(&lang_id).await
+    }
+
+    /// Waits for the server handling the given path to be ready.
+    async fn wait_for_server_ready(&self, path: &Path) -> Result<()> {
+        let client_mutex = self.get_client_for_path(path).await?;
+        let client = client_mutex.lock().await;
+
+        if !client.wait_ready().await {
+            return Err(anyhow!("LSP server died while waiting for ready state"));
+        }
+
+        Ok(())
+    }
+
+    /// Extract file path from arguments if present.
+    fn extract_file_path(arguments: &Option<serde_json::Value>) -> Option<PathBuf> {
+        arguments
+            .as_ref()
+            .and_then(|v| v.get("file"))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+    }
+
+    /// Handles the catenary_status tool.
+    fn handle_status(&self) -> Result<CallToolResult> {
+        let statuses = self
+            .runtime
+            .block_on(async { self.client_manager.all_server_status().await });
+
+        if statuses.is_empty() {
+            return Ok(CallToolResult::text("No LSP servers running"));
+        }
+
+        let mut output = Vec::new();
+        for status in statuses {
+            let state_str = match status.state {
+                ServerState::Initializing => "Initializing",
+                ServerState::Indexing => "Indexing",
+                ServerState::Ready => "Ready",
+                ServerState::Dead => "Dead",
+            };
+
+            let mut line = format!(
+                "{}: {} (uptime: {}s)",
+                status.language, state_str, status.uptime_secs
+            );
+
+            if let Some(title) = &status.progress_title {
+                line.push_str(&format!(" - {}", title));
+                if let Some(pct) = status.progress_percentage {
+                    line.push_str(&format!(" {}%", pct));
+                }
+                if let Some(msg) = &status.progress_message {
+                    line.push_str(&format!(" ({})", msg));
+                }
+            }
+
+            output.push(line);
+        }
+
+        Ok(CallToolResult::text(output.join("\n")))
     }
 
     /// Ensures a document is open and synced with the LSP server.
@@ -1079,6 +1161,15 @@ impl ToolHandler for LspBridgeHandler {
                     "required": ["file", "line", "character", "direction"]
                 }),
             },
+            Tool {
+                name: "catenary_status".to_string(),
+                description: Some("Report the status of all LSP servers (state, progress, uptime).".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
         ]
     }
 
@@ -1087,7 +1178,42 @@ impl ToolHandler for LspBridgeHandler {
         name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        match name {
+        let start = std::time::Instant::now();
+        let file = Self::extract_file_path(&arguments).map(|p| p.to_string_lossy().to_string());
+
+        // Broadcast tool call
+        self.broadcaster.send(EventKind::ToolCall {
+            tool: name.to_string(),
+            file: file.clone(),
+        });
+
+        // Helper to broadcast result
+        let broadcast_result = |success: bool| {
+            self.broadcaster.send(EventKind::ToolResult {
+                tool: name.to_string(),
+                success,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+
+        // Handle status tool separately (no file path)
+        if name == "catenary_status" {
+            let result = self.handle_status();
+            broadcast_result(result.is_ok());
+            return result;
+        }
+
+        // Smart wait for methods that need a ready server
+        if self.config.smart_wait
+            && METHODS_WAIT_FOR_READY.contains(&name)
+            && let Some(ref path) = Self::extract_file_path(&arguments)
+            && let Err(e) = self.runtime.block_on(self.wait_for_server_ready(path))
+        {
+            broadcast_result(false);
+            return Err(e);
+        }
+
+        let result = match name {
             "lsp_hover" => self.handle_hover(arguments),
             "lsp_definition" => self.handle_definition(arguments),
             "lsp_type_definition" => self.handle_type_definition(arguments),
@@ -1105,7 +1231,14 @@ impl ToolHandler for LspBridgeHandler {
             "lsp_call_hierarchy" => self.handle_call_hierarchy(arguments),
             "lsp_type_hierarchy" => self.handle_type_hierarchy(arguments),
             _ => Err(anyhow!("Unknown tool: {}", name)),
+        };
+
+        match &result {
+            Ok(res) => broadcast_result(res.is_error.is_none()),
+            Err(_) => broadcast_result(false),
         }
+
+        result
     }
 }
 
