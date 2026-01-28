@@ -36,17 +36,22 @@ use mcp::McpServer;
 #[command(about = "Multiplexing bridge between MCP and multiple LSP servers")]
 struct Args {
     /// LSP servers to spawn in "lang:command" format (e.g., "rust:rust-analyzer")
-    /// Can be specified multiple times.
-    #[arg(short, long = "lsp", required = true)]
+    /// Can be specified multiple times. These override/append to the config file.
+    #[arg(short, long = "lsp")]
     lsps: Vec<String>,
+
+    /// Path to configuration file
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Workspace root directory
     #[arg(short, long, default_value = ".")]
     root: PathBuf,
 
     /// Document idle timeout in seconds before auto-close (0 to disable)
-    #[arg(long, default_value = "300")]
-    idle_timeout: u64,
+    /// Overrides config file if set (default in config is 300)
+    #[arg(long)]
+    idle_timeout: Option<u64>,
 }
 
 #[tokio::main]
@@ -58,37 +63,55 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let root = args.root.canonicalize()?;
-    info!("Starting catenary multiplexing bridge");
-    info!("Workspace root: {}", root.display());
-    info!("Document idle timeout: {}s", args.idle_timeout);
+    // Load configuration
+    let mut config = catenary_mcp::config::Config::load(args.config.clone())?;
 
-    let mut clients = std::collections::HashMap::new();
+    // Override idle_timeout if provided on CLI
+    if let Some(timeout) = args.idle_timeout {
+        config.idle_timeout = timeout;
+    }
 
+    // Merge CLI LSPs into config
     for lsp_spec in args.lsps {
-        let (lang, command) = lsp_spec
+        let (lang, command_str) = lsp_spec
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("Invalid LSP spec: {}. Expected 'lang:command'", lsp_spec))?;
 
         let lang = lang.trim().to_string();
-        let command = command.trim();
+        let command_str = command_str.trim();
 
         // Parse command into program and arguments
-        let mut parts = command.split_whitespace();
-        let program = parts.next().expect("command cannot be empty");
-        let cmd_args: Vec<&str> = parts.collect();
+        let mut parts = command_str.split_whitespace();
+        let program = parts.next().expect("command cannot be empty").to_string();
+        let cmd_args: Vec<String> = parts.map(|s| s.to_string()).collect();
 
-        info!("Spawning LSP server for {}: {}", lang, command);
+        config.server.insert(lang, catenary_mcp::config::ServerConfig {
+            command: program,
+            args: cmd_args,
+            initialization_options: None,
+        });
+    }
+
+    let root = args.root.canonicalize()?;
+    info!("Starting catenary multiplexing bridge");
+    info!("Workspace root: {}", root.display());
+    info!("Document idle timeout: {}s", config.idle_timeout);
+
+    let mut clients = std::collections::HashMap::new();
+
+    for (lang, server_config) in config.server {
+        info!("Spawning LSP server for {}: {} {}", lang, server_config.command, server_config.args.join(" "));
 
         // Spawn LSP client
-        let mut client = lsp::LspClient::spawn(program, &cmd_args).await?;
+        // TODO: Pass initialization_options when LspClient supports it
+        let mut client = lsp::LspClient::spawn(&server_config.command, &server_config.args.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await?;
         client.initialize(&root).await?;
 
         clients.insert(lang, Arc::new(Mutex::new(client)));
     }
 
     if clients.is_empty() {
-        return Err(anyhow::anyhow!("No LSP servers configured"));
+        return Err(anyhow::anyhow!("No LSP servers configured. Use --lsp or config file."));
     }
 
     info!("{} LSP server(s) initialized", clients.len());
@@ -98,10 +121,10 @@ async fn main() -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
 
     // Start document cleanup task if timeout is enabled
-    let cleanup_handle = if args.idle_timeout > 0 {
+    let cleanup_handle = if config.idle_timeout > 0 {
         let clients_clone = clients.clone();
         let doc_manager_clone = doc_manager.clone();
-        let idle_timeout = args.idle_timeout;
+        let idle_timeout = config.idle_timeout;
 
         Some(tokio::spawn(async move {
             document_cleanup_task(clients_clone, doc_manager_clone, idle_timeout).await;
@@ -121,6 +144,7 @@ async fn main() -> Result<()> {
     // Stop cleanup task
     if let Some(handle) = cleanup_handle {
         handle.abort();
+        let _ = handle.await;
     }
 
     // Shutdown LSP clients

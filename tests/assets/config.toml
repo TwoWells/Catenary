@@ -1,0 +1,5 @@
+idle_timeout = 60
+
+[server.shellscript]
+command = "bash-language-server"
+args = ["start"]
