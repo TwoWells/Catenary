@@ -77,6 +77,7 @@ Catenary reads from `~/.config/catenary/config.toml`. Example:
 
 ```toml
 idle_timeout = 300
+smart_wait = true # Wait for server readiness before handling requests
 
 [server.rust]
 command = "rust-analyzer"
@@ -118,6 +119,19 @@ Once installed, Claude Code gains access to these LSP-powered tools:
 | `lsp_formatting` | Format code |
 | `lsp_call_hierarchy` | Get incoming/outgoing calls |
 | `lsp_type_hierarchy` | Get supertypes/subtypes |
+| `catenary_status` | Report status of all LSP servers |
+
+## Observability
+
+Catenary includes built-in monitoring tools to debug LSP interactions.
+
+```bash
+# List active sessions
+catenary list
+
+# Monitor a session in real-time (shows MCP messages and tool calls)
+catenary monitor <session_id>
+```
 
 ## More Information
 

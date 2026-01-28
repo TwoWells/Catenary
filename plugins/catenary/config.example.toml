@@ -4,11 +4,11 @@
 # Catenary uses lazy loading - servers only start when you open a file
 # of that language, so feel free to add many servers without overhead.
 
+# Global configuration
 idle_timeout = 300  # Seconds before closing idle documents (0 to disable)
+smart_wait = true   # Wait for server to be ready before handling requests (default: true)
 
-# ─────────────────────────────────────────────────────────────────────
-# Language Servers
-# ─────────────────────────────────────────────────────────────────────
+# Language Server Configuration
 # Format:
 #   [server.<language-id>]
 #   command = "server-binary"
