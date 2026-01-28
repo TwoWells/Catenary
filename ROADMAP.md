@@ -61,6 +61,8 @@ Refactor `LspBridgeHandler` to use a dynamic `ClientManager` instead of a static
 - [x] Update `document_cleanup_task` to communicate with `ClientManager`.
 - [x] Implement server shutdown logic when no documents are open for that language.
 
-### Phase 4: Release
+### Phase 4: Cleanup & Optimization
+- [ ] Pass `initializationOptions` from config to LSP server (`src/lsp/manager.rs`).
+- [ ] Support `DocumentChange` operations (create/rename/delete) in `apply_workspace_edit` (`src/bridge/handler.rs`).
 - [ ] Update documentation.
 - [ ] Final integration tests (verifying lazy spawn behavior).
