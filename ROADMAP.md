@@ -48,9 +48,9 @@ Refactor `LspBridgeHandler` to use a dynamic `ClientManager` instead of a static
 ## 📝 Implementation Plan
 
 ### Phase 1: Configuration Logic
-- [ ] Add `config` and `dirs` dependencies.
-- [ ] Define `Config` struct (using `serde`).
-- [ ] Implement config loading from `XDG_CONFIG_HOME` or `--config` flag.
+- [x] Add `config` and `dirs` dependencies.
+- [x] Define `Config` struct (using `serde`).
+- [x] Implement config loading from `XDG_CONFIG_HOME` or `--config` flag.
 
 ### Phase 2: Lazy Architecture
 - [ ] Create `ClientManager` struct.
