@@ -32,3 +32,4 @@ url = "2.5.8"
 [dev-dependencies]
 tempfile = "3"
 cargo-husky = { version = "1", default-features = false, features = ["run-cargo-test", "run-cargo-clippy", "run-cargo-fmt"] }
+toml = "0.9.11"

@@ -1,0 +1,28 @@
+//! Ensures that the Cargo.toml version matches the Claude Plugin version.
+//! This runs as part of `cargo test`, which is triggered by cargo-husky on push.
+
+#[test]
+fn test_version_sync() {
+    // 1. Get Cargo version
+    let cargo_toml = std::fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
+    let cargo_table: toml::Table = cargo_toml.parse().expect("Failed to parse Cargo.toml");
+    let cargo_version = cargo_table["package"]["version"]
+        .as_str()
+        .expect("Failed to get version from Cargo.toml");
+
+    // 2. Get Plugin version
+    let plugin_json = std::fs::read_to_string(".claude-plugin/marketplace.json")
+        .expect("Failed to read marketplace.json");
+    let plugin_data: serde_json::Value =
+        serde_json::from_str(&plugin_json).expect("Failed to parse marketplace.json");
+    let plugin_version = plugin_data["plugins"][0]["version"]
+        .as_str()
+        .expect("Failed to get version from marketplace.json");
+
+    // 3. Compare
+    assert_eq!(
+        cargo_version, plugin_version,
+        "Version mismatch! Cargo.toml: {}, marketplace.json: {}",
+        cargo_version, plugin_version
+    );
+}
