@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+# Pre-commit hook with minimal output to reduce context bloat for AI agents
+# Errors are still shown, but info/debug logging is suppressed
+#
+
+set -e
+
+echo 'Running pre-commit checks...'
+
+# Run lib tests only (fast, no spawned processes with logging)
+# Full integration tests run in CI
+cargo test --lib --quiet
+
+# Run clippy quietly (only shows warnings/errors)
+cargo clippy --quiet -- -D warnings
+
+# Check formatting (only shows diff if there are issues)
+cargo fmt -- --check
+
+echo 'Pre-commit checks passed.'
