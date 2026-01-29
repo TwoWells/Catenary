@@ -349,17 +349,21 @@ impl LspBridgeHandler {
             .map_err(|e| anyhow!("Invalid arguments: {}", e))
     }
 
-    fn validate_absolute_path(&self, file: &str) -> Result<PathBuf> {
+    /// Resolves a file path, converting relative paths to absolute using the current working directory.
+    fn resolve_path(&self, file: &str) -> Result<PathBuf> {
         let path = PathBuf::from(file);
-        if !path.is_absolute() {
-            return Err(anyhow!("File path must be absolute: {}", file));
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            let cwd = std::env::current_dir()
+                .map_err(|e| anyhow!("Failed to get current working directory: {}", e))?;
+            Ok(cwd.join(path))
         }
-        Ok(path)
     }
 
     fn handle_hover(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input = self.parse_position_input(arguments)?;
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Hover request: {}:{}:{}",
@@ -390,7 +394,7 @@ impl LspBridgeHandler {
 
     fn handle_definition(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input = self.parse_position_input(arguments)?;
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Definition request: {}:{}:{}",
@@ -425,7 +429,7 @@ impl LspBridgeHandler {
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let input = self.parse_position_input(arguments)?;
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Type definition request: {}:{}:{}",
@@ -460,7 +464,7 @@ impl LspBridgeHandler {
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let input = self.parse_position_input(arguments)?;
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Implementation request: {}:{}:{}",
@@ -495,7 +499,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "References request: {}:{}:{}",
@@ -538,7 +542,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!("Document symbols request: {}", input.file);
 
@@ -616,7 +620,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Code actions request: {} [{},{}]-[{},{}]",
@@ -670,7 +674,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Rename request: {}:{}:{} -> {} (dry_run: {})",
@@ -724,7 +728,7 @@ impl LspBridgeHandler {
 
     fn handle_completion(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input = self.parse_position_input(arguments)?;
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Completion request: {}:{}:{}",
@@ -760,7 +764,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!("Diagnostics request: {}", input.file);
 
@@ -783,7 +787,7 @@ impl LspBridgeHandler {
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let input = self.parse_position_input(arguments)?;
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Signature help request: {}:{}:{}",
@@ -818,7 +822,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!("Formatting request: {}", input.file);
 
@@ -851,7 +855,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Range formatting request: {} [{},{}]-[{},{}]",
@@ -901,7 +905,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Call hierarchy request: {}:{}:{} direction={}",
@@ -974,7 +978,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Type hierarchy request: {}:{}:{} direction={}",
@@ -1046,7 +1050,7 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.validate_absolute_path(&input.file)?;
+        let path = self.resolve_path(&input.file)?;
 
         debug!(
             "Apply quickfix request: {}:{}:{} filter={:?}",
@@ -1179,7 +1183,7 @@ impl LspBridgeHandler {
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
         let root_path = if let Some(p) = &input.path {
-            self.validate_absolute_path(p)?
+            self.resolve_path(p)?
         } else {
             std::env::current_dir()?
         };

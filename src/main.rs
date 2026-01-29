@@ -131,11 +131,13 @@ async fn run_server(args: Args) -> Result<()> {
     let root = args.root.canonicalize()?;
 
     // Create session for observability
-    let session = Session::create(root.to_string_lossy().as_ref())?;
-    let broadcaster = session.broadcaster();
+    let session = Arc::new(std::sync::Mutex::new(Session::create(
+        root.to_string_lossy().as_ref(),
+    )?));
+    let broadcaster = session.lock().unwrap().broadcaster();
 
     info!("Starting catenary multiplexing bridge");
-    info!("Session ID: {}", session.info.id);
+    info!("Session ID: {}", session.lock().unwrap().info.id);
     info!("Workspace root: {}", root.display());
     info!("Document idle timeout: {}s", config.idle_timeout);
 
@@ -170,7 +172,14 @@ async fn run_server(args: Args) -> Result<()> {
     );
 
     // Run MCP server (blocking - reads from stdin)
-    let mut mcp_server = McpServer::new(handler, broadcaster);
+    let session_for_callback = session.clone();
+    let mut mcp_server = McpServer::new(handler, broadcaster).on_client_info(Box::new(
+        move |name: &str, version: &str| {
+            if let Ok(mut session) = session_for_callback.lock() {
+                session.set_client_info(name, version);
+            }
+        },
+    ));
 
     // Run in a blocking task since MCP server uses synchronous I/O
     let mcp_task = tokio::task::spawn_blocking(move || mcp_server.run());

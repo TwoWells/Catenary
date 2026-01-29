@@ -35,10 +35,14 @@ pub trait ToolHandler: Send + Sync {
 }
 
 /// MCP server that communicates over stdin/stdout.
+/// Callback invoked when MCP client info is received during initialize.
+pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
+
 pub struct McpServer<H: ToolHandler> {
     handler: H,
     initialized: bool,
     broadcaster: EventBroadcaster,
+    on_client_info: Option<ClientInfoCallback>,
 }
 
 impl<H: ToolHandler> McpServer<H> {
@@ -47,7 +51,14 @@ impl<H: ToolHandler> McpServer<H> {
             handler,
             initialized: false,
             broadcaster,
+            on_client_info: None,
         }
+    }
+
+    /// Set a callback to be invoked when client info is received.
+    pub fn on_client_info(mut self, callback: ClientInfoCallback) -> Self {
+        self.on_client_info = Some(callback);
+        self
     }
 
     /// Runs the MCP server, reading from stdin and writing to stdout.
@@ -187,12 +198,16 @@ impl<H: ToolHandler> McpServer<H> {
             .context("Invalid initialize params")?
             .ok_or_else(|| anyhow!("Missing initialize params"))?;
 
-        info!(
-            "MCP client connecting: {} v{}",
-            params.client_info.name,
-            params.client_info.version.as_deref().unwrap_or("unknown")
-        );
+        let client_name = &params.client_info.name;
+        let client_version = params.client_info.version.as_deref().unwrap_or("unknown");
+
+        info!("MCP client connecting: {} v{}", client_name, client_version);
         info!("Protocol version: {}", params.protocol_version);
+
+        // Notify callback of client info
+        if let Some(ref callback) = self.on_client_info {
+            callback(client_name, client_version);
+        }
 
         let result = InitializeResult {
             protocol_version: "2024-11-05".to_string(),
