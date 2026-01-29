@@ -289,6 +289,7 @@ edition = "2021"
     .unwrap();
 
     client.initialize(dir.path()).await.unwrap();
+    client.wait_ready().await;
 
     let uri: lsp_types::Uri = format!("file://{}", main_rs.display()).parse().unwrap();
     client

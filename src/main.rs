@@ -173,7 +173,18 @@ async fn run_server(args: Args) -> Result<()> {
     let mut mcp_server = McpServer::new(handler, broadcaster);
 
     // Run in a blocking task since MCP server uses synchronous I/O
-    let mcp_result = tokio::task::spawn_blocking(move || mcp_server.run()).await?;
+    let mcp_task = tokio::task::spawn_blocking(move || mcp_server.run());
+
+    // Wait for either the MCP task to finish or a termination signal
+    let mcp_result = tokio::select! {
+        res = mcp_task => {
+            res?
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received shutdown signal");
+            Ok(())
+        }
+    };
 
     // Stop cleanup task
     if let Some(handle) = cleanup_handle {
@@ -181,7 +192,7 @@ async fn run_server(args: Args) -> Result<()> {
         let _ = handle.await;
     }
 
-    // Shutdown LSP clients
+    // Shutdown LSP clients gracefully
     info!("Shutting down LSP servers");
     client_manager.shutdown_all().await;
 

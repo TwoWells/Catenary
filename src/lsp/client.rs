@@ -728,3 +728,11 @@ impl LspClient {
         }
     }
 }
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        // We can't await a graceful LSP shutdown here because drop is sync.
+        // But we MUST ensure the child process doesn't become a zombie.
+        let _ = self._child.start_kill();
+    }
+}

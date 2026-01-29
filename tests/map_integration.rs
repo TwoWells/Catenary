@@ -8,8 +8,8 @@ use std::time::Duration;
 /// Helper to spawn the bridge
 struct BridgeProcess {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: Option<BufReader<std::process::ChildStdout>>,
 }
 
 impl BridgeProcess {
@@ -37,20 +37,22 @@ impl BridgeProcess {
 
         Self {
             child,
-            stdin,
-            stdout,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
         }
     }
 
     fn send(&mut self, request: &serde_json::Value) {
         let json = serde_json::to_string(request).unwrap();
-        writeln!(self.stdin, "{}", json).expect("Failed to write to stdin");
-        self.stdin.flush().expect("Failed to flush stdin");
+        let stdin = self.stdin.as_mut().expect("Stdin already closed");
+        writeln!(stdin, "{}", json).expect("Failed to write to stdin");
+        stdin.flush().expect("Failed to flush stdin");
     }
 
     fn recv(&mut self) -> serde_json::Value {
         let mut line = String::new();
-        self.stdout
+        let stdout = self.stdout.as_mut().expect("Stdout already closed");
+        stdout
             .read_line(&mut line)
             .expect("Failed to read from stdout");
         serde_json::from_str(&line).expect("Failed to parse JSON response")
@@ -74,7 +76,11 @@ impl BridgeProcess {
 
 impl Drop for BridgeProcess {
     fn drop(&mut self) {
+        // Closing stdin signals the server to shut down gracefully
+        self.stdin.take();
+        // The LspClient Drop will handle killing child processes if Catenary exits abruptly
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
