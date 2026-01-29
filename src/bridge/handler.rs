@@ -1193,7 +1193,7 @@ impl LspBridgeHandler {
         let walker = WalkBuilder::new(&root_path)
             .max_depth(Some(input.max_depth))
             .git_ignore(true)
-            .hidden(false)
+            .hidden(true)
             .build();
 
         struct MapEntry {
@@ -1259,9 +1259,9 @@ impl LspBridgeHandler {
                                 partial_result_params: Default::default(),
                             });
 
-                            // 200ms timeout per file to keep map generation snappy
+                            // 1s timeout per file to keep map generation snappy but reliable
                             if let Ok(Ok(Some(response))) = tokio::time::timeout(
-                                std::time::Duration::from_millis(200),
+                                std::time::Duration::from_secs(1),
                                 symbols_future,
                             )
                             .await
@@ -1628,6 +1628,9 @@ fn is_high_level_symbol(kind: lsp_types::SymbolKind) -> bool {
             | SymbolKind::FUNCTION
             | SymbolKind::STRUCT
             | SymbolKind::EVENT
+            | SymbolKind::STRING
+            | SymbolKind::CONSTANT
+            | SymbolKind::KEY
     )
 }
 
