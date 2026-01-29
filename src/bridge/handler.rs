@@ -61,6 +61,23 @@ const METHODS_WAIT_FOR_READY: &[&str] = &[
 
 use super::{DocumentManager, DocumentNotification};
 
+/// Controls how much symbol detail to include in output.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DetailLevel {
+    /// Only structural symbols: modules, classes, structs, interfaces, enums
+    #[default]
+    Outline,
+    /// Outline + functions, methods, constructors
+    Signatures,
+    /// Everything including variables, constants, fields
+    Full,
+}
+
+fn default_detail_level() -> DetailLevel {
+    DetailLevel::Outline
+}
+
 /// Input for tools that need file + position.
 #[derive(Debug, Deserialize)]
 pub struct PositionInput {
@@ -188,6 +205,9 @@ pub struct CodebaseMapInput {
     /// Max lines of output before truncation (default: 2000)
     #[serde(default = "default_budget")]
     pub budget: usize,
+    /// Symbol detail level: outline, signatures, or full (default: outline)
+    #[serde(default = "default_detail_level")]
+    pub detail_level: DetailLevel,
 }
 
 fn default_depth() -> usize {
@@ -1235,6 +1255,7 @@ impl LspBridgeHandler {
         // 2. Fetch Symbols (Async Phase)
         if input.include_symbols {
             let entries_len = entries.len();
+            let detail_level = input.detail_level;
             debug!("Fetching symbols for {} files", entries_len);
 
             self.runtime.block_on(async {
@@ -1270,7 +1291,8 @@ impl LspBridgeHandler {
                             )
                             .await
                             {
-                                entry.symbols = Some(format_compact_symbols(&response));
+                                entry.symbols =
+                                    Some(format_compact_symbols(&response, detail_level));
                             }
                         }
                     }
@@ -1503,14 +1525,19 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "catenary_codebase_map".to_string(),
-                description: Some("Generate a high-level file tree of the project, optionally including top-level symbols (functions, classes) from LSP.".to_string()),
+                description: Some("Generate a high-level file tree of the project, optionally including symbols from LSP.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Subdirectory to map (default: project root)" },
                         "max_depth": { "type": "integer", "description": "Max depth for traversal (default: 5)" },
                         "include_symbols": { "type": "boolean", "description": "Ask LSP for symbols in files (default: false)" },
-                        "budget": { "type": "integer", "description": "Max lines of output (default: 2000)" }
+                        "budget": { "type": "integer", "description": "Max lines of output (default: 2000)" },
+                        "detail_level": {
+                            "type": "string",
+                            "enum": ["outline", "signatures", "full"],
+                            "description": "Symbol detail: outline (classes/structs only), signatures (+functions/methods), full (everything). Default: outline"
+                        }
                     },
                     "required": []
                 }),
@@ -1591,23 +1618,20 @@ impl ToolHandler for LspBridgeHandler {
 
 // ... (existing schema helpers)
 
-fn format_compact_symbols(response: &DocumentSymbolResponse) -> String {
+fn format_compact_symbols(response: &DocumentSymbolResponse, level: DetailLevel) -> String {
     let mut result = Vec::new();
     match response {
         DocumentSymbolResponse::Flat(symbols) => {
             for sym in symbols {
-                // Only show top-level types (Classes, Functions, Structs, Interfaces, Modules)
-                if is_high_level_symbol(sym.kind) {
+                if matches_detail_level(sym.kind, level) {
                     result.push(format!("{} {:?}", sym.name, sym.kind));
                 }
             }
         }
         DocumentSymbolResponse::Nested(symbols) => {
             for sym in symbols {
-                if is_high_level_symbol(sym.kind) {
+                if matches_detail_level(sym.kind, level) {
                     result.push(format!("{} {:?}", sym.name, sym.kind));
-                    // Optional: Recurse one level deeper?
-                    // For now, flat top-level is safest for budget.
                 }
             }
         }
@@ -1615,34 +1639,39 @@ fn format_compact_symbols(response: &DocumentSymbolResponse) -> String {
     result.join("\n")
 }
 
-fn is_high_level_symbol(kind: lsp_types::SymbolKind) -> bool {
+fn matches_detail_level(kind: lsp_types::SymbolKind, level: DetailLevel) -> bool {
     use lsp_types::SymbolKind;
-    matches!(
+
+    // Outline: structural types + document structure (STRING for markdown headings, KEY for YAML/JSON)
+    let is_outline = matches!(
         kind,
         SymbolKind::FILE
             | SymbolKind::MODULE
             | SymbolKind::NAMESPACE
             | SymbolKind::PACKAGE
             | SymbolKind::CLASS
-            | SymbolKind::METHOD
-            | SymbolKind::PROPERTY
-            | SymbolKind::FIELD
-            | SymbolKind::CONSTRUCTOR
-            | SymbolKind::ENUM
             | SymbolKind::INTERFACE
-            | SymbolKind::FUNCTION
-            | SymbolKind::VARIABLE
-            | SymbolKind::CONSTANT
-            | SymbolKind::STRING
-            | SymbolKind::NUMBER
-            | SymbolKind::BOOLEAN
-            | SymbolKind::ARRAY
-            | SymbolKind::OBJECT
-            | SymbolKind::KEY
+            | SymbolKind::ENUM
             | SymbolKind::STRUCT
+            | SymbolKind::STRING
+            | SymbolKind::KEY
+    );
+
+    // Signatures: outline + callable members
+    let is_signature = matches!(
+        kind,
+        SymbolKind::FUNCTION
+            | SymbolKind::METHOD
+            | SymbolKind::CONSTRUCTOR
+            | SymbolKind::PROPERTY
             | SymbolKind::EVENT
-            | SymbolKind::ENUM_MEMBER
-    )
+    );
+
+    match level {
+        DetailLevel::Outline => is_outline,
+        DetailLevel::Signatures => is_outline || is_signature,
+        DetailLevel::Full => true,
+    }
 }
 
 // Schema helpers
