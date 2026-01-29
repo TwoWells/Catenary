@@ -330,50 +330,57 @@ impl LspClient {
         method: &str,
         params: P,
     ) -> Result<R> {
-        let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let params_value = serde_json::to_value(params)?;
 
-        let request = RequestMessage {
-            jsonrpc: "2.0".to_string(),
-            id: id.clone(),
-            method: method.to_string(),
-            params: serde_json::to_value(params)?,
-        };
+        // Retry loop for ContentModified errors
+        for i in 0..3 {
+            let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
 
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(id.clone(), tx);
-        }
+            let request = RequestMessage {
+                jsonrpc: "2.0".to_string(),
+                id: id.clone(),
+                method: method.to_string(),
+                params: params_value.clone(),
+            };
 
-        self.send_message(&request).await?;
-
-        // Wait for response with timeout
-        let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => {
-                // Channel closed - server died
-                return Err(anyhow!("LSP server closed connection"));
-            }
-            Err(_) => {
-                // Timeout - clean up pending request
+            let (tx, rx) = oneshot::channel();
+            {
                 let mut pending = self.pending.lock().await;
-                pending.remove(&id);
-                return Err(anyhow!(
-                    "LSP request '{}' timed out after {:?}",
-                    method,
-                    REQUEST_TIMEOUT
-                ));
+                pending.insert(id.clone(), tx);
             }
-        };
 
-        if let Some(error) = response.error {
-            return Err(anyhow!("LSP error {}: {}", error.code, error.message));
+            self.send_message(&request).await?;
+
+            // Wait for response with timeout
+            let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => return Err(anyhow!("LSP server closed connection")),
+                Err(_) => {
+                    let mut pending = self.pending.lock().await;
+                    pending.remove(&id);
+                    return Err(anyhow!("LSP request '{}' timed out", method));
+                }
+            };
+
+            if let Some(error) = response.error {
+                // Check for ContentModified (-32801) or RequestCancelled (-32800)
+                if error.code == -32801 || error.code == -32800 {
+                    debug!(
+                        "LSP request '{}' cancelled/modified, retrying ({}/3)...",
+                        method,
+                        i + 1
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * (i + 1) as u64)).await;
+                    continue;
+                }
+                return Err(anyhow!("LSP error {}: {}", error.code, error.message));
+            }
+
+            let result = response.result.unwrap_or(serde_json::Value::Null);
+            return serde_json::from_value(result).context("Failed to parse LSP response");
         }
 
-        // Handle null/missing result - use JSON null as default
-        let result = response.result.unwrap_or(serde_json::Value::Null);
-
-        serde_json::from_value(result).context("Failed to parse LSP response")
+        Err(anyhow!("LSP request '{}' failed after retries", method))
     }
 
     /// Sends a notification (no response expected).
@@ -416,6 +423,33 @@ impl LspClient {
                         PositionEncodingKind::UTF8,
                         PositionEncodingKind::UTF16,
                     ]),
+                    ..Default::default()
+                }),
+                text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                    code_action: Some(lsp_types::CodeActionClientCapabilities {
+                        code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
+                            code_action_kind: lsp_types::CodeActionKindLiteralSupport {
+                                value_set: vec![
+                                    "quickfix".to_string(),
+                                    "refactor".to_string(),
+                                    "refactor.extract".to_string(),
+                                    "refactor.inline".to_string(),
+                                    "refactor.rewrite".to_string(),
+                                    "source".to_string(),
+                                    "source.organizeImports".to_string(),
+                                ],
+                            },
+                        }),
+                        data_support: Some(true),
+                        resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
+                            properties: vec!["edit".to_string()],
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                workspace: Some(lsp_types::WorkspaceClientCapabilities {
+                    workspace_folders: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -538,6 +572,14 @@ impl LspClient {
         params: CodeActionParams,
     ) -> Result<Option<CodeActionResponse>> {
         self.request("textDocument/codeAction", params).await
+    }
+
+    /// Resolves a code action (e.g. fills in the 'edit' property).
+    pub async fn resolve_code_action(
+        &self,
+        code_action: lsp_types::CodeAction,
+    ) -> Result<lsp_types::CodeAction> {
+        self.request("codeAction/resolve", code_action).await
     }
 
     /// Computes a rename operation across the workspace.

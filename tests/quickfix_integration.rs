@@ -1,4 +1,4 @@
-//! Integration tests for codebase map tool.
+//! Integration tests for auto-fix functionality.
 
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
@@ -15,9 +15,8 @@ struct BridgeProcess {
 impl BridgeProcess {
     fn spawn(root: &str) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        // Enable bash LSP for symbol testing
-        cmd.arg("--lsp")
-            .arg("shellscript:bash-language-server start");
+        // Enable rust-analyzer
+        cmd.arg("--lsp").arg("rust:rust-analyzer");
         cmd.arg("--root").arg(root);
 
         cmd.stdin(Stdio::piped())
@@ -75,46 +74,10 @@ impl Drop for BridgeProcess {
 }
 
 #[test]
-fn test_codebase_map_basic() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("file1.txt"), "content").unwrap();
-    std::fs::create_dir(temp.path().join("subdir")).unwrap();
-    std::fs::write(temp.path().join("subdir/file2.rs"), "fn main() {}").unwrap();
-
-    let mut bridge = BridgeProcess::spawn(temp.path().to_str().unwrap());
-    bridge.initialize();
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "catenary_codebase_map",
-            "arguments": {
-                "path": temp.path().to_str().unwrap(),
-                "max_depth": 5,
-                "include_symbols": false
-            }
-        }
-    }));
-
-    let response = bridge.recv();
-    let result = &response["result"];
-    assert!(result["isError"].is_null() || result["isError"] == false);
-
-    let content = result["content"][0]["text"].as_str().unwrap();
-    println!("Map Output:\n{}", content);
-
-    assert!(content.contains("file1.txt"));
-    assert!(content.contains("subdir/"));
-    assert!(content.contains("file2.rs"));
-}
-
-#[test]
-fn test_codebase_map_with_symbols() {
-    // Requires bash-language-server
-    if Command::new("which")
-        .arg("bash-language-server")
+fn test_quickfix_rust_unused() {
+    // Requires rust-analyzer
+    if Command::new("rust-analyzer")
+        .arg("--version")
         .output()
         .is_err()
     {
@@ -122,38 +85,85 @@ fn test_codebase_map_with_symbols() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let script = temp.path().join("script.sh");
-    std::fs::write(&script, "#!/bin/bash\nfunction my_func() { echo hi; }\n").unwrap();
+    // Create Cargo.toml
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        r#"[package]
+name = "test-quickfix"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    std::fs::create_dir(temp.path().join("src")).unwrap();
+    let main_rs = temp.path().join("src/main.rs");
+
+    // Unused variable 'x'
+    let content = "fn main() {\n    let x = 1;\n}\n";
+    std::fs::write(&main_rs, content).unwrap();
 
     let mut bridge = BridgeProcess::spawn(temp.path().to_str().unwrap());
     bridge.initialize();
 
-    // Give LSP time to wake up if lazy
-    std::thread::sleep(Duration::from_millis(500));
+    // Give LSP time to index and lint (Rust Analyzer takes a bit)
+    let mut found_diagnostic = false;
+    for _ in 0..20 {
+        // 10 seconds
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 999,
+            "method": "tools/call",
+            "params": {
+                "name": "lsp_diagnostics",
+                "arguments": {
+                    "file": main_rs.to_str().unwrap()
+                }
+            }
+        }));
+        let response = bridge.recv();
+        if let Some(content) = response["result"]["content"][0]["text"].as_str() {
+            println!("Diagnostics: {}", content);
+            if content.contains("unused") || content.contains("x") {
+                found_diagnostic = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
+    assert!(found_diagnostic, "Expected unused variable warning");
+
+    // Request quickfix at line 1 ("let x = 1;"), char 8 (on "x")
     bridge.send(&json!({
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "catenary_codebase_map",
+            "name": "catenary_apply_quickfix",
             "arguments": {
-                "path": temp.path().to_str().unwrap(),
-                "include_symbols": true
+                "file": main_rs.to_str().unwrap(),
+                "line": 1,
+                "character": 8
             }
         }
     }));
 
     let response = bridge.recv();
+    println!("Response: {:?}", response);
     let result = &response["result"];
-    let content = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Tool call failed"
+    );
 
-    println!("Map with Symbols Output:\n{}", content);
+    // Verify file content changed
+    let new_content = std::fs::read_to_string(&main_rs).unwrap();
+    println!("New Content:\n{}", new_content);
 
-    assert!(content.contains("script.sh"));
-    // Bash LSP should report 'my_func' as a Function
-    // Note: Depends on bash-language-server version/capabilities, but typically yes.
-    if !content.contains("my_func") {
-        println!("WARNING: Symbols not found. Check if bash-language-server is running correctly.");
-    }
+    // Expect _x or removal
+    assert!(
+        new_content.contains("_x") || !new_content.contains("let x"),
+        "Fix was not applied (expected _x or removal)"
+    );
 }

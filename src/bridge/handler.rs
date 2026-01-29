@@ -1059,15 +1059,15 @@ impl LspBridgeHandler {
 
             // 1. Get diagnostics to find the relevant range and context
             let diagnostics = client.get_diagnostics(&uri).await;
-            
+
             // Find diagnostic at cursor
             let cursor_line = input.line;
             let cursor_char = input.character;
-            
+
             let target_diagnostic = diagnostics.iter().find(|d| {
                 let start = d.range.start;
                 let end = d.range.end;
-                
+
                 // Check if cursor is within range (inclusive of start, exclusive of end usually, but let's be loose)
                 if cursor_line < start.line || cursor_line > end.line {
                     return false;
@@ -1128,7 +1128,7 @@ impl LspBridgeHandler {
                     },
                     _ => false,
                 });
-                
+
                 if let Some(qf) = quickfix {
                     Some(qf.clone())
                 } else {
@@ -1147,17 +1147,22 @@ impl LspBridgeHandler {
                     // But some are just "executeCommand".
                     Err(anyhow!("Selected action is a Command ('{}'), which is not yet supported for auto-apply. Only WorkspaceEdit actions are supported.", cmd.title))
                 }
-                CodeActionOrCommand::CodeAction(ca) => {
+                CodeActionOrCommand::CodeAction(mut ca) => {
+                    // Resolve if edit is missing (lazy resolution)
+                    if ca.edit.is_none() {
+                        debug!("Resolving code action: {}", ca.title);
+                        ca = client.resolve_code_action(ca).await?;
+                    }
+
                     if let Some(edit) = ca.edit {
                         let encoding = client.encoding();
                         // Drop client lock before applying edit (which might take time)
                         drop(client);
-                        
+
                         apply_workspace_edit(&edit, encoding).await?;
                         Ok(format!("Applied fix: {}", ca.title))
                     } else {
-                        // TODO: Resolve code action if edit is missing (data field)
-                        Err(anyhow!("Code action '{}' has no edit attached (lazy resolution not yet supported)", ca.title))
+                        Err(anyhow!("Code action '{}' resolved but still has no edit attached", ca.title))
                     }
                 }
             }
@@ -1168,10 +1173,7 @@ impl LspBridgeHandler {
             Err(e) => Ok(CallToolResult::error(e.to_string())),
         }
     }
-    fn handle_codebase_map(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
+    fn handle_codebase_map(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: CodebaseMapInput =
             serde_json::from_value(arguments.unwrap_or_else(|| serde_json::json!({})))
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
@@ -1305,7 +1307,7 @@ impl LspBridgeHandler {
                     } else {
                         line.to_string()
                     };
-                    
+
                     output.push_str(&format!("{}{}\n", sym_indent, display_line));
                     line_count += 1;
                 }
@@ -1511,8 +1513,6 @@ impl ToolHandler for LspBridgeHandler {
             },
         ]
     }
-
-
 
     fn call_tool(
         &self,
