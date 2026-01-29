@@ -1622,15 +1622,22 @@ fn is_high_level_symbol(kind: lsp_types::SymbolKind) -> bool {
             | SymbolKind::CLASS
             | SymbolKind::METHOD
             | SymbolKind::PROPERTY
+            | SymbolKind::FIELD
             | SymbolKind::CONSTRUCTOR
             | SymbolKind::ENUM
             | SymbolKind::INTERFACE
             | SymbolKind::FUNCTION
+            | SymbolKind::VARIABLE
+            | SymbolKind::CONSTANT
+            | SymbolKind::STRING
+            | SymbolKind::NUMBER
+            | SymbolKind::BOOLEAN
+            | SymbolKind::ARRAY
+            | SymbolKind::OBJECT
+            | SymbolKind::KEY
             | SymbolKind::STRUCT
             | SymbolKind::EVENT
-            | SymbolKind::STRING
-            | SymbolKind::CONSTANT
-            | SymbolKind::KEY
+            | SymbolKind::ENUM_MEMBER
     )
 }
 
