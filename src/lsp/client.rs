@@ -694,7 +694,18 @@ impl LspClient {
 
     /// Returns true if server is ready to handle requests.
     pub fn is_ready(&self) -> bool {
-        matches!(self.server_state(), ServerState::Ready) && self.is_alive()
+        let state = self.server_state();
+        if state != ServerState::Ready || !self.is_alive() {
+            return false;
+        }
+
+        // Even if state is Ready, if we just spawned, wait a bit to see if
+        // the server starts indexing (e.g. rust-analyzer takes a moment to send $/progress).
+        if self.spawn_time.elapsed() < Duration::from_millis(1000) {
+            return false;
+        }
+
+        true
     }
 
     /// Returns detailed status for this server.

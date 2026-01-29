@@ -26,3 +26,18 @@ fn test_version_sync() {
         cargo_version, plugin_version
     );
 }
+
+#[test]
+fn test_cargo_lock_freshness() {
+    // Run 'cargo check --locked' to ensure Cargo.lock is in sync with Cargo.toml
+    // --locked will fail if Cargo.lock needs updating.
+    let status = std::process::Command::new("cargo")
+        .args(["check", "--locked"])
+        .status()
+        .expect("Failed to execute cargo check");
+
+    assert!(
+        status.success(),
+        "Cargo.lock is out of sync with Cargo.toml! Please run 'cargo check' and stage the changes."
+    );
+}

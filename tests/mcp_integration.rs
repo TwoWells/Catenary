@@ -134,7 +134,16 @@ impl Drop for BridgeProcess {
     fn drop(&mut self) {
         // Closing stdin signals the server to shut down gracefully
         self.stdin.take();
-        // The LspClient Drop will handle killing child processes if Catenary exits abruptly
+
+        // Wait for the process to exit naturally (up to 2 seconds)
+        for _ in 0..20 {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // If still alive after timeout, kill it
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
