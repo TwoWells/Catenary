@@ -19,10 +19,11 @@ impl BridgeProcess {
             cmd.arg("--lsp").arg(arg);
         } else {
             // Default for existing tests
-            cmd.arg("--lsp").arg("shellscript:bash-language-server start");
+            cmd.arg("--lsp")
+                .arg("shellscript:bash-language-server start");
         }
         cmd.arg("--root").arg(root);
-        
+
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -34,7 +35,11 @@ impl BridgeProcess {
         // Wait for initialization
         std::thread::sleep(Duration::from_millis(500));
 
-        Self { child, stdin, stdout }
+        Self {
+            child,
+            stdin,
+            stdout,
+        }
     }
 
     fn send(&mut self, request: &serde_json::Value) {
@@ -45,7 +50,9 @@ impl BridgeProcess {
 
     fn recv(&mut self) -> serde_json::Value {
         let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("Failed to read from stdout");
+        self.stdout
+            .read_line(&mut line)
+            .expect("Failed to read from stdout");
         serde_json::from_str(&line).expect("Failed to parse JSON response")
     }
 
@@ -98,7 +105,7 @@ fn test_codebase_map_basic() {
     let response = bridge.recv();
     let result = &response["result"];
     assert!(result["isError"].is_null() || result["isError"] == false);
-    
+
     let content = result["content"][0]["text"].as_str().unwrap();
     println!("Map Output:\n{}", content);
 
@@ -110,7 +117,11 @@ fn test_codebase_map_basic() {
 #[test]
 fn test_codebase_map_with_symbols() {
     // Requires bash-language-server
-    if Command::new("which").arg("bash-language-server").output().is_err() {
+    if Command::new("which")
+        .arg("bash-language-server")
+        .output()
+        .is_err()
+    {
         return;
     }
 
@@ -140,7 +151,7 @@ fn test_codebase_map_with_symbols() {
     let response = bridge.recv();
     let result = &response["result"];
     let content = result["content"][0]["text"].as_str().unwrap();
-    
+
     println!("Map with Symbols Output:\n{}", content);
 
     assert!(content.contains("script.sh"));
@@ -159,13 +170,17 @@ fn test_codebase_map_markdown() {
     let temp = tempfile::tempdir().unwrap();
     // Create .git to help Marksman detect root
     std::fs::create_dir(temp.path().join(".git")).unwrap();
-    
+
     let md_path = temp.path().join("README.md");
-    std::fs::write(&md_path, "# Title\n\n## Section 1\nContent\n\n### Subsection\nMore content").unwrap();
+    std::fs::write(
+        &md_path,
+        "# Title\n\n## Section 1\nContent\n\n### Subsection\nMore content",
+    )
+    .unwrap();
 
     let mut bridge = BridgeProcess::spawn(
-        temp.path().to_str().unwrap(), 
-        Some("markdown:marksman server")
+        temp.path().to_str().unwrap(),
+        Some("markdown:marksman server"),
     );
     bridge.initialize();
 
@@ -188,11 +203,14 @@ fn test_codebase_map_markdown() {
     let response = bridge.recv();
     let result = &response["result"];
     let content = result["content"][0]["text"].as_str().unwrap();
-    
+
     println!("Markdown Map Output:\n{}", content);
 
     assert!(content.contains("README.md"));
     // Marksman usually reports headings as symbols
     assert!(content.contains("Title"), "Should contain Title symbol");
-    assert!(content.contains("Section 1"), "Should contain Section 1 symbol");
+    assert!(
+        content.contains("Section 1"),
+        "Should contain Section 1 symbol"
+    );
 }

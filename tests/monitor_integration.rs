@@ -133,6 +133,7 @@ fn test_monitor_raw_messages() {
     }
 
     let _ = child.kill();
+    let _ = child.wait();
 
     assert!(
         found_in,
