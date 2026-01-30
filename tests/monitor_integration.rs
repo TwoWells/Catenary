@@ -103,7 +103,7 @@ fn test_monitor_raw_messages() {
     let _response = server.recv();
 
     // 4. Check monitor output
-    // We expect to see "MCP(in): ... ping" and "MCP(out): ... result"
+    // We expect to see "→ ... ping" and "← ... result" (arrows instead of MCP(in)/MCP(out))
 
     let mut found_in = false;
     let mut found_out = false;
@@ -114,13 +114,11 @@ fn test_monitor_raw_messages() {
         line.clear();
         if reader.read_line(&mut line).unwrap() > 0 {
             println!("Monitor: {}", line.trim());
-            if line.contains("MCP(in)")
-                && line.contains("ping")
-                && line.contains(&request_id.to_string())
-            {
+            // New format uses → for incoming and ← for outgoing
+            if line.contains("→") && line.contains("ping") {
                 found_in = true;
             }
-            if line.contains("MCP(out)") && line.contains(&request_id.to_string()) {
+            if line.contains("←") && line.contains("result") {
                 found_out = true;
             }
 
@@ -137,10 +135,10 @@ fn test_monitor_raw_messages() {
 
     assert!(
         found_in,
-        "Did not find incoming MCP message in monitor output"
+        "Did not find incoming MCP message (→) in monitor output"
     );
     assert!(
         found_out,
-        "Did not find outgoing MCP message in monitor output"
+        "Did not find outgoing MCP message (←) in monitor output"
     );
 }

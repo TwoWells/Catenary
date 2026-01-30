@@ -18,6 +18,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use regex::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,9 +27,10 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler};
+use catenary_mcp::cli::{self, ColorConfig, ColumnWidths};
 use catenary_mcp::lsp;
 use catenary_mcp::mcp::McpServer;
-use catenary_mcp::session::{self, EventKind, Session};
+use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
 
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
@@ -66,8 +68,20 @@ enum Command {
 
     /// Monitor events from a session
     Monitor {
-        /// Session ID (use 'catenary list' to see available sessions)
+        /// Session ID or row number (use 'catenary list' to see available sessions)
         id: String,
+
+        /// Show raw JSON output
+        #[arg(long)]
+        raw: bool,
+
+        /// Disable colored output
+        #[arg(long)]
+        nocolor: bool,
+
+        /// Filter events by regex pattern
+        #[arg(long, short)]
+        filter: Option<String>,
     },
 
     /// Show status of a session
@@ -84,7 +98,12 @@ async fn main() -> Result<()> {
     match args.command {
         None | Some(Command::Serve) => run_server(args).await,
         Some(Command::List) => run_list(),
-        Some(Command::Monitor { id }) => run_monitor(&id),
+        Some(Command::Monitor {
+            id,
+            raw,
+            nocolor,
+            filter,
+        }) => run_monitor(&id, raw, nocolor, filter),
         Some(Command::Status { id }) => run_status(&id),
     }
 }
@@ -219,43 +238,105 @@ fn run_list() -> Result<()> {
         return Ok(());
     }
 
+    let term_width = cli::terminal_width();
+    let widths = ColumnWidths::calculate(term_width);
+
     // Print header
     println!(
-        "{:<12} {:<8} {:<40} {:<20} STARTED",
-        "ID", "PID", "WORKSPACE", "CLIENT"
+        "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_ws$} {:<width_client$} {:<width_lang$} STARTED",
+        "#",
+        "ID",
+        "PID",
+        "WORKSPACE",
+        "CLIENT",
+        "LANGUAGES",
+        width_num = widths.row_num,
+        width_id = widths.id,
+        width_pid = widths.pid,
+        width_ws = widths.workspace,
+        width_client = widths.client,
+        width_lang = widths.languages,
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(term_width.min(120)));
 
-    for s in sessions {
+    for (idx, s) in sessions.iter().enumerate() {
         let client = match (&s.client_name, &s.client_version) {
             (Some(name), Some(ver)) => format!("{} v{}", name, ver),
             (Some(name), None) => name.clone(),
-            _ => "(unknown)".to_string(),
+            _ => "-".to_string(),
         };
 
         let ago = format_duration_ago(s.started_at);
 
-        // Truncate workspace if too long
-        let workspace = if s.workspace.len() > 38 {
-            format!("...{}", &s.workspace[s.workspace.len() - 35..])
+        // Get active languages for this session
+        let languages = session::active_languages(&s.id)
+            .unwrap_or_default()
+            .join(",");
+        let languages = if languages.is_empty() {
+            "-".to_string()
         } else {
-            s.workspace.clone()
+            languages
         };
 
+        // Truncate fields to fit column widths
+        let id = cli::truncate(&s.id, widths.id);
+        let workspace = cli::truncate(&s.workspace, widths.workspace);
+        let client = cli::truncate(&client, widths.client);
+        let languages = cli::truncate(&languages, widths.languages);
+
         println!(
-            "{:<12} {:<8} {:<40} {:<20} {}",
-            s.id, s.pid, workspace, client, ago
+            "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_ws$} {:<width_client$} {:<width_lang$} {}",
+            idx + 1,
+            id,
+            s.pid,
+            workspace,
+            client,
+            languages,
+            ago,
+            width_num = widths.row_num,
+            width_id = widths.id,
+            width_pid = widths.pid,
+            width_ws = widths.workspace,
+            width_client = widths.client,
+            width_lang = widths.languages,
         );
     }
 
     Ok(())
 }
 
+/// Resolve a session ID from either a row number or ID prefix
+fn resolve_session_id(id: &str) -> Result<session::SessionInfo> {
+    // Try parsing as a row number first (1-indexed)
+    if let Ok(row_num) = id.parse::<usize>()
+        && row_num > 0
+    {
+        let sessions = session::list_sessions()?;
+        if let Some(s) = sessions.get(row_num - 1) {
+            return Ok(s.clone());
+        }
+        anyhow::bail!("Row number {} out of range (1-{})", row_num, sessions.len());
+    }
+
+    // Fall back to find_session (ID prefix matching)
+    find_session(id)
+}
+
 /// Monitor events from a session
-fn run_monitor(id: &str) -> Result<()> {
-    // Find session (support prefix matching)
-    let session = find_session(id)?;
+fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<String>) -> Result<()> {
+    // Resolve session ID (supports row numbers and prefix matching)
+    let session = resolve_session_id(id)?;
     let full_id = session.id;
+
+    let colors = ColorConfig::new(nocolor);
+    let term_width = cli::terminal_width();
+
+    // Compile filter regex if provided
+    let filter_regex = filter
+        .as_ref()
+        .map(|f| Regex::new(f))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid filter regex: {}", e))?;
 
     println!("Monitoring session {} (Ctrl+C to stop)\n", full_id);
 
@@ -264,7 +345,19 @@ fn run_monitor(id: &str) -> Result<()> {
     loop {
         match reader.next_event()? {
             Some(event) => {
-                print_event(&event);
+                // Apply filter if set
+                if let Some(ref re) = filter_regex {
+                    let event_str = format!("{:?}", event.kind);
+                    if !re.is_match(&event_str) {
+                        continue;
+                    }
+                }
+
+                if raw {
+                    print_event_raw(&event);
+                } else {
+                    print_event_annotated(&event, &colors, term_width);
+                }
             }
             None => {
                 println!("\nSession ended");
@@ -351,19 +444,40 @@ fn format_duration_ago(timestamp: chrono::DateTime<Utc>) -> String {
     }
 }
 
-/// Print an event in human-readable format
-fn print_event(event: &session::SessionEvent) {
+/// Print an event in raw JSON format
+fn print_event_raw(event: &SessionEvent) {
     let time = event.timestamp.format("%H:%M:%S");
 
     match &event.kind {
+        EventKind::McpMessage { direction, message } => {
+            let arrow = if direction == "in" { "→" } else { "←" };
+            println!("[{}] {}", time, arrow);
+            let pretty = serde_json::to_string_pretty(message).unwrap_or_default();
+            println!("{}", pretty);
+        }
+        _ => {
+            // For non-MCP events, print as JSON
+            let json = serde_json::to_string_pretty(&event.kind).unwrap_or_default();
+            println!("[{}] {}", time, json);
+        }
+    }
+}
+
+/// Print an event with annotations and colors
+fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width: usize) {
+    let time = event.timestamp.format("%H:%M:%S");
+    let time_str = colors.dim(&format!("[{}]", time));
+
+    match &event.kind {
         EventKind::Started => {
-            println!("[{}] Session started", time);
+            println!("{} Session started", time_str);
         }
         EventKind::Shutdown => {
-            println!("[{}] Session shutting down", time);
+            println!("{} Session shutting down", time_str);
         }
         EventKind::ServerState { language, state } => {
-            println!("[{}] {}: {}", time, language, state);
+            let lang = colors.cyan(language);
+            println!("{} {}: {}", time_str, lang, state);
         }
         EventKind::Progress {
             language,
@@ -371,39 +485,151 @@ fn print_event(event: &session::SessionEvent) {
             message,
             percentage,
         } => {
+            let lang = colors.cyan(language);
             let pct = percentage.map(|p| format!(" {}%", p)).unwrap_or_default();
             let msg = message
                 .as_ref()
                 .map(|m| format!(" ({})", m))
                 .unwrap_or_default();
-            println!("[{}] {}: {}{}{}", time, language, title, pct, msg);
+            println!("{} {}: {}{}{}", time_str, lang, title, pct, msg);
         }
         EventKind::ProgressEnd { language } => {
-            println!("[{}] {}: Ready", time, language);
+            let lang = colors.cyan(language);
+            println!("{} {}: Ready", time_str, lang);
         }
         EventKind::ToolCall { tool, file } => {
+            let arrow = colors.green("→");
             let file_str = file
                 .as_ref()
                 .map(|f| format!(" on {}", f))
                 .unwrap_or_default();
-            println!("[{}] Tool: {}{}", time, tool, file_str);
+            println!("{} {} {}{}", time_str, arrow, tool, file_str);
         }
         EventKind::ToolResult {
             tool,
             success,
             duration_ms,
         } => {
-            let status = if *success { "ok" } else { "error" };
+            let arrow = colors.blue("←");
+            let status = if *success {
+                "ok".to_string()
+            } else {
+                colors.red("error")
+            };
             println!(
-                "[{}] Tool: {} -> {} ({}ms)",
-                time, tool, status, duration_ms
+                "{} {} {} -> {} ({}ms)",
+                time_str, arrow, tool, status, duration_ms
             );
         }
         EventKind::McpMessage { direction, message } => {
-            let json_str = serde_json::to_string(message).unwrap_or_default();
-            println!("[{}] MCP({}): {}", time, direction, json_str);
+            let arrow_colored = if direction == "in" {
+                colors.green("→")
+            } else {
+                colors.blue("←")
+            };
+
+            // Extract meaningful info from MCP message
+            let summary = extract_mcp_summary(message, colors);
+
+            // Calculate available width for message
+            // Format: [HH:MM:SS] → summary
+            let prefix_len = 10 + 2 + 2; // [time] + arrow + spaces
+            let max_summary_len = term_width.saturating_sub(prefix_len);
+
+            let summary = cli::truncate(&summary, max_summary_len);
+            println!("{} {} {}", time_str, arrow_colored, summary);
+
+            // Check for errors in response
+            if direction == "out"
+                && let Some(obj) = message.as_object()
+                && obj.contains_key("error")
+                && let Some(error) = obj.get("error")
+            {
+                let err_msg = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                println!("    {}", colors.red(&format!("Error: {}", err_msg)));
+            }
         }
     }
+}
+
+/// Extract a human-readable summary from an MCP message
+fn extract_mcp_summary(message: &serde_json::Value, colors: &ColorConfig) -> String {
+    let obj = match message.as_object() {
+        Some(o) => o,
+        None => return message.to_string(),
+    };
+
+    // Check if this is a request (has method)
+    if let Some(method) = obj.get("method").and_then(|m| m.as_str()) {
+        let id = obj.get("id").map(|i| format!("#{}", i)).unwrap_or_default();
+
+        // Extract params summary based on method
+        let params_summary = match method {
+            "tools/call" => {
+                if let Some(params) = obj.get("params")
+                    && let Some(name) = params.get("name").and_then(|n| n.as_str())
+                {
+                    // Try to get file argument if present
+                    let file_info = params
+                        .get("arguments")
+                        .and_then(|a| a.get("file_path").or_else(|| a.get("path")))
+                        .and_then(|f| f.as_str())
+                        .map(|f| {
+                            // Just show filename, not full path
+                            std::path::Path::new(f)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(f)
+                        })
+                        .map(|f| format!(" ({})", f))
+                        .unwrap_or_default();
+                    format!("{}{}", colors.cyan(name), file_info)
+                } else {
+                    String::new()
+                }
+            }
+            "initialize" => {
+                if let Some(params) = obj.get("params")
+                    && let Some(info) = params.get("clientInfo")
+                    && let Some(name) = info.get("name").and_then(|n| n.as_str())
+                {
+                    format!("from {}", name)
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
+
+        if params_summary.is_empty() {
+            format!("{} {}", method, id)
+        } else {
+            format!("{} {} {}", method, params_summary, id)
+        }
+    }
+    // Check if this is a response (has result or error)
+    else if obj.contains_key("result") || obj.contains_key("error") {
+        let id = obj.get("id").map(|i| format!("#{}", i)).unwrap_or_default();
+
+        if obj.contains_key("error") {
+            format!("{} {}", colors.red("error"), id)
+        } else {
+            format!("result {}", id)
+        }
+    } else {
+        // Fallback: show compact JSON
+        serde_json::to_string(message).unwrap_or_default()
+    }
+}
+
+/// Print an event in human-readable format (used by run_status)
+fn print_event(event: &SessionEvent) {
+    let colors = ColorConfig::new(false);
+    let term_width = cli::terminal_width();
+    print_event_annotated(event, &colors, term_width);
 }
 
 /// Background task that periodically closes idle documents.

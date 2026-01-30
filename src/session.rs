@@ -389,6 +389,41 @@ impl TailReader {
     }
 }
 
+/// Get active languages for a session by reading its events
+pub fn active_languages(id: &str) -> Result<Vec<String>> {
+    use std::collections::HashMap;
+
+    let sessions_base = sessions_dir()?;
+    let events_path = sessions_base.join(id).join("events.jsonl");
+
+    if !events_path.exists() {
+        return Ok(vec![]);
+    }
+
+    let file = File::open(&events_path)?;
+    let reader = BufReader::new(file);
+
+    // Track server states: language -> state
+    let mut states: HashMap<String, String> = HashMap::new();
+
+    for line in reader.lines() {
+        if let Ok(line) = line
+            && let Ok(event) = serde_json::from_str::<SessionEvent>(&line)
+            && let EventKind::ServerState { language, state } = event.kind
+        {
+            if state == "Dead" {
+                states.remove(&language);
+            } else {
+                states.insert(language, state);
+            }
+        }
+    }
+
+    let mut languages: Vec<String> = states.keys().cloned().collect();
+    languages.sort();
+    Ok(languages)
+}
+
 /// Check if a process is still running
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -450,6 +485,86 @@ mod tests {
         // Read events back
         let events: Vec<_> = monitor_events(&id).unwrap().collect();
         assert!(events.len() >= 2); // Started + our events
+
+        drop(session);
+    }
+
+    #[test]
+    fn test_active_languages_empty() {
+        let session = Session::create("/tmp/test-langs-empty").unwrap();
+        let id = session.info.id.clone();
+
+        // No server state events, should return empty
+        let langs = active_languages(&id).unwrap();
+        assert!(langs.is_empty());
+
+        drop(session);
+    }
+
+    #[test]
+    fn test_active_languages_tracks_server_state() {
+        let session = Session::create("/tmp/test-langs-state").unwrap();
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Initializing".to_string(),
+        });
+
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Ready".to_string(),
+        });
+
+        let langs = active_languages(&id).unwrap();
+        assert_eq!(langs, vec!["rust"]);
+
+        drop(session);
+    }
+
+    #[test]
+    fn test_active_languages_removes_dead() {
+        let session = Session::create("/tmp/test-langs-dead").unwrap();
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Ready".to_string(),
+        });
+
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Dead".to_string(),
+        });
+
+        let langs = active_languages(&id).unwrap();
+        assert!(langs.is_empty());
+
+        drop(session);
+    }
+
+    #[test]
+    fn test_active_languages_multiple_languages() {
+        let session = Session::create("/tmp/test-langs-multi").unwrap();
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Ready".to_string(),
+        });
+
+        session.broadcast(EventKind::ServerState {
+            language: "python".to_string(),
+            state: "Ready".to_string(),
+        });
+
+        session.broadcast(EventKind::ServerState {
+            language: "typescript".to_string(),
+            state: "Initializing".to_string(),
+        });
+
+        let langs = active_languages(&id).unwrap();
+        assert_eq!(langs, vec!["python", "rust", "typescript"]);
 
         drop(session);
     }
