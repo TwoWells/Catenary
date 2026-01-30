@@ -153,7 +153,7 @@ checksum = "7b02b629252fe8ef6460461409564e2c21d0c8e77e0944f3d189ff06c4e932ad"
 
 [[package]]
 name = "catenary-mcp"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "bytes",
