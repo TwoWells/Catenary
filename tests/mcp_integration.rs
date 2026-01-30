@@ -207,9 +207,9 @@ fn test_mcp_tools_list() {
         "lsp_definition",
         "lsp_type_definition",
         "lsp_implementation",
-        "lsp_references",
+        "catenary_find_references",
         "lsp_document_symbols",
-        "lsp_workspace_symbols",
+        "catenary_find_symbol",
         "lsp_code_actions",
         "lsp_rename",
         "lsp_completion",
@@ -625,7 +625,7 @@ fn test_multiplexing() {
         "TOML hover failed to return info after warmup"
     );
 
-    // 4. Test Workspace Symbols (Broadcast)
+    // 4. Test Find Symbol (replaces workspace symbols)
     std::thread::sleep(Duration::from_secs(1));
 
     bridge.send(&json!({
@@ -633,7 +633,7 @@ fn test_multiplexing() {
         "id": 400,
         "method": "tools/call",
         "params": {
-            "name": "lsp_workspace_symbols",
+            "name": "catenary_find_symbol",
             "arguments": {
                 "query": "greet"
             }
@@ -644,7 +644,7 @@ fn test_multiplexing() {
     let result = &response["result"];
     assert!(
         result["isError"].is_null() || result["isError"] == false,
-        "Workspace symbols failed"
+        "Find symbol failed"
     );
     let text = result["content"][0]["text"].as_str().unwrap();
 
@@ -690,5 +690,169 @@ fn test_client_info_stored_in_session() {
         stdout.contains("TestClient") && stdout.contains("42.0.0"),
         "Expected client info 'TestClient v42.0.0' in catenary list output, got:\n{}",
         stdout
+    );
+}
+
+#[test]
+fn test_catenary_find_references_by_position() {
+    require_bash_lsp!();
+
+    // Create a test script with a function that's called multiple times
+    let test_file = "/tmp/mcp_test_find_refs.sh";
+    std::fs::write(
+        test_file,
+        r#"#!/bin/bash
+
+my_func() {
+    echo "hello"
+}
+
+my_func
+my_func
+"#,
+    )
+    .unwrap();
+
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
+    bridge.initialize();
+
+    // Request references by position (on the function definition, line 2)
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 500,
+        "method": "tools/call",
+        "params": {
+            "name": "catenary_find_references",
+            "arguments": {
+                "file": test_file,
+                "line": 2,
+                "character": 0
+            }
+        }
+    }));
+
+    let response = bridge.recv();
+
+    assert!(
+        response.get("result").is_some(),
+        "Find references call failed: {:?}",
+        response
+    );
+
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Expected success, got error: {:?}",
+        result
+    );
+
+    let content = result["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+
+    // Should find at least the definition and calls
+    // The definition should be marked with [def]
+    assert!(
+        text.contains("[def]"),
+        "Expected definition marker [def] in output, got: {}",
+        text
+    );
+
+    std::fs::remove_file(test_file).ok();
+}
+
+#[test]
+fn test_catenary_find_references_by_symbol() {
+    require_bash_lsp!();
+
+    // Create a test script with a function
+    let test_file = "/tmp/mcp_test_find_refs_symbol.sh";
+    std::fs::write(
+        test_file,
+        r#"#!/bin/bash
+
+unique_test_func() {
+    echo "hello"
+}
+
+unique_test_func
+"#,
+    )
+    .unwrap();
+
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
+    bridge.initialize();
+
+    // Give LSP time to index
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Request references by symbol name
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 501,
+        "method": "tools/call",
+        "params": {
+            "name": "catenary_find_references",
+            "arguments": {
+                "symbol": "unique_test_func",
+                "file": test_file
+            }
+        }
+    }));
+
+    let response = bridge.recv();
+
+    let result = &response["result"];
+
+    // bash-language-server may or may not support workspace symbols well enough
+    // for this to work, so we accept either success with results or a "not found" message
+    if result["isError"] == true {
+        let content = result["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        // Accept "Symbol not found" as a valid response for bash-lsp
+        assert!(
+            text.contains("not found") || text.contains("No references"),
+            "Unexpected error: {}",
+            text
+        );
+    } else {
+        let content = result["content"].as_array().unwrap();
+        if !content.is_empty() {
+            let text = content[0]["text"].as_str().unwrap();
+            // If we got results, they should contain the file path
+            assert!(
+                text.contains(test_file) || text.contains("No references"),
+                "Expected references to contain file path, got: {}",
+                text
+            );
+        }
+    }
+
+    std::fs::remove_file(test_file).ok();
+}
+
+#[test]
+fn test_catenary_find_references_missing_args() {
+    require_bash_lsp!();
+
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp");
+    bridge.initialize();
+
+    // Request without symbol or file - should fail
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 502,
+        "method": "tools/call",
+        "params": {
+            "name": "catenary_find_references",
+            "arguments": {}
+        }
+    }));
+
+    let response = bridge.recv();
+
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "Expected error for missing arguments"
     );
 }

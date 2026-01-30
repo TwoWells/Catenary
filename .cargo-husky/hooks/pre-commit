@@ -12,6 +12,9 @@ echo 'Running pre-commit checks...'
 # Full integration tests run in CI
 cargo test --lib --quiet
 
+# Version sync check (ensures Cargo.toml matches plugin version)
+cargo test --test version_sync --quiet
+
 # Run clippy quietly (only shows warnings/errors)
 cargo clippy --quiet -- -D warnings
 

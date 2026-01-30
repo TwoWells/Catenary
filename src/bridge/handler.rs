@@ -52,7 +52,7 @@ const METHODS_WAIT_FOR_READY: &[&str] = &[
     "lsp_definition",
     "lsp_type_definition",
     "lsp_implementation",
-    "lsp_references",
+    "catenary_find_references",
     "lsp_document_symbols",
     "lsp_code_actions",
     "lsp_completion",
@@ -92,18 +92,23 @@ pub struct FileInput {
     pub file: String,
 }
 
-/// Input for references tool.
-#[derive(Debug, Deserialize)]
-pub struct ReferencesInput {
-    pub file: String,
-    pub line: u32,
-    pub character: u32,
-    #[serde(default = "default_true")]
-    pub include_declaration: bool,
-}
-
 fn default_true() -> bool {
     true
+}
+
+/// Input for catenary_find_references - accepts either symbol name OR position.
+#[derive(Debug, Deserialize)]
+pub struct FindReferencesInput {
+    /// Symbol name to search for (uses workspace symbols)
+    pub symbol: Option<String>,
+    /// File path (required if using position, optional if using symbol to narrow scope)
+    pub file: Option<String>,
+    /// Line number (0-indexed) - required if not using symbol
+    pub line: Option<u32>,
+    /// Character position (0-indexed) - required if not using symbol
+    pub character: Option<u32>,
+    #[serde(default = "default_true")]
+    pub include_declaration: bool,
 }
 
 /// Input for workspace symbol search.
@@ -243,27 +248,6 @@ impl LspBridgeHandler {
             broadcaster,
         }
     }
-
-    /// Checks if at least one LSP server is still alive.
-    fn check_alive(&self) -> Result<()> {
-        let _alive = self.runtime.block_on(async {
-            let clients = self.client_manager.active_clients().await;
-            for client in clients.values() {
-                let client = client.lock().await;
-                if client.is_alive() {
-                    return true;
-                }
-            }
-            false
-        });
-
-        // In lazy mode, "no servers running" is fine, as we spawn on demand.
-        // So we should probably always return Ok, unless we want to enforce at least one *configured*?
-        // But active_clients() only returns running ones.
-        // Let's just return Ok for now, as lsp_workspace_symbols will just return empty if no servers are running.
-        Ok(())
-    }
-
     /// Gets the appropriate LSP client for the given file path.
     async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
         let lang_id = {
@@ -514,27 +498,47 @@ impl LspBridgeHandler {
         }
     }
 
-    fn handle_references(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: ReferencesInput =
+    fn handle_find_references(
+        &self,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<CallToolResult> {
+        let input: FindReferencesInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let path = self.resolve_path(&input.file)?;
+        // Resolve target position - either from symbol search or direct position
+        let (target_path, target_position) = if let Some(symbol) = &input.symbol {
+            // Search for symbol first
+            debug!("Find references by symbol: {}", symbol);
+            self.resolve_symbol_position(symbol, input.file.as_deref())?
+        } else {
+            // Use direct position
+            let file = input.file.as_ref().ok_or_else(|| {
+                anyhow!("Either 'symbol' or 'file' with 'line'/'character' is required")
+            })?;
+            let line = input
+                .line
+                .ok_or_else(|| anyhow!("'line' is required when using position"))?;
+            let character = input
+                .character
+                .ok_or_else(|| anyhow!("'character' is required when using position"))?;
 
-        debug!(
-            "References request: {}:{}:{}",
-            input.file, input.line, input.character
-        );
+            let path = self.resolve_path(file)?;
+            let position = Position { line, character };
+            debug!(
+                "Find references by position: {}:{}:{}",
+                file, line, character
+            );
+            (path, position)
+        };
 
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = ReferenceParams {
+        let (references, definition) = self.runtime.block_on(async {
+            let (uri, client_mutex) = self.ensure_document_open(&target_path).await?;
+
+            let ref_params = ReferenceParams {
                 text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: target_position,
                 },
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
@@ -542,16 +546,106 @@ impl LspBridgeHandler {
                     include_declaration: input.include_declaration,
                 },
             };
+
+            let def_params = GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: target_position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+
             let client = client_mutex.lock().await;
-            client.references(params).await
+            let refs = client.references(ref_params).await?;
+            let def = client.definition(def_params).await?;
+            Ok::<_, anyhow::Error>((refs, def))
         })?;
 
-        match result {
+        match references {
             Some(locations) if !locations.is_empty() => {
-                Ok(CallToolResult::text(format_locations(&locations)))
+                let def_loc = definition.as_ref().and_then(extract_definition_location);
+                Ok(CallToolResult::text(format_locations_with_definition(
+                    &locations,
+                    def_loc.as_ref(),
+                )))
             }
             _ => Ok(CallToolResult::text("No references found")),
         }
+    }
+
+    /// Resolve a symbol name to a file path and position.
+    /// If `scope_file` is provided, searches within that file first.
+    fn resolve_symbol_position(
+        &self,
+        symbol: &str,
+        scope_file: Option<&str>,
+    ) -> Result<(std::path::PathBuf, Position)> {
+        // If a file is provided, try document symbols first for efficiency
+        if let Some(file) = scope_file {
+            let path = self.resolve_path(file)?;
+            if let Some(result) = self.find_symbol_in_document(symbol, &path)? {
+                return Ok(result);
+            }
+        }
+
+        // Fall back to workspace symbol search
+        self.find_symbol_in_workspace(symbol)
+    }
+
+    /// Search for a symbol within a specific document.
+    fn find_symbol_in_document(
+        &self,
+        symbol: &str,
+        path: &std::path::Path,
+    ) -> Result<Option<(std::path::PathBuf, Position)>> {
+        let result = self.runtime.block_on(async {
+            let (uri, client_mutex) = self.ensure_document_open(path).await?;
+            let params = DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            let client = client_mutex.lock().await;
+            let response = client.document_symbols(params).await?;
+            Ok::<_, anyhow::Error>((uri, response))
+        })?;
+
+        let (uri, response) = result;
+        if let Some(response) = response
+            && let Some(position) = find_symbol_in_document_response(&response, symbol)
+        {
+            let file_path = std::path::PathBuf::from(uri.path().as_str());
+            return Ok(Some((file_path, position)));
+        }
+        Ok(None)
+    }
+
+    /// Search for a symbol across the entire workspace.
+    fn find_symbol_in_workspace(&self, symbol: &str) -> Result<(std::path::PathBuf, Position)> {
+        let result = self.runtime.block_on(async {
+            let params = WorkspaceSymbolParams {
+                query: symbol.to_string(),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+
+            let clients = self.client_manager.active_clients().await;
+
+            for client_mutex in clients.values() {
+                let client = client_mutex.lock().await;
+                if let Ok(Some(response)) = client.workspace_symbols(params.clone()).await
+                    && let Some((path, position)) =
+                        find_symbol_in_workspace_response(&response, symbol)
+                {
+                    return Ok((path, position));
+                }
+            }
+
+            Err(anyhow!("Symbol '{}' not found in workspace", symbol))
+        })?;
+
+        Ok(result)
     }
 
     fn handle_document_symbols(
@@ -583,27 +677,23 @@ impl LspBridgeHandler {
         }
     }
 
-    fn handle_workspace_symbols(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        // Check LSP health first (this handler doesn't open a document)
-        self.check_alive()?;
-
+    /// Find a symbol by name with fallback to document symbols search.
+    /// This is more robust than workspace_symbols for finding private/internal symbols.
+    fn handle_find_symbol(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: WorkspaceSymbolInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        debug!("Workspace symbols request: query={}", input.query);
+        debug!("Find symbol request: query={}", input.query);
 
-        let result = self.runtime.block_on(async {
+        // First try workspace symbols (fast path)
+        let workspace_result = self.runtime.block_on(async {
             let params = WorkspaceSymbolParams {
-                query: input.query,
+                query: input.query.clone(),
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
 
-            // Broadcast to all active clients
             let clients = self.client_manager.active_clients().await;
             let mut results = Vec::new();
 
@@ -614,24 +704,176 @@ impl LspBridgeHandler {
                 }
             }
 
-            // Merge results
-            if results.is_empty() {
-                None
-            } else {
-                Some(results)
-            }
+            results
         });
 
-        match result {
-            Some(responses) => {
-                let text = responses
-                    .iter()
-                    .map(format_workspace_symbols)
-                    .collect::<Vec<_>>()
-                    .join("\n\n---\n\n");
-                Ok(CallToolResult::text(text))
+        // Check if we got any symbols from workspace search
+        let has_results = workspace_result
+            .iter()
+            .any(|r| !format_workspace_symbols(r).contains("No symbols found"));
+
+        if has_results {
+            let text = workspace_result
+                .iter()
+                .map(format_workspace_symbols)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(CallToolResult::text(text));
+        }
+
+        // Fallback: search files with ripgrep, then query document symbols
+        debug!("Workspace symbols found nothing, trying fallback search");
+        self.find_symbol_fallback(&input.query)
+    }
+
+    /// Fallback symbol search: ripgrep for files, then document symbols.
+    fn find_symbol_fallback(&self, query: &str) -> Result<CallToolResult> {
+        const MAX_FILES: usize = 20;
+
+        // Try ripgrep first
+        let files = self.ripgrep_search(query).unwrap_or_else(|_| {
+            // Fallback to manual search if rg not available
+            self.manual_file_search(query).unwrap_or_default()
+        });
+
+        if files.is_empty() {
+            return Ok(CallToolResult::text("No symbols found"));
+        }
+
+        // Cap files to search
+        let files: Vec<_> = files.into_iter().take(MAX_FILES).collect();
+        debug!("Searching {} files for symbol '{}'", files.len(), query);
+
+        // Query document symbols for each file and filter
+        let mut found_symbols = Vec::new();
+        let query_lower = query.to_lowercase();
+
+        for file_path in files {
+            if let Ok(Some(symbols)) = self.get_matching_symbols(&file_path, &query_lower) {
+                found_symbols.extend(symbols);
             }
-            None => Ok(CallToolResult::text("No symbols found")),
+        }
+
+        if found_symbols.is_empty() {
+            Ok(CallToolResult::text("No symbols found"))
+        } else {
+            Ok(CallToolResult::text(found_symbols.join("\n")))
+        }
+    }
+
+    /// Use ripgrep to find files containing the query.
+    fn ripgrep_search(&self, query: &str) -> Result<Vec<std::path::PathBuf>> {
+        use std::process::Command;
+
+        let output = Command::new("rg")
+            .args([
+                "--files-with-matches",
+                "--ignore-case",
+                "--type-add",
+                "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,cs,rb,php,swift,kt,scala,lua,sh,bash,zsh}",
+                "--type",
+                "code",
+                query,
+            ])
+            .output()
+            .map_err(|e| anyhow!("Failed to run ripgrep: {}", e))?;
+
+        if !output.status.success() && output.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let files: Vec<std::path::PathBuf> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(std::path::PathBuf::from)
+            .collect();
+
+        Ok(files)
+    }
+
+    /// Manual file search fallback when ripgrep is not available.
+    fn manual_file_search(&self, query: &str) -> Result<Vec<std::path::PathBuf>> {
+        let cwd = std::env::current_dir()?;
+        let query_lower = query.to_lowercase();
+        let mut matches = Vec::new();
+
+        let walker = WalkBuilder::new(&cwd)
+            .hidden(true)
+            .git_ignore(true)
+            .max_depth(Some(10))
+            .build();
+
+        for entry in walker.flatten() {
+            if matches.len() >= 50 {
+                break; // Cap search
+            }
+
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            // Only search code files
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !matches!(
+                ext,
+                "rs" | "py"
+                    | "js"
+                    | "ts"
+                    | "tsx"
+                    | "jsx"
+                    | "go"
+                    | "java"
+                    | "c"
+                    | "cpp"
+                    | "h"
+                    | "hpp"
+                    | "cs"
+                    | "rb"
+                    | "php"
+                    | "swift"
+                    | "kt"
+                    | "scala"
+            ) {
+                continue;
+            }
+
+            // Read and search file content
+            if let Ok(content) = std::fs::read_to_string(path)
+                && content.to_lowercase().contains(&query_lower)
+            {
+                matches.push(path.to_path_buf());
+            }
+        }
+
+        Ok(matches)
+    }
+
+    /// Get document symbols from a file that match the query.
+    fn get_matching_symbols(
+        &self,
+        path: &std::path::Path,
+        query_lower: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let result = self.runtime.block_on(async {
+            let (uri, client_mutex) = self.ensure_document_open(path).await?;
+            let params = DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            let client = client_mutex.lock().await;
+            client.document_symbols(params).await
+        })?;
+
+        let Some(response) = result else {
+            return Ok(None);
+        };
+
+        let symbols = filter_matching_symbols(&response, query_lower, path);
+        if symbols.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(symbols))
         }
     }
 
@@ -1368,17 +1610,17 @@ impl ToolHandler for LspBridgeHandler {
                 input_schema: position_schema(),
             },
             Tool {
-                name: "lsp_references".to_string(),
-                description: Some("Find all references to a symbol across the codebase.".to_string()),
+                name: "catenary_find_references".to_string(),
+                description: Some("Find all references to a symbol. Accepts either a symbol name (searched across workspace) or a file/line/character position. The definition is marked with [def] in results.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "line": { "type": "integer", "description": "Line number (0-indexed)" },
-                        "character": { "type": "integer", "description": "Character position (0-indexed)" },
+                        "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyClass', 'handleRequest'). If provided, the symbol will be found via workspace search." },
+                        "file": { "type": "string", "description": "Absolute or relative path to the file. Required if using line/character position; optional with symbol to narrow search scope." },
+                        "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
+                        "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." },
                         "include_declaration": { "type": "boolean", "description": "Include the declaration in results (default: true)" }
-                    },
-                    "required": ["file", "line", "character"]
+                    }
                 }),
             },
             Tool {
@@ -1387,12 +1629,12 @@ impl ToolHandler for LspBridgeHandler {
                 input_schema: file_schema(),
             },
             Tool {
-                name: "lsp_workspace_symbols".to_string(),
-                description: Some("Search for symbols across the entire workspace by name.".to_string()),
+                name: "catenary_find_symbol".to_string(),
+                description: Some("Find a symbol by name across the workspace. More robust than raw LSP workspace symbols - falls back to file search + document symbols for private/internal symbols.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Search query for symbol names" }
+                        "query": { "type": "string", "description": "Symbol name to search for (case-insensitive substring match)" }
                     },
                     "required": ["query"]
                 }),
@@ -1590,9 +1832,9 @@ impl ToolHandler for LspBridgeHandler {
             "lsp_definition" => self.handle_definition(arguments),
             "lsp_type_definition" => self.handle_type_definition(arguments),
             "lsp_implementation" => self.handle_implementation(arguments),
-            "lsp_references" => self.handle_references(arguments),
+            "catenary_find_references" => self.handle_find_references(arguments),
             "lsp_document_symbols" => self.handle_document_symbols(arguments),
-            "lsp_workspace_symbols" => self.handle_workspace_symbols(arguments),
+            "catenary_find_symbol" => self.handle_find_symbol(arguments),
             "lsp_code_actions" => self.handle_code_actions(arguments),
             "lsp_rename" => self.handle_rename(arguments),
             "lsp_completion" => self.handle_completion(arguments),
@@ -1748,6 +1990,81 @@ fn format_definition_response(response: &GotoDefinitionResponse) -> String {
     }
 }
 
+/// Find a symbol by name in a document symbol response, returning its position.
+fn find_symbol_in_document_response(
+    response: &DocumentSymbolResponse,
+    name: &str,
+) -> Option<Position> {
+    match response {
+        DocumentSymbolResponse::Flat(symbols) => {
+            // Exact match first
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .or_else(|| symbols.iter().find(|s| s.name.contains(name)))
+                .map(|s| s.location.range.start)
+        }
+        DocumentSymbolResponse::Nested(symbols) => find_in_nested_symbols(symbols, name),
+    }
+}
+
+/// Recursively search nested document symbols.
+fn find_in_nested_symbols(symbols: &[DocumentSymbol], name: &str) -> Option<Position> {
+    for symbol in symbols {
+        if symbol.name == name {
+            return Some(symbol.selection_range.start);
+        }
+        if let Some(children) = &symbol.children
+            && let Some(pos) = find_in_nested_symbols(children, name)
+        {
+            return Some(pos);
+        }
+    }
+    // Second pass: partial match
+    for symbol in symbols {
+        if symbol.name.contains(name) {
+            return Some(symbol.selection_range.start);
+        }
+        if let Some(children) = &symbol.children
+            && let Some(pos) = find_in_nested_symbols(children, name)
+        {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// Find a symbol by name in workspace symbol response, returning path and position.
+fn find_symbol_in_workspace_response(
+    response: &WorkspaceSymbolResponse,
+    name: &str,
+) -> Option<(std::path::PathBuf, Position)> {
+    match response {
+        WorkspaceSymbolResponse::Flat(symbols) => {
+            // Exact match first
+            let symbol = symbols
+                .iter()
+                .find(|s| s.name == name)
+                .or_else(|| symbols.iter().find(|s| s.name.contains(name)))?;
+            let path = std::path::PathBuf::from(symbol.location.uri.path().as_str());
+            Some((path, symbol.location.range.start))
+        }
+        WorkspaceSymbolResponse::Nested(symbols) => {
+            let symbol = symbols
+                .iter()
+                .find(|s| s.name == name)
+                .or_else(|| symbols.iter().find(|s| s.name.contains(name)))?;
+            match &symbol.location {
+                lsp_types::OneOf::Left(location) => {
+                    let path = std::path::PathBuf::from(location.uri.path().as_str());
+                    Some((path, location.range.start))
+                }
+                lsp_types::OneOf::Right(_) => None, // URI-only location, can't get position
+            }
+        }
+    }
+}
+
 fn format_location(location: &Location) -> String {
     let path = location.uri.path();
     let line = location.range.start.line + 1;
@@ -1762,12 +2079,62 @@ fn format_location_link(link: &LocationLink) -> String {
     format!("{}:{}:{}", path, line, col)
 }
 
-fn format_locations(locations: &[Location]) -> String {
-    locations
+/// Format locations with the definition marked and listed first.
+fn format_locations_with_definition(
+    locations: &[Location],
+    definition: Option<&Location>,
+) -> String {
+    // Check if a location matches the definition
+    let is_definition = |loc: &Location| -> bool {
+        definition.is_some_and(|def| loc.uri == def.uri && loc.range.start == def.range.start)
+    };
+
+    // Sort: definition first, then by file path and line
+    let mut sorted: Vec<_> = locations.iter().collect();
+    sorted.sort_by(|a, b| {
+        let a_is_def = is_definition(a);
+        let b_is_def = is_definition(b);
+        match (a_is_def, b_is_def) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                // Sort by path, then line, then column
+                let path_cmp = a.uri.path().as_str().cmp(b.uri.path().as_str());
+                if path_cmp != std::cmp::Ordering::Equal {
+                    return path_cmp;
+                }
+                let line_cmp = a.range.start.line.cmp(&b.range.start.line);
+                if line_cmp != std::cmp::Ordering::Equal {
+                    return line_cmp;
+                }
+                a.range.start.character.cmp(&b.range.start.character)
+            }
+        }
+    });
+
+    sorted
         .iter()
-        .map(format_location)
+        .map(|loc| {
+            if is_definition(loc) {
+                format!("{} [def]", format_location(loc))
+            } else {
+                format_location(loc)
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Extract the first location from a GotoDefinitionResponse.
+fn extract_definition_location(response: &GotoDefinitionResponse) -> Option<Location> {
+    match response {
+        GotoDefinitionResponse::Scalar(loc) => Some(loc.clone()),
+        GotoDefinitionResponse::Array(locs) => locs.first().cloned(),
+        GotoDefinitionResponse::Link(links) => links.first().map(|link| Location {
+            uri: link.target_uri.clone(),
+            range: link.target_selection_range,
+        }),
+    }
 }
 
 fn format_document_symbols(response: &DocumentSymbolResponse) -> String {
@@ -1831,6 +2198,56 @@ fn format_workspace_symbols(response: &WorkspaceSymbolResponse) -> String {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
+        }
+    }
+}
+
+/// Filter document symbols that match the query (case-insensitive).
+fn filter_matching_symbols(
+    response: &DocumentSymbolResponse,
+    query_lower: &str,
+    file_path: &std::path::Path,
+) -> Vec<String> {
+    let mut results = Vec::new();
+    let file_str = file_path.display().to_string();
+
+    match response {
+        DocumentSymbolResponse::Flat(symbols) => {
+            for symbol in symbols {
+                if symbol.name.to_lowercase().contains(query_lower) {
+                    let line = symbol.location.range.start.line + 1;
+                    results.push(format!(
+                        "{} [{:?}] {}:{}",
+                        symbol.name, symbol.kind, file_str, line
+                    ));
+                }
+            }
+        }
+        DocumentSymbolResponse::Nested(symbols) => {
+            collect_matching_nested_symbols(symbols, query_lower, &file_str, &mut results);
+        }
+    }
+
+    results
+}
+
+/// Recursively collect matching symbols from nested document symbols.
+fn collect_matching_nested_symbols(
+    symbols: &[DocumentSymbol],
+    query_lower: &str,
+    file_str: &str,
+    results: &mut Vec<String>,
+) {
+    for symbol in symbols {
+        if symbol.name.to_lowercase().contains(query_lower) {
+            let line = symbol.selection_range.start.line + 1;
+            results.push(format!(
+                "{} [{:?}] {}:{}",
+                symbol.name, symbol.kind, file_str, line
+            ));
+        }
+        if let Some(children) = &symbol.children {
+            collect_matching_nested_symbols(children, query_lower, file_str, results);
         }
     }
 }
@@ -2311,5 +2728,210 @@ fn position_to_offset(
                 position
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::{
+        DocumentSymbol, Range, SymbolInformation, SymbolKind, WorkspaceSymbolResponse,
+    };
+
+    fn make_position(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    fn make_range(start_line: u32, start_char: u32, end_line: u32, end_char: u32) -> Range {
+        Range {
+            start: make_position(start_line, start_char),
+            end: make_position(end_line, end_char),
+        }
+    }
+
+    fn make_document_symbol(name: &str, kind: SymbolKind, range: Range) -> DocumentSymbol {
+        #[allow(deprecated)]
+        DocumentSymbol {
+            name: name.to_string(),
+            detail: None,
+            kind,
+            tags: None,
+            deprecated: None,
+            range,
+            selection_range: range,
+            children: None,
+        }
+    }
+
+    fn make_symbol_info(name: &str, kind: SymbolKind, uri: &str, line: u32) -> SymbolInformation {
+        #[allow(deprecated)]
+        SymbolInformation {
+            name: name.to_string(),
+            kind,
+            tags: None,
+            deprecated: None,
+            location: Location {
+                uri: uri.parse().unwrap(),
+                range: make_range(line, 0, line, 10),
+            },
+            container_name: None,
+        }
+    }
+
+    #[test]
+    fn test_find_symbol_exact_match_flat() {
+        let symbols = vec![
+            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 0),
+            make_symbol_info("bar", SymbolKind::FUNCTION, "file:///test.rs", 10),
+            make_symbol_info("baz", SymbolKind::STRUCT, "file:///test.rs", 20),
+        ];
+        let response = DocumentSymbolResponse::Flat(symbols);
+
+        let result = find_symbol_in_document_response(&response, "bar");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().line, 10);
+    }
+
+    #[test]
+    fn test_find_symbol_partial_match_flat() {
+        let symbols = vec![
+            make_symbol_info("handle_request", SymbolKind::FUNCTION, "file:///test.rs", 5),
+            make_symbol_info("process_data", SymbolKind::FUNCTION, "file:///test.rs", 15),
+        ];
+        let response = DocumentSymbolResponse::Flat(symbols);
+
+        // Partial match "request"
+        let result = find_symbol_in_document_response(&response, "request");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().line, 5);
+    }
+
+    #[test]
+    fn test_find_symbol_exact_preferred_over_partial() {
+        let symbols = vec![
+            make_symbol_info("foobar", SymbolKind::FUNCTION, "file:///test.rs", 0),
+            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 10),
+        ];
+        let response = DocumentSymbolResponse::Flat(symbols);
+
+        // Exact match "foo" should be preferred over partial match "foobar"
+        let result = find_symbol_in_document_response(&response, "foo");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().line, 10);
+    }
+
+    #[test]
+    fn test_find_symbol_nested() {
+        let inner_symbol =
+            make_document_symbol("inner_method", SymbolKind::METHOD, make_range(5, 0, 10, 0));
+        let mut outer_symbol =
+            make_document_symbol("MyClass", SymbolKind::CLASS, make_range(0, 0, 20, 0));
+        outer_symbol.children = Some(vec![inner_symbol]);
+
+        let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
+
+        let result = find_symbol_in_document_response(&response, "inner_method");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().line, 5);
+    }
+
+    #[test]
+    fn test_find_symbol_nested_partial_match() {
+        let inner_symbol = make_document_symbol(
+            "handle_request",
+            SymbolKind::METHOD,
+            make_range(15, 0, 20, 0),
+        );
+        let mut outer_symbol =
+            make_document_symbol("Handler", SymbolKind::CLASS, make_range(0, 0, 30, 0));
+        outer_symbol.children = Some(vec![inner_symbol]);
+
+        let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
+
+        // Partial match should find inner_method
+        let result = find_symbol_in_document_response(&response, "request");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().line, 15);
+    }
+
+    #[test]
+    fn test_find_symbol_not_found() {
+        let symbols = vec![make_symbol_info(
+            "foo",
+            SymbolKind::FUNCTION,
+            "file:///test.rs",
+            0,
+        )];
+        let response = DocumentSymbolResponse::Flat(symbols);
+
+        let result = find_symbol_in_document_response(&response, "nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_workspace_symbol_exact_match() {
+        let symbols = vec![
+            make_symbol_info("MyStruct", SymbolKind::STRUCT, "file:///src/lib.rs", 10),
+            make_symbol_info("MyFunction", SymbolKind::FUNCTION, "file:///src/main.rs", 5),
+        ];
+        let response = WorkspaceSymbolResponse::Flat(symbols);
+
+        let result = find_symbol_in_workspace_response(&response, "MyStruct");
+        assert!(result.is_some());
+        let (path, position) = result.unwrap();
+        assert_eq!(path.to_string_lossy(), "/src/lib.rs");
+        assert_eq!(position.line, 10);
+    }
+
+    #[test]
+    fn test_find_workspace_symbol_partial_match() {
+        let symbols = vec![make_symbol_info(
+            "LspBridgeHandler",
+            SymbolKind::STRUCT,
+            "file:///src/handler.rs",
+            50,
+        )];
+        let response = WorkspaceSymbolResponse::Flat(symbols);
+
+        let result = find_symbol_in_workspace_response(&response, "Bridge");
+        assert!(result.is_some());
+        let (path, position) = result.unwrap();
+        assert_eq!(path.to_string_lossy(), "/src/handler.rs");
+        assert_eq!(position.line, 50);
+    }
+
+    #[test]
+    fn test_find_references_input_validation() {
+        // Test that FindReferencesInput can be deserialized with symbol
+        let json = serde_json::json!({
+            "symbol": "MyStruct"
+        });
+        let input: FindReferencesInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.symbol, Some("MyStruct".to_string()));
+        assert!(input.file.is_none());
+        assert!(input.line.is_none());
+        assert!(input.character.is_none());
+        assert!(input.include_declaration); // default true
+
+        // Test with position
+        let json = serde_json::json!({
+            "file": "/path/to/file.rs",
+            "line": 10,
+            "character": 5
+        });
+        let input: FindReferencesInput = serde_json::from_value(json).unwrap();
+        assert!(input.symbol.is_none());
+        assert_eq!(input.file, Some("/path/to/file.rs".to_string()));
+        assert_eq!(input.line, Some(10));
+        assert_eq!(input.character, Some(5));
+
+        // Test with both symbol and file (to narrow scope)
+        let json = serde_json::json!({
+            "symbol": "my_function",
+            "file": "/path/to/file.rs"
+        });
+        let input: FindReferencesInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.symbol, Some("my_function".to_string()));
+        assert_eq!(input.file, Some("/path/to/file.rs".to_string()));
     }
 }

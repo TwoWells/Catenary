@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# Pre-push hook: Warns if pushing a version bump without a corresponding tag
+#
+
+set -e
+
+# Get current version from Cargo.toml
+CURRENT_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+TAG="v$CURRENT_VERSION"
+
+# Check if tag exists
+if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+    echo ""
+    echo "WARNING: No tag found for version $CURRENT_VERSION"
+    echo ""
+    echo "If this is a release, create the tag first:"
+    echo "  git tag -a $TAG -m 'Release $TAG'"
+    echo "  git push --tags"
+    echo ""
+    echo "Or use the Makefile:"
+    echo "  make tag-current    # Tag current version"
+    echo "  make release-patch  # Bump, commit, and tag"
+    echo ""
+
+    # Ask for confirmation (if interactive)
+    if [ -t 0 ]; then
+        printf "Push anyway without tag? [y/N] "
+        read -r response
+        case "$response" in
+            [yY][eE][sS]|[yY])
+                echo "Proceeding without tag..."
+                ;;
+            *)
+                echo "Push aborted. Create tag first."
+                exit 1
+                ;;
+        esac
+    else
+        echo "Non-interactive mode: Proceeding with push (no tag)."
+    fi
+fi
