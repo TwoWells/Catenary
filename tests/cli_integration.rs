@@ -372,11 +372,11 @@ fn test_monitor_filter_flag() {
     let mut found_ping = false;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
-        if let Ok(line) = rx.recv_timeout(Duration::from_millis(100)) {
-            if line.contains("ping") {
-                found_ping = true;
-                break;
-            }
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(100))
+            && line.contains("ping")
+        {
+            found_ping = true;
+            break;
         }
     }
 

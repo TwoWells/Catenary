@@ -1,6 +1,7 @@
 # Catenary
 
 [![CI](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/ci.yml/badge.svg)](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/ci.yml)
+[![CD](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/cd.yml/badge.svg)](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/cd.yml)
 
 A bridge between [MCP](https://modelcontextprotocol.io/) and [LSP](https://microsoft.github.io/language-server-protocol/) — giving AI coding assistants IDE-quality code intelligence.
 
