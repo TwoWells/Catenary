@@ -29,8 +29,8 @@ Add to `~/.gemini/settings.json`:
 
 ## Configuration
 
-See `config.example.toml` in this directory or the [Official Configuration Guide](https://github.com/Mark-Wells-Dev/Catenary/wiki/Config).
+See `config.example.toml` in this directory or the [Official Configuration Guide](https://github.com/MarkWells-Dev/Catenary/wiki/Config).
 
 ## Documentation
 
-For full features, tool lists, and troubleshooting, please visit the **[Main Repository](https://github.com/Mark-Wells-Dev/Catenary)**.
+For full features, tool lists, and troubleshooting, please visit the **[Main Repository](https://github.com/MarkWells-Dev/Catenary)**.

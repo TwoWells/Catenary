@@ -1,11 +1,11 @@
 # Catenary
 
-[![CI](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/ci.yml/badge.svg)](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/ci.yml)
-[![CD](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/cd.yml/badge.svg)](https://github.com/Mark-Wells-Dev/Catenary/actions/workflows/cd.yml)
+[![CI](https://github.com/MarkWells-Dev/Catenary/actions/workflows/ci.yml/badge.svg)](https://github.com/MarkWells-Dev/Catenary/actions/workflows/ci.yml)
+[![CD](https://github.com/MarkWells-Dev/Catenary/actions/workflows/cd.yml/badge.svg)](https://github.com/MarkWells-Dev/Catenary/actions/workflows/cd.yml)
 
 A bridge between [MCP](https://modelcontextprotocol.io/) and [LSP](https://microsoft.github.io/language-server-protocol/) — giving AI coding assistants IDE-quality code intelligence.
 
-📚 **[Documentation](https://github.com/Mark-Wells-Dev/Catenary/wiki)**
+📚 **[Documentation](https://github.com/MarkWells-Dev/Catenary/wiki)**
 
 ## Quick Start
 
@@ -32,7 +32,7 @@ Add to `~/.gemini/settings.json`:
 }
 ```
 
-Then [configure your language servers](https://github.com/Mark-Wells-Dev/Catenary/wiki/Config) in `~/.config/catenary/config.toml`.
+Then [configure your language servers](https://github.com/MarkWells-Dev/Catenary/wiki/Config) in `~/.config/catenary/config.toml`.
 
 ## Features
 
@@ -52,13 +52,13 @@ Then [configure your language servers](https://github.com/Mark-Wells-Dev/Catenar
 | `lsp_rename` | Rename with dry-run preview |
 | `lsp_completion` | Code completions |
 | `lsp_formatting` | Format documents |
-| ... | [See all 16 tools](https://github.com/Mark-Wells-Dev/Catenary/wiki/Overview#available-tools) |
+| ... | [See all 16 tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
 
 ## Documentation
 
-- **[Install](https://github.com/Mark-Wells-Dev/Catenary/wiki/Install)** — Setup for Claude Code, Claude Desktop, Gemini CLI
-- **[Config](https://github.com/Mark-Wells-Dev/Catenary/wiki/Config)** — Configuration reference
-- **[LSPs](https://github.com/Mark-Wells-Dev/Catenary/wiki/LSPs)** — Language server setup guides
+- **[Install](https://github.com/MarkWells-Dev/Catenary/wiki/Install)** — Setup for Claude Code, Claude Desktop, Gemini CLI
+- **[Config](https://github.com/MarkWells-Dev/Catenary/wiki/Config)** — Configuration reference
+- **[LSPs](https://github.com/MarkWells-Dev/Catenary/wiki/LSPs)** — Language server setup guides
 
 ## License
 
