@@ -69,7 +69,6 @@ async fn test_bash_lsp_initialize() {
         "shellscript",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     let result = client.initialize(dir.path()).await.unwrap();
@@ -96,7 +95,6 @@ async fn test_bash_lsp_hover() {
         "shellscript",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     client.initialize(dir.path()).await.unwrap();
@@ -151,7 +149,6 @@ async fn test_lua_lsp_initialize() {
         "lua",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     let result = client.initialize(dir.path()).await.unwrap();
@@ -175,7 +172,6 @@ async fn test_document_lifecycle() {
         "shellscript",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     client.initialize(dir.path()).await.unwrap();
@@ -247,7 +243,6 @@ edition = "2021"
         "rust",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     let result = client.initialize(dir.path()).await.unwrap();
@@ -285,7 +280,6 @@ edition = "2021"
         "rust",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     client.initialize(dir.path()).await.unwrap();
@@ -339,7 +333,6 @@ async fn test_yaml_lsp_initialize() {
         "yaml",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     let result = client.initialize(dir.path()).await.unwrap();
@@ -363,7 +356,6 @@ async fn test_yaml_lsp_hover() {
         "yaml",
         catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
-    .await
     .unwrap();
 
     client.initialize(dir.path()).await.unwrap();

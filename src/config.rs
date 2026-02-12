@@ -83,7 +83,20 @@ impl Config {
             }
         }
 
-        // 3. Load from explicit file if provided
+        // 3. Load from project-local config (.catenary.toml) searching upwards
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut current = Some(cwd.as_path());
+            while let Some(path) = current {
+                let config_path = path.join(".catenary.toml");
+                if config_path.exists() {
+                    builder = builder.add_source(config::File::from(config_path));
+                    break;
+                }
+                current = path.parent();
+            }
+        }
+
+        // 4. Load from explicit file if provided
         if let Some(path) = explicit_file {
             builder = builder.add_source(config::File::from(path));
         }
@@ -96,5 +109,64 @@ impl Config {
         config
             .try_deserialize()
             .context("Failed to deserialize configuration")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+
+    fn test_config_load_local() -> Result<()> {
+        let dir = tempdir()?;
+
+        let local_config_path = dir.path().join(".catenary.toml");
+
+        fs::write(
+            &local_config_path,
+            r#"
+
+    idle_timeout = 42
+
+    smart_wait = false
+
+
+
+    [server.rust]
+
+    command = "rust-analyzer-local"
+
+    "#,
+        )?;
+
+        // Change current directory to the temp dir
+
+        let original_dir = std::env::current_dir()?;
+
+        std::env::set_current_dir(dir.path())?;
+
+        let config = Config::load(None)?;
+
+        // Restore current directory
+
+        std::env::set_current_dir(original_dir)?;
+
+        assert_eq!(config.idle_timeout, 42);
+
+        assert!(!config.smart_wait);
+
+        assert_eq!(
+            config
+                .server
+                .get("rust")
+                .context("missing rust server")?
+                .command,
+            "rust-analyzer-local"
+        );
+
+        Ok(())
     }
 }

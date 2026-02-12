@@ -215,6 +215,16 @@ fn path_to_uri(path: &Path) -> Result<Uri> {
 }
 
 fn detect_language_id(path: &Path) -> &'static str {
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        match file_name {
+            "Dockerfile" => return "dockerfile",
+            "Makefile" => return "makefile",
+            "CMakeLists.txt" => return "cmake",
+            "Cargo.toml" | "Cargo.lock" => return "toml",
+            _ => {}
+        }
+    }
+
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust",
         Some("go") => "go",
@@ -225,7 +235,10 @@ fn detect_language_id(path: &Path) -> &'static str {
         Some("jsx") => "javascriptreact",
         Some("c") => "c",
         Some("cpp" | "cc" | "cxx" | "h" | "hpp") => "cpp",
+        Some("cs") => "csharp",
         Some("java") => "java",
+        Some("kt" | "kts") => "kotlin",
+        Some("swift") => "swift",
         Some("rb") => "ruby",
         Some("php") => "php",
         Some("sh" | "bash" | "zsh") => "shellscript",
@@ -235,13 +248,29 @@ fn detect_language_id(path: &Path) -> &'static str {
         Some("md") => "markdown",
         Some("html") => "html",
         Some("css") => "css",
+        Some("scss") => "scss",
         Some("lua") => "lua",
         Some("sql") => "sql",
+        Some("zig") => "zig",
+        Some("mojo") => "mojo",
+        Some("dart") => "dart",
+        Some("m" | "mm") => "objective-c",
+        Some("nix") => "nix",
+        Some("proto") => "proto",
+        Some("graphql" | "gql") => "graphql",
+        Some("r" | "R") => "r",
+        Some("jl") => "julia",
+        Some("scala" | "sc") => "scala",
+        Some("hs") => "haskell",
+        Some("ex" | "exs") => "elixir",
+        Some("erl" | "hrl") => "erlang",
+        Some("cmake") => "cmake",
         _ => "plaintext",
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -347,10 +376,28 @@ mod tests {
         assert_eq!(detect_language_id(Path::new("test.py")), "python");
         assert_eq!(detect_language_id(Path::new("test.js")), "javascript");
         assert_eq!(detect_language_id(Path::new("test.ts")), "typescript");
+        assert_eq!(detect_language_id(Path::new("test.tsx")), "typescriptreact");
         assert_eq!(detect_language_id(Path::new("test.go")), "go");
         assert_eq!(detect_language_id(Path::new("test.php")), "php");
         assert_eq!(detect_language_id(Path::new("test.sh")), "shellscript");
         assert_eq!(detect_language_id(Path::new("test.bash")), "shellscript");
+        assert_eq!(detect_language_id(Path::new("test.cs")), "csharp");
+        assert_eq!(detect_language_id(Path::new("test.kt")), "kotlin");
+        assert_eq!(detect_language_id(Path::new("test.swift")), "swift");
+        assert_eq!(detect_language_id(Path::new("test.html")), "html");
+        assert_eq!(detect_language_id(Path::new("test.css")), "css");
+        assert_eq!(detect_language_id(Path::new("test.scss")), "scss");
+        assert_eq!(detect_language_id(Path::new("Dockerfile")), "dockerfile");
+        assert_eq!(detect_language_id(Path::new("Makefile")), "makefile");
+        assert_eq!(detect_language_id(Path::new("CMakeLists.txt")), "cmake");
+        assert_eq!(detect_language_id(Path::new("test.zig")), "zig");
+        assert_eq!(detect_language_id(Path::new("test.nix")), "nix");
+        assert_eq!(detect_language_id(Path::new("test.proto")), "proto");
+        assert_eq!(detect_language_id(Path::new("test.graphql")), "graphql");
+        assert_eq!(detect_language_id(Path::new("test.r")), "r");
+        assert_eq!(detect_language_id(Path::new("test.jl")), "julia");
+        assert_eq!(detect_language_id(Path::new("test.ex")), "elixir");
+        assert_eq!(detect_language_id(Path::new("Cargo.toml")), "toml");
         assert_eq!(detect_language_id(Path::new("test.unknown")), "plaintext");
         assert_eq!(detect_language_id(Path::new("noextension")), "plaintext");
     }
