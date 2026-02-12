@@ -15,9 +15,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+/// Low-level LSP client for communicating with a server process.
 pub mod client;
+/// High-level manager for lazy-spawning and caching LSP clients.
 pub mod manager;
+/// LSP message protocol definitions.
 pub mod protocol;
+/// Server state and progress tracking.
 pub mod state;
 
 pub use client::LspClient;

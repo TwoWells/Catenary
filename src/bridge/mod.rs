@@ -15,7 +15,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+/// Manages document lifecycle and sync between disk and LSP servers.
 mod document_manager;
+/// Maps MCP tool calls to LSP requests.
 mod handler;
 
 pub use document_manager::{DocumentManager, DocumentNotification};

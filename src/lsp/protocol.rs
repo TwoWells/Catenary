@@ -23,44 +23,65 @@ fn default_null() -> serde_json::Value {
     serde_json::Value::Null
 }
 
+/// An LSP request message.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RequestMessage {
+    /// The JSON-RPC version.
     pub jsonrpc: String,
+    /// The request ID.
     pub id: RequestId,
+    /// The method name.
     pub method: String,
+    /// The request parameters.
     #[serde(default = "default_null")]
     pub params: serde_json::Value,
 }
 
+/// An LSP response message.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ResponseMessage {
+    /// The JSON-RPC version.
     pub jsonrpc: String,
+    /// The request ID, if any.
     pub id: Option<RequestId>,
+    /// The result of the request, if successful.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    /// The error, if the request failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
 }
 
+/// An LSP notification message.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NotificationMessage {
+    /// The JSON-RPC version.
     pub jsonrpc: String,
+    /// The method name.
     pub method: String,
+    /// The notification parameters.
     #[serde(default = "default_null")]
     pub params: serde_json::Value,
 }
 
+/// An LSP request or response ID.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum RequestId {
+    /// A numeric ID.
     Number(i64),
+    /// A string ID.
     String(String),
 }
 
+/// An LSP response error.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ResponseError {
+    /// The error code.
     pub code: i64,
+    /// The error message.
     pub message: String,
+    /// Additional error data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
@@ -71,7 +92,14 @@ impl From<i64> for RequestId {
     }
 }
 
-/// Helper to parse the Content-Length header and body from a buffer
+/// Helper to parse the Content-Length header and body from a buffer.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Headers are not valid UTF-8.
+/// - Content-Length is invalid or missing.
+/// - The body is not valid UTF-8.
 pub fn try_parse_message(buffer: &mut BytesMut) -> Result<Option<String>> {
     let mut headers_end = None;
     let mut content_length = None;

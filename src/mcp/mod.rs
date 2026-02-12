@@ -15,7 +15,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+/// MCP server implementation over stdin/stdout.
 mod server;
+/// MCP type definitions and JSON-RPC messages.
 mod types;
 
 pub use server::{McpServer, ToolHandler};

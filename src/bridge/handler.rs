@@ -65,12 +65,12 @@ use super::{DocumentManager, DocumentNotification};
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DetailLevel {
-    /// Only structural symbols: modules, classes, structs, interfaces, enums
+    /// Only structural symbols: modules, classes, structs, interfaces, enums.
     #[default]
     Outline,
-    /// Outline + functions, methods, constructors
+    /// Outline + functions, methods, constructors.
     Signatures,
-    /// Everything including variables, constants, fields
+    /// Everything including variables, constants, fields.
     Full,
 }
 
@@ -81,15 +81,22 @@ fn default_detail_level() -> DetailLevel {
 /// Input for tools that need file + position.
 #[derive(Debug, Deserialize)]
 pub struct PositionInput {
+    /// Path to the file.
     pub file: String,
+    /// 0-indexed line number.
     pub line: u32,
+    /// 0-indexed character position.
     pub character: u32,
 }
 
 /// Input for tools that need only a file path.
 #[derive(Debug, Deserialize)]
 pub struct FileInput {
+    /// Path to the file.
     pub file: String,
+    /// Whether to wait for the LSP server to finish analysis before returning results.
+    ///
+    /// Defaults to `true`.
     #[serde(default = "default_true")]
     pub wait_for_reanalysis: bool,
 }
@@ -226,6 +233,7 @@ fn default_budget() -> usize {
 }
 
 /// Bridge handler that implements MCP ToolHandler trait.
+/// Handles MCP tool calls by routing them to the appropriate LSP server.
 pub struct LspBridgeHandler {
     client_manager: Arc<ClientManager>,
     doc_manager: Arc<Mutex<DocumentManager>>,
@@ -235,6 +243,7 @@ pub struct LspBridgeHandler {
 }
 
 impl LspBridgeHandler {
+    /// Creates a new `LspBridgeHandler`.
     pub fn new(
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,

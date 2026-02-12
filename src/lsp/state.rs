@@ -28,9 +28,13 @@ pub type ProgressToken = NumberOrString;
 /// State of an active progress operation.
 #[derive(Debug, Clone)]
 pub struct ProgressState {
+    /// The title of the progress operation.
     pub title: String,
+    /// The optional progress message.
     pub message: Option<String>,
+    /// The optional progress percentage (0-100).
     pub percentage: Option<u32>,
+    /// When the operation started.
     pub started: Instant,
 }
 
@@ -73,12 +77,17 @@ impl ServerState {
 /// Detailed status for a single LSP server.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerStatus {
+    /// The language ID this server handles.
     pub language: String,
+    /// Current server readiness state.
     pub state: ServerState,
+    /// Active progress title, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_title: Option<String>,
+    /// Active progress message, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_message: Option<String>,
+    /// Active progress percentage, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_percentage: Option<u32>,
     /// Seconds since spawn.
@@ -92,6 +101,7 @@ pub struct ProgressTracker {
 }
 
 impl ProgressTracker {
+    /// Creates a new `ProgressTracker`.
     pub fn new() -> Self {
         Self::default()
     }

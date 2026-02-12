@@ -39,7 +39,7 @@ struct OpenDocument {
 ///
 /// The LSP protocol requires documents to be explicitly opened before
 /// most operations. This manager handles opening documents on first
-/// access and tracking their versions.
+/// access, tracking their versions, and detecting changes on disk.
 pub struct DocumentManager {
     documents: HashMap<PathBuf, OpenDocument>,
 }
@@ -51,6 +51,7 @@ impl Default for DocumentManager {
 }
 
 impl DocumentManager {
+    /// Creates a new, empty `DocumentManager`.
     pub fn new() -> Self {
         Self {
             documents: HashMap::new(),
@@ -61,6 +62,14 @@ impl DocumentManager {
     ///
     /// If the document is already open but the file has changed on disk,
     /// returns a `didChange` notification instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path cannot be canonicalized.
+    /// - File metadata cannot be read.
+    /// - The file cannot be read from disk.
+    /// - The path cannot be converted to a valid URI.
     pub async fn ensure_open(&mut self, path: &Path) -> Result<Option<DocumentNotification>> {
         let path = path.canonicalize()?;
         let metadata = fs::metadata(&path).await?;
@@ -129,6 +138,10 @@ impl DocumentManager {
     }
 
     /// Marks a document as closed and returns the notification to send.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be canonicalized or converted to a URI.
     pub fn close(&mut self, path: &Path) -> Result<Option<DidCloseTextDocumentParams>> {
         let path = path.canonicalize()?;
 
@@ -161,6 +174,10 @@ impl DocumentManager {
     }
 
     /// Returns the URI for an open document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be canonicalized or converted to a URI.
     pub fn uri_for_path(&self, path: &Path) -> Result<Uri> {
         path_to_uri(&path.canonicalize()?)
     }
@@ -180,7 +197,9 @@ impl DocumentManager {
 
 /// Notification to send to the LSP server.
 pub enum DocumentNotification {
+    /// A `textDocument/didOpen` notification.
     Open(DidOpenTextDocumentParams),
+    /// A `textDocument/didChange` notification.
     Change(DidChangeTextDocumentParams),
 }
 

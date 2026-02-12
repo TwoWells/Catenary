@@ -27,13 +27,13 @@ Once connected, your AI assistant gains access to these LSP-powered tools:
 | `lsp_type_definition`     | Jump to the type's definition                       |
 | `lsp_implementation`      | Find implementations of interfaces/traits           |
 | `catenary_find_references` | Find all references to a symbol (by name or position) |
-| `lsp_document_symbols`    | Get the outline of a file                           |
+| `lsp_document_symbols`    | Get the outline of a file (supports `wait_for_reanalysis: true`) |
 | `catenary_find_symbol`    | Find a symbol by name (with fallback for private symbols) |
 | `lsp_code_actions`        | Get quick fixes and refactorings                    |
 | `lsp_rename`              | Rename a symbol (with dry-run preview)              |
 | `lsp_completion`          | Get completion suggestions                          |
 | `lsp_signature_help`      | Get function parameter info                         |
-| `lsp_diagnostics`         | Get errors and warnings                             |
+| `lsp_diagnostics`         | Get errors and warnings (supports `wait_for_reanalysis: true` to ensure fresh results) |
 | `lsp_formatting`          | Format a document                                   |
 | `lsp_range_formatting`    | Format a selection                                  |
 | `lsp_call_hierarchy`      | See who calls a function / what it calls            |

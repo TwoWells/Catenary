@@ -15,6 +15,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+//! Catenary MCP server and CLI.
+//!
+//! This is the main entry point for the Catenary multiplexing bridge.
+//! It can be run as an MCP server or as a CLI tool to list and monitor sessions.
+
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -32,65 +37,73 @@ use catenary_mcp::lsp;
 use catenary_mcp::mcp::McpServer;
 use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
 
+/// Command-line arguments for Catenary.
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
 #[command(about = "Multiplexing bridge between MCP and multiple LSP servers")]
 struct Args {
+    /// The subcommand to run.
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// LSP servers to spawn in "lang:command" format (e.g., "rust:rust-analyzer")
+    /// LSP servers to spawn in "lang:command" format (e.g., "rust:rust-analyzer").
     /// Can be specified multiple times. These override/append to the config file.
     #[arg(short, long = "lsp", global = true)]
     lsps: Vec<String>,
 
-    /// Path to configuration file
+    /// Path to configuration file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Workspace root directory
+    /// Workspace root directory.
     #[arg(short, long, default_value = ".", global = true)]
     root: PathBuf,
 
-    /// Document idle timeout in seconds before auto-close (0 to disable)
-    /// Overrides config file if set (default in config is 300)
+    /// Document idle timeout in seconds before auto-close (0 to disable).
+    /// Overrides config file if set (default in config is 300).
     #[arg(long, global = true)]
     idle_timeout: Option<u64>,
 }
 
+/// Subcommands supported by Catenary.
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the MCP server (default if no subcommand given)
+    /// Run the MCP server (default if no subcommand given).
     Serve,
 
-    /// List active Catenary sessions
+    /// List active Catenary sessions.
     List,
 
-    /// Monitor events from a session
+    /// Monitor events from a session.
     Monitor {
-        /// Session ID or row number (use 'catenary list' to see available sessions)
+        /// Session ID or row number (use 'catenary list' to see available sessions).
         id: String,
 
-        /// Show raw JSON output
+        /// Show raw JSON output.
         #[arg(long)]
         raw: bool,
 
-        /// Disable colored output
+        /// Disable colored output.
         #[arg(long)]
         nocolor: bool,
 
-        /// Filter events by regex pattern
+        /// Filter events by regex pattern.
         #[arg(long, short)]
         filter: Option<String>,
     },
 
-    /// Show status of a session
+    /// Show status of a session.
     Status {
-        /// Session ID (use 'catenary list' to see available sessions)
+        /// Session ID (use 'catenary list' to see available sessions).
         id: String,
     },
 }
 
+/// Entry point for the Catenary binary.
+///
+/// # Errors
+///
+/// Returns an error if the subcommand fails.
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -109,6 +122,11 @@ async fn main() -> Result<()> {
 }
 
 /// Run the MCP server (main functionality)
+/// Runs the MCP server.
+///
+/// # Errors
+///
+/// Returns an error if the server fails to start or encounters an internal error.
 async fn run_server(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("catenary=info".parse()?))
@@ -243,6 +261,11 @@ async fn run_server(args: Args) -> Result<()> {
 }
 
 /// List all active sessions
+/// Runs the session list command.
+///
+/// # Errors
+///
+/// Returns an error if listing sessions fails.
 fn run_list() -> Result<()> {
     let sessions = session::list_sessions()?;
 
@@ -336,6 +359,11 @@ fn resolve_session_id(id: &str) -> Result<session::SessionInfo> {
 }
 
 /// Monitor events from a session
+/// Runs the monitor command.
+///
+/// # Errors
+///
+/// Returns an error if the session cannot be found or monitoring fails.
 fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<String>) -> Result<()> {
     // Resolve session ID (supports row numbers and prefix matching)
     let session = resolve_session_id(id)?;
@@ -383,6 +411,11 @@ fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<String>) -> Re
 }
 
 /// Show status of a session
+/// Runs the status command.
+///
+/// # Errors
+///
+/// Returns an error if the session cannot be found.
 fn run_status(id: &str) -> Result<()> {
     let session = find_session(id)?;
 

@@ -36,6 +36,7 @@ pub struct ClientManager {
 }
 
 impl ClientManager {
+    /// Creates a new `ClientManager`.
     pub fn new(config: Config, root: PathBuf, broadcaster: EventBroadcaster) -> Self {
         Self {
             config,
@@ -46,6 +47,13 @@ impl ClientManager {
     }
 
     /// Gets an active client for the given language, spawning it if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No LSP server is configured for the language.
+    /// - The server fails to spawn.
+    /// - The server fails to initialize.
     pub async fn get_client(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
         let mut clients = self.active_clients.lock().await;
 
@@ -137,15 +145,6 @@ impl ClientManager {
     pub async fn shutdown_all(&self) {
         let mut clients = self.active_clients.lock().await;
         for (lang, client_mutex) in clients.drain() {
-            // We need to unwrap the Arc if possible, or lock and shutdown.
-            // Since we are shutting down the manager, we likely own the last references
-            // if other tasks (like handlers) have finished.
-            // However, handlers might still hold references.
-
-            // Just lock and shutdown. LspClient::shutdown handles repeated calls gracefully?
-            // LspClient::shutdown sends "shutdown" request.
-
-            // Ideally we try_unwrap, but locking is safer if there are stragglers.
             {
                 let mut client = client_mutex.lock().await;
                 if client.is_alive()

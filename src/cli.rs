@@ -20,21 +20,22 @@
 use crossterm::tty::IsTty;
 use std::io::stdout;
 
-/// Configuration for color output
+/// Configuration for color output.
 #[derive(Debug, Clone)]
 pub struct ColorConfig {
+    /// Whether color output is enabled.
     pub enabled: bool,
 }
 
 impl ColorConfig {
-    /// Create a new ColorConfig, auto-detecting TTY unless nocolor is true
+    /// Create a new `ColorConfig`, auto-detecting TTY unless `nocolor` is true.
     pub fn new(nocolor: bool) -> Self {
         Self {
             enabled: !nocolor && stdout().is_tty(),
         }
     }
 
-    /// ANSI escape code for green (incoming/request)
+    /// ANSI escape code for green (incoming/request).
     pub fn green(&self, s: &str) -> String {
         if self.enabled {
             format!("\x1b[32m{}\x1b[0m", s)
@@ -43,7 +44,7 @@ impl ColorConfig {
         }
     }
 
-    /// ANSI escape code for blue (outgoing/response)
+    /// ANSI escape code for blue (outgoing/response).
     pub fn blue(&self, s: &str) -> String {
         if self.enabled {
             format!("\x1b[34m{}\x1b[0m", s)
@@ -52,7 +53,7 @@ impl ColorConfig {
         }
     }
 
-    /// ANSI escape code for red (errors)
+    /// ANSI escape code for red (errors).
     pub fn red(&self, s: &str) -> String {
         if self.enabled {
             format!("\x1b[31m{}\x1b[0m", s)
@@ -61,7 +62,7 @@ impl ColorConfig {
         }
     }
 
-    /// ANSI escape code for cyan (language names)
+    /// ANSI escape code for cyan (language names).
     pub fn cyan(&self, s: &str) -> String {
         if self.enabled {
             format!("\x1b[36m{}\x1b[0m", s)
@@ -70,7 +71,7 @@ impl ColorConfig {
         }
     }
 
-    /// ANSI escape code for dim text
+    /// ANSI escape code for dim text.
     pub fn dim(&self, s: &str) -> String {
         if self.enabled {
             format!("\x1b[2m{}\x1b[0m", s)
@@ -80,14 +81,14 @@ impl ColorConfig {
     }
 }
 
-/// Get the terminal width, defaulting to 80 if unable to detect
+/// Get the terminal width, defaulting to 80 if unable to detect.
 pub fn terminal_width() -> usize {
     crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(80)
 }
 
-/// Truncate a string to max_len characters, adding "..." if truncated
+/// Truncate a string to `max_len` characters, adding "..." if truncated.
 pub fn truncate(s: &str, max_len: usize) -> String {
     if max_len <= 3 {
         return ".".repeat(max_len.min(3));
@@ -99,20 +100,27 @@ pub fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Column width configuration for the list command
+/// Column width configuration for the list command.
 #[derive(Debug)]
 pub struct ColumnWidths {
+    /// Width of the row number column.
     pub row_num: usize,
+    /// Width of the ID column.
     pub id: usize,
+    /// Width of the PID column.
     pub pid: usize,
+    /// Width of the workspace column.
     pub workspace: usize,
+    /// Width of the client column.
     pub client: usize,
+    /// Width of the languages column.
     pub languages: usize,
+    /// Width of the started time column.
     pub started: usize,
 }
 
 impl ColumnWidths {
-    /// Calculate column widths based on terminal width
+    /// Calculate column widths based on terminal width.
     /// Columns: # | ID | PID | WORKSPACE | CLIENT | LANGUAGES | STARTED
     pub fn calculate(term_width: usize) -> Self {
         // Fixed minimum widths

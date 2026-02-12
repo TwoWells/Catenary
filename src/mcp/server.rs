@@ -30,6 +30,10 @@ pub trait ToolHandler: Send + Sync {
     fn list_tools(&self) -> Vec<Tool>;
 
     /// Handles a tool call and returns the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tool call fails for reasons other than the tool itself reporting an error.
     fn call_tool(&self, name: &str, arguments: Option<serde_json::Value>)
     -> Result<CallToolResult>;
 }
@@ -38,6 +42,7 @@ pub trait ToolHandler: Send + Sync {
 /// Callback invoked when MCP client info is received during initialize.
 pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 
+/// An MCP server implementation.
 pub struct McpServer<H: ToolHandler> {
     handler: H,
     initialized: bool,
@@ -46,6 +51,7 @@ pub struct McpServer<H: ToolHandler> {
 }
 
 impl<H: ToolHandler> McpServer<H> {
+    /// Creates a new `McpServer`.
     pub fn new(handler: H, broadcaster: EventBroadcaster) -> Self {
         Self {
             handler,
@@ -62,6 +68,10 @@ impl<H: ToolHandler> McpServer<H> {
     }
 
     /// Runs the MCP server, reading from stdin and writing to stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading from stdin or writing to stdout fails.
     pub fn run(&mut self) -> Result<()> {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();

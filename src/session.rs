@@ -29,61 +29,92 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
-/// Session metadata stored in info.json
+/// Session metadata stored in info.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
+    /// Unique session ID.
     pub id: String,
+    /// Process ID of the Catenary instance.
     pub pid: u32,
+    /// Path to the workspace root.
     pub workspace: String,
+    /// When the session started.
     pub started_at: DateTime<Utc>,
+    /// Name of the connected MCP client.
     #[serde(default)]
     pub client_name: Option<String>,
+    /// Version of the connected MCP client.
     #[serde(default)]
     pub client_version: Option<String>,
 }
 
-/// An event that can be broadcast to listeners
+/// An event that can be broadcast to listeners.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEvent {
+    /// When the event occurred.
     pub timestamp: DateTime<Utc>,
+    /// The specific event data.
     #[serde(flatten)]
     pub kind: EventKind,
 }
 
+/// Types of session events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
-    /// Server state changed
-    ServerState { language: String, state: String },
-    /// Progress update from LSP server
-    Progress {
+    /// Server state changed.
+    ServerState {
+        /// The language ID of the server.
         language: String,
+        /// The new state.
+        state: String,
+    },
+    /// Progress update from LSP server.
+    Progress {
+        /// The language ID of the server.
+        language: String,
+        /// The title of the progress operation.
         title: String,
+        /// The optional progress message.
         message: Option<String>,
+        /// The optional progress percentage (0-100).
         percentage: Option<u32>,
     },
-    /// Progress completed
-    ProgressEnd { language: String },
-    /// Tool was called
-    ToolCall { tool: String, file: Option<String> },
-    /// Tool call completed
-    ToolResult {
+    /// Progress completed.
+    ProgressEnd {
+        /// The language ID of the server.
+        language: String,
+    },
+    /// Tool was called.
+    ToolCall {
+        /// The name of the tool called.
         tool: String,
+        /// The optional file path involved.
+        file: Option<String>,
+    },
+    /// Tool call completed.
+    ToolResult {
+        /// The name of the tool called.
+        tool: String,
+        /// Whether the tool call was successful.
         success: bool,
+        /// How long the tool call took in milliseconds.
         duration_ms: u64,
     },
-    /// Session started
+    /// Session started.
     Started,
-    /// Session ending
+    /// Session ending.
     Shutdown,
-    /// Raw MCP message (incoming or outgoing)
+    /// Raw MCP message (incoming or outgoing).
     McpMessage {
-        direction: String, // "in" or "out"
+        /// Direction of the message ("in" or "out").
+        direction: String,
+        /// The raw JSON-RPC message.
         message: serde_json::Value,
     },
 }
 
-/// Returns the base directory for session data
+/// Returns the base directory for session data.
 fn sessions_dir() -> Result<PathBuf> {
     let state_dir = dirs::state_dir()
         .or_else(dirs::data_local_dir)
@@ -91,15 +122,22 @@ fn sessions_dir() -> Result<PathBuf> {
     Ok(state_dir.join("catenary").join("sessions"))
 }
 
-/// An active session that broadcasts events
+/// An active session that broadcasts events.
 pub struct Session {
+    /// Metadata about the session.
     pub info: SessionInfo,
     session_dir: PathBuf,
     events_file: Arc<Mutex<File>>,
 }
 
 impl Session {
-    /// Create a new session
+    /// Create a new session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The session directory cannot be created.
+    /// - Metadata or event files cannot be created.
     pub fn create(workspace: &str) -> Result<Self> {
         let id = Self::generate_id();
         let sessions_base = sessions_dir()?;
@@ -141,7 +179,7 @@ impl Session {
         Ok(session)
     }
 
-    /// Generate a short unique session ID
+    /// Generate a short unique session ID.
     fn generate_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -157,7 +195,7 @@ impl Session {
         format!("{:x}{:x}{:x}", now as u32, pid, tid_hash)
     }
 
-    /// Update client info (called after MCP initialize)
+    /// Update client info (called after MCP initialize).
     pub fn set_client_info(&mut self, name: &str, version: &str) {
         self.info.client_name = Some(name.to_string());
         self.info.client_version = Some(version.to_string());
@@ -169,7 +207,7 @@ impl Session {
         }
     }
 
-    /// Broadcast an event to listeners
+    /// Broadcast an event to listeners.
     pub fn broadcast(&self, kind: EventKind) {
         let event = SessionEvent {
             timestamp: Utc::now(),
@@ -184,7 +222,7 @@ impl Session {
         }
     }
 
-    /// Get a broadcaster that can be cloned and shared
+    /// Get a broadcaster that can be cloned and shared.
     pub fn broadcaster(&self) -> EventBroadcaster {
         EventBroadcaster {
             events_file: self.events_file.clone(),
@@ -204,14 +242,14 @@ impl Drop for Session {
     }
 }
 
-/// Cloneable broadcaster for sharing across components
+/// Cloneable broadcaster for sharing across components.
 #[derive(Clone)]
 pub struct EventBroadcaster {
     events_file: Arc<Mutex<File>>,
 }
 
 impl EventBroadcaster {
-    /// Broadcast an event
+    /// Broadcast an event.
     pub fn send(&self, kind: EventKind) {
         let event = SessionEvent {
             timestamp: Utc::now(),
@@ -226,7 +264,11 @@ impl EventBroadcaster {
         }
     }
 
-    /// Create a no-op broadcaster (for when session is disabled)
+    /// Create a no-op broadcaster (for when session is disabled).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the null file cannot be opened or created.
     pub fn noop() -> Result<Self> {
         // Create a broadcaster that writes to /dev/null
         let file = OpenOptions::new()
@@ -246,7 +288,11 @@ impl EventBroadcaster {
     }
 }
 
-/// List all active sessions
+/// List all active sessions.
+///
+/// # Errors
+///
+/// Returns an error if the sessions directory cannot be read.
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     let sessions_base = sessions_dir()?;
 
@@ -281,7 +327,11 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     Ok(sessions)
 }
 
-/// Get a specific session by ID
+/// Get a specific session by ID.
+///
+/// # Errors
+///
+/// Returns an error if the session info file exists but cannot be read or parsed.
 pub fn get_session(id: &str) -> Result<Option<SessionInfo>> {
     let sessions_base = sessions_dir()?;
     let info_path = sessions_base.join(id).join("info.json");
@@ -302,7 +352,11 @@ pub fn get_session(id: &str) -> Result<Option<SessionInfo>> {
     }
 }
 
-/// Monitor events from a session (blocking iterator)
+/// Monitor events from a session (blocking iterator).
+///
+/// # Errors
+///
+/// Returns an error if the session does not exist or the events file cannot be opened.
 pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
     let sessions_base = sessions_dir()?;
     let events_path = sessions_base.join(id).join("events.jsonl");
@@ -320,7 +374,11 @@ pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
     }))
 }
 
-/// Tail events from a session (follows new events)
+/// Tail events from a session (follows new events).
+///
+/// # Errors
+///
+/// Returns an error if the session does not exist or the events file cannot be opened.
 pub fn tail_events(id: &str) -> Result<TailReader> {
     let sessions_base = sessions_dir()?;
     let events_path = sessions_base.join(id).join("events.jsonl");
@@ -332,7 +390,7 @@ pub fn tail_events(id: &str) -> Result<TailReader> {
     TailReader::new(events_path)
 }
 
-/// Reader that tails a file for new content
+/// Reader that tails a file for new content.
 pub struct TailReader {
     path: PathBuf,
     reader: BufReader<File>,
@@ -352,7 +410,11 @@ impl TailReader {
         })
     }
 
-    /// Read the next event, blocking if necessary
+    /// Read the next event, blocking if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading from the file fails.
     pub fn next_event(&mut self) -> Result<Option<SessionEvent>> {
         loop {
             let mut line = String::new();
@@ -388,7 +450,11 @@ impl TailReader {
     }
 }
 
-/// Get active languages for a session by reading its events
+/// Get active languages for a session by reading its events.
+///
+/// # Errors
+///
+/// Returns an error if the events file exists but cannot be read.
 pub fn active_languages(id: &str) -> Result<Vec<String>> {
     use std::collections::HashMap;
 
@@ -405,9 +471,8 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
     // Track server states: language -> state
     let mut states: HashMap<String, String> = HashMap::new();
 
-    for line in reader.lines() {
-        if let Ok(line) = line
-            && let Ok(event) = serde_json::from_str::<SessionEvent>(&line)
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(event) = serde_json::from_str::<SessionEvent>(&line)
             && let EventKind::ServerState { language, state } = event.kind
         {
             if state == "Dead" {

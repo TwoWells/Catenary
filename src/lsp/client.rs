@@ -74,6 +74,12 @@ pub struct LspClient {
 
 impl LspClient {
     /// Spawns the LSP server process and starts the response reader task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The server process cannot be spawned.
+    /// - Stdin or stdout cannot be captured.
     pub async fn spawn(
         program: &str,
         args: &[&str],
@@ -416,6 +422,13 @@ impl LspClient {
     }
 
     /// Performs the LSP initialize handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The root path is invalid.
+    /// - The initialize request fails.
+    /// - The server fails to respond.
     pub async fn initialize(&mut self, root: &Path) -> Result<InitializeResult> {
         let root_uri: Uri = format!("file://{}", root.display())
             .parse()
@@ -497,6 +510,10 @@ impl LspClient {
     }
 
     /// Sends shutdown request and exit notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shutdown request or exit notification fails.
     pub async fn shutdown(&mut self) -> Result<()> {
         // shutdown response varies by server (null, true, etc.) - ignore result
         let _: serde_json::Value = self.request("shutdown", serde_json::Value::Null).await?;
@@ -505,26 +522,46 @@ impl LspClient {
     }
 
     /// Notifies the LSP server that a document was opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) -> Result<()> {
         self.notify("textDocument/didOpen", params).await
     }
 
     /// Notifies the LSP server that a document changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<()> {
         self.notify("textDocument/didChange", params).await
     }
 
     /// Notifies the LSP server that a document was closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
     pub async fn did_close(&self, params: DidCloseTextDocumentParams) -> Result<()> {
         self.notify("textDocument/didClose", params).await
     }
 
     /// Gets hover information for a position in a document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         self.request("textDocument/hover", params).await
     }
 
     /// Gets the definition location for a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn definition(
         &self,
         params: GotoDefinitionParams,
@@ -533,6 +570,10 @@ impl LspClient {
     }
 
     /// Gets the type definition location for a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn type_definition(
         &self,
         params: GotoDefinitionParams,
@@ -541,6 +582,10 @@ impl LspClient {
     }
 
     /// Gets implementation locations for a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn implementation(
         &self,
         params: GotoDefinitionParams,
@@ -549,6 +594,10 @@ impl LspClient {
     }
 
     /// Gets all references to a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn references(
         &self,
         params: ReferenceParams,
@@ -557,6 +606,10 @@ impl LspClient {
     }
 
     /// Gets document symbols (outline) for a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn document_symbols(
         &self,
         params: DocumentSymbolParams,
@@ -565,6 +618,10 @@ impl LspClient {
     }
 
     /// Searches for symbols across the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn workspace_symbols(
         &self,
         params: WorkspaceSymbolParams,
@@ -573,6 +630,10 @@ impl LspClient {
     }
 
     /// Gets code actions (quick fixes, refactorings) for a range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn code_actions(
         &self,
         params: CodeActionParams,
@@ -581,6 +642,10 @@ impl LspClient {
     }
 
     /// Resolves a code action (e.g. fills in the 'edit' property).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn resolve_code_action(
         &self,
         code_action: lsp_types::CodeAction,
@@ -589,16 +654,28 @@ impl LspClient {
     }
 
     /// Computes a rename operation across the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         self.request("textDocument/rename", params).await
     }
 
     /// Gets completion suggestions at a position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         self.request("textDocument/completion", params).await
     }
 
     /// Gets signature help for a function call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn signature_help(
         &self,
         params: SignatureHelpParams,
@@ -607,6 +684,10 @@ impl LspClient {
     }
 
     /// Formats an entire document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn formatting(
         &self,
         params: DocumentFormattingParams,
@@ -615,6 +696,10 @@ impl LspClient {
     }
 
     /// Formats a range within a document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn range_formatting(
         &self,
         params: DocumentRangeFormattingParams,
@@ -623,6 +708,10 @@ impl LspClient {
     }
 
     /// Prepares call hierarchy for a position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn prepare_call_hierarchy(
         &self,
         params: CallHierarchyPrepareParams,
@@ -632,6 +721,10 @@ impl LspClient {
     }
 
     /// Gets incoming calls to a call hierarchy item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn incoming_calls(
         &self,
         params: CallHierarchyIncomingCallsParams,
@@ -640,6 +733,10 @@ impl LspClient {
     }
 
     /// Gets outgoing calls from a call hierarchy item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn outgoing_calls(
         &self,
         params: CallHierarchyOutgoingCallsParams,
@@ -648,6 +745,10 @@ impl LspClient {
     }
 
     /// Prepares type hierarchy for a position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn prepare_type_hierarchy(
         &self,
         params: TypeHierarchyPrepareParams,
@@ -657,6 +758,10 @@ impl LspClient {
     }
 
     /// Gets supertypes of a type hierarchy item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn supertypes(
         &self,
         params: TypeHierarchySupertypesParams,
@@ -665,6 +770,10 @@ impl LspClient {
     }
 
     /// Gets subtypes of a type hierarchy item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
     pub async fn subtypes(
         &self,
         params: TypeHierarchySubtypesParams,
@@ -707,7 +816,7 @@ impl LspClient {
 
         // Even if state is Ready, if we just spawned, wait a bit to see if
         // the server starts indexing (e.g. rust-analyzer takes a moment to send $/progress).
-        if self.spawn_time.elapsed() < Duration::from_millis(1000) {
+        if self.spawn_time.elapsed() < Duration::from_millis(3000) {
             return false;
         }
 
@@ -730,7 +839,8 @@ impl LspClient {
     }
 
     /// Waits until server is ready (not indexing).
-    /// Returns true if ready, false if server died.
+    ///
+    /// Returns `true` if ready, `false` if server died.
     pub async fn wait_ready(&self) -> bool {
         let poll_interval = Duration::from_millis(100);
 
@@ -746,10 +856,11 @@ impl LspClient {
     }
 
     /// Robustly waits for analysis to complete after a change.
+    ///
     /// Includes a grace period to allow the server to start indexing.
     pub async fn wait_for_analysis(&self) -> bool {
         // Give server a moment to start indexing
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         self.wait_ready().await
     }
 }

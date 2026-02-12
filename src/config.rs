@@ -20,17 +20,18 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Overall configuration for Catenary.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    /// Global idle timeout in seconds (default: 300)
+    /// Global idle timeout in seconds (default: 300).
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
 
-    /// Wait for LSP servers to be ready before executing requests (default: true)
+    /// Wait for LSP servers to be ready before executing requests (default: true).
     #[serde(default = "default_smart_wait")]
     pub smart_wait: bool,
 
-    /// Server definitions keyed by language ID (e.g., "rust", "python")
+    /// Server definitions keyed by language ID (e.g., "rust", "python").
     #[serde(default)]
     pub server: HashMap<String, ServerConfig>,
 }
@@ -39,16 +40,17 @@ fn default_smart_wait() -> bool {
     true
 }
 
+/// Configuration for a specific LSP server.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
-    /// The command to execute (e.g., "rust-analyzer")
+    /// The command to execute (e.g., "rust-analyzer").
     pub command: String,
 
-    /// Arguments to pass to the command
+    /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
 
-    /// Initialization options to pass to the LSP server
+    /// Initialization options to pass to the LSP server.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
 }
@@ -59,6 +61,13 @@ fn default_idle_timeout() -> u64 {
 
 impl Config {
     /// Load configuration from standard paths or a specific file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Default values cannot be set.
+    /// - The configuration file exists but cannot be read or parsed.
+    /// - The configuration cannot be deserialized into the `Config` struct.
     pub fn load(explicit_file: Option<PathBuf>) -> Result<Self> {
         let mut builder = config::Config::builder();
 
