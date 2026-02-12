@@ -20,6 +20,9 @@
 //! This is the main entry point for the Catenary multiplexing bridge.
 //! It can be run as an MCP server or as a CLI tool to list and monitor sessions.
 
+#![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
+#![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
+
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -116,7 +119,7 @@ async fn main() -> Result<()> {
             raw,
             nocolor,
             filter,
-        }) => run_monitor(&id, raw, nocolor, filter),
+        }) => run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => run_status(&id),
     }
 }
@@ -144,7 +147,7 @@ async fn run_server(args: Args) -> Result<()> {
     // Merge CLI LSPs into config
     for lsp_spec in args.lsps {
         let (lang, command_str) = lsp_spec.split_once(':').ok_or_else(|| {
-            anyhow::anyhow!("Invalid LSP spec: {}. Expected 'lang:command'", lsp_spec)
+            anyhow::anyhow!("Invalid LSP spec: {lsp_spec}. Expected 'lang:command'")
         })?;
 
         let lang = lang.trim().to_string();
@@ -156,7 +159,7 @@ async fn run_server(args: Args) -> Result<()> {
             .next()
             .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?
             .to_string();
-        let cmd_args: Vec<String> = parts.map(|s| s.to_string()).collect();
+        let cmd_args: Vec<String> = parts.map(std::string::ToString::to_string).collect();
 
         config.server.insert(
             lang,
@@ -297,7 +300,7 @@ fn run_list() -> Result<()> {
 
     for (idx, s) in sessions.iter().enumerate() {
         let client = match (&s.client_name, &s.client_version) {
-            (Some(name), Some(ver)) => format!("{} v{}", name, ver),
+            (Some(name), Some(ver)) => format!("{name} v{ver}"),
             (Some(name), None) => name.clone(),
             _ => "-".to_string(),
         };
@@ -364,7 +367,7 @@ fn resolve_session_id(id: &str) -> Result<session::SessionInfo> {
 /// # Errors
 ///
 /// Returns an error if the session cannot be found or monitoring fails.
-fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<String>) -> Result<()> {
+fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Result<()> {
     // Resolve session ID (supports row numbers and prefix matching)
     let session = resolve_session_id(id)?;
     let full_id = session.id;
@@ -377,33 +380,30 @@ fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<String>) -> Re
         .as_ref()
         .map(|f| Regex::new(f))
         .transpose()
-        .map_err(|e| anyhow::anyhow!("Invalid filter regex: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Invalid filter regex: {e}"))?;
 
-    println!("Monitoring session {} (Ctrl+C to stop)\n", full_id);
+    println!("Monitoring session {full_id} (Ctrl+C to stop)\n");
 
     let mut reader = session::tail_events(&full_id)?;
 
     loop {
-        match reader.next_event()? {
-            Some(event) => {
-                // Apply filter if set
-                if let Some(ref re) = filter_regex {
-                    let event_str = format!("{:?}", event.kind);
-                    if !re.is_match(&event_str) {
-                        continue;
-                    }
+        if let Some(event) = reader.next_event()? {
+            // Apply filter if set
+            if let Some(ref re) = filter_regex {
+                let event_str = format!("{:?}", event.kind);
+                if !re.is_match(&event_str) {
+                    continue;
                 }
+            }
 
-                if raw {
-                    print_event_raw(&event);
-                } else {
-                    print_event_annotated(&event, &colors, term_width);
-                }
+            if raw {
+                print_event_raw(&event);
+            } else {
+                print_event_annotated(&event, &colors, term_width);
             }
-            None => {
-                println!("\nSession ended");
-                break;
-            }
+        } else {
+            println!("\nSession ended");
+            break;
         }
     }
 
@@ -429,9 +429,9 @@ fn run_status(id: &str) -> Result<()> {
     );
 
     if let Some(name) = &session.client_name {
-        print!("Client: {}", name);
+        print!("Client: {name}");
         if let Some(ver) = &session.client_version {
-            print!(" v{}", ver);
+            print!(" v{ver}");
         }
         println!();
     }
@@ -460,10 +460,10 @@ fn find_session(id: &str) -> Result<session::SessionInfo> {
     let matches: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(id)).collect();
 
     match matches.len() {
-        0 => anyhow::bail!("No session found matching '{}'", id),
+        0 => anyhow::bail!("No session found matching '{id}'"),
         1 => Ok(matches[0].clone()),
         _ => {
-            eprintln!("Multiple sessions match '{}':", id);
+            eprintln!("Multiple sessions match '{id}':");
             for s in matches {
                 eprintln!("  {}", s.id);
             }
@@ -494,36 +494,33 @@ fn format_duration_ago(timestamp: chrono::DateTime<Utc>) -> String {
 fn print_event_raw(event: &SessionEvent) {
     let time = event.timestamp.format("%H:%M:%S");
 
-    match &event.kind {
-        EventKind::McpMessage { direction, message } => {
-            let arrow = if direction == "in" { "→" } else { "←" };
-            println!("[{}] {}", time, arrow);
-            let pretty = serde_json::to_string_pretty(message).unwrap_or_default();
-            println!("{}", pretty);
-        }
-        _ => {
-            // For non-MCP events, print as JSON
-            let json = serde_json::to_string_pretty(&event.kind).unwrap_or_default();
-            println!("[{}] {}", time, json);
-        }
+    if let EventKind::McpMessage { direction, message } = &event.kind {
+        let arrow = if direction == "in" { "→" } else { "←" };
+        println!("[{time}] {arrow}");
+        let pretty = serde_json::to_string_pretty(message).unwrap_or_default();
+        println!("{pretty}");
+    } else {
+        // For non-MCP events, print as JSON
+        let json = serde_json::to_string_pretty(&event.kind).unwrap_or_default();
+        println!("[{time}] {json}");
     }
 }
 
 /// Print an event with annotations and colors
 fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width: usize) {
     let time = event.timestamp.format("%H:%M:%S");
-    let time_str = colors.dim(&format!("[{}]", time));
+    let time_str = colors.dim(&format!("[{time}]"));
 
     match &event.kind {
         EventKind::Started => {
-            println!("{} Session started", time_str);
+            println!("{time_str} Session started");
         }
         EventKind::Shutdown => {
-            println!("{} Session shutting down", time_str);
+            println!("{time_str} Session shutting down");
         }
         EventKind::ServerState { language, state } => {
             let lang = colors.cyan(language);
-            println!("{} {}: {}", time_str, lang, state);
+            println!("{time_str} {lang}: {state}");
         }
         EventKind::Progress {
             language,
@@ -532,24 +529,24 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
             percentage,
         } => {
             let lang = colors.cyan(language);
-            let pct = percentage.map(|p| format!(" {}%", p)).unwrap_or_default();
+            let pct = percentage.map(|p| format!(" {p}%")).unwrap_or_default();
             let msg = message
                 .as_ref()
-                .map(|m| format!(" ({})", m))
+                .map(|m| format!(" ({m})"))
                 .unwrap_or_default();
-            println!("{} {}: {}{}{}", time_str, lang, title, pct, msg);
+            println!("{time_str} {lang}: {title}{pct}{msg}");
         }
         EventKind::ProgressEnd { language } => {
             let lang = colors.cyan(language);
-            println!("{} {}: Ready", time_str, lang);
+            println!("{time_str} {lang}: Ready");
         }
         EventKind::ToolCall { tool, file } => {
             let arrow = colors.green("→");
             let file_str = file
                 .as_ref()
-                .map(|f| format!(" on {}", f))
+                .map(|f| format!(" on {f}"))
                 .unwrap_or_default();
-            println!("{} {} {}{}", time_str, arrow, tool, file_str);
+            println!("{time_str} {arrow} {tool}{file_str}");
         }
         EventKind::ToolResult {
             tool,
@@ -562,10 +559,7 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
             } else {
                 colors.red("error")
             };
-            println!(
-                "{} {} {} -> {} ({}ms)",
-                time_str, arrow, tool, status, duration_ms
-            );
+            println!("{time_str} {arrow} {tool} -> {status} ({duration_ms}ms)");
         }
         EventKind::McpMessage { direction, message } => {
             let arrow_colored = if direction == "in" {
@@ -583,7 +577,7 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
             let max_summary_len = term_width.saturating_sub(prefix_len);
 
             let summary = cli::truncate(&summary, max_summary_len);
-            println!("{} {} {}", time_str, arrow_colored, summary);
+            println!("{time_str} {arrow_colored} {summary}");
 
             // Check for errors in response
             if direction == "out"
@@ -595,7 +589,7 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
-                println!("    {}", colors.red(&format!("Error: {}", err_msg)));
+                println!("    {}", colors.red(&format!("Error: {err_msg}")));
             }
         }
     }
@@ -603,75 +597,78 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
 
 /// Extract a human-readable summary from an MCP message
 fn extract_mcp_summary(message: &serde_json::Value, colors: &ColorConfig) -> String {
-    let obj = match message.as_object() {
-        Some(o) => o,
-        None => return message.to_string(),
+    let Some(obj) = message.as_object() else {
+        return message.to_string();
     };
 
     // Check if this is a request (has method)
-    if let Some(method) = obj.get("method").and_then(|m| m.as_str()) {
-        let id = obj.get("id").map(|i| format!("#{}", i)).unwrap_or_default();
+    obj.get("method").and_then(|m| m.as_str()).map_or_else(
+        || {
+            // Check if this is a response (has result or error)
+            if obj.contains_key("result") || obj.contains_key("error") {
+                let id = obj.get("id").map(|i| format!("#{i}")).unwrap_or_default();
 
-        // Extract params summary based on method
-        let params_summary = match method {
-            "tools/call" => {
-                if let Some(params) = obj.get("params")
-                    && let Some(name) = params.get("name").and_then(|n| n.as_str())
-                {
-                    // Try to get file argument if present
-                    let file_info = params
-                        .get("arguments")
-                        .and_then(|a| a.get("file_path").or_else(|| a.get("path")))
-                        .and_then(|f| f.as_str())
-                        .map(|f| {
-                            // Just show filename, not full path
-                            std::path::Path::new(f)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or(f)
-                        })
-                        .map(|f| format!(" ({})", f))
-                        .unwrap_or_default();
-                    format!("{}{}", colors.cyan(name), file_info)
+                if obj.contains_key("error") {
+                    format!("{} {}", colors.red("error"), id)
                 } else {
-                    String::new()
+                    format!("result {id}")
                 }
+            } else {
+                // Fallback: show compact JSON
+                serde_json::to_string(message).unwrap_or_default()
             }
-            "initialize" => {
-                if let Some(params) = obj.get("params")
-                    && let Some(info) = params.get("clientInfo")
-                    && let Some(name) = info.get("name").and_then(|n| n.as_str())
-                {
-                    format!("from {}", name)
-                } else {
-                    String::new()
+        },
+        |method| {
+            let id = obj.get("id").map(|i| format!("#{i}")).unwrap_or_default();
+
+            // Extract params summary based on method
+            let params_summary = match method {
+                "tools/call" => {
+                    if let Some(params) = obj.get("params")
+                        && let Some(name) = params.get("name").and_then(|n| n.as_str())
+                    {
+                        // Try to get file argument if present
+                        let file_info = params
+                            .get("arguments")
+                            .and_then(|a| a.get("file_path").or_else(|| a.get("path")))
+                            .and_then(|f| f.as_str())
+                            .map(|f| {
+                                // Just show filename, not full path
+                                std::path::Path::new(f)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(f)
+                            })
+                            .map(|f| format!(" ({f})"))
+                            .unwrap_or_default();
+                        format!("{}{}", colors.cyan(name), file_info)
+                    } else {
+                        String::new()
+                    }
                 }
+                "initialize" => {
+                    if let Some(params) = obj.get("params")
+                        && let Some(info) = params.get("clientInfo")
+                        && let Some(name) = info.get("name").and_then(|n| n.as_str())
+                    {
+                        format!("from {name}")
+                    } else {
+                        String::new()
+                    }
+                }
+                _ => String::new(),
+            };
+
+            if params_summary.is_empty() {
+                format!("{method} {id}")
+            } else {
+                format!("{method} {params_summary} {id}")
             }
-            _ => String::new(),
-        };
-
-        if params_summary.is_empty() {
-            format!("{} {}", method, id)
-        } else {
-            format!("{} {} {}", method, params_summary, id)
-        }
-    }
-    // Check if this is a response (has result or error)
-    else if obj.contains_key("result") || obj.contains_key("error") {
-        let id = obj.get("id").map(|i| format!("#{}", i)).unwrap_or_default();
-
-        if obj.contains_key("error") {
-            format!("{} {}", colors.red("error"), id)
-        } else {
-            format!("result {}", id)
-        }
-    } else {
-        // Fallback: show compact JSON
-        serde_json::to_string(message).unwrap_or_default()
-    }
+        },
+    )
 }
 
-/// Print an event in human-readable format (used by run_status)
+/// Print an event in human-readable format (used by `run_status`)
 fn print_event(event: &SessionEvent) {
     let colors = ColorConfig::new(false);
     let term_width = cli::terminal_width();

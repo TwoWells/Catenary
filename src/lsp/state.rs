@@ -54,22 +54,24 @@ pub enum ServerState {
 
 impl ServerState {
     /// Create from atomic u8 value.
-    pub fn from_u8(value: u8) -> Self {
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
         match value {
-            0 => ServerState::Initializing,
-            1 => ServerState::Indexing,
-            2 => ServerState::Ready,
-            _ => ServerState::Dead,
+            0 => Self::Initializing,
+            1 => Self::Indexing,
+            2 => Self::Ready,
+            _ => Self::Dead,
         }
     }
 
     /// Convert to atomic u8 value.
-    pub fn as_u8(self) -> u8 {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
         match self {
-            ServerState::Initializing => 0,
-            ServerState::Indexing => 1,
-            ServerState::Ready => 2,
-            ServerState::Dead => 3,
+            Self::Initializing => 0,
+            Self::Indexing => 1,
+            Self::Ready => 2,
+            Self::Dead => 3,
         }
     }
 }
@@ -102,6 +104,7 @@ pub struct ProgressTracker {
 
 impl ProgressTracker {
     /// Creates a new `ProgressTracker`.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -139,11 +142,13 @@ impl ProgressTracker {
     }
 
     /// Returns true if server is busy with any progress operations.
+    #[must_use]
     pub fn is_busy(&self) -> bool {
         !self.active_progress.is_empty()
     }
 
     /// Returns the most significant active progress (longest running or lowest percentage).
+    #[must_use]
     pub fn primary_progress(&self) -> Option<&ProgressState> {
         self.active_progress
             .values()

@@ -115,18 +115,20 @@ pub enum EventKind {
 }
 
 /// Returns the base directory for session data.
-fn sessions_dir() -> Result<PathBuf> {
+fn sessions_dir() -> PathBuf {
     let state_dir = dirs::state_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    Ok(state_dir.join("catenary").join("sessions"))
+    state_dir.join("catenary").join("sessions")
 }
 
 /// An active session that broadcasts events.
 pub struct Session {
     /// Metadata about the session.
     pub info: SessionInfo,
-    session_dir: PathBuf,
+
+    dir: PathBuf,
+
     events_file: Arc<Mutex<File>>,
 }
 
@@ -140,28 +142,40 @@ impl Session {
     /// - Metadata or event files cannot be created.
     pub fn create(workspace: &str) -> Result<Self> {
         let id = Self::generate_id();
-        let sessions_base = sessions_dir()?;
+
+        let sessions_base = sessions_dir();
+
         let session_dir = sessions_base.join(&id);
 
         fs::create_dir_all(&session_dir)
             .with_context(|| format!("Failed to create session dir: {}", session_dir.display()))?;
 
         let info = SessionInfo {
-            id: id.clone(),
+            id,
+
             pid: std::process::id(),
+
             workspace: workspace.to_string(),
+
             started_at: Utc::now(),
+
             client_name: None,
+
             client_version: None,
         };
 
         // Write info.json
+
         let info_path = session_dir.join("info.json");
+
         let info_file = File::create(&info_path)?;
+
         serde_json::to_writer_pretty(info_file, &info)?;
 
         // Create events.jsonl
+
         let events_path = session_dir.join("events.jsonl");
+
         let events_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -169,11 +183,14 @@ impl Session {
 
         let session = Self {
             info,
-            session_dir,
+
+            dir: session_dir,
+
             events_file: Arc::new(Mutex::new(events_file)),
         };
 
         // Broadcast started event
+
         session.broadcast(EventKind::Started);
 
         Ok(session)
@@ -182,26 +199,42 @@ impl Session {
     /// Generate a short unique session ID.
     fn generate_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(std::time::Duration::ZERO)
             .as_millis();
-        let pid = std::process::id();
-        // Use thread ID to avoid collisions in tests
-        let tid = format!("{:?}", std::thread::current().id());
-        // Simple hash of tid to keep it short
-        let tid_hash = tid.bytes().fold(0u32, |acc, x| acc.wrapping_add(x as u32));
 
-        format!("{:x}{:x}{:x}", now as u32, pid, tid_hash)
+        let pid = std::process::id();
+
+        // Use thread ID to avoid collisions in tests
+
+        let tid = format!("{:?}", std::thread::current().id());
+
+        // Simple hash of tid to keep it short
+
+        let tid_hash = tid
+            .bytes()
+            .fold(0u32, |acc, x| acc.wrapping_add(u32::from(x)));
+
+        format!(
+            "{:x}{:x}{:x}",
+            u32::try_from(now).unwrap_or(0),
+            pid,
+            tid_hash
+        )
     }
 
     /// Update client info (called after MCP initialize).
     pub fn set_client_info(&mut self, name: &str, version: &str) {
         self.info.client_name = Some(name.to_string());
+
         self.info.client_version = Some(version.to_string());
 
         // Rewrite info.json
-        let info_path = self.session_dir.join("info.json");
+
+        let info_path = self.dir.join("info.json");
+
         if let Ok(file) = File::create(&info_path) {
             let _ = serde_json::to_writer_pretty(file, &self.info);
         }
@@ -211,18 +244,21 @@ impl Session {
     pub fn broadcast(&self, kind: EventKind) {
         let event = SessionEvent {
             timestamp: Utc::now(),
+
             kind,
         };
 
         if let Ok(mut file) = self.events_file.lock()
             && let Ok(json) = serde_json::to_string(&event)
         {
-            let _ = writeln!(file, "{}", json);
+            let _ = writeln!(file, "{json}");
+
             let _ = file.flush();
         }
     }
 
     /// Get a broadcaster that can be cloned and shared.
+    #[must_use]
     pub fn broadcaster(&self) -> EventBroadcaster {
         EventBroadcaster {
             events_file: self.events_file.clone(),
@@ -233,10 +269,12 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         // Broadcast shutdown
+
         self.broadcast(EventKind::Shutdown);
 
         // Clean up session directory
-        if let Err(e) = fs::remove_dir_all(&self.session_dir) {
+
+        if let Err(e) = fs::remove_dir_all(&self.dir) {
             warn!("Failed to clean up session directory: {}", e);
         }
     }
@@ -259,7 +297,7 @@ impl EventBroadcaster {
         if let Ok(mut file) = self.events_file.lock()
             && let Ok(json) = serde_json::to_string(&event)
         {
-            let _ = writeln!(file, "{}", json);
+            let _ = writeln!(file, "{json}");
             let _ = file.flush();
         }
     }
@@ -294,7 +332,7 @@ impl EventBroadcaster {
 ///
 /// Returns an error if the sessions directory cannot be read.
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
-    let sessions_base = sessions_dir()?;
+    let sessions_base = sessions_dir();
 
     if !sessions_base.exists() {
         return Ok(vec![]);
@@ -333,7 +371,7 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
 ///
 /// Returns an error if the session info file exists but cannot be read or parsed.
 pub fn get_session(id: &str) -> Result<Option<SessionInfo>> {
-    let sessions_base = sessions_dir()?;
+    let sessions_base = sessions_dir();
     let info_path = sessions_base.join(id).join("info.json");
 
     if !info_path.exists() {
@@ -358,11 +396,11 @@ pub fn get_session(id: &str) -> Result<Option<SessionInfo>> {
 ///
 /// Returns an error if the session does not exist or the events file cannot be opened.
 pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
-    let sessions_base = sessions_dir()?;
+    let sessions_base = sessions_dir();
     let events_path = sessions_base.join(id).join("events.jsonl");
 
     if !events_path.exists() {
-        anyhow::bail!("Session not found: {}", id);
+        anyhow::bail!("Session not found: {id}");
     }
 
     let file = File::open(&events_path)?;
@@ -380,11 +418,11 @@ pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
 ///
 /// Returns an error if the session does not exist or the events file cannot be opened.
 pub fn tail_events(id: &str) -> Result<TailReader> {
-    let sessions_base = sessions_dir()?;
+    let sessions_base = sessions_dir();
     let events_path = sessions_base.join(id).join("events.jsonl");
 
     if !events_path.exists() {
-        anyhow::bail!("Session not found: {}", id);
+        anyhow::bail!("Session not found: {id}");
     }
 
     TailReader::new(events_path)
@@ -458,7 +496,7 @@ impl TailReader {
 pub fn active_languages(id: &str) -> Result<Vec<String>> {
     use std::collections::HashMap;
 
-    let sessions_base = sessions_dir()?;
+    let sessions_base = sessions_dir();
     let events_path = sessions_base.join(id).join("events.jsonl");
 
     if !events_path.exists() {
@@ -488,17 +526,31 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
     Ok(languages)
 }
 
-/// Check if a process is still running
+/// Check if a process is still running.
 fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        // kill with signal 0 just checks if process exists
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        // On Linux, checking /proc/<pid> is safe and doesn't require unsafe blocks.
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // On other Unix systems, we use the kill command with signal 0.
+        // This is safe but slightly slower than a syscall.
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     #[cfg(not(unix))]
     {
-        // On non-Unix, assume alive (could use platform-specific APIs)
+        // On non-Unix, assume alive (could use platform-specific APIs).
         true
     }
 }

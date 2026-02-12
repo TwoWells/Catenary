@@ -37,6 +37,7 @@ pub struct ClientManager {
 
 impl ClientManager {
     /// Creates a new `ClientManager`.
+    #[must_use]
     pub fn new(config: Config, root: PathBuf, broadcaster: EventBroadcaster) -> Self {
         Self {
             config,
@@ -55,29 +56,25 @@ impl ClientManager {
     /// - The server fails to spawn.
     /// - The server fails to initialize.
     pub async fn get_client(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
-        let mut clients = self.active_clients.lock().await;
-
-        if let Some(client) = clients.get(lang) {
+        if let Some(client) = self.active_clients.lock().await.get(lang) {
             // Check if it's still alive
-            let is_alive = {
-                let c = client.lock().await;
-                c.is_alive()
-            };
+            let is_alive = client.lock().await.is_alive();
 
             if is_alive {
                 return Ok(client.clone());
-            } else {
-                warn!("LSP server for {} died, restarting...", lang);
-                clients.remove(lang);
             }
+            warn!("LSP server for {} died, restarting...", lang);
+            self.active_clients.lock().await.remove(lang);
         }
+
+        let mut clients = self.active_clients.lock().await;
 
         // Spawn new client
         let server_config = self
             .config
             .server
             .get(lang)
-            .ok_or_else(|| anyhow!("No LSP server configured for language '{}'", lang))?;
+            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang}'"))?;
 
         info!(
             "Spawning LSP server for {}: {} {}",
@@ -96,8 +93,7 @@ impl ClientManager {
             &args,
             lang,
             self.broadcaster.clone(),
-        )
-        .await?;
+        )?;
 
         // Initialize
         // TODO: Pass initialization options from config when supported
@@ -105,6 +101,7 @@ impl ClientManager {
 
         let client_mutex = Arc::new(Mutex::new(client));
         clients.insert(lang.to_string(), client_mutex.clone());
+        drop(clients);
 
         Ok(client_mutex)
     }
@@ -116,12 +113,12 @@ impl ClientManager {
 
     /// Returns status of all active servers.
     pub async fn all_server_status(&self) -> Vec<ServerStatus> {
-        let clients = self.active_clients.lock().await;
+        let clients = self.active_clients.lock().await.clone();
         let mut statuses = Vec::new();
 
-        for (lang, client_mutex) in clients.iter() {
-            let client = client_mutex.lock().await;
-            statuses.push(client.status(lang.clone()).await);
+        for (lang, client_mutex) in clients {
+            let status = client_mutex.lock().await.status(lang).await;
+            statuses.push(status);
         }
 
         statuses

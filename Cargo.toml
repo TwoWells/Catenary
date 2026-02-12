@@ -1,6 +1,6 @@
 [package]
 name = "catenary-mcp"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A high-performance multiplexing bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol). Enables LLMs to access IDE-grade code intelligence across multiple languages simultaneously with smart routing and UTF-8 accuracy."
@@ -8,6 +8,9 @@ repository = "https://github.com/MarkWells-Dev/Catenary"
 documentation = "https://markwells-dev.github.io/catenary/"
 keywords = ["mcp", "lsp", "language-server", "llm", "ai"]
 categories = ["development-tools"]
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "catenary"
@@ -37,15 +40,34 @@ url = "2.5.8"
 tempfile = "3"
 toml = "0.9.11"
 
-[lints.rust]
+[workspace.lints.rust]
+unsafe_code = "forbid"
 missing_docs = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
+# Lint groups
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Hard denials — no agent should produce these
 unwrap_used = "deny"
 expect_used = "deny"
-todo = "deny"
 panic = "deny"
+todo = "deny"
 unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+
+# Force agents to justify exceptions
+allow_attributes_without_reason = "deny"
+
+# Dependencies
+multiple_crate_versions = "allow"
+
+# Documentation
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 missing_safety_doc = "warn"

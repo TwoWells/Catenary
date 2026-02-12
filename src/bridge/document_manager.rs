@@ -52,6 +52,7 @@ impl Default for DocumentManager {
 
 impl DocumentManager {
     /// Creates a new, empty `DocumentManager`.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             documents: HashMap::new(),
@@ -81,7 +82,7 @@ impl DocumentManager {
                 let content = fs::read_to_string(&path).await?;
                 if content != doc.content {
                     doc.version += 1;
-                    doc.content = content.clone();
+                    doc.content.clone_from(&content);
                     doc.mtime = mtime;
                     doc.last_accessed = Instant::now();
 
@@ -158,6 +159,7 @@ impl DocumentManager {
     }
 
     /// Returns paths of documents that haven't been accessed within the timeout.
+    #[must_use]
     pub fn stale_documents(&self, timeout_secs: u64) -> Vec<PathBuf> {
         let now = Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
@@ -183,11 +185,13 @@ impl DocumentManager {
     }
 
     /// Returns the language ID for a given path.
+    #[must_use]
     pub fn language_id_for_path(&self, path: &Path) -> &'static str {
         detect_language_id(path)
     }
 
     /// Checks if there are any open documents for the given language ID.
+    #[must_use]
     pub fn has_open_documents(&self, language_id: &str) -> bool {
         self.documents
             .keys()
@@ -220,13 +224,11 @@ fn detect_language_id(path: &Path) -> &'static str {
         Some("tsx") => "typescriptreact",
         Some("jsx") => "javascriptreact",
         Some("c") => "c",
-        Some("cpp" | "cc" | "cxx") => "cpp",
-        Some("h" | "hpp") => "cpp",
+        Some("cpp" | "cc" | "cxx" | "h" | "hpp") => "cpp",
         Some("java") => "java",
         Some("rb") => "ruby",
         Some("php") => "php",
-        Some("sh" | "bash") => "shellscript",
-        Some("zsh") => "shellscript",
+        Some("sh" | "bash" | "zsh") => "shellscript",
         Some("json") => "json",
         Some("yaml" | "yml") => "yaml",
         Some("toml") => "toml",

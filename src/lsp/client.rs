@@ -69,7 +69,7 @@ pub struct LspClient {
     /// Current server state (0=Initializing, 1=Indexing, 2=Ready, 3=Dead).
     state: Arc<AtomicU8>,
     _reader_handle: tokio::task::JoinHandle<()>,
-    _child: Child,
+    child: Child,
 }
 
 impl LspClient {
@@ -80,7 +80,7 @@ impl LspClient {
     /// Returns an error if:
     /// - The server process cannot be spawned.
     /// - Stdin or stdout cannot be captured.
-    pub async fn spawn(
+    pub fn spawn(
         program: &str,
         args: &[&str],
         language: &str,
@@ -92,7 +92,7 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("Failed to spawn LSP server: {}", program))?;
+            .with_context(|| format!("Failed to spawn LSP server: {program}"))?;
 
         let stdin = child
             .stdin
@@ -140,12 +140,15 @@ impl LspClient {
             spawn_time: Instant::now(),
             state,
             _reader_handle: reader_handle,
-            _child: child,
+            child,
         })
     }
 
     /// Background task that reads LSP messages and routes responses to pending requests.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Internal task requires many handles to manage client state"
+    )]
     async fn reader_task(
         stdin: Arc<Mutex<ChildStdin>>,
         stdout: ChildStdout,
@@ -205,7 +208,7 @@ impl LspClient {
                             result: None,
                             error: Some(protocol::ResponseError {
                                 code: -32601, // MethodNotFound
-                                message: format!("Method '{}' not supported by client", method),
+                                message: format!("Method '{method}' not supported by client"),
                                 data: None,
                             }),
                         };
@@ -368,9 +371,8 @@ impl LspClient {
                 Ok(Ok(response)) => response,
                 Ok(Err(_)) => return Err(anyhow!("LSP server closed connection")),
                 Err(_) => {
-                    let mut pending = self.pending.lock().await;
-                    pending.remove(&id);
-                    return Err(anyhow!("LSP request '{}' timed out", method));
+                    self.pending.lock().await.remove(&id);
+                    return Err(anyhow!("LSP request '{method}' timed out"));
                 }
             };
 
@@ -382,7 +384,10 @@ impl LspClient {
                         method,
                         i + 1
                     );
-                    tokio::time::sleep(Duration::from_millis(100 * (i + 1) as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        100 * u64::try_from(i + 1).unwrap_or(1),
+                    ))
+                    .await;
                     continue;
                 }
                 return Err(anyhow!("LSP error {}: {}", error.code, error.message));
@@ -392,7 +397,7 @@ impl LspClient {
             return serde_json::from_value(result).context("Failed to parse LSP response");
         }
 
-        Err(anyhow!("LSP request '{}' failed after retries", method))
+        Err(anyhow!("LSP request '{method}' failed after retries"))
     }
 
     /// Sends a notification (no response expected).
@@ -407,7 +412,7 @@ impl LspClient {
     }
 
     /// Sends a JSON-RPC message with Content-Length header.
-    async fn send_message<T: serde::Serialize>(&self, message: &T) -> Result<()> {
+    async fn send_message<T: serde::Serialize + Sync>(&self, message: &T) -> Result<()> {
         let body = serde_json::to_string(message)?;
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
@@ -417,6 +422,7 @@ impl LspClient {
         stdin.write_all(header.as_bytes()).await?;
         stdin.write_all(body.as_bytes()).await?;
         stdin.flush().await?;
+        drop(stdin);
 
         Ok(())
     }
@@ -432,7 +438,7 @@ impl LspClient {
     pub async fn initialize(&mut self, root: &Path) -> Result<InitializeResult> {
         let root_uri: Uri = format!("file://{}", root.display())
             .parse()
-            .map_err(|e| anyhow!("Invalid root path {:?}: {}", root, e))?;
+            .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
 
         let params = InitializeParams {
             process_id: Some(std::process::id()),
@@ -475,10 +481,10 @@ impl LspClient {
             },
             workspace_folders: Some(vec![WorkspaceFolder {
                 uri: root_uri,
-                name: root
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".to_string()),
+                name: root.file_name().map_or_else(
+                    || "workspace".to_string(),
+                    |s| s.to_string_lossy().to_string(),
+                ),
             }]),
             ..Default::default()
         };
@@ -825,15 +831,22 @@ impl LspClient {
 
     /// Returns detailed status for this server.
     pub async fn status(&self, language: String) -> ServerStatus {
-        let progress = self.progress.lock().await;
-        let primary = progress.primary_progress();
+        let (title, message, percentage) = {
+            let progress = self.progress.lock().await;
+            let primary = progress.primary_progress();
+            let title = primary.map(|p| p.title.clone());
+            let message = primary.and_then(|p| p.message.clone());
+            let percentage = primary.and_then(|p| p.percentage);
+            drop(progress);
+            (title, message, percentage)
+        };
 
         ServerStatus {
             language,
             state: self.server_state(),
-            progress_title: primary.map(|p| p.title.clone()),
-            progress_message: primary.and_then(|p| p.message.clone()),
-            progress_percentage: primary.and_then(|p| p.percentage),
+            progress_title: title,
+            progress_message: message,
+            progress_percentage: percentage,
             uptime_secs: self.uptime().as_secs(),
         }
     }
@@ -869,6 +882,6 @@ impl Drop for LspClient {
     fn drop(&mut self) {
         // We can't await a graceful LSP shutdown here because drop is sync.
         // But we MUST ensure the child process doesn't become a zombie.
-        let _ = self._child.start_kill();
+        let _ = self.child.start_kill();
     }
 }

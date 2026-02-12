@@ -21,7 +21,11 @@ use anyhow::{Context, Result, anyhow};
 use std::io::{BufRead, Write};
 use tracing::{debug, error, info, trace, warn};
 
-use super::types::*;
+use super::types::{
+    CallToolParams, CallToolResult, INTERNAL_ERROR, InitializeParams, InitializeResult,
+    ListToolsResult, METHOD_NOT_FOUND, Notification, Request, Response, ServerCapabilities,
+    ServerInfo, Tool, ToolsCapability,
+};
 use crate::session::{EventBroadcaster, EventKind};
 
 /// Trait for handling MCP tool calls.
@@ -62,6 +66,7 @@ impl<H: ToolHandler> McpServer<H> {
     }
 
     /// Set a callback to be invoked when client info is received.
+    #[must_use]
     pub fn on_client_info(mut self, callback: ClientInfoCallback) -> Self {
         self.on_client_info = Some(callback);
         self
@@ -112,7 +117,7 @@ impl<H: ToolHandler> McpServer<H> {
                         });
                     }
 
-                    writeln!(stdout, "{}", response_json)?;
+                    writeln!(stdout, "{response_json}")?;
                     stdout.flush()?;
                 }
                 Ok(None) => {
@@ -133,7 +138,7 @@ impl<H: ToolHandler> McpServer<H> {
                         }
 
                         let response_json = serde_json::to_string(&response)?;
-                        writeln!(stdout, "{}", response_json)?;
+                        writeln!(stdout, "{response_json}")?;
                         stdout.flush()?;
                     }
                 }
@@ -153,7 +158,7 @@ impl<H: ToolHandler> McpServer<H> {
 
         // Try to parse as notification
         if let Ok(notification) = serde_json::from_str::<Notification>(line) {
-            self.handle_notification(notification)?;
+            self.handle_notification(&notification);
             return Ok(None);
         }
 
@@ -162,7 +167,7 @@ impl<H: ToolHandler> McpServer<H> {
         ))
     }
 
-    fn handle_request(&mut self, request: Request) -> Result<Response> {
+    fn handle_request(&self, request: Request) -> Result<Response> {
         debug!("Handling request: {} (id={:?})", request.method, request.id);
 
         match request.method.as_str() {
@@ -181,7 +186,7 @@ impl<H: ToolHandler> McpServer<H> {
         }
     }
 
-    fn handle_notification(&mut self, notification: Notification) -> Result<()> {
+    fn handle_notification(&mut self, notification: &Notification) {
         debug!("Handling notification: {}", notification.method);
 
         match notification.method.as_str() {
@@ -196,11 +201,9 @@ impl<H: ToolHandler> McpServer<H> {
                 debug!("Ignoring unknown notification: {}", notification.method);
             }
         }
-
-        Ok(())
     }
 
-    fn handle_initialize(&mut self, request: Request) -> Result<Response> {
+    fn handle_initialize(&self, request: Request) -> Result<Response> {
         let params: InitializeParams = request
             .params
             .map(serde_json::from_value)
@@ -267,6 +270,7 @@ impl<H: ToolHandler> McpServer<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::types::RequestId;
 
     struct TestHandler;
 
@@ -297,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_handle_initialize() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -323,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_list() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -342,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_success() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -363,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_error() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -383,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_handle_unknown_method() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -399,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_handle_ping() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),

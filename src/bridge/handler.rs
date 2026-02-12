@@ -62,7 +62,7 @@ const METHODS_WAIT_FOR_READY: &[&str] = &[
 use super::{DocumentManager, DocumentNotification};
 
 /// Controls how much symbol detail to include in output.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DetailLevel {
     /// Only structural symbols: modules, classes, structs, interfaces, enums.
@@ -74,7 +74,7 @@ pub enum DetailLevel {
     Full,
 }
 
-fn default_detail_level() -> DetailLevel {
+const fn default_detail_level() -> DetailLevel {
     DetailLevel::Outline
 }
 
@@ -101,11 +101,11 @@ pub struct FileInput {
     pub wait_for_reanalysis: bool,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-/// Input for catenary_find_references - accepts either symbol name OR position.
+/// Input for `catenary_find_references` - accepts either symbol name OR position.
 #[derive(Debug, Deserialize)]
 pub struct FindReferencesInput {
     /// Symbol name to search for (uses workspace symbols)
@@ -157,7 +157,7 @@ pub struct FormattingInput {
     pub insert_spaces: bool,
 }
 
-fn default_tab_size() -> u32 {
+const fn default_tab_size() -> u32 {
     4
 }
 
@@ -224,15 +224,15 @@ pub struct CodebaseMapInput {
     pub detail_level: DetailLevel,
 }
 
-fn default_depth() -> usize {
+const fn default_depth() -> usize {
     5
 }
 
-fn default_budget() -> usize {
+const fn default_budget() -> usize {
     2000
 }
 
-/// Bridge handler that implements MCP ToolHandler trait.
+/// Bridge handler that implements MCP `ToolHandler` trait.
 /// Handles MCP tool calls by routing them to the appropriate LSP server.
 pub struct LspBridgeHandler {
     client_manager: Arc<ClientManager>,
@@ -244,7 +244,7 @@ pub struct LspBridgeHandler {
 
 impl LspBridgeHandler {
     /// Creates a new `LspBridgeHandler`.
-    pub fn new(
+    pub const fn new(
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
@@ -272,9 +272,9 @@ impl LspBridgeHandler {
     /// Waits for the server handling the given path to be ready.
     async fn wait_for_server_ready(&self, path: &Path) -> Result<()> {
         let client_mutex = self.get_client_for_path(path).await?;
-        let client = client_mutex.lock().await;
+        let is_ready = client_mutex.lock().await.wait_ready().await;
 
-        if !client.wait_ready().await {
+        if !is_ready {
             return Err(anyhow!("LSP server died while waiting for ready state"));
         }
 
@@ -282,22 +282,21 @@ impl LspBridgeHandler {
     }
 
     /// Extract file path from arguments if present.
-    fn extract_file_path(arguments: &Option<serde_json::Value>) -> Option<PathBuf> {
+    fn extract_file_path(arguments: Option<&serde_json::Value>) -> Option<PathBuf> {
         arguments
-            .as_ref()
             .and_then(|v| v.get("file"))
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
     }
 
-    /// Handles the catenary_status tool.
-    fn handle_status(&self) -> Result<CallToolResult> {
+    /// Handles the `catenary_status` tool.
+    fn handle_status(&self) -> CallToolResult {
         let statuses = self
             .runtime
             .block_on(async { self.client_manager.all_server_status().await });
 
         if statuses.is_empty() {
-            return Ok(CallToolResult::text("No LSP servers running"));
+            return CallToolResult::text("No LSP servers running");
         }
 
         let mut output = Vec::new();
@@ -315,19 +314,20 @@ impl LspBridgeHandler {
             );
 
             if let Some(title) = &status.progress_title {
-                line.push_str(&format!(" - {}", title));
+                use std::fmt::Write;
+                let _ = write!(line, " - {title}");
                 if let Some(pct) = status.progress_percentage {
-                    line.push_str(&format!(" {}%", pct));
+                    let _ = write!(line, " {pct}%");
                 }
                 if let Some(msg) = &status.progress_message {
-                    line.push_str(&format!(" ({})", msg));
+                    let _ = write!(line, " ({msg})");
                 }
             }
 
             output.push(line);
         }
 
-        Ok(CallToolResult::text(output.join("\n")))
+        CallToolResult::text(output.join("\n"))
     }
 
     /// Ensures a document is open and synced with the LSP server.
@@ -356,29 +356,31 @@ impl LspBridgeHandler {
         }
 
         let uri = doc_manager.uri_for_path(path)?;
+        drop(doc_manager);
+        drop(client);
         Ok((uri, client_mutex.clone()))
     }
 
-    fn parse_position_input(&self, arguments: Option<serde_json::Value>) -> Result<PositionInput> {
+    fn parse_position_input(arguments: Option<serde_json::Value>) -> Result<PositionInput> {
         serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-            .map_err(|e| anyhow!("Invalid arguments: {}", e))
+            .map_err(|e| anyhow!("Invalid arguments: {e}"))
     }
 
     /// Resolves a file path, converting relative paths to absolute using the current working directory.
-    fn resolve_path(&self, file: &str) -> Result<PathBuf> {
+    fn resolve_path(file: &str) -> Result<PathBuf> {
         let path = PathBuf::from(file);
         if path.is_absolute() {
             Ok(path)
         } else {
             let cwd = std::env::current_dir()
-                .map_err(|e| anyhow!("Failed to get current working directory: {}", e))?;
+                .map_err(|e| anyhow!("Failed to get current working directory: {e}"))?;
             Ok(cwd.join(path))
         }
     }
 
     fn handle_hover(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input = self.parse_position_input(arguments)?;
-        let path = self.resolve_path(&input.file)?;
+        let input = Self::parse_position_input(arguments)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Hover request: {}:{}:{}",
@@ -395,21 +397,20 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.hover(params).await
+            client_mutex.lock().await.hover(params).await
         })?;
 
-        match result {
-            Some(hover) => Ok(CallToolResult::text(format_hover(&hover))),
-            None => Ok(CallToolResult::text("No hover information available")),
-        }
+        result.map_or_else(
+            || Ok(CallToolResult::text("No hover information available")),
+            |hover| Ok(CallToolResult::text(format_hover(&hover))),
+        )
     }
 
     fn handle_definition(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input = self.parse_position_input(arguments)?;
-        let path = self.resolve_path(&input.file)?;
+        let input = Self::parse_position_input(arguments)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Definition request: {}:{}:{}",
@@ -426,25 +427,24 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.definition(params).await
+            client_mutex.lock().await.definition(params).await
         })?;
 
-        match result {
-            Some(response) => Ok(CallToolResult::text(format_definition_response(&response))),
-            None => Ok(CallToolResult::text("No definition found")),
-        }
+        result.map_or_else(
+            || Ok(CallToolResult::text("No definition found")),
+            |response| Ok(CallToolResult::text(format_definition_response(&response))),
+        )
     }
 
     fn handle_type_definition(
         &self,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        let input = self.parse_position_input(arguments)?;
-        let path = self.resolve_path(&input.file)?;
+        let input = Self::parse_position_input(arguments)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Type definition request: {}:{}:{}",
@@ -461,25 +461,24 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.type_definition(params).await
+            client_mutex.lock().await.type_definition(params).await
         })?;
 
-        match result {
-            Some(response) => Ok(CallToolResult::text(format_definition_response(&response))),
-            None => Ok(CallToolResult::text("No type definition found")),
-        }
+        result.map_or_else(
+            || Ok(CallToolResult::text("No type definition found")),
+            |response| Ok(CallToolResult::text(format_definition_response(&response))),
+        )
     }
 
     fn handle_implementation(
         &self,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        let input = self.parse_position_input(arguments)?;
-        let path = self.resolve_path(&input.file)?;
+        let input = Self::parse_position_input(arguments)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Implementation request: {}:{}:{}",
@@ -496,17 +495,16 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.implementation(params).await
+            client_mutex.lock().await.implementation(params).await
         })?;
 
-        match result {
-            Some(response) => Ok(CallToolResult::text(format_definition_response(&response))),
-            None => Ok(CallToolResult::text("No implementations found")),
-        }
+        result.map_or_else(
+            || Ok(CallToolResult::text("No implementations found")),
+            |response| Ok(CallToolResult::text(format_definition_response(&response))),
+        )
     }
 
     fn handle_find_references(
@@ -515,7 +513,7 @@ impl LspBridgeHandler {
     ) -> Result<CallToolResult> {
         let input: FindReferencesInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         // Resolve target position - either from symbol search or direct position
         let (target_path, target_position) = if let Some(symbol) = &input.symbol {
@@ -534,7 +532,7 @@ impl LspBridgeHandler {
                 .character
                 .ok_or_else(|| anyhow!("'character' is required when using position"))?;
 
-            let path = self.resolve_path(file)?;
+            let path = Self::resolve_path(file)?;
             let position = Position { line, character };
             debug!(
                 "Find references by position: {}:{}:{}",
@@ -551,8 +549,8 @@ impl LspBridgeHandler {
                     text_document: TextDocumentIdentifier { uri: uri.clone() },
                     position: target_position,
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
                 context: ReferenceContext {
                     include_declaration: input.include_declaration,
                 },
@@ -563,13 +561,14 @@ impl LspBridgeHandler {
                     text_document: TextDocumentIdentifier { uri },
                     position: target_position,
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
 
             let client = client_mutex.lock().await;
             let refs = client.references(ref_params).await?;
             let def = client.definition(def_params).await?;
+            drop(client);
             Ok::<_, anyhow::Error>((refs, def))
         })?;
 
@@ -594,7 +593,7 @@ impl LspBridgeHandler {
     ) -> Result<(std::path::PathBuf, Position)> {
         // If a file is provided, try document symbols first for efficiency
         if let Some(file) = scope_file {
-            let path = self.resolve_path(file)?;
+            let path = Self::resolve_path(file)?;
             if let Some(result) = self.find_symbol_in_document(symbol, &path)? {
                 return Ok(result);
             }
@@ -604,7 +603,6 @@ impl LspBridgeHandler {
         self.find_symbol_in_workspace(symbol)
     }
 
-    /// Search for a symbol within a specific document.
     fn find_symbol_in_document(
         &self,
         symbol: &str,
@@ -614,11 +612,10 @@ impl LspBridgeHandler {
             let (uri, client_mutex) = self.ensure_document_open(path).await?;
             let params = DocumentSymbolParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            let client = client_mutex.lock().await;
-            let response = client.document_symbols(params).await?;
+            let response = client_mutex.lock().await.document_symbols(params).await?;
             Ok::<_, anyhow::Error>((uri, response))
         })?;
 
@@ -637,15 +634,18 @@ impl LspBridgeHandler {
         let result = self.runtime.block_on(async {
             let params = WorkspaceSymbolParams {
                 query: symbol.to_string(),
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
 
             let clients = self.client_manager.active_clients().await;
 
             for client_mutex in clients.values() {
-                let client = client_mutex.lock().await;
-                if let Ok(Some(response)) = client.workspace_symbols(params.clone()).await
+                if let Ok(Some(response)) = client_mutex
+                    .lock()
+                    .await
+                    .workspace_symbols(params.clone())
+                    .await
                     && let Some((path, position)) =
                         find_symbol_in_workspace_response(&response, symbol)
                 {
@@ -653,7 +653,7 @@ impl LspBridgeHandler {
                 }
             }
 
-            Err(anyhow!("Symbol '{}' not found in workspace", symbol))
+            Err(anyhow!("Symbol '{symbol}' not found in workspace"))
         })?;
 
         Ok(result)
@@ -665,43 +665,39 @@ impl LspBridgeHandler {
     ) -> Result<CallToolResult> {
         let input: FileInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!("Document symbols request: {}", input.file);
 
         let result = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
-            if input.wait_for_reanalysis {
-                let client = client_mutex.lock().await;
-                if !client.wait_for_analysis().await {
-                    return Err(anyhow!("LSP server stopped responding during analysis"));
-                }
+            if input.wait_for_reanalysis && !client_mutex.lock().await.wait_for_analysis().await {
+                return Err(anyhow!("LSP server stopped responding during analysis"));
             }
 
             let params = DocumentSymbolParams {
                 text_document: TextDocumentIdentifier { uri },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.document_symbols(params).await
+            client_mutex.lock().await.document_symbols(params).await
         })?;
 
-        match result {
-            Some(response) => Ok(CallToolResult::text(format_document_symbols(&response))),
-            None => Ok(CallToolResult::text("No symbols found")),
-        }
+        result.map_or_else(
+            || Ok(CallToolResult::text("No symbols found")),
+            |response| Ok(CallToolResult::text(format_document_symbols(&response))),
+        )
     }
 
     /// Find a symbol by name with fallback to document symbols search.
-    /// This is more robust than workspace_symbols for finding private/internal symbols.
+    /// This is more robust than `workspace_symbols` for finding private/internal symbols.
     fn handle_find_symbol(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: WorkspaceSymbolInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         debug!("Find symbol request: query={}", input.query);
 
@@ -709,16 +705,20 @@ impl LspBridgeHandler {
         let workspace_result = self.runtime.block_on(async {
             let params = WorkspaceSymbolParams {
                 query: input.query.clone(),
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
 
             let clients = self.client_manager.active_clients().await;
             let mut results = Vec::new();
 
             for client_mutex in clients.values() {
-                let client = client_mutex.lock().await;
-                if let Ok(Some(response)) = client.workspace_symbols(params.clone()).await {
+                if let Ok(Some(response)) = client_mutex
+                    .lock()
+                    .await
+                    .workspace_symbols(params.clone())
+                    .await
+                {
                     results.push(response);
                 }
             }
@@ -742,21 +742,21 @@ impl LspBridgeHandler {
 
         // Fallback: search files with ripgrep, then query document symbols
         debug!("Workspace symbols found nothing, trying fallback search");
-        self.find_symbol_fallback(&input.query)
+        Ok(self.find_symbol_fallback(&input.query))
     }
 
     /// Fallback symbol search: ripgrep for files, then document symbols.
-    fn find_symbol_fallback(&self, query: &str) -> Result<CallToolResult> {
+    fn find_symbol_fallback(&self, query: &str) -> CallToolResult {
         const MAX_FILES: usize = 20;
 
         // Try ripgrep first
-        let files = self.ripgrep_search(query).unwrap_or_else(|_| {
+        let files = Self::ripgrep_search(query).unwrap_or_else(|_| {
             // Fallback to manual search if rg not available
-            self.manual_file_search(query).unwrap_or_default()
+            Self::manual_file_search(query).unwrap_or_default()
         });
 
         if files.is_empty() {
-            return Ok(CallToolResult::text("No symbols found"));
+            return CallToolResult::text("No symbols found");
         }
 
         // Cap files to search
@@ -774,14 +774,14 @@ impl LspBridgeHandler {
         }
 
         if found_symbols.is_empty() {
-            Ok(CallToolResult::text("No symbols found"))
+            CallToolResult::text("No symbols found")
         } else {
-            Ok(CallToolResult::text(found_symbols.join("\n")))
+            CallToolResult::text(found_symbols.join("\n"))
         }
     }
 
     /// Use ripgrep to find files containing the query.
-    fn ripgrep_search(&self, query: &str) -> Result<Vec<std::path::PathBuf>> {
+    fn ripgrep_search(query: &str) -> Result<Vec<std::path::PathBuf>> {
         use std::process::Command;
 
         let output = Command::new("rg")
@@ -795,7 +795,7 @@ impl LspBridgeHandler {
                 query,
             ])
             .output()
-            .map_err(|e| anyhow!("Failed to run ripgrep: {}", e))?;
+            .map_err(|e| anyhow!("Failed to run ripgrep: {e}"))?;
 
         if !output.status.success() && output.stdout.is_empty() {
             return Ok(Vec::new());
@@ -810,7 +810,7 @@ impl LspBridgeHandler {
     }
 
     /// Manual file search fallback when ripgrep is not available.
-    fn manual_file_search(&self, query: &str) -> Result<Vec<std::path::PathBuf>> {
+    fn manual_file_search(query: &str) -> Result<Vec<std::path::PathBuf>> {
         let cwd = std::env::current_dir()?;
         let query_lower = query.to_lowercase();
         let mut matches = Vec::new();
@@ -877,11 +877,10 @@ impl LspBridgeHandler {
             let (uri, client_mutex) = self.ensure_document_open(path).await?;
             let params = DocumentSymbolParams {
                 text_document: TextDocumentIdentifier { uri },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.document_symbols(params).await
+            client_mutex.lock().await.document_symbols(params).await
         })?;
 
         let Some(response) = result else {
@@ -899,9 +898,9 @@ impl LspBridgeHandler {
     fn handle_code_actions(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: CodeActionInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Code actions request: {} [{},{}]-[{},{}]",
@@ -916,8 +915,7 @@ impl LspBridgeHandler {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
             // Get diagnostics for the range to include in context
-            let client = client_mutex.lock().await;
-            let diagnostics = client.get_diagnostics(&uri).await;
+            let diagnostics = client_mutex.lock().await.get_diagnostics(&uri).await;
 
             let params = CodeActionParams {
                 text_document: TextDocumentIdentifier { uri },
@@ -936,10 +934,10 @@ impl LspBridgeHandler {
                     only: None,
                     trigger_kind: None,
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            client.code_actions(params).await
+            client_mutex.lock().await.code_actions(params).await
         })?;
 
         match result {
@@ -953,9 +951,9 @@ impl LspBridgeHandler {
     fn handle_rename(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: RenameInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Rename request: {}:{}:{} -> {} (dry_run: {})",
@@ -973,10 +971,9 @@ impl LspBridgeHandler {
                     },
                 },
                 new_name: input.new_name,
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.rename(params).await
+            client_mutex.lock().await.rename(params).await
         })?;
 
         match result {
@@ -998,8 +995,7 @@ impl LspBridgeHandler {
                     self.runtime
                         .block_on(async { apply_workspace_edit(&edit, encoding).await })?;
                     Ok(CallToolResult::text(format!(
-                        "Successfully applied rename. Changes:\n{}",
-                        diff_text
+                        "Successfully applied rename. Changes:\n{diff_text}"
                     )))
                 }
             }
@@ -1010,8 +1006,8 @@ impl LspBridgeHandler {
     }
 
     fn handle_completion(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input = self.parse_position_input(arguments)?;
-        let path = self.resolve_path(&input.file)?;
+        let input = Self::parse_position_input(arguments)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Completion request: {}:{}:{}",
@@ -1028,41 +1024,36 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
                 context: None,
             };
-            let client = client_mutex.lock().await;
-            client.completion(params).await
+            client_mutex.lock().await.completion(params).await
         })?;
 
-        match result {
-            Some(response) => Ok(CallToolResult::text(format_completion(&response))),
-            None => Ok(CallToolResult::text("No completions available")),
-        }
+        result.map_or_else(
+            || Ok(CallToolResult::text("No completions available")),
+            |response| Ok(CallToolResult::text(format_completion(&response))),
+        )
     }
 
     fn handle_diagnostics(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: FileInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!("Diagnostics request: {}", input.file);
 
         let diagnostics = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
-            if input.wait_for_reanalysis {
-                let client = client_mutex.lock().await;
-                if !client.wait_for_analysis().await {
-                    return Err(anyhow!("LSP server stopped responding during analysis"));
-                }
+            if input.wait_for_reanalysis && !client_mutex.lock().await.wait_for_analysis().await {
+                return Err(anyhow!("LSP server stopped responding during analysis"));
             }
 
-            let client = client_mutex.lock().await;
-            Ok::<_, anyhow::Error>(client.get_diagnostics(&uri).await)
+            Ok::<_, anyhow::Error>(client_mutex.lock().await.get_diagnostics(&uri).await)
         })?;
 
         if diagnostics.is_empty() {
@@ -1076,8 +1067,8 @@ impl LspBridgeHandler {
         &self,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        let input = self.parse_position_input(arguments)?;
-        let path = self.resolve_path(&input.file)?;
+        let input = Self::parse_position_input(arguments)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Signature help request: {}:{}:{}",
@@ -1094,25 +1085,24 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
                 context: None,
             };
-            let client = client_mutex.lock().await;
-            client.signature_help(params).await
+            client_mutex.lock().await.signature_help(params).await
         })?;
 
-        match result {
-            Some(help) => Ok(CallToolResult::text(format_signature_help(&help))),
-            None => Ok(CallToolResult::text("No signature help available")),
-        }
+        result.map_or_else(
+            || Ok(CallToolResult::text("No signature help available")),
+            |help| Ok(CallToolResult::text(format_signature_help(&help))),
+        )
     }
 
     fn handle_formatting(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: FormattingInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!("Formatting request: {}", input.file);
 
@@ -1123,12 +1113,11 @@ impl LspBridgeHandler {
                 options: FormattingOptions {
                     tab_size: input.tab_size,
                     insert_spaces: input.insert_spaces,
-                    ..Default::default()
+                    ..lsp_types::FormattingOptions::default()
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.formatting(params).await
+            client_mutex.lock().await.formatting(params).await
         })?;
 
         match result {
@@ -1143,9 +1132,9 @@ impl LspBridgeHandler {
     ) -> Result<CallToolResult> {
         let input: RangeFormattingInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Range formatting request: {} [{},{}]-[{},{}]",
@@ -1173,12 +1162,11 @@ impl LspBridgeHandler {
                 options: FormattingOptions {
                     tab_size: input.tab_size,
                     insert_spaces: input.insert_spaces,
-                    ..Default::default()
+                    ..lsp_types::FormattingOptions::default()
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
-            let client = client_mutex.lock().await;
-            client.range_formatting(params).await
+            client_mutex.lock().await.range_formatting(params).await
         })?;
 
         match result {
@@ -1193,9 +1181,9 @@ impl LspBridgeHandler {
     ) -> Result<CallToolResult> {
         let input: CallHierarchyInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Call hierarchy request: {}:{}:{} direction={}",
@@ -1214,7 +1202,7 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
 
             let client = client_mutex.lock().await;
@@ -1237,19 +1225,21 @@ impl LspBridgeHandler {
                 "incoming" => {
                     let params = CallHierarchyIncomingCallsParams {
                         item,
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
+                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                        partial_result_params: lsp_types::PartialResultParams::default(),
                     };
                     let calls = client.incoming_calls(params).await?;
+                    drop(client);
                     Ok(calls.map(|c| format_incoming_calls(&c)))
                 }
                 "outgoing" => {
                     let params = CallHierarchyOutgoingCallsParams {
                         item,
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
+                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                        partial_result_params: lsp_types::PartialResultParams::default(),
                     };
                     let calls = client.outgoing_calls(params).await?;
+                    drop(client);
                     Ok(calls.map(|c| format_outgoing_calls(&c)))
                 }
                 _ => Err(anyhow!("direction must be 'incoming' or 'outgoing'")),
@@ -1268,9 +1258,9 @@ impl LspBridgeHandler {
     ) -> Result<CallToolResult> {
         let input: TypeHierarchyInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Type hierarchy request: {}:{}:{} direction={}",
@@ -1289,7 +1279,7 @@ impl LspBridgeHandler {
                         character: input.character,
                     },
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
 
             let client = client_mutex.lock().await;
@@ -1312,19 +1302,21 @@ impl LspBridgeHandler {
                 "supertypes" => {
                     let params = TypeHierarchySupertypesParams {
                         item,
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
+                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                        partial_result_params: lsp_types::PartialResultParams::default(),
                     };
                     let types = client.supertypes(params).await?;
+                    drop(client);
                     Ok(types.map(|t| format_type_hierarchy_items(&t)))
                 }
                 "subtypes" => {
                     let params = TypeHierarchySubtypesParams {
                         item,
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
+                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                        partial_result_params: lsp_types::PartialResultParams::default(),
                     };
                     let types = client.subtypes(params).await?;
+                    drop(client);
                     Ok(types.map(|t| format_type_hierarchy_items(&t)))
                 }
                 _ => Err(anyhow!("direction must be 'supertypes' or 'subtypes'")),
@@ -1336,15 +1328,19 @@ impl LspBridgeHandler {
             _ => Ok(CallToolResult::text("No type hierarchy found")),
         }
     }
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Complexity of quickfix selection and application requires many lines"
+    )]
     fn handle_apply_quickfix(
         &self,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let input: ApplyQuickFixInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = self.resolve_path(&input.file)?;
+        let path = Self::resolve_path(&input.file)?;
 
         debug!(
             "Apply quickfix request: {}:{}:{} filter={:?}",
@@ -1379,18 +1375,24 @@ impl LspBridgeHandler {
                 true
             });
 
-            let (range, context_diagnostics) = if let Some(d) = target_diagnostic {
-                (d.range, vec![d.clone()])
-            } else {
-                // No diagnostic found at cursor, use cursor position as range
-                (
-                    Range {
-                        start: Position { line: cursor_line, character: cursor_char },
-                        end: Position { line: cursor_line, character: cursor_char },
-                    },
-                    vec![]
-                )
-            };
+            let (range, context_diagnostics) = target_diagnostic.map_or_else(
+                || {
+                    (
+                        Range {
+                            start: Position {
+                                line: cursor_line,
+                                character: cursor_char,
+                            },
+                            end: Position {
+                                line: cursor_line,
+                                character: cursor_char,
+                            },
+                        },
+                        vec![],
+                    )
+                },
+                |d| (d.range, vec![d.clone()]),
+            );
 
             // 2. Request Code Actions
             let params = CodeActionParams {
@@ -1401,8 +1403,8 @@ impl LspBridgeHandler {
                     only: None,
                     trigger_kind: None,
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
 
             let response = client.code_actions(params).await?;
@@ -1422,16 +1424,14 @@ impl LspBridgeHandler {
                 // Prefer "quickfix" kind
                 let quickfix = actions.iter().find(|a| match a {
                     CodeActionOrCommand::CodeAction(ca) => {
-                        ca.kind.as_ref().map(|k| k.as_str().contains("quickfix")).unwrap_or(false)
-                    },
-                    _ => false,
+                        ca.kind
+                            .as_ref()
+                            .is_some_and(|k| k.as_str().contains("quickfix"))
+                    }
+                    CodeActionOrCommand::Command(_) => false,
                 });
 
-                if let Some(qf) = quickfix {
-                    Some(qf.clone())
-                } else {
-                    actions.into_iter().next()
-                }
+                quickfix.cloned().or_else(|| actions.first().cloned())
             };
 
             let Some(action) = action_to_apply else {
@@ -1471,13 +1471,24 @@ impl LspBridgeHandler {
             Err(e) => Ok(CallToolResult::error(e.to_string())),
         }
     }
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Complexity of codebase map generation requires many lines"
+    )]
     fn handle_codebase_map(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
+        use std::fmt::Write;
+        struct MapEntry {
+            path: PathBuf,
+            depth: usize,
+            is_dir: bool,
+            symbols: Option<String>,
+        }
         let input: CodebaseMapInput =
             serde_json::from_value(arguments.unwrap_or_else(|| serde_json::json!({})))
-                .map_err(|e| anyhow!("Invalid arguments: {}", e))?;
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         let root_path = if let Some(p) = &input.path {
-            self.resolve_path(p)?
+            Self::resolve_path(p)?
         } else {
             std::env::current_dir()?
         };
@@ -1494,13 +1505,6 @@ impl LspBridgeHandler {
             .hidden(true)
             .build();
 
-        struct MapEntry {
-            path: PathBuf,
-            depth: usize,
-            is_dir: bool,
-            symbols: Option<String>,
-        }
-
         let mut entries = Vec::new();
 
         for result in walker {
@@ -1513,7 +1517,7 @@ impl LspBridgeHandler {
 
                     let rel_path = path.strip_prefix(&root_path).unwrap_or(path);
                     let depth = rel_path.components().count();
-                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
 
                     entries.push(MapEntry {
                         path: path.to_path_buf(),
@@ -1551,20 +1555,25 @@ impl LspBridgeHandler {
                     if let Ok(client_mutex) = self.client_manager.get_client(&lang_id).await {
                         // Attempt to open and get symbols with a short timeout
                         if let Ok((uri, _)) = self.ensure_document_open(&entry.path).await {
-                            let client = client_mutex.lock().await;
-                            let symbols_future = client.document_symbols(DocumentSymbolParams {
+                            let params = DocumentSymbolParams {
                                 text_document: TextDocumentIdentifier { uri },
-                                work_done_progress_params: Default::default(),
-                                partial_result_params: Default::default(),
-                            });
+                                work_done_progress_params:
+                                    lsp_types::WorkDoneProgressParams::default(),
+                                partial_result_params: lsp_types::PartialResultParams::default(),
+                            };
+
+                            let client = client_mutex.lock().await;
+                            let symbols_future = client.document_symbols(params);
 
                             // 1s timeout per file to keep map generation snappy but reliable
-                            if let Ok(Ok(Some(response))) = tokio::time::timeout(
+                            let timeout_result = tokio::time::timeout(
                                 std::time::Duration::from_secs(1),
                                 symbols_future,
                             )
-                            .await
-                            {
+                            .await;
+                            drop(client);
+
+                            if let Ok(Ok(Some(response))) = timeout_result {
                                 entry.symbols =
                                     Some(format_compact_symbols(&response, detail_level));
                             }
@@ -1591,7 +1600,7 @@ impl LspBridgeHandler {
             let name = rel_path.file_name().unwrap_or_default().to_string_lossy();
             let marker = if entry.is_dir { "/" } else { "" };
 
-            output.push_str(&format!("{}{}{}\n", indent, name, marker));
+            let _ = writeln!(output, "{indent}{name}{marker}");
             line_count += 1;
 
             if let Some(symbols) = &entry.symbols {
@@ -1608,7 +1617,7 @@ impl LspBridgeHandler {
                         line.to_string()
                     };
 
-                    output.push_str(&format!("{}{}\n", sym_indent, display_line));
+                    let _ = writeln!(output, "{sym_indent}{display_line}");
                     line_count += 1;
                 }
             }
@@ -1619,6 +1628,7 @@ impl LspBridgeHandler {
 }
 
 impl ToolHandler for LspBridgeHandler {
+    #[allow(clippy::too_many_lines, reason = "Naturally long list of tools")]
     fn list_tools(&self) -> Vec<Tool> {
         vec![
             Tool {
@@ -1825,12 +1835,13 @@ impl ToolHandler for LspBridgeHandler {
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let start = std::time::Instant::now();
-        let file = Self::extract_file_path(&arguments).map(|p| p.to_string_lossy().to_string());
+        let file =
+            Self::extract_file_path(arguments.as_ref()).map(|p| p.to_string_lossy().to_string());
 
         // Broadcast tool call
         self.broadcaster.send(EventKind::ToolCall {
             tool: name.to_string(),
-            file: file.clone(),
+            file,
         });
 
         // Helper to broadcast result
@@ -1838,21 +1849,21 @@ impl ToolHandler for LspBridgeHandler {
             self.broadcaster.send(EventKind::ToolResult {
                 tool: name.to_string(),
                 success,
-                duration_ms: start.elapsed().as_millis() as u64,
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             });
         };
 
         // Handle status tool separately (no file path)
         if name == "catenary_status" {
             let result = self.handle_status();
-            broadcast_result(result.is_ok());
-            return result;
+            broadcast_result(result.is_error.is_none());
+            return Ok(result);
         }
 
         // Smart wait for methods that need a ready server
         if self.config.smart_wait
             && METHODS_WAIT_FOR_READY.contains(&name)
-            && let Some(ref path) = Self::extract_file_path(&arguments)
+            && let Some(ref path) = Self::extract_file_path(arguments.as_ref())
             && let Err(e) = self.runtime.block_on(self.wait_for_server_ready(path))
         {
             broadcast_result(false);
@@ -1878,7 +1889,7 @@ impl ToolHandler for LspBridgeHandler {
             "lsp_type_hierarchy" => self.handle_type_hierarchy(arguments),
             "catenary_apply_quickfix" => self.handle_apply_quickfix(arguments),
             "catenary_codebase_map" => self.handle_codebase_map(arguments),
-            _ => Err(anyhow!("Unknown tool: {}", name)),
+            _ => Err(anyhow!("Unknown tool: {name}")),
         };
 
         match &result {
@@ -1913,7 +1924,7 @@ fn format_compact_symbols(response: &DocumentSymbolResponse, level: DetailLevel)
     result.join("\n")
 }
 
-fn matches_detail_level(kind: lsp_types::SymbolKind, level: DetailLevel) -> bool {
+const fn matches_detail_level(kind: lsp_types::SymbolKind, level: DetailLevel) -> bool {
     use lsp_types::SymbolKind;
 
     // Outline: structural types + document structure (STRING for markdown headings, KEY for YAML/JSON)
@@ -2102,14 +2113,14 @@ fn format_location(location: &Location) -> String {
     let path = location.uri.path();
     let line = location.range.start.line + 1;
     let col = location.range.start.character + 1;
-    format!("{}:{}:{}", path, line, col)
+    format!("{path}:{line}:{col}")
 }
 
-fn format_location_link(link: &LocationLink) -> String {
-    let path = link.target_uri.path();
-    let line = link.target_range.start.line + 1;
-    let col = link.target_range.start.character + 1;
-    format!("{}:{}:{}", path, line, col)
+fn format_location_link(loc_link: &LocationLink) -> String {
+    let path = loc_link.target_uri.path();
+    let line = loc_link.target_range.start.line + 1;
+    let col = loc_link.target_range.start.character + 1;
+    format!("{path}:{line}:{col}")
 }
 
 /// Format locations with the definition marked and listed first.
@@ -2158,7 +2169,7 @@ fn format_locations_with_definition(
         .join("\n")
 }
 
-/// Extract the first location from a GotoDefinitionResponse.
+/// Extract the first location from a `GotoDefinitionResponse`.
 fn extract_definition_location(response: &GotoDefinitionResponse) -> Option<Location> {
     match response {
         GotoDefinitionResponse::Scalar(loc) => Some(loc.clone()),
@@ -2358,7 +2369,7 @@ fn format_workspace_edit(edit: &WorkspaceEdit) -> String {
                 for op in ops {
                     match op {
                         lsp_types::DocumentChangeOperation::Op(resource_op) => {
-                            result.push(format!("Operation: {:?}", resource_op));
+                            result.push(format!("Operation: {resource_op:?}"));
                         }
                         lsp_types::DocumentChangeOperation::Edit(edit) => {
                             result.push(format!("File: {}", edit.text_document.uri.path()));
@@ -2414,11 +2425,11 @@ fn format_completion(response: &CompletionResponse) -> String {
         .iter()
         .take(50)
         .map(|item| {
-            let kind = item.kind.map(|k| format!(" [{:?}]", k)).unwrap_or_default();
+            let kind = item.kind.map(|k| format!(" [{k:?}]")).unwrap_or_default();
             let detail = item
                 .detail
                 .as_ref()
-                .map(|d| format!(" - {}", d))
+                .map(|d| format!(" - {d}"))
                 .unwrap_or_default();
             format!("{}{}{}", item.label, kind, detail)
         })
@@ -2466,7 +2477,7 @@ fn format_signature_help(help: &SignatureHelp) -> String {
     let mut result = Vec::new();
 
     for (i, sig) in help.signatures.iter().enumerate() {
-        let active = if Some(i as u32) == help.active_signature {
+        let active = if Some(u32::try_from(i).unwrap_or(u32::MAX)) == help.active_signature {
             " (active)"
         } else {
             ""
@@ -2485,11 +2496,12 @@ fn format_signature_help(help: &SignatureHelp) -> String {
 
         if let Some(params) = &sig.parameters {
             for (j, param) in params.iter().enumerate() {
-                let active_param = if Some(j as u32) == help.active_parameter {
-                    " <--"
-                } else {
-                    ""
-                };
+                let active_param =
+                    if Some(u32::try_from(j).unwrap_or(u32::MAX)) == help.active_parameter {
+                        " <--"
+                    } else {
+                        ""
+                    };
                 let label = match &param.label {
                     lsp_types::ParameterLabel::Simple(s) => s.clone(),
                     lsp_types::ParameterLabel::LabelOffsets([start, end]) => sig
@@ -2499,7 +2511,7 @@ fn format_signature_help(help: &SignatureHelp) -> String {
                         .take((*end - *start) as usize)
                         .collect(),
                 };
-                result.push(format!("   - {}{}", label, active_param));
+                result.push(format!("   - {label}{active_param}"));
             }
         }
     }
@@ -2540,7 +2552,7 @@ fn format_incoming_calls(calls: &[CallHierarchyIncomingCall]) -> String {
             let line = call.from.range.start.line + 1;
             let name = &call.from.name;
             let kind = format!("{:?}", call.from.kind);
-            format!("{} [{}] {}:{}", name, kind, path, line)
+            format!("{name} [{kind}] {path}:{line}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2558,7 +2570,7 @@ fn format_outgoing_calls(calls: &[CallHierarchyOutgoingCall]) -> String {
             let line = call.to.range.start.line + 1;
             let name = &call.to.name;
             let kind = format!("{:?}", call.to.kind);
-            format!("{} [{}] {}:{}", name, kind, path, line)
+            format!("{name} [{kind}] {path}:{line}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2591,7 +2603,7 @@ async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKi
                 .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
             let path = url
                 .to_file_path()
-                .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
+                .map_err(|()| anyhow!("Invalid file URI: {}", uri.as_str()))?;
             file_edits
                 .entry(path)
                 .or_default()
@@ -2608,7 +2620,7 @@ async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKi
                         .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
                     let path = url
                         .to_file_path()
-                        .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
+                        .map_err(|()| anyhow!("Invalid file URI: {}", uri.as_str()))?;
                     let changes = edit.edits.iter().map(|e| match e {
                         lsp_types::OneOf::Left(te) => te.clone(),
                         lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
@@ -2629,7 +2641,7 @@ async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKi
                             .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
                         let path = url
                             .to_file_path()
-                            .map_err(|_| anyhow!("Invalid file URI: {}", uri.as_str()))?;
+                            .map_err(|()| anyhow!("Invalid file URI: {}", uri.as_str()))?;
                         let changes = edit.edits.iter().map(|e| match e {
                             lsp_types::OneOf::Left(te) => te.clone(),
                             lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
@@ -2680,9 +2692,7 @@ async fn apply_edits_to_file(
 
         if start_offset > end_offset {
             return Err(anyhow!(
-                "Invalid range: start {} > end {}",
-                start_offset,
-                end_offset
+                "Invalid range: start {start_offset} > end {end_offset}"
             ));
         }
 
@@ -2723,8 +2733,7 @@ fn position_to_offset(
     let line_content = &content[line_start_byte..];
     let line_end_byte = line_content
         .find('\n')
-        .map(|i| line_start_byte + i)
-        .unwrap_or(content.len());
+        .map_or(content.len(), |i| line_start_byte + i);
     let line_text = &content[line_start_byte..line_end_byte];
 
     if *encoding == PositionEncodingKind::UTF8 {
@@ -2757,8 +2766,7 @@ fn position_to_offset(
             Ok(line_start_byte + byte_offset)
         } else {
             Err(anyhow!(
-                "Position {:?} lands in the middle of a UTF-16 surrogate pair or out of bounds",
-                position
+                "Position {position:?} lands in the middle of a UTF-16 surrogate pair or out of bounds"
             ))
         }
     }

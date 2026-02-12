@@ -22,7 +22,10 @@ use serde_json::Value;
 
 /// JSON-RPC request from MCP client.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Fields required by JSON-RPC protocol but not all are read
+#[allow(
+    dead_code,
+    reason = "Fields required by JSON-RPC protocol but not all are read"
+)]
 pub struct Request {
     /// The JSON-RPC version.
     pub jsonrpc: String,
@@ -37,7 +40,10 @@ pub struct Request {
 
 /// JSON-RPC notification from MCP client (no id).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Fields required by JSON-RPC protocol but not all are read
+#[allow(
+    dead_code,
+    reason = "Fields required by JSON-RPC protocol but not all are read"
+)]
 pub struct Notification {
     /// The JSON-RPC version.
     pub jsonrpc: String,
@@ -123,7 +129,10 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// MCP initialize request params.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // Fields required by MCP protocol but not all are read
+#[allow(
+    dead_code,
+    reason = "Fields required by MCP protocol but not all are read"
+)]
 pub struct InitializeParams {
     /// The protocol version requested by the client.
     pub protocol_version: String,
@@ -135,7 +144,10 @@ pub struct InitializeParams {
 
 /// MCP client capabilities.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Fields required by MCP protocol but not all are read
+#[allow(
+    dead_code,
+    reason = "Fields required by MCP protocol but not all are read"
+)]
 pub struct ClientCapabilities {
     /// Roots-related capabilities.
     #[serde(default)]
@@ -148,7 +160,10 @@ pub struct ClientCapabilities {
 /// Roots-related capabilities.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // Fields required by MCP protocol but not all are read
+#[allow(
+    dead_code,
+    reason = "Fields required by MCP protocol but not all are read"
+)]
 pub struct RootsCapability {
     /// Whether the client supports listing changed roots.
     #[serde(default)]

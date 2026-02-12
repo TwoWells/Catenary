@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 
-fn default_null() -> serde_json::Value {
+const fn default_null() -> serde_json::Value {
     serde_json::Value::Null
 }
 
@@ -88,7 +88,7 @@ pub struct ResponseError {
 
 impl From<i64> for RequestId {
     fn from(n: i64) -> Self {
-        RequestId::Number(n)
+        Self::Number(n)
     }
 }
 

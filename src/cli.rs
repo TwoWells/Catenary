@@ -29,6 +29,7 @@ pub struct ColorConfig {
 
 impl ColorConfig {
     /// Create a new `ColorConfig`, auto-detecting TTY unless `nocolor` is true.
+    #[must_use]
     pub fn new(nocolor: bool) -> Self {
         Self {
             enabled: !nocolor && stdout().is_tty(),
@@ -36,45 +37,50 @@ impl ColorConfig {
     }
 
     /// ANSI escape code for green (incoming/request).
+    #[must_use]
     pub fn green(&self, s: &str) -> String {
         if self.enabled {
-            format!("\x1b[32m{}\x1b[0m", s)
+            format!("\x1b[32m{s}\x1b[0m")
         } else {
             s.to_string()
         }
     }
 
     /// ANSI escape code for blue (outgoing/response).
+    #[must_use]
     pub fn blue(&self, s: &str) -> String {
         if self.enabled {
-            format!("\x1b[34m{}\x1b[0m", s)
+            format!("\x1b[34m{s}\x1b[0m")
         } else {
             s.to_string()
         }
     }
 
     /// ANSI escape code for red (errors).
+    #[must_use]
     pub fn red(&self, s: &str) -> String {
         if self.enabled {
-            format!("\x1b[31m{}\x1b[0m", s)
+            format!("\x1b[31m{s}\x1b[0m")
         } else {
             s.to_string()
         }
     }
 
     /// ANSI escape code for cyan (language names).
+    #[must_use]
     pub fn cyan(&self, s: &str) -> String {
         if self.enabled {
-            format!("\x1b[36m{}\x1b[0m", s)
+            format!("\x1b[36m{s}\x1b[0m")
         } else {
             s.to_string()
         }
     }
 
     /// ANSI escape code for dim text.
+    #[must_use]
     pub fn dim(&self, s: &str) -> String {
         if self.enabled {
-            format!("\x1b[2m{}\x1b[0m", s)
+            format!("\x1b[2m{s}\x1b[0m")
         } else {
             s.to_string()
         }
@@ -82,6 +88,7 @@ impl ColorConfig {
 }
 
 /// Get the terminal width, defaulting to 80 if unable to detect.
+#[must_use]
 pub fn terminal_width() -> usize {
     crossterm::terminal::size()
         .map(|(w, _)| w as usize)
@@ -89,6 +96,7 @@ pub fn terminal_width() -> usize {
 }
 
 /// Truncate a string to `max_len` characters, adding "..." if truncated.
+#[must_use]
 pub fn truncate(s: &str, max_len: usize) -> String {
     if max_len <= 3 {
         return ".".repeat(max_len.min(3));
@@ -122,7 +130,8 @@ pub struct ColumnWidths {
 impl ColumnWidths {
     /// Calculate column widths based on terminal width.
     /// Columns: # | ID | PID | WORKSPACE | CLIENT | LANGUAGES | STARTED
-    pub fn calculate(term_width: usize) -> Self {
+    #[must_use]
+    pub const fn calculate(term_width: usize) -> Self {
         // Fixed minimum widths
         let row_num = 3; // "#"
         let pid = 8; // "PID"

@@ -36,7 +36,7 @@ pub struct Config {
     pub server: HashMap<String, ServerConfig>,
 }
 
-fn default_smart_wait() -> bool {
+const fn default_smart_wait() -> bool {
     true
 }
 
@@ -55,7 +55,7 @@ pub struct ServerConfig {
     pub initialization_options: Option<serde_json::Value>,
 }
 
-fn default_idle_timeout() -> u64 {
+const fn default_idle_timeout() -> u64 {
     300
 }
 
