@@ -61,13 +61,13 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn success(id: RequestId, result: impl Serialize) -> Self {
-        Self {
+    pub fn success(id: RequestId, result: impl Serialize) -> Result<Self, serde_json::Error> {
+        Ok(Self {
             jsonrpc: "2.0".to_string(),
             id,
-            result: Some(serde_json::to_value(result).unwrap()),
+            result: Some(serde_json::to_value(result)?),
             error: None,
-        }
+        })
     }
 
     pub fn error(id: RequestId, code: i64, message: impl Into<String>) -> Self {
@@ -296,7 +296,8 @@ mod tests {
 
     #[test]
     fn test_response_success() {
-        let resp = Response::success(RequestId::Number(1), serde_json::json!({"ok": true}));
+        let resp =
+            Response::success(RequestId::Number(1), serde_json::json!({"ok": true})).unwrap();
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("result"));
         assert!(!json.contains("error"));

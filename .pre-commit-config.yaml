@@ -1,0 +1,71 @@
+# Pre-commit hooks for Catenary
+# Install: pre-commit install
+# Run all: pre-commit run --all-files
+
+repos:
+  # General checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+
+  # Secret detection
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  # Rust checks
+  - repo: local
+    hooks:
+      - id: cargo-lock-check
+        name: cargo lock check
+        entry: cargo update --locked
+        language: system
+        pass_filenames: false
+        files: ^Cargo\.(toml|lock)$
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --quiet
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny check
+        language: system
+        pass_filenames: false
+
+      - id: cargo-test-lib
+        name: cargo test lib
+        entry: cargo test --lib --quiet
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+  # Docs check (only when docs change)
+  - repo: local
+    hooks:
+      - id: mdbook-build
+        name: mdbook build
+        entry: mdbook build docs
+        language: system
+        pass_filenames: false
+        files: ^docs/

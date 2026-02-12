@@ -968,7 +968,9 @@ impl LspBridgeHandler {
                 } else {
                     // Get encoding from client
                     let encoding = self.runtime.block_on(async {
-                        let client_mutex = self.get_client_for_path(&path).await.unwrap(); // Should succeed as we just opened it
+                        let Ok(client_mutex) = self.get_client_for_path(&path).await else {
+                            return PositionEncodingKind::UTF16; // Fallback if client unavailable
+                        };
                         let client = client_mutex.lock().await;
                         client.encoding()
                     });
@@ -1200,8 +1202,10 @@ impl LspBridgeHandler {
                 return Ok(None);
             }
 
-            // Get calls for the first item
-            let item = items.into_iter().next().unwrap();
+            // Get calls for the first item (safe: we checked is_empty above)
+            let Some(item) = items.into_iter().next() else {
+                return Ok(None);
+            };
 
             match input.direction.as_str() {
                 "incoming" => {
@@ -1273,8 +1277,10 @@ impl LspBridgeHandler {
                 return Ok(None);
             }
 
-            // Get hierarchy for the first item
-            let item = items.into_iter().next().unwrap();
+            // Get hierarchy for the first item (safe: we checked is_empty above)
+            let Some(item) = items.into_iter().next() else {
+                return Ok(None);
+            };
 
             match input.direction.as_str() {
                 "supertypes" => {

@@ -88,8 +88,14 @@ impl LspClient {
             .spawn()
             .with_context(|| format!("Failed to spawn LSP server: {}", program))?;
 
-        let stdin = child.stdin.take().expect("stdin not captured");
-        let stdout = child.stdout.take().expect("stdout not captured");
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("stdin not captured"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("stdout not captured"))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>> =

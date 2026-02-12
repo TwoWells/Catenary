@@ -159,7 +159,7 @@ impl<H: ToolHandler> McpServer<H> {
             "initialize" => self.handle_initialize(request),
             "tools/list" => self.handle_tools_list(request),
             "tools/call" => self.handle_tools_call(request),
-            "ping" => Ok(Response::success(request.id, serde_json::json!({}))),
+            "ping" => Ok(Response::success(request.id, serde_json::json!({}))?),
             _ => {
                 warn!("Unknown method: {}", request.method);
                 Ok(Response::error(
@@ -220,7 +220,7 @@ impl<H: ToolHandler> McpServer<H> {
             },
         };
 
-        Ok(Response::success(request.id, result))
+        Ok(Response::success(request.id, result)?)
     }
 
     fn handle_tools_list(&self, request: Request) -> Result<Response> {
@@ -228,7 +228,7 @@ impl<H: ToolHandler> McpServer<H> {
         debug!("Listing {} tools", tools.len());
 
         let result = ListToolsResult { tools };
-        Ok(Response::success(request.id, result))
+        Ok(Response::success(request.id, result)?)
     }
 
     fn handle_tools_call(&self, request: Request) -> Result<Response> {
@@ -242,13 +242,13 @@ impl<H: ToolHandler> McpServer<H> {
         debug!("Calling tool: {}", params.name);
 
         match self.handler.call_tool(&params.name, params.arguments) {
-            Ok(result) => Ok(Response::success(request.id, result)),
+            Ok(result) => Ok(Response::success(request.id, result)?),
             Err(e) => {
                 error!("Tool call failed: {}", e);
                 Ok(Response::success(
                     request.id,
                     CallToolResult::error(e.to_string()),
-                ))
+                )?)
             }
         }
     }
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_handle_initialize() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_list() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_success() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_error() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_handle_unknown_method() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_handle_ping() {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),

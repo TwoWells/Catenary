@@ -5,6 +5,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A high-performance multiplexing bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol). Enables LLMs to access IDE-grade code intelligence across multiple languages simultaneously with smart routing and UTF-8 accuracy."
 repository = "https://github.com/MarkWells-Dev/Catenary"
+documentation = "https://markwells-dev.github.io/catenary/"
 keywords = ["mcp", "lsp", "language-server", "llm", "ai"]
 categories = ["development-tools"]
 
@@ -34,5 +35,24 @@ url = "2.5.8"
 
 [dev-dependencies]
 tempfile = "3"
-cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 toml = "0.9.11"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+panic = "deny"
+unimplemented = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"

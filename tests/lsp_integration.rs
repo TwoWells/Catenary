@@ -67,7 +67,7 @@ async fn test_bash_lsp_initialize() {
         "bash-language-server",
         &["start"],
         "shellscript",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();
@@ -94,7 +94,7 @@ async fn test_bash_lsp_hover() {
         "bash-language-server",
         &["start"],
         "shellscript",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();
@@ -149,7 +149,7 @@ async fn test_lua_lsp_initialize() {
         "lua-language-server",
         &[],
         "lua",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();
@@ -173,7 +173,7 @@ async fn test_document_lifecycle() {
         "bash-language-server",
         &["start"],
         "shellscript",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();
@@ -245,7 +245,7 @@ edition = "2021"
         "rust-analyzer",
         &[],
         "rust",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();
@@ -283,7 +283,7 @@ edition = "2021"
         "rust-analyzer",
         &[],
         "rust",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();
@@ -337,7 +337,7 @@ async fn test_yaml_lsp_initialize() {
         "yaml-language-server",
         &["--stdio"],
         "yaml",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();
@@ -361,7 +361,7 @@ async fn test_yaml_lsp_hover() {
         "yaml-language-server",
         &["--stdio"],
         "yaml",
-        catenary_mcp::session::EventBroadcaster::noop(),
+        catenary_mcp::session::EventBroadcaster::noop().unwrap(),
     )
     .await
     .unwrap();

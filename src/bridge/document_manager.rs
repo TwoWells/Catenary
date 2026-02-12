@@ -205,6 +205,7 @@ fn detect_language_id(path: &Path) -> &'static str {
         Some("h" | "hpp") => "cpp",
         Some("java") => "java",
         Some("rb") => "ruby",
+        Some("php") => "php",
         Some("sh" | "bash") => "shellscript",
         Some("zsh") => "shellscript",
         Some("json") => "json",
@@ -326,6 +327,7 @@ mod tests {
         assert_eq!(detect_language_id(Path::new("test.js")), "javascript");
         assert_eq!(detect_language_id(Path::new("test.ts")), "typescript");
         assert_eq!(detect_language_id(Path::new("test.go")), "go");
+        assert_eq!(detect_language_id(Path::new("test.php")), "php");
         assert_eq!(detect_language_id(Path::new("test.sh")), "shellscript");
         assert_eq!(detect_language_id(Path::new("test.bash")), "shellscript");
         assert_eq!(detect_language_id(Path::new("test.unknown")), "plaintext");

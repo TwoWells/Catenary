@@ -134,7 +134,10 @@ async fn run_server(args: Args) -> Result<()> {
 
         // Parse command into program and arguments
         let mut parts = command_str.split_whitespace();
-        let program = parts.next().expect("command cannot be empty").to_string();
+        let program = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?
+            .to_string();
         let cmd_args: Vec<String> = parts.map(|s| s.to_string()).collect();
 
         config.server.insert(
@@ -153,10 +156,20 @@ async fn run_server(args: Args) -> Result<()> {
     let session = Arc::new(std::sync::Mutex::new(Session::create(
         root.to_string_lossy().as_ref(),
     )?));
-    let broadcaster = session.lock().unwrap().broadcaster();
+    let broadcaster = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .broadcaster();
 
     info!("Starting catenary multiplexing bridge");
-    info!("Session ID: {}", session.lock().unwrap().info.id);
+    info!(
+        "Session ID: {}",
+        session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+            .info
+            .id
+    );
     info!("Workspace root: {}", root.display());
     info!("Document idle timeout: {}s", config.idle_timeout);
 

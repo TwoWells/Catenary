@@ -146,7 +146,7 @@ impl Session {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::ZERO)
             .as_millis();
         let pid = std::process::id();
         // Use thread ID to avoid collisions in tests
@@ -227,23 +227,22 @@ impl EventBroadcaster {
     }
 
     /// Create a no-op broadcaster (for when session is disabled)
-    pub fn noop() -> Self {
+    pub fn noop() -> Result<Self> {
         // Create a broadcaster that writes to /dev/null
         let file = OpenOptions::new()
             .write(true)
             .open("/dev/null")
-            .unwrap_or_else(|_| {
+            .or_else(|_| {
                 // Fallback for non-Unix systems
                 OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
                     .open(std::env::temp_dir().join(".catenary_null"))
-                    .unwrap()
-            });
-        Self {
+            })?;
+        Ok(Self {
             events_file: Arc::new(Mutex::new(file)),
-        }
+        })
     }
 }
 

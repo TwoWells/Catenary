@@ -1,0 +1,47 @@
+# cargo-deny configuration
+# Protects dual GPL-3.0 + commercial licensing
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+
+# Only permissive licenses - safe for both GPL and commercial
+# One codebase, no split maintenance
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+
+# Denied by omission: GPL, AGPL, LGPL, SSPL, proprietary, unknown
+
+# Catenary itself is GPL-3.0 (dual-licensed), but dependencies must be permissive
+exceptions = [
+    { name = "catenary-mcp", allow = ["GPL-3.0-or-later"] },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
