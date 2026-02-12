@@ -744,6 +744,14 @@ impl LspClient {
             tokio::time::sleep(poll_interval).await;
         }
     }
+
+    /// Robustly waits for analysis to complete after a change.
+    /// Includes a grace period to allow the server to start indexing.
+    pub async fn wait_for_analysis(&self) -> bool {
+        // Give server a moment to start indexing
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.wait_ready().await
+    }
 }
 
 impl Drop for LspClient {

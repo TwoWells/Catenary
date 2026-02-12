@@ -90,6 +90,8 @@ pub struct PositionInput {
 #[derive(Debug, Deserialize)]
 pub struct FileInput {
     pub file: String,
+    #[serde(default = "default_true")]
+    pub wait_for_reanalysis: bool,
 }
 
 fn default_true() -> bool {
@@ -662,6 +664,14 @@ impl LspBridgeHandler {
 
         let result = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
+
+            if input.wait_for_reanalysis {
+                let client = client_mutex.lock().await;
+                if !client.wait_for_analysis().await {
+                    return Err(anyhow!("LSP server stopped responding during analysis"));
+                }
+            }
+
             let params = DocumentSymbolParams {
                 text_document: TextDocumentIdentifier { uri },
                 work_done_progress_params: Default::default(),
@@ -1034,7 +1044,14 @@ impl LspBridgeHandler {
 
         let diagnostics = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            if input.wait_for_reanalysis {
+                let client = client_mutex.lock().await;
+                if !client.wait_for_analysis().await {
+                    return Err(anyhow!("LSP server stopped responding during analysis"));
+                }
+            }
+
             let client = client_mutex.lock().await;
             Ok::<_, anyhow::Error>(client.get_diagnostics(&uri).await)
         })?;
@@ -1939,7 +1956,8 @@ fn file_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "file": { "type": "string", "description": "Absolute path to the file" }
+            "file": { "type": "string", "description": "Absolute path to the file" },
+            "wait_for_reanalysis": { "type": "boolean", "description": "Wait for LSP server to finish re-analyzing the file after changes (default: true)" }
         },
         "required": ["file"]
     })
