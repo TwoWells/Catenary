@@ -29,3 +29,19 @@ This file serves as the single point of truth for AI agents (Claude, Gemini, etc
 - **Test:** `cargo test`
 - **Lint:** `cargo clippy`
 - **Format:** `cargo fmt`
+
+## Release Workflow
+Versioning and releases are managed via the `Makefile`.
+- **Patch Release:** `make release-patch` (e.g., 0.1.0 -> 0.1.1)
+- **Minor Release:** `make release-minor` (e.g., 0.1.0 -> 0.2.0)
+- **Major Release:** `make release-major` (e.g., 0.1.0 -> 1.0.0)
+- **Custom Version:** `make release V=x.y.z`
+
+These commands automatically:
+1. Verify the working tree is clean and on `main`.
+2. Bump versions in `Cargo.toml` and `.claude-plugin/marketplace.json`.
+3. Run all tests and linting checks.
+4. Commit the changes and create a git tag.
+
+To complete the release, push the changes and tags:
+`git push && git push --tags`
