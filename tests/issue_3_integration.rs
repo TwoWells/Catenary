@@ -1,16 +1,24 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+//! Regression test for issue #3: LSP diagnostics timing.
+//!
+//! Verifies that Catenary correctly waits for the LSP server to complete
+//! its analysis after a file change before returning diagnostics,
+//! ensuring accuracy and avoiding race conditions.
+
+use anyhow::{Context, Result};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use tempfile::tempdir;
 
 #[test]
-fn test_lsp_diagnostics_waits_for_analysis_after_change() {
+fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     // 1. Setup workspace with a valid rust file
-    let dir = tempdir().unwrap();
+    let dir = tempdir()?;
     let src_dir = dir.path().join("src");
-    std::fs::create_dir(&src_dir).unwrap();
+    std::fs::create_dir(&src_dir)?;
     let file_path = src_dir.join("main.rs");
-    std::fs::write(&file_path, "fn main() { let x: i32 = 1; }").unwrap();
+    std::fs::write(&file_path, "fn main() { let x: i32 = 1; }")?;
 
     std::fs::write(
         dir.path().join("Cargo.toml"),
@@ -19,8 +27,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() {
 name = "test-crate"
 version = "0.1.0"
 "#,
-    )
-    .unwrap();
+    )?;
 
     // 2. Start Catenary
     let mut child = Command::new("cargo")
@@ -28,7 +35,7 @@ version = "0.1.0"
             "run",
             "--",
             "--root",
-            dir.path().to_str().unwrap(),
+            dir.path().to_str().context("invalid path")?,
             "--lsp",
             "rust:rust-analyzer",
         ])
@@ -36,10 +43,10 @@ version = "0.1.0"
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("Failed to start catenary");
+        .context("Failed to start catenary")?;
 
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
+    let stdin = child.stdin.as_mut().context("Failed to get stdin")?;
+    let stdout = child.stdout.as_mut().context("Failed to get stdout")?;
     let mut reader = BufReader::new(stdout);
 
     // 3. Initialize MCP
@@ -53,21 +60,23 @@ version = "0.1.0"
             "clientInfo": { "name": "test", "version": "1.0" }
         }
     });
-    writeln!(stdin, "{}", init_req).unwrap();
+    writeln!(stdin, "{init_req}").context("Failed to write to stdin")?;
     let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
+    reader
+        .read_line(&mut line)
+        .context("Failed to read from stdout")?;
 
     let initialized_notif = json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    writeln!(stdin, "{}", initialized_notif).unwrap();
+    writeln!(stdin, "{initialized_notif}").context("Failed to write to stdin")?;
 
     // Give it a moment to finish initial indexing
     std::thread::sleep(std::time::Duration::from_millis(5000));
 
     // 4. Update file to introduce error
-    std::fs::write(&file_path, "fn main() { let x: i32 = \"string\"; }").unwrap();
+    std::fs::write(&file_path, "fn main() { let x: i32 = \"string\"; }")?;
 
     // 5. Call lsp_diagnostics IMMEDIATELY
     let diag_req = json!({
@@ -77,24 +86,27 @@ version = "0.1.0"
         "params": {
             "name": "lsp_diagnostics",
             "arguments": {
-                "file": file_path.to_str().unwrap(),
+                "file": file_path.to_str().context("invalid path")?,
                 "wait_for_reanalysis": true
             }
         }
     });
 
-    writeln!(stdin, "{}", diag_req).unwrap();
+    writeln!(stdin, "{diag_req}").context("Failed to write to stdin")?;
 
     line.clear();
-    reader.read_line(&mut line).unwrap();
+    reader
+        .read_line(&mut line)
+        .context("Failed to read from stdout")?;
 
     // 6. Verify result contains the expected error
     assert!(
         line.contains("mismatched types") || line.contains("expected i32"),
-        "Diagnostics should contain the error after change. Got: {}",
-        line
+        "Diagnostics should contain the error after change. Got: {line}"
     );
 
     // Cleanup
     let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
 }

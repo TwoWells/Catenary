@@ -1,43 +1,47 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Ensures that the Cargo.toml version matches the Claude Plugin version.
 //! This runs as part of `cargo test`, which is triggered by cargo-husky on push.
 
+use anyhow::{Context, Result};
+
 #[test]
-fn test_version_sync() {
+fn test_version_sync() -> Result<()> {
     // 1. Get Cargo version
-    let cargo_toml = std::fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
-    let cargo_table: toml::Table = cargo_toml.parse().expect("Failed to parse Cargo.toml");
+    let cargo_toml = std::fs::read_to_string("Cargo.toml").context("Failed to read Cargo.toml")?;
+    let cargo_table: toml::Table = cargo_toml.parse().context("Failed to parse Cargo.toml")?;
     let cargo_version = cargo_table["package"]["version"]
         .as_str()
-        .expect("Failed to get version from Cargo.toml");
+        .context("Failed to get version from Cargo.toml")?;
 
     // 2. Get Plugin version
     let plugin_json = std::fs::read_to_string(".claude-plugin/marketplace.json")
-        .expect("Failed to read marketplace.json");
+        .context("Failed to read marketplace.json")?;
     let plugin_data: serde_json::Value =
-        serde_json::from_str(&plugin_json).expect("Failed to parse marketplace.json");
+        serde_json::from_str(&plugin_json).context("Failed to parse marketplace.json")?;
     let plugin_version = plugin_data["plugins"][0]["version"]
         .as_str()
-        .expect("Failed to get version from marketplace.json");
+        .context("Failed to get version from marketplace.json")?;
 
     // 3. Compare
     assert_eq!(
         cargo_version, plugin_version,
-        "Version mismatch! Cargo.toml: {}, marketplace.json: {}",
-        cargo_version, plugin_version
+        "Version mismatch! Cargo.toml: {cargo_version}, marketplace.json: {plugin_version}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_cargo_lock_freshness() {
+fn test_cargo_lock_freshness() -> Result<()> {
     // Run 'cargo check --locked' to ensure Cargo.lock is in sync with Cargo.toml
     // --locked will fail if Cargo.lock needs updating.
     let status = std::process::Command::new("cargo")
         .args(["check", "--locked"])
         .status()
-        .expect("Failed to execute cargo check");
+        .context("Failed to execute cargo check")?;
 
     assert!(
         status.success(),
         "Cargo.lock is out of sync with Cargo.toml! Please run 'cargo check' and stage the changes."
     );
+    Ok(())
 }

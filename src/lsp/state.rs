@@ -164,6 +164,7 @@ impl ProgressTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
 
     fn make_progress_params(token: &str, progress: WorkDoneProgress) -> ProgressParams {
         ProgressParams {
@@ -173,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_progress_begin_end() {
+    fn test_progress_begin_end() -> Result<()> {
         let mut tracker = ProgressTracker::new();
         assert!(!tracker.is_busy());
 
@@ -190,7 +191,7 @@ mod tests {
         tracker.update(&begin);
 
         assert!(tracker.is_busy());
-        let primary = tracker.primary_progress().unwrap();
+        let primary = tracker.primary_progress().context("missing progress")?;
         assert_eq!(primary.title, "Indexing");
         assert_eq!(primary.message, Some("src/main.rs".to_string()));
         assert_eq!(primary.percentage, Some(0));
@@ -203,10 +204,11 @@ mod tests {
         tracker.update(&end);
 
         assert!(!tracker.is_busy());
+        Ok(())
     }
 
     #[test]
-    fn test_progress_report() {
+    fn test_progress_report() -> Result<()> {
         let mut tracker = ProgressTracker::new();
 
         // Begin
@@ -232,13 +234,14 @@ mod tests {
         );
         tracker.update(&report);
 
-        let primary = tracker.primary_progress().unwrap();
+        let primary = tracker.primary_progress().context("missing progress")?;
         assert_eq!(primary.percentage, Some(50));
         assert_eq!(primary.message, Some("50% done".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_multiple_progress_tokens() {
+    fn test_multiple_progress_tokens() -> Result<()> {
         let mut tracker = ProgressTracker::new();
 
         // Begin two progress operations
@@ -266,7 +269,7 @@ mod tests {
         assert!(tracker.is_busy());
 
         // Primary should be the one with lower percentage
-        let primary = tracker.primary_progress().unwrap();
+        let primary = tracker.primary_progress().context("missing progress")?;
         assert_eq!(primary.title, "Analyzing");
         assert_eq!(primary.percentage, Some(10));
 
@@ -278,8 +281,9 @@ mod tests {
         tracker.update(&end1);
 
         assert!(tracker.is_busy());
-        let primary = tracker.primary_progress().unwrap();
+        let primary = tracker.primary_progress().context("missing progress")?;
         assert_eq!(primary.title, "Analyzing");
+        Ok(())
     }
 
     #[test]

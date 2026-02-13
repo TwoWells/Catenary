@@ -2775,6 +2775,7 @@ fn position_to_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use lsp_types::{
         DocumentSymbol, Range, SymbolInformation, SymbolKind, WorkspaceSymbolResponse,
     };
@@ -2791,7 +2792,10 @@ mod tests {
     }
 
     fn make_document_symbol(name: &str, kind: SymbolKind, range: Range) -> DocumentSymbol {
-        #[allow(deprecated)]
+        #[allow(
+            deprecated,
+            reason = "LSP spec uses deprecated fields in some versions"
+        )]
         DocumentSymbol {
             name: name.to_string(),
             detail: None,
@@ -2804,65 +2808,76 @@ mod tests {
         }
     }
 
-    fn make_symbol_info(name: &str, kind: SymbolKind, uri: &str, line: u32) -> SymbolInformation {
-        #[allow(deprecated)]
-        SymbolInformation {
+    fn make_symbol_info(
+        name: &str,
+        kind: SymbolKind,
+        uri: &str,
+        line: u32,
+    ) -> Result<SymbolInformation> {
+        #[allow(
+            deprecated,
+            reason = "LSP spec uses deprecated fields in some versions"
+        )]
+        Ok(SymbolInformation {
             name: name.to_string(),
             kind,
             tags: None,
             deprecated: None,
             location: Location {
-                uri: uri.parse().unwrap(),
+                uri: uri.parse()?,
                 range: make_range(line, 0, line, 10),
             },
             container_name: None,
-        }
+        })
     }
 
     #[test]
-    fn test_find_symbol_exact_match_flat() {
+    fn test_find_symbol_exact_match_flat() -> Result<()> {
         let symbols = vec![
-            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 0),
-            make_symbol_info("bar", SymbolKind::FUNCTION, "file:///test.rs", 10),
-            make_symbol_info("baz", SymbolKind::STRUCT, "file:///test.rs", 20),
+            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 0)?,
+            make_symbol_info("bar", SymbolKind::FUNCTION, "file:///test.rs", 10)?,
+            make_symbol_info("baz", SymbolKind::STRUCT, "file:///test.rs", 20)?,
         ];
         let response = DocumentSymbolResponse::Flat(symbols);
 
-        let result = find_symbol_in_document_response(&response, "bar");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().line, 10);
+        let result =
+            find_symbol_in_document_response(&response, "bar").context("symbol not found")?;
+        assert_eq!(result.line, 10);
+        Ok(())
     }
 
     #[test]
-    fn test_find_symbol_partial_match_flat() {
+    fn test_find_symbol_partial_match_flat() -> Result<()> {
         let symbols = vec![
-            make_symbol_info("handle_request", SymbolKind::FUNCTION, "file:///test.rs", 5),
-            make_symbol_info("process_data", SymbolKind::FUNCTION, "file:///test.rs", 15),
+            make_symbol_info("handle_request", SymbolKind::FUNCTION, "file:///test.rs", 5)?,
+            make_symbol_info("process_data", SymbolKind::FUNCTION, "file:///test.rs", 15)?,
         ];
         let response = DocumentSymbolResponse::Flat(symbols);
 
         // Partial match "request"
-        let result = find_symbol_in_document_response(&response, "request");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().line, 5);
+        let result =
+            find_symbol_in_document_response(&response, "request").context("symbol not found")?;
+        assert_eq!(result.line, 5);
+        Ok(())
     }
 
     #[test]
-    fn test_find_symbol_exact_preferred_over_partial() {
+    fn test_find_symbol_exact_preferred_over_partial() -> Result<()> {
         let symbols = vec![
-            make_symbol_info("foobar", SymbolKind::FUNCTION, "file:///test.rs", 0),
-            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 10),
+            make_symbol_info("foobar", SymbolKind::FUNCTION, "file:///test.rs", 0)?,
+            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 10)?,
         ];
         let response = DocumentSymbolResponse::Flat(symbols);
 
         // Exact match "foo" should be preferred over partial match "foobar"
-        let result = find_symbol_in_document_response(&response, "foo");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().line, 10);
+        let result =
+            find_symbol_in_document_response(&response, "foo").context("symbol not found")?;
+        assert_eq!(result.line, 10);
+        Ok(())
     }
 
     #[test]
-    fn test_find_symbol_nested() {
+    fn test_find_symbol_nested() -> Result<()> {
         let inner_symbol =
             make_document_symbol("inner_method", SymbolKind::METHOD, make_range(5, 0, 10, 0));
         let mut outer_symbol =
@@ -2871,13 +2886,14 @@ mod tests {
 
         let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
 
-        let result = find_symbol_in_document_response(&response, "inner_method");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().line, 5);
+        let result = find_symbol_in_document_response(&response, "inner_method")
+            .context("symbol not found")?;
+        assert_eq!(result.line, 5);
+        Ok(())
     }
 
     #[test]
-    fn test_find_symbol_nested_partial_match() {
+    fn test_find_symbol_nested_partial_match() -> Result<()> {
         let inner_symbol = make_document_symbol(
             "handle_request",
             SymbolKind::METHOD,
@@ -2890,64 +2906,68 @@ mod tests {
         let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
 
         // Partial match should find inner_method
-        let result = find_symbol_in_document_response(&response, "request");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().line, 15);
+        let result =
+            find_symbol_in_document_response(&response, "request").context("symbol not found")?;
+        assert_eq!(result.line, 15);
+        Ok(())
     }
 
     #[test]
-    fn test_find_symbol_not_found() {
+    fn test_find_symbol_not_found() -> Result<()> {
         let symbols = vec![make_symbol_info(
             "foo",
             SymbolKind::FUNCTION,
             "file:///test.rs",
             0,
-        )];
+        )?];
         let response = DocumentSymbolResponse::Flat(symbols);
 
         let result = find_symbol_in_document_response(&response, "nonexistent");
         assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_find_workspace_symbol_exact_match() {
+    fn test_find_workspace_symbol_exact_match() -> Result<()> {
         let symbols = vec![
-            make_symbol_info("MyStruct", SymbolKind::STRUCT, "file:///src/lib.rs", 10),
-            make_symbol_info("MyFunction", SymbolKind::FUNCTION, "file:///src/main.rs", 5),
+            make_symbol_info("MyStruct", SymbolKind::STRUCT, "file:///src/lib.rs", 10)?,
+            make_symbol_info("MyFunction", SymbolKind::FUNCTION, "file:///src/main.rs", 5)?,
         ];
         let response = WorkspaceSymbolResponse::Flat(symbols);
 
-        let result = find_symbol_in_workspace_response(&response, "MyStruct");
-        assert!(result.is_some());
-        let (path, position) = result.unwrap();
+        let result =
+            find_symbol_in_workspace_response(&response, "MyStruct").context("symbol not found")?;
+        let (path, position): (std::path::PathBuf, _) = result;
         assert_eq!(path.to_string_lossy(), "/src/lib.rs");
         assert_eq!(position.line, 10);
+        Ok(())
     }
 
     #[test]
-    fn test_find_workspace_symbol_partial_match() {
+    fn test_find_workspace_symbol_partial_match() -> Result<()> {
         let symbols = vec![make_symbol_info(
             "LspBridgeHandler",
             SymbolKind::STRUCT,
             "file:///src/handler.rs",
             50,
-        )];
+        )?];
         let response = WorkspaceSymbolResponse::Flat(symbols);
 
-        let result = find_symbol_in_workspace_response(&response, "Bridge");
-        assert!(result.is_some());
-        let (path, position) = result.unwrap();
+        let result =
+            find_symbol_in_workspace_response(&response, "Bridge").context("symbol not found")?;
+        let (path, position): (std::path::PathBuf, _) = result;
         assert_eq!(path.to_string_lossy(), "/src/handler.rs");
         assert_eq!(position.line, 50);
+        Ok(())
     }
 
     #[test]
-    fn test_find_references_input_validation() {
+    fn test_find_references_input_validation() -> Result<()> {
         // Test that FindReferencesInput can be deserialized with symbol
         let json = serde_json::json!({
             "symbol": "MyStruct"
         });
-        let input: FindReferencesInput = serde_json::from_value(json).unwrap();
+        let input: FindReferencesInput = serde_json::from_value(json)?;
         assert_eq!(input.symbol, Some("MyStruct".to_string()));
         assert!(input.file.is_none());
         assert!(input.line.is_none());
@@ -2960,7 +2980,7 @@ mod tests {
             "line": 10,
             "character": 5
         });
-        let input: FindReferencesInput = serde_json::from_value(json).unwrap();
+        let input: FindReferencesInput = serde_json::from_value(json)?;
         assert!(input.symbol.is_none());
         assert_eq!(input.file, Some("/path/to/file.rs".to_string()));
         assert_eq!(input.line, Some(10));
@@ -2971,8 +2991,9 @@ mod tests {
             "symbol": "my_function",
             "file": "/path/to/file.rs"
         });
-        let input: FindReferencesInput = serde_json::from_value(json).unwrap();
+        let input: FindReferencesInput = serde_json::from_value(json)?;
         assert_eq!(input.symbol, Some("my_function".to_string()));
         assert_eq!(input.file, Some("/path/to/file.rs".to_string()));
+        Ok(())
     }
 }

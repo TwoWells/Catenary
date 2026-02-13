@@ -270,19 +270,18 @@ fn detect_language_id(path: &Path) -> &'static str {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
     #[tokio::test]
-    async fn test_open_document() {
-        let mut file = NamedTempFile::with_suffix(".rs").unwrap();
-        writeln!(file, "fn main() {{}}").unwrap();
+    async fn test_open_document() -> Result<()> {
+        let mut file = NamedTempFile::with_suffix(".rs")?;
+        writeln!(file, "fn main() {{}}")?;
 
         let mut manager = DocumentManager::new();
-        let notification = manager.ensure_open(file.path()).await.unwrap();
+        let notification = manager.ensure_open(file.path()).await?;
 
         assert!(notification.is_some());
         if let Some(DocumentNotification::Open(params)) = notification {
@@ -290,73 +289,77 @@ mod tests {
             assert_eq!(params.text_document.version, 1);
             assert!(params.text_document.text.contains("fn main()"));
         } else {
-            panic!("Expected Open notification");
+            anyhow::bail!("Expected Open notification");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_already_open_no_change() {
-        let mut file = NamedTempFile::with_suffix(".py").unwrap();
-        writeln!(file, "print('hello')").unwrap();
+    async fn test_already_open_no_change() -> Result<()> {
+        let mut file = NamedTempFile::with_suffix(".py")?;
+        writeln!(file, "print('hello')")?;
 
         let mut manager = DocumentManager::new();
 
         // First open
-        let notification1 = manager.ensure_open(file.path()).await.unwrap();
+        let notification1 = manager.ensure_open(file.path()).await?;
         assert!(notification1.is_some());
 
         // Second access - no notification since file unchanged
-        let notification2 = manager.ensure_open(file.path()).await.unwrap();
+        let notification2 = manager.ensure_open(file.path()).await?;
         assert!(notification2.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_document_changed_on_disk() {
-        let file = NamedTempFile::with_suffix(".js").unwrap();
+    async fn test_document_changed_on_disk() -> Result<()> {
+        let file = NamedTempFile::with_suffix(".js")?;
         let path = file.path().to_path_buf();
-        std::fs::write(&path, "const x = 1;").unwrap();
+        std::fs::write(&path, "const x = 1;")?;
 
         let mut manager = DocumentManager::new();
 
         // First open
-        let notification1 = manager.ensure_open(&path).await.unwrap();
+        let notification1 = manager.ensure_open(&path).await?;
         assert!(matches!(notification1, Some(DocumentNotification::Open(_))));
 
         // Modify file (need delay for mtime to differ on some filesystems)
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        std::fs::write(&path, "const x = 2;").unwrap();
+        std::fs::write(&path, "const x = 2;")?;
 
         // Re-access - should get Change notification since content differs
-        let notification2 = manager.ensure_open(&path).await.unwrap();
+        let notification2 = manager.ensure_open(&path).await?;
         assert!(
             matches!(notification2, Some(DocumentNotification::Change(_))),
             "Expected Change notification after file modification"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_close_document() {
-        let mut file = NamedTempFile::with_suffix(".go").unwrap();
-        writeln!(file, "package main").unwrap();
+    async fn test_close_document() -> Result<()> {
+        let mut file = NamedTempFile::with_suffix(".go")?;
+        writeln!(file, "package main")?;
 
         let mut manager = DocumentManager::new();
-        manager.ensure_open(file.path()).await.unwrap();
+        manager.ensure_open(file.path()).await?;
 
-        let close_params = manager.close(file.path()).unwrap();
+        let close_params = manager.close(file.path())?;
         assert!(close_params.is_some());
 
         // Closing again should return None
-        let close_params2 = manager.close(file.path()).unwrap();
+        let close_params2 = manager.close(file.path())?;
         assert!(close_params2.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_stale_documents() {
-        let mut file = NamedTempFile::with_suffix(".txt").unwrap();
-        writeln!(file, "test").unwrap();
+    async fn test_stale_documents() -> Result<()> {
+        let mut file = NamedTempFile::with_suffix(".txt")?;
+        writeln!(file, "test")?;
 
         let mut manager = DocumentManager::new();
-        manager.ensure_open(file.path()).await.unwrap();
+        manager.ensure_open(file.path()).await?;
 
         // Wait a moment so the document becomes stale
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -368,6 +371,7 @@ mod tests {
         // With large timeout, nothing should be stale
         let stale = manager.stale_documents(3600);
         assert!(stale.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -403,8 +407,9 @@ mod tests {
     }
 
     #[test]
-    fn test_path_to_uri() {
-        let uri = path_to_uri(Path::new("/home/user/test.rs")).unwrap();
+    fn test_path_to_uri() -> Result<()> {
+        let uri = path_to_uri(Path::new("/home/user/test.rs"))?;
         assert!(uri.as_str().starts_with("file:///home/user/test.rs"));
+        Ok(())
     }
 }

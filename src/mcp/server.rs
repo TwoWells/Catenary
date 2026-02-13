@@ -294,14 +294,14 @@ mod tests {
             match name {
                 "test_tool" => Ok(CallToolResult::text("Test result")),
                 "error_tool" => Err(anyhow!("Test error")),
-                _ => Err(anyhow!("Unknown tool: {}", name)),
+                _ => Err(anyhow!("Unknown tool: {name}")),
             }
         }
     }
 
     #[test]
-    fn test_handle_initialize() {
-        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+    fn test_handle_initialize() -> Result<()> {
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -317,17 +317,19 @@ mod tests {
             })),
         };
 
-        let response = server.handle_request(request).unwrap();
+        let response = server.handle_request(request)?;
         assert!(response.result.is_some());
         assert!(response.error.is_none());
 
-        let result: InitializeResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        let result: InitializeResult =
+            serde_json::from_value(response.result.context("missing result")?)?;
         assert_eq!(result.server_info.name, "catenary");
+        Ok(())
     }
 
     #[test]
-    fn test_handle_tools_list() {
-        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+    fn test_handle_tools_list() -> Result<()> {
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -336,17 +338,19 @@ mod tests {
             params: None,
         };
 
-        let response = server.handle_request(request).unwrap();
+        let response = server.handle_request(request)?;
         assert!(response.result.is_some());
 
-        let result: ListToolsResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        let result: ListToolsResult =
+            serde_json::from_value(response.result.context("missing result")?)?;
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "test_tool");
+        Ok(())
     }
 
     #[test]
-    fn test_handle_tools_call_success() {
-        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+    fn test_handle_tools_call_success() -> Result<()> {
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -358,16 +362,18 @@ mod tests {
             })),
         };
 
-        let response = server.handle_request(request).unwrap();
+        let response = server.handle_request(request)?;
         assert!(response.result.is_some());
 
-        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        let result: CallToolResult =
+            serde_json::from_value(response.result.context("missing result")?)?;
         assert!(result.is_error.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_handle_tools_call_error() {
-        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+    fn test_handle_tools_call_error() -> Result<()> {
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -378,16 +384,18 @@ mod tests {
             })),
         };
 
-        let response = server.handle_request(request).unwrap();
+        let response = server.handle_request(request)?;
         assert!(response.result.is_some());
 
-        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        let result: CallToolResult =
+            serde_json::from_value(response.result.context("missing result")?)?;
         assert_eq!(result.is_error, Some(true));
+        Ok(())
     }
 
     #[test]
-    fn test_handle_unknown_method() {
-        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+    fn test_handle_unknown_method() -> Result<()> {
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -396,14 +404,18 @@ mod tests {
             params: None,
         };
 
-        let response = server.handle_request(request).unwrap();
+        let response = server.handle_request(request)?;
         assert!(response.error.is_some());
-        assert_eq!(response.error.unwrap().code, METHOD_NOT_FOUND);
+        assert_eq!(
+            response.error.context("missing error")?.code,
+            METHOD_NOT_FOUND
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_handle_ping() {
-        let server = McpServer::new(TestHandler, EventBroadcaster::noop().unwrap());
+    fn test_handle_ping() -> Result<()> {
+        let server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -412,8 +424,9 @@ mod tests {
             params: None,
         };
 
-        let response = server.handle_request(request).unwrap();
+        let response = server.handle_request(request)?;
         assert!(response.result.is_some());
         assert!(response.error.is_none());
+        Ok(())
     }
 }

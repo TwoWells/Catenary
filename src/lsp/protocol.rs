@@ -144,32 +144,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_complete_message() {
+    fn test_parse_complete_message() -> Result<()> {
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
         let raw = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
         let mut buffer = BytesMut::from(raw.as_str());
 
-        let result = try_parse_message(&mut buffer).unwrap();
+        let result = try_parse_message(&mut buffer)?;
         assert_eq!(result, Some(body.to_string()));
         assert!(buffer.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_incomplete_header() {
+    fn test_parse_incomplete_header() -> Result<()> {
         let mut buffer = BytesMut::from("Content-Length: 10\r\n");
-        let result = try_parse_message(&mut buffer).unwrap();
+        let result = try_parse_message(&mut buffer)?;
         assert_eq!(result, None);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_incomplete_body() {
+    fn test_parse_incomplete_body() -> Result<()> {
         let mut buffer = BytesMut::from("Content-Length: 100\r\n\r\n{\"partial\":");
-        let result = try_parse_message(&mut buffer).unwrap();
+        let result = try_parse_message(&mut buffer)?;
         assert_eq!(result, None);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_multiple_messages() {
+    fn test_parse_multiple_messages() -> Result<()> {
         let body1 = r#"{"jsonrpc":"2.0","id":1}"#;
         let body2 = r#"{"jsonrpc":"2.0","id":2}"#;
         let raw = format!(
@@ -181,69 +184,77 @@ mod tests {
         );
         let mut buffer = BytesMut::from(raw.as_str());
 
-        let result1 = try_parse_message(&mut buffer).unwrap();
+        let result1 = try_parse_message(&mut buffer)?;
         assert_eq!(result1, Some(body1.to_string()));
 
-        let result2 = try_parse_message(&mut buffer).unwrap();
+        let result2 = try_parse_message(&mut buffer)?;
         assert_eq!(result2, Some(body2.to_string()));
 
         assert!(buffer.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_case_insensitive_header() {
+    fn test_parse_case_insensitive_header() -> Result<()> {
         let body = r#"{"test":true}"#;
         let raw = format!("content-length: {}\r\n\r\n{}", body.len(), body);
         let mut buffer = BytesMut::from(raw.as_str());
 
-        let result = try_parse_message(&mut buffer).unwrap();
+        let result = try_parse_message(&mut buffer)?;
         assert_eq!(result, Some(body.to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_request_id_number() {
+    fn test_request_id_number() -> Result<()> {
         let json = r#"{"jsonrpc":"2.0","id":42,"method":"test"}"#;
-        let msg: RequestMessage = serde_json::from_str(json).unwrap();
+        let msg: RequestMessage = serde_json::from_str(json)?;
         assert_eq!(msg.id, RequestId::Number(42));
+        Ok(())
     }
 
     #[test]
-    fn test_request_id_string() {
+    fn test_request_id_string() -> Result<()> {
         let json = r#"{"jsonrpc":"2.0","id":"abc-123","method":"test"}"#;
-        let msg: RequestMessage = serde_json::from_str(json).unwrap();
+        let msg: RequestMessage = serde_json::from_str(json)?;
         assert_eq!(msg.id, RequestId::String("abc-123".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_response_with_result() {
+    fn test_response_with_result() -> Result<()> {
         let json = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
-        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        let msg: ResponseMessage = serde_json::from_str(json)?;
         assert!(msg.result.is_some());
         assert!(msg.error.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_response_with_error() {
+    fn test_response_with_error() -> Result<()> {
         let json =
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
-        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        let msg: ResponseMessage = serde_json::from_str(json)?;
         assert!(msg.result.is_none());
         assert!(msg.error.is_some());
-        assert_eq!(msg.error.unwrap().code, -32600);
+        assert_eq!(msg.error.context("missing error")?.code, -32600);
+        Ok(())
     }
 
     #[test]
-    fn test_response_null_result() {
+    fn test_response_null_result() -> Result<()> {
         let json = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
-        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        let msg: ResponseMessage = serde_json::from_str(json)?;
         // null deserializes to None for Option<Value>
         assert!(msg.result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_notification_no_id() {
+    fn test_notification_no_id() -> Result<()> {
         let json = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
-        let msg: NotificationMessage = serde_json::from_str(json).unwrap();
+        let msg: NotificationMessage = serde_json::from_str(json)?;
         assert_eq!(msg.method, "initialized");
+        Ok(())
     }
 }

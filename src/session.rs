@@ -558,32 +558,34 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
 
     #[test]
-    fn test_session_create_and_list() {
-        let session = Session::create("/tmp/test-workspace").unwrap();
+    fn test_session_create_and_list() -> Result<()> {
+        let session = Session::create("/tmp/test-workspace")?;
         let id = session.info.id.clone();
 
         // Should appear in list
-        let sessions = list_sessions().unwrap();
+        let sessions = list_sessions()?;
         assert!(sessions.iter().any(|s| s.id == id));
 
         // Should be retrievable
-        let found = get_session(&id).unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().workspace, "/tmp/test-workspace");
+        let found = get_session(&id)?;
+        let found_session = found.context("missing session")?;
+        assert_eq!(found_session.workspace, "/tmp/test-workspace");
 
         // Drop session
         drop(session);
 
         // Should be cleaned up
-        let found = get_session(&id).unwrap();
+        let found = get_session(&id)?;
         assert!(found.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_event_broadcast() {
-        let session = Session::create("/tmp/test-events").unwrap();
+    fn test_event_broadcast() -> Result<()> {
+        let session = Session::create("/tmp/test-events")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -599,27 +601,28 @@ mod tests {
         });
 
         // Read events back
-        let events: Vec<_> = monitor_events(&id).unwrap().collect();
-        assert!(events.len() >= 2); // Started + our events
+        assert!(monitor_events(&id)?.count() >= 2); // Started + our events
 
         drop(session);
+        Ok(())
     }
 
     #[test]
-    fn test_active_languages_empty() {
-        let session = Session::create("/tmp/test-langs-empty").unwrap();
+    fn test_active_languages_empty() -> Result<()> {
+        let session = Session::create("/tmp/test-langs-empty")?;
         let id = session.info.id.clone();
 
         // No server state events, should return empty
-        let langs = active_languages(&id).unwrap();
+        let langs = active_languages(&id)?;
         assert!(langs.is_empty());
 
         drop(session);
+        Ok(())
     }
 
     #[test]
-    fn test_active_languages_tracks_server_state() {
-        let session = Session::create("/tmp/test-langs-state").unwrap();
+    fn test_active_languages_tracks_server_state() -> Result<()> {
+        let session = Session::create("/tmp/test-langs-state")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -632,15 +635,16 @@ mod tests {
             state: "Ready".to_string(),
         });
 
-        let langs = active_languages(&id).unwrap();
+        let langs = active_languages(&id)?;
         assert_eq!(langs, vec!["rust"]);
 
         drop(session);
+        Ok(())
     }
 
     #[test]
-    fn test_active_languages_removes_dead() {
-        let session = Session::create("/tmp/test-langs-dead").unwrap();
+    fn test_active_languages_removes_dead() -> Result<()> {
+        let session = Session::create("/tmp/test-langs-dead")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -653,15 +657,16 @@ mod tests {
             state: "Dead".to_string(),
         });
 
-        let langs = active_languages(&id).unwrap();
+        let langs = active_languages(&id)?;
         assert!(langs.is_empty());
 
         drop(session);
+        Ok(())
     }
 
     #[test]
-    fn test_active_languages_multiple_languages() {
-        let session = Session::create("/tmp/test-langs-multi").unwrap();
+    fn test_active_languages_multiple_languages() -> Result<()> {
+        let session = Session::create("/tmp/test-langs-multi")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -679,9 +684,10 @@ mod tests {
             state: "Initializing".to_string(),
         });
 
-        let langs = active_languages(&id).unwrap();
+        let langs = active_languages(&id)?;
         assert_eq!(langs, vec!["python", "rust", "typescript"]);
 
         drop(session);
+        Ok(())
     }
 }

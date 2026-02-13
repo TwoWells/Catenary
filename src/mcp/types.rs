@@ -294,9 +294,10 @@ impl CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
 
     #[test]
-    fn test_deserialize_initialize_params() {
+    fn test_deserialize_initialize_params() -> Result<()> {
         let json = r#"{
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -308,13 +309,14 @@ mod tests {
             }
         }"#;
 
-        let params: InitializeParams = serde_json::from_str(json).unwrap();
+        let params: InitializeParams = serde_json::from_str(json)?;
         assert_eq!(params.protocol_version, "2024-11-05");
         assert_eq!(params.client_info.name, "test-client");
+        Ok(())
     }
 
     #[test]
-    fn test_serialize_initialize_result() {
+    fn test_serialize_initialize_result() -> Result<()> {
         let result = InitializeResult {
             protocol_version: "2024-11-05".to_string(),
             capabilities: ServerCapabilities {
@@ -326,13 +328,14 @@ mod tests {
             },
         };
 
-        let json = serde_json::to_string(&result).unwrap();
+        let json = serde_json::to_string(&result)?;
         assert!(json.contains("protocolVersion"));
         assert!(json.contains("catenary"));
+        Ok(())
     }
 
     #[test]
-    fn test_serialize_tool() {
+    fn test_serialize_tool() -> Result<()> {
         let tool = Tool {
             name: "lsp_hover".to_string(),
             description: Some("Get hover info".to_string()),
@@ -347,42 +350,46 @@ mod tests {
             }),
         };
 
-        let json = serde_json::to_string(&tool).unwrap();
+        let json = serde_json::to_string(&tool)?;
         assert!(json.contains("inputSchema"));
         assert!(json.contains("lsp_hover"));
+        Ok(())
     }
 
     #[test]
-    fn test_call_tool_result_text() {
+    fn test_call_tool_result_text() -> Result<()> {
         let result = CallToolResult::text("Hello, world!");
-        let json = serde_json::to_string(&result).unwrap();
+        let json = serde_json::to_string(&result)?;
         assert!(json.contains("Hello, world!"));
         assert!(!json.contains("isError"));
+        Ok(())
     }
 
     #[test]
-    fn test_call_tool_result_error() {
+    fn test_call_tool_result_error() -> Result<()> {
         let result = CallToolResult::error("Something went wrong");
-        let json = serde_json::to_string(&result).unwrap();
+        let json = serde_json::to_string(&result)?;
         assert!(json.contains("isError"));
         assert!(json.contains("true"));
+        Ok(())
     }
 
     #[test]
-    fn test_response_success() {
-        let resp =
-            Response::success(RequestId::Number(1), serde_json::json!({"ok": true})).unwrap();
-        let json = serde_json::to_string(&resp).unwrap();
+    fn test_response_success() -> Result<()> {
+        let resp = Response::success(RequestId::Number(1), serde_json::json!({"ok": true}))?;
+        let json = serde_json::to_string(&resp)?;
         assert!(json.contains("result"));
         assert!(!json.contains("error"));
+        Ok(())
     }
 
     #[test]
-    fn test_response_error() {
+    fn test_response_error() -> Result<()> {
         let resp = Response::error(RequestId::Number(1), METHOD_NOT_FOUND, "Unknown method");
-        let json = serde_json::to_string(&resp).unwrap();
+        let json = serde_json::to_string(&resp)?;
         assert!(json.contains("error"));
         assert!(json.contains("-32601"));
         assert!(!json.contains("result"));
+        Ok(())
     }
 }
