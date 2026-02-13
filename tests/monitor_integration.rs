@@ -54,7 +54,6 @@ impl ServerProcess {
                 // The log line might look like: "2026-02-13T03:14:15.819396Z  INFO catenary: Session ID: 012305b387"
                 // Or with different formatting. We want the last word.
                 let id = line
-                    .trim()
                     .split_whitespace()
                     .last()
                     .context("Failed to parse Session ID from line")?;

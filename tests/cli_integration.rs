@@ -51,7 +51,6 @@ impl ServerProcess {
                 .context("Failed to read stderr")?;
             if line.contains("Session ID:") {
                 let id = line
-                    .trim()
                     .split_whitespace()
                     .last()
                     .context("Failed to parse Session ID from line")?;
