@@ -48,15 +48,15 @@ use crate::session::{EventBroadcaster, EventKind};
 
 /// Methods that should wait for server readiness before executing.
 const METHODS_WAIT_FOR_READY: &[&str] = &[
-    "lsp_hover",
-    "lsp_definition",
-    "lsp_type_definition",
-    "lsp_implementation",
-    "catenary_find_references",
-    "lsp_document_symbols",
-    "lsp_code_actions",
-    "lsp_completion",
-    "lsp_diagnostics",
+    "hover",
+    "definition",
+    "type_definition",
+    "implementation",
+    "find_references",
+    "document_symbols",
+    "code_actions",
+    "completion",
+    "diagnostics",
 ];
 
 use super::{DocumentManager, DocumentNotification};
@@ -89,6 +89,19 @@ pub struct PositionInput {
     pub character: u32,
 }
 
+/// Input for tools that accept either a symbol name or file/line/character position.
+#[derive(Debug, Deserialize)]
+pub struct SymbolOrPositionInput {
+    /// Symbol name to search for (uses workspace/document symbols).
+    pub symbol: Option<String>,
+    /// File path — required for position mode, optional for symbol mode (narrows search scope).
+    pub file: Option<String>,
+    /// 0-indexed line number — required if not using symbol.
+    pub line: Option<u32>,
+    /// 0-indexed character position — required if not using symbol.
+    pub character: Option<u32>,
+}
+
 /// Input for tools that need only a file path.
 #[derive(Debug, Deserialize)]
 pub struct FileInput {
@@ -105,7 +118,7 @@ const fn default_true() -> bool {
     true
 }
 
-/// Input for `catenary_find_references` - accepts either symbol name OR position.
+/// Input for `find_references` - accepts either symbol name OR position.
 #[derive(Debug, Deserialize)]
 pub struct FindReferencesInput {
     /// Symbol name to search for (uses workspace symbols)
@@ -178,9 +191,14 @@ pub struct RangeFormattingInput {
 /// Input for call hierarchy.
 #[derive(Debug, Deserialize)]
 pub struct CallHierarchyInput {
-    pub file: String,
-    pub line: u32,
-    pub character: u32,
+    /// Symbol name to search for (uses workspace/document symbols).
+    pub symbol: Option<String>,
+    /// File path — required for position mode, optional for symbol mode.
+    pub file: Option<String>,
+    /// 0-indexed line number — required if not using symbol.
+    pub line: Option<u32>,
+    /// 0-indexed character position — required if not using symbol.
+    pub character: Option<u32>,
     /// "incoming" or "outgoing"
     pub direction: String,
 }
@@ -188,9 +206,14 @@ pub struct CallHierarchyInput {
 /// Input for type hierarchy.
 #[derive(Debug, Deserialize)]
 pub struct TypeHierarchyInput {
-    pub file: String,
-    pub line: u32,
-    pub character: u32,
+    /// Symbol name to search for (uses workspace/document symbols).
+    pub symbol: Option<String>,
+    /// File path — required for position mode, optional for symbol mode.
+    pub file: Option<String>,
+    /// 0-indexed line number — required if not using symbol.
+    pub line: Option<u32>,
+    /// 0-indexed character position — required if not using symbol.
+    pub character: Option<u32>,
     /// "supertypes" or "subtypes"
     pub direction: String,
 }
@@ -289,7 +312,7 @@ impl LspBridgeHandler {
             .map(PathBuf::from)
     }
 
-    /// Handles the `catenary_status` tool.
+    /// Handles the `status` tool.
     fn handle_status(&self) -> CallToolResult {
         let statuses = self
             .runtime
@@ -378,24 +401,45 @@ impl LspBridgeHandler {
         }
     }
 
-    fn handle_hover(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input = Self::parse_position_input(arguments)?;
-        let path = Self::resolve_path(&input.file)?;
+    /// Resolves a [`SymbolOrPositionInput`] to a `(PathBuf, Position)`.
+    ///
+    /// If a symbol name is provided, delegates to [`resolve_symbol_position`].
+    /// Otherwise, requires file/line/character and resolves the path.
+    fn resolve_symbol_or_position(
+        &self,
+        input: &SymbolOrPositionInput,
+    ) -> Result<(PathBuf, Position)> {
+        if let Some(symbol) = &input.symbol {
+            self.resolve_symbol_position(symbol, input.file.as_deref())
+        } else {
+            let file = input.file.as_ref().ok_or_else(|| {
+                anyhow!("Either 'symbol' or 'file' with 'line'/'character' is required")
+            })?;
+            let line = input
+                .line
+                .ok_or_else(|| anyhow!("'line' is required when using position"))?;
+            let character = input
+                .character
+                .ok_or_else(|| anyhow!("'character' is required when using position"))?;
+            let path = Self::resolve_path(file)?;
+            Ok((path, Position { line, character }))
+        }
+    }
 
-        debug!(
-            "Hover request: {}:{}:{}",
-            input.file, input.line, input.character
-        );
+    fn handle_hover(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
+        let input: SymbolOrPositionInput =
+            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
+        let (path, position) = self.resolve_symbol_or_position(&input)?;
+
+        debug!("Hover request: {}:{}", path.display(), position.line);
 
         let result = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = HoverParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
+                    position,
                 },
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
@@ -409,23 +453,19 @@ impl LspBridgeHandler {
     }
 
     fn handle_definition(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input = Self::parse_position_input(arguments)?;
-        let path = Self::resolve_path(&input.file)?;
+        let input: SymbolOrPositionInput =
+            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
+        let (path, position) = self.resolve_symbol_or_position(&input)?;
 
-        debug!(
-            "Definition request: {}:{}:{}",
-            input.file, input.line, input.character
-        );
+        debug!("Definition request: {}:{}", path.display(), position.line);
 
         let result = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
             let params = GotoDefinitionParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
+                    position,
                 },
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
                 partial_result_params: lsp_types::PartialResultParams::default(),
@@ -443,12 +483,15 @@ impl LspBridgeHandler {
         &self,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        let input = Self::parse_position_input(arguments)?;
-        let path = Self::resolve_path(&input.file)?;
+        let input: SymbolOrPositionInput =
+            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
+        let (path, position) = self.resolve_symbol_or_position(&input)?;
 
         debug!(
-            "Type definition request: {}:{}:{}",
-            input.file, input.line, input.character
+            "Type definition request: {}:{}",
+            path.display(),
+            position.line
         );
 
         let result = self.runtime.block_on(async {
@@ -456,10 +499,7 @@ impl LspBridgeHandler {
             let params = GotoDefinitionParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
+                    position,
                 },
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
                 partial_result_params: lsp_types::PartialResultParams::default(),
@@ -477,12 +517,15 @@ impl LspBridgeHandler {
         &self,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        let input = Self::parse_position_input(arguments)?;
-        let path = Self::resolve_path(&input.file)?;
+        let input: SymbolOrPositionInput =
+            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
+                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
+        let (path, position) = self.resolve_symbol_or_position(&input)?;
 
         debug!(
-            "Implementation request: {}:{}:{}",
-            input.file, input.line, input.character
+            "Implementation request: {}:{}",
+            path.display(),
+            position.line
         );
 
         let result = self.runtime.block_on(async {
@@ -490,10 +533,7 @@ impl LspBridgeHandler {
             let params = GotoDefinitionParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
+                    position,
                 },
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
                 partial_result_params: lsp_types::PartialResultParams::default(),
@@ -516,30 +556,13 @@ impl LspBridgeHandler {
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         // Resolve target position - either from symbol search or direct position
-        let (target_path, target_position) = if let Some(symbol) = &input.symbol {
-            // Search for symbol first
-            debug!("Find references by symbol: {}", symbol);
-            self.resolve_symbol_position(symbol, input.file.as_deref())?
-        } else {
-            // Use direct position
-            let file = input.file.as_ref().ok_or_else(|| {
-                anyhow!("Either 'symbol' or 'file' with 'line'/'character' is required")
-            })?;
-            let line = input
-                .line
-                .ok_or_else(|| anyhow!("'line' is required when using position"))?;
-            let character = input
-                .character
-                .ok_or_else(|| anyhow!("'character' is required when using position"))?;
-
-            let path = Self::resolve_path(file)?;
-            let position = Position { line, character };
-            debug!(
-                "Find references by position: {}:{}:{}",
-                file, line, character
-            );
-            (path, position)
+        let sym_input = SymbolOrPositionInput {
+            symbol: input.symbol,
+            file: input.file,
+            line: input.line,
+            character: input.character,
         };
+        let (target_path, target_position) = self.resolve_symbol_or_position(&sym_input)?;
 
         let (references, definition) = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&target_path).await?;
@@ -1183,11 +1206,19 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = Self::resolve_path(&input.file)?;
+        let sym_input = SymbolOrPositionInput {
+            symbol: input.symbol,
+            file: input.file,
+            line: input.line,
+            character: input.character,
+        };
+        let (path, position) = self.resolve_symbol_or_position(&sym_input)?;
 
         debug!(
-            "Call hierarchy request: {}:{}:{} direction={}",
-            input.file, input.line, input.character, input.direction
+            "Call hierarchy request: {}:{} direction={}",
+            path.display(),
+            position.line,
+            input.direction
         );
 
         let result = self.runtime.block_on(async {
@@ -1197,10 +1228,7 @@ impl LspBridgeHandler {
             let prepare_params = CallHierarchyPrepareParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
+                    position,
                 },
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
@@ -1260,11 +1288,19 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = Self::resolve_path(&input.file)?;
+        let sym_input = SymbolOrPositionInput {
+            symbol: input.symbol,
+            file: input.file,
+            line: input.line,
+            character: input.character,
+        };
+        let (path, position) = self.resolve_symbol_or_position(&sym_input)?;
 
         debug!(
-            "Type hierarchy request: {}:{}:{} direction={}",
-            input.file, input.line, input.character, input.direction
+            "Type hierarchy request: {}:{} direction={}",
+            path.display(),
+            position.line,
+            input.direction
         );
 
         let result = self.runtime.block_on(async {
@@ -1274,10 +1310,7 @@ impl LspBridgeHandler {
             let prepare_params = TypeHierarchyPrepareParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
+                    position,
                 },
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
@@ -1632,27 +1665,27 @@ impl ToolHandler for LspBridgeHandler {
     fn list_tools(&self) -> Vec<Tool> {
         vec![
             Tool {
-                name: "lsp_hover".to_string(),
-                description: Some("Get hover information (documentation, type info) for a symbol at a position.".to_string()),
-                input_schema: position_schema(),
+                name: "hover".to_string(),
+                description: Some("Get hover information (documentation, type info) for a symbol. Accepts a symbol name or file/line/character position.".to_string()),
+                input_schema: symbol_or_position_schema(),
             },
             Tool {
-                name: "lsp_definition".to_string(),
-                description: Some("Go to the definition of a symbol.".to_string()),
-                input_schema: position_schema(),
+                name: "definition".to_string(),
+                description: Some("Go to the definition of a symbol. Accepts a symbol name or file/line/character position.".to_string()),
+                input_schema: symbol_or_position_schema(),
             },
             Tool {
-                name: "lsp_type_definition".to_string(),
-                description: Some("Go to the type definition of a symbol (e.g., for a variable, go to its type's definition).".to_string()),
-                input_schema: position_schema(),
+                name: "type_definition".to_string(),
+                description: Some("Go to the type definition of a symbol (e.g., for a variable, go to its type's definition). Accepts a symbol name or file/line/character position.".to_string()),
+                input_schema: symbol_or_position_schema(),
             },
             Tool {
-                name: "lsp_implementation".to_string(),
-                description: Some("Find implementations of an interface, trait, or abstract method.".to_string()),
-                input_schema: position_schema(),
+                name: "implementation".to_string(),
+                description: Some("Find implementations of an interface, trait, or abstract method. Accepts a symbol name or file/line/character position.".to_string()),
+                input_schema: symbol_or_position_schema(),
             },
             Tool {
-                name: "catenary_find_references".to_string(),
+                name: "find_references".to_string(),
                 description: Some("Find all references to a symbol. Accepts either a symbol name (searched across workspace) or a file/line/character position. The definition is marked with [def] in results.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1666,12 +1699,12 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "lsp_document_symbols".to_string(),
+                name: "document_symbols".to_string(),
                 description: Some("Get the symbol outline of a file (functions, classes, variables, etc.).".to_string()),
                 input_schema: file_schema(),
             },
             Tool {
-                name: "catenary_find_symbol".to_string(),
+                name: "find_symbol".to_string(),
                 description: Some("Find a symbol by name across the workspace. More robust than raw LSP workspace symbols - falls back to file search + document symbols for private/internal symbols.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1682,7 +1715,7 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "lsp_code_actions".to_string(),
+                name: "code_actions".to_string(),
                 description: Some("Get available code actions (quick fixes, refactorings) for a range.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1697,7 +1730,7 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "lsp_rename".to_string(),
+                name: "rename".to_string(),
                 description: Some("Compute the edits needed to rename a symbol across the codebase. Returns a list of changes. If dry_run is false, applies the changes.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1712,22 +1745,22 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "lsp_completion".to_string(),
+                name: "completion".to_string(),
                 description: Some("Get completion suggestions at a position.".to_string()),
                 input_schema: position_schema(),
             },
             Tool {
-                name: "lsp_diagnostics".to_string(),
+                name: "diagnostics".to_string(),
                 description: Some("Get diagnostics (errors, warnings, hints) for a file.".to_string()),
                 input_schema: file_schema(),
             },
             Tool {
-                name: "lsp_signature_help".to_string(),
+                name: "signature_help".to_string(),
                 description: Some("Get function signature help at a position (parameter info while typing a call).".to_string()),
                 input_schema: position_schema(),
             },
             Tool {
-                name: "lsp_formatting".to_string(),
+                name: "formatting".to_string(),
                 description: Some("Format an entire document.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1740,7 +1773,7 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "lsp_range_formatting".to_string(),
+                name: "range_formatting".to_string(),
                 description: Some("Format a specific range within a document.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1757,35 +1790,37 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "lsp_call_hierarchy".to_string(),
-                description: Some("Get incoming or outgoing calls for a function/method.".to_string()),
+                name: "call_hierarchy".to_string(),
+                description: Some("Get incoming or outgoing calls for a function/method. Accepts a symbol name or file/line/character position.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "line": { "type": "integer", "description": "Line number (0-indexed)" },
-                        "character": { "type": "integer", "description": "Character position (0-indexed)" },
+                        "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyStruct', 'handle_request'). If provided, position fields are optional." },
+                        "file": { "type": "string", "description": "Absolute or relative path to the file. Required when using line/character; optional with symbol to narrow search." },
+                        "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
+                        "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." },
                         "direction": { "type": "string", "enum": ["incoming", "outgoing"], "description": "Direction: 'incoming' (who calls this?) or 'outgoing' (what does this call?)" }
                     },
-                    "required": ["file", "line", "character", "direction"]
+                    "required": ["direction"]
                 }),
             },
             Tool {
-                name: "lsp_type_hierarchy".to_string(),
-                description: Some("Get supertypes or subtypes of a type.".to_string()),
+                name: "type_hierarchy".to_string(),
+                description: Some("Get supertypes or subtypes of a type. Accepts a symbol name or file/line/character position.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "line": { "type": "integer", "description": "Line number (0-indexed)" },
-                        "character": { "type": "integer", "description": "Character position (0-indexed)" },
+                        "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyStruct', 'handle_request'). If provided, position fields are optional." },
+                        "file": { "type": "string", "description": "Absolute or relative path to the file. Required when using line/character; optional with symbol to narrow search." },
+                        "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
+                        "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." },
                         "direction": { "type": "string", "enum": ["supertypes", "subtypes"], "description": "Direction: 'supertypes' (parent types) or 'subtypes' (child types)" }
                     },
-                    "required": ["file", "line", "character", "direction"]
+                    "required": ["direction"]
                 }),
             },
             Tool {
-                name: "catenary_status".to_string(),
+                name: "status".to_string(),
                 description: Some("Report the status of all LSP servers (state, progress, uptime).".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1794,7 +1829,7 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "catenary_apply_quickfix".to_string(),
+                name: "apply_quickfix".to_string(),
                 description: Some("Automatically find and apply a Code Action (Quick Fix) for a diagnostic at the given position.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1808,7 +1843,7 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "catenary_codebase_map".to_string(),
+                name: "codebase_map".to_string(),
                 description: Some("Generate a high-level file tree of the project, optionally including symbols from LSP.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1854,7 +1889,7 @@ impl ToolHandler for LspBridgeHandler {
         };
 
         // Handle status tool separately (no file path)
-        if name == "catenary_status" {
+        if name == "status" {
             let result = self.handle_status();
             broadcast_result(result.is_error.is_none());
             return Ok(result);
@@ -1871,24 +1906,24 @@ impl ToolHandler for LspBridgeHandler {
         }
 
         let result = match name {
-            "lsp_hover" => self.handle_hover(arguments),
-            "lsp_definition" => self.handle_definition(arguments),
-            "lsp_type_definition" => self.handle_type_definition(arguments),
-            "lsp_implementation" => self.handle_implementation(arguments),
-            "catenary_find_references" => self.handle_find_references(arguments),
-            "lsp_document_symbols" => self.handle_document_symbols(arguments),
-            "catenary_find_symbol" => self.handle_find_symbol(arguments),
-            "lsp_code_actions" => self.handle_code_actions(arguments),
-            "lsp_rename" => self.handle_rename(arguments),
-            "lsp_completion" => self.handle_completion(arguments),
-            "lsp_diagnostics" => self.handle_diagnostics(arguments),
-            "lsp_signature_help" => self.handle_signature_help(arguments),
-            "lsp_formatting" => self.handle_formatting(arguments),
-            "lsp_range_formatting" => self.handle_range_formatting(arguments),
-            "lsp_call_hierarchy" => self.handle_call_hierarchy(arguments),
-            "lsp_type_hierarchy" => self.handle_type_hierarchy(arguments),
-            "catenary_apply_quickfix" => self.handle_apply_quickfix(arguments),
-            "catenary_codebase_map" => self.handle_codebase_map(arguments),
+            "hover" => self.handle_hover(arguments),
+            "definition" => self.handle_definition(arguments),
+            "type_definition" => self.handle_type_definition(arguments),
+            "implementation" => self.handle_implementation(arguments),
+            "find_references" => self.handle_find_references(arguments),
+            "document_symbols" => self.handle_document_symbols(arguments),
+            "find_symbol" => self.handle_find_symbol(arguments),
+            "code_actions" => self.handle_code_actions(arguments),
+            "rename" => self.handle_rename(arguments),
+            "completion" => self.handle_completion(arguments),
+            "diagnostics" => self.handle_diagnostics(arguments),
+            "signature_help" => self.handle_signature_help(arguments),
+            "formatting" => self.handle_formatting(arguments),
+            "range_formatting" => self.handle_range_formatting(arguments),
+            "call_hierarchy" => self.handle_call_hierarchy(arguments),
+            "type_hierarchy" => self.handle_type_hierarchy(arguments),
+            "apply_quickfix" => self.handle_apply_quickfix(arguments),
+            "codebase_map" => self.handle_codebase_map(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
 
@@ -1969,6 +2004,18 @@ fn position_schema() -> serde_json::Value {
             "character": { "type": "integer", "description": "Character position (0-indexed)" }
         },
         "required": ["file", "line", "character"]
+    })
+}
+
+fn symbol_or_position_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyStruct', 'handle_request'). If provided, position fields are optional." },
+            "file": { "type": "string", "description": "Absolute or relative path to the file. Required when using line/character; optional with symbol to narrow search." },
+            "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
+            "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." }
+        }
     })
 }
 

@@ -45,13 +45,13 @@ Then [configure your language servers](https://github.com/MarkWells-Dev/Catenary
 
 | Tool | Description |
 |------|-------------|
-| `lsp_hover` | Documentation and type info |
-| `lsp_definition` | Go to definition |
+| `hover` | Documentation and type info |
+| `definition` | Go to definition |
 | `lsp_references` | Find all references |
-| `lsp_diagnostics` | Errors and warnings |
-| `lsp_rename` | Rename with dry-run preview |
-| `lsp_completion` | Code completions |
-| `lsp_formatting` | Format documents |
+| `diagnostics` | Errors and warnings |
+| `rename` | Rename with dry-run preview |
+| `completion` | Code completions |
+| `formatting` | Format documents |
 | ... | [See all 16 tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
 
 ## Documentation

@@ -323,21 +323,21 @@ mod tests {
                 tools: Some(ToolsCapability { list_changed: None }),
             },
             server_info: ServerInfo {
-                name: "catenary".to_string(),
+                name: "tool".to_string(),
                 version: Some("0.1.0".to_string()),
             },
         };
 
         let json = serde_json::to_string(&result)?;
         assert!(json.contains("protocolVersion"));
-        assert!(json.contains("catenary"));
+        assert!(json.contains("tool"));
         Ok(())
     }
 
     #[test]
     fn test_serialize_tool() -> Result<()> {
         let tool = Tool {
-            name: "lsp_hover".to_string(),
+            name: "hover".to_string(),
             description: Some("Get hover info".to_string()),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -352,7 +352,7 @@ mod tests {
 
         let json = serde_json::to_string(&tool)?;
         assert!(json.contains("inputSchema"));
-        assert!(json.contains("lsp_hover"));
+        assert!(json.contains("hover"));
         Ok(())
     }
 

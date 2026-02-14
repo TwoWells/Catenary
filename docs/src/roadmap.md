@@ -38,7 +38,7 @@ LSP tools exposed via MCP. Feature complete.
       or indexing
 - [x] **Internal Retry:** Retry internally if a server returns `null` shortly
       after spawn
-- [x] **Status Tool:** Add `catenary_status` tool to report server states
+- [x] **Status Tool:** Add `status` tool to report server states
 
 #### Phase 4.5: Observability & CD
 
@@ -51,9 +51,9 @@ LSP tools exposed via MCP. Feature complete.
 
 #### Phase 5: High-Level Tools ("Catenary Intelligence")
 
-- [x] **Auto-Fix:** Add `catenary_apply_quickfix` tool (chains `codeAction` +
+- [x] **Auto-Fix:** Add `apply_quickfix` tool (chains `codeAction` +
       `workspaceEdit` application)
-- [x] **Codebase Map:** Add `catenary_codebase_map` to generate a high-level
+- [x] **Codebase Map:** Add `codebase_map` to generate a high-level
       semantic tree of the project (synthesized from file walk +
       `documentSymbol`)
 - [x] **Relative Path Support:** Resolve relative paths in tool arguments

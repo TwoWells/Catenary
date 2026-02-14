@@ -133,7 +133,7 @@ edition = "2021"
             "id": 999,
             "method": "tools/call",
             "params": {
-                "name": "lsp_diagnostics",
+                "name": "diagnostics",
                 "arguments": {
                     "file": main_rs.to_str().context("invalid path")?
                 }
@@ -158,7 +158,7 @@ edition = "2021"
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "catenary_apply_quickfix",
+            "name": "apply_quickfix",
             "arguments": {
                 "file": main_rs.to_str().context("invalid path")?,
                 "line": 1,

@@ -145,15 +145,15 @@ Validated 2026-02-06.
 
 1. Tried WebFetch to read local file (wrong tool)
 2. Tried `run_shell_command` → blocked
-3. Adapted to `catenary_codebase_map`
-4. Used `lsp_document_symbols`
+3. Adapted to `codebase_map`
+4. Used `document_symbols`
 5. Delegated to sub-agent (burned tokens before admitting defeat)
 
 **Claude:**
 
 1. Tried `Skill(read)` → failed
 2. No Read/Bash/Task available
-3. Adapted to `lsp_document_symbols`
+3. Adapted to `document_symbols`
 4. Admitted limitations gracefully
 5. Offered LSP-based alternatives
 
@@ -170,12 +170,12 @@ For full functionality, catenary-mcp needs file I/O tools:
 | `catenary_write_file`     | ❌ TODO   | With diagnostics         |
 | `catenary_edit_file`      | ❌ TODO   | With diagnostics         |
 | `catenary_list_directory` | ❌ TODO   | Basic navigation         |
-| `catenary_find_symbol`    | ✓ Exists  | LSP workspace symbols    |
-| `catenary_find_references`| ✓ Exists  | LSP references           |
-| `catenary_codebase_map`   | ✓ Exists  | File tree with symbols   |
-| `lsp_document_symbols`    | ✓ Exists  | File structure           |
-| `lsp_hover`               | ✓ Exists  | Type info, docs          |
-| `lsp_diagnostics`         | ✓ Exists  | Errors, warnings         |
+| `find_symbol`    | ✓ Exists  | LSP workspace symbols    |
+| `find_references`| ✓ Exists  | LSP references           |
+| `codebase_map`   | ✓ Exists  | File tree with symbols   |
+| `document_symbols`    | ✓ Exists  | File structure           |
+| `hover`               | ✓ Exists  | Type info, docs          |
+| `diagnostics`         | ✓ Exists  | Errors, warnings         |
 
 ## Limitations
 

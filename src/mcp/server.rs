@@ -228,7 +228,7 @@ impl<H: ToolHandler> McpServer<H> {
                 tools: Some(ToolsCapability { list_changed: None }),
             },
             server_info: ServerInfo {
-                name: "catenary".to_string(),
+                name: "tool".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             },
         };
@@ -323,7 +323,7 @@ mod tests {
 
         let result: InitializeResult =
             serde_json::from_value(response.result.context("missing result")?)?;
-        assert_eq!(result.server_info.name, "catenary");
+        assert_eq!(result.server_info.name, "tool");
         Ok(())
     }
 

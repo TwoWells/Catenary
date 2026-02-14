@@ -181,7 +181,7 @@ fn test_mcp_initialize() -> Result<()> {
 
     let result = &response["result"];
     assert_eq!(result["protocolVersion"], "2024-11-05");
-    assert_eq!(result["serverInfo"]["name"], "catenary");
+    assert_eq!(result["serverInfo"]["name"], "tool");
     assert!(result["capabilities"]["tools"].is_object());
     Ok(())
 }
@@ -210,22 +210,22 @@ fn test_mcp_tools_list() -> Result<()> {
 
     // Check all expected tools are present
     let expected_tools = [
-        "lsp_hover",
-        "lsp_definition",
-        "lsp_type_definition",
-        "lsp_implementation",
-        "catenary_find_references",
-        "lsp_document_symbols",
-        "catenary_find_symbol",
-        "lsp_code_actions",
-        "lsp_rename",
-        "lsp_completion",
-        "lsp_diagnostics",
-        "lsp_signature_help",
-        "lsp_formatting",
-        "lsp_range_formatting",
-        "lsp_call_hierarchy",
-        "lsp_type_hierarchy",
+        "hover",
+        "definition",
+        "type_definition",
+        "implementation",
+        "find_references",
+        "document_symbols",
+        "find_symbol",
+        "code_actions",
+        "rename",
+        "completion",
+        "diagnostics",
+        "signature_help",
+        "formatting",
+        "range_formatting",
+        "call_hierarchy",
+        "type_hierarchy",
     ];
 
     for expected in &expected_tools {
@@ -269,7 +269,7 @@ fn test_mcp_hover_builtin() -> Result<()> {
         "id": 3,
         "method": "tools/call",
         "params": {
-            "name": "lsp_hover",
+            "name": "hover",
             "arguments": {
                 "file": test_file,
                 "line": 1,
@@ -332,7 +332,7 @@ my_function
         "id": 4,
         "method": "tools/call",
         "params": {
-            "name": "lsp_definition",
+            "name": "definition",
             "arguments": {
                 "file": test_file,
                 "line": 6,
@@ -386,7 +386,7 @@ fn test_mcp_hover_no_info() -> Result<()> {
         "id": 5,
         "method": "tools/call",
         "params": {
-            "name": "lsp_hover",
+            "name": "hover",
             "arguments": {
                 "file": test_file,
                 "line": 1,
@@ -420,7 +420,7 @@ fn test_mcp_tool_call_invalid_file() -> Result<()> {
         "id": 6,
         "method": "tools/call",
         "params": {
-            "name": "lsp_hover",
+            "name": "hover",
             "arguments": {
                 "file": "/tmp/nonexistent_file_12345.sh",
                 "line": 0,
@@ -534,7 +534,7 @@ fn test_multiplexing() -> Result<()> {
             "id": 100 + i,
             "method": "tools/call",
             "params": {
-                "name": "lsp_hover",
+                "name": "hover",
                 "arguments": {
                     "file": rust_file.to_str().context("invalid rust path")?,
                     "line": line,
@@ -577,7 +577,7 @@ fn test_multiplexing() -> Result<()> {
         "id": 200,
         "method": "tools/call",
         "params": {
-            "name": "lsp_hover",
+            "name": "hover",
             "arguments": {
                 "file": bash_file.to_str().context("invalid bash path")?,
                 "line": 2, // echo line
@@ -604,7 +604,7 @@ fn test_multiplexing() -> Result<()> {
             "id": 300 + i,
             "method": "tools/call",
             "params": {
-                "name": "lsp_hover",
+                "name": "hover",
                 "arguments": {
                     "file": toml_file.to_str().context("invalid toml path")?,
                     "line": 1, // name = ...
@@ -652,7 +652,7 @@ fn test_multiplexing() -> Result<()> {
         "id": 400,
         "method": "tools/call",
         "params": {
-            "name": "catenary_find_symbol",
+            "name": "find_symbol",
             "arguments": {
                 "query": "greet"
             }
@@ -744,7 +744,7 @@ my_func
         "id": 500,
         "method": "tools/call",
         "params": {
-            "name": "catenary_find_references",
+            "name": "find_references",
             "arguments": {
                 "file": test_file,
                 "line": 2,
@@ -814,7 +814,7 @@ unique_test_func
         "id": 501,
         "method": "tools/call",
         "params": {
-            "name": "catenary_find_references",
+            "name": "find_references",
             "arguments": {
                 "symbol": "unique_test_func",
                 "file": test_file
@@ -868,7 +868,7 @@ fn test_catenary_find_references_missing_args() -> Result<()> {
         "id": 502,
         "method": "tools/call",
         "params": {
-            "name": "catenary_find_references",
+            "name": "find_references",
             "arguments": {}
         }
     }))?;

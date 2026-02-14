@@ -44,7 +44,7 @@ args = ["server"]
 
 - Marksman provides document symbols (headings), go-to-definition for
   wiki-links, and references
-- Works well with `catenary_codebase_map` to show document structure
+- Works well with `codebase_map` to show document structure
 - Supports wiki-style `[[links]]` and standard `[links](url)`
 
 ## Links

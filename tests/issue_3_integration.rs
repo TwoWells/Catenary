@@ -84,7 +84,7 @@ version = "0.1.0"
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "lsp_diagnostics",
+            "name": "diagnostics",
             "arguments": {
                 "file": file_path.to_str().context("invalid path")?,
                 "wait_for_reanalysis": true

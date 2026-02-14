@@ -112,7 +112,7 @@ fn test_codebase_map_basic() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "catenary_codebase_map",
+            "name": "codebase_map",
             "arguments": {
                 "path": temp.path().to_str().context("invalid path")?,
                 "max_depth": 5,
@@ -162,7 +162,7 @@ fn test_codebase_map_with_symbols() -> Result<()> {
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "catenary_codebase_map",
+            "name": "codebase_map",
             "arguments": {
                 "path": temp.path().to_str().context("invalid path")?,
                 "include_symbols": true
@@ -218,7 +218,7 @@ fn test_codebase_map_markdown() -> Result<()> {
         "id": 3,
         "method": "tools/call",
         "params": {
-            "name": "catenary_codebase_map",
+            "name": "codebase_map",
             "arguments": {
                 "path": temp.path().to_str().context("invalid path")?,
                 "include_symbols": true

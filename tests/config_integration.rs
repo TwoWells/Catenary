@@ -70,7 +70,7 @@ fn test_config_loading() -> Result<()> {
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "lsp_hover",
+            "name": "hover",
             "arguments": {
                 "file": bash_file.to_str().context("invalid bash file path")?,
                 "line": 2,
@@ -157,7 +157,7 @@ fn test_config_override() -> Result<()> {
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "lsp_hover",
+            "name": "hover",
             "arguments": {
                 "file": rust_file.to_str().context("invalid rust file path")?,
                 "line": 1,
