@@ -1,6 +1,6 @@
 # Roadmap
 
-Current version: **v0.6.6**
+Current version: **v0.7.0**
 
 ## Completed
 
