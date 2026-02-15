@@ -19,6 +19,15 @@
       "additionalProperties": {
         "$ref": "#/definitions/server_config"
       }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Tool-specific configuration.",
+      "properties": {
+        "run": {
+          "$ref": "#/definitions/run_tool_config"
+        }
+      }
     }
   },
   "definitions": {
@@ -44,6 +53,37 @@
           "additionalProperties": true
         }
       }
+    },
+    "run_tool_config": {
+      "type": "object",
+      "description": "Configuration for the 'run' shell execution tool.",
+      "properties": {
+        "allowed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Always-allowed commands (e.g., ['git', 'make']). Use ['*'] for unrestricted execution.",
+          "default": []
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/language_commands"
+      }
+    },
+    "language_commands": {
+      "type": "object",
+      "description": "Language-specific allowed commands. Activated when matching files exist in workspace.",
+      "properties": {
+        "allowed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Commands allowed for this language."
+        }
+      },
+      "required": ["allowed"]
     }
   }
 }

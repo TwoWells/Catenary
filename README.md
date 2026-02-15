@@ -40,6 +40,8 @@ Then [configure your language servers](https://github.com/MarkWells-Dev/Catenary
 - **Lazy Loading** — Servers start only when needed
 - **Smart Routing** — Automatic language detection by file type
 - **Full Coverage** — Hover, definitions, references, diagnostics, completions, rename, formatting, and more
+- **File I/O** — Read, write, edit files with automatic LSP diagnostics
+- **Shell Execution** — Run commands with configurable allowlists
 
 ## MCP Tools
 
@@ -52,7 +54,12 @@ Then [configure your language servers](https://github.com/MarkWells-Dev/Catenary
 | `rename` | Rename with dry-run preview |
 | `completion` | Code completions |
 | `formatting` | Format documents |
-| ... | [See all 16 tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
+| `read_file` | Read file contents + diagnostics |
+| `write_file` | Write file + diagnostics |
+| `edit_file` | Search-and-replace edit + diagnostics |
+| `list_directory` | List directory contents |
+| `run` | Execute shell commands (allowlist enforced) |
+| ... | [See all tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
 
 ## Documentation
 

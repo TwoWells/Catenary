@@ -28,9 +28,10 @@ maintaining a CLI.
 
 Preserved from the original CLI design:
 
-### No Arbitrary Shell
+### Controlled Shell
 
-No `shell` tool. Every action goes through a targeted MCP tool.
+No arbitrary shell access. The `run` tool requires an explicit allowlist — only
+commands you configure are permitted.
 
 **Why:**
 
@@ -39,6 +40,9 @@ No `shell` tool. Every action goes through a targeted MCP tool.
 - No accidental `rm -rf` or destructive commands
 - Every action is intentional and auditable
 - Token efficient — no parsing noisy shell output
+
+See [Configuration: Shell Execution](configuration.md#shell-execution-toolsrun)
+for allowlist setup.
 
 ### LSP-First
 
@@ -160,36 +164,39 @@ Validated 2026-02-06.
 **Key difference:** Claude admits defeat faster and communicates limitations
 clearly. Gemini burns tokens trying workarounds.
 
-## Required Catenary Tools
+## Catenary Tool Coverage
 
-For full functionality, catenary-mcp needs file I/O tools:
+Catenary provides a complete toolkit — LSP intelligence, file I/O, and
+controlled shell execution:
 
-| Tool                      | Status    | Notes                    |
-| ------------------------- | --------- | ------------------------ |
-| `catenary_read_file`      | ❌ TODO   | Essential for any task   |
-| `catenary_write_file`     | ❌ TODO   | With diagnostics         |
-| `catenary_edit_file`      | ❌ TODO   | With diagnostics         |
-| `catenary_list_directory` | ❌ TODO   | Basic navigation         |
-| `search`         | ✓ Exists  | LSP workspace symbols + grep fallback |
-| `find_references`| ✓ Exists  | LSP references           |
-| `codebase_map`   | ✓ Exists  | File tree with symbols   |
-| `document_symbols`    | ✓ Exists  | File structure           |
-| `hover`               | ✓ Exists  | Type info, docs          |
-| `diagnostics`         | ✓ Exists  | Errors, warnings         |
+| Tool                | Category  | Notes                                    |
+| ------------------- | --------- | ---------------------------------------- |
+| `read_file`         | File I/O  | With line numbers and diagnostics        |
+| `write_file`        | File I/O  | With post-write diagnostics              |
+| `edit_file`         | File I/O  | Search-and-replace with diagnostics      |
+| `list_directory`    | File I/O  | Files, dirs, symlinks                    |
+| `run`               | Shell     | Allowlist-enforced command execution     |
+| `search`            | LSP       | Workspace symbols + grep fallback        |
+| `find_references`   | LSP       | LSP references                           |
+| `codebase_map`      | LSP       | File tree with symbols                   |
+| `document_symbols`  | LSP       | File structure                           |
+| `hover`             | LSP       | Type info, docs                          |
+| `diagnostics`       | LSP       | Errors, warnings                         |
+| ...                 | LSP       | [Full list](overview.md#available-tools) |
 
 ## Limitations
 
-### No Shell Fallback
+### Shell is Allowlist-Only
 
-By design. Models can't escape to grep/cat/shell. This is the feature.
+The `run` tool only executes commands on the configured allowlist. There is no
+general-purpose shell — models can't escape to `grep`, `cat`, or arbitrary
+commands unless you explicitly allow them.
 
 When catenary lacks a tool the model needs, it must either:
 
 - Use available catenary tools creatively
+- Use `run` if the command is on the allowlist
 - Admit it can't complete the task
-
-This surfaces gaps in catenary's tool coverage rather than hiding them behind
-shell escapes.
 
 ### LSP Dependency
 
@@ -199,8 +206,8 @@ Some operations require LSP:
 - Rename symbol
 - Code actions / quick fixes
 
-If LSP is unavailable for a language, these tools return errors. Future work
-may add grep fallbacks with degradation notices.
+If LSP is unavailable for a language, these tools return errors. `search` has
+a grep fallback for basic text matching when no LSP server covers the file.
 
 ## See Also
 

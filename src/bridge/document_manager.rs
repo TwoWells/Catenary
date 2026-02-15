@@ -197,6 +197,72 @@ impl DocumentManager {
             .keys()
             .any(|path| detect_language_id(path) == language_id)
     }
+
+    /// Notifies the manager that a file was written externally (by Catenary itself).
+    ///
+    /// Updates internal state with the new content and returns the appropriate
+    /// LSP notification to send, without re-reading from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be canonicalized or converted to a URI.
+    pub fn notify_external_write(
+        &mut self,
+        path: &Path,
+        content: &str,
+        mtime: SystemTime,
+    ) -> Result<DocumentNotification> {
+        let path = path.canonicalize()?;
+        let uri = path_to_uri(&path)?;
+
+        if let Some(doc) = self.documents.get_mut(&path) {
+            // Already open — send didChange
+            doc.version += 1;
+            doc.content = content.to_string();
+            doc.mtime = mtime;
+            doc.last_accessed = Instant::now();
+
+            debug!("External write (change): {}", path.display());
+
+            Ok(DocumentNotification::Change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri,
+                    version: doc.version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: content.to_string(),
+                }],
+            }))
+        } else {
+            // Not open — send didOpen
+            let language_id = detect_language_id(&path);
+
+            let doc = OpenDocument {
+                version: 1,
+                content: content.to_string(),
+                mtime,
+                last_accessed: Instant::now(),
+            };
+
+            self.documents.insert(path.clone(), doc);
+            debug!(
+                "External write (open): {} ({})",
+                path.display(),
+                language_id
+            );
+
+            Ok(DocumentNotification::Open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri,
+                    language_id: language_id.to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            }))
+        }
+    }
 }
 
 /// Notification to send to the LSP server.

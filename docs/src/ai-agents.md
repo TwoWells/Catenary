@@ -61,15 +61,26 @@ Catenary provides LSP-backed tools that return precise, targeted information.
 Instead of reading a 500-line file to find a function's type signature, ask the
 language server directly.
 
-## Limitations
+## When to Use LSP vs File I/O
 
-Catenary doesn't replace file reading entirely. Agents will still need Read/Grep
-when:
+Catenary provides both LSP tools and file I/O tools (`read_file`, `write_file`,
+`edit_file`, `list_directory`). Use LSP tools for navigation and understanding;
+use file I/O for reading implementation logic and making changes.
 
-- Understanding implementation logic (not just signatures)
-- Searching for patterns in comments or string literals
-- Looking for configuration values or constants
-- Working with content that lacks LSP support (plain text, logs, etc.)
+**Use LSP tools** for:
+
+- Finding definitions, references, and symbols
+- Getting type info and documentation (hover)
+- Understanding file structure (document_symbols)
+- Checking errors after changes (diagnostics)
+
+**Use file I/O tools** for:
+
+- Reading implementation logic (not just signatures)
+- Searching comments or string literals (use `search` with grep fallback)
+- Config files or non-code content
+- Writing and editing code (`write_file`, `edit_file` return diagnostics
+  automatically)
 
 ## Workflow Example
 
@@ -89,7 +100,8 @@ when:
 2. `definition` to jump to the specific handler
 3. `hover` on unfamiliar types to understand them
 4. `find_references` to see how the handler is called
-5. Only `Read` the specific function you need to modify
+5. `read_file` on the specific function you need to modify
+6. `edit_file` to make the change — diagnostics returned automatically
 
 ## Codebase Orientation
 
@@ -102,6 +114,9 @@ codebase_map with include_symbols: true
 # Then drill down with targeted queries
 search for specific components
 document_symbols for file structure
+
+# Read implementation when needed
+read_file for the specific code you need to understand
 ```
 
 This provides a mental map without reading every file.
@@ -135,5 +150,8 @@ A single file read can cost as much as 10-20 targeted LSP queries.
 4. **References are precise.** `find_references` finds actual usages,
    not text matches. No false positives from comments or strings.
 
-5. **Save reads for logic.** Only read files when you need to understand _how_
-   something works, not _what_ it is or _where_ it lives.
+5. **Save reads for logic.** Only use `read_file` when you need to understand
+   _how_ something works, not _what_ it is or _where_ it lives.
+
+6. **Edit with feedback.** Use `edit_file` and `write_file` — they return LSP
+   diagnostics automatically, so you immediately see any errors introduced.

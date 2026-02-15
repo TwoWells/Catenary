@@ -29,12 +29,14 @@ use clap::{Parser, Subcommand};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler};
+use catenary_mcp::bridge::run_tool::RunToolManager;
+use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler, PathValidator};
 use catenary_mcp::cli::{self, ColorConfig, ColumnWidths};
 use catenary_mcp::lsp;
 use catenary_mcp::mcp::McpServer;
@@ -233,17 +235,36 @@ async fn run_server(args: Args) -> Result<()> {
         None
     };
 
+    let current_roots = client_manager.roots().await;
+
+    let path_validator = Arc::new(tokio::sync::RwLock::new(PathValidator::new(
+        current_roots.clone(),
+    )));
+
+    let run_tool = config.tools.run.as_ref().map(|run_config| {
+        Arc::new(tokio::sync::RwLock::new(RunToolManager::new(
+            run_config,
+            &current_roots,
+        )))
+    });
+
     let handler = LspBridgeHandler::new(
         client_manager.clone(),
         doc_manager,
         runtime,
         config,
         broadcaster.clone(),
+        path_validator.clone(),
+        run_tool.clone(),
     );
 
     // Run MCP server (blocking - reads from stdin)
     let session_for_callback = session.clone();
+    let tools_changed_flag = Arc::new(AtomicBool::new(false));
+    let tools_changed_for_roots = tools_changed_flag.clone();
     let client_manager_for_roots = client_manager.clone();
+    let path_validator_for_roots = path_validator.clone();
+    let run_tool_for_roots = run_tool;
     let runtime_for_roots = tokio::runtime::Handle::current();
     let mut mcp_server = McpServer::new(handler, broadcaster)
         .on_client_info(Box::new(move |name: &str, version: &str| {
@@ -267,8 +288,25 @@ async fn run_server(args: Args) -> Result<()> {
                     })
                 })
                 .collect();
+
+            // Update path validator with new roots
+            runtime_for_roots
+                .block_on(path_validator_for_roots.write())
+                .update_roots(paths.clone());
+
+            // Update run tool with new roots (re-detect languages)
+            if let Some(ref run_tool) = run_tool_for_roots {
+                let changed = runtime_for_roots
+                    .block_on(run_tool.write())
+                    .update_roots(&paths);
+                if changed {
+                    tools_changed_for_roots.store(true, Ordering::Release);
+                }
+            }
+
             runtime_for_roots.block_on(client_manager_for_roots.sync_roots(paths))
-        }));
+        }))
+        .tools_changed_flag(tools_changed_flag);
 
     // Run in a blocking task since MCP server uses synchronous I/O
     let mcp_task = tokio::task::spawn_blocking(move || mcp_server.run());

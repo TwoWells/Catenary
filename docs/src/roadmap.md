@@ -1,6 +1,6 @@
 # Roadmap
 
-Current version: **v0.7.0**
+Current version: **v0.8.0**
 
 ## Completed
 
@@ -87,12 +87,12 @@ See [CLI Integration](cli-integration.md) for full details.
 
 ## Known Vulnerabilities
 
-These must be resolved before v1.0.0. See [LSP Fault Model](lsp-fault-model.md)
-and [Adversarial Testing](adversarial-testing.md) for full details.
+See [LSP Fault Model](lsp-fault-model.md) and
+[Adversarial Testing](adversarial-testing.md) for full details.
 
-- **Symlink traversal.** `codebase_map` and `find_symbol` fallback use
-  `WalkBuilder` which follows symlinks. A symlink pointing outside the
-  workspace allows reading files the user didn't intend to expose.
+- **~~Symlink traversal.~~** Resolved in Phase 7. File I/O tools use
+  `canonicalize()` + workspace root validation. `list_directory` uses
+  `symlink_metadata()` to avoid following symlinks.
 - **Unbounded LSP data.** Diagnostic caches grow without limit. Hover
   responses, symbol trees, and workspace edit previews have no size caps.
   A malicious or buggy LSP server can cause unbounded memory growth.
@@ -129,46 +129,32 @@ Single Catenary instance multiplexing across multiple workspace roots.
       grep fallback), with clear messaging when using fallback
 - [x] Update documentation
 
-### Phase 7: Complete Agent Toolkit — v1.0.0
+### Phase 7: Complete Agent Toolkit ✓
 
-Full toolset to replace CLI built-in tools. Requires CLI settings changes
-(Claude Code, Gemini CLI) to disable built-in tools in favor of Catenary.
+Full toolset to replace CLI built-in tools.
 
 **File I/O:**
-- [ ] `read_file` — Read file contents + return diagnostics
-- [ ] `write_file` — Write file + return diagnostics
-- [ ] `edit_file` — Edit file + return diagnostics
-- [ ] `list_directory` — List directory contents
+- [x] `read_file` — Read file contents + return diagnostics
+- [x] `write_file` — Write file + return diagnostics
+- [x] `edit_file` — Edit file + return diagnostics
+- [x] `list_directory` — List directory contents
 
 **Shell Execution:**
-- [ ] `run` tool with allowlist enforcement
-- [ ] `allowed = ["*"]` opt-in for unrestricted shell
-- [ ] Dynamic language detection — language-specific commands activate when
+- [x] `run` tool with allowlist enforcement
+- [x] `allowed = ["*"]` opt-in for unrestricted shell
+- [x] Dynamic language detection — language-specific commands activate when
       matching files exist in the workspace
-- [ ] Tool description updates dynamically to show current allowlist:
-      `"Allowed: git, make. Python (detected): python, pytest, uv"`
-- [ ] Emit `tools/list_changed` when allowlist changes (e.g., workspace added)
-- [ ] Error messages on denied commands include the current allowlist
+- [x] Tool description updates dynamically to show current allowlist
+- [x] Emit `tools/list_changed` when allowlist changes (e.g., workspace added)
+- [x] Error messages on denied commands include the current allowlist
 
-```toml
-[tools.run]
-allowed = ["git", "make"]
-
-[tools.run.python]
-allowed = ["python", "pytest", "uv"]
-
-[tools.run.rust]
-allowed = ["cargo"]
-```
-
-**Design constraints:**
-- Write/edit tools return LSP diagnostics automatically. Models can't proceed
-  unaware they broke something.
-- Write/edit tools validate all paths against workspace roots. LSP-proposed
-  edits (rename, code actions) are applied through these tools, never directly
-  from LSP data (see [LSP Fault Model](lsp-fault-model.md)).
-- Write/edit tools refuse to modify Catenary's own config files. An agent that
-  can rewrite its own permissions isn't a controlled agent.
+**Security:**
+- [x] Path validation against workspace roots (read and write)
+- [x] Symlink traversal protection (`canonicalize()` + root check)
+- [x] Config file self-modification protection (`.catenary.toml`,
+      `~/.config/catenary/config.toml`)
+- [x] Direct command execution (no shell injection)
+- [x] Output size limits (100KB per stream) and timeout enforcement
 
 ---
 

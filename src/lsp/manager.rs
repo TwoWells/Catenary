@@ -334,6 +334,7 @@ mod tests {
             server: HashMap::new(),
             idle_timeout: 300,
             smart_wait: true,
+            tools: crate::config::ToolsConfig::default(),
         }
     }
 

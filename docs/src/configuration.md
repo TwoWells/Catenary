@@ -137,6 +137,34 @@ The `[server.<language-id>]` key must match the LSP language identifier. Catenar
 | `idle_timeout` | `300` | Seconds before auto-closing idle documents. Set to `0` to disable. |
 | `smart_wait` | `true` | Wait for LSP servers to be fully ready before executing requests. |
 
+## Shell Execution (`tools.run`)
+
+The `run` tool allows AI agents to execute shell commands. It is **disabled by
+default** — add a `[tools.run]` section to enable it.
+
+```toml
+[tools.run]
+allowed = ["git", "make"]  # Always allowed commands
+
+# Language-specific commands (activated when matching files exist in workspace)
+[tools.run.python]
+allowed = ["python", "pytest", "uv"]
+
+[tools.run.rust]
+allowed = ["cargo"]
+```
+
+**Key behaviors:**
+
+- Commands not on the allowlist are **rejected** with an error showing the
+  current allowlist.
+- Set `allowed = ["*"]` for **unrestricted** execution (use with caution).
+- Language-specific commands activate automatically when matching files are
+  detected in the workspace (e.g., `.py` files activate the `python` group).
+- The tool description updates dynamically to reflect the current allowlist.
+- Commands are executed **directly** (not via shell) to prevent injection.
+- Output is capped at 100KB per stream. Default timeout is 120 seconds.
+
 ## CLI Override
 
 You can also specify servers via CLI:

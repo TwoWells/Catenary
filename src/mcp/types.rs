@@ -38,8 +38,8 @@ pub struct Request {
     pub params: Option<Value>,
 }
 
-/// JSON-RPC notification from MCP client (no id).
-#[derive(Debug, Clone, Deserialize)]
+/// JSON-RPC notification (incoming from client or outgoing from server).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(
     dead_code,
     reason = "Fields required by JSON-RPC protocol but not all are read"

@@ -17,8 +17,15 @@
 
 /// Manages document lifecycle and sync between disk and LSP servers.
 mod document_manager;
+/// File I/O tool handlers.
+mod file_tools;
 /// Maps MCP tool calls to LSP requests.
 mod handler;
+/// Path validation and security for file I/O tools.
+pub mod path_security;
+/// Shell execution tool with allowlist enforcement.
+pub mod run_tool;
 
 pub use document_manager::{DocumentManager, DocumentNotification};
 pub use handler::LspBridgeHandler;
+pub use path_security::PathValidator;

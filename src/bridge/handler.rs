@@ -43,6 +43,9 @@ use crate::lsp::{ClientManager, LspClient, ServerState};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
+use super::PathValidator;
+use super::run_tool::RunToolManager;
+
 /// Methods that should wait for server readiness before executing.
 const METHODS_WAIT_FOR_READY: &[&str] = &[
     "hover",
@@ -253,11 +256,13 @@ const fn default_budget() -> usize {
 /// Bridge handler that implements MCP `ToolHandler` trait.
 /// Handles MCP tool calls by routing them to the appropriate LSP server.
 pub struct LspBridgeHandler {
-    client_manager: Arc<ClientManager>,
-    doc_manager: Arc<Mutex<DocumentManager>>,
-    runtime: Handle,
-    config: Config,
-    broadcaster: EventBroadcaster,
+    pub(super) client_manager: Arc<ClientManager>,
+    pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
+    pub(super) runtime: Handle,
+    pub(super) config: Config,
+    pub(super) broadcaster: EventBroadcaster,
+    pub(super) path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
+    pub(super) run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
 }
 
 impl LspBridgeHandler {
@@ -268,6 +273,8 @@ impl LspBridgeHandler {
         runtime: Handle,
         config: Config,
         broadcaster: EventBroadcaster,
+        path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
+        run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
     ) -> Self {
         Self {
             client_manager,
@@ -275,10 +282,12 @@ impl LspBridgeHandler {
             runtime,
             config,
             broadcaster,
+            path_validator,
+            run_tool,
         }
     }
     /// Gets the appropriate LSP client for the given file path.
-    async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
+    pub(super) async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
         let lang_id = {
             let doc_manager = self.doc_manager.lock().await;
             doc_manager.language_id_for_path(path).to_string()
@@ -399,7 +408,7 @@ impl LspBridgeHandler {
     }
 
     /// Resolves a file path, converting relative paths to absolute using the current working directory.
-    fn resolve_path(file: &str) -> Result<PathBuf> {
+    pub(super) fn resolve_path(file: &str) -> Result<PathBuf> {
         let path = PathBuf::from(file);
         if path.is_absolute() {
             Ok(path)
@@ -1792,7 +1801,7 @@ impl LspBridgeHandler {
 impl ToolHandler for LspBridgeHandler {
     #[allow(clippy::too_many_lines, reason = "Naturally long list of tools")]
     fn list_tools(&self) -> Vec<Tool> {
-        vec![
+        let mut tools = vec![
             Tool {
                 name: "hover".to_string(),
                 description: Some("Get hover information (documentation, type info) for a symbol. Accepts a symbol name or file/line/character position.".to_string()),
@@ -1989,7 +1998,82 @@ impl ToolHandler for LspBridgeHandler {
                     "required": []
                 }),
             },
-        ]
+            Tool {
+                name: "read_file".to_string(),
+                description: Some("Read a file's contents with line numbers, plus any LSP diagnostics. Supports pagination with offset and limit.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Absolute or relative path to the file" },
+                        "offset": { "type": "integer", "description": "Starting line number (1-indexed, default: 1)" },
+                        "limit": { "type": "integer", "description": "Maximum number of lines to return" }
+                    },
+                    "required": ["file"]
+                }),
+            },
+            Tool {
+                name: "write_file".to_string(),
+                description: Some("Write content to a file, creating it and parent directories if needed. Returns line count and LSP diagnostics. Path must be within workspace roots.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Absolute or relative path to the file" },
+                        "content": { "type": "string", "description": "Content to write to the file" }
+                    },
+                    "required": ["file", "content"]
+                }),
+            },
+            Tool {
+                name: "edit_file".to_string(),
+                description: Some("Edit a file by replacing an exact string match. The old_string must appear exactly once. Returns LSP diagnostics after the edit. Path must be within workspace roots.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Absolute or relative path to the file" },
+                        "old_string": { "type": "string", "description": "The exact text to find (must appear exactly once)" },
+                        "new_string": { "type": "string", "description": "The text to replace it with" }
+                    },
+                    "required": ["file", "old_string", "new_string"]
+                }),
+            },
+            Tool {
+                name: "list_directory".to_string(),
+                description: Some("List the contents of a directory. Shows directories, files with sizes, and symlinks with targets. Symlinks are not followed. Path must be within workspace roots.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute or relative path to the directory" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        ];
+
+        // Conditionally add the run tool if configured
+        if let Some(ref run_tool) = self.run_tool {
+            let description = self.runtime.block_on(run_tool.read()).describe_allowlist();
+            tools.push(Tool {
+                name: "run".to_string(),
+                description: Some(format!(
+                    "Execute a shell command. {description}"
+                )),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The command to execute (binary name, e.g., 'git', 'cargo')" },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Arguments to pass to the command"
+                        },
+                        "timeout": { "type": "integer", "description": "Timeout in seconds (default: 120)" }
+                    },
+                    "required": ["command"]
+                }),
+            });
+        }
+
+        tools
     }
 
     fn call_tool(
@@ -2052,6 +2136,11 @@ impl ToolHandler for LspBridgeHandler {
             "type_hierarchy" => self.handle_type_hierarchy(arguments),
             "apply_quickfix" => self.handle_apply_quickfix(arguments),
             "codebase_map" => self.handle_codebase_map(arguments),
+            "read_file" => self.handle_read_file(arguments),
+            "write_file" => self.handle_write_file(arguments),
+            "edit_file" => self.handle_edit_file(arguments),
+            "list_directory" => self.handle_list_directory(arguments),
+            "run" => self.handle_run(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
 

@@ -19,6 +19,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::io::{BufRead, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, trace, warn};
 
 use super::types::{
@@ -69,6 +71,8 @@ pub struct McpServer<H: ToolHandler> {
     next_outbound_id: i64,
     /// Callback invoked when roots change.
     on_roots_changed: Option<RootsChangedCallback>,
+    /// Flag set by external callbacks to trigger `notifications/tools/list_changed`.
+    tools_changed_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<H: ToolHandler> McpServer<H> {
@@ -84,6 +88,7 @@ impl<H: ToolHandler> McpServer<H> {
             fetching_roots: false,
             next_outbound_id: 0,
             on_roots_changed: None,
+            tools_changed_flag: None,
         }
     }
 
@@ -98,6 +103,14 @@ impl<H: ToolHandler> McpServer<H> {
     #[must_use]
     pub fn on_roots_changed(mut self, callback: RootsChangedCallback) -> Self {
         self.on_roots_changed = Some(callback);
+        self
+    }
+
+    /// Set a flag that, when set to `true`, causes the server to emit
+    /// a `notifications/tools/list_changed` notification.
+    #[must_use]
+    pub fn tools_changed_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.tools_changed_flag = Some(flag);
         self
     }
 
@@ -151,6 +164,14 @@ impl<H: ToolHandler> McpServer<H> {
             {
                 error!("Failed to fetch roots: {}", e);
             }
+
+            // Check if tools list changed (e.g., after roots update)
+            if let Some(ref flag) = self.tools_changed_flag
+                && flag.swap(false, Ordering::AcqRel)
+                && let Err(e) = self.emit_tools_list_changed(&mut writer)
+            {
+                error!("Failed to emit tools/list_changed: {}", e);
+            }
         }
 
         info!("MCP server shutting down (stdin closed)");
@@ -192,6 +213,30 @@ impl<H: ToolHandler> McpServer<H> {
         }
 
         writeln!(writer, "{response_json}")?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Emits a `notifications/tools/list_changed` notification to the client.
+    fn emit_tools_list_changed(&self, writer: &mut impl Write) -> Result<()> {
+        let notification = Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/tools/list_changed".to_string(),
+            params: None,
+        };
+
+        let json =
+            serde_json::to_string(&notification).context("Failed to serialize notification")?;
+        debug!("Emitting tools/list_changed notification");
+
+        if let Ok(value) = serde_json::to_value(&notification) {
+            self.broadcaster.send(EventKind::McpMessage {
+                direction: "out".to_string(),
+                message: value,
+            });
+        }
+
+        writeln!(writer, "{json}")?;
         writer.flush()?;
         Ok(())
     }
@@ -292,7 +337,9 @@ impl<H: ToolHandler> McpServer<H> {
         let result = InitializeResult {
             protocol_version: "2024-11-05".to_string(),
             capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability { list_changed: None }),
+                tools: Some(ToolsCapability {
+                    list_changed: Some(true),
+                }),
             },
             server_info: ServerInfo {
                 name: "tool".to_string(),
