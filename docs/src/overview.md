@@ -28,9 +28,9 @@ Once connected, your AI assistant gains access to these LSP-powered tools:
 | `implementation`      | Find implementations of interfaces/traits           |
 | `find_references` | Find all references to a symbol (by name or position) |
 | `document_symbols`    | Get the outline of a file (supports `wait_for_reanalysis: true`) |
-| `find_symbol`    | Find a symbol by name (with fallback for private symbols) |
+| `search`         | Search for a symbol or pattern (LSP with grep fallback) |
 | `code_actions`        | Get quick fixes and refactorings                    |
-| `rename`              | Rename a symbol (with dry-run preview)              |
+| `rename`              | Compute rename edits (does not modify files)        |
 | `completion`          | Get completion suggestions                          |
 | `signature_help`      | Get function parameter info                         |
 | `diagnostics`         | Get errors and warnings (supports `wait_for_reanalysis: true` to ensure fresh results) |
@@ -39,7 +39,7 @@ Once connected, your AI assistant gains access to these LSP-powered tools:
 | `call_hierarchy`      | See who calls a function / what it calls            |
 | `type_hierarchy`      | See type inheritance                                |
 | `status`         | Report status of all LSP servers (e.g. "Indexing")  |
-| `apply_quickfix` | Automatically find and apply a fix for a diagnostic |
+| `apply_quickfix` | Find a quick fix and return its proposed edits       |
 | `codebase_map`   | Generate a high-level file tree with symbols        |
 
 ## How It Works

@@ -45,12 +45,12 @@ This document catalogs the failure modes, current handling, and required invaria
 
 | Failure | Trigger | Current Handling | Status |
 |---------|---------|-----------------|--------|
-| Wrong response type | Server returns string where object expected | `serde_json::from_value` fails, returns `Err("Failed to parse LSP response")` | **Problem** — see [Error Attribution](#error-attribution) |
+| Wrong response type | Server returns string where object expected | `serde_json::from_value` fails, returns error prefixed with `[language]` | OK |
 | Null where value expected | Server omits required field | Depends on `Option` wrapping in lsp-types. Serde handles most cases. | OK for optional fields |
 | Empty results | Server has no data | Returns "No hover information" etc. | OK |
 | Extremely large response | Server dumps entire AST | No size limit on response parsing | **Problem** — see [Unbounded Data](#unbounded-data) |
 | Invalid URI in response | Mangled paths, non-file:// schemes | `uri.path()` used directly without validation | **Problem** — see [URI Trust](#uri-trust) |
-| Out-of-range positions | Line/column beyond file bounds | `position_to_offset()` returns error on out-of-bounds | OK |
+| Out-of-range positions | Line/column beyond file bounds | Edits returned as text, MCP client applies | OK |
 | Wrong position encoding | Server claims UTF-8 but sends UTF-16 offsets | Encoding taken from initialize response, no runtime validation | **Problem** — see [Encoding Trust](#encoding-trust) |
 | Stale diagnostic data | Server sends diagnostics for old file version | Cached and served as current | Low risk — diagnostics are advisory |
 
@@ -80,7 +80,7 @@ This eliminates an entire class of failures:
 | Server handles one root, ignores others | Server doesn't support multi-root workspaces | Server initialized with all roots, but behavior is server-dependent | Acceptable — can't fix broken servers |
 | `didChangeWorkspaceFolders` rejected | Server doesn't support dynamic workspace changes | Error logged as warn, other servers unaffected | OK |
 | Cross-root references | Symbol in root A references file in root B | Works if server supports it; fails gracefully if not | OK |
-| Partial workspace search results | One server dead during `find_symbol_in_workspace` iteration | **Results from dead server silently omitted** | **Problem** — see [Silent Partial Results](#silent-partial-results) |
+| Partial workspace search results | One server dead during workspace search | Warning appended to response: `"Warning: [lang] unavailable, results may be incomplete"` | OK |
 
 ---
 
@@ -96,13 +96,9 @@ When the reader task encounters malformed JSON, it logs a warning and skips the 
 
 **Fix:** When skipping a malformed message, attempt to extract the `id` field from the raw string (even if full deserialization failed) and fail the pending request with a clear "server sent malformed response" error.
 
-### Error Attribution
+### ~~Error Attribution~~ (Resolved)
 
-**Location:** `src/mcp/server.rs` line ~260, `src/lsp/client.rs` line ~397
-
-LSP errors are wrapped in `CallToolResult::error()` with messages like `"Failed to parse LSP response"` or `"LSP request 'textDocument/hover' timed out"`. These appear in the MCP response as `isError: true` but are indistinguishable from Catenary bugs without parsing the error text.
-
-**Fix:** Prefix all LSP-originated errors consistently: `"[rust-analyzer] request timed out"` or `"[pylsp] invalid response for textDocument/hover"`. Include the language server name so the user knows which server to investigate.
+All LSP-originated errors are now prefixed with `[language]`, e.g., `[rust] request timed out` or `[python] server closed connection`. The `LspClient` stores its language identifier and includes it in all error messages from the `request()` method. Handler-level errors (e.g., "server is no longer running") also include the language prefix.
 
 ### Timeout Ambiguity
 
@@ -137,13 +133,9 @@ There are no size limits on:
 
 **Fix for recursive traversal:** Add depth limit to `format_nested_symbols()` and related recursive functions.
 
-### Silent Partial Results
+### ~~Silent Partial Results~~ (Resolved)
 
-**Location:** `src/bridge/handler.rs` `find_symbol_in_workspace()`, line ~660
-
-When iterating active clients for workspace symbol search, a dead client is silently skipped via `if let Ok(Some(...))`. The MCP client receives results from surviving servers with no indication that coverage is incomplete.
-
-**Fix:** Track which clients were queried and which failed. Append a note to the response: `"Note: rust-analyzer is not responding, results may be incomplete"`.
+`search` (formerly `find_symbol`) and `codebase_map` now track which servers fail during workspace-wide operations. Failed servers produce a warning appended to the response: `"Warning: [lang] unavailable, results may be incomplete"`. When `search` falls back to grep, it warns: `"Note: text search only (cannot distinguish definitions from usages)."`
 
 ### Signature Help Label Offsets
 

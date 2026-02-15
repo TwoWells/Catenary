@@ -43,6 +43,9 @@ idle_timeout = 300
 [server.rust]
 command = "rust-analyzer"
 
+[server.rust.initialization_options]
+check.command = "clippy"
+
 [server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
@@ -61,6 +64,23 @@ command = "gopls"
 [server.php]
 command = "php-language-server"
 ```
+
+## Initialization Options
+
+Each server can receive custom `initialization_options` that are passed to the
+LSP server during the `initialize` request. These are server-specific settings
+that configure the server's behavior.
+
+```toml
+[server.rust]
+command = "rust-analyzer"
+
+[server.rust.initialization_options]
+check.command = "clippy"
+cargo.features = "all"
+```
+
+Refer to your language server's documentation for available options.
 
 ## Language IDs
 

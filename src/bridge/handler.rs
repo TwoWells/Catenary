@@ -26,17 +26,14 @@ use lsp_types::{
     Diagnostic, DiagnosticSeverity, DocumentChanges, DocumentFormattingParams,
     DocumentRangeFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
     FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, Location,
-    LocationLink, Position, PositionEncodingKind, Range, ReferenceContext, ReferenceParams,
-    RenameParams, SignatureHelp, SignatureHelpParams, SymbolInformation, TextDocumentIdentifier,
-    TextDocumentPositionParams, TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkspaceEdit,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    LocationLink, Position, Range, ReferenceContext, ReferenceParams, RenameParams, SignatureHelp,
+    SignatureHelpParams, SymbolInformation, TextDocumentIdentifier, TextDocumentPositionParams,
+    TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::fs;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -133,9 +130,9 @@ pub struct FindReferencesInput {
     pub include_declaration: bool,
 }
 
-/// Input for workspace symbol search.
+/// Input for unified search.
 #[derive(Debug, Deserialize)]
-pub struct WorkspaceSymbolInput {
+pub struct SearchInput {
     pub query: String,
 }
 
@@ -156,8 +153,6 @@ pub struct RenameInput {
     pub line: u32,
     pub character: u32,
     pub new_name: String,
-    #[serde(default = "default_true")]
-    pub dry_run: bool,
 }
 
 /// Input for formatting.
@@ -293,12 +288,23 @@ impl LspBridgeHandler {
     }
 
     /// Waits for the server handling the given path to be ready.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Client lock held across wait_ready call"
+    )]
     async fn wait_for_server_ready(&self, path: &Path) -> Result<()> {
-        let client_mutex = self.get_client_for_path(path).await?;
-        let is_ready = client_mutex.lock().await.wait_ready().await;
+        let (lang, is_ready) = {
+            let client_mutex = self.get_client_for_path(path).await?;
+            let client = client_mutex.lock().await;
+            let lang = client.language().to_string();
+            let ready = client.wait_ready().await;
+            (lang, ready)
+        };
 
         if !is_ready {
-            return Err(anyhow!("LSP server died while waiting for ready state"));
+            return Err(anyhow!(
+                "[{lang}] server died while waiting for ready state"
+            ));
         }
 
         Ok(())
@@ -364,7 +370,10 @@ impl LspBridgeHandler {
 
         // Check if LSP is still alive
         if !client.is_alive() {
-            return Err(anyhow!("LSP server is no longer running"));
+            return Err(anyhow!(
+                "[{}] server is no longer running",
+                client.language()
+            ));
         }
 
         if let Some(notification) = doc_manager.ensure_open(path).await? {
@@ -715,17 +724,16 @@ impl LspBridgeHandler {
         )
     }
 
-    /// Find a symbol by name with fallback to document symbols search.
-    /// This is more robust than `workspace_symbols` for finding private/internal symbols.
-    fn handle_find_symbol(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: WorkspaceSymbolInput =
+    /// Unified search: LSP workspace symbols with grep fallback.
+    fn handle_search(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
+        let input: SearchInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        debug!("Find symbol request: query={}", input.query);
+        debug!("Search request: query={}", input.query);
 
         // First try workspace symbols (fast path)
-        let workspace_result = self.runtime.block_on(async {
+        let (workspace_result, warnings) = self.runtime.block_on(async {
             let params = WorkspaceSymbolParams {
                 query: input.query.clone(),
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
@@ -734,19 +742,27 @@ impl LspBridgeHandler {
 
             let clients = self.client_manager.active_clients().await;
             let mut results = Vec::new();
+            let mut warnings = Vec::new();
 
-            for client_mutex in clients.values() {
-                if let Ok(Some(response)) = client_mutex
+            for (lang, client_mutex) in &clients {
+                match client_mutex
                     .lock()
                     .await
                     .workspace_symbols(params.clone())
                     .await
                 {
-                    results.push(response);
+                    Ok(Some(response)) => results.push(response),
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("[{lang}] workspace symbol search failed: {e}");
+                        warnings.push(format!(
+                            "Warning: [{lang}] unavailable, results may be incomplete"
+                        ));
+                    }
                 }
             }
 
-            results
+            (results, warnings)
         });
 
         // Check if we got any symbols from workspace search
@@ -755,54 +771,77 @@ impl LspBridgeHandler {
             .any(|r| !format_workspace_symbols(r).contains("No symbols found"));
 
         if has_results {
-            let text = workspace_result
-                .iter()
-                .map(format_workspace_symbols)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut text = if warnings.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n\n", warnings.join("\n"))
+            };
+            text.push_str(
+                &workspace_result
+                    .iter()
+                    .map(format_workspace_symbols)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             return Ok(CallToolResult::text(text));
         }
 
         // Fallback: search files with ripgrep, then query document symbols
         debug!("Workspace symbols found nothing, trying fallback search");
-        Ok(self.find_symbol_fallback(&input.query))
+        Ok(self.search_fallback(&input.query, &warnings))
     }
 
-    /// Fallback symbol search: ripgrep for files, then document symbols.
-    fn find_symbol_fallback(&self, query: &str) -> CallToolResult {
+    /// Fallback search: ripgrep for files, then document symbols.
+    /// Adds a note about grep limitations when LSP workspace symbols were unavailable.
+    fn search_fallback(&self, query: &str, warnings: &[String]) -> CallToolResult {
         const MAX_FILES: usize = 20;
+
+        let mut output = String::new();
+        if !warnings.is_empty() {
+            output.push_str(&warnings.join("\n"));
+            output.push('\n');
+        }
 
         let roots = self.runtime.block_on(self.client_manager.roots());
 
-        // Try ripgrep first
-        let files = Self::ripgrep_search(query, &roots).unwrap_or_else(|_| {
-            // Fallback to manual search if rg not available
-            Self::manual_file_search(query, &roots)
-        });
+        // Try ripgrep to find files, then query document symbols
+        let files = Self::ripgrep_search(query, &roots)
+            .unwrap_or_else(|_| Self::manual_file_search(query, &roots));
 
         if files.is_empty() {
-            return CallToolResult::text("No symbols found");
+            output.push_str("No results found");
+            return CallToolResult::text(output);
         }
 
-        // Cap files to search
         let files: Vec<_> = files.into_iter().take(MAX_FILES).collect();
-        debug!("Searching {} files for symbol '{}'", files.len(), query);
+        debug!("Searching {} files for '{}'", files.len(), query);
 
         // Query document symbols for each file and filter
         let mut found_symbols = Vec::new();
         let query_lower = query.to_lowercase();
 
-        for file_path in files {
-            if let Ok(Some(symbols)) = self.get_matching_symbols(&file_path, &query_lower) {
+        for file_path in &files {
+            if let Ok(Some(symbols)) = self.get_matching_symbols(file_path, &query_lower) {
                 found_symbols.extend(symbols);
             }
         }
 
         if found_symbols.is_empty() {
-            CallToolResult::text("No symbols found")
+            // No LSP symbols matched — fall back to raw grep line matches
+            output.push_str(
+                "Note: text search only (cannot distinguish definitions from usages).\n\n",
+            );
+            let grep_lines = Self::ripgrep_search_lines(query, &roots);
+            if grep_lines.is_empty() {
+                output.push_str("No results found");
+            } else {
+                output.push_str(&grep_lines);
+            }
         } else {
-            CallToolResult::text(found_symbols.join("\n"))
+            output.push_str(&found_symbols.join("\n"));
         }
+
+        CallToolResult::text(output)
     }
 
     /// Use ripgrep to find files containing the query across workspace roots.
@@ -838,6 +877,41 @@ impl LspBridgeHandler {
             .collect();
 
         Ok(files)
+    }
+
+    /// Use ripgrep to get line-level matches (`file:line:content`) across workspace roots.
+    fn ripgrep_search_lines(query: &str, roots: &[PathBuf]) -> String {
+        use std::process::Command;
+
+        let mut cmd = Command::new("rg");
+        cmd.args([
+            "--line-number",
+            "--no-heading",
+            "--max-count",
+            "5",
+            "--ignore-case",
+            "--type-add",
+            "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,cs,rb,php,swift,kt,scala,lua,sh,bash,zsh}",
+            "--type",
+            "code",
+            query,
+        ]);
+
+        for root in roots {
+            cmd.arg(root);
+        }
+
+        let Ok(output) = cmd.output() else {
+            return String::new();
+        };
+
+        if !output.status.success() && output.stdout.is_empty() {
+            return String::new();
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        // Cap output to 50 lines
+        text.lines().take(50).collect::<Vec<_>>().join("\n")
     }
 
     /// Manual file search fallback when ripgrep is not available.
@@ -993,8 +1067,8 @@ impl LspBridgeHandler {
         let path = Self::resolve_path(&input.file)?;
 
         debug!(
-            "Rename request: {}:{}:{} -> {} (dry_run: {})",
-            input.file, input.line, input.character, input.new_name, input.dry_run
+            "Rename request: {}:{}:{} -> {}",
+            input.file, input.line, input.character, input.new_name
         );
 
         let result = self.runtime.block_on(async {
@@ -1013,33 +1087,10 @@ impl LspBridgeHandler {
             client_mutex.lock().await.rename(params).await
         })?;
 
-        match result {
-            Some(edit) => {
-                let diff_text = format_workspace_edit(&edit);
-                if input.dry_run {
-                    Ok(CallToolResult::text(diff_text))
-                } else {
-                    // Get encoding from client
-                    let encoding = self.runtime.block_on(async {
-                        let Ok(client_mutex) = self.get_client_for_path(&path).await else {
-                            return PositionEncodingKind::UTF16; // Fallback if client unavailable
-                        };
-                        let client = client_mutex.lock().await;
-                        client.encoding()
-                    });
-
-                    // Apply changes
-                    self.runtime
-                        .block_on(async { apply_workspace_edit(&edit, encoding).await })?;
-                    Ok(CallToolResult::text(format!(
-                        "Successfully applied rename. Changes:\n{diff_text}"
-                    )))
-                }
-            }
-            None => Ok(CallToolResult::text(
-                "Rename not supported at this location",
-            )),
-        }
+        Ok(result.map_or_else(
+            || CallToolResult::text("Rename not supported at this location"),
+            |edit| CallToolResult::text(format_workspace_edit(&edit)),
+        ))
     }
 
     fn handle_completion(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
@@ -1377,7 +1428,8 @@ impl LspBridgeHandler {
     }
     #[allow(
         clippy::too_many_lines,
-        reason = "Complexity of quickfix selection and application requires many lines"
+        clippy::significant_drop_tightening,
+        reason = "Complexity of quickfix selection requires many lines; client lock held across async operations"
     )]
     fn handle_apply_quickfix(
         &self,
@@ -1485,12 +1537,10 @@ impl LspBridgeHandler {
                 return Err(anyhow!("No matching code action found"));
             };
 
-            // 4. Apply Edit
+            // 4. Return proposed edits
             match action {
                 CodeActionOrCommand::Command(cmd) => {
-                    // We can't easily execute server-side commands that require client logic
-                    // But some are just "executeCommand".
-                    Err(anyhow!("Selected action is a Command ('{}'), which is not yet supported for auto-apply. Only WorkspaceEdit actions are supported.", cmd.title))
+                    Err(anyhow!("Selected action is a Command ('{}'), not a WorkspaceEdit. Cannot extract proposed edits.", cmd.title))
                 }
                 CodeActionOrCommand::CodeAction(mut ca) => {
                     // Resolve if edit is missing (lazy resolution)
@@ -1500,12 +1550,11 @@ impl LspBridgeHandler {
                     }
 
                     if let Some(edit) = ca.edit {
-                        let encoding = client.encoding();
-                        // Drop client lock before applying edit (which might take time)
-                        drop(client);
-
-                        apply_workspace_edit(&edit, encoding).await?;
-                        Ok(format!("Applied fix: {}", ca.title))
+                        Ok(format!(
+                            "Proposed fix: {}\n{}",
+                            ca.title,
+                            format_workspace_edit(&edit)
+                        ))
                     } else {
                         Err(anyhow!("Code action '{}' resolved but still has no edit attached", ca.title))
                     }
@@ -1614,12 +1663,14 @@ impl LspBridgeHandler {
         let primary_root = root_paths.first().cloned().unwrap_or_default();
 
         // 2. Fetch Symbols (Async Phase)
-        if input.include_symbols {
+        let unavailable_langs = if input.include_symbols {
             let entries_len = entries.len();
             let detail_level = input.detail_level;
             debug!("Fetching symbols for {} files", entries_len);
 
             self.runtime.block_on(async {
+                let mut unavailable: Vec<String> = Vec::new();
+
                 for entry in &mut entries {
                     if entry.is_dir {
                         continue;
@@ -1661,10 +1712,17 @@ impl LspBridgeHandler {
                                     Some(format_compact_symbols(&response, detail_level));
                             }
                         }
+                    } else if !unavailable.contains(&lang_id) {
+                        warn!("[{lang_id}] unavailable during codebase map symbol fetch");
+                        unavailable.push(lang_id);
                     }
                 }
-            });
-        }
+
+                unavailable
+            })
+        } else {
+            Vec::new()
+        };
 
         // 3. Render Output
         let mut output = String::new();
@@ -1720,6 +1778,13 @@ impl LspBridgeHandler {
             }
         }
 
+        for lang in &unavailable_langs {
+            let _ = writeln!(
+                output,
+                "\nWarning: [{lang}] unavailable, symbols may be incomplete"
+            );
+        }
+
         Ok(CallToolResult::text(output))
     }
 }
@@ -1768,12 +1833,12 @@ impl ToolHandler for LspBridgeHandler {
                 input_schema: file_schema(),
             },
             Tool {
-                name: "find_symbol".to_string(),
-                description: Some("Find a symbol by name across the workspace. More robust than raw LSP workspace symbols - falls back to file search + document symbols for private/internal symbols.".to_string()),
+                name: "search".to_string(),
+                description: Some("Search for a symbol or pattern across the workspace. Uses LSP workspace symbols when available, falls back to text search. Warns when using fallback since text search cannot distinguish definitions from usages.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name to search for (case-insensitive substring match)" }
+                        "query": { "type": "string", "description": "Symbol name or text pattern to search for" }
                     },
                     "required": ["query"]
                 }),
@@ -1795,15 +1860,14 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "rename".to_string(),
-                description: Some("Compute the edits needed to rename a symbol across the codebase. Returns a list of changes. If dry_run is false, applies the changes.".to_string()),
+                description: Some("Compute the edits needed to rename a symbol across the codebase. Returns proposed changes — does not modify files.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Absolute path to the file" },
                         "line": { "type": "integer", "description": "Line number (0-indexed)" },
                         "character": { "type": "integer", "description": "Character position (0-indexed)" },
-                        "new_name": { "type": "string", "description": "New name for the symbol" },
-                        "dry_run": { "type": "boolean", "description": "If true (default), only return expected changes. If false, apply changes to disk." }
+                        "new_name": { "type": "string", "description": "New name for the symbol" }
                     },
                     "required": ["file", "line", "character", "new_name"]
                 }),
@@ -1894,7 +1958,7 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "apply_quickfix".to_string(),
-                description: Some("Automatically find and apply a Code Action (Quick Fix) for a diagnostic at the given position.".to_string()),
+                description: Some("Find a Code Action (Quick Fix) for a diagnostic at the given position and return its proposed edits. Does not modify files.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1976,7 +2040,7 @@ impl ToolHandler for LspBridgeHandler {
             "implementation" => self.handle_implementation(arguments),
             "find_references" => self.handle_find_references(arguments),
             "document_symbols" => self.handle_document_symbols(arguments),
-            "find_symbol" => self.handle_find_symbol(arguments),
+            "search" => self.handle_search(arguments),
             "code_actions" => self.handle_code_actions(arguments),
             "rename" => self.handle_rename(arguments),
             "completion" => self.handle_completion(arguments),
@@ -2702,185 +2766,6 @@ fn format_type_hierarchy_items(items: &[TypeHierarchyItem]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-async fn apply_workspace_edit(edit: &WorkspaceEdit, encoding: PositionEncodingKind) -> Result<()> {
-    // Collect all edits by file path
-    let mut file_edits: HashMap<PathBuf, Vec<TextEdit>> = HashMap::new();
-
-    if let Some(changes) = &edit.changes {
-        for (uri, edits) in changes {
-            let url = url::Url::parse(uri.as_str())
-                .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
-            let path = url
-                .to_file_path()
-                .map_err(|()| anyhow!("Invalid file URI: {}", uri.as_str()))?;
-            file_edits
-                .entry(path)
-                .or_default()
-                .extend(edits.iter().cloned());
-        }
-    }
-
-    if let Some(doc_changes) = &edit.document_changes {
-        match doc_changes {
-            DocumentChanges::Edits(edits) => {
-                for edit in edits {
-                    let uri = &edit.text_document.uri;
-                    let url = url::Url::parse(uri.as_str())
-                        .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
-                    let path = url
-                        .to_file_path()
-                        .map_err(|()| anyhow!("Invalid file URI: {}", uri.as_str()))?;
-                    let changes = edit.edits.iter().map(|e| match e {
-                        lsp_types::OneOf::Left(te) => te.clone(),
-                        lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
-                    });
-                    file_edits.entry(path).or_default().extend(changes);
-                }
-            }
-            DocumentChanges::Operations(ops) => {
-                // TODO: Support create/rename/delete operations
-                // For now, we only support edits within operations if they map simply
-                warn!(
-                    "DocumentChange operations (create/rename/delete) are not yet fully supported. Only text edits will be applied."
-                );
-                for op in ops {
-                    if let lsp_types::DocumentChangeOperation::Edit(edit) = op {
-                        let uri = &edit.text_document.uri;
-                        let url = url::Url::parse(uri.as_str())
-                            .map_err(|_| anyhow!("Invalid URI: {}", uri.as_str()))?;
-                        let path = url
-                            .to_file_path()
-                            .map_err(|()| anyhow!("Invalid file URI: {}", uri.as_str()))?;
-                        let changes = edit.edits.iter().map(|e| match e {
-                            lsp_types::OneOf::Left(te) => te.clone(),
-                            lsp_types::OneOf::Right(ae) => annotated_text_edit_to_text_edit(ae),
-                        });
-                        file_edits.entry(path).or_default().extend(changes);
-                    }
-                }
-            }
-        }
-    }
-
-    // Apply edits for each file
-    for (path, edits) in file_edits {
-        apply_edits_to_file(&path, edits, encoding.clone()).await?;
-    }
-
-    Ok(())
-}
-
-fn annotated_text_edit_to_text_edit(annotated: &lsp_types::AnnotatedTextEdit) -> TextEdit {
-    TextEdit {
-        range: annotated.text_edit.range,
-        new_text: annotated.text_edit.new_text.clone(),
-    }
-}
-
-async fn apply_edits_to_file(
-    path: &Path,
-    mut edits: Vec<TextEdit>,
-    encoding: PositionEncodingKind,
-) -> Result<()> {
-    let content = fs::read_to_string(path).await?;
-
-    // Sort edits by start position descending to apply from bottom up
-    edits.sort_by(|a, b| {
-        b.range
-            .start
-            .line
-            .cmp(&a.range.start.line)
-            .then(b.range.start.character.cmp(&a.range.start.character))
-    });
-
-    let mut result = content.clone();
-
-    for edit in edits {
-        let start_offset = position_to_offset(&content, edit.range.start, &encoding)?;
-        let end_offset = position_to_offset(&content, edit.range.end, &encoding)?;
-
-        if start_offset > end_offset {
-            return Err(anyhow!(
-                "Invalid range: start {start_offset} > end {end_offset}"
-            ));
-        }
-
-        result.replace_range(start_offset..end_offset, &edit.new_text);
-    }
-
-    fs::write(path, result).await?;
-    Ok(())
-}
-
-fn position_to_offset(
-    content: &str,
-    position: Position,
-    encoding: &PositionEncodingKind,
-) -> Result<usize> {
-    let mut current_line = 0;
-    let mut line_start_byte = 0;
-
-    // Find the start of the target line
-    if position.line > 0 {
-        let mut lines_found = 0;
-        for (i, b) in content.as_bytes().iter().enumerate() {
-            if *b == b'\n' {
-                lines_found += 1;
-                if lines_found == position.line {
-                    line_start_byte = i + 1;
-                    current_line = lines_found;
-                    break;
-                }
-            }
-        }
-
-        if current_line != position.line {
-            return Err(anyhow!("Line {} out of bounds", position.line));
-        }
-    }
-
-    let line_content = &content[line_start_byte..];
-    let line_end_byte = line_content
-        .find('\n')
-        .map_or(content.len(), |i| line_start_byte + i);
-    let line_text = &content[line_start_byte..line_end_byte];
-
-    if *encoding == PositionEncodingKind::UTF8 {
-        // Character is a byte offset
-        let char_offset = position.character as usize;
-        if char_offset <= line_text.len() {
-            Ok(line_start_byte + char_offset)
-        } else {
-            Err(anyhow!(
-                "Character offset {} out of bounds for line {}",
-                char_offset,
-                position.line
-            ))
-        }
-    } else {
-        // Default to UTF-16 logic
-        // Character is a UTF-16 code unit offset
-        let mut utf16_offset = 0;
-        let mut byte_offset = 0;
-
-        for c in line_text.chars() {
-            if utf16_offset >= position.character as usize {
-                break;
-            }
-            utf16_offset += c.len_utf16();
-            byte_offset += c.len_utf8();
-        }
-
-        if utf16_offset == position.character as usize {
-            Ok(line_start_byte + byte_offset)
-        } else {
-            Err(anyhow!(
-                "Position {position:?} lands in the middle of a UTF-16 surrogate pair or out of bounds"
-            ))
-        }
-    }
 }
 
 #[cfg(test)]

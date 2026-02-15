@@ -264,9 +264,10 @@ impl ClientManager {
         )?;
 
         // Initialize
-        // TODO: Pass initialization options from config when supported
         let roots = self.roots.lock().await.clone();
-        client.initialize(&roots).await?;
+        client
+            .initialize(&roots, server_config.initialization_options.clone())
+            .await?;
 
         let client_mutex = Arc::new(Mutex::new(client));
         clients.insert(lang.to_string(), client_mutex.clone());

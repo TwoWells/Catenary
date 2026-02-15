@@ -96,8 +96,9 @@ and [Adversarial Testing](adversarial-testing.md) for full details.
 - **Unbounded LSP data.** Diagnostic caches grow without limit. Hover
   responses, symbol trees, and workspace edit previews have no size caps.
   A malicious or buggy LSP server can cause unbounded memory growth.
-- **`apply_workspace_edit` trusts LSP URIs.** Workspace edits can target
-  files outside the workspace. Tracked for removal in Phase 6.5.
+- **~~`apply_workspace_edit` trusts LSP URIs.~~** Resolved in Phase 6.5.
+  `apply_workspace_edit` removed. All edit tools now return proposed
+  edits as text; the MCP client applies them.
 
 ---
 
@@ -116,20 +117,17 @@ Single Catenary instance multiplexing across multiple workspace roots.
 
 ### Phase 6.5: Hardening
 
-- [ ] Remove `apply_workspace_edit` — `rename`, `apply_quickfix`, and
+- [x] Remove `apply_workspace_edit` — `rename`, `apply_quickfix`, and
       `formatting` return proposed edits only; MCP client applies them
-      (see [LSP Fault Model](lsp-fault-model.md#4-workspace-edit-failures)).
-      **Open question:** return edits as human-readable text (current
-      dry-run format) or structured JSON for mechanical application?
-- [ ] Error attribution — prefix all LSP-originated errors with server
-      name: `[rust-analyzer] request timed out`
-- [ ] Silent partial results — warn when workspace search skips a dead
+      (see [LSP Fault Model](lsp-fault-model.md#4-workspace-edit-failures))
+- [x] Error attribution — prefix all LSP-originated errors with server
+      language: `[rust] request timed out`
+- [x] Silent partial results — warn when workspace search skips a dead
       server
-- [ ] Pass `initializationOptions` from config to LSP server
-- [ ] `search` — unified search tool (LSP → grep fallback), with clear
-      messaging when using fallback ("grep cannot distinguish definition
-      from usage")
-- [ ] Update documentation
+- [x] Pass `initializationOptions` from config to LSP server
+- [x] `search` — unified search tool replacing `find_symbol` (LSP →
+      grep fallback), with clear messaging when using fallback
+- [x] Update documentation
 
 ### Phase 7: Complete Agent Toolkit — v1.0.0
 

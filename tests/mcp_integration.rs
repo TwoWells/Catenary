@@ -286,7 +286,7 @@ fn test_mcp_tools_list() -> Result<()> {
         "implementation",
         "find_references",
         "document_symbols",
-        "find_symbol",
+        "search",
         "code_actions",
         "rename",
         "completion",
@@ -722,7 +722,7 @@ fn test_multiplexing() -> Result<()> {
         "id": 400,
         "method": "tools/call",
         "params": {
-            "name": "find_symbol",
+            "name": "search",
             "arguments": {
                 "query": "greet"
             }
@@ -1083,7 +1083,7 @@ fn test_multi_root_find_symbol() -> Result<()> {
         "id": 700,
         "method": "tools/call",
         "params": {
-            "name": "find_symbol",
+            "name": "search",
             "arguments": { "query": "alpha_func" }
         }
     }))?;
@@ -1108,7 +1108,7 @@ fn test_multi_root_find_symbol() -> Result<()> {
         "id": 701,
         "method": "tools/call",
         "params": {
-            "name": "find_symbol",
+            "name": "search",
             "arguments": { "query": "beta_func" }
         }
     }))?;

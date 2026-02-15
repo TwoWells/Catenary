@@ -72,15 +72,25 @@ next-major:
 	$(eval V := $(shell echo $(CURRENT_VERSION) | awk -F. '{print $$1+1".0.0"}'))
 
 # Main release target (requires V=x.y.z)
+# Rolls back the version bump if checks or commit fail, so it is safe
+# to re-run after fixing the issue.
 release: pre-release-check
 	@if [ -z "$(V)" ]; then \
 		echo "Error: Version not specified. Use 'make release V=x.y.z' or 'make release-patch'"; \
 		exit 1; \
 	fi
 	@$(MAKE) bump-version V=$(V)
-	@$(MAKE) check
+	@if ! $(MAKE) check; then \
+		echo "Checks failed. Rolling back version bump..."; \
+		git checkout HEAD -- Cargo.toml Cargo.lock .claude-plugin/marketplace.json; \
+		exit 1; \
+	fi
 	@git add Cargo.toml Cargo.lock .claude-plugin/marketplace.json
-	@git commit -m "chore: Bump version to $(V)"
+	@if ! git commit -m "chore: Bump version to $(V)"; then \
+		echo "Commit failed. Rolling back version bump..."; \
+		git checkout HEAD -- Cargo.toml Cargo.lock .claude-plugin/marketplace.json; \
+		exit 1; \
+	fi
 	@git tag -a "v$(V)" -m "Release v$(V)"
 	@echo ""
 	@echo "Release v$(V) prepared locally."

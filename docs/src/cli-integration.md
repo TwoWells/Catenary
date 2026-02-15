@@ -170,7 +170,7 @@ For full functionality, catenary-mcp needs file I/O tools:
 | `catenary_write_file`     | ❌ TODO   | With diagnostics         |
 | `catenary_edit_file`      | ❌ TODO   | With diagnostics         |
 | `catenary_list_directory` | ❌ TODO   | Basic navigation         |
-| `find_symbol`    | ✓ Exists  | LSP workspace symbols    |
+| `search`         | ✓ Exists  | LSP workspace symbols + grep fallback |
 | `find_references`| ✓ Exists  | LSP references           |
 | `codebase_map`   | ✓ Exists  | File tree with symbols   |
 | `document_symbols`    | ✓ Exists  | File structure           |

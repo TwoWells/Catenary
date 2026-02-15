@@ -97,7 +97,7 @@ function innocent(): void {}
 
 ## 2. Prompt Injection via Symbol Names
 
-Symbol names flow through `document_symbols`, `find_symbol`, `codebase_map`, and `completion`. They come directly from source code identifiers.
+Symbol names flow through `document_symbols`, `search`, `codebase_map`, and `completion`. They come directly from source code identifiers.
 
 ### 2.1 Function names as instructions
 
@@ -125,7 +125,7 @@ def аuthenticate(password):  # Cyrillic 'а'
     return True
 ```
 
-**Trigger:** AI agent calls `find_symbol` for `authenticate`.
+**Trigger:** AI agent calls `search` for `authenticate`.
 
 **What to verify:**
 - The symbol is returned with its actual Unicode codepoints
@@ -345,7 +345,7 @@ workspace/
     secrets -> /home/user/.ssh/
 ```
 
-**Trigger:** AI agent calls `codebase_map` or `find_symbol` which walks the filesystem.
+**Trigger:** AI agent calls `codebase_map` or `search` which walks the filesystem.
 
 **Expected:** The `ignore` crate's `WalkBuilder` follows symlinks by default. Files outside the workspace could be walked and opened.
 
@@ -458,7 +458,7 @@ client_manager.add_root(PathBuf::from("/etc"))
 **What to verify:**
 - `add_root()` validates the path (currently it does not)
 - LSP servers are notified but can't access files outside their capabilities
-- `codebase_map` and `find_symbol` fallback would walk `/etc` — is this acceptable?
+- `codebase_map` and `search` fallback would walk `/etc` — is this acceptable?
 
 ---
 

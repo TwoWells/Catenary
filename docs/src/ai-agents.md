@@ -20,10 +20,10 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 | Find all usages of a symbol | `find_references` | grep/ripgrep |
 | Get type info or documentation | `hover` | Reading entire files |
 | Understand a file's structure | `document_symbols` | Reading entire files |
-| Find a class/function by name | `find_symbol` | grep/glob patterns |
+| Find a class/function by name | `search` | grep/glob patterns |
 | See available methods on an object | `completion` | Reading class definitions |
 | Find implementations of interface | `implementation` | grep for impl blocks |
-| Rename a symbol safely | `rename` (with `dry_run: true`) | Find/replace with grep |
+| Rename a symbol safely | `rename` | Find/replace with grep |
 | Check for errors after edits | `diagnostics` | Running compiler |
 | Explore unfamiliar codebase | `codebase_map` | Multiple grep/read cycles |
 
@@ -85,7 +85,7 @@ when:
 
 **Efficient approach:**
 
-1. `find_symbol` for "auth" - returns symbol names with locations
+1. `search` for "auth" - returns symbol names with locations
 2. `definition` to jump to the specific handler
 3. `hover` on unfamiliar types to understand them
 4. `find_references` to see how the handler is called
@@ -100,7 +100,7 @@ When first exploring an unfamiliar codebase:
 codebase_map with include_symbols: true
 
 # Then drill down with targeted queries
-find_symbol for specific components
+search for specific components
 document_symbols for file structure
 ```
 

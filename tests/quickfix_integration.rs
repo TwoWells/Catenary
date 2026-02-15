@@ -175,14 +175,20 @@ edition = "2021"
         "Tool call failed"
     );
 
-    // Verify file content changed
-    let new_content = std::fs::read_to_string(&main_rs)?;
-    tracing::debug!("New Content:\n{new_content}");
+    // Verify the response contains proposed edits (not applied to disk)
+    let response_text = result["content"][0]["text"].as_str().unwrap_or_default();
+    tracing::debug!("Response text: {response_text}");
 
-    // Expect _x or removal
     assert!(
-        new_content.contains("_x") || !new_content.contains("let x"),
-        "Fix was not applied (expected _x or removal)"
+        response_text.contains("Proposed fix:") && response_text.contains("_x"),
+        "Expected proposed edits with _x prefix, got: {response_text}"
+    );
+
+    // Verify the file was NOT modified (edits are proposed, not applied)
+    let new_content = std::fs::read_to_string(&main_rs)?;
+    assert_eq!(
+        new_content, content,
+        "File should not have been modified — edits are proposed only"
     );
     Ok(())
 }

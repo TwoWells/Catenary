@@ -69,6 +69,8 @@ pub struct LspClient {
     spawn_time: Instant,
     /// Current server state (0=Initializing, 1=Indexing, 2=Ready, 3=Dead).
     state: Arc<AtomicU8>,
+    /// The language identifier (e.g., "rust", "python") for error attribution.
+    language: String,
     _reader_handle: tokio::task::JoinHandle<()>,
     child: Child,
 }
@@ -140,6 +142,7 @@ impl LspClient {
             progress,
             spawn_time: Instant::now(),
             state,
+            language: language.to_string(),
             _reader_handle: reader_handle,
             child,
         })
@@ -370,10 +373,10 @@ impl LspClient {
             // Wait for response with timeout
             let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) => return Err(anyhow!("LSP server closed connection")),
+                Ok(Err(_)) => return Err(anyhow!("[{}] server closed connection", self.language)),
                 Err(_) => {
                     self.pending.lock().await.remove(&id);
-                    return Err(anyhow!("LSP request '{method}' timed out"));
+                    return Err(anyhow!("[{}] request '{method}' timed out", self.language));
                 }
             };
 
@@ -391,14 +394,23 @@ impl LspClient {
                     .await;
                     continue;
                 }
-                return Err(anyhow!("LSP error {}: {}", error.code, error.message));
+                return Err(anyhow!(
+                    "[{}] LSP error {}: {}",
+                    self.language,
+                    error.code,
+                    error.message
+                ));
             }
 
             let result = response.result.unwrap_or(serde_json::Value::Null);
-            return serde_json::from_value(result).context("Failed to parse LSP response");
+            return serde_json::from_value(result)
+                .with_context(|| format!("[{}] failed to parse LSP response", self.language));
         }
 
-        Err(anyhow!("LSP request '{method}' failed after retries"))
+        Err(anyhow!(
+            "[{}] request '{method}' failed after retries",
+            self.language
+        ))
     }
 
     /// Sends a notification (no response expected).
@@ -436,7 +448,11 @@ impl LspClient {
     /// - A root path is invalid.
     /// - The initialize request fails.
     /// - The server fails to respond.
-    pub async fn initialize(&mut self, roots: &[PathBuf]) -> Result<InitializeResult> {
+    pub async fn initialize(
+        &mut self,
+        roots: &[PathBuf],
+        initialization_options: Option<serde_json::Value>,
+    ) -> Result<InitializeResult> {
         let workspace_folders: Vec<WorkspaceFolder> = roots
             .iter()
             .map(|root| {
@@ -493,6 +509,7 @@ impl LspClient {
                 ..Default::default()
             },
             workspace_folders: Some(workspace_folders),
+            initialization_options,
             ..Default::default()
         };
 
@@ -820,6 +837,12 @@ impl LspClient {
     }
 
     /// Returns true if the LSP server connection is still alive.
+    /// Returns the language identifier for this client (e.g., "rust", "python").
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// Returns whether the LSP server process is still running.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }

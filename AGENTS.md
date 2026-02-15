@@ -45,3 +45,14 @@ These commands automatically:
 
 To complete the release, push the changes and tags:
 `git push && git push --tags`
+
+### Pre-release checklist
+Before running `make release-*`:
+1. Run `cargo update` to ensure `Cargo.lock` is fresh. The release
+   commit's pre-commit hook runs `cargo-lock-check --locked`, which
+   fails if any dependency has a newer compatible version available.
+2. Ensure `git push` has been run so local `main` matches `origin/main`.
+
+If checks or the commit fail, the Makefile automatically rolls back
+the version bump — it is safe to re-run `make release-*` after fixing
+the issue.
