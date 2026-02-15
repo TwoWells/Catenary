@@ -1,6 +1,6 @@
 # Roadmap
 
-Current version: **v0.6.1**
+Current version: **v0.6.6**
 
 ## Completed
 
@@ -85,39 +85,92 @@ See [CLI Integration](cli-integration.md) for full details.
 
 ---
 
-## In Progress
+## Known Vulnerabilities
 
-### Phase 6: File I/O Tools
+These must be resolved before v1.0.0. See [LSP Fault Model](lsp-fault-model.md)
+and [Adversarial Testing](adversarial-testing.md) for full details.
 
-Add file operations to catenary-mcp so models can complete coding tasks without
-built-in tools.
-
-- [ ] `catenary_read_file` — Read file contents
-- [ ] `catenary_write_file` — Write file + return diagnostics
-- [ ] `catenary_edit_file` — Edit file + return diagnostics
-- [ ] `catenary_list_directory` — List directory contents
-
-**Design constraint:** Write/edit tools return LSP diagnostics automatically.
-Models can't proceed unaware they broke something.
-
-### Phase 6.5: Polish
-
-- [ ] Pass `initializationOptions` from config to LSP server
-- [ ] Support `DocumentChange` operations (create/rename/delete) in
-      `apply_workspace_edit`
-- [ ] Update documentation
+- **Symlink traversal.** `codebase_map` and `find_symbol` fallback use
+  `WalkBuilder` which follows symlinks. A symlink pointing outside the
+  workspace allows reading files the user didn't intend to expose.
+- **Unbounded LSP data.** Diagnostic caches grow without limit. Hover
+  responses, symbol trees, and workspace edit previews have no size caps.
+  A malicious or buggy LSP server can cause unbounded memory growth.
+- **`apply_workspace_edit` trusts LSP URIs.** Workspace edits can target
+  files outside the workspace. Tracked for removal in Phase 6.5.
 
 ---
 
-## Next
+## In Progress
 
-### Phase 7: Grep Fallback
+### Phase 6: Multi-Workspace Support
 
-When LSP unavailable, fall back to grep with degradation notice.
+Single Catenary instance multiplexing across multiple workspace roots.
 
-- [ ] `catenary_search` — unified search tool (LSP → grep fallback)
-- [ ] Clear messaging when using fallback ("grep cannot distinguish definition
+- [x] Accept multiple `--root` paths
+- [x] Pass all roots as `workspace_folders` to each LSP server
+- [x] Multi-root `find_symbol` fallback (ripgrep + manual search across roots)
+- [x] Multi-root `codebase_map` (walks all roots, prefixes entries in multi-root mode)
+- [x] `add_root()` plumbing (appends root, sends `didChangeWorkspaceFolders`)
+- [x] Expose `add_root` mid-session via MCP `roots/list`
+
+### Phase 6.5: Hardening
+
+- [ ] Remove `apply_workspace_edit` — `rename`, `apply_quickfix`, and
+      `formatting` return proposed edits only; MCP client applies them
+      (see [LSP Fault Model](lsp-fault-model.md#4-workspace-edit-failures)).
+      **Open question:** return edits as human-readable text (current
+      dry-run format) or structured JSON for mechanical application?
+- [ ] Error attribution — prefix all LSP-originated errors with server
+      name: `[rust-analyzer] request timed out`
+- [ ] Silent partial results — warn when workspace search skips a dead
+      server
+- [ ] Pass `initializationOptions` from config to LSP server
+- [ ] `search` — unified search tool (LSP → grep fallback), with clear
+      messaging when using fallback ("grep cannot distinguish definition
       from usage")
+- [ ] Update documentation
+
+### Phase 7: Complete Agent Toolkit — v1.0.0
+
+Full toolset to replace CLI built-in tools. Requires CLI settings changes
+(Claude Code, Gemini CLI) to disable built-in tools in favor of Catenary.
+
+**File I/O:**
+- [ ] `read_file` — Read file contents + return diagnostics
+- [ ] `write_file` — Write file + return diagnostics
+- [ ] `edit_file` — Edit file + return diagnostics
+- [ ] `list_directory` — List directory contents
+
+**Shell Execution:**
+- [ ] `run` tool with allowlist enforcement
+- [ ] `allowed = ["*"]` opt-in for unrestricted shell
+- [ ] Dynamic language detection — language-specific commands activate when
+      matching files exist in the workspace
+- [ ] Tool description updates dynamically to show current allowlist:
+      `"Allowed: git, make. Python (detected): python, pytest, uv"`
+- [ ] Emit `tools/list_changed` when allowlist changes (e.g., workspace added)
+- [ ] Error messages on denied commands include the current allowlist
+
+```toml
+[tools.run]
+allowed = ["git", "make"]
+
+[tools.run.python]
+allowed = ["python", "pytest", "uv"]
+
+[tools.run.rust]
+allowed = ["cargo"]
+```
+
+**Design constraints:**
+- Write/edit tools return LSP diagnostics automatically. Models can't proceed
+  unaware they broke something.
+- Write/edit tools validate all paths against workspace roots. LSP-proposed
+  edits (rename, code actions) are applied through these tools, never directly
+  from LSP data (see [LSP Fault Model](lsp-fault-model.md)).
+- Write/edit tools refuse to modify Catenary's own config files. An agent that
+  can rewrite its own permissions isn't a controlled agent.
 
 ---
 

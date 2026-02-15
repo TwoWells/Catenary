@@ -20,8 +20,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// JSON-RPC request from MCP client.
-#[derive(Debug, Clone, Deserialize)]
+/// JSON-RPC request (client-to-server or server-to-client).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(
     dead_code,
     reason = "Fields required by JSON-RPC protocol but not all are read"
@@ -64,18 +64,18 @@ pub enum RequestId {
     String(String),
 }
 
-/// JSON-RPC response to MCP client.
-#[derive(Debug, Clone, Serialize)]
+/// JSON-RPC response (client-to-server or server-to-client).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     /// The JSON-RPC version.
     pub jsonrpc: String,
     /// The request ID.
     pub id: RequestId,
     /// The result of the request, if successful.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     /// The error, if the request failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
 }
 
@@ -110,7 +110,7 @@ impl Response {
 }
 
 /// JSON-RPC response error.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseError {
     /// The error code.
     pub code: i64,
@@ -160,10 +160,6 @@ pub struct ClientCapabilities {
 /// Roots-related capabilities.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(
-    dead_code,
-    reason = "Fields required by MCP protocol but not all are read"
-)]
 pub struct RootsCapability {
     /// Whether the client supports listing changed roots.
     #[serde(default)]
@@ -271,6 +267,23 @@ pub enum ToolContent {
     },
 }
 
+/// A root provided by the MCP client via `roots/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Root {
+    /// The root URI. Must be a `file://` URI.
+    pub uri: String,
+    /// Optional human-readable name for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Response to a `roots/list` request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RootsListResult {
+    /// The list of roots.
+    pub roots: Vec<Root>,
+}
+
 impl CallToolResult {
     /// Creates a successful tool result with text content.
     pub fn text(text: impl Into<String>) -> Self {
@@ -294,7 +307,7 @@ impl CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
     #[test]
     fn test_deserialize_initialize_params() -> Result<()> {
@@ -390,6 +403,80 @@ mod tests {
         assert!(json.contains("error"));
         assert!(json.contains("-32601"));
         assert!(!json.contains("result"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialize_request() -> Result<()> {
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::String("catenary-0".to_string()),
+            method: "roots/list".to_string(),
+            params: None,
+        };
+        let json = serde_json::to_string(&req)?;
+        assert!(json.contains("roots/list"));
+        assert!(json.contains("catenary-0"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_response_success() -> Result<()> {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"roots": []}
+        }"#;
+        let resp: Response = serde_json::from_str(json)?;
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_response_error() -> Result<()> {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "id": "catenary-0",
+            "error": {"code": -32601, "message": "not found"}
+        }"#;
+        let resp: Response = serde_json::from_str(json)?;
+        assert!(resp.result.is_none());
+        let err = resp.error.as_ref().context("missing error")?;
+        assert_eq!(err.code, METHOD_NOT_FOUND);
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_root_with_name() -> Result<()> {
+        let json = r#"{"uri": "file:///tmp/project", "name": "My Project"}"#;
+        let root: Root = serde_json::from_str(json)?;
+        assert_eq!(root.uri, "file:///tmp/project");
+        assert_eq!(root.name.as_deref(), Some("My Project"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_root_without_name() -> Result<()> {
+        let json = r#"{"uri": "file:///tmp/project"}"#;
+        let root: Root = serde_json::from_str(json)?;
+        assert_eq!(root.uri, "file:///tmp/project");
+        assert!(root.name.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_roots_list_result() -> Result<()> {
+        let json = r#"{
+            "roots": [
+                {"uri": "file:///tmp/a", "name": "A"},
+                {"uri": "file:///tmp/b"}
+            ]
+        }"#;
+        let result: RootsListResult = serde_json::from_str(json)?;
+        assert_eq!(result.roots.len(), 2);
+        assert_eq!(result.roots[0].uri, "file:///tmp/a");
+        assert_eq!(result.roots[1].name, None);
         Ok(())
     }
 }

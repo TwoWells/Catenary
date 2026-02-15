@@ -73,7 +73,7 @@ async fn test_bash_lsp_initialize() -> Result<()> {
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    let result = client.initialize(dir.path()).await?;
+    let result = client.initialize(&[dir.path().to_path_buf()]).await?;
 
     // Verify bash-language-server capabilities
     assert!(result.capabilities.hover_provider.is_some());
@@ -99,7 +99,7 @@ async fn test_bash_lsp_hover() -> Result<()> {
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    client.initialize(dir.path()).await?;
+    client.initialize(&[dir.path().to_path_buf()]).await?;
 
     // Open the document
     let uri: lsp_types::Uri = format!("file://{}", script_path.display()).parse()?;
@@ -151,7 +151,7 @@ async fn test_lua_lsp_initialize() -> Result<()> {
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    let result = client.initialize(dir.path()).await?;
+    let result = client.initialize(&[dir.path().to_path_buf()]).await?;
 
     assert!(result.capabilities.hover_provider.is_some());
 
@@ -174,7 +174,7 @@ async fn test_document_lifecycle() -> Result<()> {
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    client.initialize(dir.path()).await?;
+    client.initialize(&[dir.path().to_path_buf()]).await?;
 
     let uri: lsp_types::Uri = format!("file://{}", script_path.display()).parse()?;
 
@@ -241,7 +241,7 @@ edition = "2021"
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    let result = client.initialize(dir.path()).await?;
+    let result = client.initialize(&[dir.path().to_path_buf()]).await?;
 
     // rust-analyzer provides hover and definition
     assert!(result.capabilities.hover_provider.is_some());
@@ -277,7 +277,7 @@ edition = "2021"
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    client.initialize(dir.path()).await?;
+    client.initialize(&[dir.path().to_path_buf()]).await?;
     client.wait_ready().await;
 
     let uri: lsp_types::Uri = format!("file://{}", main_rs.display()).parse()?;
@@ -328,7 +328,7 @@ async fn test_yaml_lsp_initialize() -> Result<()> {
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    let result = client.initialize(dir.path()).await?;
+    let result = client.initialize(&[dir.path().to_path_buf()]).await?;
 
     assert!(result.capabilities.hover_provider.is_some());
 
@@ -351,7 +351,7 @@ async fn test_yaml_lsp_hover() -> Result<()> {
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
-    client.initialize(dir.path()).await?;
+    client.initialize(&[dir.path().to_path_buf()]).await?;
 
     let uri: lsp_types::Uri = format!("file://{}", yaml_path.display()).parse()?;
     client

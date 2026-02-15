@@ -21,17 +21,18 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     ClientCapabilities, CodeActionParams, CodeActionResponse, CompletionParams, CompletionResponse,
-    Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
+    Diagnostic, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
+    InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
     PublishDiagnosticsParams, ReferenceParams, RenameParams, SignatureHelp, SignatureHelpParams,
     TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    TypeHierarchySupertypesParams, Uri, WorkspaceEdit, WorkspaceFolder,
+    WorkspaceFoldersChangeEvent, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
@@ -432,13 +433,25 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The root path is invalid.
+    /// - A root path is invalid.
     /// - The initialize request fails.
     /// - The server fails to respond.
-    pub async fn initialize(&mut self, root: &Path) -> Result<InitializeResult> {
-        let root_uri: Uri = format!("file://{}", root.display())
-            .parse()
-            .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
+    pub async fn initialize(&mut self, roots: &[PathBuf]) -> Result<InitializeResult> {
+        let workspace_folders: Vec<WorkspaceFolder> = roots
+            .iter()
+            .map(|root| {
+                let uri: Uri = format!("file://{}", root.display())
+                    .parse()
+                    .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
+                Ok(WorkspaceFolder {
+                    uri,
+                    name: root.file_name().map_or_else(
+                        || "workspace".to_string(),
+                        |s| s.to_string_lossy().to_string(),
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let params = InitializeParams {
             process_id: Some(std::process::id()),
@@ -479,13 +492,7 @@ impl LspClient {
                 }),
                 ..Default::default()
             },
-            workspace_folders: Some(vec![WorkspaceFolder {
-                uri: root_uri,
-                name: root.file_name().map_or_else(
-                    || "workspace".to_string(),
-                    |s| s.to_string_lossy().to_string(),
-                ),
-            }]),
+            workspace_folders: Some(workspace_folders),
             ..Default::default()
         };
 
@@ -552,6 +559,25 @@ impl LspClient {
     /// Returns an error if the notification fails.
     pub async fn did_close(&self, params: DidCloseTextDocumentParams) -> Result<()> {
         self.notify("textDocument/didClose", params).await
+    }
+
+    /// Notifies the LSP server that workspace folders changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
+    pub async fn did_change_workspace_folders(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: Vec<WorkspaceFolder>,
+    ) -> Result<()> {
+        self.notify(
+            "workspace/didChangeWorkspaceFolders",
+            DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent { added, removed },
+            },
+        )
+        .await
     }
 
     /// Gets hover information for a position in a document.

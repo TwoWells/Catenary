@@ -16,6 +16,10 @@ struct BridgeProcess {
 
 impl BridgeProcess {
     fn spawn(root: &str, lsp_args: Option<&str>) -> Result<Self> {
+        Self::spawn_multi_root(&[root], lsp_args)
+    }
+
+    fn spawn_multi_root(roots: &[&str], lsp_args: Option<&str>) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         if let Some(arg) = lsp_args {
             cmd.arg("--lsp").arg(arg);
@@ -24,7 +28,10 @@ impl BridgeProcess {
             cmd.arg("--lsp")
                 .arg("shellscript:bash-language-server start");
         }
-        cmd.arg("--root").arg(root);
+
+        for root in roots {
+            cmd.arg("--root").arg(root);
+        }
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -241,5 +248,148 @@ fn test_codebase_map_markdown() -> Result<()> {
         content.contains("Section 1"),
         "Should contain Section 1 symbol"
     );
+    Ok(())
+}
+
+#[test]
+fn test_codebase_map_multi_root() -> Result<()> {
+    // Create two workspace roots with distinct files
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+
+    std::fs::write(dir_a.path().join("alpha.txt"), "content a")?;
+    std::fs::create_dir(dir_a.path().join("sub_a"))?;
+    std::fs::write(dir_a.path().join("sub_a/nested_a.rs"), "fn a() {}")?;
+
+    std::fs::write(dir_b.path().join("beta.txt"), "content b")?;
+    std::fs::create_dir(dir_b.path().join("sub_b"))?;
+    std::fs::write(dir_b.path().join("sub_b/nested_b.rs"), "fn b() {}")?;
+
+    let root_a = dir_a.path().to_str().context("invalid path A")?;
+    let root_b = dir_b.path().to_str().context("invalid path B")?;
+
+    let mut bridge = BridgeProcess::spawn_multi_root(&[root_a, root_b], None)?;
+    bridge.initialize()?;
+
+    // Request codebase_map without specifying a path — should show all roots
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "codebase_map",
+            "arguments": {
+                "max_depth": 5,
+                "include_symbols": false
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "codebase_map multi-root failed: {response:?}"
+    );
+
+    let content = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text in content")?;
+
+    tracing::debug!("Multi-root Map Output:\n{content}");
+
+    // Should contain files from both roots
+    assert!(
+        content.contains("alpha.txt"),
+        "Should contain alpha.txt from root A, got:\n{content}"
+    );
+    assert!(
+        content.contains("beta.txt"),
+        "Should contain beta.txt from root B, got:\n{content}"
+    );
+    assert!(
+        content.contains("nested_a.rs"),
+        "Should contain nested_a.rs from root A, got:\n{content}"
+    );
+    assert!(
+        content.contains("nested_b.rs"),
+        "Should contain nested_b.rs from root B, got:\n{content}"
+    );
+
+    // In multi-root mode, root directories should appear as top-level entries
+    // Get the directory names for the temp dirs
+    let names: Vec<String> = [&dir_a, &dir_b]
+        .iter()
+        .map(|d| {
+            d.path()
+                .file_name()
+                .context("no dirname")
+                .and_then(|n| n.to_str().context("invalid dirname").map(String::from))
+        })
+        .collect::<Result<_>>()?;
+
+    assert!(
+        content.contains(&format!("{}/", names[0])),
+        "Should contain root A directory prefix '{0}/', got:\n{content}",
+        names[0]
+    );
+    assert!(
+        content.contains(&format!("{}/", names[1])),
+        "Should contain root B directory prefix '{0}/', got:\n{content}",
+        names[1]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_codebase_map_single_path_override() -> Result<()> {
+    // When an explicit path is given, even in multi-root mode, only that path is shown
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+
+    std::fs::write(dir_a.path().join("only_a.txt"), "a")?;
+    std::fs::write(dir_b.path().join("only_b.txt"), "b")?;
+
+    let root_a = dir_a.path().to_str().context("invalid path A")?;
+    let root_b = dir_b.path().to_str().context("invalid path B")?;
+
+    let mut bridge = BridgeProcess::spawn_multi_root(&[root_a, root_b], None)?;
+    bridge.initialize()?;
+
+    // Request map with explicit path pointing to root A only
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": {
+            "name": "codebase_map",
+            "arguments": {
+                "path": root_a,
+                "include_symbols": false
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "codebase_map with explicit path failed: {response:?}"
+    );
+
+    let content = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text in content")?;
+
+    assert!(
+        content.contains("only_a.txt"),
+        "Should contain only_a.txt from explicit path, got:\n{content}"
+    );
+    assert!(
+        !content.contains("only_b.txt"),
+        "Should NOT contain only_b.txt when explicit path is root A, got:\n{content}"
+    );
+
     Ok(())
 }

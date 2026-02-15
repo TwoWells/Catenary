@@ -58,9 +58,9 @@ struct Args {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Workspace root directory.
-    #[arg(short, long, default_value = ".", global = true)]
-    root: PathBuf,
+    /// Workspace root directories. Can be specified multiple times.
+    #[arg(short, long, global = true)]
+    root: Vec<PathBuf>,
 
     /// Document idle timeout in seconds before auto-close (0 to disable).
     /// Overrides config file if set (default in config is 300).
@@ -130,6 +130,10 @@ async fn main() -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the server fails to start or encounters an internal error.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Server setup requires sequential initialization steps"
+)]
 async fn run_server(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("catenary=info".parse()?))
@@ -171,12 +175,25 @@ async fn run_server(args: Args) -> Result<()> {
         );
     }
 
-    let root = args.root.canonicalize()?;
+    // Default to current directory if no roots specified
+    let raw_roots = if args.root.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        args.root
+    };
+    let roots: Vec<PathBuf> = raw_roots
+        .into_iter()
+        .map(|r| r.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    let workspace_display = roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     // Create session for observability
-    let session = Arc::new(std::sync::Mutex::new(Session::create(
-        root.to_string_lossy().as_ref(),
-    )?));
+    let session = Arc::new(std::sync::Mutex::new(Session::create(&workspace_display)?));
     let broadcaster = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
@@ -191,13 +208,13 @@ async fn run_server(args: Args) -> Result<()> {
             .info
             .id
     );
-    info!("Workspace root: {}", root.display());
+    info!("Workspace roots: {}", workspace_display);
     info!("Document idle timeout: {}s", config.idle_timeout);
 
     // Create managers
     let client_manager = Arc::new(lsp::ClientManager::new(
         config.clone(),
-        root,
+        roots,
         broadcaster.clone(),
     ));
     let doc_manager = Arc::new(Mutex::new(DocumentManager::new()));
@@ -226,13 +243,32 @@ async fn run_server(args: Args) -> Result<()> {
 
     // Run MCP server (blocking - reads from stdin)
     let session_for_callback = session.clone();
-    let mut mcp_server = McpServer::new(handler, broadcaster).on_client_info(Box::new(
-        move |name: &str, version: &str| {
+    let client_manager_for_roots = client_manager.clone();
+    let runtime_for_roots = tokio::runtime::Handle::current();
+    let mut mcp_server = McpServer::new(handler, broadcaster)
+        .on_client_info(Box::new(move |name: &str, version: &str| {
             if let Ok(mut session) = session_for_callback.lock() {
                 session.set_client_info(name, version);
             }
-        },
-    ));
+        }))
+        .on_roots_changed(Box::new(move |roots| {
+            let paths: Vec<PathBuf> = roots
+                .iter()
+                .filter_map(|root| {
+                    root.uri.strip_prefix("file://").and_then(|p| {
+                        let path = PathBuf::from(p);
+                        match path.canonicalize() {
+                            Ok(canonical) => Some(canonical),
+                            Err(e) => {
+                                warn!("Skipping root {p}: {e}");
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+            runtime_for_roots.block_on(client_manager_for_roots.sync_roots(paths))
+        }));
 
     // Run in a blocking task since MCP server uses synchronous I/O
     let mcp_task = tokio::task::spawn_blocking(move || mcp_server.run());

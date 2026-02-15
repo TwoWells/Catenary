@@ -59,13 +59,20 @@ struct BridgeProcess {
 
 impl BridgeProcess {
     fn spawn(lsp_commands: &[&str], root: &str) -> Result<Self> {
+        Self::spawn_multi_root(lsp_commands, &[root])
+    }
+
+    fn spawn_multi_root(lsp_commands: &[&str], roots: &[&str]) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
 
         for lsp in lsp_commands {
             cmd.arg("--lsp").arg(lsp);
         }
 
-        cmd.arg("--root").arg(root);
+        for root in roots {
+            cmd.arg("--root").arg(root);
+        }
+
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -129,6 +136,69 @@ impl BridgeProcess {
         }))?;
 
         // Small delay for notification processing
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(())
+    }
+
+    /// Initializes with `roots.listChanged` capability.
+    ///
+    /// After sending `notifications/initialized`, reads the server's
+    /// `roots/list` request from stdout and responds with the given roots.
+    fn initialize_with_roots(&mut self, roots: &[&str]) -> Result<()> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "roots": { "listChanged": true }
+                },
+                "clientInfo": {
+                    "name": "integration-test",
+                    "version": "1.0.0"
+                }
+            }
+        }))?;
+
+        let response = self.recv()?;
+        if response.get("result").is_none() {
+            bail!("Initialize failed: {response:?}");
+        }
+
+        // Send initialized notification — this triggers the roots/list request
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))?;
+
+        // The server should send us a roots/list request
+        let roots_request = self.recv()?;
+        let method = roots_request
+            .get("method")
+            .and_then(|m| m.as_str())
+            .ok_or_else(|| anyhow!("Expected roots/list request, got: {roots_request:?}"))?;
+        if method != "roots/list" {
+            bail!("Expected roots/list, got {method}");
+        }
+        let request_id = roots_request
+            .get("id")
+            .ok_or_else(|| anyhow!("roots/list request missing id"))?
+            .clone();
+
+        // Respond with the provided roots
+        let root_objects: Vec<Value> = roots
+            .iter()
+            .map(|r| json!({"uri": format!("file://{r}")}))
+            .collect();
+
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": { "roots": root_objects }
+        }))?;
+
+        // Small delay for processing
         std::thread::sleep(Duration::from_millis(100));
         Ok(())
     }
@@ -880,5 +950,483 @@ fn test_catenary_find_references_missing_args() -> Result<()> {
         result["isError"], true,
         "Expected error for missing arguments"
     );
+    Ok(())
+}
+
+#[test]
+fn test_multi_root_hover() -> Result<()> {
+    require_bash_lsp!();
+
+    // Create two separate workspace roots with different scripts
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    let script_a = dir_a.path().join("script_a.sh");
+    std::fs::write(&script_a, "#!/bin/bash\necho \"from root A\"\n")?;
+
+    let script_b = dir_b.path().join("script_b.sh");
+    std::fs::write(&script_b, "#!/bin/bash\necho \"from root B\"\n")?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    let mut bridge = BridgeProcess::spawn_multi_root(
+        &["shellscript:bash-language-server start"],
+        &[root_a, root_b],
+    )?;
+    bridge.initialize()?;
+
+    // Hover on echo in script from root A
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 600,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": script_a.to_str().context("Invalid script A path")?,
+                "line": 1,
+                "character": 0
+            }
+        }
+    }))?;
+
+    let response_a = bridge.recv()?;
+    let result_a = &response_a["result"];
+    assert!(
+        result_a["isError"].is_null() || result_a["isError"] == false,
+        "Hover on root A script failed: {response_a:?}"
+    );
+    let content_a = result_a["content"]
+        .as_array()
+        .context("Missing content array for root A")?;
+    assert!(!content_a.is_empty(), "Expected hover content for root A");
+    let text_a = content_a[0]["text"]
+        .as_str()
+        .context("Missing text in root A content")?;
+    assert!(
+        text_a.contains("echo"),
+        "Hover should contain 'echo' for root A, got: {text_a}"
+    );
+
+    // Hover on echo in script from root B
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 601,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": script_b.to_str().context("Invalid script B path")?,
+                "line": 1,
+                "character": 0
+            }
+        }
+    }))?;
+
+    let response_b = bridge.recv()?;
+    let result_b = &response_b["result"];
+    assert!(
+        result_b["isError"].is_null() || result_b["isError"] == false,
+        "Hover on root B script failed: {response_b:?}"
+    );
+    let content_b = result_b["content"]
+        .as_array()
+        .context("Missing content array for root B")?;
+    assert!(!content_b.is_empty(), "Expected hover content for root B");
+    let text_b = content_b[0]["text"]
+        .as_str()
+        .context("Missing text in root B content")?;
+    assert!(
+        text_b.contains("echo"),
+        "Hover should contain 'echo' for root B, got: {text_b}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_multi_root_find_symbol() -> Result<()> {
+    require_bash_lsp!();
+
+    // Create two roots with unique function names
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    let script_a = dir_a.path().join("alpha.sh");
+    std::fs::write(
+        &script_a,
+        "#!/bin/bash\nfunction alpha_func() { echo alpha; }\n",
+    )?;
+
+    let script_b = dir_b.path().join("beta.sh");
+    std::fs::write(
+        &script_b,
+        "#!/bin/bash\nfunction beta_func() { echo beta; }\n",
+    )?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    let mut bridge = BridgeProcess::spawn_multi_root(
+        &["shellscript:bash-language-server start"],
+        &[root_a, root_b],
+    )?;
+    bridge.initialize()?;
+
+    // Give LSP time to index
+    std::thread::sleep(Duration::from_secs(1));
+
+    // find_symbol should locate alpha_func from root A
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 700,
+        "method": "tools/call",
+        "params": {
+            "name": "find_symbol",
+            "arguments": { "query": "alpha_func" }
+        }
+    }))?;
+
+    let response_a = bridge.recv()?;
+    let result_a = &response_a["result"];
+    assert!(
+        result_a["isError"].is_null() || result_a["isError"] == false,
+        "find_symbol for alpha_func failed: {response_a:?}"
+    );
+    let text_a = result_a["content"][0]["text"]
+        .as_str()
+        .context("Missing text for alpha_func")?;
+    assert!(
+        text_a.contains("alpha_func"),
+        "Expected to find alpha_func, got: {text_a}"
+    );
+
+    // find_symbol should locate beta_func from root B
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 701,
+        "method": "tools/call",
+        "params": {
+            "name": "find_symbol",
+            "arguments": { "query": "beta_func" }
+        }
+    }))?;
+
+    let response_b = bridge.recv()?;
+    let result_b = &response_b["result"];
+    assert!(
+        result_b["isError"].is_null() || result_b["isError"] == false,
+        "find_symbol for beta_func failed: {response_b:?}"
+    );
+    let text_b = result_b["content"][0]["text"]
+        .as_str()
+        .context("Missing text for beta_func")?;
+    assert!(
+        text_b.contains("beta_func"),
+        "Expected to find beta_func, got: {text_b}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_multi_root_definition() -> Result<()> {
+    require_bash_lsp!();
+
+    // Create two roots, each with a function definition and a call
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    let script_a = dir_a.path().join("defs_a.sh");
+    std::fs::write(
+        &script_a,
+        "#!/bin/bash\nfunction greet_a() { echo hi; }\ngreet_a\n",
+    )?;
+
+    let script_b = dir_b.path().join("defs_b.sh");
+    std::fs::write(
+        &script_b,
+        "#!/bin/bash\nfunction greet_b() { echo hi; }\ngreet_b\n",
+    )?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    let mut bridge = BridgeProcess::spawn_multi_root(
+        &["shellscript:bash-language-server start"],
+        &[root_a, root_b],
+    )?;
+    bridge.initialize()?;
+
+    // Go to definition of greet_a call in root A (line 2, char 0)
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 710,
+        "method": "tools/call",
+        "params": {
+            "name": "definition",
+            "arguments": {
+                "file": script_a.to_str().context("Invalid script A path")?,
+                "line": 2,
+                "character": 0
+            }
+        }
+    }))?;
+
+    let response_a = bridge.recv()?;
+    let result_a = &response_a["result"];
+    assert!(
+        result_a["isError"].is_null() || result_a["isError"] == false,
+        "Definition in root A failed: {response_a:?}"
+    );
+    let text_a = result_a["content"][0]["text"]
+        .as_str()
+        .context("Missing text for definition A")?;
+    assert!(
+        text_a.contains("defs_a.sh"),
+        "Definition should point to defs_a.sh, got: {text_a}"
+    );
+
+    // Go to definition of greet_b call in root B (line 2, char 0)
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 711,
+        "method": "tools/call",
+        "params": {
+            "name": "definition",
+            "arguments": {
+                "file": script_b.to_str().context("Invalid script B path")?,
+                "line": 2,
+                "character": 0
+            }
+        }
+    }))?;
+
+    let response_b = bridge.recv()?;
+    let result_b = &response_b["result"];
+    assert!(
+        result_b["isError"].is_null() || result_b["isError"] == false,
+        "Definition in root B failed: {response_b:?}"
+    );
+    let text_b = result_b["content"][0]["text"]
+        .as_str()
+        .context("Missing text for definition B")?;
+    assert!(
+        text_b.contains("defs_b.sh"),
+        "Definition should point to defs_b.sh, got: {text_b}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_multi_root_document_symbols() -> Result<()> {
+    require_bash_lsp!();
+
+    // Create two roots with different symbols
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    let script_a = dir_a.path().join("syms_a.sh");
+    std::fs::write(
+        &script_a,
+        "#!/bin/bash\nfunction sym_alpha() { echo a; }\nfunction sym_beta() { echo b; }\n",
+    )?;
+
+    let script_b = dir_b.path().join("syms_b.sh");
+    std::fs::write(
+        &script_b,
+        "#!/bin/bash\nfunction sym_gamma() { echo c; }\nfunction sym_delta() { echo d; }\n",
+    )?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    let mut bridge = BridgeProcess::spawn_multi_root(
+        &["shellscript:bash-language-server start"],
+        &[root_a, root_b],
+    )?;
+    bridge.initialize()?;
+
+    // Get symbols from root A file
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 720,
+        "method": "tools/call",
+        "params": {
+            "name": "document_symbols",
+            "arguments": {
+                "file": script_a.to_str().context("Invalid script A path")?
+            }
+        }
+    }))?;
+
+    let response_a = bridge.recv()?;
+    let result_a = &response_a["result"];
+    assert!(
+        result_a["isError"].is_null() || result_a["isError"] == false,
+        "Document symbols from root A failed: {response_a:?}"
+    );
+    let text_a = result_a["content"][0]["text"]
+        .as_str()
+        .context("Missing text for symbols A")?;
+    assert!(
+        text_a.contains("sym_alpha"),
+        "Should contain sym_alpha, got: {text_a}"
+    );
+    assert!(
+        text_a.contains("sym_beta"),
+        "Should contain sym_beta, got: {text_a}"
+    );
+
+    // Get symbols from root B file
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 721,
+        "method": "tools/call",
+        "params": {
+            "name": "document_symbols",
+            "arguments": {
+                "file": script_b.to_str().context("Invalid script B path")?
+            }
+        }
+    }))?;
+
+    let response_b = bridge.recv()?;
+    let result_b = &response_b["result"];
+    assert!(
+        result_b["isError"].is_null() || result_b["isError"] == false,
+        "Document symbols from root B failed: {response_b:?}"
+    );
+    let text_b = result_b["content"][0]["text"]
+        .as_str()
+        .context("Missing text for symbols B")?;
+    assert!(
+        text_b.contains("sym_gamma"),
+        "Should contain sym_gamma, got: {text_b}"
+    );
+    assert!(
+        text_b.contains("sym_delta"),
+        "Should contain sym_delta, got: {text_b}"
+    );
+
+    Ok(())
+}
+
+// ─── roots/list tests ───────────────────────────────────────────────────
+
+#[test]
+fn test_roots_list_after_initialize() -> Result<()> {
+    require_bash_lsp!();
+
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp")?;
+
+    // Initialize with roots capability — this validates the full round-trip:
+    // initialize → notifications/initialized → server sends roots/list →
+    // client responds → server applies roots
+    bridge.initialize_with_roots(&["/tmp"])?;
+
+    // Verify the server is still functional after roots exchange
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 100,
+        "method": "ping"
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response.get("result").is_some(),
+        "Ping should succeed after roots exchange"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_roots_list_changed_notification() -> Result<()> {
+    require_bash_lsp!();
+
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp")?;
+
+    // Initialize with roots capability
+    bridge.initialize_with_roots(&["/tmp"])?;
+
+    // Send roots/list_changed notification — server should send another roots/list request
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed"
+    }))?;
+
+    // Read the roots/list request
+    let roots_request = bridge.recv()?;
+    let method = roots_request
+        .get("method")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| anyhow!("Expected roots/list request, got: {roots_request:?}"))?;
+    assert_eq!(method, "roots/list", "Server should re-fetch roots");
+
+    let request_id = roots_request
+        .get("id")
+        .ok_or_else(|| anyhow!("roots/list request missing id"))?
+        .clone();
+
+    // Respond with updated roots
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "roots": [
+                {"uri": "file:///tmp", "name": "tmp"},
+                {"uri": "file:///var", "name": "var"}
+            ]
+        }
+    }))?;
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Verify still functional
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 200,
+        "method": "ping"
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response.get("result").is_some(),
+        "Ping should succeed after roots update"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_no_roots_request_without_capability() -> Result<()> {
+    require_bash_lsp!();
+
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], "/tmp")?;
+
+    // Initialize WITHOUT roots capability
+    bridge.initialize()?;
+
+    // Send a ping immediately — if the server had sent a roots/list request,
+    // we'd read that instead of the ping response
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 300,
+        "method": "ping"
+    }))?;
+
+    let response = bridge.recv()?;
+
+    // This should be the ping response, not a roots/list request
+    let id = response
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("Expected ping response, got: {response:?}"))?;
+    assert_eq!(id, 300, "Should receive ping response, not roots/list");
+    assert!(response.get("result").is_some());
+
     Ok(())
 }

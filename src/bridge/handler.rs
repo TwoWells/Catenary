@@ -772,10 +772,12 @@ impl LspBridgeHandler {
     fn find_symbol_fallback(&self, query: &str) -> CallToolResult {
         const MAX_FILES: usize = 20;
 
+        let roots = self.runtime.block_on(self.client_manager.roots());
+
         // Try ripgrep first
-        let files = Self::ripgrep_search(query).unwrap_or_else(|_| {
+        let files = Self::ripgrep_search(query, &roots).unwrap_or_else(|_| {
             // Fallback to manual search if rg not available
-            Self::manual_file_search(query).unwrap_or_default()
+            Self::manual_file_search(query, &roots)
         });
 
         if files.is_empty() {
@@ -803,20 +805,26 @@ impl LspBridgeHandler {
         }
     }
 
-    /// Use ripgrep to find files containing the query.
-    fn ripgrep_search(query: &str) -> Result<Vec<std::path::PathBuf>> {
+    /// Use ripgrep to find files containing the query across workspace roots.
+    fn ripgrep_search(query: &str, roots: &[PathBuf]) -> Result<Vec<std::path::PathBuf>> {
         use std::process::Command;
 
-        let output = Command::new("rg")
-            .args([
-                "--files-with-matches",
-                "--ignore-case",
-                "--type-add",
-                "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,cs,rb,php,swift,kt,scala,lua,sh,bash,zsh}",
-                "--type",
-                "code",
-                query,
-            ])
+        let mut cmd = Command::new("rg");
+        cmd.args([
+            "--files-with-matches",
+            "--ignore-case",
+            "--type-add",
+            "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,cs,rb,php,swift,kt,scala,lua,sh,bash,zsh}",
+            "--type",
+            "code",
+            query,
+        ]);
+
+        for root in roots {
+            cmd.arg(root);
+        }
+
+        let output = cmd
             .output()
             .map_err(|e| anyhow!("Failed to run ripgrep: {e}"))?;
 
@@ -833,12 +841,18 @@ impl LspBridgeHandler {
     }
 
     /// Manual file search fallback when ripgrep is not available.
-    fn manual_file_search(query: &str) -> Result<Vec<std::path::PathBuf>> {
-        let cwd = std::env::current_dir()?;
+    fn manual_file_search(query: &str, roots: &[PathBuf]) -> Vec<std::path::PathBuf> {
         let query_lower = query.to_lowercase();
         let mut matches = Vec::new();
 
-        let walker = WalkBuilder::new(&cwd)
+        let mut builder = WalkBuilder::new(roots.first().map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Clone::clone,
+        ));
+        for root in roots.iter().skip(1) {
+            builder.add(root);
+        }
+        let walker = builder
             .hidden(true)
             .git_ignore(true)
             .max_depth(Some(10))
@@ -887,7 +901,7 @@ impl LspBridgeHandler {
             }
         }
 
-        Ok(matches)
+        matches
     }
 
     /// Get document symbols from a file that match the query.
@@ -1515,53 +1529,89 @@ impl LspBridgeHandler {
             depth: usize,
             is_dir: bool,
             symbols: Option<String>,
+            display_name: Option<String>,
         }
         let input: CodebaseMapInput =
             serde_json::from_value(arguments.unwrap_or_else(|| serde_json::json!({})))
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let root_path = if let Some(p) = &input.path {
-            Self::resolve_path(p)?
+        let root_paths: Vec<PathBuf> = if let Some(p) = &input.path {
+            vec![Self::resolve_path(p)?]
         } else {
-            std::env::current_dir()?
+            let roots = self.runtime.block_on(self.client_manager.roots());
+            if roots.is_empty() {
+                vec![std::env::current_dir()?]
+            } else {
+                roots
+            }
         };
+        let multi_root = root_paths.len() > 1;
 
         debug!(
-            "Codebase map request: path={:?} depth={} symbols={}",
-            root_path, input.max_depth, input.include_symbols
+            "Codebase map request: paths={:?} depth={} symbols={}",
+            root_paths, input.max_depth, input.include_symbols
         );
 
         // 1. Walk Directory and collect entries
-        let walker = WalkBuilder::new(&root_path)
-            .max_depth(Some(input.max_depth))
-            .git_ignore(true)
-            .hidden(true)
-            .build();
-
         let mut entries = Vec::new();
 
-        for result in walker {
-            match result {
-                Ok(entry) => {
-                    let path = entry.path();
-                    if path == root_path {
-                        continue;
-                    } // Skip root itself
+        for root_path in &root_paths {
+            // For multi-root, add the root itself as a top-level directory entry
+            let root_prefix = if multi_root {
+                root_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            } else {
+                None
+            };
 
-                    let rel_path = path.strip_prefix(&root_path).unwrap_or(path);
-                    let depth = rel_path.components().count();
-                    let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            let walker = WalkBuilder::new(root_path)
+                .max_depth(Some(input.max_depth))
+                .git_ignore(true)
+                .hidden(true)
+                .build();
 
-                    entries.push(MapEntry {
-                        path: path.to_path_buf(),
-                        depth,
-                        is_dir,
-                        symbols: None,
-                    });
+            // Add a virtual root entry for multi-root display
+            if let Some(ref name) = root_prefix {
+                entries.push(MapEntry {
+                    path: root_path.clone(),
+                    depth: 1,
+                    is_dir: true,
+                    symbols: None,
+                    display_name: Some(format!("{name}/")),
+                });
+            }
+
+            for result in walker {
+                match result {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path == root_path {
+                            continue;
+                        } // Skip root itself
+
+                        let rel_path = path.strip_prefix(root_path).unwrap_or(path);
+                        let depth = rel_path.components().count();
+                        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+
+                        // In multi-root mode, add 1 to depth for nesting under root name
+                        let adjusted_depth = if multi_root { depth + 1 } else { depth };
+
+                        entries.push(MapEntry {
+                            path: path.to_path_buf(),
+                            depth: adjusted_depth,
+                            is_dir,
+                            symbols: None,
+                            display_name: None,
+                        });
+                    }
+                    Err(err) => warn!("Error walking directory: {}", err),
                 }
-                Err(err) => warn!("Error walking directory: {}", err),
             }
         }
+
+        // Pick the first root for relative path display in single-root mode
+        let primary_root = root_paths.first().cloned().unwrap_or_default();
 
         // 2. Fetch Symbols (Async Phase)
         if input.include_symbols {
@@ -1629,11 +1679,25 @@ impl LspBridgeHandler {
 
             // Indentation
             let indent = "  ".repeat(entry.depth - 1);
-            let rel_path = entry.path.strip_prefix(&root_path).unwrap_or(&entry.path);
-            let name = rel_path.file_name().unwrap_or_default().to_string_lossy();
-            let marker = if entry.is_dir { "/" } else { "" };
 
-            let _ = writeln!(output, "{indent}{name}{marker}");
+            let display = if let Some(ref name) = entry.display_name {
+                name.clone()
+            } else {
+                // Find the matching root for this entry to compute relative path
+                let matching_root = root_paths
+                    .iter()
+                    .find(|r| entry.path.starts_with(r))
+                    .unwrap_or(&primary_root);
+                let rel_path = entry
+                    .path
+                    .strip_prefix(matching_root)
+                    .unwrap_or(&entry.path);
+                let name = rel_path.file_name().unwrap_or_default().to_string_lossy();
+                let marker = if entry.is_dir { "/" } else { "" };
+                format!("{name}{marker}")
+            };
+
+            let _ = writeln!(output, "{indent}{display}");
             line_count += 1;
 
             if let Some(symbols) = &entry.symbols {

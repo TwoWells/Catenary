@@ -17,6 +17,8 @@
 
 - [🛠️ Language Servers](lsp/README.md)
 - [🤖 AI Agents](ai-agents.md)
+- [🛡️ LSP Fault Model](lsp-fault-model.md)
+- [🔴 Adversarial Testing](adversarial-testing.md)
 - [🗺️ Roadmap](roadmap.md)
 
 ---

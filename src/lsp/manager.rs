@@ -17,7 +17,7 @@
 
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -30,7 +30,7 @@ use crate::session::EventBroadcaster;
 /// Manages the lifecycle of LSP clients (lazy spawning, caching, shutdown).
 pub struct ClientManager {
     config: Config,
-    root: PathBuf,
+    roots: Mutex<Vec<PathBuf>>,
     active_clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
     broadcaster: EventBroadcaster,
 }
@@ -38,13 +38,181 @@ pub struct ClientManager {
 impl ClientManager {
     /// Creates a new `ClientManager`.
     #[must_use]
-    pub fn new(config: Config, root: PathBuf, broadcaster: EventBroadcaster) -> Self {
+    pub fn new(config: Config, roots: Vec<PathBuf>, broadcaster: EventBroadcaster) -> Self {
         Self {
             config,
-            root,
+            roots: Mutex::new(roots),
             active_clients: Mutex::new(HashMap::new()),
             broadcaster,
         }
+    }
+
+    /// Returns the current workspace roots.
+    pub async fn roots(&self) -> Vec<PathBuf> {
+        self.roots.lock().await.clone()
+    }
+
+    /// Adds a new workspace root and notifies all active LSP clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root path cannot be converted to a valid URI.
+    pub async fn add_root(&self, root: PathBuf) -> Result<()> {
+        let uri: lsp_types::Uri = format!("file://{}", root.display())
+            .parse()
+            .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
+
+        let folder = lsp_types::WorkspaceFolder {
+            uri,
+            name: root.file_name().map_or_else(
+                || "workspace".to_string(),
+                |s| s.to_string_lossy().to_string(),
+            ),
+        };
+
+        self.roots.lock().await.push(root);
+
+        // Notify all active clients
+        let clients = self.active_clients.lock().await.clone();
+        for (lang, client_mutex) in clients {
+            let client = client_mutex.lock().await;
+            if client.is_alive()
+                && let Err(e) = client
+                    .did_change_workspace_folders(vec![folder.clone()], vec![])
+                    .await
+            {
+                warn!(
+                    "Failed to notify {} server about new workspace folder: {}",
+                    lang, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Removes a workspace root and notifies all active LSP clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root path cannot be converted to a valid URI.
+    pub async fn remove_root(&self, root: &Path) -> Result<()> {
+        let uri: lsp_types::Uri = format!("file://{}", root.display())
+            .parse()
+            .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
+
+        let folder = lsp_types::WorkspaceFolder {
+            uri,
+            name: root.file_name().map_or_else(
+                || "workspace".to_string(),
+                |s| s.to_string_lossy().to_string(),
+            ),
+        };
+
+        self.roots.lock().await.retain(|r| r != root);
+
+        // Notify all active clients
+        let clients = self.active_clients.lock().await.clone();
+        for (lang, client_mutex) in clients {
+            let client = client_mutex.lock().await;
+            if client.is_alive()
+                && let Err(e) = client
+                    .did_change_workspace_folders(vec![], vec![folder.clone()])
+                    .await
+            {
+                warn!(
+                    "Failed to notify {} server about removed workspace folder: {}",
+                    lang, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Synchronizes workspace roots with a new set.
+    ///
+    /// Diffs against current roots: adds new ones, removes stale ones.
+    /// Sends a single `didChangeWorkspaceFolders` notification per client
+    /// with both additions and removals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any root path cannot be converted to a valid URI.
+    pub async fn sync_roots(&self, new_roots: Vec<PathBuf>) -> Result<()> {
+        let current_roots = self.roots.lock().await.clone();
+
+        let to_add: Vec<&PathBuf> = new_roots
+            .iter()
+            .filter(|r| !current_roots.contains(r))
+            .collect();
+        let to_remove: Vec<&PathBuf> = current_roots
+            .iter()
+            .filter(|r| !new_roots.contains(r))
+            .collect();
+
+        if to_add.is_empty() && to_remove.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Syncing roots: {} added, {} removed",
+            to_add.len(),
+            to_remove.len()
+        );
+
+        let added_folders = to_add
+            .iter()
+            .map(|root| {
+                let uri: lsp_types::Uri = format!("file://{}", root.display())
+                    .parse()
+                    .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
+                Ok(lsp_types::WorkspaceFolder {
+                    uri,
+                    name: root.file_name().map_or_else(
+                        || "workspace".to_string(),
+                        |s| s.to_string_lossy().to_string(),
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let removed_folders = to_remove
+            .iter()
+            .map(|root| {
+                let uri: lsp_types::Uri = format!("file://{}", root.display())
+                    .parse()
+                    .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
+                Ok(lsp_types::WorkspaceFolder {
+                    uri,
+                    name: root.file_name().map_or_else(
+                        || "workspace".to_string(),
+                        |s| s.to_string_lossy().to_string(),
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Update internal state
+        *self.roots.lock().await = new_roots;
+
+        // Notify all active clients
+        let clients = self.active_clients.lock().await.clone();
+        for (lang, client_mutex) in clients {
+            let client = client_mutex.lock().await;
+            if client.is_alive()
+                && let Err(e) = client
+                    .did_change_workspace_folders(added_folders.clone(), removed_folders.clone())
+                    .await
+            {
+                warn!(
+                    "Failed to notify {} server about workspace folder changes: {}",
+                    lang, e
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Gets an active client for the given language, spawning it if necessary.
@@ -97,7 +265,8 @@ impl ClientManager {
 
         // Initialize
         // TODO: Pass initialization options from config when supported
-        client.initialize(&self.root).await?;
+        let roots = self.roots.lock().await.clone();
+        client.initialize(&roots).await?;
 
         let client_mutex = Arc::new(Mutex::new(client));
         clients.insert(lang.to_string(), client_mutex.clone());
@@ -151,5 +320,126 @@ impl ClientManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+
+    fn test_config() -> Config {
+        Config {
+            server: HashMap::new(),
+            idle_timeout: 300,
+            smart_wait: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_roots_returns_initial_roots() -> Result<()> {
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(
+            test_config(),
+            vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
+            broadcaster,
+        );
+
+        let roots = manager.roots().await;
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], PathBuf::from("/tmp/root_a"));
+        assert_eq!(roots[1], PathBuf::from("/tmp/root_b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_root_appends() -> Result<()> {
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(
+            test_config(),
+            vec![PathBuf::from("/tmp/root_a")],
+            broadcaster,
+        );
+
+        assert_eq!(manager.roots().await.len(), 1);
+
+        // add_root with no active clients should succeed silently
+        manager.add_root(PathBuf::from("/tmp/root_b")).await?;
+
+        let roots = manager.roots().await;
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[1], PathBuf::from("/tmp/root_b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_roots_empty_initial() -> Result<()> {
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(test_config(), vec![], broadcaster);
+
+        assert!(manager.roots().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_root() -> Result<()> {
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(
+            test_config(),
+            vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
+            broadcaster,
+        );
+
+        assert_eq!(manager.roots().await.len(), 2);
+
+        manager.remove_root(Path::new("/tmp/root_a")).await?;
+
+        let roots = manager.roots().await;
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], PathBuf::from("/tmp/root_b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sync_roots_adds_and_removes() -> Result<()> {
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(
+            test_config(),
+            vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
+            broadcaster,
+        );
+
+        // Sync: remove /tmp/root_a, keep /tmp/root_b, add /tmp/root_c
+        manager
+            .sync_roots(vec![
+                PathBuf::from("/tmp/root_b"),
+                PathBuf::from("/tmp/root_c"),
+            ])
+            .await?;
+
+        let roots = manager.roots().await;
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], PathBuf::from("/tmp/root_b"));
+        assert_eq!(roots[1], PathBuf::from("/tmp/root_c"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sync_roots_no_change() -> Result<()> {
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(
+            test_config(),
+            vec![PathBuf::from("/tmp/root_a")],
+            broadcaster,
+        );
+
+        manager
+            .sync_roots(vec![PathBuf::from("/tmp/root_a")])
+            .await?;
+
+        let roots = manager.roots().await;
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], PathBuf::from("/tmp/root_a"));
+        Ok(())
     }
 }
