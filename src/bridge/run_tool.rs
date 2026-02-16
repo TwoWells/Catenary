@@ -28,7 +28,7 @@ use ignore::WalkBuilder;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::config::RunToolConfig;
@@ -48,13 +48,21 @@ const LANGUAGE_SCAN_DEPTH: usize = 2;
 /// Input for the `run` tool.
 #[derive(Debug, Deserialize)]
 pub struct RunInput {
-    /// The command to execute (binary name, not a shell expression).
+    /// The command to execute. Accepts a binary name (e.g., `"cargo"`) or a
+    /// single string with arguments (e.g., `"cargo test --lib"`).
     pub command: String,
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Timeout in seconds (default: 120).
-    pub timeout: Option<u64>,
+    /// Timeout in seconds (default: 120). Accepts integer or string.
+    pub timeout: Option<serde_json::Value>,
+    /// Working directory for the command. Must be within workspace roots.
+    pub cwd: Option<String>,
+    /// Content to pipe to the process's standard input.
+    pub stdin: Option<String>,
+    /// Capture stdout to a file instead of returning it inline.
+    /// Path must be within workspace roots.
+    pub output_file: Option<String>,
 }
 
 /// Output from a command execution.
@@ -225,24 +233,46 @@ impl RunToolManager {
         command: &str,
         args: &[String],
         timeout_secs: Option<u64>,
+        cwd: Option<&Path>,
+        stdin_content: Option<&str>,
     ) -> Result<RunOutput> {
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
-        let cwd = self
-            .roots
-            .first()
-            .cloned()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let cwd = cwd.map_or_else(
+            || {
+                self.roots.first().cloned().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                })
+            },
+            Path::to_path_buf,
+        );
 
         debug!("Executing: {} {:?} in {:?}", command, args, cwd);
 
-        let child = tokio::process::Command::new(command)
+        let stdin_cfg = if stdin_content.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        };
+
+        let mut child = tokio::process::Command::new(command)
             .args(args)
             .current_dir(&cwd)
+            .stdin(stdin_cfg)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn command '{command}': {e}"))?;
+
+        if let Some(content) = stdin_content
+            && let Some(mut pipe) = child.stdin.take()
+        {
+            use tokio::io::AsyncWriteExt;
+            pipe.write_all(content.as_bytes())
+                .await
+                .map_err(|e| anyhow!("Failed to write to stdin: {e}"))?;
+            // Drop the pipe to close stdin
+        }
 
         match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(output)) => {
@@ -313,6 +343,19 @@ fn extension_to_language(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Parses a timeout value from JSON, accepting both integer and string types.
+fn parse_timeout(value: &serde_json::Value) -> Result<u64> {
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| anyhow!("timeout must be a positive integer")),
+        serde_json::Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|_| anyhow!("timeout must be a positive integer, got '{s}'")),
+        _ => Err(anyhow!("timeout must be an integer or string")),
+    }
+}
+
 impl LspBridgeHandler {
     /// Handles the `run` tool call.
     pub(super) fn handle_run(
@@ -323,20 +366,80 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        debug!("run: {} {:?}", input.command, input.args);
+        // Split command string if it contains spaces (e.g., "cargo test --lib")
+        let (command, args) = if input.command.contains(' ') {
+            let mut parts = input.command.split_whitespace();
+            let cmd = parts.next().unwrap_or_default().to_string();
+            let mut split_args: Vec<String> = parts.map(String::from).collect();
+            split_args.extend(input.args);
+            (cmd, split_args)
+        } else {
+            (input.command, input.args)
+        };
+
+        // Coerce timeout from string or integer
+        let timeout_secs = input.timeout.as_ref().map(parse_timeout).transpose()?;
+
+        debug!("run: {} {:?}", command, args);
 
         let run_tool = self
             .run_tool
             .as_ref()
             .ok_or_else(|| anyhow!("run tool is not configured"))?;
 
+        // Validate and resolve cwd
+        let cwd = if let Some(ref cwd_str) = input.cwd {
+            let cwd_path = Self::resolve_path(cwd_str)?;
+            let canonical = self
+                .runtime
+                .block_on(self.path_validator.read())
+                .validate_read(&cwd_path)?;
+            if !canonical.is_dir() {
+                return Err(anyhow!("cwd is not a directory: {cwd_str}"));
+            }
+            Some(canonical)
+        } else {
+            None
+        };
+
         let output = self.runtime.block_on(async {
             let manager = run_tool.read().await;
-            manager.validate_command(&input.command)?;
+            manager.validate_command(&command)?;
             manager
-                .execute(&input.command, &input.args, input.timeout)
+                .execute(
+                    &command,
+                    &args,
+                    timeout_secs,
+                    cwd.as_deref(),
+                    input.stdin.as_deref(),
+                )
                 .await
         })?;
+
+        // Handle output_file: write stdout to file if requested
+        let stdout_text = if let Some(ref output_path) = input.output_file {
+            let path = Self::resolve_path(output_path)?;
+            let canonical = self
+                .runtime
+                .block_on(self.path_validator.read())
+                .validate_write(&path)?;
+
+            if let Some(parent) = canonical.parent() {
+                self.runtime
+                    .block_on(tokio::fs::create_dir_all(parent))
+                    .map_err(|e| anyhow!("Failed to create parent directories: {e}"))?;
+            }
+
+            let byte_count = output.stdout.len();
+            self.runtime
+                .block_on(tokio::fs::write(&canonical, &output.stdout))
+                .map_err(|e| anyhow!("Failed to write output file: {e}"))?;
+
+            let rel_path = self.relative_display_path(&canonical);
+            format!("Output written to {rel_path} ({byte_count} bytes)")
+        } else {
+            output.stdout.clone()
+        };
 
         let mut result = String::new();
 
@@ -348,8 +451,8 @@ impl LspBridgeHandler {
             let _ = writeln!(result, "Exit code: {code}");
         }
 
-        if !output.stdout.is_empty() {
-            let _ = writeln!(result, "\n{}", output.stdout);
+        if !stdout_text.is_empty() {
+            let _ = writeln!(result, "\n{stdout_text}");
         }
 
         if !output.stderr.is_empty() {
@@ -497,7 +600,7 @@ mod tests {
         let manager = RunToolManager::new(&config, &[]);
 
         let output = manager
-            .execute("echo", &["hello".to_string()], Some(5))
+            .execute("echo", &["hello".to_string()], Some(5), None, None)
             .await
             .unwrap();
 
@@ -512,11 +615,70 @@ mod tests {
         let manager = RunToolManager::new(&config, &[]);
 
         let output = manager
-            .execute("sleep", &["10".to_string()], Some(1))
+            .execute("sleep", &["10".to_string()], Some(1), None, None)
             .await
             .unwrap();
 
         assert!(output.timed_out);
         assert!(output.exit_code.is_none());
+    }
+
+    #[test]
+    fn test_parse_timeout_integer() {
+        let val = serde_json::json!(60);
+        assert_eq!(parse_timeout(&val).unwrap(), 60);
+    }
+
+    #[test]
+    fn test_parse_timeout_string() {
+        let val = serde_json::json!("120");
+        assert_eq!(parse_timeout(&val).unwrap(), 120);
+    }
+
+    #[test]
+    fn test_parse_timeout_invalid_string() {
+        let val = serde_json::json!("abc");
+        assert!(parse_timeout(&val).is_err());
+    }
+
+    #[test]
+    fn test_parse_timeout_negative() {
+        let val = serde_json::json!(-5);
+        assert!(parse_timeout(&val).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_cwd() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(&["pwd"], &[]);
+        let manager = RunToolManager::new(&config, &[]);
+
+        let output = manager
+            .execute("pwd", &[], Some(5), Some(dir.path()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        let canonical = dir.path().canonicalize().unwrap();
+        assert!(
+            output.stdout.trim() == canonical.to_string_lossy(),
+            "Expected cwd {:?}, got {:?}",
+            canonical,
+            output.stdout.trim()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_stdin() {
+        let config = make_config(&["cat"], &[]);
+        let manager = RunToolManager::new(&config, &[]);
+
+        let output = manager
+            .execute("cat", &[], Some(5), None, Some("hello from stdin"))
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "hello from stdin");
     }
 }

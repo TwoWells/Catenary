@@ -2060,13 +2060,16 @@ impl ToolHandler for LspBridgeHandler {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "The command to execute (binary name, e.g., 'git', 'cargo')" },
+                        "cwd": { "type": "string", "description": "Working directory for the command (must be within workspace roots)" },
+                        "command": { "type": "string", "description": "The command to execute (e.g., 'cargo' or 'cargo test --lib')" },
                         "args": {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Arguments to pass to the command"
                         },
-                        "timeout": { "type": "integer", "description": "Timeout in seconds (default: 120)" }
+                        "stdin": { "type": "string", "description": "Content to pipe to the process's standard input" },
+                        "timeout": { "type": ["integer", "string"], "description": "Timeout in seconds (default: 120)" },
+                        "output_file": { "type": "string", "description": "Capture stdout to a file instead of returning it inline (path must be within workspace roots)" }
                     },
                     "required": ["command"]
                 }),

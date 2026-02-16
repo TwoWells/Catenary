@@ -457,7 +457,7 @@ impl LspBridgeHandler {
     }
 
     /// Returns a display-friendly relative path against workspace roots.
-    fn relative_display_path(&self, path: &Path) -> String {
+    pub(super) fn relative_display_path(&self, path: &Path) -> String {
         let roots = self.runtime.block_on(self.client_manager.roots());
         for root in &roots {
             if let Ok(relative) = path.strip_prefix(root) {
