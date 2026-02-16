@@ -4,6 +4,7 @@ This file serves as the single point of truth for AI agents (Claude, Gemini, etc
 
 ## Project Grounding
 - **Project Goal:** High-performance multiplexing bridge between MCP and LSP.
+- **Repository:** `MarkWells-Dev/Catenary` on GitHub.
 - **Config:** `@./Cargo.toml`
 - **Dependency Policy:** `@./deny.toml`
 - **Documentation:** `docs/src/`

@@ -1,9 +1,10 @@
-/target
+target/
 /docs/book
 *.swp
 *.swo
 *~
 .DS_Store
+.plans/
 .idea/
 .vscode/
 *.log
