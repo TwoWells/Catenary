@@ -454,6 +454,8 @@ impl TailReader {
     ///
     /// Returns an error if reading from the file fails.
     pub fn next_event(&mut self) -> Result<Option<SessionEvent>> {
+        use std::io::Seek;
+
         loop {
             let mut line = String::new();
             let bytes_read = self.reader.read_line(&mut line)?;
@@ -475,6 +477,13 @@ impl TailReader {
                         self.last_size = 0;
                         continue;
                     }
+
+                    if metadata.len() > self.last_size {
+                        // File grew — reset BufReader's EOF state so
+                        // it reads new data on the next iteration.
+                        self.reader.stream_position()?;
+                    }
+
                     self.last_size = metadata.len();
                 } else {
                     // File was deleted, session ended
