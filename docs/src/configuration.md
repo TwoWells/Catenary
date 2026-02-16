@@ -154,6 +154,18 @@ allowed = ["python", "pytest", "uv"]
 allowed = ["cargo"]
 ```
 
+**Recommended base allowlist for constrained mode:**
+
+```toml
+[tools.run]
+allowed = ["chmod", "cp", "diff", "git", "gh", "ln", "make", "mkdir", "mv", "rm", "rmdir", "touch", "wc"]
+```
+
+This covers file management, version control, and basic utilities without
+opening up arbitrary shell access. Avoid adding commands that can write
+arbitrary content to stdout (`cat`, `echo`, `printf`, `bash`) — these bypass
+Catenary's file tools and their path validation.
+
 **Key behaviors:**
 
 - Commands not on the allowlist are **rejected** with an error showing the
