@@ -6,8 +6,12 @@ text-based file scanning.
 
 ## System Prompt
 
-Consider adding some or all of the following to your system prompt (e.g.,
-`CLAUDE.md`, `GEMINI.md`, `.github/copilot-instructions.md`):
+In **constrained mode** (built-in file/shell tools disabled), the agent has no
+choice but to use Catenary's LSP tools — no system prompt changes are needed.
+
+If Catenary is running **alongside built-in tools**, agents will default to
+what they were trained on (reading files, grepping). Adding the following to
+your system prompt nudges them toward LSP queries instead:
 
 ```
 ## Catenary (LSP Tools)
@@ -155,3 +159,52 @@ A single file read can cost as much as 10-20 targeted LSP queries.
 
 6. **Edit with feedback.** Use `edit_file` and `write_file` — they return LSP
    diagnostics automatically, so you immediately see any errors introduced.
+
+## Display Hooks
+
+Catenary's `edit_file` and `write_file` tools pass raw JSON parameters to the
+CLI, which can be hard to review. The bundled hook script formats these as
+colorized diffs and previews.
+
+### Claude Code
+
+Copy the script and make it executable:
+
+```bash
+mkdir -p ~/.claude/hooks
+cp .claude-plugin/plugins/catenary/hooks/format_tool_output.py ~/.claude/hooks/
+chmod +x ~/.claude/hooks/format_tool_output.py
+```
+
+Add to `~/.claude/settings.json` (all projects) or `.claude/settings.json`
+(single project):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*__edit_file|mcp__.*__write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/format_tool_output.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Gemini CLI
+
+Not currently supported. Gemini CLI's `BeforeTool` hook fires *after* the user
+approves the tool call, so there's no way to show a formatted diff in the
+approval prompt. The hook output only appears in the debug console, not the
+main UI.
+
+### What you get
+
+- **edit_file**: colorized unified diff (red = removed, green = added)
+- **write_file**: file header with line count and first 30 lines numbered
