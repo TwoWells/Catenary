@@ -335,16 +335,24 @@ impl<H: ToolHandler> McpServer<H> {
         }
 
         let result = InitializeResult {
-            protocol_version: "2024-11-05".to_string(),
+            protocol_version: params.protocol_version.clone(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(true),
                 }),
             },
             server_info: ServerInfo {
-                name: "tool".to_string(),
+                name: "catenary".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             },
+            instructions: Some(
+                "Catenary is a multiplexing bridge between MCP and LSP servers. \
+                 Use its tools to navigate and edit code via language intelligence: \
+                 hover for type info, definition/references for navigation, \
+                 diagnostics for errors, completion for suggestions, \
+                 and file read/write/edit for code changes."
+                    .to_string(),
+            ),
         };
 
         Ok(Response::success(request.id, result)?)
@@ -569,7 +577,9 @@ mod tests {
 
         let result: InitializeResult =
             serde_json::from_value(response.result.context("missing result")?)?;
-        assert_eq!(result.server_info.name, "tool");
+        assert_eq!(result.server_info.name, "catenary");
+        assert_eq!(result.protocol_version, "2024-11-05");
+        assert!(result.instructions.is_some());
         Ok(())
     }
 

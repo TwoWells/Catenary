@@ -34,7 +34,7 @@ pub struct Request {
     /// The method name.
     pub method: String,
     /// The request parameters.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
 
@@ -50,7 +50,7 @@ pub struct Notification {
     /// The method name.
     pub method: String,
     /// The notification parameters.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
 
@@ -186,6 +186,9 @@ pub struct InitializeResult {
     pub capabilities: ServerCapabilities,
     /// Information about the server.
     pub server_info: ServerInfo,
+    /// Optional instructions for the client on how to use this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 /// MCP server capabilities.
@@ -336,14 +339,15 @@ mod tests {
                 tools: Some(ToolsCapability { list_changed: None }),
             },
             server_info: ServerInfo {
-                name: "tool".to_string(),
+                name: "catenary".to_string(),
                 version: Some("0.1.0".to_string()),
             },
+            instructions: None,
         };
 
         let json = serde_json::to_string(&result)?;
         assert!(json.contains("protocolVersion"));
-        assert!(json.contains("tool"));
+        assert!(json.contains("catenary"));
         Ok(())
     }
 
@@ -417,6 +421,37 @@ mod tests {
         let json = serde_json::to_string(&req)?;
         assert!(json.contains("roots/list"));
         assert!(json.contains("catenary-0"));
+        Ok(())
+    }
+
+    /// Regression: the MCP TypeScript SDK rejects `"params": null` with a
+    /// ZodError ("expected object, received null"). Requests and notifications
+    /// with no params must omit the field entirely instead of serializing null.
+    #[test]
+    fn test_none_params_omitted_not_null() -> Result<()> {
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::String("catenary-0".to_string()),
+            method: "roots/list".to_string(),
+            params: None,
+        };
+        let json = serde_json::to_string(&req)?;
+        assert!(
+            !json.contains("params"),
+            "Request with params: None must omit the field, got: {json}"
+        );
+
+        let notification = Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/tools/list_changed".to_string(),
+            params: None,
+        };
+        let json = serde_json::to_string(&notification)?;
+        assert!(
+            !json.contains("params"),
+            "Notification with params: None must omit the field, got: {json}"
+        );
+
         Ok(())
     }
 
