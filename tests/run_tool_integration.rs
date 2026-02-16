@@ -109,7 +109,7 @@ impl BridgeProcess {
         Ok(())
     }
 
-    fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+    fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": 100,
@@ -127,7 +127,7 @@ impl BridgeProcess {
         Ok(result)
     }
 
-    fn call_tool_text(&mut self, name: &str, args: Value) -> Result<String> {
+    fn call_tool_text(&mut self, name: &str, args: &Value) -> Result<String> {
         let result = self.call_tool(name, args)?;
         let content = result
             .get("content")
@@ -162,7 +162,7 @@ allowed = ["echo"]
 
     let text = bridge.call_tool_text(
         "run",
-        json!({ "command": "echo", "args": ["hello", "world"] }),
+        &json!({ "command": "echo", "args": ["hello", "world"] }),
     )?;
 
     assert!(
@@ -189,9 +189,9 @@ allowed = ["echo"]
     )?;
     bridge.initialize()?;
 
-    let result = bridge.call_tool("run", json!({ "command": "rm", "args": ["-rf", "/"] }))?;
+    let result = bridge.call_tool("run", &json!({ "command": "rm", "args": ["-rf", "/"] }))?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(is_error, Some(true), "Should be an error");
 
     let text = result
@@ -227,7 +227,7 @@ allowed = ["*"]
 
     let text = bridge.call_tool_text(
         "run",
-        json!({ "command": "echo", "args": ["unrestricted"] }),
+        &json!({ "command": "echo", "args": ["unrestricted"] }),
     )?;
 
     assert!(text.contains("unrestricted"), "Should work: {text}");
@@ -282,10 +282,10 @@ allowed = ["sleep"]
 
     let result = bridge.call_tool(
         "run",
-        json!({ "command": "sleep", "args": ["10"], "timeout": 1 }),
+        &json!({ "command": "sleep", "args": ["10"], "timeout": 1 }),
     )?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(is_error, Some(true), "Should be an error (timeout)");
 
     let text = result

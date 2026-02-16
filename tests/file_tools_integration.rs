@@ -1,5 +1,5 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Integration tests for file I/O tools: read_file, write_file, edit_file, list_directory.
+//! Integration tests for file I/O tools: `read_file`, `write_file`, `edit_file`, `list_directory`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -82,7 +82,7 @@ impl BridgeProcess {
         Ok(())
     }
 
-    fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+    fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": 100,
@@ -101,7 +101,7 @@ impl BridgeProcess {
         Ok(result)
     }
 
-    fn call_tool_text(&mut self, name: &str, args: Value) -> Result<String> {
+    fn call_tool_text(&mut self, name: &str, args: &Value) -> Result<String> {
         let result = self.call_tool(name, args)?;
         let content = result
             .get("content")
@@ -133,7 +133,7 @@ fn test_read_file_basic() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "read_file",
-        json!({ "file": file_path.to_string_lossy().to_string() }),
+        &json!({ "file": file_path.to_string_lossy().to_string() }),
     )?;
 
     assert!(text.contains("line one"), "Should contain file content");
@@ -155,7 +155,7 @@ fn test_read_file_with_offset_limit() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "read_file",
-        json!({ "file": file_path.to_string_lossy().to_string(), "offset": 2, "limit": 2 }),
+        &json!({ "file": file_path.to_string_lossy().to_string(), "offset": 2, "limit": 2 }),
     )?;
 
     assert!(text.contains("line 2"), "Should contain line 2");
@@ -172,9 +172,9 @@ fn test_read_file_outside_root_fails() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
-    let result = bridge.call_tool("read_file", json!({ "file": "/etc/hostname" }))?;
+    let result = bridge.call_tool("read_file", &json!({ "file": "/etc/hostname" }))?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(is_error, Some(true), "Should be an error");
 
     let text = result
@@ -201,7 +201,7 @@ fn test_write_file_creates_file() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "write_file",
-        json!({
+        &json!({
             "file": file_path.to_string_lossy().to_string(),
             "content": "hello world\nsecond line\n"
         }),
@@ -228,7 +228,7 @@ fn test_write_file_creates_parent_dirs() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "write_file",
-        json!({
+        &json!({
             "file": file_path.to_string_lossy().to_string(),
             "content": "deep content\n"
         }),
@@ -248,10 +248,10 @@ fn test_write_file_outside_root_fails() -> Result<()> {
 
     let result = bridge.call_tool(
         "write_file",
-        json!({ "file": "/tmp/outside_root.txt", "content": "hack" }),
+        &json!({ "file": "/tmp/outside_root.txt", "content": "hack" }),
     )?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(is_error, Some(true), "Should be an error");
     Ok(())
 }
@@ -267,13 +267,13 @@ fn test_write_file_config_protection() -> Result<()> {
 
     let result = bridge.call_tool(
         "write_file",
-        json!({
+        &json!({
             "file": config_path.to_string_lossy().to_string(),
             "content": "idle_timeout = 0\n"
         }),
     )?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(is_error, Some(true), "Should be an error for config file");
 
     // Verify file was NOT modified
@@ -296,7 +296,7 @@ fn test_edit_file_basic() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "edit_file",
-        json!({
+        &json!({
             "file": file_path.to_string_lossy().to_string(),
             "old_string": "Foo Bar",
             "new_string": "Baz Qux"
@@ -322,14 +322,14 @@ fn test_edit_file_not_found() -> Result<()> {
 
     let result = bridge.call_tool(
         "edit_file",
-        json!({
+        &json!({
             "file": file_path.to_string_lossy().to_string(),
             "old_string": "nonexistent text",
             "new_string": "replacement"
         }),
     )?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(is_error, Some(true), "Should be an error");
     Ok(())
 }
@@ -345,14 +345,14 @@ fn test_edit_file_ambiguous() -> Result<()> {
 
     let result = bridge.call_tool(
         "edit_file",
-        json!({
+        &json!({
             "file": file_path.to_string_lossy().to_string(),
             "old_string": "foo",
             "new_string": "baz"
         }),
     )?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(
         is_error,
         Some(true),
@@ -385,7 +385,7 @@ fn test_list_directory_basic() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "list_directory",
-        json!({ "path": dir.path().to_string_lossy().to_string() }),
+        &json!({ "path": dir.path().to_string_lossy().to_string() }),
     )?;
 
     assert!(text.contains("src/"), "Should list src directory: {text}");
@@ -403,9 +403,9 @@ fn test_list_directory_outside_root_fails() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
-    let result = bridge.call_tool("list_directory", json!({ "path": "/etc" }))?;
+    let result = bridge.call_tool("list_directory", &json!({ "path": "/etc" }))?;
 
-    let is_error = result.get("isError").and_then(|v| v.as_bool());
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
     assert_eq!(is_error, Some(true), "Should be an error");
     Ok(())
 }
@@ -475,7 +475,7 @@ fn test_list_directory_symlink_shown_not_followed() -> Result<()> {
 
     let text = bridge.call_tool_text(
         "list_directory",
-        json!({ "path": dir.path().to_string_lossy().to_string() }),
+        &json!({ "path": dir.path().to_string_lossy().to_string() }),
     )?;
 
     // Symlink should be shown with its target

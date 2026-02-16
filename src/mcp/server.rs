@@ -816,6 +816,7 @@ mod tests {
         assert_eq!(roots[0].name.as_deref(), Some("Project A"));
         assert_eq!(roots[1].uri, "file:///tmp/project_b");
         assert!(roots[1].name.is_none());
+        drop(roots);
 
         // Verify the outbound request was written
         let output = String::from_utf8(writer)?;
@@ -868,6 +869,7 @@ mod tests {
         let roots = received_roots.lock().map_err(|e| anyhow!("{e}"))?;
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].uri, "file:///tmp/test");
+        drop(roots);
 
         // Verify both the roots/list request AND the ping response were written
         let output = String::from_utf8(writer)?;

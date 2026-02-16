@@ -251,7 +251,7 @@ fn test_mcp_initialize() -> Result<()> {
 
     let result = &response["result"];
     assert_eq!(result["protocolVersion"], "2024-11-05");
-    assert_eq!(result["serverInfo"]["name"], "tool");
+    assert_eq!(result["serverInfo"]["name"], "catenary");
     assert!(result["capabilities"]["tools"].is_object());
     Ok(())
 }
@@ -1423,7 +1423,7 @@ fn test_no_roots_request_without_capability() -> Result<()> {
     // This should be the ping response, not a roots/list request
     let id = response
         .get("id")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| anyhow!("Expected ping response, got: {response:?}"))?;
     assert_eq!(id, 300, "Should receive ping response, not roots/list");
     assert!(response.get("result").is_some());

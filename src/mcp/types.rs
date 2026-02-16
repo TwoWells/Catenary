@@ -425,7 +425,7 @@ mod tests {
     }
 
     /// Regression: the MCP TypeScript SDK rejects `"params": null` with a
-    /// ZodError ("expected object, received null"). Requests and notifications
+    /// `ZodError` ("expected object, received null"). Requests and notifications
     /// with no params must omit the field entirely instead of serializing null.
     #[test]
     fn test_none_params_omitted_not_null() -> Result<()> {

@@ -495,57 +495,66 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_base_allowed() {
+    fn test_validate_base_allowed() -> Result<()> {
         let config = make_config(&["git", "make"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
-        assert!(manager.validate_command("git").is_ok());
-        assert!(manager.validate_command("make").is_ok());
+        manager.validate_command("git")?;
+        manager.validate_command("make")?;
         assert!(manager.validate_command("rm").is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_validate_denied_includes_allowlist() {
+    fn test_validate_denied_includes_allowlist() -> Result<()> {
         let config = make_config(&["git"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
-        let err = manager.validate_command("rm").unwrap_err().to_string();
+        let result = manager.validate_command("rm");
+        assert!(result.is_err());
+        let err = result
+            .err()
+            .ok_or_else(|| anyhow!("expected error"))?
+            .to_string();
         assert!(err.contains("'rm'"), "Should mention denied command: {err}");
         assert!(err.contains("git"), "Should include allowlist: {err}");
+        Ok(())
     }
 
     #[test]
-    fn test_validate_unrestricted() {
+    fn test_validate_unrestricted() -> Result<()> {
         let config = make_config(&["*"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
-        assert!(manager.validate_command("anything").is_ok());
-        assert!(manager.validate_command("rm").is_ok());
+        manager.validate_command("anything")?;
+        manager.validate_command("rm")?;
+        Ok(())
     }
 
     #[test]
-    fn test_language_detection() {
-        let dir = TempDir::new().unwrap();
+    fn test_language_detection() -> Result<()> {
+        let dir = TempDir::new()?;
         let root = dir.path().to_path_buf();
 
         // Create Python file
-        fs::write(root.join("main.py"), "print('hello')").unwrap();
+        fs::write(root.join("main.py"), "print('hello')")?;
 
         let config = make_config(&["git"], &[("python", &["python", "pytest"])]);
         let manager = RunToolManager::new(&config, &[root]);
 
         assert!(manager.detected_languages.contains("python"));
-        assert!(manager.validate_command("python").is_ok());
-        assert!(manager.validate_command("pytest").is_ok());
+        manager.validate_command("python")?;
+        manager.validate_command("pytest")?;
+        Ok(())
     }
 
     #[test]
-    fn test_language_not_detected_commands_denied() {
-        let dir = TempDir::new().unwrap();
+    fn test_language_not_detected_commands_denied() -> Result<()> {
+        let dir = TempDir::new()?;
         let root = dir.path().to_path_buf();
 
         // No Python files — only Rust
-        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}")?;
 
         let config = make_config(
             &["git"],
@@ -554,15 +563,16 @@ mod tests {
         let manager = RunToolManager::new(&config, &[root]);
 
         // Rust detected, Python not
-        assert!(manager.validate_command("cargo").is_ok());
+        manager.validate_command("cargo")?;
         assert!(manager.validate_command("python").is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_describe_allowlist() {
+    fn test_describe_allowlist() -> Result<()> {
         let config = make_config(&["git", "make"], &[("python", &["python", "pytest"])]);
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("app.py"), "").unwrap();
+        let dir = TempDir::new()?;
+        fs::write(dir.path().join("app.py"), "")?;
         let manager = RunToolManager::new(&config, &[dir.path().to_path_buf()]);
 
         let desc = manager.describe_allowlist();
@@ -572,15 +582,16 @@ mod tests {
             desc.contains("python (detected)"),
             "Should mention detected python: {desc}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_update_roots_changes_detection() {
-        let dir1 = TempDir::new().unwrap();
-        let dir2 = TempDir::new().unwrap();
+    fn test_update_roots_changes_detection() -> Result<()> {
+        let dir1 = TempDir::new()?;
+        let dir2 = TempDir::new()?;
 
         // Only dir2 has Python files
-        fs::write(dir2.path().join("app.py"), "").unwrap();
+        fs::write(dir2.path().join("app.py"), "")?;
 
         let config = make_config(&["git"], &[("python", &["python"])]);
         let mut manager = RunToolManager::new(&config, &[dir1.path().to_path_buf()]);
@@ -592,47 +603,50 @@ mod tests {
 
         assert!(changed, "Should detect change");
         assert!(manager.detected_languages.contains("python"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_echo() {
+    async fn test_execute_echo() -> Result<()> {
         let config = make_config(&["echo"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
         let output = manager
             .execute("echo", &["hello".to_string()], Some(5), None, None)
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(output.exit_code, Some(0));
         assert!(output.stdout.contains("hello"));
         assert!(!output.timed_out);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_timeout() {
+    async fn test_execute_timeout() -> Result<()> {
         let config = make_config(&["sleep"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
         let output = manager
             .execute("sleep", &["10".to_string()], Some(1), None, None)
-            .await
-            .unwrap();
+            .await?;
 
         assert!(output.timed_out);
         assert!(output.exit_code.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_timeout_integer() {
+    fn test_parse_timeout_integer() -> Result<()> {
         let val = serde_json::json!(60);
-        assert_eq!(parse_timeout(&val).unwrap(), 60);
+        assert_eq!(parse_timeout(&val)?, 60);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_timeout_string() {
+    fn test_parse_timeout_string() -> Result<()> {
         let val = serde_json::json!("120");
-        assert_eq!(parse_timeout(&val).unwrap(), 120);
+        assert_eq!(parse_timeout(&val)?, 120);
+        Ok(())
     }
 
     #[test]
@@ -648,37 +662,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_with_cwd() {
-        let dir = TempDir::new().unwrap();
+    async fn test_execute_with_cwd() -> Result<()> {
+        let dir = TempDir::new()?;
         let config = make_config(&["pwd"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
         let output = manager
             .execute("pwd", &[], Some(5), Some(dir.path()), None)
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(output.exit_code, Some(0));
-        let canonical = dir.path().canonicalize().unwrap();
+        let canonical = dir.path().canonicalize()?;
         assert!(
             output.stdout.trim() == canonical.to_string_lossy(),
             "Expected cwd {:?}, got {:?}",
             canonical,
             output.stdout.trim()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_with_stdin() {
+    async fn test_execute_with_stdin() -> Result<()> {
         let config = make_config(&["cat"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
         let output = manager
             .execute("cat", &[], Some(5), None, Some("hello from stdin"))
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(output.stdout, "hello from stdin");
+        Ok(())
     }
 }

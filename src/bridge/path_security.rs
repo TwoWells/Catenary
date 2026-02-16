@@ -221,153 +221,174 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn setup_workspace() -> (TempDir, PathValidator) {
-        let dir = TempDir::new().map_err(|e| anyhow!("{e}")).unwrap();
-        let root = dir.path().canonicalize().unwrap();
+    fn setup_workspace() -> Result<(TempDir, PathValidator)> {
+        let dir = TempDir::new().map_err(|e| anyhow!("{e}"))?;
+        let root = dir.path().canonicalize()?;
 
         // Create some test files
-        fs::write(root.join("test.rs"), "fn main() {}").unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), "// lib").unwrap();
+        fs::write(root.join("test.rs"), "fn main() {}")?;
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/lib.rs"), "// lib")?;
 
         let validator = PathValidator::new(vec![root]);
-        (dir, validator)
+        Ok((dir, validator))
     }
 
     #[test]
-    fn test_read_within_root_succeeds() {
-        let (dir, validator) = setup_workspace();
+    fn test_read_within_root_succeeds() -> Result<()> {
+        let (dir, validator) = setup_workspace()?;
         let result = validator.validate_read(&dir.path().join("test.rs"));
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_read_subdirectory_succeeds() {
-        let (dir, validator) = setup_workspace();
+    fn test_read_subdirectory_succeeds() -> Result<()> {
+        let (dir, validator) = setup_workspace()?;
         let result = validator.validate_read(&dir.path().join("src/lib.rs"));
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_read_outside_root_fails() {
-        let (_dir, validator) = setup_workspace();
+    fn test_read_outside_root_fails() -> Result<()> {
+        let (_dir, validator) = setup_workspace()?;
         let result = validator.validate_read(Path::new("/etc/hostname"));
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result
+            .err()
+            .ok_or_else(|| anyhow!("Expected error"))?
+            .to_string();
         assert!(
             err.contains("outside workspace roots"),
             "Error should mention workspace roots: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_read_nonexistent_fails() {
-        let (dir, validator) = setup_workspace();
+    fn test_read_nonexistent_fails() -> Result<()> {
+        let (dir, validator) = setup_workspace()?;
         let result = validator.validate_read(&dir.path().join("nonexistent.rs"));
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result
+            .err()
+            .ok_or_else(|| anyhow!("Expected error"))?
+            .to_string();
         assert!(
             err.contains("does not exist"),
             "Error should mention file not existing: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_read_path_traversal_outside_root_fails() {
-        let (_dir, validator) = setup_workspace();
+    fn test_read_path_traversal_outside_root_fails() -> Result<()> {
+        let (_dir, validator) = setup_workspace()?;
         // Even with ../ that technically resolves to something that exists,
         // if it's outside the root, it should fail.
         let result = validator.validate_read(Path::new("/tmp/../etc/hostname"));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_write_within_root_succeeds() {
-        let (dir, validator) = setup_workspace();
+    fn test_write_within_root_succeeds() -> Result<()> {
+        let (dir, validator) = setup_workspace()?;
         let result = validator.validate_write(&dir.path().join("test.rs"));
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_write_outside_root_fails() {
-        let (_dir, validator) = setup_workspace();
+    fn test_write_outside_root_fails() -> Result<()> {
+        let (_dir, validator) = setup_workspace()?;
         let result = validator.validate_write(Path::new("/tmp/outside.rs"));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_write_new_file_within_root_succeeds() {
-        let (dir, validator) = setup_workspace();
+    fn test_write_new_file_within_root_succeeds() -> Result<()> {
+        let (dir, validator) = setup_workspace()?;
         let result = validator.validate_write(&dir.path().join("new_file.rs"));
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_write_new_file_in_new_subdir_within_root() {
-        let (dir, validator) = setup_workspace();
+    fn test_write_new_file_in_new_subdir_within_root() -> Result<()> {
+        let (dir, validator) = setup_workspace()?;
         let result = validator.validate_write(&dir.path().join("new_dir/new_file.rs"));
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_write_config_file_rejected() {
-        let (dir, validator) = setup_workspace();
+    fn test_write_config_file_rejected() -> Result<()> {
+        let (dir, _) = setup_workspace()?;
         // Create a .catenary.toml in the root
         let config_path = dir.path().join(".catenary.toml");
-        fs::write(&config_path, "idle_timeout = 300").unwrap();
+        fs::write(&config_path, "idle_timeout = 300")?;
 
         // Recreate validator to pick up the config
-        let root = dir.path().canonicalize().unwrap();
+        let root = dir.path().canonicalize()?;
         let validator = PathValidator::new(vec![root]);
 
         let result = validator.validate_write(&config_path);
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result
+            .err()
+            .ok_or_else(|| anyhow!("Expected error"))?
+            .to_string();
         assert!(
             err.contains("configuration file"),
             "Error should mention config file: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_read_config_file_allowed() {
-        let (dir, _) = setup_workspace();
+    fn test_read_config_file_allowed() -> Result<()> {
+        let (dir, _) = setup_workspace()?;
         let config_path = dir.path().join(".catenary.toml");
-        fs::write(&config_path, "idle_timeout = 300").unwrap();
+        fs::write(&config_path, "idle_timeout = 300")?;
 
-        let root = dir.path().canonicalize().unwrap();
+        let root = dir.path().canonicalize()?;
         let validator = PathValidator::new(vec![root]);
 
         // Reading config files is fine
         let result = validator.validate_read(&config_path);
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_multiple_roots() {
-        let dir1 = TempDir::new().unwrap();
-        let dir2 = TempDir::new().unwrap();
-        let root1 = dir1.path().canonicalize().unwrap();
-        let root2 = dir2.path().canonicalize().unwrap();
+    fn test_multiple_roots() -> Result<()> {
+        let dir1 = TempDir::new()?;
+        let dir2 = TempDir::new()?;
+        let root1 = dir1.path().canonicalize()?;
+        let root2 = dir2.path().canonicalize()?;
 
-        fs::write(root1.join("a.rs"), "// a").unwrap();
-        fs::write(root2.join("b.rs"), "// b").unwrap();
+        fs::write(root1.join("a.rs"), "// a")?;
+        fs::write(root2.join("b.rs"), "// b")?;
 
         let validator = PathValidator::new(vec![root1, root2]);
 
         assert!(validator.validate_read(&dir1.path().join("a.rs")).is_ok());
         assert!(validator.validate_read(&dir2.path().join("b.rs")).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_update_roots() {
-        let dir1 = TempDir::new().unwrap();
-        let dir2 = TempDir::new().unwrap();
-        let root1 = dir1.path().canonicalize().unwrap();
-        let root2 = dir2.path().canonicalize().unwrap();
+    fn test_update_roots() -> Result<()> {
+        let dir1 = TempDir::new()?;
+        let dir2 = TempDir::new()?;
+        let root1 = dir1.path().canonicalize()?;
+        let root2 = dir2.path().canonicalize()?;
 
-        fs::write(root1.join("a.rs"), "// a").unwrap();
-        fs::write(root2.join("b.rs"), "// b").unwrap();
+        fs::write(root1.join("a.rs"), "// a")?;
+        fs::write(root2.join("b.rs"), "// b")?;
 
         let mut validator = PathValidator::new(vec![root1]);
 
@@ -375,47 +396,50 @@ mod tests {
         assert!(validator.validate_read(&dir2.path().join("b.rs")).is_err());
 
         // Update roots to include dir2
-        validator.update_roots(vec![dir1.path().canonicalize().unwrap(), root2]);
+        validator.update_roots(vec![dir1.path().canonicalize()?, root2]);
 
         // Now b.rs is within roots
         assert!(validator.validate_read(&dir2.path().join("b.rs")).is_ok());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_symlink_within_root_succeeds() {
+    fn test_symlink_within_root_succeeds() -> Result<()> {
         use std::os::unix::fs as unix_fs;
 
-        let (dir, validator) = setup_workspace();
-        let root = dir.path().canonicalize().unwrap();
+        let (dir, validator) = setup_workspace()?;
+        let root = dir.path().canonicalize()?;
 
         // Create a symlink within the workspace
         let link_path = root.join("link.rs");
-        unix_fs::symlink(root.join("test.rs"), &link_path).unwrap();
+        unix_fs::symlink(root.join("test.rs"), &link_path)?;
 
         let result = validator.validate_read(&link_path);
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_symlink_outside_root_fails() {
+    fn test_symlink_outside_root_fails() -> Result<()> {
         use std::os::unix::fs as unix_fs;
 
-        let (dir, validator) = setup_workspace();
-        let root = dir.path().canonicalize().unwrap();
+        let (dir, validator) = setup_workspace()?;
+        let root = dir.path().canonicalize()?;
 
         // Create a file outside the workspace
-        let outside_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new()?;
         let outside_file = outside_dir.path().join("secret.txt");
-        fs::write(&outside_file, "secret").unwrap();
+        fs::write(&outside_file, "secret")?;
 
         // Create a symlink inside workspace pointing outside
         let link_path = root.join("sneaky_link.txt");
-        unix_fs::symlink(&outside_file, &link_path).unwrap();
+        unix_fs::symlink(&outside_file, &link_path)?;
 
         // canonicalize() will resolve the symlink to the outside path
         let result = validator.validate_read(&link_path);
         assert!(result.is_err());
+        Ok(())
     }
 }
