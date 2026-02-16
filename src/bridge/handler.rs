@@ -54,6 +54,7 @@ const METHODS_WAIT_FOR_READY: &[&str] = &[
     "implementation",
     "find_references",
     "document_symbols",
+    "search",
     "code_actions",
     "completion",
     "diagnostics",
@@ -314,6 +315,25 @@ impl LspBridgeHandler {
             return Err(anyhow!(
                 "[{lang}] server died while waiting for ready state"
             ));
+        }
+
+        Ok(())
+    }
+
+    /// Waits for all active LSP servers to be ready.
+    ///
+    /// Used for symbol-only queries that don't target a specific file,
+    /// since we don't know which server will handle the request.
+    async fn wait_for_all_servers_ready(&self) -> Result<()> {
+        let clients = self.client_manager.active_clients().await;
+
+        for (lang, client_mutex) in clients {
+            let is_ready = client_mutex.lock().await.wait_ready().await;
+            if !is_ready {
+                return Err(anyhow!(
+                    "[{lang}] server died while waiting for ready state"
+                ));
+            }
         }
 
         Ok(())
@@ -2110,14 +2130,21 @@ impl ToolHandler for LspBridgeHandler {
             return Ok(result);
         }
 
-        // Smart wait for methods that need a ready server
-        if self.config.smart_wait
-            && METHODS_WAIT_FOR_READY.contains(&name)
-            && let Some(ref path) = Self::extract_file_path(arguments.as_ref())
-            && let Err(e) = self.runtime.block_on(self.wait_for_server_ready(path))
-        {
-            broadcast_result(false);
-            return Err(e);
+        // Smart wait for methods that need a ready server.
+        // File-scoped calls wait for the specific server; symbol-only calls
+        // wait for all active servers since we don't know which will handle it.
+        if self.config.smart_wait && METHODS_WAIT_FOR_READY.contains(&name) {
+            let wait_result = Self::extract_file_path(arguments.as_ref())
+                .as_ref()
+                .map_or_else(
+                    || self.runtime.block_on(self.wait_for_all_servers_ready()),
+                    |path| self.runtime.block_on(self.wait_for_server_ready(path)),
+                );
+
+            if let Err(e) = wait_result {
+                broadcast_result(false);
+                return Err(e);
+            }
         }
 
         let result = match name {
