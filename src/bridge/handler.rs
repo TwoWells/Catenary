@@ -137,7 +137,8 @@ pub struct FindReferencesInput {
 /// Input for unified search.
 #[derive(Debug, Deserialize)]
 pub struct SearchInput {
-    pub query: String,
+    /// One or more search queries.
+    pub queries: Vec<String>,
 }
 
 /// Input for code actions.
@@ -759,12 +760,27 @@ impl LspBridgeHandler {
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        debug!("Search request: query={}", input.query);
+        if input.queries.is_empty() {
+            return Err(anyhow!("queries must contain at least one search term"));
+        }
+
+        let mut sections = Vec::new();
+
+        for query in &input.queries {
+            sections.push(self.search_single(query));
+        }
+
+        Ok(CallToolResult::text(sections.join("\n")))
+    }
+
+    /// Executes a single search query with workspace symbols and grep fallback.
+    fn search_single(&self, query: &str) -> String {
+        debug!("Search request: query={query}");
 
         // First try workspace symbols (fast path)
         let (workspace_result, warnings) = self.runtime.block_on(async {
             let params = WorkspaceSymbolParams {
-                query: input.query.clone(),
+                query: query.to_string(),
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
                 partial_result_params: lsp_types::PartialResultParams::default(),
             };
@@ -812,17 +828,17 @@ impl LspBridgeHandler {
                     .collect::<Vec<_>>()
                     .join("\n"),
             );
-            return Ok(CallToolResult::text(text));
+            return text;
         }
 
         // Fallback: search files with ripgrep, then query document symbols
         debug!("Workspace symbols found nothing, trying fallback search");
-        Ok(self.search_fallback(&input.query, &warnings))
+        self.search_fallback(query, &warnings)
     }
 
     /// Fallback search: ripgrep for files, then document symbols.
     /// Adds a note about grep limitations when LSP workspace symbols were unavailable.
-    fn search_fallback(&self, query: &str, warnings: &[String]) -> CallToolResult {
+    fn search_fallback(&self, query: &str, warnings: &[String]) -> String {
         const MAX_FILES: usize = 20;
 
         let mut output = String::new();
@@ -839,7 +855,7 @@ impl LspBridgeHandler {
 
         if files.is_empty() {
             output.push_str("No results found");
-            return CallToolResult::text(output);
+            return output;
         }
 
         let files: Vec<_> = files.into_iter().take(MAX_FILES).collect();
@@ -870,7 +886,7 @@ impl LspBridgeHandler {
             output.push_str(&found_symbols.join("\n"));
         }
 
-        CallToolResult::text(output)
+        output
     }
 
     /// Use ripgrep to find files containing the query across workspace roots.
@@ -1867,9 +1883,13 @@ impl ToolHandler for LspBridgeHandler {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or text pattern to search for" }
+                        "queries": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Symbol names or text patterns to search for"
+                        }
                     },
-                    "required": ["query"]
+                    "required": ["queries"]
                 }),
             },
             Tool {
