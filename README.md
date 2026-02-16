@@ -20,13 +20,12 @@ location. The context stays lean across the entire session.
 
 ## How It Works
 
-```
-┌─────────────┐     MCP      ┌──────────┐     LSP      ┌─────────────────┐
-│ AI Assistant│◄────────────►│ Catenary │◄────────────►│ Language Server │
-│ (Claude)    │              │          │              │ (rust-analyzer) │
-└─────────────┘              │          │◄────────────►│ (pyright)       │
-                             │          │              │ (gopls)         │
-                             └──────────┘              └─────────────────┘
+```mermaid
+graph LR
+    A["AI Assistant<br/>(Claude, Gemini)"] <-->|MCP| B[Catenary]
+    B <-->|LSP| C[rust-analyzer]
+    B <-->|LSP| D[pyright]
+    B <-->|LSP| E[gopls]
 ```
 
 Catenary bridges [MCP](https://modelcontextprotocol.io/) and
