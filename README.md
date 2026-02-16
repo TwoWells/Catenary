@@ -22,7 +22,7 @@ location. The context stays lean across the entire session.
 
 ```mermaid
 graph LR
-    A["AI Assistant<br/>(Claude, Gemini)"] <-->|MCP| B[Catenary]
+    A["AI Assistant<br/>(Claude, Gemini)"] <-->|MCP| B["Catenary<br/><br/>MCP ↔ LSP<br/>Bridge"]
     B <-->|LSP| C[rust-analyzer]
     B <-->|LSP| D[pyright]
     B <-->|LSP| E[gopls]
