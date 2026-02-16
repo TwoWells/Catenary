@@ -158,6 +158,22 @@ don't fix this — they just let you waste more before hitting the wall.
 | `run` | Execute shell commands (allowlist enforced) |
 | ... | [See all tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
 
+## Known Limitations
+
+**MCP tool display in CLIs.** Claude Code and Gemini CLI render built-in tools
+with clean, purpose-built UI — diffs for edits, syntax highlighting for reads.
+MCP tools get none of this. Every Catenary tool call shows raw escaped JSON in
+the approval prompt, making the normally sleek UX feel like a debug console.
+
+The bundled display hook (step 4 above) patches this for `edit_file` and
+`write_file` in Claude Code, but every other tool still renders as JSON. This
+is a host CLI limitation, not something Catenary can fix — MCP tools need the
+same display treatment as built-in tools.
+
+**Gemini CLI hooks fire post-approval.** Gemini's `BeforeTool` hook runs after
+the user accepts the tool call, so display hooks can't improve the approval
+prompt. The formatted output only appears in the debug console.
+
 ## Documentation
 
 - **[Overview](https://github.com/MarkWells-Dev/Catenary/wiki/Overview)** — The problem, the solution, available tools
