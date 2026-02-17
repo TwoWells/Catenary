@@ -342,6 +342,29 @@ impl RunToolManager {
         self.roots = roots.to_vec();
         self.detect_languages(roots)
     }
+
+    /// Checks if a file path introduces a new language to the detected set.
+    ///
+    /// If the file's extension maps to a configured language that hasn't been
+    /// detected yet, marks it as detected and returns `true`. This is an O(1)
+    /// check — no filesystem scan is performed.
+    pub fn maybe_detect_language(&mut self, path: &Path) -> bool {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let Some(lang) = extension_to_language(ext) else {
+            return false;
+        };
+        if !self.language_configs.contains_key(lang) {
+            return false;
+        }
+        if self.detected_languages.contains(lang) {
+            return false;
+        }
+        debug!("New language detected from file write: {lang}");
+        self.detected_languages.insert(lang.to_string());
+        true
+    }
 }
 
 /// Truncates output to `MAX_OUTPUT_BYTES`, converting to lossy UTF-8.
@@ -790,5 +813,47 @@ mod tests {
 
         manager.validate_command("git", &[])?;
         Ok(())
+    }
+
+    #[test]
+    fn test_maybe_detect_language_new() {
+        let config = make_config(&["git"], &[("rust", &["cargo"])]);
+        let mut manager = RunToolManager::new(&config, &[]);
+
+        assert!(!manager.detected_languages.contains("rust"));
+        assert!(manager.maybe_detect_language(Path::new("src/main.rs")));
+        assert!(manager.detected_languages.contains("rust"));
+        // cargo should now be allowed
+        assert!(manager.validate_command("cargo", &[]).is_ok());
+    }
+
+    #[test]
+    fn test_maybe_detect_language_already_detected() {
+        let config = make_config(&["git"], &[("rust", &["cargo"])]);
+        let dir = TempDir::new().unwrap();
+        let rs_file = dir.path().join("main.rs");
+        fs::write(&rs_file, "fn main() {}").unwrap();
+
+        let mut manager = RunToolManager::new(&config, &[dir.path().to_path_buf()]);
+        assert!(manager.detected_languages.contains("rust"));
+        // Already detected — should return false
+        assert!(!manager.maybe_detect_language(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn test_maybe_detect_language_unconfigured() {
+        let config = make_config(&["git"], &[]);
+        let mut manager = RunToolManager::new(&config, &[]);
+
+        // Python not in language configs — should return false
+        assert!(!manager.maybe_detect_language(Path::new("script.py")));
+    }
+
+    #[test]
+    fn test_maybe_detect_language_no_extension() {
+        let config = make_config(&["git"], &[("rust", &["cargo"])]);
+        let mut manager = RunToolManager::new(&config, &[]);
+
+        assert!(!manager.maybe_detect_language(Path::new("Makefile")));
     }
 }

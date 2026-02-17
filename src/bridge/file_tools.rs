@@ -27,6 +27,7 @@ use serde::Deserialize;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -165,6 +166,17 @@ impl LspBridgeHandler {
         self.runtime
             .block_on(tokio::fs::write(&canonical, &input.content))
             .map_err(|e| anyhow!("Failed to write file: {e}"))?;
+
+        // Check if this file introduces a new language for the run tool
+        if let Some(ref run_tool) = self.run_tool
+            && self
+                .runtime
+                .block_on(run_tool.write())
+                .maybe_detect_language(&canonical)
+            && let Some(ref flag) = self.tools_changed_flag
+        {
+            flag.store(true, Ordering::Release);
+        }
 
         let line_count = input.content.lines().count();
         let rel_path = self.relative_display_path(&canonical);

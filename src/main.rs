@@ -250,6 +250,9 @@ async fn run_server(args: Args) -> Result<()> {
         )))
     });
 
+    // Create tools-changed flag before handler so both share it
+    let tools_changed_flag = Arc::new(AtomicBool::new(false));
+
     let handler = LspBridgeHandler::new(
         client_manager.clone(),
         doc_manager,
@@ -257,11 +260,11 @@ async fn run_server(args: Args) -> Result<()> {
         broadcaster.clone(),
         path_validator.clone(),
         run_tool.clone(),
+        Some(tools_changed_flag.clone()),
     );
 
     // Run MCP server (blocking - reads from stdin)
     let session_for_callback = session.clone();
-    let tools_changed_flag = Arc::new(AtomicBool::new(false));
     let tools_changed_for_roots = tools_changed_flag.clone();
     let client_manager_for_roots = client_manager.clone();
     let path_validator_for_roots = path_validator.clone();

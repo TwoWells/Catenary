@@ -34,6 +34,7 @@ use lsp_types::{
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -248,6 +249,8 @@ pub struct LspBridgeHandler {
     pub(super) broadcaster: EventBroadcaster,
     pub(super) path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
     pub(super) run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
+    /// Flag to signal the MCP server to emit `tools/list_changed`.
+    pub(super) tools_changed_flag: Option<Arc<AtomicBool>>,
 }
 
 impl LspBridgeHandler {
@@ -259,6 +262,7 @@ impl LspBridgeHandler {
         broadcaster: EventBroadcaster,
         path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
         run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
+        tools_changed_flag: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             client_manager,
@@ -267,6 +271,7 @@ impl LspBridgeHandler {
             broadcaster,
             path_validator,
             run_tool,
+            tools_changed_flag,
         }
     }
     /// Gets the appropriate LSP client for the given file path.
