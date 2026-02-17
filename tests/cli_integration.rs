@@ -210,18 +210,68 @@ fn test_monitor_by_row_number_starts() -> Result<()> {
 
 #[test]
 fn test_monitor_invalid_row_number_fails() -> Result<()> {
-    // Verify that an invalid row number (999) fails appropriately
+    // Verify that an invalid row number (999) fails appropriately.
+    // "999" is tried as row number (out of range), then as session ID prefix
+    // (no match), so the row-number error is reported.
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .arg("monitor")
         .arg("999")
         .output()
         .context("Failed to run monitor command")?;
 
-    // Should fail with an error message about row number being out of range
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("out of range") || stderr.contains("Row number"),
         "Should report row number out of range, got: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_monitor_numeric_session_id_resolves() -> Result<()> {
+    use std::sync::mpsc;
+
+    // Regression test: session IDs are hex strings that may be all digits
+    // (e.g., "025586387"). resolve_session_id must not treat these as row
+    // numbers and bail with "out of range".
+    let mut server = ServerProcess::spawn()?;
+    let session_id = server.get_session_id()?;
+
+    // Start monitor using the full session ID — this must work regardless
+    // of whether the ID happens to be all digits.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    cmd.arg("monitor").arg(&session_id);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("Failed to spawn monitor")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to take monitor stdout")?;
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        while let Ok(n) = reader.read_line(&mut line) {
+            if n == 0 {
+                break;
+            }
+            let _ = tx.send(line.clone());
+            line.clear();
+        }
+    });
+
+    let header = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+
+    // Capture stderr before asserting, for diagnostics
+    let _ = child.kill();
+    let output = child.wait_with_output().context("wait_with_output")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        header.contains("Monitoring session"),
+        "Monitor should start successfully with session ID '{session_id}', \
+         got header: '{header}', stderr: '{stderr}'"
     );
     Ok(())
 }

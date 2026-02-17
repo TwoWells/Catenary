@@ -1063,6 +1063,9 @@ impl LspBridgeHandler {
                     }
                 }
 
+                // Trigger flycheck on servers that only run diagnostics on save
+                client.did_save(uri.clone()).await?;
+
                 drop(doc_manager);
 
                 if !client
@@ -1998,7 +2001,8 @@ impl ToolHandler for LspBridgeHandler {
                         },
                         "stdin": { "type": "string", "description": "Content to pipe to the process's standard input" },
                         "timeout": { "type": ["integer", "string"], "description": "Timeout in seconds (default: 120)" },
-                        "output_file": { "type": "string", "description": "Capture stdout to a file instead of returning it inline (path must be within workspace roots)" }
+                        "output_file": { "type": "string", "description": "Capture stdout to a file instead of returning it inline (path must be within workspace roots)" },
+                        "sleep": { "type": "number", "description": "Seconds to sleep before executing the command (max 300)" }
                     },
                     "required": ["command"]
                 }),

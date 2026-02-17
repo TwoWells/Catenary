@@ -434,6 +434,12 @@ fn resolve_session_id(id: &str) -> Result<session::SessionInfo> {
         if let Some(s) = sessions.get(row_num - 1) {
             return Ok(s.clone());
         }
+        // Row number out of range — try as session ID prefix before giving up.
+        // Session IDs are hex strings that may be all digits (e.g., "025586387"),
+        // so a purely numeric input could be either a row number or a session ID.
+        if let Ok(session) = find_session(id) {
+            return Ok(session);
+        }
         anyhow::bail!("Row number {} out of range (1-{})", row_num, sessions.len());
     }
 

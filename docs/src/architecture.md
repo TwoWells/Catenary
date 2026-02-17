@@ -104,6 +104,16 @@ and returning results. Because the snapshot is taken before the change is sent,
 there is no race window: any publication that arrives after the snapshot
 necessarily reflects the change or something newer.
 
+After the counter advances, Catenary continues to observe the server's
+notification stream and progress state. A polling loop checks every 100 ms
+for new notifications or active progress tokens (e.g., flycheck running
+`cargo check`). If the server sends any further notifications or has
+background work in progress, the quiet timer resets. Only when the server
+has been completely silent for 2 seconds with no active progress tokens does
+Catenary read the cache and return. This catches servers like rust-analyzer
+that publish diagnostics in multiple rounds — fast warnings from native
+analysis followed by slower type-checking errors from flycheck.
+
 This mechanism applies to the tool paths that return diagnostics after a
 change: `write_file`, `edit_file`, `read_file` (when syncing an out-of-date
 document), and the `diagnostics` tool. Request/response tools like `hover` and

@@ -392,6 +392,9 @@ impl LspBridgeHandler {
                     }
                 }
 
+                // Trigger flycheck on servers that only run diagnostics on save
+                client.did_save(uri.clone()).await?;
+
                 drop(doc_manager);
 
                 // Wait for diagnostics that reflect our change
@@ -466,6 +469,9 @@ impl LspBridgeHandler {
                     client.did_change(params).await?;
                 }
             }
+
+            // Trigger flycheck on servers that only run diagnostics on save
+            client.did_save(uri.clone()).await?;
 
             // Wait for diagnostics that reflect our change
             if !client

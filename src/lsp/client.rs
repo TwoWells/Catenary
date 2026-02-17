@@ -22,20 +22,20 @@ use lsp_types::{
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     ClientCapabilities, CodeActionParams, CodeActionResponse, CompletionParams, CompletionResponse,
     Diagnostic, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
-    InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
     PublishDiagnosticsParams, ReferenceParams, RenameParams, SignatureHelp, SignatureHelpParams,
-    TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkspaceEdit, WorkspaceFolder,
-    WorkspaceFoldersChangeEvent, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    TextDocumentIdentifier, TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceEdit,
+    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -68,6 +68,9 @@ pub struct LspClient {
     diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
     /// Wakes waiters when any URI receives fresh diagnostics.
     diagnostics_notify: Arc<Notify>,
+    /// Incremented on every incoming server notification; used by the
+    /// activity-settle loop to detect when the server goes quiet.
+    activity_counter: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     encoding: PositionEncodingKind,
     /// Progress tracking for `$/progress` notifications.
@@ -120,6 +123,7 @@ impl LspClient {
         let diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics_notify = Arc::new(Notify::new());
+        let activity_counter = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let progress = Arc::new(Mutex::new(ProgressTracker::new()));
         let state = Arc::new(AtomicU8::new(ServerState::Initializing.as_u8()));
@@ -137,6 +141,7 @@ impl LspClient {
             diagnostics.clone(),
             diagnostics_generation.clone(),
             diagnostics_notify.clone(),
+            activity_counter.clone(),
             alive.clone(),
             progress.clone(),
             state.clone(),
@@ -151,6 +156,7 @@ impl LspClient {
             diagnostics,
             diagnostics_generation,
             diagnostics_notify,
+            activity_counter,
             alive,
             encoding: PositionEncodingKind::UTF16, // Default per spec
             progress,
@@ -174,6 +180,7 @@ impl LspClient {
         diagnostics: DiagnosticsCache,
         diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
         diagnostics_notify: Arc<Notify>,
+        activity_counter: Arc<AtomicU64>,
         alive: Arc<AtomicBool>,
         progress: Arc<Mutex<ProgressTracker>>,
         state: Arc<AtomicU8>,
@@ -270,6 +277,7 @@ impl LspClient {
                                 &broadcaster,
                             )
                             .await;
+                            activity_counter.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                 } else if value.get("id").is_some() {
@@ -635,6 +643,25 @@ impl LspClient {
         self.notify("textDocument/didChange", params).await
     }
 
+    /// Notifies the LSP server that a document was saved.
+    ///
+    /// This triggers flycheck (e.g., `cargo check`) on servers that only
+    /// run diagnostics on save, like rust-analyzer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
+    pub async fn did_save(&self, uri: Uri) -> Result<()> {
+        self.notify(
+            "textDocument/didSave",
+            DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+                text: None,
+            },
+        )
+        .await
+    }
+
     /// Notifies the LSP server that a document was closed.
     ///
     /// # Errors
@@ -912,11 +939,64 @@ impl LspClient {
         generations.get(uri).copied().unwrap_or(0)
     }
 
-    /// Waits until diagnostics for the URI advance past `snapshot`.
+    /// Waits until the server is both quiet and not busy with background work.
+    ///
+    /// Polls every 100 ms, tracking when the last activity occurred (either a
+    /// notification via `activity_counter` or an active progress token). Only
+    /// returns once the server has been quiet for `settle_duration` **and**
+    /// has no active progress tokens (e.g., flycheck).
+    ///
+    /// Returns `true` if settled or the overall timeout expired, `false` if
+    /// the server died.
+    async fn wait_for_activity_settle(&self, settle_duration: Duration, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(100);
+        let mut last_counter = self.activity_counter.load(Ordering::SeqCst);
+        let mut last_activity = tokio::time::Instant::now();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+
+            tokio::time::sleep(remaining.min(poll_interval)).await;
+
+            let current_counter = self.activity_counter.load(Ordering::SeqCst);
+            let has_active_progress = self.progress.lock().await.is_busy();
+
+            if current_counter != last_counter {
+                last_counter = current_counter;
+                last_activity = tokio::time::Instant::now();
+            }
+
+            if has_active_progress {
+                last_activity = tokio::time::Instant::now();
+            }
+
+            let quiet = last_activity.elapsed();
+            if quiet >= settle_duration && !has_active_progress {
+                return true;
+            }
+
+            if !self.is_alive() {
+                return false;
+            }
+        }
+    }
+
+    /// Waits until diagnostics for the URI advance past `snapshot`, then waits
+    /// for the server's notification stream to go quiet.
     ///
     /// `snapshot` should be obtained via [`diagnostics_generation`] **before**
     /// sending the change that should trigger new diagnostics. This ensures
     /// no race window between sending the change and starting the wait.
+    ///
+    /// After the first diagnostics update, the server may still publish
+    /// additional diagnostic rounds (e.g., warnings first, then type errors)
+    /// or run flycheck. The settle phase polls the notification counter and
+    /// progress tracker, returning only once the server has been quiet for
+    /// 2 seconds with no active background work.
     ///
     /// Returns `true` if diagnostics advanced, `false` on timeout or server
     /// death.
@@ -928,9 +1008,11 @@ impl LspClient {
     ) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
 
+        // Phase 1: Wait for diagnostics generation to advance past snapshot.
+        // This confirms the server received and started processing our change.
         loop {
             if self.diagnostics_generation(uri).await > snapshot {
-                return true;
+                break;
             }
 
             if !self.is_alive() {
@@ -952,6 +1034,17 @@ impl LspClient {
                 }
             }
         }
+
+        // Phase 2: Wait for server activity to settle.
+        // After the first diagnostics update, the server may still be publishing
+        // additional diagnostic rounds or running flycheck (cargo check). The
+        // settle polls every 100 ms and tracks the last notification or active
+        // progress. It returns only after 2 seconds of silence with no active
+        // progress tokens, which bridges the flycheck debounce gap and waits
+        // for cargo check to finish.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.wait_for_activity_settle(Duration::from_secs(2), remaining)
+            .await
     }
 
     /// Returns the language identifier for this client (e.g., "rust", "python").

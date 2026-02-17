@@ -451,3 +451,59 @@ allowed = ["cargo"]
 
     Ok(())
 }
+
+#[test]
+fn test_run_sleep_before_command() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(
+        &dir.path().to_string_lossy(),
+        r#"
+[tools.run]
+allowed = ["echo"]
+"#,
+    )?;
+    bridge.initialize()?;
+
+    let start = std::time::Instant::now();
+    let text = bridge.call_tool_text(
+        "run",
+        &json!({ "command": "echo", "args": ["after-sleep"], "sleep": 0.2 }),
+    )?;
+    let elapsed = start.elapsed();
+
+    assert!(
+        text.contains("after-sleep"),
+        "Should contain echo output: {text}"
+    );
+    assert!(
+        text.contains("Exit code: 0"),
+        "Should show exit code: {text}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "Expected at least 200ms delay from sleep, got {elapsed:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_run_sleep_without_command_fails() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(
+        &dir.path().to_string_lossy(),
+        r#"
+[tools.run]
+allowed = ["echo"]
+"#,
+    )?;
+    bridge.initialize()?;
+
+    // Send a raw tools/call with sleep but no command
+    let result = bridge.call_tool("run", &json!({ "sleep": 1 }))?;
+
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
+    assert_eq!(is_error, Some(true), "Should be an error: {result:?}");
+    Ok(())
+}

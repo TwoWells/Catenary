@@ -63,6 +63,9 @@ pub struct RunInput {
     /// Capture stdout to a file instead of returning it inline.
     /// Path must be within workspace roots.
     pub output_file: Option<String>,
+    /// Seconds to sleep before executing the command. Must be paired with
+    /// a command — standalone sleep is not permitted.
+    pub sleep: Option<f64>,
 }
 
 /// Output from a command execution.
@@ -463,6 +466,12 @@ impl LspBridgeHandler {
         };
 
         let output = self.runtime.block_on(async {
+            if let Some(secs) = input.sleep {
+                if secs <= 0.0 || secs > 300.0 {
+                    return Err(anyhow!("sleep must be between 0 and 300 seconds"));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+            }
             let manager = run_tool.read().await;
             manager.validate_command(&command, &args)?;
             manager
@@ -762,6 +771,27 @@ mod tests {
 
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(output.stdout, "hello from stdin");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_with_sleep() -> Result<()> {
+        let config = make_config(&["echo"], &[]);
+        let manager = RunToolManager::new(&config, &[]);
+
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_secs_f64(0.1)).await;
+        let output = manager
+            .execute("echo", &["after-sleep".to_string()], Some(5), None, None)
+            .await?;
+        let elapsed = start.elapsed();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.contains("after-sleep"));
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "Expected at least 100ms delay, got {elapsed:?}"
+        );
         Ok(())
     }
 
