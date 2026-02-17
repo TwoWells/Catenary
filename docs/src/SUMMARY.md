@@ -1,6 +1,6 @@
 # Summary
 
-[📖 Introduction](README.md)
+[📖 Introduction](./README.md)
 
 ---
 
@@ -15,6 +15,7 @@
 
 # 📋 Reference
 
+- [🏗️ Architecture](architecture.md)
 - [🛠️ Language Servers](lsp/README.md)
 - [🤖 AI Agents](ai-agents.md)
 - [🛡️ LSP Fault Model](lsp-fault-model.md)

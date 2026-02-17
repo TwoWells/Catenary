@@ -770,23 +770,15 @@ impl LspBridgeHandler {
             let clients = self.client_manager.active_clients().await;
             let mut lines = Vec::new();
 
-            for (lang, client_mutex) in &clients {
-                match client_mutex
+            for client_mutex in clients.values() {
+                if let Ok(Some(response)) = client_mutex
                     .lock()
                     .await
                     .workspace_symbols(params.clone())
                     .await
+                    && let Some(formatted) = format_workspace_symbols(&response)
                 {
-                    Ok(Some(response)) => {
-                        let formatted = format_workspace_symbols(&response);
-                        if formatted != "No symbols found" {
-                            lines.push(formatted);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!("[{lang}] workspace symbol search failed: {e}");
-                    }
+                    lines.push(formatted);
                 }
             }
 
@@ -2385,35 +2377,41 @@ fn format_nested_symbols(symbols: &[DocumentSymbol], indent: usize) -> String {
     result.join("\n")
 }
 
-fn format_workspace_symbols(response: &WorkspaceSymbolResponse) -> String {
+fn format_workspace_symbols(response: &WorkspaceSymbolResponse) -> Option<String> {
     match response {
         WorkspaceSymbolResponse::Flat(symbols) => {
             if symbols.is_empty() {
-                "No symbols found".to_string()
+                None
             } else {
-                symbols
-                    .iter()
-                    .map(format_symbol_info)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                Some(
+                    symbols
+                        .iter()
+                        .map(format_symbol_info)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
             }
         }
         WorkspaceSymbolResponse::Nested(symbols) => {
             if symbols.is_empty() {
-                "No symbols found".to_string()
+                None
             } else {
-                symbols
-                    .iter()
-                    .map(|s| {
-                        let kind = format!("{:?}", s.kind);
-                        let loc = match &s.location {
-                            lsp_types::OneOf::Left(loc) => format_location(loc),
-                            lsp_types::OneOf::Right(uri_info) => uri_info.uri.path().to_string(),
-                        };
-                        format!("{} [{}] {}", s.name, kind, loc)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                Some(
+                    symbols
+                        .iter()
+                        .map(|s| {
+                            let kind = format!("{:?}", s.kind);
+                            let loc = match &s.location {
+                                lsp_types::OneOf::Left(loc) => format_location(loc),
+                                lsp_types::OneOf::Right(uri_info) => {
+                                    uri_info.uri.path().to_string()
+                                }
+                            };
+                            format!("{} [{}] {}", s.name, kind, loc)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
             }
         }
     }

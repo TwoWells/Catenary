@@ -135,7 +135,7 @@ There are no size limits on:
 
 ### ~~Silent Partial Results~~ (Resolved)
 
-`search` (formerly `find_symbol`) and `codebase_map` now track which servers fail during workspace-wide operations. Failed servers produce a warning appended to the response: `"Warning: [lang] unavailable, results may be incomplete"`. When `search` falls back to grep, it warns: `"Note: text search only (cannot distinguish definitions from usages)."`
+`search` always runs both LSP workspace symbols and a ripgrep file heatmap. If an LSP server is unavailable, its symbols are silently omitted — the heatmap covers the gap. `codebase_map` appends `"Warning: [lang] unavailable, symbols may be incomplete"` when a server fails during symbol collection.
 
 ### Signature Help Label Offsets
 
