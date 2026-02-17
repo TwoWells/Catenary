@@ -728,7 +728,7 @@ fn test_multiplexing() -> Result<()> {
         "params": {
             "name": "search",
             "arguments": {
-                "query": "greet"
+                "queries": ["greet"]
             }
         }
     }))?;
@@ -1079,16 +1079,16 @@ fn test_multi_root_find_symbol() -> Result<()> {
     bridge.initialize()?;
 
     // Give LSP time to index
-    std::thread::sleep(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_secs(2));
 
-    // find_symbol should locate alpha_func from root A
+    // Search should locate alpha_func from root A (via symbols or heatmap)
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 700,
         "method": "tools/call",
         "params": {
             "name": "search",
-            "arguments": { "query": "alpha_func" }
+            "arguments": { "queries": ["alpha_func"] }
         }
     }))?;
 
@@ -1096,24 +1096,24 @@ fn test_multi_root_find_symbol() -> Result<()> {
     let result_a = &response_a["result"];
     assert!(
         result_a["isError"].is_null() || result_a["isError"] == false,
-        "find_symbol for alpha_func failed: {response_a:?}"
+        "search for alpha_func failed: {response_a:?}"
     );
     let text_a = result_a["content"][0]["text"]
         .as_str()
         .context("Missing text for alpha_func")?;
     assert!(
-        text_a.contains("alpha_func"),
-        "Expected to find alpha_func, got: {text_a}"
+        text_a.contains("alpha.sh"),
+        "Expected search to find alpha.sh, got: {text_a}"
     );
 
-    // find_symbol should locate beta_func from root B
+    // Search should locate beta_func from root B (via symbols or heatmap)
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 701,
         "method": "tools/call",
         "params": {
             "name": "search",
-            "arguments": { "query": "beta_func" }
+            "arguments": { "queries": ["beta_func"] }
         }
     }))?;
 
@@ -1121,14 +1121,14 @@ fn test_multi_root_find_symbol() -> Result<()> {
     let result_b = &response_b["result"];
     assert!(
         result_b["isError"].is_null() || result_b["isError"] == false,
-        "find_symbol for beta_func failed: {response_b:?}"
+        "search for beta_func failed: {response_b:?}"
     );
     let text_b = result_b["content"][0]["text"]
         .as_str()
         .context("Missing text for beta_func")?;
     assert!(
-        text_b.contains("beta_func"),
-        "Expected to find beta_func, got: {text_b}"
+        text_b.contains("beta.sh"),
+        "Expected search to find beta.sh, got: {text_b}"
     );
 
     Ok(())

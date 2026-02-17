@@ -68,6 +68,8 @@ pub struct LspClient {
     diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
     /// Wakes waiters when any URI receives fresh diagnostics.
     diagnostics_notify: Arc<Notify>,
+    /// Whether this server has ever published diagnostics.
+    has_published_diagnostics: Arc<AtomicBool>,
     /// Incremented on every incoming server notification; used by the
     /// activity-settle loop to detect when the server goes quiet.
     activity_counter: Arc<AtomicU64>,
@@ -123,6 +125,7 @@ impl LspClient {
         let diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics_notify = Arc::new(Notify::new());
+        let has_published_diagnostics = Arc::new(AtomicBool::new(false));
         let activity_counter = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let progress = Arc::new(Mutex::new(ProgressTracker::new()));
@@ -141,6 +144,7 @@ impl LspClient {
             diagnostics.clone(),
             diagnostics_generation.clone(),
             diagnostics_notify.clone(),
+            has_published_diagnostics.clone(),
             activity_counter.clone(),
             alive.clone(),
             progress.clone(),
@@ -156,6 +160,7 @@ impl LspClient {
             diagnostics,
             diagnostics_generation,
             diagnostics_notify,
+            has_published_diagnostics,
             activity_counter,
             alive,
             encoding: PositionEncodingKind::UTF16, // Default per spec
@@ -171,6 +176,7 @@ impl LspClient {
     /// Background task that reads LSP messages and routes responses to pending requests.
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "Internal task requires many handles to manage client state"
     )]
     async fn reader_task(
@@ -180,6 +186,7 @@ impl LspClient {
         diagnostics: DiagnosticsCache,
         diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
         diagnostics_notify: Arc<Notify>,
+        has_published_diagnostics: Arc<AtomicBool>,
         activity_counter: Arc<AtomicU64>,
         alive: Arc<AtomicBool>,
         progress: Arc<Mutex<ProgressTracker>>,
@@ -271,6 +278,7 @@ impl LspClient {
                                 &diagnostics,
                                 &diagnostics_generation,
                                 &diagnostics_notify,
+                                &has_published_diagnostics,
                                 &progress,
                                 &state,
                                 &language,
@@ -337,6 +345,7 @@ impl LspClient {
         diagnostics: &DiagnosticsCache,
         diagnostics_generation: &Arc<Mutex<HashMap<Uri, u64>>>,
         diagnostics_notify: &Notify,
+        has_published_diagnostics: &Arc<AtomicBool>,
         progress: &Arc<Mutex<ProgressTracker>>,
         state: &Arc<AtomicU8>,
         language: &str,
@@ -352,6 +361,8 @@ impl LspClient {
                         params.diagnostics.len(),
                         params.uri.as_str()
                     );
+                    has_published_diagnostics.store(true, Ordering::SeqCst);
+
                     let mut cache = diagnostics.lock().await;
                     cache.insert(params.uri.clone(), params.diagnostics);
                     drop(cache);
@@ -1006,6 +1017,44 @@ impl LspClient {
         snapshot: u64,
         timeout: Duration,
     ) -> bool {
+        if !self.has_published_diagnostics.load(Ordering::SeqCst) {
+            if !self.is_warming_up() {
+                // Past warmup and server has never published diagnostics —
+                // it likely doesn't support them. Don't block.
+                return true;
+            }
+            // During warmup, cap the wait to the remaining warmup time so
+            // we don't block for the full diagnostic timeout on servers
+            // that will never publish diagnostics.
+            let warmup_remaining = WARMUP_PERIOD.saturating_sub(self.spawn_time.elapsed());
+            if warmup_remaining.is_zero() {
+                return true;
+            }
+            let deadline = tokio::time::Instant::now() + warmup_remaining;
+            loop {
+                if self.diagnostics_generation(uri).await > snapshot {
+                    // Server published diagnostics during warmup — fall
+                    // through to the normal settle logic below.
+                    break;
+                }
+                if !self.is_alive() {
+                    return false;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    // Warmup expired and still no diagnostics — give up.
+                    return true;
+                }
+                match tokio::time::timeout(remaining, self.diagnostics_notify.notified()).await {
+                    Ok(()) => {}
+                    Err(_) => {
+                        // Warmup expired without diagnostics — give up.
+                        return true;
+                    }
+                }
+            }
+        }
+
         let deadline = tokio::time::Instant::now() + timeout;
 
         // Phase 1: Wait for diagnostics generation to advance past snapshot.
