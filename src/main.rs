@@ -219,6 +219,8 @@ async fn run_server(args: Args) -> Result<()> {
         roots,
         broadcaster.clone(),
     ));
+    client_manager.spawn_all().await;
+
     let doc_manager = Arc::new(Mutex::new(DocumentManager::new()));
     let runtime = tokio::runtime::Handle::current();
 
@@ -252,7 +254,6 @@ async fn run_server(args: Args) -> Result<()> {
         client_manager.clone(),
         doc_manager,
         runtime,
-        config,
         broadcaster.clone(),
         path_validator.clone(),
         run_tool.clone(),
@@ -304,7 +305,9 @@ async fn run_server(args: Args) -> Result<()> {
                 }
             }
 
-            runtime_for_roots.block_on(client_manager_for_roots.sync_roots(paths))
+            runtime_for_roots.block_on(client_manager_for_roots.sync_roots(paths))?;
+            runtime_for_roots.block_on(client_manager_for_roots.spawn_all());
+            Ok(())
         }))
         .tools_changed_flag(tools_changed_flag);
 

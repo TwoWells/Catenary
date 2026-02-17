@@ -16,7 +16,8 @@
  */
 
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use ignore::WalkBuilder;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -27,7 +28,7 @@ use crate::lsp::LspClient;
 use crate::lsp::state::ServerStatus;
 use crate::session::EventBroadcaster;
 
-/// Manages the lifecycle of LSP clients (lazy spawning, caching, shutdown).
+/// Manages the lifecycle of LSP clients (spawning, caching, shutdown).
 pub struct ClientManager {
     config: Config,
     roots: Mutex<Vec<PathBuf>>,
@@ -44,6 +45,34 @@ impl ClientManager {
             roots: Mutex::new(roots),
             active_clients: Mutex::new(HashMap::new()),
             broadcaster,
+        }
+    }
+
+    /// Spawns LSP servers for languages detected in the workspace.
+    ///
+    /// Scans workspace roots for file types, matches against configured
+    /// server keys, and only spawns servers for languages actually present.
+    /// Servers that fail to spawn are logged and skipped — a misconfigured
+    /// server should not prevent other servers from starting.
+    pub async fn spawn_all(&self) {
+        let roots = self.roots.lock().await.clone();
+        let configured_keys: HashSet<&str> =
+            self.config.server.keys().map(String::as_str).collect();
+        let relevant = detect_workspace_languages(&roots, &configured_keys);
+
+        if relevant.is_empty() {
+            info!("No configured languages detected in workspace");
+            return;
+        }
+
+        let mut sorted: Vec<&str> = relevant.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        info!("Detected languages in workspace: {}", sorted.join(", "));
+
+        for lang in &relevant {
+            if let Err(e) = self.get_client(lang).await {
+                warn!("Failed to spawn LSP server for {lang}: {e}");
+            }
         }
     }
 
@@ -324,6 +353,107 @@ impl ClientManager {
     }
 }
 
+/// Scans workspace roots for files and returns the set of configured
+/// language keys that have matching files present.
+///
+/// Respects `.gitignore` and skips hidden files. Exits early once all
+/// configured languages have been detected.
+fn detect_workspace_languages(
+    roots: &[PathBuf],
+    configured_keys: &HashSet<&str>,
+) -> HashSet<String> {
+    let mut detected = HashSet::new();
+
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+
+        let walker = WalkBuilder::new(root).git_ignore(true).hidden(true).build();
+
+        for entry in walker.flatten() {
+            let path = entry.path();
+
+            // Filename-based detection
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                let lang = match name {
+                    "Dockerfile" => Some("dockerfile"),
+                    "Makefile" => Some("makefile"),
+                    "CMakeLists.txt" => Some("cmake"),
+                    _ => None,
+                };
+                if let Some(l) = lang {
+                    if configured_keys.contains(l) {
+                        detected.insert(l.to_string());
+                    }
+                    if detected.len() == configured_keys.len() {
+                        return detected;
+                    }
+                    continue;
+                }
+            }
+
+            // Extension-based detection
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && let Some(lang) = extension_to_config_key(ext)
+                && configured_keys.contains(lang)
+            {
+                detected.insert(lang.to_string());
+            }
+
+            if detected.len() == configured_keys.len() {
+                return detected;
+            }
+        }
+    }
+
+    detected
+}
+
+/// Maps a file extension to the language config key used in
+/// `config.server`.
+fn extension_to_config_key(ext: &str) -> Option<&'static str> {
+    match ext {
+        "rs" => Some("rust"),
+        "py" => Some("python"),
+        "go" => Some("go"),
+        "js" | "jsx" => Some("javascript"),
+        "ts" | "tsx" => Some("typescript"),
+        "c" => Some("c"),
+        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some("cpp"),
+        "cs" => Some("csharp"),
+        "java" => Some("java"),
+        "kt" | "kts" => Some("kotlin"),
+        "swift" => Some("swift"),
+        "rb" => Some("ruby"),
+        "php" => Some("php"),
+        "sh" | "bash" | "zsh" => Some("shellscript"),
+        "json" => Some("json"),
+        "yaml" | "yml" => Some("yaml"),
+        "toml" => Some("toml"),
+        "md" => Some("markdown"),
+        "html" => Some("html"),
+        "css" => Some("css"),
+        "scss" => Some("scss"),
+        "lua" => Some("lua"),
+        "sql" => Some("sql"),
+        "zig" => Some("zig"),
+        "mojo" => Some("mojo"),
+        "dart" => Some("dart"),
+        "nix" => Some("nix"),
+        "proto" => Some("proto"),
+        "graphql" | "gql" => Some("graphql"),
+        "r" | "R" => Some("r"),
+        "jl" => Some("julia"),
+        "scala" | "sc" => Some("scala"),
+        "hs" => Some("haskell"),
+        "ex" | "exs" => Some("elixir"),
+        "erl" | "hrl" => Some("erlang"),
+        "vim" => Some("vim"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,7 +463,6 @@ mod tests {
         Config {
             server: HashMap::new(),
             idle_timeout: 300,
-            smart_wait: true,
             tools: crate::config::ToolsConfig::default(),
         }
     }

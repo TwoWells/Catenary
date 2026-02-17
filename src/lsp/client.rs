@@ -200,21 +200,31 @@ impl LspClient {
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                     // Request or Notification
                     if let Some(id) = value.get("id") {
-                        // Server Request (e.g., workspace/configuration)
+                        // Server Request
                         debug!("Received server request: {} (id: {})", method, id);
 
-                        // Reply with MethodNotFound to unblock server
-                        let response = ResponseMessage {
-                            jsonrpc: "2.0".to_string(),
-                            id: Some(
-                                serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0)),
-                            ),
-                            result: None,
-                            error: Some(protocol::ResponseError {
-                                code: -32601, // MethodNotFound
-                                message: format!("Method '{method}' not supported by client"),
-                                data: None,
-                            }),
+                        let request_id =
+                            serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0));
+
+                        let response = match method {
+                            "workspace/configuration" => {
+                                Self::handle_configuration_request(&value, request_id)
+                            }
+                            _ => {
+                                // MethodNotFound for unsupported requests
+                                ResponseMessage {
+                                    jsonrpc: "2.0".to_string(),
+                                    id: Some(request_id),
+                                    result: None,
+                                    error: Some(protocol::ResponseError {
+                                        code: -32601,
+                                        message: format!(
+                                            "Method '{method}' not supported by client"
+                                        ),
+                                        data: None,
+                                    }),
+                                }
+                            }
                         };
 
                         if let Ok(body) = serde_json::to_string(&response) {
@@ -266,6 +276,29 @@ impl LspClient {
         alive.store(false, Ordering::SeqCst);
         state.store(ServerState::Dead.as_u8(), Ordering::SeqCst);
         warn!("LSP reader task exiting - server connection lost");
+    }
+
+    /// Handles `workspace/configuration` requests from the server.
+    ///
+    /// Returns an empty object for each requested configuration item,
+    /// allowing the server to fall back to its built-in defaults.
+    fn handle_configuration_request(value: &serde_json::Value, id: RequestId) -> ResponseMessage {
+        let item_count = value
+            .get("params")
+            .and_then(|p| p.get("items"))
+            .and_then(|i| i.as_array())
+            .map_or(1, Vec::len);
+
+        let results: Vec<serde_json::Value> = (0..item_count)
+            .map(|_| serde_json::Value::Object(serde_json::Map::new()))
+            .collect();
+
+        ResponseMessage {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            result: Some(serde_json::Value::Array(results)),
+            error: None,
+        }
     }
 
     /// Handles incoming LSP notifications.
@@ -504,6 +537,7 @@ impl LspClient {
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
                     workspace_folders: Some(true),
+                    configuration: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()

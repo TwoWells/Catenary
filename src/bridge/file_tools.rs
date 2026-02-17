@@ -345,21 +345,24 @@ impl LspBridgeHandler {
     }
 
     /// Fetches diagnostics for a path, returning a formatted string.
-    /// Returns empty string if no LSP server is configured for the language
-    /// or if diagnostics cannot be fetched.
+    /// Returns empty string if no LSP server is configured for the language.
+    /// Returns an explicit warning if the server is dead or unresponsive.
     fn fetch_diagnostics_for_path(&self, path: &Path) -> String {
-        let result: Result<Vec<Diagnostic>> = self.runtime.block_on(async {
+        let result: Result<String> = self.runtime.block_on(async {
             // Try to get the client — if no server configured, this errors
             let client_mutex: Arc<Mutex<LspClient>> = match self.get_client_for_path(path).await {
                 Ok(c) => c,
-                Err(_) => return Ok(Vec::new()), // No LSP server for this language
+                Err(_) => return Ok(String::new()), // No LSP server for this language
             };
 
             let mut doc_manager = self.doc_manager.lock().await;
             let client = client_mutex.lock().await;
+            let lang = client.language().to_string();
 
             if !client.is_alive() {
-                return Ok(Vec::new());
+                return Ok(format!(
+                    "[{lang}] server is not running \u{2014} diagnostics unavailable"
+                ));
             }
 
             if let Some(notification) = doc_manager.ensure_open(path).await? {
@@ -376,34 +379,40 @@ impl LspBridgeHandler {
             let uri = doc_manager.uri_for_path(path)?;
             drop(doc_manager);
 
-            // Wait briefly for analysis
+            // Wait for analysis
             if !client.wait_for_analysis().await {
-                return Ok(Vec::new());
+                return Ok(format!(
+                    "[{lang}] server stopped responding \u{2014} diagnostics unavailable"
+                ));
             }
 
-            Ok(client.get_diagnostics(&uri).await)
-        });
-
-        match result {
-            Ok(diagnostics) if diagnostics.is_empty() => String::new(),
-            Ok(diagnostics) => {
-                format!(
+            let diagnostics = client.get_diagnostics(&uri).await;
+            drop(client);
+            if diagnostics.is_empty() {
+                Ok(String::new())
+            } else {
+                Ok(format!(
                     "Diagnostics ({}):\n{}",
                     diagnostics.len(),
                     format_diagnostics_compact(&diagnostics)
-                )
+                ))
             }
-            Err(_) => String::new(),
+        });
+
+        match result {
+            Ok(s) => s,
+            Err(e) => format!("Diagnostics error: {e}"),
         }
     }
 
     /// Notifies the LSP server of a file write and returns formatted diagnostics.
-    /// Returns empty string if no LSP server is available.
+    /// Returns empty string if no LSP server is configured for the language.
+    /// Returns an explicit warning if the server is dead or unresponsive.
     fn notify_lsp_and_get_diagnostics(&self, path: &Path, content: &str) -> String {
-        let result: Result<Vec<Diagnostic>> = self.runtime.block_on(async {
+        let result: Result<String> = self.runtime.block_on(async {
             let client_mutex: Arc<Mutex<LspClient>> = match self.get_client_for_path(path).await {
                 Ok(c) => c,
-                Err(_) => return Ok(Vec::new()),
+                Err(_) => return Ok(String::new()),
             };
 
             let mtime = tokio::fs::metadata(path)
@@ -417,8 +426,12 @@ impl LspBridgeHandler {
             };
 
             let client = client_mutex.lock().await;
+            let lang = client.language().to_string();
+
             if !client.is_alive() {
-                return Ok(Vec::new());
+                return Ok(format!(
+                    "[{lang}] server is not running \u{2014} diagnostics unavailable"
+                ));
             }
 
             match notification {
@@ -437,22 +450,27 @@ impl LspBridgeHandler {
 
             // Wait for analysis
             if !client.wait_for_analysis().await {
-                return Ok(Vec::new());
+                return Ok(format!(
+                    "[{lang}] server stopped responding \u{2014} diagnostics unavailable"
+                ));
             }
 
-            Ok(client.get_diagnostics(&uri).await)
-        });
-
-        match result {
-            Ok(diagnostics) if diagnostics.is_empty() => String::new(),
-            Ok(diagnostics) => {
-                format!(
+            let diagnostics = client.get_diagnostics(&uri).await;
+            drop(client);
+            if diagnostics.is_empty() {
+                Ok(String::new())
+            } else {
+                Ok(format!(
                     "Diagnostics ({}):\n{}",
                     diagnostics.len(),
                     format_diagnostics_compact(&diagnostics)
-                )
+                ))
             }
-            Err(_) => String::new(),
+        });
+
+        match result {
+            Ok(s) => s,
+            Err(e) => format!("Diagnostics error: {e}"),
         }
     }
 

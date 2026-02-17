@@ -38,7 +38,6 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::config::Config;
 use crate::lsp::{ClientManager, LspClient, ServerState};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
@@ -46,19 +45,9 @@ use crate::session::{EventBroadcaster, EventKind};
 use super::PathValidator;
 use super::run_tool::RunToolManager;
 
-/// Methods that should wait for server readiness before executing.
-const METHODS_WAIT_FOR_READY: &[&str] = &[
-    "hover",
-    "definition",
-    "type_definition",
-    "implementation",
-    "find_references",
-    "document_symbols",
-    "search",
-    "code_actions",
-    "completion",
-    "diagnostics",
-];
+/// Tools that do not require LSP server readiness.
+/// Everything else waits by default — new tools are safe automatically.
+const METHODS_SKIP_WAIT: &[&str] = &["status", "list_directory", "run"];
 
 use super::{DocumentManager, DocumentNotification};
 
@@ -108,11 +97,6 @@ pub struct SymbolOrPositionInput {
 pub struct FileInput {
     /// Path to the file.
     pub file: String,
-    /// Whether to wait for the LSP server to finish analysis before returning results.
-    ///
-    /// Defaults to `true`.
-    #[serde(default = "default_true")]
-    pub wait_for_reanalysis: bool,
 }
 
 const fn default_true() -> bool {
@@ -261,7 +245,6 @@ pub struct LspBridgeHandler {
     pub(super) client_manager: Arc<ClientManager>,
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
     pub(super) runtime: Handle,
-    pub(super) config: Config,
     pub(super) broadcaster: EventBroadcaster,
     pub(super) path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
     pub(super) run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
@@ -273,7 +256,6 @@ impl LspBridgeHandler {
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
-        config: Config,
         broadcaster: EventBroadcaster,
         path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
         run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
@@ -282,7 +264,6 @@ impl LspBridgeHandler {
             client_manager,
             doc_manager,
             runtime,
-            config,
             broadcaster,
             path_validator,
             run_tool,
@@ -304,13 +285,14 @@ impl LspBridgeHandler {
         reason = "Client lock held across wait_ready call"
     )]
     async fn wait_for_server_ready(&self, path: &Path) -> Result<()> {
-        let (lang, is_ready) = {
-            let client_mutex = self.get_client_for_path(path).await?;
-            let client = client_mutex.lock().await;
-            let lang = client.language().to_string();
-            let ready = client.wait_ready().await;
-            (lang, ready)
+        let Ok(client_mutex) = self.get_client_for_path(path).await else {
+            return Ok(()); // No LSP server configured for this language
         };
+
+        let client = client_mutex.lock().await;
+        let lang = client.language().to_string();
+        let is_ready = client.wait_ready().await;
+        drop(client);
 
         if !is_ready {
             return Err(anyhow!(
@@ -736,7 +718,7 @@ impl LspBridgeHandler {
         let result = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
-            if input.wait_for_reanalysis && !client_mutex.lock().await.wait_for_analysis().await {
+            if !client_mutex.lock().await.wait_for_analysis().await {
                 return Err(anyhow!("LSP server stopped responding during analysis"));
             }
 
@@ -773,12 +755,12 @@ impl LspBridgeHandler {
         Ok(CallToolResult::text(sections.join("\n")))
     }
 
-    /// Executes a single search query with workspace symbols and grep fallback.
+    /// Executes a single search query: LSP workspace symbols + ripgrep file heatmap.
     fn search_single(&self, query: &str) -> String {
         debug!("Search request: query={query}");
 
-        // First try workspace symbols (fast path)
-        let (workspace_result, warnings) = self.runtime.block_on(async {
+        // 1. Workspace symbols from all active LSP servers
+        let symbol_lines = self.runtime.block_on(async {
             let params = WorkspaceSymbolParams {
                 query: query.to_string(),
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
@@ -786,8 +768,7 @@ impl LspBridgeHandler {
             };
 
             let clients = self.client_manager.active_clients().await;
-            let mut results = Vec::new();
-            let mut warnings = Vec::new();
+            let mut lines = Vec::new();
 
             for (lang, client_mutex) in &clients {
                 match client_mutex
@@ -796,259 +777,138 @@ impl LspBridgeHandler {
                     .workspace_symbols(params.clone())
                     .await
                 {
-                    Ok(Some(response)) => results.push(response),
+                    Ok(Some(response)) => {
+                        let formatted = format_workspace_symbols(&response);
+                        if formatted != "No symbols found" {
+                            lines.push(formatted);
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         warn!("[{lang}] workspace symbol search failed: {e}");
-                        warnings.push(format!(
-                            "Warning: [{lang}] unavailable, results may be incomplete"
-                        ));
                     }
                 }
             }
 
-            (results, warnings)
+            lines
         });
 
-        // Check if we got any symbols from workspace search
-        let has_results = workspace_result
-            .iter()
-            .any(|r| !format_workspace_symbols(r).contains("No symbols found"));
+        // 2. Ripgrep file heatmap (always, covers all non-ignored files)
+        let roots = self.runtime.block_on(self.client_manager.roots());
+        let heatmap = Self::ripgrep_heatmap(query, &roots);
 
-        if has_results {
-            let mut text = if warnings.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n\n", warnings.join("\n"))
-            };
-            text.push_str(
-                &workspace_result
-                    .iter()
-                    .map(format_workspace_symbols)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-            return text;
+        // 3. Combine
+        let has_symbols = !symbol_lines.is_empty();
+        let has_heatmap = !heatmap.is_empty();
+
+        if !has_symbols && !has_heatmap {
+            return "No results found".to_string();
         }
-
-        // Fallback: search files with ripgrep, then query document symbols
-        debug!("Workspace symbols found nothing, trying fallback search");
-        self.search_fallback(query, &warnings)
-    }
-
-    /// Fallback search: ripgrep for files, then document symbols.
-    /// Adds a note about grep limitations when LSP workspace symbols were unavailable.
-    fn search_fallback(&self, query: &str, warnings: &[String]) -> String {
-        const MAX_FILES: usize = 20;
 
         let mut output = String::new();
-        if !warnings.is_empty() {
-            output.push_str(&warnings.join("\n"));
-            output.push('\n');
+
+        if has_symbols {
+            output.push_str("## Symbols\n");
+            output.push_str(&symbol_lines.join("\n"));
         }
 
-        let roots = self.runtime.block_on(self.client_manager.roots());
-
-        // Try ripgrep to find files, then query document symbols
-        let files = Self::ripgrep_search(query, &roots)
-            .unwrap_or_else(|_| Self::manual_file_search(query, &roots));
-
-        if files.is_empty() {
-            output.push_str("No results found");
-            return output;
-        }
-
-        let files: Vec<_> = files.into_iter().take(MAX_FILES).collect();
-        debug!("Searching {} files for '{}'", files.len(), query);
-
-        // Query document symbols for each file and filter
-        let mut found_symbols = Vec::new();
-        let query_lower = query.to_lowercase();
-
-        for file_path in &files {
-            if let Ok(Some(symbols)) = self.get_matching_symbols(file_path, &query_lower) {
-                found_symbols.extend(symbols);
+        if has_heatmap {
+            if has_symbols {
+                output.push_str("\n\n");
             }
-        }
-
-        if found_symbols.is_empty() {
-            // No LSP symbols matched — fall back to raw grep line matches
-            output.push_str(
-                "Note: text search only (cannot distinguish definitions from usages).\n\n",
-            );
-            let grep_lines = Self::ripgrep_search_lines(query, &roots);
-            if grep_lines.is_empty() {
-                output.push_str("No results found");
-            } else {
-                output.push_str(&grep_lines);
-            }
-        } else {
-            output.push_str(&found_symbols.join("\n"));
+            output.push_str("## File matches\n");
+            output.push_str(&heatmap);
         }
 
         output
     }
 
-    /// Use ripgrep to find files containing the query across workspace roots.
-    fn ripgrep_search(query: &str, roots: &[PathBuf]) -> Result<Vec<std::path::PathBuf>> {
+    /// Runs ripgrep and returns a file-level heatmap: file path, match count, line range.
+    ///
+    /// Searches all non-ignored files (no `--type` filter) so config files,
+    /// docs, and other non-code files are included.
+    fn ripgrep_heatmap(query: &str, roots: &[PathBuf]) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write;
         use std::process::Command;
 
         let mut cmd = Command::new("rg");
-        cmd.args([
-            "--files-with-matches",
-            "--ignore-case",
-            "--type-add",
-            "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,cs,rb,php,swift,kt,scala,lua,sh,bash,zsh}",
-            "--type",
-            "code",
-            query,
-        ]);
+        cmd.args(["--line-number", "--no-heading", "--ignore-case", query]);
 
         for root in roots {
             cmd.arg(root);
         }
 
-        let output = cmd
-            .output()
-            .map_err(|e| anyhow!("Failed to run ripgrep: {e}"))?;
-
-        if !output.status.success() && output.stdout.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let files: Vec<std::path::PathBuf> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(std::path::PathBuf::from)
-            .collect();
-
-        Ok(files)
-    }
-
-    /// Use ripgrep to get line-level matches (`file:line:content`) across workspace roots.
-    fn ripgrep_search_lines(query: &str, roots: &[PathBuf]) -> String {
-        use std::process::Command;
-
-        let mut cmd = Command::new("rg");
-        cmd.args([
-            "--line-number",
-            "--no-heading",
-            "--max-count",
-            "5",
-            "--ignore-case",
-            "--type-add",
-            "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,cs,rb,php,swift,kt,scala,lua,sh,bash,zsh}",
-            "--type",
-            "code",
-            query,
-        ]);
-
-        for root in roots {
-            cmd.arg(root);
-        }
-
-        let Ok(output) = cmd.output() else {
+        let Ok(rg_output) = cmd.output() else {
             return String::new();
         };
 
-        if !output.status.success() && output.stdout.is_empty() {
+        if !rg_output.status.success() && rg_output.stdout.is_empty() {
             return String::new();
         }
 
-        let text = String::from_utf8_lossy(&output.stdout);
-        // Cap output to 50 lines
-        text.lines().take(50).collect::<Vec<_>>().join("\n")
-    }
+        // Parse output lines: "file:line:content" — group by file
+        // Use BTreeMap for deterministic (sorted) file order
+        let mut file_stats: BTreeMap<String, (usize, u32, u32)> = BTreeMap::new();
+        let stdout = String::from_utf8_lossy(&rg_output.stdout);
 
-    /// Manual file search fallback when ripgrep is not available.
-    fn manual_file_search(query: &str, roots: &[PathBuf]) -> Vec<std::path::PathBuf> {
-        let query_lower = query.to_lowercase();
-        let mut matches = Vec::new();
-
-        let mut builder = WalkBuilder::new(roots.first().map_or_else(
-            || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Clone::clone,
-        ));
-        for root in roots.iter().skip(1) {
-            builder.add(root);
-        }
-        let walker = builder
-            .hidden(true)
-            .git_ignore(true)
-            .max_depth(Some(10))
-            .build();
-
-        for entry in walker.flatten() {
-            if matches.len() >= 50 {
-                break; // Cap search
-            }
-
-            let path = entry.path();
-            if !path.is_file() {
+        for line in stdout.lines() {
+            // Format: file:line_number:content
+            // Find second colon (first colon may be in Windows path, but we're on Linux)
+            let Some((file, rest)) = line.split_once(':') else {
                 continue;
-            }
-
-            // Only search code files
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !matches!(
-                ext,
-                "rs" | "py"
-                    | "js"
-                    | "ts"
-                    | "tsx"
-                    | "jsx"
-                    | "go"
-                    | "java"
-                    | "c"
-                    | "cpp"
-                    | "h"
-                    | "hpp"
-                    | "cs"
-                    | "rb"
-                    | "php"
-                    | "swift"
-                    | "kt"
-                    | "scala"
-            ) {
-                continue;
-            }
-
-            // Read and search file content
-            if let Ok(content) = std::fs::read_to_string(path)
-                && content.to_lowercase().contains(&query_lower)
-            {
-                matches.push(path.to_path_buf());
-            }
-        }
-
-        matches
-    }
-
-    /// Get document symbols from a file that match the query.
-    fn get_matching_symbols(
-        &self,
-        path: &std::path::Path,
-        query_lower: &str,
-    ) -> Result<Option<Vec<String>>> {
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(path).await?;
-            let params = DocumentSymbolParams {
-                text_document: TextDocumentIdentifier { uri },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
             };
-            client_mutex.lock().await.document_symbols(params).await
-        })?;
+            let Some((line_str, _content)) = rest.split_once(':') else {
+                continue;
+            };
+            let Ok(line_num) = line_str.parse::<u32>() else {
+                continue;
+            };
 
-        let Some(response) = result else {
-            return Ok(None);
-        };
-
-        let symbols = filter_matching_symbols(&response, query_lower, path);
-        if symbols.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(symbols))
+            let entry = file_stats
+                .entry(file.to_string())
+                .or_insert((0, u32::MAX, 0));
+            entry.0 += 1; // count
+            entry.1 = entry.1.min(line_num); // min line
+            entry.2 = entry.2.max(line_num); // max line
         }
+
+        if file_stats.is_empty() {
+            return String::new();
+        }
+
+        // Sort by match count descending, then by file path
+        let mut sorted: Vec<_> = file_stats.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+
+        // Show all files — the model has no way to retrieve omitted results
+        let mut output = String::new();
+        for (file, (count, min_line, max_line)) in sorted {
+            let display_path = roots
+                .iter()
+                .find_map(|root| {
+                    let root_str = root.to_string_lossy();
+                    file.strip_prefix(root_str.as_ref())
+                        .map(|rest| rest.strip_prefix('/').unwrap_or(rest).to_string())
+                })
+                .unwrap_or_else(|| file.clone());
+
+            let line_range = if min_line == max_line {
+                format!("line {min_line}")
+            } else {
+                format!("lines {min_line}-{max_line}")
+            };
+
+            let match_word = if count == 1 { "match" } else { "matches" };
+            let _ = writeln!(
+                output,
+                "{display_path}: {count} {match_word} ({line_range})"
+            );
+        }
+
+        // Remove trailing newline
+        output.truncate(output.trim_end().len());
+        output
     }
 
     fn handle_code_actions(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
@@ -1182,7 +1042,7 @@ impl LspBridgeHandler {
         let diagnostics = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
-            if input.wait_for_reanalysis && !client_mutex.lock().await.wait_for_analysis().await {
+            if !client_mutex.lock().await.wait_for_analysis().await {
                 return Err(anyhow!("LSP server stopped responding during analysis"));
             }
 
@@ -1879,7 +1739,7 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "search".to_string(),
-                description: Some("Search for a symbol or pattern across the workspace. Uses LSP workspace symbols when available, falls back to text search. Warns when using fallback since text search cannot distinguish definitions from usages.".to_string()),
+                description: Some("Search for a symbol or pattern across the workspace. Returns LSP workspace symbols (semantic) plus a file heatmap showing which files contain the query and where (match count + line range).".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2150,10 +2010,10 @@ impl ToolHandler for LspBridgeHandler {
             return Ok(result);
         }
 
-        // Smart wait for methods that need a ready server.
+        // Wait for LSP readiness on all tools that touch language servers.
         // File-scoped calls wait for the specific server; symbol-only calls
         // wait for all active servers since we don't know which will handle it.
-        if self.config.smart_wait && METHODS_WAIT_FOR_READY.contains(&name) {
+        if !METHODS_SKIP_WAIT.contains(&name) {
             let wait_result = Self::extract_file_path(arguments.as_ref())
                 .as_ref()
                 .map_or_else(
@@ -2290,8 +2150,7 @@ fn file_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "file": { "type": "string", "description": "Absolute path to the file" },
-            "wait_for_reanalysis": { "type": "boolean", "description": "Wait for LSP server to finish re-analyzing the file after changes (default: true)" }
+            "file": { "type": "string", "description": "Absolute path to the file" }
         },
         "required": ["file"]
     })
@@ -2556,56 +2415,6 @@ fn format_workspace_symbols(response: &WorkspaceSymbolResponse) -> String {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-        }
-    }
-}
-
-/// Filter document symbols that match the query (case-insensitive).
-fn filter_matching_symbols(
-    response: &DocumentSymbolResponse,
-    query_lower: &str,
-    file_path: &std::path::Path,
-) -> Vec<String> {
-    let mut results = Vec::new();
-    let file_str = file_path.display().to_string();
-
-    match response {
-        DocumentSymbolResponse::Flat(symbols) => {
-            for symbol in symbols {
-                if symbol.name.to_lowercase().contains(query_lower) {
-                    let line = symbol.location.range.start.line + 1;
-                    results.push(format!(
-                        "{} [{:?}] {}:{}",
-                        symbol.name, symbol.kind, file_str, line
-                    ));
-                }
-            }
-        }
-        DocumentSymbolResponse::Nested(symbols) => {
-            collect_matching_nested_symbols(symbols, query_lower, &file_str, &mut results);
-        }
-    }
-
-    results
-}
-
-/// Recursively collect matching symbols from nested document symbols.
-fn collect_matching_nested_symbols(
-    symbols: &[DocumentSymbol],
-    query_lower: &str,
-    file_str: &str,
-    results: &mut Vec<String>,
-) {
-    for symbol in symbols {
-        if symbol.name.to_lowercase().contains(query_lower) {
-            let line = symbol.selection_range.start.line + 1;
-            results.push(format!(
-                "{} [{:?}] {}:{}",
-                symbol.name, symbol.kind, file_str, line
-            ));
-        }
-        if let Some(children) = &symbol.children {
-            collect_matching_nested_symbols(children, query_lower, file_str, results);
         }
     }
 }

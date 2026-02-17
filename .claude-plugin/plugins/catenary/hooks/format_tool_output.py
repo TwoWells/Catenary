@@ -93,7 +93,6 @@ def emit_result(formatted):
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "ask",
                 "permissionDecisionReason": f"\n{formatted}",
             }
         },
