@@ -828,16 +828,17 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_detect_language_already_detected() {
+    fn test_maybe_detect_language_already_detected() -> Result<()> {
         let config = make_config(&["git"], &[("rust", &["cargo"])]);
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new()?;
         let rs_file = dir.path().join("main.rs");
-        fs::write(&rs_file, "fn main() {}").unwrap();
+        fs::write(&rs_file, "fn main() {}")?;
 
         let mut manager = RunToolManager::new(&config, &[dir.path().to_path_buf()]);
         assert!(manager.detected_languages.contains("rust"));
         // Already detected — should return false
         assert!(!manager.maybe_detect_language(Path::new("src/lib.rs")));
+        Ok(())
     }
 
     #[test]

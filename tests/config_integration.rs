@@ -20,6 +20,8 @@ fn test_config_loading() -> Result<()> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
     cmd.arg("--root").arg(&root_dir); // Catenary root
+    // Isolate from user-level config
+    cmd.env("XDG_CONFIG_HOME", &root_dir);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -113,6 +115,8 @@ fn test_config_override() -> Result<()> {
     cmd.arg("--lsp").arg("rust:rust-analyzer");
     cmd.arg("--idle-timeout").arg("10");
     cmd.arg("--root").arg(&root_dir);
+    // Isolate from user-level config
+    cmd.env("XDG_CONFIG_HOME", &root_dir);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

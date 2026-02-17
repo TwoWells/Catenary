@@ -20,6 +20,8 @@ impl BridgeProcess {
         // Enable rust-analyzer
         cmd.arg("--lsp").arg("rust:rust-analyzer");
         cmd.arg("--root").arg(root);
+        // Isolate from user-level config
+        cmd.env("XDG_CONFIG_HOME", root);
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -22,6 +22,8 @@ impl ServerProcess {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("serve");
         cmd.arg("--root").arg(".");
+        // Isolate from user-level config
+        cmd.env("XDG_CONFIG_HOME", ".");
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

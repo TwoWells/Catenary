@@ -19,6 +19,8 @@ impl BridgeProcess {
     fn spawn(root: &str) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("--root").arg(root);
+        // Isolate from user-level config
+        cmd.env("XDG_CONFIG_HOME", root);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());

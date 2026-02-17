@@ -26,6 +26,8 @@ impl BridgeProcess {
             .arg(root)
             .arg("--config")
             .arg(&config_path);
+        // Isolate from user-level config
+        cmd.env("XDG_CONFIG_HOME", root);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -46,6 +48,9 @@ impl BridgeProcess {
     fn spawn_without_config(root: &str) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("--root").arg(root);
+        // Point XDG_CONFIG_HOME at the (empty) root so no user-level
+        // ~/.config/catenary/config.toml is picked up.
+        cmd.env("XDG_CONFIG_HOME", root);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -343,5 +348,106 @@ allowed = ["git", "make"]
         description.contains("make"),
         "Description should include make: {description}"
     );
+    Ok(())
+}
+
+#[test]
+fn test_write_file_triggers_language_detection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(
+        &dir.path().to_string_lossy(),
+        r#"
+[tools.run]
+allowed = ["git"]
+
+[tools.run.rust]
+allowed = ["cargo"]
+"#,
+    )?;
+    bridge.initialize()?;
+
+    // First tools/list — rust should be "not detected"
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list"
+    }))?;
+
+    let response = bridge.recv()?;
+    let tools = response
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+        .context("No tools in response")?;
+
+    let run_tool = tools
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("run"))
+        .context("run tool not found in initial tools/list")?;
+
+    let description = run_tool
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+
+    assert!(
+        description.contains("rust (not detected)"),
+        "Before write_file, rust should be not detected: {description}"
+    );
+
+    // Write a .rs file to trigger language detection
+    let rs_path = dir.path().join("main.rs");
+    let text = bridge.call_tool_text(
+        "write_file",
+        &json!({ "file": rs_path.to_string_lossy(), "content": "fn main() {}\n" }),
+    )?;
+    assert!(text.contains("Wrote"), "write_file should succeed: {text}");
+
+    // Consume the notifications/tools/list_changed notification
+    let notification = bridge.recv()?;
+    assert_eq!(
+        notification.get("method").and_then(|m| m.as_str()),
+        Some("notifications/tools/list_changed"),
+        "Expected tools/list_changed notification: {notification:?}"
+    );
+
+    // Second tools/list — rust should now be "detected" with cargo
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list"
+    }))?;
+
+    let response = bridge.recv()?;
+    let tools = response
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+        .context("No tools in second response")?;
+
+    let run_tool = tools
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("run"))
+        .context("run tool not found in second tools/list")?;
+
+    let description = run_tool
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+
+    assert!(
+        description.contains("rust (detected)"),
+        "After write_file, rust should be detected: {description}"
+    );
+    assert!(
+        description.contains("cargo"),
+        "After detection, description should include cargo: {description}"
+    );
+    assert!(
+        !description.contains("rust (not detected)"),
+        "After detection, rust should no longer be 'not detected': {description}"
+    );
+
     Ok(())
 }
