@@ -1,6 +1,6 @@
 # Roadmap
 
-Current version: **v0.8.0**
+Current version: **v1.1.0**
 
 ## Completed
 
@@ -61,6 +61,72 @@ LSP tools exposed via MCP. Feature complete.
 
 </details>
 
+### Phase 6: Multi-Workspace Support ✓
+
+Single Catenary instance multiplexing across multiple workspace roots.
+
+- [x] Accept multiple `--root` paths
+- [x] Pass all roots as `workspace_folders` to each LSP server
+- [x] Multi-root search across roots
+- [x] Multi-root `codebase_map` (walks all roots, prefixes entries in multi-root mode)
+- [x] `add_root()` plumbing (appends root, sends `didChangeWorkspaceFolders`)
+- [x] Expose `add_root` mid-session via MCP `roots/list`
+
+### Phase 6.5: Hardening ✓
+
+- [x] Remove `apply_workspace_edit` — `rename`, `apply_quickfix`, and
+      `formatting` return proposed edits only; MCP client applies them
+      (see [LSP Fault Model](lsp-fault-model.md#4-workspace-edit-failures))
+- [x] Error attribution — prefix all LSP-originated errors with server
+      language: `[rust] request timed out`
+- [x] Pass `initializationOptions` from config to LSP server
+- [x] `search` — unified search tool replacing `find_symbol`
+
+### Phase 7: Complete Agent Toolkit ✓
+
+Full toolset to replace CLI built-in tools.
+
+**File I/O:**
+- [x] `read_file` — Read file contents + return diagnostics
+- [x] `write_file` — Write file + return diagnostics
+- [x] `edit_file` — Edit file + return diagnostics
+- [x] `list_directory` — List directory contents
+
+**Shell Execution:**
+- [x] `run` tool with allowlist enforcement
+- [x] `allowed = ["*"]` opt-in for unrestricted shell
+- [x] Dynamic language detection — language-specific commands activate when
+      matching files exist in the workspace
+- [x] Tool description updates dynamically to show current allowlist
+- [x] Emit `tools/list_changed` when allowlist changes (e.g., workspace added)
+- [x] Error messages on denied commands include the current allowlist
+
+**Security:**
+- [x] Path validation against workspace roots (read and write)
+- [x] Symlink traversal protection (`canonicalize()` + root check)
+- [x] Config file self-modification protection (`.catenary.toml`,
+      `~/.config/catenary/config.toml`)
+- [x] Direct command execution (no shell injection)
+- [x] Output size limits (100KB per stream) and timeout enforcement
+
+### Phase 8: Reliability & Polish ✓
+
+- [x] **Eager server startup** — detect workspace languages at startup and
+      spawn configured servers immediately (on-demand for undetected languages)
+- [x] **Always-on readiness wait** — all LSP tools wait for server readiness
+      automatically (removed `smart_wait` config toggle and
+      `wait_for_reanalysis` parameter)
+- [x] **`workspace/configuration` support** — respond to server configuration
+      requests with empty defaults instead of `MethodNotFound`
+- [x] **Search rework** — `search` returns LSP workspace symbols plus a
+      ripgrep file heatmap (match count + line range per file), replacing
+      the previous fallback chain
+- [x] **Diagnostic resilience** — explicit warnings when an LSP server is
+      dead or unresponsive instead of silently returning empty results
+- [x] **`denied` subcommands** — block specific command+subcommand pairs
+      in the `run` tool (e.g., `"git grep"`), takes priority over allowlist
+      including `["*"]`
+
 ### CLI Integration Research ✓
 
 Validated approach: use existing CLI tools (Claude Code, Gemini CLI) with
@@ -102,66 +168,8 @@ See [LSP Fault Model](lsp-fault-model.md) and
 
 ---
 
-## In Progress
+## Low Priority
 
-### Phase 6: Multi-Workspace Support
-
-Single Catenary instance multiplexing across multiple workspace roots.
-
-- [x] Accept multiple `--root` paths
-- [x] Pass all roots as `workspace_folders` to each LSP server
-- [x] Multi-root `find_symbol` fallback (ripgrep + manual search across roots)
-- [x] Multi-root `codebase_map` (walks all roots, prefixes entries in multi-root mode)
-- [x] `add_root()` plumbing (appends root, sends `didChangeWorkspaceFolders`)
-- [x] Expose `add_root` mid-session via MCP `roots/list`
-
-### Phase 6.5: Hardening
-
-- [x] Remove `apply_workspace_edit` — `rename`, `apply_quickfix`, and
-      `formatting` return proposed edits only; MCP client applies them
-      (see [LSP Fault Model](lsp-fault-model.md#4-workspace-edit-failures))
-- [x] Error attribution — prefix all LSP-originated errors with server
-      language: `[rust] request timed out`
-- [x] Silent partial results — warn when workspace search skips a dead
-      server
-- [x] Pass `initializationOptions` from config to LSP server
-- [x] `search` — unified search tool replacing `find_symbol` (LSP →
-      grep fallback), with clear messaging when using fallback
-- [x] Update documentation
-
-### Phase 7: Complete Agent Toolkit ✓
-
-Full toolset to replace CLI built-in tools.
-
-**File I/O:**
-- [x] `read_file` — Read file contents + return diagnostics
-- [x] `write_file` — Write file + return diagnostics
-- [x] `edit_file` — Edit file + return diagnostics
-- [x] `list_directory` — List directory contents
-
-**Shell Execution:**
-- [x] `run` tool with allowlist enforcement
-- [x] `allowed = ["*"]` opt-in for unrestricted shell
-- [x] Dynamic language detection — language-specific commands activate when
-      matching files exist in the workspace
-- [x] Tool description updates dynamically to show current allowlist
-- [x] Emit `tools/list_changed` when allowlist changes (e.g., workspace added)
-- [x] Error messages on denied commands include the current allowlist
-
-**Security:**
-- [x] Path validation against workspace roots (read and write)
-- [x] Symlink traversal protection (`canonicalize()` + root check)
-- [x] Config file self-modification protection (`.catenary.toml`,
-      `~/.config/catenary/config.toml`)
-- [x] Direct command execution (no shell injection)
-- [x] Output size limits (100KB per stream) and timeout enforcement
-
----
-
-## Backlog
-
-- [ ] **Semantic Search:** Integrate local embeddings (RAG) for fuzzy code
-      search (e.g., "Find auth logic")
 - [ ] **Batch Operations:** Query hover/definition/references for multiple
       positions in a single call
 - [ ] **References with Context:** Include surrounding lines (e.g., `-C 3`) in

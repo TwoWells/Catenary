@@ -8,11 +8,6 @@
       "description": "Global idle timeout in seconds. LSP servers will be shut down if no documents are open for this duration.",
       "default": 300
     },
-    "smart_wait": {
-      "type": "boolean",
-      "description": "Wait for LSP servers to be fully ready (initialized) before executing requests.",
-      "default": true
-    },
     "server": {
       "type": "object",
       "description": "Server definitions keyed by language ID (e.g., 'rust', 'python').",
@@ -64,6 +59,14 @@
             "type": "string"
           },
           "description": "Always-allowed commands (e.g., ['git', 'make']). Use ['*'] for unrestricted execution.",
+          "default": []
+        },
+        "denied": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Denied command+subcommand pairs (e.g., ['git grep', 'git log']). Takes priority over allowed, including ['*'].",
           "default": []
         }
       },

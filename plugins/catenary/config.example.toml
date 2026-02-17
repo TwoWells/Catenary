@@ -1,12 +1,12 @@
 # Catenary Configuration
 # Copy to ~/.config/catenary/config.toml and customize
 #
-# Catenary uses lazy loading - servers only start when you open a file
-# of that language, so feel free to add many servers without overhead.
+# At startup Catenary scans the workspace and only spawns servers for
+# languages it detects. Undetected servers start on first file access.
+# Feel free to add many servers without overhead.
 
 # Global configuration
 idle_timeout = 300  # Seconds before closing idle documents (0 to disable)
-smart_wait = true   # Wait for server to be ready before handling requests (default: true)
 
 # Language Server Configuration
 # Format:
@@ -95,6 +95,7 @@ command = "clangd"
 
 # [tools.run]
 # allowed = ["git", "make"]  # Always allowed. Use ["*"] for unrestricted.
+# denied = ["git grep", "git log"]  # Deny specific subcommands (overrides allowed).
 #
 # [tools.run.python]
 # allowed = ["python", "pytest", "uv"]

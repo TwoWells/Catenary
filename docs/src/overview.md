@@ -80,7 +80,7 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | Feature               | Description                                                                            |
 | --------------------- | -------------------------------------------------------------------------------------- |
 | **LSP Multiplexing**  | Run multiple language servers in a single Catenary instance                            |
-| **Lazy Loading**      | Servers only start when you open a file of that language                               |
+| **Eager Startup**     | Servers for detected languages start at launch; others start on first file access      |
 | **Smart Routing**     | Requests automatically route to the correct server based on file type                  |
 | **Universal Support** | Works with any LSP-compliant language server                                           |
 | **Full LSP Coverage** | Hover, definitions, references, diagnostics, completions, rename, formatting, and more |
@@ -98,13 +98,13 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | `type_definition`     | Jump to the type's definition                       |
 | `implementation`      | Find implementations of interfaces/traits           |
 | `find_references` | Find all references to a symbol (by name or position) |
-| `document_symbols`    | Get the outline of a file (supports `wait_for_reanalysis: true`) |
-| `search`         | Search for a symbol or pattern (LSP with grep fallback) |
+| `document_symbols`    | Get the outline of a file                                       |
+| `search`         | Search for a symbol or pattern (LSP workspace symbols + file heatmap) |
 | `code_actions`        | Get quick fixes and refactorings                    |
 | `rename`              | Compute rename edits (does not modify files)        |
 | `completion`          | Get completion suggestions                          |
 | `signature_help`      | Get function parameter info                         |
-| `diagnostics`         | Get errors and warnings (supports `wait_for_reanalysis: true` to ensure fresh results) |
+| `diagnostics`         | Get errors and warnings                                    |
 | `formatting`          | Format a document                                   |
 | `range_formatting`    | Format a selection                                  |
 | `call_hierarchy`      | See who calls a function / what it calls            |

@@ -81,7 +81,7 @@ use file I/O for reading implementation logic and making changes.
 **Use file I/O tools** for:
 
 - Reading implementation logic (not just signatures)
-- Searching comments or string literals (use `search` with grep fallback)
+- Searching comments or string literals (`search` includes a file heatmap)
 - Config files or non-code content
 - Writing and editing code (`write_file`, `edit_file` return diagnostics
   automatically)

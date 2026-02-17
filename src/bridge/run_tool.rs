@@ -81,6 +81,9 @@ pub struct RunOutput {
 pub struct RunToolManager {
     /// Static allowlist from config.
     base_allowed: Vec<String>,
+    /// Denied command+subcommand pairs parsed from config.
+    /// Each entry is `(command, subcommand)`.
+    denied_subcommands: Vec<(String, String)>,
     /// Language-specific commands from config.
     language_configs: HashMap<String, Vec<String>>,
     /// Currently detected languages in workspace.
@@ -110,8 +113,20 @@ impl RunToolManager {
             .cloned()
             .collect();
 
+        let denied_subcommands: Vec<(String, String)> = config
+            .denied
+            .iter()
+            .filter_map(|entry| {
+                let mut parts = entry.splitn(2, ' ');
+                let cmd = parts.next()?.to_string();
+                let sub = parts.next()?.to_string();
+                Some((cmd, sub))
+            })
+            .collect();
+
         let mut manager = Self {
             base_allowed,
+            denied_subcommands,
             language_configs,
             detected_languages: HashSet::new(),
             roots: roots.to_vec(),
@@ -159,12 +174,25 @@ impl RunToolManager {
         changed
     }
 
-    /// Validates that a command is on the allowlist.
+    /// Validates that a command is on the allowlist and not denied.
     ///
     /// # Errors
     ///
-    /// Returns an error with the current allowlist if the command is denied.
-    pub fn validate_command(&self, command: &str) -> Result<()> {
+    /// Returns an error if the command+subcommand is denied, or if the command
+    /// is not on the allowlist.
+    pub fn validate_command(&self, command: &str, args: &[String]) -> Result<()> {
+        // Denied subcommands take priority over everything, including unrestricted
+        if let Some(first_arg) = args.first() {
+            for (denied_cmd, denied_sub) in &self.denied_subcommands {
+                if denied_cmd == command && denied_sub == first_arg {
+                    return Err(anyhow!(
+                        "Command '{command} {first_arg}' is denied. {}",
+                        self.describe_allowlist()
+                    ));
+                }
+            }
+        }
+
         if self.unrestricted {
             return Ok(());
         }
@@ -193,27 +221,36 @@ impl RunToolManager {
     /// Returns a human-readable description of the current allowlist.
     #[must_use]
     pub fn describe_allowlist(&self) -> String {
-        if self.unrestricted {
-            return "All commands are allowed.".to_string();
-        }
-
         let mut parts = Vec::new();
 
-        if !self.base_allowed.is_empty() {
-            parts.push(format!("Allowed: {}", self.base_allowed.join(", ")));
-        }
+        if self.unrestricted {
+            parts.push("All commands are allowed".to_string());
+        } else {
+            if !self.base_allowed.is_empty() {
+                parts.push(format!("Allowed: {}", self.base_allowed.join(", ")));
+            }
 
-        for lang in &self.detected_languages {
-            if let Some(commands) = self.language_configs.get(lang) {
-                parts.push(format!("{lang} (detected): {}", commands.join(", ")));
+            for lang in &self.detected_languages {
+                if let Some(commands) = self.language_configs.get(lang) {
+                    parts.push(format!("{lang} (detected): {}", commands.join(", ")));
+                }
+            }
+
+            // Include configured but not-detected languages for completeness
+            for (lang, commands) in &self.language_configs {
+                if !self.detected_languages.contains(lang) {
+                    parts.push(format!("{lang} (not detected): {}", commands.join(", ")));
+                }
             }
         }
 
-        // Include configured but not-detected languages for completeness
-        for (lang, commands) in &self.language_configs {
-            if !self.detected_languages.contains(lang) {
-                parts.push(format!("{lang} (not detected): {}", commands.join(", ")));
-            }
+        if !self.denied_subcommands.is_empty() {
+            let denied: Vec<String> = self
+                .denied_subcommands
+                .iter()
+                .map(|(cmd, sub)| format!("{cmd} {sub}"))
+                .collect();
+            parts.push(format!("Denied: {}", denied.join(", ")));
         }
 
         if parts.is_empty() {
@@ -404,7 +441,7 @@ impl LspBridgeHandler {
 
         let output = self.runtime.block_on(async {
             let manager = run_tool.read().await;
-            manager.validate_command(&command)?;
+            manager.validate_command(&command, &args)?;
             manager
                 .execute(
                     &command,
@@ -479,6 +516,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_config(allowed: &[&str], languages: &[(&str, &[&str])]) -> RunToolConfig {
+        make_config_with_denied(allowed, &[], languages)
+    }
+
+    fn make_config_with_denied(
+        allowed: &[&str],
+        denied: &[&str],
+        languages: &[(&str, &[&str])],
+    ) -> RunToolConfig {
         let mut lang_map = HashMap::new();
         for (name, cmds) in languages {
             lang_map.insert(
@@ -490,6 +535,7 @@ mod tests {
         }
         RunToolConfig {
             allowed: allowed.iter().map(|s| (*s).to_string()).collect(),
+            denied: denied.iter().map(|s| (*s).to_string()).collect(),
             languages: lang_map,
         }
     }
@@ -499,9 +545,9 @@ mod tests {
         let config = make_config(&["git", "make"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
-        manager.validate_command("git")?;
-        manager.validate_command("make")?;
-        assert!(manager.validate_command("rm").is_err());
+        manager.validate_command("git", &[])?;
+        manager.validate_command("make", &[])?;
+        assert!(manager.validate_command("rm", &[]).is_err());
         Ok(())
     }
 
@@ -510,7 +556,7 @@ mod tests {
         let config = make_config(&["git"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
-        let result = manager.validate_command("rm");
+        let result = manager.validate_command("rm", &[]);
         assert!(result.is_err());
         let err = result
             .err()
@@ -526,8 +572,8 @@ mod tests {
         let config = make_config(&["*"], &[]);
         let manager = RunToolManager::new(&config, &[]);
 
-        manager.validate_command("anything")?;
-        manager.validate_command("rm")?;
+        manager.validate_command("anything", &[])?;
+        manager.validate_command("rm", &[])?;
         Ok(())
     }
 
@@ -543,8 +589,8 @@ mod tests {
         let manager = RunToolManager::new(&config, &[root]);
 
         assert!(manager.detected_languages.contains("python"));
-        manager.validate_command("python")?;
-        manager.validate_command("pytest")?;
+        manager.validate_command("python", &[])?;
+        manager.validate_command("pytest", &[])?;
         Ok(())
     }
 
@@ -563,8 +609,8 @@ mod tests {
         let manager = RunToolManager::new(&config, &[root]);
 
         // Rust detected, Python not
-        manager.validate_command("cargo")?;
-        assert!(manager.validate_command("python").is_err());
+        manager.validate_command("cargo", &[])?;
+        assert!(manager.validate_command("python", &[]).is_err());
         Ok(())
     }
 
@@ -693,6 +739,56 @@ mod tests {
 
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(output.stdout, "hello from stdin");
+        Ok(())
+    }
+
+    #[test]
+    fn test_denied_subcommand_blocks() -> Result<()> {
+        let config = make_config_with_denied(&["git"], &["git grep"], &[]);
+        let manager = RunToolManager::new(&config, &[]);
+
+        let result = manager.validate_command("git", &["grep".into(), "pattern".into()]);
+        assert!(result.is_err());
+        let err = result
+            .err()
+            .ok_or_else(|| anyhow!("expected error"))?
+            .to_string();
+        assert!(
+            err.contains("'git grep'"),
+            "Should mention denied pair: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_denied_does_not_affect_other_subcommands() -> Result<()> {
+        let config = make_config_with_denied(&["git"], &["git grep"], &[]);
+        let manager = RunToolManager::new(&config, &[]);
+
+        manager.validate_command("git", &["status".into()])?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_denied_overrides_unrestricted() -> Result<()> {
+        let config = make_config_with_denied(&["*"], &["git grep"], &[]);
+        let manager = RunToolManager::new(&config, &[]);
+
+        assert!(
+            manager.validate_command("git", &["grep".into()]).is_err(),
+            "git grep should be denied even in unrestricted mode"
+        );
+        manager.validate_command("git", &["status".into()])?;
+        manager.validate_command("rm", &[])?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_denied_no_args_still_allowed() -> Result<()> {
+        let config = make_config_with_denied(&["git"], &["git grep"], &[]);
+        let manager = RunToolManager::new(&config, &[]);
+
+        manager.validate_command("git", &[])?;
         Ok(())
     }
 }

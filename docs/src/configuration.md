@@ -2,7 +2,7 @@
 
 Catenary loads configuration from multiple sources, in order of priority (last one wins):
 
-1.  **Defaults**: `idle_timeout = 300`, `smart_wait = true`.
+1.  **Defaults**: `idle_timeout = 300`.
 2.  **User Config**: `~/.config/catenary/config.toml`.
 3.  **Project Config**: `.catenary.toml` in the current directory or any parent directory (searches upwards).
 4.  **Explicit File**: Specified via `--config <path>`.
@@ -14,7 +14,6 @@ Catenary loads configuration from multiple sources, in order of priority (last o
 ```toml
 # Global settings
 idle_timeout = 300  # Seconds before closing idle documents (0 to disable)
-smart_wait = true    # Wait for server initialization before first request
 
 # Language servers
 [server.<language-id>]
@@ -135,7 +134,6 @@ The `[server.<language-id>]` key must match the LSP language identifier. Catenar
 | Option | Default | Description |
 |--------|---------|-------------|
 | `idle_timeout` | `300` | Seconds before auto-closing idle documents. Set to `0` to disable. |
-| `smart_wait` | `true` | Wait for LSP servers to be fully ready before executing requests. |
 
 ## Shell Execution (`tools.run`)
 
@@ -145,6 +143,7 @@ default** — add a `[tools.run]` section to enable it.
 ```toml
 [tools.run]
 allowed = ["git", "make"]  # Always allowed commands
+denied = ["git grep", "git log"]  # Block specific subcommands
 
 # Language-specific commands (activated when matching files exist in workspace)
 [tools.run.python]
@@ -176,6 +175,8 @@ Catenary's file tools and their path validation.
 - The tool description updates dynamically to reflect the current allowlist.
 - Commands are executed **directly** (not via shell) to prevent injection.
 - Output is capped at 100KB per stream. Default timeout is 120 seconds.
+- The `denied` list blocks specific command+subcommand pairs (e.g., `"git grep"`).
+  Denied entries take priority over the allowlist, including `["*"]`.
 
 ## CLI Override
 

@@ -68,6 +68,13 @@ pub struct RunToolConfig {
     #[serde(default)]
     pub allowed: Vec<String>,
 
+    /// Denied command+subcommand pairs (e.g., `["git grep", "git log"]`).
+    /// Each entry is `"command subcommand"`. When a command matches, the first
+    /// argument is checked against the denied subcommand. Denied entries take
+    /// priority over the allowlist, including `["*"]`.
+    #[serde(default)]
+    pub denied: Vec<String>,
+
     /// Language-specific command groups.
     /// Key is language name (e.g., "python", "rust").
     /// These commands are allowed only when matching files exist in workspace.
@@ -256,6 +263,36 @@ allowed = ["*"]
 
         let run = config.tools.run.context("run tool should be configured")?;
         assert_eq!(run.allowed, vec!["*"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_with_tools_run_denied() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+[tools.run]
+allowed = ["git", "make"]
+denied = ["git grep", "git log"]
+"#,
+        )?;
+
+        let run = config.tools.run.context("run tool should be configured")?;
+        assert_eq!(run.allowed, vec!["git", "make"]);
+        assert_eq!(run.denied, vec!["git grep", "git log"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_with_tools_run_denied_defaults_empty() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+[tools.run]
+allowed = ["git"]
+"#,
+        )?;
+
+        let run = config.tools.run.context("run tool should be configured")?;
+        assert!(run.denied.is_empty(), "denied should default to empty");
         Ok(())
     }
 }
