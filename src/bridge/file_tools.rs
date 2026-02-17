@@ -32,7 +32,7 @@ use tracing::debug;
 
 use super::DocumentNotification;
 use super::handler::LspBridgeHandler;
-use crate::lsp::LspClient;
+use crate::lsp::{DIAGNOSTICS_TIMEOUT, LspClient};
 use crate::mcp::CallToolResult;
 
 /// Input for `read_file`.
@@ -365,7 +365,12 @@ impl LspBridgeHandler {
                 ));
             }
 
+            let uri = doc_manager.uri_for_path(path)?;
+
             if let Some(notification) = doc_manager.ensure_open(path).await? {
+                // Snapshot generation *before* sending the change
+                let snapshot = client.diagnostics_generation(&uri).await;
+
                 match notification {
                     DocumentNotification::Open(params) => {
                         client.did_open(params).await?;
@@ -374,16 +379,20 @@ impl LspBridgeHandler {
                         client.did_change(params).await?;
                     }
                 }
-            }
 
-            let uri = doc_manager.uri_for_path(path)?;
-            drop(doc_manager);
+                drop(doc_manager);
 
-            // Wait for analysis
-            if !client.wait_for_analysis().await {
-                return Ok(format!(
-                    "[{lang}] server stopped responding \u{2014} diagnostics unavailable"
-                ));
+                // Wait for diagnostics that reflect our change
+                if !client
+                    .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
+                    .await
+                {
+                    return Ok(format!(
+                        "[{lang}] server stopped responding \u{2014} diagnostics unavailable"
+                    ));
+                }
+            } else {
+                drop(doc_manager);
             }
 
             let diagnostics = client.get_diagnostics(&uri).await;
@@ -420,10 +429,10 @@ impl LspBridgeHandler {
                 .and_then(|m| m.modified())
                 .unwrap_or_else(|_| std::time::SystemTime::now());
 
-            let notification = {
-                let mut doc_manager = self.doc_manager.lock().await;
-                doc_manager.notify_external_write(path, content, mtime)?
-            };
+            let mut doc_manager = self.doc_manager.lock().await;
+            let notification = doc_manager.notify_external_write(path, content, mtime)?;
+            let uri = doc_manager.uri_for_path(path)?;
+            drop(doc_manager);
 
             let client = client_mutex.lock().await;
             let lang = client.language().to_string();
@@ -434,6 +443,9 @@ impl LspBridgeHandler {
                 ));
             }
 
+            // Snapshot generation *before* sending the change
+            let snapshot = client.diagnostics_generation(&uri).await;
+
             match notification {
                 DocumentNotification::Open(params) => {
                     client.did_open(params).await?;
@@ -443,13 +455,11 @@ impl LspBridgeHandler {
                 }
             }
 
-            let uri = {
-                let doc_manager = self.doc_manager.lock().await;
-                doc_manager.uri_for_path(path)?
-            };
-
-            // Wait for analysis
-            if !client.wait_for_analysis().await {
+            // Wait for diagnostics that reflect our change
+            if !client
+                .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
+                .await
+            {
                 return Ok(format!(
                     "[{lang}] server stopped responding \u{2014} diagnostics unavailable"
                 ));

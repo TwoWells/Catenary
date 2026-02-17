@@ -38,7 +38,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::lsp::{ClientManager, LspClient, ServerState};
+use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, LspClient, ServerState};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
@@ -1032,13 +1032,45 @@ impl LspBridgeHandler {
         debug!("Diagnostics request: {}", input.file);
 
         let diagnostics = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
+            let client_mutex = self.get_client_for_path(&path).await?;
+            let mut doc_manager = self.doc_manager.lock().await;
+            let client = client_mutex.lock().await;
 
-            if !client_mutex.lock().await.wait_for_analysis().await {
-                return Err(anyhow!("LSP server stopped responding during analysis"));
+            if !client.is_alive() {
+                return Err(anyhow!(
+                    "[{}] server is no longer running",
+                    client.language()
+                ));
             }
 
-            Ok::<_, anyhow::Error>(client_mutex.lock().await.get_diagnostics(&uri).await)
+            let uri = doc_manager.uri_for_path(&path)?;
+
+            if let Some(notification) = doc_manager.ensure_open(&path).await? {
+                // Snapshot generation *before* sending the change
+                let snapshot = client.diagnostics_generation(&uri).await;
+
+                match notification {
+                    super::DocumentNotification::Open(params) => {
+                        client.did_open(params).await?;
+                    }
+                    super::DocumentNotification::Change(params) => {
+                        client.did_change(params).await?;
+                    }
+                }
+
+                drop(doc_manager);
+
+                if !client
+                    .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
+                    .await
+                {
+                    return Err(anyhow!("LSP server stopped responding during analysis"));
+                }
+            } else {
+                drop(doc_manager);
+            }
+
+            Ok::<_, anyhow::Error>(client.get_diagnostics(&uri).await)
         })?;
 
         if diagnostics.is_empty() {

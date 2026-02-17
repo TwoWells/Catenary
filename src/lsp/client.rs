@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tracing::{debug, error, trace, warn};
 
 use super::protocol::{self, NotificationMessage, RequestId, RequestMessage, ResponseMessage};
@@ -55,12 +55,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Time after spawn during which we consider the server to be "warming up".
 const WARMUP_PERIOD: Duration = Duration::from_secs(10);
 
+/// Timeout for waiting for fresh diagnostics after a file change.
+pub(crate) const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Manages communication with an LSP server process.
 pub struct LspClient {
     next_id: AtomicI64,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
     diagnostics: DiagnosticsCache,
+    /// Per-URI generation counter, incremented on each `publishDiagnostics`.
+    diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
+    /// Wakes waiters when any URI receives fresh diagnostics.
+    diagnostics_notify: Arc<Notify>,
     alive: Arc<AtomicBool>,
     encoding: PositionEncodingKind,
     /// Progress tracking for `$/progress` notifications.
@@ -110,6 +117,9 @@ impl LspClient {
         let pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: DiagnosticsCache = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics_notify = Arc::new(Notify::new());
         let alive = Arc::new(AtomicBool::new(true));
         let progress = Arc::new(Mutex::new(ProgressTracker::new()));
         let state = Arc::new(AtomicU8::new(ServerState::Initializing.as_u8()));
@@ -125,6 +135,8 @@ impl LspClient {
             stdout,
             pending.clone(),
             diagnostics.clone(),
+            diagnostics_generation.clone(),
+            diagnostics_notify.clone(),
             alive.clone(),
             progress.clone(),
             state.clone(),
@@ -137,6 +149,8 @@ impl LspClient {
             stdin,
             pending,
             diagnostics,
+            diagnostics_generation,
+            diagnostics_notify,
             alive,
             encoding: PositionEncodingKind::UTF16, // Default per spec
             progress,
@@ -158,6 +172,8 @@ impl LspClient {
         stdout: ChildStdout,
         pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
         diagnostics: DiagnosticsCache,
+        diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
+        diagnostics_notify: Arc<Notify>,
         alive: Arc<AtomicBool>,
         progress: Arc<Mutex<ProgressTracker>>,
         state: Arc<AtomicU8>,
@@ -246,6 +262,8 @@ impl LspClient {
                             Self::handle_notification(
                                 &notification,
                                 &diagnostics,
+                                &diagnostics_generation,
+                                &diagnostics_notify,
                                 &progress,
                                 &state,
                                 &language,
@@ -302,9 +320,15 @@ impl LspClient {
     }
 
     /// Handles incoming LSP notifications.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Internal notification handler requires many shared-state handles"
+    )]
     async fn handle_notification(
         notification: &NotificationMessage,
         diagnostics: &DiagnosticsCache,
+        diagnostics_generation: &Arc<Mutex<HashMap<Uri, u64>>>,
+        diagnostics_notify: &Notify,
         progress: &Arc<Mutex<ProgressTracker>>,
         state: &Arc<AtomicU8>,
         language: &str,
@@ -321,7 +345,15 @@ impl LspClient {
                         params.uri.as_str()
                     );
                     let mut cache = diagnostics.lock().await;
-                    cache.insert(params.uri, params.diagnostics);
+                    cache.insert(params.uri.clone(), params.diagnostics);
+                    drop(cache);
+
+                    // Bump generation counter and wake waiters
+                    let mut generations = diagnostics_generation.lock().await;
+                    let counter = generations.entry(params.uri).or_insert(0);
+                    *counter += 1;
+                    drop(generations);
+                    diagnostics_notify.notify_waiters();
                 } else {
                     warn!("Failed to parse publishDiagnostics params");
                 }
@@ -870,7 +902,58 @@ impl LspClient {
         cache.get(uri).cloned().unwrap_or_default()
     }
 
-    /// Returns true if the LSP server connection is still alive.
+    /// Returns the current diagnostics generation for a URI.
+    ///
+    /// Callers should snapshot this *before* sending a change notification,
+    /// then pass the snapshot to [`wait_for_diagnostics_update`] to ensure
+    /// the returned diagnostics reflect that specific change.
+    pub async fn diagnostics_generation(&self, uri: &Uri) -> u64 {
+        let generations = self.diagnostics_generation.lock().await;
+        generations.get(uri).copied().unwrap_or(0)
+    }
+
+    /// Waits until diagnostics for the URI advance past `snapshot`.
+    ///
+    /// `snapshot` should be obtained via [`diagnostics_generation`] **before**
+    /// sending the change that should trigger new diagnostics. This ensures
+    /// no race window between sending the change and starting the wait.
+    ///
+    /// Returns `true` if diagnostics advanced, `false` on timeout or server
+    /// death.
+    pub async fn wait_for_diagnostics_update(
+        &self,
+        uri: &Uri,
+        snapshot: u64,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            if self.diagnostics_generation(uri).await > snapshot {
+                return true;
+            }
+
+            if !self.is_alive() {
+                return false;
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            match tokio::time::timeout(remaining, self.diagnostics_notify.notified()).await {
+                Ok(()) => {
+                    // Woken — re-check generation at top of loop
+                }
+                Err(_) => {
+                    // Timed out — check one last time
+                    return self.diagnostics_generation(uri).await > snapshot;
+                }
+            }
+        }
+    }
+
     /// Returns the language identifier for this client (e.g., "rust", "python").
     pub fn language(&self) -> &str {
         &self.language
