@@ -1,13 +1,24 @@
 {
-  "description": "Post-edit LSP diagnostics via catenary notify",
+  "description": "Post-edit LSP diagnostics and /add-dir root sync via catenary hooks",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/catenary sync-roots"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify"
+            "command": "${CLAUDE_PLUGIN_ROOT}/catenary notify"
           }
         ]
       }

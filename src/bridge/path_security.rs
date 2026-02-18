@@ -38,6 +38,12 @@ impl PathValidator {
         }
     }
 
+    /// Returns the current workspace roots.
+    #[must_use]
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
     /// Updates the workspace roots and re-discovers protected config paths.
     pub fn update_roots(&mut self, roots: Vec<PathBuf>) {
         self.protected_configs = Self::discover_config_paths(&roots);

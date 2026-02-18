@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Unix socket server for file-change notifications.
+//! Unix socket server for file-change notifications and root management.
 //!
 //! When Claude Code's native `Edit` or `Write` tools modify a file, a
 //! `PostToolUse` hook runs `catenary notify`, which connects to this socket
 //! and sends the changed file path. The server notifies the LSP, waits for
 //! fresh diagnostics, and returns them so they appear in the model's context.
+//!
+//! The socket also accepts `add_roots` requests from `catenary sync-roots`,
+//! which adds new workspace roots discovered from `/add-dir` commands in the
+//! Claude Code transcript.
 
 use anyhow::{Result, anyhow};
 use lsp_types::Diagnostic;
@@ -21,11 +25,20 @@ use tracing::{debug, info, warn};
 use crate::bridge::{DocumentManager, DocumentNotification, PathValidator};
 use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, LspClient};
 
-/// Request from the `catenary notify` CLI.
+/// Request from `catenary notify` (file change) or `catenary sync-roots` (root addition).
 #[derive(Debug, Deserialize)]
-struct NotifyRequest {
-    /// Absolute path to the changed file.
-    file: String,
+#[serde(untagged)]
+enum NotifyRequest {
+    /// A file-change notification.
+    File {
+        /// Absolute path to the changed file.
+        file: String,
+    },
+    /// A request to add new workspace roots.
+    AddRoots {
+        /// Absolute paths of directories to add as roots.
+        add_roots: Vec<String>,
+    },
 }
 
 /// Listens on a Unix socket for file-change notifications and returns
@@ -95,8 +108,8 @@ impl NotifyServer {
         Ok(handle)
     }
 
-    /// Handles a single connection: reads a JSON request, processes the
-    /// file change, and writes back diagnostics.
+    /// Handles a single connection: reads a JSON request, dispatches to the
+    /// appropriate handler, and writes back the response.
     async fn handle_connection(&self, stream: tokio::net::UnixStream) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
         let mut buf_reader = BufReader::new(reader);
@@ -106,9 +119,16 @@ impl NotifyServer {
         let request: NotifyRequest =
             serde_json::from_str(line.trim()).map_err(|e| anyhow!("Invalid request: {e}"))?;
 
-        debug!("Notify: processing {}", request.file);
-
-        let response = self.process_file(&request.file).await;
+        let response = match request {
+            NotifyRequest::File { file } => {
+                debug!("Notify: processing file {file}");
+                self.process_file(&file).await
+            }
+            NotifyRequest::AddRoots { add_roots } => {
+                debug!("Notify: adding {} root(s)", add_roots.len());
+                self.process_add_roots(&add_roots).await
+            }
+        };
 
         writer.write_all(response.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -203,6 +223,71 @@ impl NotifyServer {
                 format_diagnostics_compact(&diagnostics)
             ))
         }
+    }
+
+    /// Processes a request to add new workspace roots.
+    ///
+    /// Canonicalizes each path, filters to genuinely new roots, updates the
+    /// path validator, notifies LSP clients, and spawns servers for new languages.
+    async fn process_add_roots(&self, paths: &[String]) -> String {
+        match self.process_add_roots_inner(paths).await {
+            Ok(msg) => msg,
+            Err(e) => format!("Notify error: {e}"),
+        }
+    }
+
+    /// Inner implementation for `process_add_roots`.
+    async fn process_add_roots_inner(&self, paths: &[String]) -> Result<String> {
+        // Canonicalize each path, skipping any that don't exist
+        let mut new_paths = Vec::new();
+        for p in paths {
+            let path = PathBuf::from(p);
+            match path.canonicalize() {
+                Ok(canonical) => new_paths.push(canonical),
+                Err(e) => {
+                    debug!("Skipping root {p}: {e}");
+                }
+            }
+        }
+
+        if new_paths.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Get current roots and filter to only genuinely new ones
+        let current_roots = self.path_validator.read().await.roots().to_vec();
+        let genuinely_new: Vec<PathBuf> = new_paths
+            .into_iter()
+            .filter(|p| !current_roots.contains(p))
+            .collect();
+
+        if genuinely_new.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Build new full root list
+        let mut all_roots = current_roots;
+        all_roots.extend(genuinely_new.iter().cloned());
+
+        // Update path validator
+        self.path_validator.write().await.update_roots(all_roots);
+
+        // Notify LSP clients about each new root
+        for root in &genuinely_new {
+            if let Err(e) = self.client_manager.add_root(root.clone()).await {
+                warn!("Failed to add root {}: {e}", root.display());
+            }
+        }
+
+        // Spawn any new language servers for the added roots
+        self.client_manager.spawn_all().await;
+
+        let added: Vec<String> = genuinely_new
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        info!("Added roots: {}", added.join(", "));
+        Ok(format!("Added roots: {}", added.join(", ")))
     }
 }
 

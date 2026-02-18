@@ -102,6 +102,14 @@ enum Command {
         #[arg(long)]
         nocolor: bool,
     },
+
+    /// Sync /add-dir roots from Claude Code transcript to a running session.
+    /// Designed for `PreToolUse` hooks — reads hook JSON from stdin.
+    SyncRoots {
+        /// Output format: "plain" (default) or "gemini".
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
 }
 
 /// Entry point for the Catenary binary.
@@ -128,6 +136,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Doctor { nocolor }) => run_doctor(args, nocolor).await,
+        Some(Command::SyncRoots { format }) => {
+            run_sync_roots(&format);
+            Ok(())
+        }
     }
 }
 
@@ -606,6 +618,166 @@ fn run_notify(format: &str) {
     }
 
     // Read the response (diagnostics)
+    let reader = std::io::BufReader::new(&stream);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        match line {
+            Ok(text) if !text.is_empty() => lines.push(text),
+            _ => break,
+        }
+    }
+
+    if lines.is_empty() {
+        return;
+    }
+
+    let output = format_diagnostics(&lines, format);
+    print!("{output}");
+}
+
+/// Sync `/add-dir` roots from Claude Code transcript to a running Catenary session.
+///
+/// Reads hook JSON from stdin, scans the transcript for `/add-dir` confirmation
+/// messages, and sends newly discovered roots to the session's notify socket.
+/// Uses a byte-offset cache to avoid re-scanning the entire transcript each time.
+///
+/// Silently succeeds on any error to avoid breaking Claude Code's flow.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Sequential hook processing with early returns"
+)]
+fn run_sync_roots(format: &str) {
+    use std::io::{BufRead, Seek, SeekFrom, Write};
+
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    // Extract transcript_path and cwd from hook input
+    let Some(transcript_path) = hook_json.get("transcript_path").and_then(|v| v.as_str()) else {
+        return;
+    };
+
+    let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        PathBuf::from,
+    );
+
+    // Find the session whose workspace matches cwd
+    let sessions = session::list_sessions().unwrap_or_default();
+    let cwd_str = cwd.to_string_lossy();
+    let session = sessions.iter().find(|s| cwd_str.starts_with(&s.workspace));
+
+    let Some(session) = session else {
+        return;
+    };
+
+    let session_dir = session::sessions_dir().join(&session.id);
+
+    // Read the byte offset from previous invocation
+    let offset_path = session_dir.join("transcript_offset");
+    let start_offset: u64 = std::fs::read_to_string(&offset_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    // Open transcript and seek to offset
+    let Ok(mut file) = std::fs::File::open(transcript_path) else {
+        return;
+    };
+
+    if file.seek(SeekFrom::Start(start_offset)).is_err() {
+        return;
+    }
+
+    // Scan new lines for /add-dir confirmation messages
+    let mut new_roots = Vec::new();
+    let reader = std::io::BufReader::new(&mut file);
+
+    // Pattern: Added \x1b[1m/path\x1b[22m as a working directory
+    // In the JSONL file, ESC (\x1b) is JSON-encoded as \u001b, and we're
+    // reading raw text lines (not deserializing), so match the escaped form.
+    let add_dir_pattern = "Added \\u001b[1m";
+    let add_dir_suffix = "\\u001b[22m as a working directory";
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+
+        // Each line is a JSON object; look inside message.content for the pattern
+        if !line.contains(add_dir_pattern) {
+            continue;
+        }
+
+        // Extract all occurrences of the pattern from this line
+        let mut search_from = 0;
+        while let Some(start) = line[search_from..].find(add_dir_pattern) {
+            let abs_start = search_from + start + add_dir_pattern.len();
+            if let Some(end) = line[abs_start..].find(add_dir_suffix) {
+                let path_str = &line[abs_start..abs_start + end];
+                // Unescape JSON string escapes (the path is inside a JSON string)
+                let path_str = path_str
+                    .replace("\\\\", "\\")
+                    .replace("\\/", "/")
+                    .replace("\\\"", "\"");
+                let path = PathBuf::from(&path_str);
+                let resolved = if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                };
+                if !new_roots.contains(&resolved) {
+                    new_roots.push(resolved);
+                }
+                search_from = abs_start + end + add_dir_suffix.len();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Update the byte offset for next invocation
+    if let Ok(pos) = file.stream_position() {
+        let _ = std::fs::write(&offset_path, pos.to_string());
+    }
+
+    if new_roots.is_empty() {
+        return;
+    }
+
+    // Connect to the session's notify socket
+    let socket_path = session_dir.join("notify.sock");
+    if !socket_path.exists() {
+        return;
+    }
+
+    let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) else {
+        return;
+    };
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    // Send the add_roots request
+    let root_strings: Vec<String> = new_roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let request = serde_json::json!({ "add_roots": root_strings });
+    let mut writer = std::io::BufWriter::new(&stream);
+    if serde_json::to_writer(&mut writer, &request).is_err() {
+        return;
+    }
+    if writeln!(writer).is_err() || writer.flush().is_err() {
+        return;
+    }
+
+    // Read the response
     let reader = std::io::BufReader::new(&stream);
     let mut lines = Vec::new();
     for line in reader.lines() {

@@ -39,66 +39,47 @@ cargo build --release
 
 The binary will be located at `target/release/catenary`.
 
-### 2. Configure MCP Server
+### 2. Install Plugin/Extension
 
-Point your tool's MCP configuration to the local binary.
-
-**Claude Code:**
-Add to `~/.claude/settings.json` (user) or `.claude/settings.json` (workspace):
-```json
-{
-  "mcpServers": {
-    "catenary": {
-      "command": "/absolute/path/to/catenary/target/release/catenary"
-    }
-  }
-}
-```
-
-**Gemini CLI:**
-Add to `~/.gemini/settings.json` (user) or `.gemini/settings.json` (workspace):
-```json
-{
-  "mcpServers": {
-    "catenary": {
-      "command": "/absolute/path/to/catenary/target/release/catenary"
-    }
-  }
-}
-```
-
-### 3. Install Extension/Plugin
-
-Catenary ships extension manifests for both Claude Code and Gemini CLI. These
-bundle the MCP server configuration along with `PostToolUse`/`AfterTool` hooks
-that feed LSP diagnostics back to the model after file edits.
+Catenary ships plugin/extension manifests for both Claude Code and Gemini CLI.
+These bundle the MCP server configuration along with hooks that feed LSP
+diagnostics back to the model after file edits and sync `/add-dir` roots
+mid-session.
 
 #### Claude Code
 
 ```bash
-# Link the local plugin for development (changes take effect on restart)
-claude --plugin-dir /path/to/Catenary
+# Install as a local marketplace plugin
+/plugin marketplace add /path/to/Catenary
+/plugin install catenary@catenary
 ```
 
-Or install it as a local marketplace plugin:
-
-```bash
-/plugin marketplace add /path/to/Catenary/.claude-plugin
-/plugin install catenary@my-local-marketplace
-```
+The plugin includes:
+- MCP server configuration
+- `PreToolUse` hook — syncs `/add-dir` roots to the running session
+- `PostToolUse` hook — returns LSP diagnostics after file edits
 
 #### Gemini CLI
 
 ```bash
-# Link the local extension for development (changes take effect immediately)
+# Link the local extension for development
 gemini extensions link /path/to/Catenary
 ```
 
-To simulate a production install instead:
+The extension includes:
+- MCP server configuration
+- `AfterTool` hook — returns LSP diagnostics after file edits
+
+### 3. Iterate
+
+After making changes, rebuild and reinstall:
 
 ```bash
-gemini extensions install /path/to/Catenary
+cargo install --path .
 ```
+
+This places the updated binary at `~/.cargo/bin/catenary`. Restart your
+Claude Code or Gemini CLI session to pick up the new binary.
 
 ## Licensing and Copyright
 
