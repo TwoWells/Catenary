@@ -90,7 +90,11 @@ enum Command {
     /// Notify a running session of a file change (used by `PostToolUse` hooks).
     /// Reads hook JSON from stdin, connects to the session's notify socket,
     /// and prints any LSP diagnostics to stdout.
-    Notify,
+    Notify {
+        /// Output format: "plain" (default) or "gemini".
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
 
     /// Check language server health for the current workspace.
     Doctor {
@@ -119,8 +123,8 @@ async fn main() -> Result<()> {
             filter,
         }) => run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => run_status(&id),
-        Some(Command::Notify) => {
-            run_notify();
+        Some(Command::Notify { format }) => {
+            run_notify(&format);
             Ok(())
         }
         Some(Command::Doctor { nocolor }) => run_doctor(args, nocolor).await,
@@ -535,7 +539,7 @@ fn run_status(id: &str) -> Result<()> {
 /// Reads hook JSON from stdin, finds the matching session by workspace,
 /// connects to its notify socket, and prints diagnostics to stdout.
 /// Silently succeeds on any error to avoid breaking Claude Code's flow.
-fn run_notify() {
+fn run_notify(format: &str) {
     use std::io::{BufRead, Write};
 
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
@@ -603,11 +607,40 @@ fn run_notify() {
 
     // Read the response (diagnostics)
     let reader = std::io::BufReader::new(&stream);
+    let mut lines = Vec::new();
     for line in reader.lines() {
         match line {
-            Ok(text) if !text.is_empty() => println!("{text}"),
+            Ok(text) if !text.is_empty() => lines.push(text),
             _ => break,
         }
+    }
+
+    if lines.is_empty() {
+        return;
+    }
+
+    let output = format_diagnostics(&lines, format);
+    print!("{output}");
+}
+
+/// Format diagnostic lines for output.
+///
+/// - `"gemini"`: wraps in a JSON envelope for Gemini CLI hooks.
+/// - Any other value (including `"plain"`): joins lines with newlines and a trailing newline.
+fn format_diagnostics(lines: &[String], format: &str) -> String {
+    if format == "gemini" {
+        let diagnostics = lines.join("\n");
+        let envelope = serde_json::json!({
+            "hookSpecificOutput": {
+                "additionalContext": format!("LSP Diagnostics:\n{diagnostics}")
+            }
+        });
+        // serde_json::to_string cannot fail on Value
+        envelope.to_string()
+    } else {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
     }
 }
 
@@ -1063,6 +1096,49 @@ fn print_event(event: &SessionEvent) {
     let colors = ColorConfig::new(false);
     let term_width = cli::terminal_width();
     print_event_annotated(event, &colors, term_width);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_diagnostics_plain() {
+        let lines = vec![
+            "error[E0308]: mismatched types".into(),
+            "  --> src/main.rs:5:10".into(),
+        ];
+        let output = format_diagnostics(&lines, "plain");
+        assert_eq!(
+            output,
+            "error[E0308]: mismatched types\n  --> src/main.rs:5:10\n"
+        );
+    }
+
+    #[test]
+    fn test_format_diagnostics_gemini() {
+        let lines = vec!["error[E0308]: mismatched types".into()];
+        let output = format_diagnostics(&lines, "gemini");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("gemini format should produce valid JSON");
+
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext should be a string");
+        assert!(context.starts_with("LSP Diagnostics:\n"));
+        assert!(context.contains("error[E0308]: mismatched types"));
+    }
+
+    #[test]
+    fn test_format_diagnostics_gemini_multiline() {
+        let lines = vec!["warning: unused variable".into(), "  --> lib.rs:3:9".into()];
+        let output = format_diagnostics(&lines, "gemini");
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.contains("warning: unused variable\n  --> lib.rs:3:9"));
+    }
 }
 
 /// Background task that periodically closes idle documents.
