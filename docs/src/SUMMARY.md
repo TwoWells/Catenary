@@ -16,6 +16,7 @@
 # 📋 Reference
 
 - [🏗️ Architecture](architecture.md)
+- [🔌 Plugin Architecture](plugin-architecture.md)
 - [🛠️ Language Servers](lsp/README.md)
 - [🤖 AI Agents](ai-agents.md)
 - [🛡️ LSP Fault Model](lsp-fault-model.md)
