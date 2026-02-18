@@ -25,6 +25,81 @@ Catenary uses a mix of unit tests and integration tests.
 - **Unit Tests:** Located in the same file as the code (e.g., `src/lib.rs`).
 - **Integration Tests:** Located in `tests/`. These spawn real LSP servers (like `rust-analyzer` or `bash-language-server`). Ensure you have the necessary tools installed if you are modifying relevant tests.
 
+## Local Development & Testing
+
+To test your changes end-to-end with Claude Code or Gemini CLI without publishing to a marketplace:
+
+### 1. Build Catenary
+
+Build the release binary:
+
+```bash
+cargo build --release
+```
+
+The binary will be located at `target/release/catenary`.
+
+### 2. Configure MCP Server
+
+Point your tool's MCP configuration to the local binary.
+
+**Claude Code:**
+Add to `~/.claude/settings.json` (user) or `.claude/settings.json` (workspace):
+```json
+{
+  "mcpServers": {
+    "catenary": {
+      "command": "/absolute/path/to/catenary/target/release/catenary"
+    }
+  }
+}
+```
+
+**Gemini CLI:**
+Add to `~/.gemini/settings.json` (user) or `.gemini/settings.json` (workspace):
+```json
+{
+  "mcpServers": {
+    "catenary": {
+      "command": "/absolute/path/to/catenary/target/release/catenary"
+    }
+  }
+}
+```
+
+### 3. Install Extension/Plugin
+
+Catenary ships extension manifests for both Claude Code and Gemini CLI. These
+bundle the MCP server configuration along with `PostToolUse`/`AfterTool` hooks
+that feed LSP diagnostics back to the model after file edits.
+
+#### Claude Code
+
+```bash
+# Link the local plugin for development (changes take effect on restart)
+claude --plugin-dir /path/to/Catenary
+```
+
+Or install it as a local marketplace plugin:
+
+```bash
+/plugin marketplace add /path/to/Catenary/.claude-plugin
+/plugin install catenary@my-local-marketplace
+```
+
+#### Gemini CLI
+
+```bash
+# Link the local extension for development (changes take effect immediately)
+gemini extensions link /path/to/Catenary
+```
+
+To simulate a production install instead:
+
+```bash
+gemini extensions install /path/to/Catenary
+```
+
 ## Licensing and Copyright
 
 **Catenary is dual-licensed.**

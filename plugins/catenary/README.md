@@ -10,26 +10,18 @@ A high-performance multiplexing bridge between MCP (Model Context Protocol) and 
 cargo install catenary-mcp
 ```
 
-### 2. Connect your AI Assistant
+### 2. Install the Plugin
 
-**Claude Code**
-```bash
-claude mcp add catenary -- catenary
+```
+/plugin marketplace add https://github.com/MarkWells-Dev/Catenary
+/plugin install catenary@catenary
 ```
 
-**Gemini CLI**
-Add to `~/.gemini/settings.json`:
-```json
-{
-  "mcpServers": {
-    "catenary": { "command": "catenary" }
-  }
-}
-```
+The plugin configures the MCP server and adds a `PostToolUse` hook that returns LSP diagnostics after every edit.
 
 ## Configuration
 
-See `config.example.toml` in this directory or the [Official Configuration Guide](https://github.com/MarkWells-Dev/Catenary/wiki/Config).
+See `config.example.toml` in this directory or the [Official Configuration Guide](https://markwells-dev.github.io/catenary/configuration.html).
 
 ## Documentation
 

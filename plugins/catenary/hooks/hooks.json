@@ -1,0 +1,16 @@
+{
+  "description": "Post-edit LSP diagnostics via catenary notify",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary notify"
+          }
+        ]
+      }
+    ]
+  }
+}

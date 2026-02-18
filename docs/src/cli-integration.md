@@ -46,9 +46,19 @@ Preserved from the original CLI design:
 
 Location: `~/.gemini/policies/` (user) or `.gemini/settings.json` (workspace)
 
-**Constrained mode.** Use the Policy Engine to deny text-scanning commands while
-keeping Gemini's native file I/O and shell tools available. Create the file
-`~/.gemini/policies/catenary-constrained.toml`:
+**Recommended: Extension + Constrained Mode.**
+
+1.  **Install the Extension:** The `markwells.catenary` extension provides an
+    `AfterTool` hook that runs `catenary notify` after every file edit. This
+    ensures the model sees LSP diagnostics immediately.
+
+    ```bash
+    gemini ext install markwells.catenary
+    ```
+
+2.  **Constrained mode.** Use the Policy Engine to deny text-scanning commands while
+    keeping Gemini's native file I/O and shell tools available. Create the file
+    `~/.gemini/policies/catenary-constrained.toml`:
 
 ```toml
 # Catenary constrained mode — forces LSP-first navigation
@@ -156,6 +166,12 @@ toolName = "read_many_files"
 decision = "deny"
 priority = 900
 deny_message = "Use Catenary's LSP tools for code navigation."
+
+[[rule]]
+toolName = "list_directory"
+decision = "deny"
+priority = 900
+deny_message = "Use Catenary's list_directory tool instead."
 ```
 
 Then add the MCP server to `.gemini/settings.json`:

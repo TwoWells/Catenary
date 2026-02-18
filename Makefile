@@ -11,7 +11,7 @@
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 
 # Files that contain the version
-VERSION_FILES := Cargo.toml .claude-plugin/marketplace.json
+VERSION_FILES := Cargo.toml .claude-plugin/marketplace.json gemini-extension.json
 
 # Default target: run all checks
 check:
@@ -55,6 +55,8 @@ bump-version:
 	@sed -i 's/^version = "$(CURRENT_VERSION)"/version = "$(V)"/' Cargo.toml
 	@# Update marketplace.json
 	@sed -i 's/"version": "$(CURRENT_VERSION)"/"version": "$(V)"/' .claude-plugin/marketplace.json
+	@# Update gemini-extension.json
+	@sed -i 's/"version": "$(CURRENT_VERSION)"/"version": "$(V)"/' gemini-extension.json
 	@# Update Cargo.lock
 	@cargo check --quiet
 	@echo "Version bumped to $(V)"
@@ -82,13 +84,13 @@ release: pre-release-check
 	@$(MAKE) bump-version V=$(V)
 	@if ! $(MAKE) check; then \
 		echo "Checks failed. Rolling back version bump..."; \
-		git checkout HEAD -- Cargo.toml Cargo.lock .claude-plugin/marketplace.json; \
+		git checkout HEAD -- Cargo.toml Cargo.lock .claude-plugin/marketplace.json gemini-extension.json; \
 		exit 1; \
 	fi
-	@git add Cargo.toml Cargo.lock .claude-plugin/marketplace.json
+	@git add Cargo.toml Cargo.lock .claude-plugin/marketplace.json gemini-extension.json
 	@if ! git commit -m "chore: Bump version to $(V)"; then \
 		echo "Commit failed. Rolling back version bump..."; \
-		git checkout HEAD -- Cargo.toml Cargo.lock .claude-plugin/marketplace.json; \
+		git checkout HEAD -- Cargo.toml Cargo.lock .claude-plugin/marketplace.json gemini-extension.json; \
 		exit 1; \
 	fi
 	@git tag -a "v$(V)" -m "Release v$(V)"
@@ -124,3 +126,4 @@ version:
 	@echo "Version in files:"
 	@grep -H 'version' Cargo.toml | head -1
 	@grep -H 'version' .claude-plugin/marketplace.json | grep -v schema
+	@grep -H 'version' gemini-extension.json

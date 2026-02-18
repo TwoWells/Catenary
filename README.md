@@ -57,40 +57,24 @@ args = ["--stdio"]
 
 ### 3. Connect your AI assistant
 
-**Claude Code** (recommended — hook mode)
+**Claude Code**
+```
+/plugin marketplace add https://github.com/MarkWells-Dev/Catenary
+/plugin install catenary@catenary
+```
+
+The plugin configures the MCP server and adds a `PostToolUse` hook that
+returns LSP diagnostics after every edit.
+
+**Gemini CLI**
 ```bash
-claude mcp add catenary -- catenary
+gemini extensions install https://github.com/MarkWells-Dev/Catenary
 ```
 
-Then add to `.claude/settings.json` to get LSP diagnostics after every edit:
+The extension configures the MCP server and adds an `AfterTool` hook that
+returns LSP diagnostics after every edit.
 
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit",
-        "hooks": [
-          { "type": "command", "command": "catenary notify" }
-        ]
-      }
-    ]
-  }
-}
-```
-
-**Gemini CLI** (recommended — constrained mode)
-
-Add catenary to `.gemini/settings.json`:
-```json
-{
-  "mcpServers": {
-    "catenary": { "command": "catenary" }
-  }
-}
-```
-
-Then install the [policy file](https://markwells-dev.github.io/catenary/cli-integration.html#gemini-cli)
+Optionally, install the [policy file](https://markwells-dev.github.io/catenary/cli-integration.html#gemini-cli)
 to `~/.gemini/policies/catenary-constrained.toml` to block text-scanning
 commands and force LSP-first navigation.
 

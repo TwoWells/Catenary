@@ -283,11 +283,11 @@ impl<H: ToolHandler> McpServer<H> {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             },
             instructions: Some(
-                "Catenary is a multiplexing bridge between MCP and LSP servers. \
-                 Use its tools to navigate and edit code via language intelligence: \
-                 hover for type info, definition/references for navigation, \
-                 diagnostics for errors, completion for suggestions, \
-                 and file read/write/edit for code changes."
+                "Catenary provides LSP-backed code intelligence tools. \
+                 Its search tools include all available LSP information \
+                 and condense grep-equivalent results into a heatmap. \
+                 Use list_directory for directory browsing. Post-edit LSP \
+                 diagnostics are provided automatically via the notify hook."
                     .to_string(),
             ),
         };
