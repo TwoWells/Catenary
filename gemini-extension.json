@@ -6,7 +6,7 @@
   "publisher": "MarkWells-Dev",
   "mcpServers": {
     "catenary": {
-      "command": "${extensionPath}/catenary"
+      "command": "catenary"
     }
   },
   "hooks": {
@@ -17,7 +17,7 @@
           {
             "name": "catenary-notify",
             "type": "command",
-            "command": "${extensionPath}/catenary notify --format=gemini"
+            "command": "catenary notify --format=gemini"
           }
         ]
       }

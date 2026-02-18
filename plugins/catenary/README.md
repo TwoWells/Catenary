@@ -17,7 +17,7 @@ cargo install catenary-mcp
 /plugin install catenary@catenary
 ```
 
-The plugin configures the MCP server and adds a `PostToolUse` hook that returns LSP diagnostics after every edit.
+The plugin configures the MCP server and adds hooks for LSP diagnostics after edits and `/add-dir` root syncing.
 
 ## Configuration
 
