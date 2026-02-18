@@ -616,7 +616,10 @@ fn run_notify() {
 /// # Errors
 ///
 /// Returns an error if the configuration cannot be loaded or roots cannot be resolved.
-#[allow(clippy::too_many_lines, reason = "Doctor command has sequential output logic")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Doctor command has sequential output logic"
+)]
 async fn run_doctor(args: Args, nocolor: bool) -> Result<()> {
     let colors = ColorConfig::new(nocolor);
 
@@ -660,11 +663,7 @@ async fn run_doctor(args: Args, nocolor: bool) -> Result<()> {
         .config
         .as_ref()
         .map_or_else(|| "default paths".to_string(), |p| p.display().to_string());
-    println!(
-        "{} {}",
-        colors.bold("Config:"),
-        config_source
-    );
+    println!("{} {}", colors.bold("Config:"), config_source);
     println!(
         "{} {}",
         colors.bold("Roots: "),

@@ -117,7 +117,6 @@ pub struct RenameInput {
     pub new_name: String,
 }
 
-
 /// Input for call hierarchy.
 #[derive(Debug, Deserialize)]
 pub struct CallHierarchyInput {
@@ -147,7 +146,6 @@ pub struct TypeHierarchyInput {
     /// "supertypes" or "subtypes"
     pub direction: String,
 }
-
 
 /// Input for codebase map.
 #[derive(Debug, Deserialize)]
