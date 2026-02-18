@@ -45,8 +45,8 @@ pub struct McpServer<H: ToolHandler> {
     initialized: bool,
     broadcaster: EventBroadcaster,
     on_client_info: Option<ClientInfoCallback>,
-    /// Whether the client advertised `roots.listChanged` capability.
-    client_supports_roots: bool,
+    /// Whether the client advertised any `roots` capability.
+    client_has_roots: bool,
     /// Flag: should we send a `roots/list` request after this message?
     should_fetch_roots: bool,
     /// Guard: are we currently inside `fetch_roots`? Prevents recursion.
@@ -65,7 +65,7 @@ impl<H: ToolHandler> McpServer<H> {
             initialized: false,
             broadcaster,
             on_client_info: None,
-            client_supports_roots: false,
+            client_has_roots: false,
             should_fetch_roots: false,
             fetching_roots: false,
             next_outbound_id: 0,
@@ -226,15 +226,15 @@ impl<H: ToolHandler> McpServer<H> {
             "notifications/initialized" => {
                 info!("MCP client initialized");
                 self.initialized = true;
-                if self.client_supports_roots {
+                if self.client_has_roots {
                     self.should_fetch_roots = true;
                 }
             }
             "notifications/roots/list_changed" => {
                 info!("MCP client roots changed");
-                if self.client_supports_roots {
-                    self.should_fetch_roots = true;
-                }
+                // Always honor — the client explicitly told us roots changed,
+                // regardless of what it advertised during initialization.
+                self.should_fetch_roots = true;
             }
             "notifications/cancelled" => {
                 debug!("Request cancelled");
@@ -260,14 +260,10 @@ impl<H: ToolHandler> McpServer<H> {
         info!("Protocol version: {}", params.protocol_version);
 
         // Store whether client supports roots
-        self.client_supports_roots = params
-            .capabilities
-            .roots
-            .as_ref()
-            .is_some_and(|r| r.list_changed);
+        self.client_has_roots = params.capabilities.roots.is_some();
 
-        if self.client_supports_roots {
-            info!("Client supports roots/list_changed");
+        if self.client_has_roots {
+            info!("Client supports roots capability");
         }
 
         // Notify callback of client info
@@ -349,6 +345,17 @@ impl<H: ToolHandler> McpServer<H> {
         self.fetching_roots = true;
         self.should_fetch_roots = false;
 
+        let result = self.fetch_roots_inner(reader, writer);
+        self.fetching_roots = false;
+        result
+    }
+
+    /// Inner implementation of [`Self::fetch_roots`].
+    fn fetch_roots_inner(
+        &mut self,
+        reader: &mut impl BufRead,
+        writer: &mut impl Write,
+    ) -> Result<()> {
         let request_id = self.next_id();
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -372,7 +379,11 @@ impl<H: ToolHandler> McpServer<H> {
         writeln!(writer, "{request_json}")?;
         writer.flush()?;
 
-        // Read lines until we get the matching response
+        // Read lines until we get the matching response.
+        // Buffer interleaved requests (id + method) until roots are applied,
+        // so they execute against the updated PathValidator.
+        // Notifications are dispatched immediately.
+        let mut buffered: Vec<String> = Vec::new();
         let mut line = String::new();
         loop {
             line.clear();
@@ -380,7 +391,6 @@ impl<H: ToolHandler> McpServer<H> {
                 .read_line(&mut line)
                 .context("Failed to read from stdin during roots/list")?;
             if bytes_read == 0 {
-                self.fetching_roots = false;
                 return Err(anyhow!(
                     "stdin closed while waiting for roots/list response"
                 ));
@@ -393,34 +403,45 @@ impl<H: ToolHandler> McpServer<H> {
 
             trace!("Received (during roots/list wait): {}", trimmed);
 
-            // Broadcast incoming message
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                self.broadcaster.send(EventKind::McpMessage {
-                    direction: "in".to_string(),
-                    message: json.clone(),
-                });
+            // Parse JSON once for disambiguation and broadcasting
+            let json: serde_json::Value = serde_json::from_str(trimmed)
+                .context("Failed to parse JSON during roots/list wait")?;
 
-                // Disambiguate: Response has `id` + no `method` + (`result` or `error`)
-                if json.get("id").is_some()
-                    && json.get("method").is_none()
-                    && (json.get("result").is_some() || json.get("error").is_some())
-                {
-                    let response: Response = serde_json::from_str(trimmed)
-                        .context("Failed to parse roots/list response")?;
-                    if response.id == request_id {
-                        self.fetching_roots = false;
-                        return self.handle_roots_response(response);
+            self.broadcaster.send(EventKind::McpMessage {
+                direction: "in".to_string(),
+                message: json.clone(),
+            });
+
+            // Response: has `id` + no `method` + (`result` or `error`)
+            let is_response = json.get("id").is_some()
+                && json.get("method").is_none()
+                && (json.get("result").is_some() || json.get("error").is_some());
+
+            if is_response {
+                let response: Response =
+                    serde_json::from_value(json).context("Failed to parse roots/list response")?;
+                if response.id == request_id {
+                    let result = self.handle_roots_response(response);
+                    // Replay buffered requests against the updated roots
+                    for msg in &buffered {
+                        self.dispatch_message(msg, writer)?;
                     }
-                    warn!(
-                        "Received response with unexpected ID {:?} while waiting for roots/list",
-                        response.id
-                    );
-                    continue;
+                    return result;
                 }
+                warn!(
+                    "Received response with unexpected ID {:?} while waiting for roots/list",
+                    response.id
+                );
+                continue;
             }
 
-            // Not a response — handle as normal request or notification
-            self.dispatch_message(trimmed, writer)?;
+            // Requests (id + method) are buffered until roots are applied.
+            // Notifications dispatch immediately.
+            if json.get("id").is_some() && json.get("method").is_some() {
+                buffered.push(trimmed.to_string());
+            } else {
+                self.dispatch_message(trimmed, writer)?;
+            }
         }
     }
 
@@ -651,10 +672,10 @@ mod tests {
     #[test]
     fn test_roots_capability_stored_when_present() -> Result<()> {
         let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
-        assert!(!server.client_supports_roots);
+        assert!(!server.client_has_roots);
 
         initialize_server(&mut server, true)?;
-        assert!(server.client_supports_roots);
+        assert!(server.client_has_roots);
         Ok(())
     }
 
@@ -662,7 +683,7 @@ mod tests {
     fn test_roots_capability_absent_by_default() -> Result<()> {
         let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
         initialize_server(&mut server, false)?;
-        assert!(!server.client_supports_roots);
+        assert!(!server.client_has_roots);
         Ok(())
     }
 
@@ -767,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_roots_handles_interleaved_request() -> Result<()> {
+    fn test_fetch_roots_buffers_interleaved_request() -> Result<()> {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
@@ -785,7 +806,8 @@ mod tests {
 
         server.should_fetch_roots = true;
 
-        // Mock stdin: a ping request THEN the roots/list response
+        // Mock stdin: a ping request arrives BEFORE the roots/list response.
+        // The request should be buffered and replayed after roots are applied.
         let ping_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -812,10 +834,19 @@ mod tests {
         assert_eq!(roots[0].uri, "file:///tmp/test");
         drop(roots);
 
-        // Verify both the roots/list request AND the ping response were written
+        // Verify both the roots/list request AND the ping response were written,
+        // and that the ping response (buffered) appears after the roots/list request.
         let output = String::from_utf8(writer)?;
-        assert!(output.contains("roots/list"));
-        assert!(output.contains(r#""id":42"#));
+        let roots_pos = output
+            .find("roots/list")
+            .ok_or_else(|| anyhow!("roots/list request not found in output"))?;
+        let ping_pos = output
+            .find(r#""id":42"#)
+            .ok_or_else(|| anyhow!("ping response not found in output"))?;
+        assert!(
+            roots_pos < ping_pos,
+            "ping response should appear after roots/list request (buffered)"
+        );
         Ok(())
     }
 
@@ -839,6 +870,66 @@ mod tests {
 
         // Should not error — error responses are non-fatal
         server.fetch_roots(&mut reader, &mut writer)?;
+        assert!(!server.fetching_roots);
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_changed_honored_without_capability() -> Result<()> {
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        // Initialize WITHOUT roots capability
+        initialize_server(&mut server, false)?;
+        assert!(!server.client_has_roots);
+
+        // Client sends roots/list_changed anyway — we must honor it
+        let notification = Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/roots/list_changed".to_string(),
+            params: None,
+        };
+        server.handle_notification(&notification);
+
+        assert!(server.should_fetch_roots);
+        Ok(())
+    }
+
+    #[test]
+    fn test_roots_capability_without_list_changed() -> Result<()> {
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+
+        // Initialize with `roots: {}` (no listChanged field)
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(99),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"roots": {}},
+                "clientInfo": {"name": "test", "version": "1.0"}
+            })),
+        };
+        let _ = server.handle_request(request)?;
+
+        // roots.is_some() should be true even without listChanged
+        assert!(server.client_has_roots);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fetching_roots_reset_on_error() -> Result<()> {
+        use std::io::Cursor;
+
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        initialize_server(&mut server, true)?;
+        server.should_fetch_roots = true;
+
+        // Empty stdin — will cause EOF error during fetch
+        let mut reader = Cursor::new(Vec::new());
+        let mut writer: Vec<u8> = Vec::new();
+
+        let result = server.fetch_roots(&mut reader, &mut writer);
+        assert!(result.is_err());
+        // fetching_roots must be reset even on error
         assert!(!server.fetching_roots);
         Ok(())
     }
