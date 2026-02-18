@@ -343,19 +343,40 @@ path that would let the model fall back to text scanning. The model uses:
 
 ## Experiment Results
 
+### Current: Policy Engine (Gemini) + Deny List (Claude)
+
+Validated 2026-02-17.
+
+| Test                     | Gemini CLI                | Claude Code                                 |
+| ------------------------ | ------------------------- | ------------------------------------------- |
+| Restriction method       | Policy Engine (`deny`)    | `permissions.deny` list + block `Grep/Glob/Task` |
+| MCP tools discovered     | ✓                         | ✓                                           |
+| Text scanning blocked    | ✓                         | ✓                                           |
+| Model adapts gracefully  | ✓ (immediately)           | ✓ (immediately)                             |
+| Sub-agent escape blocked | N/A                       | ✓ (requires denying `Task`)                 |
+
+The policy engine approach gives models clear feedback on *why* a tool is
+blocked and *what to use instead* (via `deny_message`). This eliminates the
+thrashing seen with earlier approaches — models go straight to Catenary tools
+on the first turn without attempting workarounds.
+
+Tested with `gemini-3-flash-preview` and `claude-opus-4-6`. Both adapted
+on the first prompt with zero fallback attempts.
+
+### Historical: `tools.core` Allowlist (Gemini, deprecated)
+
 Validated 2026-02-06.
 
-| Test                     | Gemini CLI             | Claude Code                                 |
-| ------------------------ | ---------------------- | ------------------------------------------- |
-| Restriction method       | `tools.core` allowlist | `permissions.deny` list + block `Grep/Glob/Task` |
-| MCP tools discovered     | ✓                      | ✓                                           |
-| Text scanning blocked    | ✓                      | ✓                                           |
-| Model adapts gracefully  | ✓ (slowly)             | ✓ (quickly)                                 |
-| Sub-agent escape blocked | N/A                    | ✓ (requires denying `Task`)                 |
+The original Gemini approach used `tools.core` to allowlist only non-file
+tools (`web_fetch`, `google_web_search`, `save_memory`), hiding all built-in
+file and shell tools. This worked but models adapted slowly — Gemini would
+try several workarounds (WebFetch for local files, sub-agent delegation)
+before settling on Catenary tools. The policy engine approach replaced this
+by giving explicit deny messages instead of silently removing tools.
 
 ## Catenary Tool Coverage
 
-Catenary provides a complete toolkit — LSP intelligence and file I/O:
+Catenary provides LSP intelligence and directory browsing:
 
 | Tool                | Category  | Notes                                    |
 | ------------------- | --------- | ---------------------------------------- |
@@ -368,9 +389,8 @@ Catenary provides a complete toolkit — LSP intelligence and file I/O:
 | `diagnostics`       | LSP       | Errors, warnings                         |
 | ...                 | LSP       | [Full list](overview.md#available-tools) |
 
-File I/O (`read_file`, `write_file`, `edit_file`) is handled by the host
-tool's native file operations. Catenary provides post-edit diagnostics via
-the `catenary notify` hook.
+File I/O is handled by the host tool's native file operations. Catenary
+provides post-edit diagnostics via the `catenary notify` hook.
 
 ## Limitations
 
