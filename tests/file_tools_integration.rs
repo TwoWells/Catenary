@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Integration tests for file I/O tools: `read_file`, `write_file`, `edit_file`, `list_directory`.
+//! Integration tests for file I/O tools: `list_directory`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -125,257 +128,6 @@ impl Drop for BridgeProcess {
 }
 
 #[test]
-fn test_read_file_basic() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("hello.txt");
-    std::fs::write(&file_path, "line one\nline two\nline three\n")?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "read_file",
-        &json!({ "file": file_path.to_string_lossy().to_string() }),
-    )?;
-
-    assert!(text.contains("line one"), "Should contain file content");
-    assert!(text.contains("line two"), "Should contain file content");
-    assert!(text.contains("line three"), "Should contain file content");
-    // Should have line numbers
-    assert!(text.contains("1\t"), "Should have line numbers");
-    Ok(())
-}
-
-#[test]
-fn test_read_file_with_offset_limit() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("lines.txt");
-    std::fs::write(&file_path, "line 1\nline 2\nline 3\nline 4\nline 5\n")?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "read_file",
-        &json!({ "file": file_path.to_string_lossy().to_string(), "offset": 2, "limit": 2 }),
-    )?;
-
-    assert!(text.contains("line 2"), "Should contain line 2");
-    assert!(text.contains("line 3"), "Should contain line 3");
-    assert!(!text.contains("line 1"), "Should not contain line 1");
-    assert!(!text.contains("line 4"), "Should not contain line 4");
-    Ok(())
-}
-
-#[test]
-fn test_read_file_outside_root_fails() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let result = bridge.call_tool("read_file", &json!({ "file": "/etc/hostname" }))?;
-
-    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
-    assert_eq!(is_error, Some(true), "Should be an error");
-
-    let text = result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .and_then(|item| item.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    assert!(
-        text.contains("outside workspace roots"),
-        "Error should mention workspace roots: {text}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_write_file_creates_file() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("new_file.txt");
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "write_file",
-        &json!({
-            "file": file_path.to_string_lossy().to_string(),
-            "content": "hello world\nsecond line\n"
-        }),
-    )?;
-
-    assert!(
-        text.contains("Wrote 2 lines"),
-        "Should report line count: {text}"
-    );
-
-    // Verify file was actually written
-    let content = std::fs::read_to_string(&file_path)?;
-    assert_eq!(content, "hello world\nsecond line\n");
-    Ok(())
-}
-
-#[test]
-fn test_write_file_creates_parent_dirs() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("a/b/c/deep_file.txt");
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "write_file",
-        &json!({
-            "file": file_path.to_string_lossy().to_string(),
-            "content": "deep content\n"
-        }),
-    )?;
-
-    assert!(text.contains("Wrote"), "Should report success: {text}");
-    assert!(file_path.exists(), "File should exist");
-    Ok(())
-}
-
-#[test]
-fn test_write_file_outside_root_fails() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let result = bridge.call_tool(
-        "write_file",
-        &json!({ "file": "/tmp/outside_root.txt", "content": "hack" }),
-    )?;
-
-    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
-    assert_eq!(is_error, Some(true), "Should be an error");
-    Ok(())
-}
-
-#[test]
-fn test_write_file_config_protection() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let config_path = dir.path().join(".catenary.toml");
-    std::fs::write(&config_path, "idle_timeout = 300")?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let result = bridge.call_tool(
-        "write_file",
-        &json!({
-            "file": config_path.to_string_lossy().to_string(),
-            "content": "idle_timeout = 0\n"
-        }),
-    )?;
-
-    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
-    assert_eq!(is_error, Some(true), "Should be an error for config file");
-
-    // Verify file was NOT modified
-    let content = std::fs::read_to_string(&config_path)?;
-    assert_eq!(
-        content, "idle_timeout = 300",
-        "Config should not be modified"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_edit_file_basic() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("edit_me.txt");
-    std::fs::write(&file_path, "Hello World\nFoo Bar\n")?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let text = bridge.call_tool_text(
-        "edit_file",
-        &json!({
-            "file": file_path.to_string_lossy().to_string(),
-            "old_string": "Foo Bar",
-            "new_string": "Baz Qux"
-        }),
-    )?;
-
-    assert!(text.contains("Edited"), "Should report success: {text}");
-
-    let content = std::fs::read_to_string(&file_path)?;
-    assert!(content.contains("Baz Qux"), "Should contain new text");
-    assert!(!content.contains("Foo Bar"), "Should not contain old text");
-    Ok(())
-}
-
-#[test]
-fn test_edit_file_not_found() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("edit_me.txt");
-    std::fs::write(&file_path, "Hello World\n")?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let result = bridge.call_tool(
-        "edit_file",
-        &json!({
-            "file": file_path.to_string_lossy().to_string(),
-            "old_string": "nonexistent text",
-            "new_string": "replacement"
-        }),
-    )?;
-
-    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
-    assert_eq!(is_error, Some(true), "Should be an error");
-    Ok(())
-}
-
-#[test]
-fn test_edit_file_ambiguous() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("ambig.txt");
-    std::fs::write(&file_path, "foo\nfoo\nbar\n")?;
-
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
-    bridge.initialize()?;
-
-    let result = bridge.call_tool(
-        "edit_file",
-        &json!({
-            "file": file_path.to_string_lossy().to_string(),
-            "old_string": "foo",
-            "new_string": "baz"
-        }),
-    )?;
-
-    let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
-    assert_eq!(
-        is_error,
-        Some(true),
-        "Should be an error for ambiguous match"
-    );
-
-    let text = result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .and_then(|item| item.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    assert!(
-        text.contains("2 times"),
-        "Error should mention multiple matches: {text}"
-    );
-    Ok(())
-}
-
-#[test]
 fn test_list_directory_basic() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::create_dir_all(dir.path().join("src"))?;
@@ -413,7 +165,7 @@ fn test_list_directory_outside_root_fails() -> Result<()> {
 }
 
 #[test]
-fn test_tools_list_includes_file_tools() -> Result<()> {
+fn test_tools_list_includes_list_directory() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
@@ -438,20 +190,21 @@ fn test_tools_list_includes_file_tools() -> Result<()> {
         .collect();
 
     assert!(
-        tool_names.contains(&"read_file"),
-        "Should include read_file: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"write_file"),
-        "Should include write_file: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"edit_file"),
-        "Should include edit_file: {tool_names:?}"
-    );
-    assert!(
         tool_names.contains(&"list_directory"),
         "Should include list_directory: {tool_names:?}"
+    );
+    // File tools are now handled by native Claude Code tools + notify hook
+    assert!(
+        !tool_names.contains(&"read_file"),
+        "Should not include read_file: {tool_names:?}"
+    );
+    assert!(
+        !tool_names.contains(&"write_file"),
+        "Should not include write_file: {tool_names:?}"
+    );
+    assert!(
+        !tool_names.contains(&"edit_file"),
+        "Should not include edit_file: {tool_names:?}"
     );
     Ok(())
 }

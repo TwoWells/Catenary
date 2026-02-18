@@ -1,19 +1,5 @@
-/*
- * Copyright (C) 2026 Mark Wells Dev
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -30,10 +16,6 @@ pub struct Config {
     /// Server definitions keyed by language ID (e.g., "rust", "python").
     #[serde(default)]
     pub server: HashMap<String, ServerConfig>,
-
-    /// Tool-specific configuration.
-    #[serde(default)]
-    pub tools: ToolsConfig,
 }
 
 /// Configuration for a specific LSP server.
@@ -49,44 +31,6 @@ pub struct ServerConfig {
     /// Initialization options to pass to the LSP server.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
-}
-
-/// Tool-specific configuration.
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct ToolsConfig {
-    /// Configuration for the `run` shell execution tool.
-    /// When `None`, the `run` tool is not registered.
-    #[serde(default)]
-    pub run: Option<RunToolConfig>,
-}
-
-/// Configuration for the `run` tool.
-#[derive(Debug, Deserialize, Clone)]
-pub struct RunToolConfig {
-    /// Always-allowed commands (e.g., `["git", "make"]`).
-    /// Set to `["*"]` for unrestricted execution.
-    #[serde(default)]
-    pub allowed: Vec<String>,
-
-    /// Denied command+subcommand pairs (e.g., `["git grep", "git log"]`).
-    /// Each entry is `"command subcommand"`. When a command matches, the first
-    /// argument is checked against the denied subcommand. Denied entries take
-    /// priority over the allowlist, including `["*"]`.
-    #[serde(default)]
-    pub denied: Vec<String>,
-
-    /// Language-specific command groups.
-    /// Key is language name (e.g., "python", "rust").
-    /// These commands are allowed only when matching files exist in workspace.
-    #[serde(flatten)]
-    pub languages: HashMap<String, LanguageCommands>,
-}
-
-/// Language-specific allowed commands for the `run` tool.
-#[derive(Debug, Deserialize, Clone)]
-pub struct LanguageCommands {
-    /// Commands allowed for this language.
-    pub allowed: Vec<String>,
 }
 
 const fn default_idle_timeout() -> u64 {
@@ -199,100 +143,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_config_without_tools_run() -> Result<()> {
-        let config: Config = toml::from_str("idle_timeout = 100\n")?;
-
-        assert!(
-            config.tools.run.is_none(),
-            "run tool should not be configured"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_config_with_tools_run_basic() -> Result<()> {
-        let config: Config = toml::from_str(
-            r#"
-[tools.run]
-allowed = ["git", "make"]
-"#,
-        )?;
-
-        let run = config.tools.run.context("run tool should be configured")?;
-        assert_eq!(run.allowed, vec!["git", "make"]);
-        assert!(run.languages.is_empty(), "No language configs expected");
-        Ok(())
-    }
-
-    #[test]
-    fn test_config_with_tools_run_languages() -> Result<()> {
-        let config: Config = toml::from_str(
-            r#"
-[tools.run]
-allowed = ["git"]
-
-[tools.run.python]
-allowed = ["python", "pytest", "uv"]
-
-[tools.run.rust]
-allowed = ["cargo"]
-"#,
-        )?;
-
-        let run = config.tools.run.context("run tool should be configured")?;
-        assert_eq!(run.allowed, vec!["git"]);
-        assert_eq!(run.languages.len(), 2);
-
-        let python = run.languages.get("python").context("missing python")?;
-        assert_eq!(python.allowed, vec!["python", "pytest", "uv"]);
-
-        let rust = run.languages.get("rust").context("missing rust")?;
-        assert_eq!(rust.allowed, vec!["cargo"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_config_with_tools_run_wildcard() -> Result<()> {
-        let config: Config = toml::from_str(
-            r#"
-[tools.run]
-allowed = ["*"]
-"#,
-        )?;
-
-        let run = config.tools.run.context("run tool should be configured")?;
-        assert_eq!(run.allowed, vec!["*"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_config_with_tools_run_denied() -> Result<()> {
-        let config: Config = toml::from_str(
-            r#"
-[tools.run]
-allowed = ["git", "make"]
-denied = ["git grep", "git log"]
-"#,
-        )?;
-
-        let run = config.tools.run.context("run tool should be configured")?;
-        assert_eq!(run.allowed, vec!["git", "make"]);
-        assert_eq!(run.denied, vec!["git grep", "git log"]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_config_with_tools_run_denied_defaults_empty() -> Result<()> {
-        let config: Config = toml::from_str(
-            r#"
-[tools.run]
-allowed = ["git"]
-"#,
-        )?;
-
-        let run = config.tools.run.context("run tool should be configured")?;
-        assert!(run.denied.is_empty(), "denied should default to empty");
-        Ok(())
-    }
 }

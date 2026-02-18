@@ -1,19 +1,5 @@
-/*
- * Copyright (C) 2026 Mark Wells Dev
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Session management for observability.
 //!
@@ -115,7 +101,7 @@ pub enum EventKind {
 }
 
 /// Returns the base directory for session data.
-fn sessions_dir() -> PathBuf {
+pub fn sessions_dir() -> PathBuf {
     let state_dir = dirs::state_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -130,6 +116,9 @@ pub struct Session {
     dir: PathBuf,
 
     events_file: Arc<Mutex<File>>,
+
+    /// Path to the Unix notify socket (if started).
+    socket_path: Option<PathBuf>,
 }
 
 impl Session {
@@ -187,6 +176,8 @@ impl Session {
             dir: session_dir,
 
             events_file: Arc::new(Mutex::new(events_file)),
+
+            socket_path: None,
         };
 
         // Broadcast started event
@@ -223,6 +214,18 @@ impl Session {
             pid,
             tid_hash
         )
+    }
+
+    /// Returns the path to the Unix notify socket for this session.
+    #[must_use]
+    pub fn socket_path(&self) -> PathBuf {
+        self.dir.join("notify.sock")
+    }
+
+    /// Records that the notify socket has been started, so it will be
+    /// cleaned up on drop.
+    pub fn set_socket_active(&mut self) {
+        self.socket_path = Some(self.socket_path());
     }
 
     /// Update client info (called after MCP initialize).
@@ -271,6 +274,11 @@ impl Drop for Session {
         // Broadcast shutdown
 
         self.broadcast(EventKind::Shutdown);
+
+        // Clean up notify socket (if active)
+        if let Some(ref sock) = self.socket_path {
+            let _ = fs::remove_file(sock);
+        }
 
         // Clean up session directory
 

@@ -85,23 +85,3 @@ command = "clangd"
 
 # [server.cmake]
 # command = "cmake-language-server"
-
-# ─────────────────────────────────────────────────────────────────────
-# Shell Execution (run tool)
-# ─────────────────────────────────────────────────────────────────────
-# Uncomment to enable the `run` tool. Commands not in the allowlist
-# will be rejected. Language-specific commands activate automatically
-# when matching files exist in the workspace.
-
-# [tools.run]
-# allowed = ["git", "make"]  # Always allowed. Use ["*"] for unrestricted.
-# denied = ["git grep", "git log"]  # Deny specific subcommands (overrides allowed).
-#
-# [tools.run.python]
-# allowed = ["python", "pytest", "uv"]
-#
-# [tools.run.rust]
-# allowed = ["cargo"]
-#
-# [tools.run.javascript]
-# allowed = ["node", "npm", "npx"]

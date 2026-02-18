@@ -1,19 +1,5 @@
-/*
- * Copyright (C) 2026 Mark Wells Dev
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Catenary MCP server and CLI.
 //!
@@ -29,13 +15,11 @@ use clap::{Parser, Subcommand};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use catenary_mcp::bridge::run_tool::RunToolManager;
 use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler, PathValidator};
 use catenary_mcp::cli::{self, ColorConfig, ColumnWidths};
 use catenary_mcp::lsp;
@@ -102,6 +86,18 @@ enum Command {
         /// Session ID (use 'catenary list' to see available sessions).
         id: String,
     },
+
+    /// Notify a running session of a file change (used by `PostToolUse` hooks).
+    /// Reads hook JSON from stdin, connects to the session's notify socket,
+    /// and prints any LSP diagnostics to stdout.
+    Notify,
+
+    /// Check language server health for the current workspace.
+    Doctor {
+        /// Disable colored output.
+        #[arg(long)]
+        nocolor: bool,
+    },
 }
 
 /// Entry point for the Catenary binary.
@@ -123,6 +119,11 @@ async fn main() -> Result<()> {
             filter,
         }) => run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => run_status(&id),
+        Some(Command::Notify) => {
+            run_notify();
+            Ok(())
+        }
+        Some(Command::Doctor { nocolor }) => run_doctor(args, nocolor).await,
     }
 }
 
@@ -243,15 +244,21 @@ async fn run_server(args: Args) -> Result<()> {
         current_roots.clone(),
     )));
 
-    let run_tool = config.tools.run.as_ref().map(|run_config| {
-        Arc::new(tokio::sync::RwLock::new(RunToolManager::new(
-            run_config,
-            &current_roots,
-        )))
-    });
-
-    // Create tools-changed flag before handler so both share it
-    let tools_changed_flag = Arc::new(AtomicBool::new(false));
+    // Start the notify socket server for PostToolUse hook integration
+    let notify_server = catenary_mcp::notify::NotifyServer::new(
+        client_manager.clone(),
+        doc_manager.clone(),
+        path_validator.clone(),
+    );
+    let socket_path = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .socket_path();
+    let notify_handle = notify_server.start(&socket_path)?;
+    session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .set_socket_active();
 
     let handler = LspBridgeHandler::new(
         client_manager.clone(),
@@ -259,16 +266,12 @@ async fn run_server(args: Args) -> Result<()> {
         runtime,
         broadcaster.clone(),
         path_validator.clone(),
-        run_tool.clone(),
-        Some(tools_changed_flag.clone()),
     );
 
     // Run MCP server (blocking - reads from stdin)
     let session_for_callback = session.clone();
-    let tools_changed_for_roots = tools_changed_flag.clone();
     let client_manager_for_roots = client_manager.clone();
     let path_validator_for_roots = path_validator.clone();
-    let run_tool_for_roots = run_tool;
     let runtime_for_roots = tokio::runtime::Handle::current();
     let mut mcp_server = McpServer::new(handler, broadcaster)
         .on_client_info(Box::new(move |name: &str, version: &str| {
@@ -298,21 +301,10 @@ async fn run_server(args: Args) -> Result<()> {
                 .block_on(path_validator_for_roots.write())
                 .update_roots(paths.clone());
 
-            // Update run tool with new roots (re-detect languages)
-            if let Some(ref run_tool) = run_tool_for_roots {
-                let changed = runtime_for_roots
-                    .block_on(run_tool.write())
-                    .update_roots(&paths);
-                if changed {
-                    tools_changed_for_roots.store(true, Ordering::Release);
-                }
-            }
-
             runtime_for_roots.block_on(client_manager_for_roots.sync_roots(paths))?;
             runtime_for_roots.block_on(client_manager_for_roots.spawn_all());
             Ok(())
-        }))
-        .tools_changed_flag(tools_changed_flag);
+        }));
 
     // Run in a blocking task since MCP server uses synchronous I/O
     let mcp_task = tokio::task::spawn_blocking(move || mcp_server.run());
@@ -327,6 +319,10 @@ async fn run_server(args: Args) -> Result<()> {
             Ok(())
         }
     };
+
+    // Stop notify socket server
+    notify_handle.abort();
+    let _ = notify_handle.await;
 
     // Stop cleanup task
     if let Some(handle) = cleanup_handle {
@@ -532,6 +528,315 @@ fn run_status(id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Notify a running session of a file change (`PostToolUse` hook handler).
+///
+/// Reads hook JSON from stdin, finds the matching session by workspace,
+/// connects to its notify socket, and prints diagnostics to stdout.
+/// Silently succeeds on any error to avoid breaking Claude Code's flow.
+fn run_notify() {
+    use std::io::{BufRead, Write};
+
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    // Extract file_path from tool_input
+    let file_path = hook_json
+        .get("tool_input")
+        .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
+        .and_then(|fp| fp.as_str());
+
+    let Some(file_path) = file_path else {
+        return;
+    };
+
+    // Resolve to absolute path
+    let abs_path = if std::path::Path::new(file_path).is_absolute() {
+        std::path::PathBuf::from(file_path)
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        cwd.join(file_path)
+    };
+
+    // Find session whose workspace contains this file
+    let sessions = session::list_sessions().unwrap_or_default();
+    let session = sessions
+        .iter()
+        .find(|s| abs_path.to_string_lossy().starts_with(&s.workspace));
+
+    let Some(session) = session else {
+        return;
+    };
+
+    // Connect to the session's notify socket
+    let socket_path = session::sessions_dir()
+        .join(&session.id)
+        .join("notify.sock");
+
+    if !socket_path.exists() {
+        return;
+    }
+
+    let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) else {
+        return;
+    };
+
+    // Set a timeout so we don't hang forever
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    // Send the file path as JSON
+    let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
+    let mut writer = std::io::BufWriter::new(&stream);
+    if serde_json::to_writer(&mut writer, &request).is_err() {
+        return;
+    }
+    if writeln!(writer).is_err() || writer.flush().is_err() {
+        return;
+    }
+
+    // Read the response (diagnostics)
+    let reader = std::io::BufReader::new(&stream);
+    for line in reader.lines() {
+        match line {
+            Ok(text) if !text.is_empty() => println!("{text}"),
+            _ => break,
+        }
+    }
+}
+
+/// Run the doctor command: check language server health for the current workspace.
+///
+/// # Errors
+///
+/// Returns an error if the configuration cannot be loaded or roots cannot be resolved.
+#[allow(clippy::too_many_lines, reason = "Doctor command has sequential output logic")]
+async fn run_doctor(args: Args, nocolor: bool) -> Result<()> {
+    let colors = ColorConfig::new(nocolor);
+
+    // Load configuration (same as run_server)
+    let mut config = catenary_mcp::config::Config::load(args.config.clone())?;
+    for lsp_spec in &args.lsps {
+        let (lang, command_str) = lsp_spec.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("Invalid LSP spec: {lsp_spec}. Expected 'lang:command'")
+        })?;
+        let lang = lang.trim().to_string();
+        let command_str = command_str.trim();
+        let mut parts = command_str.split_whitespace();
+        let program = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?
+            .to_string();
+        let cmd_args: Vec<String> = parts.map(std::string::ToString::to_string).collect();
+        config.server.insert(
+            lang,
+            catenary_mcp::config::ServerConfig {
+                command: program,
+                args: cmd_args,
+                initialization_options: None,
+            },
+        );
+    }
+
+    // Resolve workspace roots
+    let raw_roots = if args.root.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        args.root
+    };
+    let roots: Vec<PathBuf> = raw_roots
+        .into_iter()
+        .map(|r| r.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    // Print config and roots
+    let config_source = args
+        .config
+        .as_ref()
+        .map_or_else(|| "default paths".to_string(), |p| p.display().to_string());
+    println!(
+        "{} {}",
+        colors.bold("Config:"),
+        config_source
+    );
+    println!(
+        "{} {}",
+        colors.bold("Roots: "),
+        roots
+            .iter()
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!();
+
+    if config.server.is_empty() {
+        println!("No language servers configured.");
+        return Ok(());
+    }
+
+    // Detect which languages have files in the workspace
+    let configured_keys: std::collections::HashSet<&str> =
+        config.server.keys().map(String::as_str).collect();
+    let detected = lsp::detect_workspace_languages(&roots, &configured_keys);
+
+    // Sort servers alphabetically
+    let mut servers: Vec<(&String, &catenary_mcp::config::ServerConfig)> =
+        config.server.iter().collect();
+    servers.sort_by_key(|(lang, _)| *lang);
+
+    // Determine column width for language name
+    let max_lang_width = servers.iter().map(|(l, _)| l.len()).max().unwrap_or(10);
+    let max_cmd_width = servers
+        .iter()
+        .map(|(_, s)| s.command.len())
+        .max()
+        .unwrap_or(10);
+
+    // Create a broadcaster for client spawning (no-op since we don't need events)
+    let broadcaster = catenary_mcp::session::EventBroadcaster::noop()?;
+
+    for (lang, server_config) in &servers {
+        let lang_display = format!("{lang:<max_lang_width$}");
+        let cmd_display = format!("{cmd:<max_cmd_width$}", cmd = server_config.command);
+
+        // Check if any files for this language exist
+        if !detected.contains(lang.as_str()) {
+            println!(
+                "{}  {}  {}",
+                colors.dim(&lang_display),
+                colors.dim(&cmd_display),
+                colors.dim("- skipped (no matching files)"),
+            );
+            continue;
+        }
+
+        // Check if binary exists on PATH
+        if !binary_exists(&server_config.command) {
+            println!(
+                "{}  {}  {}",
+                lang_display,
+                cmd_display,
+                colors.red("✗ command not found"),
+            );
+            continue;
+        }
+
+        // Spawn and initialize the server
+        let args_refs: Vec<&str> = server_config.args.iter().map(String::as_str).collect();
+        let spawn_result = lsp::LspClient::spawn_quiet(
+            &server_config.command,
+            &args_refs,
+            lang,
+            broadcaster.clone(),
+        );
+
+        let mut client = match spawn_result {
+            Ok(client) => client,
+            Err(e) => {
+                println!(
+                    "{}  {}  {}",
+                    lang_display,
+                    cmd_display,
+                    colors.red(&format!("✗ spawn failed: {e}")),
+                );
+                continue;
+            }
+        };
+
+        match client
+            .initialize(&roots, server_config.initialization_options.clone())
+            .await
+        {
+            Ok(result) => {
+                let tools = extract_capabilities(&result.capabilities);
+                println!(
+                    "{}  {}  {}",
+                    lang_display,
+                    cmd_display,
+                    colors.green("✓ ready"),
+                );
+                if !tools.is_empty() {
+                    println!(
+                        "{}  {}",
+                        " ".repeat(max_lang_width + max_cmd_width + 4),
+                        colors.dim(&tools.join(" ")),
+                    );
+                }
+            }
+            Err(e) => {
+                println!(
+                    "{}  {}  {}",
+                    lang_display,
+                    cmd_display,
+                    colors.red(&format!("✗ initialize failed: {e}")),
+                );
+            }
+        }
+
+        // Shutdown cleanly
+        let _ = client.shutdown().await;
+    }
+
+    Ok(())
+}
+
+/// Checks whether a binary can be found on `$PATH`.
+fn binary_exists(command: &str) -> bool {
+    // If the command contains a path separator, check it directly
+    if command.contains('/') {
+        return std::path::Path::new(command).exists();
+    }
+
+    // Search PATH
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    std::env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+}
+
+/// Extracts Catenary tool names from LSP `ServerCapabilities`.
+fn extract_capabilities(caps: &lsp_types::ServerCapabilities) -> Vec<&'static str> {
+    let mut tools = Vec::new();
+
+    if caps.hover_provider.is_some() {
+        tools.push("hover");
+    }
+    if caps.definition_provider.is_some() {
+        tools.push("definition");
+    }
+    if caps.type_definition_provider.is_some() {
+        tools.push("type_definition");
+    }
+    if caps.implementation_provider.is_some() {
+        tools.push("implementation");
+    }
+    if caps.references_provider.is_some() {
+        tools.push("references");
+    }
+    if caps.document_symbol_provider.is_some() {
+        tools.push("document_symbols");
+    }
+    if caps.workspace_symbol_provider.is_some() {
+        tools.push("search");
+    }
+    if caps.code_action_provider.is_some() {
+        tools.push("code_actions");
+    }
+    if caps.rename_provider.is_some() {
+        tools.push("rename");
+    }
+    if caps.call_hierarchy_provider.is_some() {
+        tools.push("call_hierarchy");
+    }
+    // type_hierarchy_provider is not exposed as a direct field in lsp_types 0.97;
+    // type hierarchy support is probed at call time, so we omit it here.
+
+    tools
 }
 
 /// Find session by ID or prefix

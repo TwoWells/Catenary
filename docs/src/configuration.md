@@ -135,53 +135,39 @@ The `[server.<language-id>]` key must match the LSP language identifier. Catenar
 |--------|---------|-------------|
 | `idle_timeout` | `300` | Seconds before auto-closing idle documents. Set to `0` to disable. |
 
-## Shell Execution (`tools.run`)
-
-The `run` tool allows AI agents to execute shell commands. It is **disabled by
-default** — add a `[tools.run]` section to enable it.
-
-```toml
-[tools.run]
-allowed = ["git", "make"]  # Always allowed commands
-denied = ["git grep", "git log"]  # Block specific subcommands
-
-# Language-specific commands (activated when matching files exist in workspace)
-[tools.run.python]
-allowed = ["python", "pytest", "uv"]
-
-[tools.run.rust]
-allowed = ["cargo"]
-```
-
-**Recommended base allowlist for constrained mode:**
-
-```toml
-[tools.run]
-allowed = ["chmod", "cp", "diff", "git", "gh", "ln", "make", "mkdir", "mv", "rm", "rmdir", "touch", "wc"]
-```
-
-This covers file management, version control, and basic utilities without
-opening up arbitrary shell access. Avoid adding commands that can write
-arbitrary content to stdout (`cat`, `echo`, `printf`, `bash`) — these bypass
-Catenary's file tools and their path validation.
-
-**Key behaviors:**
-
-- Commands not on the allowlist are **rejected** with an error showing the
-  current allowlist.
-- Set `allowed = ["*"]` for **unrestricted** execution (use with caution).
-- Language-specific commands activate automatically when matching files are
-  detected in the workspace (e.g., `.py` files activate the `python` group).
-- The tool description updates dynamically to reflect the current allowlist.
-- Commands are executed **directly** (not via shell) to prevent injection.
-- Output is capped at 100KB per stream. Default timeout is 120 seconds.
-- The `denied` list blocks specific command+subcommand pairs (e.g., `"git grep"`).
-  Denied entries take priority over the allowlist, including `["*"]`.
-
 ## CLI Override
 
 You can also specify servers via CLI:
 
 ```bash
 catenary --lsp "rust:rust-analyzer" --lsp "python:pyright-langserver --stdio"
+```
+
+## Verifying Your Setup
+
+Use `catenary doctor` to check that configured language servers are working:
+
+```bash
+catenary doctor
+```
+
+For each configured server, `doctor` reports one of:
+
+| Status | Meaning |
+|--------|---------|
+| `✓ ready` | Server spawned, initialized, and capabilities listed |
+| `✗ command not found` | Binary not on `$PATH` |
+| `✗ spawn failed` | Binary found but process failed to start |
+| `✗ initialize failed` | Process started but LSP handshake failed |
+| `- skipped` | No files for this language in the workspace |
+
+Ready servers also list which Catenary tools they support (e.g. `hover`,
+`definition`, `references`), based on the capabilities the server reports
+during initialization.
+
+Use `--nocolor` to disable colored output, or `--root` to check a different
+workspace:
+
+```bash
+catenary doctor --root /path/to/project
 ```

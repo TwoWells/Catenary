@@ -1,19 +1,5 @@
-/*
- * Copyright (C) 2026 Mark Wells Dev
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Bridge handler that maps MCP tool calls to LSP requests.
 
@@ -22,19 +8,17 @@ use ignore::WalkBuilder;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCall,
     CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, CodeActionContext,
-    CodeActionOrCommand, CodeActionParams, CompletionItem, CompletionParams, CompletionResponse,
-    Diagnostic, DiagnosticSeverity, DocumentChanges, DocumentFormattingParams,
-    DocumentRangeFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, Location,
-    LocationLink, Position, Range, ReferenceContext, ReferenceParams, RenameParams, SignatureHelp,
-    SignatureHelpParams, SymbolInformation, TextDocumentIdentifier, TextDocumentPositionParams,
-    TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    CodeActionOrCommand, CodeActionParams, Diagnostic, DiagnosticSeverity, DocumentChanges,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, Location, LocationLink, Position, Range,
+    ReferenceContext, ReferenceParams, RenameParams, SymbolInformation, TextDocumentIdentifier,
+    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkspaceEdit,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -44,11 +28,10 @@ use crate::mcp::{CallToolResult, Tool, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
 use super::PathValidator;
-use super::run_tool::RunToolManager;
 
 /// Tools that do not require LSP server readiness.
 /// Everything else waits by default — new tools are safe automatically.
-const METHODS_SKIP_WAIT: &[&str] = &["status", "list_directory", "run"];
+const METHODS_SKIP_WAIT: &[&str] = &["status", "list_directory"];
 
 use super::{DocumentManager, DocumentNotification};
 
@@ -67,17 +50,6 @@ pub enum DetailLevel {
 
 const fn default_detail_level() -> DetailLevel {
     DetailLevel::Outline
-}
-
-/// Input for tools that need file + position.
-#[derive(Debug, Deserialize)]
-pub struct PositionInput {
-    /// Path to the file.
-    pub file: String,
-    /// 0-indexed line number.
-    pub line: u32,
-    /// 0-indexed character position.
-    pub character: u32,
 }
 
 /// Input for tools that accept either a symbol name or file/line/character position.
@@ -145,33 +117,6 @@ pub struct RenameInput {
     pub new_name: String,
 }
 
-/// Input for formatting.
-#[derive(Debug, Deserialize)]
-pub struct FormattingInput {
-    pub file: String,
-    #[serde(default = "default_tab_size")]
-    pub tab_size: u32,
-    #[serde(default)]
-    pub insert_spaces: bool,
-}
-
-const fn default_tab_size() -> u32 {
-    4
-}
-
-/// Input for range formatting.
-#[derive(Debug, Deserialize)]
-pub struct RangeFormattingInput {
-    pub file: String,
-    pub start_line: u32,
-    pub start_character: u32,
-    pub end_line: u32,
-    pub end_character: u32,
-    #[serde(default = "default_tab_size")]
-    pub tab_size: u32,
-    #[serde(default)]
-    pub insert_spaces: bool,
-}
 
 /// Input for call hierarchy.
 #[derive(Debug, Deserialize)]
@@ -203,15 +148,6 @@ pub struct TypeHierarchyInput {
     pub direction: String,
 }
 
-/// Input for auto-fixing.
-#[derive(Debug, Deserialize)]
-pub struct ApplyQuickFixInput {
-    pub file: String,
-    pub line: u32,
-    pub character: u32,
-    /// Optional filter string to match against action title.
-    pub filter: Option<String>,
-}
 
 /// Input for codebase map.
 #[derive(Debug, Deserialize)]
@@ -248,9 +184,6 @@ pub struct LspBridgeHandler {
     pub(super) runtime: Handle,
     pub(super) broadcaster: EventBroadcaster,
     pub(super) path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
-    pub(super) run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
-    /// Flag to signal the MCP server to emit `tools/list_changed`.
-    pub(super) tools_changed_flag: Option<Arc<AtomicBool>>,
 }
 
 impl LspBridgeHandler {
@@ -261,8 +194,6 @@ impl LspBridgeHandler {
         runtime: Handle,
         broadcaster: EventBroadcaster,
         path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
-        run_tool: Option<Arc<tokio::sync::RwLock<RunToolManager>>>,
-        tools_changed_flag: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             client_manager,
@@ -270,8 +201,6 @@ impl LspBridgeHandler {
             runtime,
             broadcaster,
             path_validator,
-            run_tool,
-            tools_changed_flag,
         }
     }
     /// Gets the appropriate LSP client for the given file path.
@@ -408,11 +337,6 @@ impl LspBridgeHandler {
         drop(doc_manager);
         drop(client);
         Ok((uri, client_mutex.clone()))
-    }
-
-    fn parse_position_input(arguments: Option<serde_json::Value>) -> Result<PositionInput> {
-        serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-            .map_err(|e| anyhow!("Invalid arguments: {e}"))
     }
 
     /// Resolves a file path, converting relative paths to absolute using the current working directory.
@@ -995,38 +919,6 @@ impl LspBridgeHandler {
         ))
     }
 
-    fn handle_completion(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input = Self::parse_position_input(arguments)?;
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!(
-            "Completion request: {}:{}:{}",
-            input.file, input.line, input.character
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = CompletionParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-                context: None,
-            };
-            client_mutex.lock().await.completion(params).await
-        })?;
-
-        result.map_or_else(
-            || Ok(CallToolResult::text("No completions available")),
-            |response| Ok(CallToolResult::text(format_completion(&response))),
-        )
-    }
-
     fn handle_diagnostics(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: FileInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
@@ -1085,118 +977,6 @@ impl LspBridgeHandler {
             Ok(CallToolResult::text("No diagnostics"))
         } else {
             Ok(CallToolResult::text(format_diagnostics(&diagnostics)))
-        }
-    }
-
-    fn handle_signature_help(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input = Self::parse_position_input(arguments)?;
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!(
-            "Signature help request: {}:{}:{}",
-            input.file, input.line, input.character
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = SignatureHelpParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                context: None,
-            };
-            client_mutex.lock().await.signature_help(params).await
-        })?;
-
-        result.map_or_else(
-            || Ok(CallToolResult::text("No signature help available")),
-            |help| Ok(CallToolResult::text(format_signature_help(&help))),
-        )
-    }
-
-    fn handle_formatting(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: FormattingInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!("Formatting request: {}", input.file);
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = DocumentFormattingParams {
-                text_document: TextDocumentIdentifier { uri },
-                options: FormattingOptions {
-                    tab_size: input.tab_size,
-                    insert_spaces: input.insert_spaces,
-                    ..lsp_types::FormattingOptions::default()
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-            };
-            client_mutex.lock().await.formatting(params).await
-        })?;
-
-        match result {
-            Some(edits) if !edits.is_empty() => Ok(CallToolResult::text(format_text_edits(&edits))),
-            _ => Ok(CallToolResult::text("No formatting changes")),
-        }
-    }
-
-    fn handle_range_formatting(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: RangeFormattingInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!(
-            "Range formatting request: {} [{},{}]-[{},{}]",
-            input.file,
-            input.start_line,
-            input.start_character,
-            input.end_line,
-            input.end_character
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = DocumentRangeFormattingParams {
-                text_document: TextDocumentIdentifier { uri },
-                range: Range {
-                    start: Position {
-                        line: input.start_line,
-                        character: input.start_character,
-                    },
-                    end: Position {
-                        line: input.end_line,
-                        character: input.end_character,
-                    },
-                },
-                options: FormattingOptions {
-                    tab_size: input.tab_size,
-                    insert_spaces: input.insert_spaces,
-                    ..lsp_types::FormattingOptions::default()
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-            };
-            client_mutex.lock().await.range_formatting(params).await
-        })?;
-
-        match result {
-            Some(edits) if !edits.is_empty() => Ok(CallToolResult::text(format_text_edits(&edits))),
-            _ => Ok(CallToolResult::text("No formatting changes")),
         }
     }
 
@@ -1361,147 +1141,6 @@ impl LspBridgeHandler {
         match result {
             Some(text) if !text.is_empty() => Ok(CallToolResult::text(text)),
             _ => Ok(CallToolResult::text("No type hierarchy found")),
-        }
-    }
-    #[allow(
-        clippy::too_many_lines,
-        clippy::significant_drop_tightening,
-        reason = "Complexity of quickfix selection requires many lines; client lock held across async operations"
-    )]
-    fn handle_apply_quickfix(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: ApplyQuickFixInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!(
-            "Apply quickfix request: {}:{}:{} filter={:?}",
-            input.file, input.line, input.character, input.filter
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let client = client_mutex.lock().await;
-
-            // 1. Get diagnostics to find the relevant range and context
-            let diagnostics = client.get_diagnostics(&uri).await;
-
-            // Find diagnostic at cursor
-            let cursor_line = input.line;
-            let cursor_char = input.character;
-
-            let target_diagnostic = diagnostics.iter().find(|d| {
-                let start = d.range.start;
-                let end = d.range.end;
-
-                // Check if cursor is within range (inclusive of start, exclusive of end usually, but let's be loose)
-                if cursor_line < start.line || cursor_line > end.line {
-                    return false;
-                }
-                if cursor_line == start.line && cursor_char < start.character {
-                    return false;
-                }
-                if cursor_line == end.line && cursor_char > end.character {
-                    return false;
-                }
-                true
-            });
-
-            let (range, context_diagnostics) = target_diagnostic.map_or_else(
-                || {
-                    (
-                        Range {
-                            start: Position {
-                                line: cursor_line,
-                                character: cursor_char,
-                            },
-                            end: Position {
-                                line: cursor_line,
-                                character: cursor_char,
-                            },
-                        },
-                        vec![],
-                    )
-                },
-                |d| (d.range, vec![d.clone()]),
-            );
-
-            // 2. Request Code Actions
-            let params = CodeActionParams {
-                text_document: TextDocumentIdentifier { uri },
-                range,
-                context: CodeActionContext {
-                    diagnostics: context_diagnostics,
-                    only: None,
-                    trigger_kind: None,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-
-            let response = client.code_actions(params).await?;
-            let actions = response.unwrap_or_default();
-
-            if actions.is_empty() {
-                return Err(anyhow!("No code actions available at this location"));
-            }
-
-            // 3. Filter and Pick Action
-            let action_to_apply = if let Some(filter) = &input.filter {
-                actions.into_iter().find(|a| match a {
-                    CodeActionOrCommand::Command(cmd) => cmd.title.contains(filter),
-                    CodeActionOrCommand::CodeAction(ca) => ca.title.contains(filter),
-                })
-            } else {
-                // Prefer "quickfix" kind
-                let quickfix = actions.iter().find(|a| match a {
-                    CodeActionOrCommand::CodeAction(ca) => {
-                        ca.kind
-                            .as_ref()
-                            .is_some_and(|k| k.as_str().contains("quickfix"))
-                    }
-                    CodeActionOrCommand::Command(_) => false,
-                });
-
-                quickfix.cloned().or_else(|| actions.first().cloned())
-            };
-
-            let Some(action) = action_to_apply else {
-                return Err(anyhow!("No matching code action found"));
-            };
-
-            // 4. Return proposed edits
-            match action {
-                CodeActionOrCommand::Command(cmd) => {
-                    Err(anyhow!("Selected action is a Command ('{}'), not a WorkspaceEdit. Cannot extract proposed edits.", cmd.title))
-                }
-                CodeActionOrCommand::CodeAction(mut ca) => {
-                    // Resolve if edit is missing (lazy resolution)
-                    if ca.edit.is_none() {
-                        debug!("Resolving code action: {}", ca.title);
-                        ca = client.resolve_code_action(ca).await?;
-                    }
-
-                    if let Some(edit) = ca.edit {
-                        Ok(format!(
-                            "Proposed fix: {}\n{}",
-                            ca.title,
-                            format_workspace_edit(&edit)
-                        ))
-                    } else {
-                        Err(anyhow!("Code action '{}' resolved but still has no edit attached", ca.title))
-                    }
-                }
-            }
-        });
-
-        match result {
-            Ok(msg) => Ok(CallToolResult::text(msg)),
-            Err(e) => Ok(CallToolResult::error(e.to_string())),
         }
     }
     #[allow(
@@ -1729,7 +1368,7 @@ impl LspBridgeHandler {
 impl ToolHandler for LspBridgeHandler {
     #[allow(clippy::too_many_lines, reason = "Naturally long list of tools")]
     fn list_tools(&self) -> Vec<Tool> {
-        let mut tools = vec![
+        let tools = vec![
             Tool {
                 name: "hover".to_string(),
                 description: Some("Get hover information (documentation, type info) for a symbol. Accepts a symbol name or file/line/character position.".to_string()),
@@ -1814,49 +1453,9 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "completion".to_string(),
-                description: Some("Get completion suggestions at a position.".to_string()),
-                input_schema: position_schema(),
-            },
-            Tool {
                 name: "diagnostics".to_string(),
                 description: Some("Get diagnostics (errors, warnings, hints) for a file.".to_string()),
                 input_schema: file_schema(),
-            },
-            Tool {
-                name: "signature_help".to_string(),
-                description: Some("Get function signature help at a position (parameter info while typing a call).".to_string()),
-                input_schema: position_schema(),
-            },
-            Tool {
-                name: "formatting".to_string(),
-                description: Some("Format an entire document.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "tab_size": { "type": "integer", "description": "Tab size (default: 4)" },
-                        "insert_spaces": { "type": "boolean", "description": "Use spaces instead of tabs (default: false)" }
-                    },
-                    "required": ["file"]
-                }),
-            },
-            Tool {
-                name: "range_formatting".to_string(),
-                description: Some("Format a specific range within a document.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "start_line": { "type": "integer", "description": "Start line (0-indexed)" },
-                        "start_character": { "type": "integer", "description": "Start character (0-indexed)" },
-                        "end_line": { "type": "integer", "description": "End line (0-indexed)" },
-                        "end_character": { "type": "integer", "description": "End character (0-indexed)" },
-                        "tab_size": { "type": "integer", "description": "Tab size (default: 4)" },
-                        "insert_spaces": { "type": "boolean", "description": "Use spaces instead of tabs (default: false)" }
-                    },
-                    "required": ["file", "start_line", "start_character", "end_line", "end_character"]
-                }),
             },
             Tool {
                 name: "call_hierarchy".to_string(),
@@ -1898,20 +1497,6 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "apply_quickfix".to_string(),
-                description: Some("Find a Code Action (Quick Fix) for a diagnostic at the given position and return its proposed edits. Does not modify files.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "line": { "type": "integer", "description": "Line number (0-indexed)" },
-                        "character": { "type": "integer", "description": "Character position (0-indexed)" },
-                        "filter": { "type": "string", "description": "Optional text to match against the action title (e.g. 'Import')" }
-                    },
-                    "required": ["file", "line", "character"]
-                }),
-            },
-            Tool {
                 name: "codebase_map".to_string(),
                 description: Some("Generate a high-level file tree of the project, optionally including symbols from LSP.".to_string()),
                 input_schema: serde_json::json!({
@@ -1931,44 +1516,6 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "read_file".to_string(),
-                description: Some("Read a file's contents with line numbers, plus any LSP diagnostics. Supports pagination with offset and limit.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute or relative path to the file" },
-                        "offset": { "type": "integer", "description": "Starting line number (1-indexed, default: 1)" },
-                        "limit": { "type": "integer", "description": "Maximum number of lines to return" }
-                    },
-                    "required": ["file"]
-                }),
-            },
-            Tool {
-                name: "write_file".to_string(),
-                description: Some("Write content to a file, creating it and parent directories if needed. Returns line count and LSP diagnostics. Path must be within workspace roots.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute or relative path to the file" },
-                        "content": { "type": "string", "description": "Content to write to the file" }
-                    },
-                    "required": ["file", "content"]
-                }),
-            },
-            Tool {
-                name: "edit_file".to_string(),
-                description: Some("Edit a file by replacing an exact string match. The old_string must appear exactly once. Returns LSP diagnostics after the edit. Path must be within workspace roots.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute or relative path to the file" },
-                        "old_string": { "type": "string", "description": "The exact text to find (must appear exactly once)" },
-                        "new_string": { "type": "string", "description": "The text to replace it with" }
-                    },
-                    "required": ["file", "old_string", "new_string"]
-                }),
-            },
-            Tool {
                 name: "list_directory".to_string(),
                 description: Some("List the contents of a directory. Shows directories, files with sizes, and symlinks with targets. Symlinks are not followed. Path must be within workspace roots.".to_string()),
                 input_schema: serde_json::json!({
@@ -1980,34 +1527,6 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
         ];
-
-        // Conditionally add the run tool if configured
-        if let Some(ref run_tool) = self.run_tool {
-            let description = self.runtime.block_on(run_tool.read()).describe_allowlist();
-            tools.push(Tool {
-                name: "run".to_string(),
-                description: Some(format!(
-                    "Execute a shell command. {description}"
-                )),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "cwd": { "type": "string", "description": "Working directory for the command (must be within workspace roots)" },
-                        "command": { "type": "string", "description": "The command to execute (e.g., 'cargo' or 'cargo test --lib')" },
-                        "args": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Arguments to pass to the command"
-                        },
-                        "stdin": { "type": "string", "description": "Content to pipe to the process's standard input" },
-                        "timeout": { "type": ["integer", "string"], "description": "Timeout in seconds (default: 120)" },
-                        "output_file": { "type": "string", "description": "Capture stdout to a file instead of returning it inline (path must be within workspace roots)" },
-                        "sleep": { "type": "number", "description": "Seconds to sleep before executing the command (max 300)" }
-                    },
-                    "required": ["command"]
-                }),
-            });
-        }
 
         tools
     }
@@ -2070,20 +1589,11 @@ impl ToolHandler for LspBridgeHandler {
             "search" => self.handle_search(arguments),
             "code_actions" => self.handle_code_actions(arguments),
             "rename" => self.handle_rename(arguments),
-            "completion" => self.handle_completion(arguments),
             "diagnostics" => self.handle_diagnostics(arguments),
-            "signature_help" => self.handle_signature_help(arguments),
-            "formatting" => self.handle_formatting(arguments),
-            "range_formatting" => self.handle_range_formatting(arguments),
             "call_hierarchy" => self.handle_call_hierarchy(arguments),
             "type_hierarchy" => self.handle_type_hierarchy(arguments),
-            "apply_quickfix" => self.handle_apply_quickfix(arguments),
             "codebase_map" => self.handle_codebase_map(arguments),
-            "read_file" => self.handle_read_file(arguments),
-            "write_file" => self.handle_write_file(arguments),
-            "edit_file" => self.handle_edit_file(arguments),
             "list_directory" => self.handle_list_directory(arguments),
-            "run" => self.handle_run(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
 
@@ -2155,18 +1665,6 @@ const fn matches_detail_level(kind: lsp_types::SymbolKind, level: DetailLevel) -
 }
 
 // Schema helpers
-fn position_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "file": { "type": "string", "description": "Absolute path to the file" },
-            "line": { "type": "integer", "description": "Line number (0-indexed)" },
-            "character": { "type": "integer", "description": "Character position (0-indexed)" }
-        },
-        "required": ["file", "line", "character"]
-    })
-}
-
 fn symbol_or_position_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -2573,32 +2071,6 @@ fn format_workspace_edit(edit: &WorkspaceEdit) -> String {
     }
 }
 
-fn format_completion(response: &CompletionResponse) -> String {
-    let items: Vec<&CompletionItem> = match response {
-        CompletionResponse::Array(items) => items.iter().collect(),
-        CompletionResponse::List(list) => list.items.iter().collect(),
-    };
-
-    if items.is_empty() {
-        return "No completions".to_string();
-    }
-
-    items
-        .iter()
-        .take(50)
-        .map(|item| {
-            let kind = item.kind.map(|k| format!(" [{k:?}]")).unwrap_or_default();
-            let detail = item
-                .detail
-                .as_ref()
-                .map(|d| format!(" - {d}"))
-                .unwrap_or_default();
-            format!("{}{}{}", item.label, kind, detail)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
     diagnostics
         .iter()
@@ -2630,73 +2102,6 @@ fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
                     line, col, severity, source, code, d.message
                 )
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn format_signature_help(help: &SignatureHelp) -> String {
-    let mut result = Vec::new();
-
-    for (i, sig) in help.signatures.iter().enumerate() {
-        let active = if Some(u32::try_from(i).unwrap_or(u32::MAX)) == help.active_signature {
-            " (active)"
-        } else {
-            ""
-        };
-        result.push(format!("{}. {}{}", i + 1, sig.label, active));
-
-        if let Some(doc) = &sig.documentation {
-            let doc_str = match doc {
-                lsp_types::Documentation::String(s) => s.clone(),
-                lsp_types::Documentation::MarkupContent(m) => m.value.clone(),
-            };
-            if !doc_str.is_empty() {
-                result.push(format!("   {}", doc_str.lines().next().unwrap_or("")));
-            }
-        }
-
-        if let Some(params) = &sig.parameters {
-            for (j, param) in params.iter().enumerate() {
-                let active_param =
-                    if Some(u32::try_from(j).unwrap_or(u32::MAX)) == help.active_parameter {
-                        " <--"
-                    } else {
-                        ""
-                    };
-                let label = match &param.label {
-                    lsp_types::ParameterLabel::Simple(s) => s.clone(),
-                    lsp_types::ParameterLabel::LabelOffsets([start, end]) => sig
-                        .label
-                        .chars()
-                        .skip(*start as usize)
-                        .take((*end - *start) as usize)
-                        .collect(),
-                };
-                result.push(format!("   - {label}{active_param}"));
-            }
-        }
-    }
-
-    if result.is_empty() {
-        "No signature information".to_string()
-    } else {
-        result.join("\n")
-    }
-}
-
-fn format_text_edits(edits: &[TextEdit]) -> String {
-    edits
-        .iter()
-        .map(|e| {
-            format!(
-                "L{}:{}-L{}:{}: {}",
-                e.range.start.line + 1,
-                e.range.start.character + 1,
-                e.range.end.line + 1,
-                e.range.end.character + 1,
-                e.new_text.replace('\n', "\\n")
-            )
         })
         .collect::<Vec<_>>()
         .join("\n")

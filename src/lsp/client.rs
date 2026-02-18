@@ -1,19 +1,5 @@
-/*
- * Copyright (C) 2026 Mark Wells Dev
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 use anyhow::{Context, Result, anyhow};
 use bytes::BytesMut;
@@ -101,11 +87,35 @@ impl LspClient {
         language: &str,
         broadcaster: EventBroadcaster,
     ) -> Result<Self> {
+        Self::spawn_inner(program, args, language, broadcaster, Stdio::inherit())
+    }
+
+    /// Spawns the LSP server with stderr suppressed (for `catenary doctor`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server process cannot be spawned.
+    pub fn spawn_quiet(
+        program: &str,
+        args: &[&str],
+        language: &str,
+        broadcaster: EventBroadcaster,
+    ) -> Result<Self> {
+        Self::spawn_inner(program, args, language, broadcaster, Stdio::null())
+    }
+
+    fn spawn_inner(
+        program: &str,
+        args: &[&str],
+        language: &str,
+        broadcaster: EventBroadcaster,
+        stderr: Stdio,
+    ) -> Result<Self> {
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .spawn()
             .with_context(|| format!("Failed to spawn LSP server: {program}"))?;
 
@@ -1003,14 +1013,20 @@ impl LspClient {
     /// sending the change that should trigger new diagnostics. This ensures
     /// no race window between sending the change and starting the wait.
     ///
-    /// After the first diagnostics update, the server may still publish
-    /// additional diagnostic rounds (e.g., warnings first, then type errors)
-    /// or run flycheck. The settle phase polls the notification counter and
-    /// progress tracker, returning only once the server has been quiet for
-    /// 2 seconds with no active background work.
+    /// Phase 1 uses an inactivity-based timeout: as long as the server shows
+    /// signs of life (activity counter changing or progress tokens active),
+    /// the wait continues indefinitely. If the server goes completely silent
+    /// for `timeout` with no activity and no active progress, it is presumed
+    /// hung and the wait aborts. This allows slow-but-working servers (e.g.,
+    /// rust-analyzer flycheck on large projects) to finish while still
+    /// detecting genuinely hung servers.
     ///
-    /// Returns `true` if diagnostics advanced, `false` on timeout or server
-    /// death.
+    /// After the first diagnostics update, the settle phase (phase 2) polls
+    /// the notification counter and progress tracker, returning only once
+    /// the server has been quiet for 2 seconds with no active background work.
+    ///
+    /// Returns `true` if diagnostics advanced, `false` on inactivity timeout
+    /// or server death.
     pub async fn wait_for_diagnostics_update(
         &self,
         uri: &Uri,
@@ -1055,10 +1071,14 @@ impl LspClient {
             }
         }
 
-        let deadline = tokio::time::Instant::now() + timeout;
-
         // Phase 1: Wait for diagnostics generation to advance past snapshot.
-        // This confirms the server received and started processing our change.
+        // Uses an inactivity-based timeout: keeps waiting while the server
+        // shows signs of life (activity counter or progress tokens), gives
+        // up after `timeout` of complete silence.
+        let poll_interval = Duration::from_millis(100);
+        let mut last_counter = self.activity_counter.load(Ordering::SeqCst);
+        let mut last_activity = tokio::time::Instant::now();
+
         loop {
             if self.diagnostics_generation(uri).await > snapshot {
                 break;
@@ -1068,19 +1088,24 @@ impl LspClient {
                 return false;
             }
 
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return false;
+            tokio::time::sleep(poll_interval).await;
+
+            let current_counter = self.activity_counter.load(Ordering::SeqCst);
+            let has_active_progress = self.progress.lock().await.is_busy();
+
+            if current_counter != last_counter {
+                last_counter = current_counter;
+                last_activity = tokio::time::Instant::now();
             }
 
-            match tokio::time::timeout(remaining, self.diagnostics_notify.notified()).await {
-                Ok(()) => {
-                    // Woken — re-check generation at top of loop
-                }
-                Err(_) => {
-                    // Timed out — check one last time
-                    return self.diagnostics_generation(uri).await > snapshot;
-                }
+            if has_active_progress {
+                last_activity = tokio::time::Instant::now();
+            }
+
+            // If server has been completely silent for the timeout duration,
+            // it's either hung or won't produce diagnostics for this change.
+            if last_activity.elapsed() >= timeout && !has_active_progress {
+                return false;
             }
         }
 
@@ -1091,8 +1116,7 @@ impl LspClient {
         // progress. It returns only after 2 seconds of silence with no active
         // progress tokens, which bridges the flycheck debounce gap and waits
         // for cargo check to finish.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        self.wait_for_activity_settle(Duration::from_secs(2), remaining)
+        self.wait_for_activity_settle(Duration::from_secs(2), timeout)
             .await
     }
 

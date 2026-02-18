@@ -27,7 +27,7 @@ Instead of reading a 500-line file to find a type signature, the agent asks
 the language server directly — `hover` returns 50 tokens instead of 2,000.
 Instead of grepping across 20 files to find a definition, `definition` returns
 the exact location in one query. Instead of re-reading a file after editing it
-to check for errors, `edit_file` returns diagnostics inline.
+to check for errors, the `catenary notify` hook returns diagnostics inline.
 
 Each LSP query is small and stateless. Nothing accumulates. The context stays
 lean across the entire session, regardless of how long the agent works.
@@ -41,7 +41,7 @@ lean across the entire session, regardless of how long the agent works.
 | Graph navigation | Tokens | Context cost |
 |------------------|--------|--------------|
 | `hover` for type info | ~100 | stateless |
-| `edit_file` (diagnostics included) | ~300 | no re-read |
+| Native edit + notify hook diagnostics | ~300 | no re-read |
 | `definition` | ~50 | stateless |
 
 ## How It Works
@@ -57,17 +57,18 @@ lean across the entire session, regardless of how long the agent works.
 
 Catenary bridges [MCP](https://modelcontextprotocol.io/) and
 [LSP](https://microsoft.github.io/language-server-protocol/). It manages
-multiple language servers, routes requests by file type, and provides file I/O
-with automatic diagnostics — all through a single MCP server. The agent never
-needs to know which server handles which language.
+multiple language servers, routes requests by file type, and provides automatic
+post-edit diagnostics via the `catenary notify` hook — all through a single MCP
+server. The agent never needs to know which server handles which language.
 
 ## Constrained Mode
 
-Catenary is designed to be the agent's **primary toolkit**, not a supplement.
-When you disable the host CLI's built-in file and shell tools, the agent is
-forced to use LSP queries for navigation and Catenary's file I/O for edits.
-This eliminates the fallback to brute-force reads and keeps context usage
-minimal.
+Catenary is designed to be the agent's **primary navigation toolkit**, not a
+supplement. In constrained mode, the host CLI's text-scanning commands (grep,
+cat, find, ls, etc.) are denied via permissions, forcing the agent to use LSP
+queries for navigation. The host's native file I/O tools remain available for
+reading and editing, with Catenary providing post-edit diagnostics via the
+`catenary notify` hook.
 
 See [CLI Integration](cli-integration.md) for setup instructions.
 
@@ -83,9 +84,8 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | **Eager Startup**     | Servers for detected languages start at launch; others start on first file access      |
 | **Smart Routing**     | Requests automatically route to the correct server based on file type                  |
 | **Universal Support** | Works with any LSP-compliant language server                                           |
-| **Full LSP Coverage** | Hover, definitions, references, diagnostics, completions, rename, formatting, and more |
+| **Full LSP Coverage** | Hover, definitions, references, diagnostics, rename, code actions, and more |
 | **File I/O**          | Read, write, and edit files with automatic LSP diagnostics                            |
-| **Shell Execution**   | Run commands with configurable allowlists and language detection                       |
 
 ## Available Tools
 
@@ -102,37 +102,22 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | `search`         | Search for a symbol or pattern (LSP workspace symbols + file heatmap) |
 | `code_actions`        | Get quick fixes and refactorings                    |
 | `rename`              | Compute rename edits (does not modify files)        |
-| `completion`          | Get completion suggestions                          |
-| `signature_help`      | Get function parameter info                         |
-| `diagnostics`         | Get errors and warnings                                    |
-| `formatting`          | Format a document                                   |
-| `range_formatting`    | Format a selection                                  |
+| `diagnostics`         | Get errors and warnings                             |
 | `call_hierarchy`      | See who calls a function / what it calls            |
 | `type_hierarchy`      | See type inheritance                                |
 | `status`         | Report status of all LSP servers (e.g. "Indexing")  |
-| `apply_quickfix` | Find a quick fix and return its proposed edits       |
 | `codebase_map`   | Generate a high-level file tree with symbols        |
 
 ### File I/O Tools
 
 | Tool                      | Description                                         |
 | ------------------------- | --------------------------------------------------- |
-| `read_file`          | Read file contents with line numbers and diagnostics |
-| `write_file`         | Write content to a file, returns diagnostics         |
-| `edit_file`          | Search-and-replace edit, returns diagnostics         |
 | `list_directory`     | List directory contents (files, dirs, symlinks)      |
 
-Write and edit tools **automatically return LSP diagnostics** after modifying
-files, so the model immediately sees any errors introduced by its changes.
+File reading and editing is handled by the host tool's native file operations
+(e.g. Claude Code's `Read`, `Edit`, `Write`). Catenary provides **post-edit
+LSP diagnostics** via the `catenary notify` hook — diagnostics appear in the
+model's context after every edit. See [CLI Integration](cli-integration.md)
+for hook configuration.
 
-All file paths are validated against workspace roots. Catenary's own
-configuration files are protected from modification.
-
-### Shell Execution
-
-| Tool                      | Description                                         |
-| ------------------------- | --------------------------------------------------- |
-| `run`                | Execute a shell command (allowlist enforced)          |
-
-The `run` tool requires explicit configuration. See
-[Configuration](configuration.md#shell-execution-toolsrun) for setup.
+All file paths are validated against workspace roots.

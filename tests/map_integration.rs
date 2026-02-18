@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Integration tests for codebase map tool.
 
@@ -86,29 +89,6 @@ impl BridgeProcess {
         let _ = self.recv()?;
         self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
         Ok(())
-    }
-
-    fn call_tool_text(&mut self, name: &str, args: &serde_json::Value) -> Result<String> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 100,
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": args
-            }
-        }))?;
-
-        let response = self.recv()?;
-        let result = response.get("result").context("No result in response")?;
-        let content = result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|item| item.get("text"))
-            .and_then(|t| t.as_str())
-            .context("No text content in result")?;
-        Ok(content.to_string())
     }
 }
 
@@ -416,70 +396,6 @@ fn test_codebase_map_single_path_override() -> Result<()> {
     assert!(
         !content.contains("only_b.txt"),
         "Should NOT contain only_b.txt when explicit path is root A, got:\n{content}"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_read_file_markdown_no_timeout() -> Result<()> {
-    if !Command::new("which")
-        .arg("marksman")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-
-    let temp = tempfile::tempdir()?;
-    // Marksman needs .git to detect workspace root
-    std::fs::create_dir(temp.path().join(".git"))?;
-
-    let md_path = temp.path().join("README.md");
-    std::fs::write(
-        &md_path,
-        "# Project Title\n\n## Getting Started\n\nSome content here.\n",
-    )?;
-
-    let mut bridge = BridgeProcess::spawn(
-        temp.path().to_str().context("invalid path")?,
-        Some("markdown:marksman server"),
-    )?;
-    bridge.initialize()?;
-
-    // Give marksman time to initialize and index
-    std::thread::sleep(Duration::from_secs(5));
-
-    let start = std::time::Instant::now();
-
-    let text = bridge.call_tool_text(
-        "read_file",
-        &json!({ "file": md_path.to_str().context("invalid path")? }),
-    )?;
-
-    let elapsed = start.elapsed();
-
-    // Should contain file content
-    assert!(
-        text.contains("Project Title"),
-        "Should contain file content, got:\n{text}"
-    );
-    assert!(
-        text.contains("Getting Started"),
-        "Should contain file content, got:\n{text}"
-    );
-
-    // Should NOT have timed out waiting for diagnostics
-    assert!(
-        !text.contains("server stopped responding"),
-        "Should not have timed out on diagnostics, got:\n{text}"
-    );
-
-    // Should complete well under the 30s diagnostic timeout
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "read_file took {elapsed:?}, expected under 15s (30s = diagnostic timeout hit)"
     );
 
     Ok(())

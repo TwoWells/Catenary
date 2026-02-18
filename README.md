@@ -31,7 +31,7 @@ graph LR
 Catenary bridges [MCP](https://modelcontextprotocol.io/) and
 [LSP](https://microsoft.github.io/language-server-protocol/), giving agents
 the same code intelligence that powers your IDE. It manages multiple language
-servers, routes requests by file type, and provides file I/O with automatic
+servers, routes requests by file type, and provides automatic post-edit
 diagnostics — all through a single MCP server.
 
 ## Quick Start
@@ -57,70 +57,70 @@ args = ["--stdio"]
 
 ### 3. Connect your AI assistant
 
-**Claude Code** (recommended — constrained mode)
+**Claude Code** (recommended — hook mode)
 ```bash
 claude mcp add catenary -- catenary
 ```
 
-Then add to `.claude/settings.json` to replace built-in tools with Catenary:
+Then add to `.claude/settings.json` to get LSP diagnostics after every edit:
 
-```json
-{
-  "permissions": {
-    "deny": ["Read", "Edit", "Write", "Bash", "Grep", "Glob", "Task", "NotebookEdit"],
-    "allow": ["WebSearch", "WebFetch", "mcp__catenary__*", "ToolSearch", "AskUserQuestion"]
-  }
-}
-```
-
-**Gemini CLI** (recommended — constrained mode)
-```json
-{
-  "tools": {
-    "core": ["web_fetch", "google_web_search", "save_memory"]
-  },
-  "mcpServers": {
-    "catenary": { "command": "catenary" }
-  }
-}
-```
-
-> Catenary also works as a supplement alongside built-in tools — just add the
-> MCP server without restricting permissions. But you'll get the most value in
-> constrained mode, where the agent is forced to use efficient LSP queries
-> instead of falling back to file reads and grep.
-
-### 4. Display hooks (optional)
-
-Catenary's `edit_file` and `write_file` tools pass raw JSON to the CLI, which
-is hard to review. The bundled hook formats these as colorized diffs and
-previews.
-
-**Claude Code**
-```bash
-mkdir -p ~/.claude/hooks
-cp .claude-plugin/plugins/catenary/hooks/format_tool_output.py ~/.claude/hooks/
-chmod +x ~/.claude/hooks/format_tool_output.py
-```
-
-Add to `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "PreToolUse": [
+    "PostToolUse": [
       {
-        "matcher": "mcp__.*__edit_file|mcp__.*__write_file",
-        "hooks": [{ "type": "command", "command": "~/.claude/hooks/format_tool_output.py" }]
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "catenary notify" }
+        ]
       }
     ]
   }
 }
 ```
 
-**Gemini CLI** — not currently supported. Gemini's `BeforeTool` hook fires
-after the user approves the tool call, so there's no way to show a formatted
-diff in the approval prompt. The raw JSON parameters are all that's available
-at decision time.
+**Gemini CLI** (recommended — constrained mode)
+
+Add catenary to `.gemini/settings.json`:
+```json
+{
+  "mcpServers": {
+    "catenary": { "command": "catenary" }
+  }
+}
+```
+
+Then install the [policy file](https://markwells-dev.github.io/catenary/cli-integration.html#gemini-cli)
+to `~/.gemini/policies/catenary-constrained.toml` to block text-scanning
+commands and force LSP-first navigation.
+
+> Catenary also works as a supplement alongside built-in tools — just add the
+> MCP server without restricting permissions. But you'll get the most value in
+> **[constrained mode](https://markwells-dev.github.io/catenary/cli-integration.html)**,
+> where the agent is forced to use efficient LSP queries instead of falling
+> back to file reads and grep.
+
+### 4. Verify
+
+Check that your language servers are working:
+
+```bash
+catenary doctor
+```
+
+```
+rust         rust-analyzer       ✓ ready
+             hover definition references document_symbols search code_actions rename call_hierarchy
+
+python       pyright-langserver  ✓ ready
+             hover definition references document_symbols search rename
+
+toml         taplo               - skipped (no matching files)
+```
+
+Then edit any source file — you should see LSP diagnostics appear in the
+model's context after each edit. Catenary's `PostToolUse` hook automatically
+notifies the running LSP servers and returns any errors or warnings.
 
 ## Why This Matters
 
@@ -135,7 +135,7 @@ at decision time.
 |-----------------|--------|-------------------|
 | `hover` for type info | ~100 | 0 (stateless) |
 | `definition` | ~50 | 0 |
-| `edit_file` (returns diagnostics) | ~300 | 0 (no re-read needed) |
+| Native edit + notify hook diagnostics | ~300 | 0 (no re-read needed) |
 | **Total** | **~450** | **0 copies** |
 
 Every token in context is re-processed on every turn. Bigger context windows
@@ -150,36 +150,30 @@ don't fix this — they just let you waste more before hitting the wall.
 | `find_references` | Find all references |
 | `search` | Symbol search with grep fallback |
 | `diagnostics` | Errors and warnings |
-| `read_file` | Read file contents + diagnostics |
-| `write_file` | Write file + diagnostics |
-| `edit_file` | Search-and-replace edit + diagnostics |
 | `list_directory` | List directory contents |
-| `run` | Execute shell commands (allowlist enforced) |
+| `catenary notify` | PostToolUse hook — returns LSP diagnostics after edits |
 | ... | [See all tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
 
 ## Known Limitations
 
 **MCP tool display in CLIs.** Claude Code and Gemini CLI render built-in tools
 with clean, purpose-built UI — diffs for edits, syntax highlighting for reads.
-MCP tools get none of this. Every Catenary tool call shows raw escaped JSON in
-the approval prompt, making the normally sleek UX feel like a debug console.
+MCP tools get none of this. Catenary's LSP tool calls show raw escaped JSON in
+the approval prompt. This is a host CLI limitation, not something Catenary can
+fix — MCP tools need the same display treatment as built-in tools.
 
-The bundled display hook (step 4 above) patches this for `edit_file` and
-`write_file` in Claude Code, but every other tool still renders as JSON. This
-is a host CLI limitation, not something Catenary can fix — MCP tools need the
-same display treatment as built-in tools.
-
-**Gemini CLI hooks fire post-approval.** Gemini's `BeforeTool` hook runs after
-the user accepts the tool call, so display hooks can't improve the approval
-prompt. The formatted output only appears in the debug console.
+File I/O uses the host's native tools (with full diff/highlight UX) and
+Catenary provides diagnostics via the `PostToolUse` hook.
 
 ## Documentation
 
-- **[Overview](https://github.com/MarkWells-Dev/Catenary/wiki/Overview)** — The problem, the solution, available tools
-- **[Install](https://github.com/MarkWells-Dev/Catenary/wiki/Install)** — Setup for Claude Code, Claude Desktop, Gemini CLI
-- **[Config](https://github.com/MarkWells-Dev/Catenary/wiki/Config)** — Configuration reference
-- **[LSPs](https://github.com/MarkWells-Dev/Catenary/wiki/LSPs)** — Language server setup guides
-- **[AI Agents](https://github.com/MarkWells-Dev/Catenary/wiki/AI-Agents)** — System prompt suggestions and workflow patterns
+Full documentation at **[markwells-dev.github.io/catenary](https://markwells-dev.github.io/catenary/)**
+
+- **[Overview](https://markwells-dev.github.io/catenary/overview.html)** — The problem, the solution, available tools
+- **[Installation](https://markwells-dev.github.io/catenary/installation.html)** — Setup for Claude Code, Claude Desktop, Gemini CLI
+- **[Configuration](https://markwells-dev.github.io/catenary/configuration.html)** — Language servers, `catenary doctor`
+- **[CLI Integration](https://markwells-dev.github.io/catenary/cli-integration.html)** — Constrained mode for Claude Code and Gemini CLI
+- **[AI Agents](https://markwells-dev.github.io/catenary/ai-agents.html)** — System prompt suggestions and workflow patterns
 
 ## License
 

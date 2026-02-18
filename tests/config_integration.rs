@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Integration tests for configuration loading and merging.
 //!

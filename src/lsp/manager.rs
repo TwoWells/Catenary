@@ -1,19 +1,5 @@
-/*
- * Copyright (C) 2026 Mark Wells Dev
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
@@ -358,7 +344,9 @@ impl ClientManager {
 ///
 /// Respects `.gitignore` and skips hidden files. Exits early once all
 /// configured languages have been detected.
-fn detect_workspace_languages(
+#[must_use]
+#[allow(clippy::implicit_hasher, reason = "All callers use the default hasher")]
+pub fn detect_workspace_languages(
     roots: &[PathBuf],
     configured_keys: &HashSet<&str>,
 ) -> HashSet<String> {
@@ -463,7 +451,6 @@ mod tests {
         Config {
             server: HashMap::new(),
             idle_timeout: 300,
-            tools: crate::config::ToolsConfig::default(),
         }
     }
 

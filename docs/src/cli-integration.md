@@ -1,8 +1,8 @@
 # CLI Integration
 
 Integrate catenary-mcp with existing AI coding assistants (Claude Code, Gemini
-CLI) by disabling their built-in tools and replacing them with catenary's
-LSP-backed alternatives.
+CLI) by constraining their built-in tools so the model uses catenary's
+LSP-backed navigation instead of text scanning.
 
 ## Why Not a Custom CLI?
 
@@ -28,22 +28,6 @@ maintaining a CLI.
 
 Preserved from the original CLI design:
 
-### Controlled Shell
-
-No arbitrary shell access. The `run` tool requires an explicit allowlist — only
-commands you configure are permitted.
-
-**Why:**
-
-- Model can't bypass `search` with raw `grep`
-- Model can't `cat` files instead of using `read_file`
-- No accidental `rm -rf` or destructive commands
-- Every action is intentional and auditable
-- Token efficient — no parsing noisy shell output
-
-See [Configuration: Shell Execution](configuration.md#shell-execution-toolsrun)
-for allowlist setup.
-
 ### LSP-First
 
 - Hover instead of file read (for type info)
@@ -60,17 +44,104 @@ for allowlist setup.
 
 ### Gemini CLI
 
-Location: `.gemini/settings.json` (workspace) or `~/.gemini/settings.json`
-(user)
+Location: `~/.gemini/policies/` (user) or `.gemini/settings.json` (workspace)
 
-**Key finding:** Use `tools.core` (allowlist). `tools.exclude` doesn't work
-reliably.
+**Constrained mode.** Use the Policy Engine to deny text-scanning commands while
+keeping Gemini's native file I/O and shell tools available. Create the file
+`~/.gemini/policies/catenary-constrained.toml`:
+
+```toml
+# Catenary constrained mode — forces LSP-first navigation
+# Place in ~/.gemini/policies/catenary-constrained.toml
+
+# --- 1. Search (Grep Family) ---
+[[rule]]
+commandPrefix = [
+  "rg", "ag", "ack", "fd",
+  "grep", "egrep", "fgrep", "rgrep", "zgrep",
+  "git grep",
+]
+decision = "deny"
+priority = 900
+deny_message = "Use Catenary's search tool instead."
+
+# --- 2. Navigation (Listing Family) ---
+[[rule]]
+commandPrefix = [
+  "ls", "dir", "vdir", "tree", "find",
+  "locate", "mlocate", "whereis", "which",
+  "git ls-files", "git ls-tree",
+]
+decision = "deny"
+priority = 900
+deny_message = "Use Catenary's list_directory tool instead."
+
+# --- 3. Peeking (Reading Family) ---
+[[rule]]
+commandPrefix = [
+  "cat", "head", "tail", "more", "less", "nl",
+  "od", "hexdump", "xxd", "strings", "dd", "tee",
+]
+decision = "deny"
+priority = 900
+deny_message = "Use the native read_file tool instead."
+
+# --- 4. Text Processing (Scripting Family) ---
+[[rule]]
+commandPrefix = [
+  "awk", "sed", "perl",
+  "cut", "paste", "sort", "uniq", "join",
+]
+decision = "deny"
+priority = 900
+deny_message = "Text processing commands are not allowed in constrained mode."
+
+# --- 5. Reconnaissance (Metadata Family) ---
+[[rule]]
+commandPrefix = ["file", "stat", "du", "df"]
+decision = "deny"
+priority = 900
+deny_message = "Metadata commands are not allowed in constrained mode."
+
+# --- 6. Executors & Shells (The Wrapper Family) ---
+[[rule]]
+commandPrefix = [
+  "bash", "sh", "zsh", "dash", "fish",
+  "ash", "csh", "ksh", "tcsh",
+]
+decision = "deny"
+priority = 900
+deny_message = "Shell wrappers are not allowed in constrained mode."
+
+# --- 7. The Command Runners (Prevents Masquerading) ---
+[[rule]]
+commandPrefix = [
+  "env", "sudo", "su", "nohup", "timeout", "watch", "time",
+  "eval", "exec", "command", "builtin", "type", "hash",
+]
+decision = "deny"
+priority = 900
+deny_message = "Command runners are not allowed in constrained mode."
+
+# --- 8. The Multiplexers ---
+[[rule]]
+commandPrefix = ["xargs", "parallel"]
+decision = "deny"
+priority = 900
+deny_message = "Multiplexers are not allowed in constrained mode."
+
+# --- 9. Framework Blocks ---
+[[rule]]
+toolName = ["grep_search", "glob", "read_many_files"]
+decision = "deny"
+priority = 900
+deny_message = "Use Catenary's LSP tools for code navigation."
+```
+
+Then add the MCP server to `.gemini/settings.json`:
 
 ```json
 {
-  "tools": {
-    "core": ["web_fetch", "google_web_search", "save_memory"]
-  },
   "mcpServers": {
     "catenary": {
       "command": "catenary"
@@ -100,27 +171,24 @@ reliably.
 Location: `.claude/settings.json` (workspace) or `~/.claude/settings.json`
 (user)
 
-**Key finding:** Must deny `Task` to prevent sub-agent escape hatch.
+**Recommended: Hook-based integration.** Claude Code's native `Read`, `Edit`,
+and `Write` tools handle file I/O with inline diffs and syntax highlighting.
+Catenary provides LSP diagnostics via a `PostToolUse` hook — diagnostics appear
+in the model's context after every edit.
 
 ```json
 {
-  "permissions": {
-    "deny": [
-      "Read",
-      "Edit",
-      "Write",
-      "Bash",
-      "Grep",
-      "Glob",
-      "Task",
-      "NotebookEdit"
-    ],
-    "allow": [
-      "WebSearch",
-      "WebFetch",
-      "mcp__catenary__*",
-      "ToolSearch",
-      "AskUserQuestion"
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary notify"
+          }
+        ]
+      }
     ]
   },
   "mcpServers": {
@@ -131,51 +199,147 @@ Location: `.claude/settings.json` (workspace) or `~/.claude/settings.json`
 }
 ```
 
+The `catenary notify` command reads the hook's JSON from stdin, finds the
+running Catenary session for the workspace, and returns any LSP diagnostics
+for the changed file. It exits silently on any error so it never blocks
+Claude Code's flow.
+
+**Alternative: Constrained mode.** Keep Claude Code's native `Read`, `Edit`,
+`Write`, and `Bash` tools but deny text-scanning commands to force LSP-first
+navigation. This deny list blocks grep, file listing, manual reads, text
+processing, shell wrappers, and framework tools that would bypass Catenary.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch",
+      "mcp__catenary__*",
+      "mcp__plugin_catenary_catenary__*",
+      "ToolSearch",
+      "AskUserQuestion",
+      "Bash"
+    ],
+    "deny": [
+      "// --- 1. Search (Grep Family) ---",
+      "Bash(rg *)",
+      "Bash(ag *)",
+      "Bash(ack *)",
+      "Bash(fd *)",
+      "Bash(grep *)",
+      "Bash(egrep *)",
+      "Bash(fgrep *)",
+      "Bash(rgrep *)",
+      "Bash(zgrep *)",
+      "Bash(git grep *)",
+      "// --- 2. Navigation (Listing Family) ---",
+      "Bash(ls *)",
+      "Bash(dir *)",
+      "Bash(vdir *)",
+      "Bash(tree *)",
+      "Bash(find *)",
+      "Bash(locate *)",
+      "Bash(mlocate *)",
+      "Bash(whereis *)",
+      "Bash(which *)",
+      "Bash(git ls-files *)",
+      "Bash(git ls-tree *)",
+      "// --- 3. Peeking (Reading Family) ---",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(more *)",
+      "Bash(less *)",
+      "Bash(nl *)",
+      "Bash(od *)",
+      "Bash(hexdump *)",
+      "Bash(xxd *)",
+      "Bash(strings *)",
+      "Bash(dd *)",
+      "Bash(tee *)",
+      "// --- 4. Text Processing (Scripting Family) ---",
+      "Bash(awk *)",
+      "Bash(sed *)",
+      "Bash(perl *)",
+      "Bash(cut *)",
+      "Bash(paste *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(join *)",
+      "// --- 5. Reconnaissance (Metadata Family) ---",
+      "Bash(file *)",
+      "Bash(stat *)",
+      "Bash(du *)",
+      "Bash(df *)",
+      "// --- 6. Executors & Shells (The Wrapper Family) ---",
+      "Bash(bash *)",
+      "Bash(sh *)",
+      "Bash(zsh *)",
+      "Bash(dash *)",
+      "Bash(fish *)",
+      "Bash(ash *)",
+      "Bash(csh *)",
+      "Bash(ksh *)",
+      "Bash(tcsh *)",
+      "// --- 7. The Command Runners (Prevents Masquerading) ---",
+      "Bash(env *)",
+      "Bash(sudo *)",
+      "Bash(su *)",
+      "Bash(nohup *)",
+      "Bash(timeout *)",
+      "Bash(watch *)",
+      "Bash(time *)",
+      "Bash(eval *)",
+      "Bash(exec *)",
+      "Bash(command *)",
+      "Bash(builtin *)",
+      "Bash(type *)",
+      "Bash(hash *)",
+      "// --- 8. The Multiplexers ---",
+      "Bash(xargs *)",
+      "Bash(parallel *)",
+      "// --- 9. Framework Blocks ---",
+      "Grep",
+      "Glob",
+      "Task"
+    ]
+  },
+  "mcpServers": {
+    "catenary": {
+      "command": "catenary"
+    }
+  }
+}
+```
+
+This keeps `Bash` available for build/test/git commands while blocking every
+path that would let the model fall back to text scanning. The model uses:
+
+- **Catenary LSP tools** for navigation (`search`, `hover`, `definition`, etc.)
+- **Catenary `list_directory`** for directory browsing (replaces `ls`, `tree`, `find`)
+- **Claude Code `Read`/`Edit`/`Write`** for file I/O (with `catenary notify` hook for diagnostics)
+- **Claude Code `Bash`** for build, test, and git commands only
+
 ## Experiment Results
 
 Validated 2026-02-06.
 
-| Test                     | Gemini CLI             | Claude Code                        |
-| ------------------------ | ---------------------- | ---------------------------------- |
-| Restriction method       | `tools.core` allowlist | `permissions.deny` + block `Task`  |
-| MCP tools discovered     | ✓                      | ✓                                  |
-| Built-in tools blocked   | ✓                      | ✓                                  |
-| Model adapts gracefully  | ✓ (slowly)             | ✓ (quickly)                        |
-| Sub-agent escape blocked | N/A                    | ✓ (requires denying `Task`)        |
-
-### Model Behavior When Constrained
-
-**Gemini:**
-
-1. Tried WebFetch to read local file (wrong tool)
-2. Tried `run_shell_command` → blocked
-3. Adapted to `codebase_map`
-4. Used `document_symbols`
-5. Delegated to sub-agent (burned tokens before admitting defeat)
-
-**Claude:**
-
-1. Tried `Skill(read)` → failed
-2. No Read/Bash/Task available
-3. Adapted to `document_symbols`
-4. Admitted limitations gracefully
-5. Offered LSP-based alternatives
-
-**Key difference:** Claude admits defeat faster and communicates limitations
-clearly. Gemini burns tokens trying workarounds.
+| Test                     | Gemini CLI             | Claude Code                                 |
+| ------------------------ | ---------------------- | ------------------------------------------- |
+| Restriction method       | `tools.core` allowlist | `permissions.deny` list + block `Grep/Glob/Task` |
+| MCP tools discovered     | ✓                      | ✓                                           |
+| Text scanning blocked    | ✓                      | ✓                                           |
+| Model adapts gracefully  | ✓ (slowly)             | ✓ (quickly)                                 |
+| Sub-agent escape blocked | N/A                    | ✓ (requires denying `Task`)                 |
 
 ## Catenary Tool Coverage
 
-Catenary provides a complete toolkit — LSP intelligence, file I/O, and
-controlled shell execution:
+Catenary provides a complete toolkit — LSP intelligence and file I/O:
 
 | Tool                | Category  | Notes                                    |
 | ------------------- | --------- | ---------------------------------------- |
-| `read_file`         | File I/O  | With line numbers and diagnostics        |
-| `write_file`        | File I/O  | With post-write diagnostics              |
-| `edit_file`         | File I/O  | Search-and-replace with diagnostics      |
 | `list_directory`    | File I/O  | Files, dirs, symlinks                    |
-| `run`               | Shell     | Allowlist-enforced command execution     |
 | `search`            | LSP       | Workspace symbols + grep fallback        |
 | `find_references`   | LSP       | LSP references                           |
 | `codebase_map`      | LSP       | File tree with symbols                   |
@@ -184,19 +348,11 @@ controlled shell execution:
 | `diagnostics`       | LSP       | Errors, warnings                         |
 | ...                 | LSP       | [Full list](overview.md#available-tools) |
 
+File I/O (`read_file`, `write_file`, `edit_file`) is handled by the host
+tool's native file operations. Catenary provides post-edit diagnostics via
+the `catenary notify` hook.
+
 ## Limitations
-
-### Shell is Allowlist-Only
-
-The `run` tool only executes commands on the configured allowlist. There is no
-general-purpose shell — models can't escape to `grep`, `cat`, or arbitrary
-commands unless you explicitly allow them.
-
-When catenary lacks a tool the model needs, it must either:
-
-- Use available catenary tools creatively
-- Use `run` if the command is on the allowlist
-- Admit it can't complete the task
 
 ### LSP Dependency
 
@@ -204,7 +360,7 @@ Some operations require LSP:
 
 - Find references (no grep fallback currently)
 - Rename symbol
-- Code actions / quick fixes
+- Code actions
 
 If LSP is unavailable for a language, these tools return errors. `search` has
 a grep fallback for basic text matching when no LSP server covers the file.

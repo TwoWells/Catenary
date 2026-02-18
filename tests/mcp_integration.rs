@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! End-to-end integration tests for the MCP-LSP bridge.
 //!
@@ -293,11 +296,7 @@ fn test_mcp_tools_list() -> Result<()> {
         "search",
         "code_actions",
         "rename",
-        "completion",
         "diagnostics",
-        "signature_help",
-        "formatting",
-        "range_formatting",
         "call_hierarchy",
         "type_hierarchy",
     ];

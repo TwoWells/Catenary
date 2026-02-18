@@ -88,11 +88,10 @@ server computes the answer on demand and sends it back. Diagnostics work
 differently. Servers push them asynchronously via `textDocument/publishDiagnostics`
 whenever analysis completes, and Catenary caches whatever arrived last.
 
-This creates a consistency problem for file tools. After `write_file` or
-`edit_file` sends a change to the server, there is a window where the
-diagnostics cache still holds results from before the change. If the tool
-returns during this window, the agent receives stale diagnostics and may
-proceed unaware of errors it just introduced.
+This creates a consistency problem. After a file change is sent to the server,
+there is a window where the diagnostics cache still holds results from before
+the change. If the result is returned during this window, the agent receives
+stale diagnostics and may proceed unaware of errors it just introduced.
 
 Catenary buffers this eventually consistent gap to ensure diagnostics are
 current before returning them. Each URI has a generation counter that
@@ -114,11 +113,10 @@ Catenary read the cache and return. This catches servers like rust-analyzer
 that publish diagnostics in multiple rounds — fast warnings from native
 analysis followed by slower type-checking errors from flycheck.
 
-This mechanism applies to the tool paths that return diagnostics after a
-change: `write_file`, `edit_file`, `read_file` (when syncing an out-of-date
-document), and the `diagnostics` tool. Request/response tools like `hover` and
-`document_symbols` do not need it — their results come directly from the
-server response, not from the cache.
+This mechanism applies to the paths that return diagnostics after a change:
+the `catenary notify` hook (for post-edit diagnostics) and the `diagnostics`
+tool. Request/response tools like `hover` and `document_symbols` do not need
+it — their results come directly from the server response, not from the cache.
 
 ## Root Synchronization
 
@@ -128,9 +126,7 @@ Catenary:
 1. Sends a `roots/list` request to the client to fetch the current roots.
 2. Diffs the new roots against the current set.
 3. Updates the `PathValidator` security boundary.
-4. Updates the `RunToolManager` (re-detects workspace languages; emits
-   `notifications/tools/list_changed` if the available commands change).
-5. Sends a batched `workspace/didChangeWorkspaceFolders` notification to each
+4. Sends a batched `workspace/didChangeWorkspaceFolders` notification to each
    active LSP server.
-6. Spawns any newly needed LSP servers for languages detected in the added
+5. Spawns any newly needed LSP servers for languages detected in the added
    roots.

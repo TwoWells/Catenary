@@ -6,8 +6,15 @@ text-based file scanning.
 
 ## System Prompt
 
-In **constrained mode** (built-in file/shell tools disabled), the agent has no
-choice but to use Catenary's LSP tools — no system prompt changes are needed.
+In **constrained mode** (text-scanning commands denied via permissions), add
+the following to your system prompt or agent instructions to prevent the model
+from wasting tokens discovering the deny list through trial and error:
+
+```
+Text-scanning shell commands (grep, find, ls, cat, etc.) are denied.
+Use Catenary's LSP tools for navigation and list_directory for browsing.
+Workarounds will be added to the deny list.
+```
 
 If Catenary is running **alongside built-in tools**, agents will default to
 what they were trained on (reading files, grepping). Adding the following to
@@ -65,11 +72,12 @@ Catenary provides LSP-backed tools that return precise, targeted information.
 Instead of reading a 500-line file to find a function's type signature, ask the
 language server directly.
 
-## When to Use LSP vs File I/O
+## When to Use LSP vs Native File Tools
 
-Catenary provides both LSP tools and file I/O tools (`read_file`, `write_file`,
-`edit_file`, `list_directory`). Use LSP tools for navigation and understanding;
-use file I/O for reading implementation logic and making changes.
+Catenary provides LSP tools and `list_directory`. File reading and editing is
+handled by the host tool's native file operations (e.g. Claude Code's `Read`,
+`Edit`, `Write`). The `catenary notify` hook provides post-edit LSP diagnostics
+so you immediately see any errors introduced by changes.
 
 **Use LSP tools** for:
 
@@ -78,13 +86,12 @@ use file I/O for reading implementation logic and making changes.
 - Understanding file structure (document_symbols)
 - Checking errors after changes (diagnostics)
 
-**Use file I/O tools** for:
+**Use native file tools** for:
 
 - Reading implementation logic (not just signatures)
 - Searching comments or string literals (`search` includes a file heatmap)
 - Config files or non-code content
-- Writing and editing code (`write_file`, `edit_file` return diagnostics
-  automatically)
+- Writing and editing code (diagnostics returned via notify hook)
 
 ## Workflow Example
 
@@ -104,8 +111,8 @@ use file I/O for reading implementation logic and making changes.
 2. `definition` to jump to the specific handler
 3. `hover` on unfamiliar types to understand them
 4. `find_references` to see how the handler is called
-5. `read_file` on the specific function you need to modify
-6. `edit_file` to make the change — diagnostics returned automatically
+5. Read the specific function you need to modify
+6. Edit to make the change — diagnostics returned via notify hook
 
 ## Codebase Orientation
 
@@ -120,7 +127,7 @@ search for specific components
 document_symbols for file structure
 
 # Read implementation when needed
-read_file for the specific code you need to understand
+Read the specific code you need to understand
 ```
 
 This provides a mental map without reading every file.
@@ -154,41 +161,29 @@ A single file read can cost as much as 10-20 targeted LSP queries.
 4. **References are precise.** `find_references` finds actual usages,
    not text matches. No false positives from comments or strings.
 
-5. **Save reads for logic.** Only use `read_file` when you need to understand
+5. **Save reads for logic.** Only read files when you need to understand
    _how_ something works, not _what_ it is or _where_ it lives.
 
-6. **Edit with feedback.** Use `edit_file` and `write_file` — they return LSP
-   diagnostics automatically, so you immediately see any errors introduced.
+6. **Edit with feedback.** The `catenary notify` hook returns LSP diagnostics
+   after every edit, so you immediately see any errors introduced.
 
-## Display Hooks
+## Notify Hook
 
-Catenary's `edit_file` and `write_file` tools pass raw JSON parameters to the
-CLI, which can be hard to review. The bundled hook script formats these as
-colorized diffs and previews.
+Catenary provides post-edit LSP diagnostics via the `catenary notify` command,
+designed for use as a `PostToolUse` hook in Claude Code.
 
-### Claude Code
-
-Copy the script and make it executable:
-
-```bash
-mkdir -p ~/.claude/hooks
-cp .claude-plugin/plugins/catenary/hooks/format_tool_output.py ~/.claude/hooks/
-chmod +x ~/.claude/hooks/format_tool_output.py
-```
-
-Add to `~/.claude/settings.json` (all projects) or `.claude/settings.json`
-(single project):
+Add to `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "PreToolUse": [
+    "PostToolUse": [
       {
-        "matcher": "mcp__.*__edit_file|mcp__.*__write_file",
+        "matcher": "Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/format_tool_output.py"
+            "command": "catenary notify"
           }
         ]
       }
@@ -197,14 +192,7 @@ Add to `~/.claude/settings.json` (all projects) or `.claude/settings.json`
 }
 ```
 
-### Gemini CLI
-
-Not currently supported. Gemini CLI's `BeforeTool` hook fires *after* the user
-approves the tool call, so there's no way to show a formatted diff in the
-approval prompt. The hook output only appears in the debug console, not the
-main UI.
-
-### What you get
-
-- **edit_file**: colorized unified diff (red = removed, green = added)
-- **write_file**: file header with line count and first 30 lines numbered
+The hook reads the `PostToolUse` JSON from stdin, finds the running Catenary
+session for the workspace, notifies the LSP servers of the file change, and
+prints any diagnostics to stdout. It exits silently on any error so it never
+blocks the host tool's flow.
