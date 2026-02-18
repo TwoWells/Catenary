@@ -56,6 +56,7 @@ keeping Gemini's native file I/O and shell tools available. Create the file
 
 # --- 1. Search (Grep Family) ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = [
   "rg", "ag", "ack", "fd",
   "grep", "egrep", "fgrep", "rgrep", "zgrep",
@@ -67,6 +68,7 @@ deny_message = "Use Catenary's search tool instead."
 
 # --- 2. Navigation (Listing Family) ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = [
   "ls", "dir", "vdir", "tree", "find",
   "locate", "mlocate", "whereis", "which",
@@ -78,6 +80,7 @@ deny_message = "Use Catenary's list_directory tool instead."
 
 # --- 3. Peeking (Reading Family) ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = [
   "cat", "head", "tail", "more", "less", "nl",
   "od", "hexdump", "xxd", "strings", "dd", "tee",
@@ -88,6 +91,7 @@ deny_message = "Use the native read_file tool instead."
 
 # --- 4. Text Processing (Scripting Family) ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = [
   "awk", "sed", "perl",
   "cut", "paste", "sort", "uniq", "join",
@@ -98,6 +102,7 @@ deny_message = "Text processing commands are not allowed in constrained mode."
 
 # --- 5. Reconnaissance (Metadata Family) ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = ["file", "stat", "du", "df"]
 decision = "deny"
 priority = 900
@@ -105,6 +110,7 @@ deny_message = "Metadata commands are not allowed in constrained mode."
 
 # --- 6. Executors & Shells (The Wrapper Family) ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = [
   "bash", "sh", "zsh", "dash", "fish",
   "ash", "csh", "ksh", "tcsh",
@@ -115,6 +121,7 @@ deny_message = "Shell wrappers are not allowed in constrained mode."
 
 # --- 7. The Command Runners (Prevents Masquerading) ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = [
   "env", "sudo", "su", "nohup", "timeout", "watch", "time",
   "eval", "exec", "command", "builtin", "type", "hash",
@@ -125,14 +132,27 @@ deny_message = "Command runners are not allowed in constrained mode."
 
 # --- 8. The Multiplexers ---
 [[rule]]
+toolName = "run_shell_command"
 commandPrefix = ["xargs", "parallel"]
 decision = "deny"
 priority = 900
 deny_message = "Multiplexers are not allowed in constrained mode."
 
-# --- 9. Framework Blocks ---
+# --- 9. Framework Tool Blocks ---
 [[rule]]
-toolName = ["grep_search", "glob", "read_many_files"]
+toolName = "grep_search"
+decision = "deny"
+priority = 900
+deny_message = "Use Catenary's search tool instead."
+
+[[rule]]
+toolName = "glob"
+decision = "deny"
+priority = 900
+deny_message = "Use Catenary's list_directory tool instead."
+
+[[rule]]
+toolName = "read_many_files"
 decision = "deny"
 priority = 900
 deny_message = "Use Catenary's LSP tools for code navigation."
