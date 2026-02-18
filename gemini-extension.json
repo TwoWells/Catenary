@@ -8,19 +8,5 @@
     "catenary": {
       "command": "catenary"
     }
-  },
-  "hooks": {
-    "AfterTool": [
-      {
-        "matcher": "read_file|write_file|replace",
-        "hooks": [
-          {
-            "name": "catenary-notify",
-            "type": "command",
-            "command": "catenary notify --format=gemini"
-          }
-        ]
-      }
-    ]
   }
 }

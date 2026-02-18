@@ -572,11 +572,14 @@ fn run_notify(format: &str) {
         return;
     };
 
-    // Resolve to absolute path
+    // Resolve to absolute path using cwd from hook JSON (matching run_sync_roots)
     let abs_path = if std::path::Path::new(file_path).is_absolute() {
         std::path::PathBuf::from(file_path)
     } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
+        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        );
         cwd.join(file_path)
     };
 
