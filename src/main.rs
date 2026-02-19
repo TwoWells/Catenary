@@ -10,7 +10,7 @@
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use regex::Regex;
 use std::path::PathBuf;
@@ -522,7 +522,7 @@ fn run_status(id: &str) -> Result<()> {
     println!("Workspace: {}", session.workspace);
     println!(
         "Started: {} ({})",
-        session.started_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        session.started_at.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"),
         format_duration_ago(session.started_at)
     );
 
@@ -546,14 +546,83 @@ fn run_status(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns the IPC endpoint path for a session.
+///
+/// On Unix this is the Unix socket path in the session directory.
+/// On Windows this is a named pipe in the kernel namespace.
+fn notify_endpoint(session_id: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
+        session::sessions_dir()
+            .join(session_id)
+            .join("notify.sock")
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\catenary-{session_id}"))
+    }
+}
+
+/// Connects to a notify IPC endpoint and returns a stream for I/O.
+///
+/// Returns `None` silently on failure (hooks must not break Claude Code's flow).
+#[cfg(unix)]
+fn notify_connect(endpoint: &std::path::Path) -> Option<std::os::unix::net::UnixStream> {
+    if !endpoint.exists() {
+        return None;
+    }
+    let stream = std::os::unix::net::UnixStream::connect(endpoint).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    Some(stream)
+}
+
+/// Connects to a notify IPC endpoint and returns a stream for I/O.
+///
+/// Returns `None` silently on failure (hooks must not break Claude Code's flow).
+#[cfg(windows)]
+fn notify_connect(endpoint: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // SECURITY_IDENTIFICATION (0x0001_0000) prevents impersonation attacks
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .security_qos_flags(0x0001_0000)
+        .open(endpoint)
+        .ok()
+}
+
+/// Sends a JSON request over an IPC stream and reads response lines.
+fn ipc_exchange(
+    mut stream: impl std::io::Read + std::io::Write,
+    request: &serde_json::Value,
+) -> Vec<String> {
+    use std::io::BufRead;
+
+    if serde_json::to_writer(&mut stream, request).is_err() {
+        return Vec::new();
+    }
+    if stream.write_all(b"\n").is_err() || stream.flush().is_err() {
+        return Vec::new();
+    }
+
+    let reader = std::io::BufReader::new(stream);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        match line {
+            Ok(text) if !text.is_empty() => lines.push(text),
+            _ => break,
+        }
+    }
+    lines
+}
+
 /// Notify a running session of a file change (`PostToolUse` hook handler).
 ///
 /// Reads hook JSON from stdin, finds the matching session by workspace,
-/// connects to its notify socket, and prints diagnostics to stdout.
+/// connects to its notify endpoint, and prints diagnostics to stdout.
 /// Silently succeeds on any error to avoid breaking Claude Code's flow.
 fn run_notify(format: &str) {
-    use std::io::{BufRead, Write};
-
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -593,42 +662,13 @@ fn run_notify(format: &str) {
         return;
     };
 
-    // Connect to the session's notify socket
-    let socket_path = session::sessions_dir()
-        .join(&session.id)
-        .join("notify.sock");
-
-    if !socket_path.exists() {
-        return;
-    }
-
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) else {
+    let endpoint = notify_endpoint(&session.id);
+    let Some(stream) = notify_connect(&endpoint) else {
         return;
     };
 
-    // Set a timeout so we don't hang forever
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-
-    // Send the file path as JSON
     let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
-    let mut writer = std::io::BufWriter::new(&stream);
-    if serde_json::to_writer(&mut writer, &request).is_err() {
-        return;
-    }
-    if writeln!(writer).is_err() || writer.flush().is_err() {
-        return;
-    }
-
-    // Read the response (diagnostics)
-    let reader = std::io::BufReader::new(&stream);
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        match line {
-            Ok(text) if !text.is_empty() => lines.push(text),
-            _ => break,
-        }
-    }
+    let lines = ipc_exchange(stream, &request);
 
     if lines.is_empty() {
         return;
@@ -641,7 +681,7 @@ fn run_notify(format: &str) {
 /// Sync `/add-dir` roots from Claude Code transcript to a running Catenary session.
 ///
 /// Reads hook JSON from stdin, scans the transcript for `/add-dir` confirmation
-/// messages, and sends newly discovered roots to the session's notify socket.
+/// messages, and sends newly discovered roots to the session's notify endpoint.
 /// Uses a byte-offset cache to avoid re-scanning the entire transcript each time.
 ///
 /// Silently succeeds on any error to avoid breaking Claude Code's flow.
@@ -650,7 +690,7 @@ fn run_notify(format: &str) {
     reason = "Sequential hook processing with early returns"
 )]
 fn run_sync_roots(format: &str) {
-    use std::io::{BufRead, Seek, SeekFrom, Write};
+    use std::io::{BufRead, Seek, SeekFrom};
 
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
@@ -753,42 +793,17 @@ fn run_sync_roots(format: &str) {
         return;
     }
 
-    // Connect to the session's notify socket
-    let socket_path = session_dir.join("notify.sock");
-    if !socket_path.exists() {
-        return;
-    }
-
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) else {
+    let endpoint = notify_endpoint(&session.id);
+    let Some(stream) = notify_connect(&endpoint) else {
         return;
     };
 
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-
-    // Send the add_roots request
     let root_strings: Vec<String> = new_roots
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let request = serde_json::json!({ "add_roots": root_strings });
-    let mut writer = std::io::BufWriter::new(&stream);
-    if serde_json::to_writer(&mut writer, &request).is_err() {
-        return;
-    }
-    if writeln!(writer).is_err() || writer.flush().is_err() {
-        return;
-    }
-
-    // Read the response
-    let reader = std::io::BufReader::new(&stream);
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        match line {
-            Ok(text) if !text.is_empty() => lines.push(text),
-            _ => break,
-        }
-    }
+    let lines = ipc_exchange(stream, &request);
 
     if lines.is_empty() {
         return;
@@ -1090,7 +1105,7 @@ fn format_duration_ago(timestamp: chrono::DateTime<Utc>) -> String {
 
 /// Print an event in raw JSON format
 fn print_event_raw(event: &SessionEvent) {
-    let time = event.timestamp.format("%H:%M:%S");
+    let time = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
 
     if let EventKind::McpMessage { direction, message } = &event.kind {
         let arrow = if direction == "in" { "→" } else { "←" };
@@ -1106,7 +1121,7 @@ fn print_event_raw(event: &SessionEvent) {
 
 /// Print an event with annotations and colors
 fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width: usize) {
-    let time = event.timestamp.format("%H:%M:%S");
+    let time = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
     let time_str = colors.dim(&format!("[{time}]"));
 
     match &event.kind {

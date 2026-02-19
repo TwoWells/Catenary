@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Unix socket server for file-change notifications and root management.
+//! IPC server for file-change notifications and root management.
 //!
 //! When Claude Code's native `Edit` or `Write` tools modify a file, a
-//! `PostToolUse` hook runs `catenary notify`, which connects to this socket
+//! `PostToolUse` hook runs `catenary notify`, which connects to this server
 //! and sends the changed file path. The server notifies the LSP, waits for
 //! fresh diagnostics, and returns them so they appear in the model's context.
 //!
-//! The socket also accepts `add_roots` requests from `catenary sync-roots`,
+//! The server also accepts `add_roots` requests from `catenary sync-roots`,
 //! which adds new workspace roots discovered from `/add-dir` commands in the
 //! Claude Code transcript.
+//!
+//! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
 use anyhow::{Result, anyhow};
 use lsp_types::Diagnostic;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -41,8 +44,8 @@ enum NotifyRequest {
     },
 }
 
-/// Listens on a Unix socket for file-change notifications and returns
-/// LSP diagnostics.
+/// Listens on an IPC endpoint (Unix socket or named pipe) for file-change
+/// notifications and returns LSP diagnostics.
 pub struct NotifyServer {
     client_manager: Arc<ClientManager>,
     doc_manager: Arc<Mutex<DocumentManager>>,
@@ -64,14 +67,15 @@ impl NotifyServer {
         }
     }
 
-    /// Starts listening on the given Unix socket path.
+    /// Starts listening on the given IPC endpoint.
     ///
     /// Spawns a background task that accepts connections and processes
     /// file-change notifications. Returns a `JoinHandle` for the listener task.
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket cannot be bound.
+    /// Returns an error if the endpoint cannot be created.
+    #[cfg(unix)]
     pub fn start(self, socket_path: &std::path::Path) -> Result<tokio::task::JoinHandle<()>> {
         // Remove stale socket file if it exists
         let _ = std::fs::remove_file(socket_path);
@@ -108,10 +112,68 @@ impl NotifyServer {
         Ok(handle)
     }
 
+    /// Starts listening on the given named pipe path.
+    ///
+    /// Spawns a background task that accepts connections and processes
+    /// file-change notifications. Returns a `JoinHandle` for the listener task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named pipe cannot be created.
+    #[cfg(windows)]
+    pub fn start(self, pipe_path: &std::path::Path) -> Result<tokio::task::JoinHandle<()>> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = pipe_path.to_string_lossy().to_string();
+
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .map_err(|e| anyhow!("Failed to create notify pipe {pipe_name}: {e}"))?;
+
+        info!("Notify pipe listening on {pipe_name}");
+
+        let server_arc = Arc::new(self);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Wait for a client to connect to the current instance
+                if let Err(e) = server.connect().await {
+                    warn!("Notify pipe connect error: {e}");
+                    continue;
+                }
+
+                let connected = server;
+
+                // Create a fresh pipe instance before spawning the handler
+                // so clients never see ERROR_FILE_NOT_FOUND
+                server = match ServerOptions::new().create(&pipe_name) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Notify pipe create error: {e}");
+                        break;
+                    }
+                };
+
+                let srv = server_arc.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = srv.handle_connection(connected).await {
+                        debug!("Notify connection error: {e}");
+                    }
+                });
+            }
+        });
+
+        Ok(handle)
+    }
+
     /// Handles a single connection: reads a JSON request, dispatches to the
     /// appropriate handler, and writes back the response.
-    async fn handle_connection(&self, stream: tokio::net::UnixStream) -> Result<()> {
-        let (reader, mut writer) = stream.into_split();
+    async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: S,
+    ) -> Result<()> {
+        let (reader, mut writer) = tokio::io::split(stream);
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
         buf_reader.read_line(&mut line).await?;

@@ -16,7 +16,7 @@ pub mod config;
 pub mod lsp;
 /// MCP server implementation and type definitions.
 pub mod mcp;
-/// Unix socket server for file-change notifications from hooks.
+/// IPC server for file-change notifications from hooks.
 pub mod notify;
 /// Session management and event broadcasting.
 pub mod session;

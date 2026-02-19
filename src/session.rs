@@ -117,7 +117,7 @@ pub struct Session {
 
     events_file: Arc<Mutex<File>>,
 
-    /// Path to the Unix notify socket (if started).
+    /// Path to the notify IPC endpoint (if started).
     socket_path: Option<PathBuf>,
 }
 
@@ -216,10 +216,17 @@ impl Session {
         )
     }
 
-    /// Returns the path to the Unix notify socket for this session.
+    /// Returns the path to the notify IPC endpoint for this session.
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
-        self.dir.join("notify.sock")
+        #[cfg(unix)]
+        {
+            self.dir.join("notify.sock")
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"\\.\pipe\catenary-{}", self.info.id))
+        }
     }
 
     /// Records that the notify socket has been started, so it will be
@@ -275,7 +282,9 @@ impl Drop for Session {
 
         self.broadcast(EventKind::Shutdown);
 
-        // Clean up notify socket (if active)
+        // Clean up notify socket (Unix only — named pipes are kernel
+        // objects cleaned up automatically when all handles close)
+        #[cfg(unix)]
         if let Some(ref sock) = self.socket_path {
             let _ = fs::remove_file(sock);
         }
@@ -568,6 +577,7 @@ fn is_process_alive(pid: u32) -> bool {
     #[cfg(not(unix))]
     {
         // On non-Unix, assume alive (could use platform-specific APIs).
+        let _ = pid;
         true
     }
 }
