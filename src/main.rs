@@ -522,7 +522,10 @@ fn run_status(id: &str) -> Result<()> {
     println!("Workspace: {}", session.workspace);
     println!(
         "Started: {} ({})",
-        session.started_at.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"),
+        session
+            .started_at
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S"),
         format_duration_ago(session.started_at)
     );
 
@@ -553,9 +556,7 @@ fn run_status(id: &str) -> Result<()> {
 fn notify_endpoint(session_id: &str) -> PathBuf {
     #[cfg(unix)]
     {
-        session::sessions_dir()
-            .join(session_id)
-            .join("notify.sock")
+        session::sessions_dir().join(session_id).join("notify.sock")
     }
     #[cfg(windows)]
     {

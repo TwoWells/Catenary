@@ -169,10 +169,7 @@ impl NotifyServer {
 
     /// Handles a single connection: reads a JSON request, dispatches to the
     /// appropriate handler, and writes back the response.
-    async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        stream: S,
-    ) -> Result<()> {
+    async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(&self, stream: S) -> Result<()> {
         let (reader, mut writer) = tokio::io::split(stream);
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
