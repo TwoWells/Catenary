@@ -87,6 +87,15 @@ pub enum EventKind {
         /// How long the tool call took in milliseconds.
         duration_ms: u64,
     },
+    /// Diagnostics returned from notify hook.
+    Diagnostics {
+        /// File that was checked.
+        file: String,
+        /// Number of diagnostics found.
+        count: usize,
+        /// Short preview of the first diagnostic.
+        preview: String,
+    },
     /// Session started.
     Started,
     /// Session ending.

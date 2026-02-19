@@ -265,6 +265,7 @@ async fn run_server(args: Args) -> Result<()> {
         client_manager.clone(),
         doc_manager.clone(),
         path_validator.clone(),
+        broadcaster.clone(),
     );
     let socket_path = session
         .lock()
@@ -1174,6 +1175,32 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 colors.red("error")
             };
             println!("{time_str} {arrow} {tool} -> {status} ({duration_ms}ms)");
+        }
+        EventKind::Diagnostics {
+            file,
+            count,
+            preview,
+        } => {
+            let basename = std::path::Path::new(file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file);
+            if *count == 0 {
+                let check = colors.green("ok");
+                println!("{time_str} {basename}: {check}");
+            } else {
+                let label = colors.yellow(&format!(
+                    "{count} diagnostic{}",
+                    if *count == 1 { "" } else { "s" }
+                ));
+                let detail = if preview.is_empty() {
+                    String::new()
+                } else {
+                    let max_len = term_width.saturating_sub(14 + basename.len() + 20);
+                    format!(" -- {}", cli::truncate(preview, max_len))
+                };
+                println!("{time_str} {basename}: {label}{detail}");
+            }
         }
         EventKind::McpMessage { direction, message } => {
             let arrow_colored = if direction == "in" {

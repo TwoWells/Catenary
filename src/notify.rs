@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::{DocumentManager, DocumentNotification, PathValidator};
 use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, LspClient};
+use crate::session::{EventBroadcaster, EventKind};
 
 /// Request from `catenary notify` (file change) or `catenary sync-roots` (root addition).
 #[derive(Debug, Deserialize)]
@@ -50,6 +51,7 @@ pub struct NotifyServer {
     client_manager: Arc<ClientManager>,
     doc_manager: Arc<Mutex<DocumentManager>>,
     path_validator: Arc<RwLock<PathValidator>>,
+    broadcaster: EventBroadcaster,
 }
 
 impl NotifyServer {
@@ -59,11 +61,13 @@ impl NotifyServer {
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         path_validator: Arc<RwLock<PathValidator>>,
+        broadcaster: EventBroadcaster,
     ) -> Self {
         Self {
             client_manager,
             doc_manager,
             path_validator,
+            broadcaster,
         }
     }
 
@@ -273,14 +277,30 @@ impl NotifyServer {
         let diagnostics = client.get_diagnostics(&uri).await;
         drop(client);
 
+        let count = diagnostics.len();
+        let compact = if diagnostics.is_empty() {
+            String::new()
+        } else {
+            format_diagnostics_compact(&diagnostics)
+        };
+
+        // Broadcast diagnostics event for monitor visibility
+        let preview = compact
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        self.broadcaster.send(EventKind::Diagnostics {
+            file: file_path.to_string(),
+            count,
+            preview,
+        });
+
         if diagnostics.is_empty() {
             Ok(String::new())
         } else {
-            Ok(format!(
-                "Diagnostics ({}):\n{}",
-                diagnostics.len(),
-                format_diagnostics_compact(&diagnostics)
-            ))
+            Ok(format!("Diagnostics ({count}):\n{compact}"))
         }
     }
 
