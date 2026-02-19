@@ -1273,49 +1273,6 @@ fn print_event(event: &SessionEvent) {
     print_event_annotated(event, &colors, term_width);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_diagnostics_plain() {
-        let lines = vec![
-            "error[E0308]: mismatched types".into(),
-            "  --> src/main.rs:5:10".into(),
-        ];
-        let output = format_diagnostics(&lines, "plain");
-        assert_eq!(
-            output,
-            "error[E0308]: mismatched types\n  --> src/main.rs:5:10\n"
-        );
-    }
-
-    #[test]
-    fn test_format_diagnostics_gemini() {
-        let lines = vec!["error[E0308]: mismatched types".into()];
-        let output = format_diagnostics(&lines, "gemini");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).expect("gemini format should produce valid JSON");
-
-        let context = parsed["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("additionalContext should be a string");
-        assert!(context.starts_with("LSP Diagnostics:\n"));
-        assert!(context.contains("error[E0308]: mismatched types"));
-    }
-
-    #[test]
-    fn test_format_diagnostics_gemini_multiline() {
-        let lines = vec!["warning: unused variable".into(), "  --> lib.rs:3:9".into()];
-        let output = format_diagnostics(&lines, "gemini");
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        let context = parsed["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap();
-        assert!(context.contains("warning: unused variable\n  --> lib.rs:3:9"));
-    }
-}
-
 /// Background task that periodically closes idle documents.
 async fn document_cleanup_task(
     client_manager: Arc<lsp::ClientManager>,
@@ -1381,5 +1338,52 @@ async fn document_cleanup_task(
                 client_manager.shutdown_client(&lang).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn test_format_diagnostics_plain() {
+        let lines = vec![
+            "error[E0308]: mismatched types".into(),
+            "  --> src/main.rs:5:10".into(),
+        ];
+        let output = format_diagnostics(&lines, "plain");
+        assert_eq!(
+            output,
+            "error[E0308]: mismatched types\n  --> src/main.rs:5:10\n"
+        );
+    }
+
+    #[test]
+    fn test_format_diagnostics_gemini() -> Result<()> {
+        let lines = vec!["error[E0308]: mismatched types".into()];
+        let output = format_diagnostics(&lines, "gemini");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("gemini format should produce valid JSON")?;
+
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .context("additionalContext should be a string")?;
+        assert!(context.starts_with("LSP Diagnostics:\n"));
+        assert!(context.contains("error[E0308]: mismatched types"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_diagnostics_gemini_multiline() -> Result<()> {
+        let lines = vec!["warning: unused variable".into(), "  --> lib.rs:3:9".into()];
+        let output = format_diagnostics(&lines, "gemini");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .context("additionalContext should be a string")?;
+        assert!(context.contains("warning: unused variable\n  --> lib.rs:3:9"));
+        Ok(())
     }
 }
