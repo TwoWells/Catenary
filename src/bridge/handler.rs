@@ -23,7 +23,9 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, LspClient, ServerState};
+use crate::lsp::{
+    ClientManager, DIAGNOSTICS_TIMEOUT, DiagnosticsWaitResult, LspClient, ServerState,
+};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
@@ -917,6 +919,9 @@ impl LspBridgeHandler {
         ))
     }
 
+    /// Maximum number of `didSave` nudge retries when the server goes silent.
+    const DIAGNOSTICS_RETRIES: u32 = 3;
+
     fn handle_diagnostics(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: FileInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
@@ -958,11 +963,39 @@ impl LspBridgeHandler {
 
                 drop(doc_manager);
 
-                if !client
-                    .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
-                    .await
-                {
-                    return Err(anyhow!("LSP server stopped responding during analysis"));
+                // Wait for diagnostics with retry-on-inactivity. If the
+                // server goes silent (e.g., CPU-starved under load), re-send
+                // didSave to nudge it back into action.
+                for attempt in 0..Self::DIAGNOSTICS_RETRIES {
+                    match client
+                        .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
+                        .await
+                    {
+                        DiagnosticsWaitResult::Updated => break,
+                        DiagnosticsWaitResult::ServerDied => {
+                            return Err(anyhow!(
+                                "[{}] server died during analysis",
+                                client.language()
+                            ));
+                        }
+                        DiagnosticsWaitResult::Inactive => {
+                            if attempt + 1 < Self::DIAGNOSTICS_RETRIES {
+                                warn!(
+                                    "Server silent for {:?}, nudging with didSave (attempt {}/{})",
+                                    DIAGNOSTICS_TIMEOUT,
+                                    attempt + 2,
+                                    Self::DIAGNOSTICS_RETRIES
+                                );
+                                client.did_save(uri.clone()).await?;
+                            } else {
+                                warn!(
+                                    "Server still silent after {} nudge attempts — \
+                                     proceeding with cached diagnostics",
+                                    Self::DIAGNOSTICS_RETRIES
+                                );
+                            }
+                        }
+                    }
                 }
             } else {
                 drop(doc_manager);

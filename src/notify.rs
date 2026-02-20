@@ -26,7 +26,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::bridge::{DocumentManager, DocumentNotification, PathValidator};
-use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, LspClient};
+use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, DiagnosticsWaitResult, LspClient};
 use crate::session::{EventBroadcaster, EventKind};
 
 /// Request from `catenary notify` (file change) or `catenary sync-roots` (root addition).
@@ -261,13 +261,45 @@ impl NotifyServer {
 
             drop(doc_manager);
 
-            // Wait for diagnostics that reflect our change
-            if !client
-                .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
-                .await
-            {
+            // Wait for diagnostics with retry-on-inactivity. If the server
+            // goes silent (e.g., CPU-starved under load), re-send didSave
+            // to nudge it back into action.
+            let max_retries: u32 = 3;
+            let mut server_died = false;
+
+            for attempt in 0..max_retries {
+                match client
+                    .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
+                    .await
+                {
+                    DiagnosticsWaitResult::Updated => break,
+                    DiagnosticsWaitResult::ServerDied => {
+                        server_died = true;
+                        break;
+                    }
+                    DiagnosticsWaitResult::Inactive => {
+                        if attempt + 1 < max_retries {
+                            warn!(
+                                "Server silent for {:?}, nudging with didSave (attempt {}/{})",
+                                DIAGNOSTICS_TIMEOUT,
+                                attempt + 2,
+                                max_retries
+                            );
+                            client.did_save(uri.clone()).await?;
+                        } else {
+                            warn!(
+                                "Server still silent after {} nudge attempts — \
+                                 proceeding with cached diagnostics",
+                                max_retries
+                            );
+                        }
+                    }
+                }
+            }
+
+            if server_died {
                 return Ok(format!(
-                    "[{lang}] server stopped responding \u{2014} diagnostics unavailable"
+                    "[{lang}] server died \u{2014} diagnostics unavailable"
                 ));
             }
         } else {

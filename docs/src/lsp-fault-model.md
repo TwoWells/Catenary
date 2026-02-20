@@ -26,7 +26,7 @@ This document catalogs the failure modes, current handling, and required invaria
 |---------|---------|-----------------|--------|
 | Server won't start | Bad command, missing binary, permission error | `LspClient::spawn()` returns `Err`, propagated to `get_client()` | OK |
 | Server crashes mid-session | Segfault, OOM, unhandled exception | Reader task detects stdout close, sets `alive=false`. Next request triggers restart via `get_client()` | OK |
-| Server hangs (no response) | Deadlock, infinite loop | `REQUEST_TIMEOUT` (30s) fires, returns timeout error | Partial — see [Timeout Ambiguity](#timeout-ambiguity) |
+| Server hangs (no response) | Deadlock, infinite loop | `REQUEST_TIMEOUT` (30s) fires, returns timeout error. Diagnostics wait uses activity tracking + nudge-and-retry — see [Timeout Ambiguity](#timeout-ambiguity-resolved) | OK |
 | Server exits during initialize | Crash on startup | `initialize()` request times out or gets channel-closed error | OK |
 | Server produces no stdout | Blocks on stderr, misconfigured pipes | Timeout on first request | OK |
 
@@ -100,13 +100,11 @@ When the reader task encounters malformed JSON, it logs a warning and skips the 
 
 All LSP-originated errors are now prefixed with `[language]`, e.g., `[rust] request timed out` or `[python] server closed connection`. The `LspClient` stores its language identifier and includes it in all error messages from the `request()` method. Handler-level errors (e.g., "server is no longer running") also include the language prefix.
 
-### Timeout Ambiguity
+### ~~Timeout Ambiguity~~ (Resolved)
 
-**Location:** `src/lsp/client.rs` line ~375
+`wait_for_diagnostics_update` now returns a three-variant enum (`DiagnosticsWaitResult`) instead of a boolean, distinguishing `Updated`, `Inactive` (server alive but silent), and `ServerDied`. Phase 1 tracks server activity (notification counter + progress tokens) and waits indefinitely while the server shows signs of life. When the server goes completely silent for `DIAGNOSTICS_TIMEOUT` (30s) but is still alive, it returns `Inactive` rather than aborting.
 
-A 30-second timeout doesn't distinguish between "server is slow but working" and "server is hung." After timeout, the next request may succeed (slow server) or also timeout (hung server).
-
-**Possible improvement:** Track consecutive timeouts per client. After N consecutive timeouts, mark server as unhealthy and include this in error messages: `"[rust-analyzer] timed out (3 consecutive failures, server may be hung)"`.
+Callers (`handle_diagnostics` in `handler.rs`, `process_file_inner` in `notify.rs`) implement a nudge-and-retry loop: on `Inactive`, they re-send `didSave` to wake the server and retry up to 3 times. This handles CPU-starved servers under concurrent load that may miss or deprioritize the initial notification. On `ServerDied`, callers report the error. After all retries exhaust, callers proceed with cached diagnostics (graceful degradation) rather than returning an error.
 
 ### URI Trust
 
@@ -155,7 +153,7 @@ These properties must hold regardless of LSP server behavior:
 
 2. **Catenary never modifies the filesystem based on LSP data.** LSP-proposed edits (rename, code actions, formatting) are returned as structured text. Catenary's `edit_file` and `write_file` tools validate all paths against workspace roots independently of LSP data — the LSP never gets direct write access.
 
-3. **Catenary never hangs indefinitely.** All LSP requests have bounded timeouts. Reader task failures don't block the MCP server.
+3. **Catenary never hangs indefinitely.** All LSP requests have bounded timeouts. Diagnostics waits use activity-based tracking with nudge-and-retry (bounded by attempt count). Reader task failures don't block the MCP server.
 
 4. **Error messages identify the source.** LSP-originated errors include the server language/name. Catenary errors don't mention LSP.
 

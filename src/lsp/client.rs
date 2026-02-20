@@ -35,6 +35,19 @@ use crate::session::{EventBroadcaster, EventKind};
 /// Cached diagnostics for a file.
 pub type DiagnosticsCache = Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>;
 
+/// Result of waiting for diagnostics to update after a file change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiagnosticsWaitResult {
+    /// Diagnostics generation advanced past the snapshot and activity settled.
+    Updated,
+    /// Server went completely silent (no notifications, no active progress
+    /// tokens) for the inactivity duration while still alive. The caller
+    /// should re-send `didSave` to nudge the server and retry.
+    Inactive,
+    /// Server process died during the wait.
+    ServerDied,
+}
+
 /// Default timeout for LSP requests.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -42,6 +55,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WARMUP_PERIOD: Duration = Duration::from_secs(10);
 
 /// Timeout for waiting for fresh diagnostics after a file change.
+/// Used as the inactivity threshold (silence with no notifications or
+/// active progress tokens) and as the Phase 2 settle timeout.
 pub(crate) const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Manages communication with an LSP server process.
@@ -1013,38 +1028,34 @@ impl LspClient {
     /// sending the change that should trigger new diagnostics. This ensures
     /// no race window between sending the change and starting the wait.
     ///
-    /// Phase 1 uses an inactivity-based timeout: as long as the server shows
-    /// signs of life (activity counter changing or progress tokens active),
-    /// the wait continues indefinitely. If the server goes completely silent
-    /// for `timeout` with no activity and no active progress, it is presumed
-    /// hung and the wait aborts. This allows slow-but-working servers (e.g.,
-    /// rust-analyzer flycheck on large projects) to finish while still
-    /// detecting genuinely hung servers.
+    /// Phase 1 waits for diagnostics generation to advance. It tracks server
+    /// activity (notification counter and progress tokens) and keeps waiting
+    /// as long as the server shows signs of life. If the server goes
+    /// completely silent for `timeout` with no activity, returns
+    /// [`DiagnosticsWaitResult::Inactive`] so the caller can re-send
+    /// `didSave` to nudge the server and retry.
     ///
     /// After the first diagnostics update, the settle phase (phase 2) polls
     /// the notification counter and progress tracker, returning only once
     /// the server has been quiet for 2 seconds with no active background work.
-    ///
-    /// Returns `true` if diagnostics advanced, `false` on inactivity timeout
-    /// or server death.
-    pub async fn wait_for_diagnostics_update(
+    pub(crate) async fn wait_for_diagnostics_update(
         &self,
         uri: &Uri,
         snapshot: u64,
         timeout: Duration,
-    ) -> bool {
+    ) -> DiagnosticsWaitResult {
         if !self.has_published_diagnostics.load(Ordering::SeqCst) {
             if !self.is_warming_up() {
                 // Past warmup and server has never published diagnostics —
                 // it likely doesn't support them. Don't block.
-                return true;
+                return DiagnosticsWaitResult::Updated;
             }
             // During warmup, cap the wait to the remaining warmup time so
             // we don't block for the full diagnostic timeout on servers
             // that will never publish diagnostics.
             let warmup_remaining = WARMUP_PERIOD.saturating_sub(self.spawn_time.elapsed());
             if warmup_remaining.is_zero() {
-                return true;
+                return DiagnosticsWaitResult::Updated;
             }
             let deadline = tokio::time::Instant::now() + warmup_remaining;
             loop {
@@ -1054,27 +1065,30 @@ impl LspClient {
                     break;
                 }
                 if !self.is_alive() {
-                    return false;
+                    return DiagnosticsWaitResult::ServerDied;
                 }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     // Warmup expired and still no diagnostics — give up.
-                    return true;
+                    return DiagnosticsWaitResult::Updated;
                 }
                 match tokio::time::timeout(remaining, self.diagnostics_notify.notified()).await {
                     Ok(()) => {}
                     Err(_) => {
                         // Warmup expired without diagnostics — give up.
-                        return true;
+                        return DiagnosticsWaitResult::Updated;
                     }
                 }
             }
         }
 
         // Phase 1: Wait for diagnostics generation to advance past snapshot.
-        // Uses an inactivity-based timeout: keeps waiting while the server
-        // shows signs of life (activity counter or progress tokens), gives
-        // up after `timeout` of complete silence.
+        //
+        // Tracks server activity (notification counter + progress tokens) to
+        // distinguish "slow but working" from "genuinely hung." As long as
+        // the server shows signs of life, the wait continues. If the server
+        // goes completely silent for `timeout`, returns `Inactive` so the
+        // caller can nudge the server (e.g., re-send `didSave`) and retry.
         let poll_interval = Duration::from_millis(100);
         let mut last_counter = self.activity_counter.load(Ordering::SeqCst);
         let mut last_activity = tokio::time::Instant::now();
@@ -1085,7 +1099,7 @@ impl LspClient {
             }
 
             if !self.is_alive() {
-                return false;
+                return DiagnosticsWaitResult::ServerDied;
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -1102,10 +1116,11 @@ impl LspClient {
                 last_activity = tokio::time::Instant::now();
             }
 
-            // If server has been completely silent for the timeout duration,
-            // it's either hung or won't produce diagnostics for this change.
+            // Server has been completely silent for the timeout duration.
+            // Return Inactive so the caller can nudge and retry rather than
+            // giving up entirely.
             if last_activity.elapsed() >= timeout && !has_active_progress {
-                return false;
+                return DiagnosticsWaitResult::Inactive;
             }
         }
 
@@ -1116,8 +1131,14 @@ impl LspClient {
         // progress. It returns only after 2 seconds of silence with no active
         // progress tokens, which bridges the flycheck debounce gap and waits
         // for cargo check to finish.
-        self.wait_for_activity_settle(Duration::from_secs(2), timeout)
+        if self
+            .wait_for_activity_settle(Duration::from_secs(2), timeout)
             .await
+        {
+            DiagnosticsWaitResult::Updated
+        } else {
+            DiagnosticsWaitResult::ServerDied
+        }
     }
 
     /// Returns the language identifier for this client (e.g., "rust", "python").
