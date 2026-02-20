@@ -1,5 +1,17 @@
 {
   "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "name": "catenary-lock-acquire",
+            "type": "command",
+            "command": "catenary lock acquire --format=gemini"
+          }
+        ]
+      }
+    ],
     "AfterTool": [
       {
         "matcher": "read_file|write_file|replace",
@@ -8,6 +20,26 @@
             "name": "catenary-notify",
             "type": "command",
             "command": "catenary notify --format=gemini"
+          }
+        ]
+      },
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "name": "catenary-lock-release",
+            "type": "command",
+            "command": "catenary lock release --format=gemini"
+          }
+        ]
+      },
+      {
+        "matcher": "read_file",
+        "hooks": [
+          {
+            "name": "catenary-lock-track-read",
+            "type": "command",
+            "command": "catenary lock track-read --format=gemini"
           }
         ]
       }

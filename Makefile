@@ -15,13 +15,10 @@ VERSION_FILES := Cargo.toml .claude-plugin/marketplace.json gemini-extension.jso
 
 # Default target: run all checks
 check:
-	@echo "Running version sync check..."
-	@cargo test --test version_sync --quiet
-	@echo "Running pre-commit checks..."
-	@cargo test --lib --quiet
-	@cargo clippy --quiet -- -D warnings
-	@cargo fmt -- --check
-	@echo "All checks passed!"
+	@cargo fmt
+	@cargo clippy --tests --quiet -- -D warnings
+	@cargo deny check
+	@cargo nextest run
 
 # Verify we're in a good state for release
 pre-release-check:

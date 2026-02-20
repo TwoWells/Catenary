@@ -52,11 +52,19 @@ claude plugin install catenary@catenary
 Inside `plugins/catenary/`:
 
 - **`.mcp.json`** — declares the MCP server (`catenary` command).
-- **`hooks/hooks.json`** — registers two hooks:
-  - `PostToolUse` on `Edit|Write|NotebookEdit`: runs `catenary notify` for
-    post-edit LSP diagnostics.
+- **`hooks/hooks.json`** — registers hooks for diagnostics, root sync, and
+  file locking:
   - `PreToolUse` (all tools): runs `catenary sync-roots` to pick up `/add-dir`
     workspace additions.
+  - `PreToolUse` on `Edit|Write|NotebookEdit`: runs `catenary lock acquire` to
+    serialize concurrent edits across agents.
+  - `PostToolUse` on `Edit|Write|NotebookEdit`: runs `catenary notify` for
+    post-edit LSP diagnostics, then `catenary lock release` to start the grace
+    period.
+  - `PostToolUse` on `Read`: runs `catenary lock track-read` for change
+    detection.
+  - `PostToolUseFailure` on `Edit|Write|NotebookEdit`: runs
+    `catenary lock release --grace 0` for immediate lock release on failure.
 - **`config.example.toml`** — example Catenary configuration.
 
 ## Gemini CLI Extension
@@ -71,14 +79,21 @@ The extension root is the repository root. Two files matter:
 
 - **`gemini-extension.json`** — manifest declaring the MCP server. Does **not**
   contain hooks (Gemini CLI ignores hooks defined in the manifest).
-- **`hooks/hooks.json`** — registers one hook:
+- **`hooks/hooks.json`** — registers hooks for diagnostics and file locking:
+  - `BeforeTool` on `write_file|replace`: runs
+    `catenary lock acquire --format=gemini` to serialize concurrent edits.
   - `AfterTool` on `read_file|write_file|replace`: runs
     `catenary notify --format=gemini` for post-edit LSP diagnostics.
+  - `AfterTool` on `write_file|replace`: runs
+    `catenary lock release --format=gemini` for lock grace period.
+  - `AfterTool` on `read_file`: runs
+    `catenary lock track-read --format=gemini` for change detection.
 
 ## Hook Contracts
 
-Both `catenary notify` and `catenary sync-roots` read hook JSON from stdin.
-They silently succeed on any error to avoid breaking the host CLI's flow.
+All hook commands (`catenary notify`, `catenary sync-roots`, `catenary lock`)
+read hook JSON from stdin. They silently succeed on any error to avoid breaking
+the host CLI's flow.
 
 ### `catenary notify`
 
@@ -110,6 +125,68 @@ running Catenary session.
 | ----- | -------- |
 | `transcript_path` | Path to the Claude Code transcript file |
 | `cwd` | Identifying which Catenary session to update |
+
+### `catenary lock acquire`
+
+Triggered before file edits (Claude Code `PreToolUse`, Gemini `BeforeTool`). Acquires a file-level
+advisory lock, blocking until the lock is available or the timeout expires. This
+serializes concurrent edits to the same file across multiple agents.
+
+**Fields consumed from hook JSON:**
+
+| Field | Used for |
+| ----- | -------- |
+| `session_id` | Lock owner identity (primary key) |
+| `agent_id` | Lock owner identity (appended if present) |
+| `tool_input.file_path` or `tool_input.file` | File to lock |
+| `cwd` | Resolving relative file paths and finding the session for monitor events |
+
+**Flags:**
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--timeout` | 180 | Seconds to wait before giving up |
+| `--format` | plain | Output format (`plain` or `gemini`) |
+
+**Output:** silent on success. On timeout, returns JSON with
+`permissionDecision: "deny"`. If the file was modified since the owner's last
+read, returns JSON with `additionalContext` warning.
+
+### `catenary lock release`
+
+Triggered after file edits (Claude Code `PostToolUse`, Gemini `AfterTool`).
+Releases the lock with a grace period, allowing the same agent to re-acquire
+without contention during the diagnostics→fix cycle.
+
+**Fields consumed from hook JSON:**
+
+| Field | Used for |
+| ----- | -------- |
+| `session_id` | Lock owner identity |
+| `agent_id` | Lock owner identity (appended if present) |
+| `tool_input.file_path` or `tool_input.file` | File to unlock |
+| `cwd` | Finding the session for monitor events |
+
+**Flags:**
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--grace` | 30 | Seconds before the lock expires |
+| `--format` | plain | Output format (`plain` or `gemini`) |
+
+### `catenary lock track-read`
+
+Triggered after file reads (Claude Code `PostToolUse` on `Read`, Gemini
+`AfterTool` on `read_file`). Records the file's modification time so future
+lock acquisitions can detect if the file changed since the agent last read it.
+
+**Fields consumed from hook JSON:**
+
+| Field | Used for |
+| ----- | -------- |
+| `session_id` | Owner identity for tracking |
+| `agent_id` | Owner identity (appended if present) |
+| `tool_input.file_path` or `tool_input.file` | File to track |
 
 ## Version Management
 

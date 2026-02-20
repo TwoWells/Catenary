@@ -107,6 +107,29 @@ pub enum EventKind {
         /// The raw JSON-RPC message.
         message: serde_json::Value,
     },
+    /// File lock acquired by an agent.
+    LockAcquired {
+        /// The locked file path.
+        file: String,
+        /// The lock owner identity.
+        owner: String,
+    },
+    /// File lock released by an agent.
+    LockReleased {
+        /// The released file path.
+        file: String,
+        /// The lock owner identity.
+        owner: String,
+    },
+    /// File lock acquisition denied (timeout).
+    LockDenied {
+        /// The file that could not be locked.
+        file: String,
+        /// The agent that was denied.
+        owner: String,
+        /// The agent currently holding the lock.
+        held_by: String,
+    },
 }
 
 /// Returns the base directory for session data.

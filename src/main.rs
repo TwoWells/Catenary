@@ -110,6 +110,55 @@ enum Command {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+
+    /// Manage file locks for concurrent agent coordination.
+    /// Used by `PreToolUse` and `PostToolUse` hooks to serialize file edits
+    /// across multiple agents.
+    Lock {
+        /// The lock action to perform.
+        #[command(subcommand)]
+        action: LockAction,
+    },
+}
+
+/// Lock subcommands for concurrent agent coordination.
+#[derive(Subcommand, Debug)]
+enum LockAction {
+    /// Acquire a lock before editing a file.
+    /// Blocks until the lock is available or the timeout expires.
+    /// Reads hook JSON from stdin.
+    Acquire {
+        /// Maximum time to wait for the lock (seconds).
+        #[arg(long, default_value = "180")]
+        timeout: u64,
+
+        /// Output format: "plain" (default) or "gemini".
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+
+    /// Release a lock after editing a file.
+    /// Sets a grace period before the lock becomes available to other agents.
+    /// Reads hook JSON from stdin.
+    Release {
+        /// Grace period before the lock expires (seconds).
+        #[arg(long, default_value = "30")]
+        grace: u64,
+
+        /// Output format: "plain" (default) or "gemini".
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+
+    /// Track a file read for change detection.
+    /// Records the file's modification time so future lock acquisitions
+    /// can warn if the file changed.
+    /// Reads hook JSON from stdin.
+    TrackRead {
+        /// Output format: "plain" (default) or "gemini".
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
 }
 
 /// Entry point for the Catenary binary.
@@ -138,6 +187,10 @@ async fn main() -> Result<()> {
         Some(Command::Doctor { nocolor }) => run_doctor(args, nocolor).await,
         Some(Command::SyncRoots { format }) => {
             run_sync_roots(&format);
+            Ok(())
+        }
+        Some(Command::Lock { action }) => {
+            run_lock(action);
             Ok(())
         }
     }
@@ -815,6 +868,243 @@ fn run_sync_roots(format: &str) {
     print!("{output}");
 }
 
+/// Dispatch lock subcommands.
+///
+/// Reads hook JSON from stdin, extracts owner identity and file path,
+/// and performs the requested lock operation. Silently succeeds on any
+/// error to avoid breaking the host CLI's flow.
+fn run_lock(action: LockAction) {
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    let owner = extract_owner(&hook_json);
+    let Some(file_path) = extract_file_path(&hook_json) else {
+        return;
+    };
+
+    let Ok(mgr) = catenary_mcp::lock::FileLockManager::new() else {
+        return;
+    };
+
+    match action {
+        LockAction::Acquire { timeout, format } => {
+            run_lock_acquire(&mgr, &file_path, &owner, timeout, &format, &hook_json);
+        }
+        LockAction::Release { grace, format: _ } => {
+            run_lock_release(&mgr, &file_path, &owner, grace, &hook_json);
+        }
+        LockAction::TrackRead { format: _ } => {
+            run_lock_track_read(&mgr, &file_path, &owner);
+        }
+    }
+}
+
+/// Acquires a file lock, blocking until available or timeout.
+fn run_lock_acquire(
+    mgr: &catenary_mcp::lock::FileLockManager,
+    file_path: &str,
+    owner: &str,
+    timeout: u64,
+    format: &str,
+    hook_json: &serde_json::Value,
+) {
+    use catenary_mcp::lock::AcquireResult;
+
+    let result = mgr.acquire(file_path, owner, timeout);
+
+    // Broadcast event to monitor (best-effort)
+    match &result {
+        AcquireResult::Acquired | AcquireResult::AcquiredStaleRead { .. } => {
+            broadcast_lock_event(
+                hook_json,
+                EventKind::LockAcquired {
+                    file: file_path.to_string(),
+                    owner: owner.to_string(),
+                },
+            );
+        }
+        AcquireResult::Denied { .. } => {
+            // Read the lock to find who's holding it
+            let held_by = "unknown".to_string();
+            broadcast_lock_event(
+                hook_json,
+                EventKind::LockDenied {
+                    file: file_path.to_string(),
+                    owner: owner.to_string(),
+                    held_by,
+                },
+            );
+        }
+    }
+
+    match result {
+        AcquireResult::Acquired => {
+            // Silent success
+        }
+        AcquireResult::AcquiredStaleRead { context } => {
+            let output = format_lock_output(format, Some(&context), None);
+            print!("{output}");
+        }
+        AcquireResult::Denied { reason } => {
+            let output = format_lock_output(format, None, Some(&reason));
+            print!("{output}");
+        }
+    }
+}
+
+/// Releases a file lock with an optional grace period.
+fn run_lock_release(
+    mgr: &catenary_mcp::lock::FileLockManager,
+    file_path: &str,
+    owner: &str,
+    grace: u64,
+    hook_json: &serde_json::Value,
+) {
+    if mgr.release(file_path, owner, grace).is_ok() {
+        broadcast_lock_event(
+            hook_json,
+            EventKind::LockReleased {
+                file: file_path.to_string(),
+                owner: owner.to_string(),
+            },
+        );
+    }
+}
+
+/// Records a file read for change detection.
+fn run_lock_track_read(mgr: &catenary_mcp::lock::FileLockManager, file_path: &str, owner: &str) {
+    let _ = mgr.track_read(file_path, owner);
+}
+
+/// Extracts the owner identity from hook JSON.
+///
+/// Uses `session_id` as the primary key. If `agent_id` is present,
+/// appends it as `session_id:agent_id`.
+fn extract_owner(hook_json: &serde_json::Value) -> String {
+    let session_id = hook_json
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let agent_id = hook_json.get("agent_id").and_then(|v| v.as_str());
+
+    agent_id.map_or_else(
+        || session_id.to_string(),
+        |aid| format!("{session_id}:{aid}"),
+    )
+}
+
+/// Extracts the file path from hook JSON's `tool_input`.
+fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
+    let file_path = hook_json
+        .get("tool_input")
+        .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
+        .and_then(|fp| fp.as_str())?;
+
+    // Resolve to absolute path
+    let abs_path = if std::path::Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        );
+        cwd.join(file_path)
+    };
+
+    Some(abs_path.to_string_lossy().into_owned())
+}
+
+/// Formats lock output for the hook response.
+///
+/// - `additional_context`: injected when the lock was acquired but the file
+///   was modified since the owner's last read.
+/// - `deny_reason`: injected when the lock acquisition timed out.
+fn format_lock_output(
+    format: &str,
+    additional_context: Option<&str>,
+    deny_reason: Option<&str>,
+) -> String {
+    let is_gemini = format == "gemini";
+
+    match (deny_reason, additional_context) {
+        // Gemini BeforeTool uses top-level decision/reason
+        (Some(reason), _) if is_gemini => serde_json::json!({
+            "decision": "deny",
+            "reason": reason
+        })
+        .to_string(),
+        // Claude Code PreToolUse uses hookSpecificOutput
+        (Some(reason), _) => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            }
+        })
+        .to_string(),
+        // Gemini: deny stale reads too — force re-read before editing
+        (None, Some(context)) if is_gemini => serde_json::json!({
+            "decision": "deny",
+            "reason": context
+        })
+        .to_string(),
+        // Claude Code: allow with advisory context
+        (None, Some(context)) => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "additionalContext": context
+            }
+        })
+        .to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// Broadcasts a lock event to the monitor (best-effort).
+///
+/// Finds the Catenary session matching the hook's `cwd` and sends the event
+/// via the session's event broadcaster. Silently does nothing if no session
+/// is found or the broadcast fails.
+fn broadcast_lock_event(hook_json: &serde_json::Value, event: EventKind) {
+    use std::io::Write;
+
+    let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+
+    let sessions = session::list_sessions().unwrap_or_default();
+    let Some(session_info) = sessions.iter().find(|s| cwd.starts_with(&s.workspace)) else {
+        return;
+    };
+
+    // Write directly to the session's events file
+    let events_path = session::sessions_dir()
+        .join(&session_info.id)
+        .join("events.jsonl");
+
+    let event = SessionEvent {
+        timestamp: chrono::Utc::now(),
+        kind: event,
+    };
+
+    if let Ok(mut line) = serde_json::to_string(&event) {
+        line.push('\n');
+        // Append to events file (best-effort)
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&events_path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
 /// Format diagnostic lines for output.
 ///
 /// - `"gemini"`: wraps in a JSON envelope for Gemini CLI hooks.
@@ -1122,6 +1412,7 @@ fn print_event_raw(event: &SessionEvent) {
 }
 
 /// Print an event with annotations and colors
+#[allow(clippy::too_many_lines, reason = "Match arms for each event kind")]
 fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width: usize) {
     let time = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
     let time_str = colors.dim(&format!("[{time}]"));
@@ -1201,6 +1492,38 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 };
                 println!("{time_str} {basename}: {label}{detail}");
             }
+        }
+        EventKind::LockAcquired { file, owner } => {
+            let basename = std::path::Path::new(file.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file);
+            let lock_icon = colors.green("locked");
+            let short_owner = cli::truncate(owner, 20);
+            println!("{time_str} {basename}: {lock_icon} by {short_owner}");
+        }
+        EventKind::LockReleased { file, owner } => {
+            let basename = std::path::Path::new(file.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file);
+            let unlock_icon = colors.dim("unlocked");
+            let short_owner = cli::truncate(owner, 20);
+            println!("{time_str} {basename}: {unlock_icon} by {short_owner}");
+        }
+        EventKind::LockDenied {
+            file,
+            owner,
+            held_by,
+        } => {
+            let basename = std::path::Path::new(file.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file);
+            let denied = colors.red("lock denied");
+            let short_owner = cli::truncate(owner, 20);
+            let short_held = cli::truncate(held_by, 20);
+            println!("{time_str} {basename}: {denied} for {short_owner} (held by {short_held})");
         }
         EventKind::McpMessage { direction, message } => {
             let arrow_colored = if direction == "in" {

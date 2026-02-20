@@ -23,7 +23,7 @@ repos:
     hooks:
       - id: gitleaks
 
-  # Rust checks
+  # Rust checks — single source of truth is `make check`
   - repo: local
     hooks:
       - id: cargo-lock-check
@@ -33,29 +33,9 @@ repos:
         pass_filenames: false
         files: ^Cargo\.(toml|lock)$
 
-      - id: cargo-fmt
-        name: cargo fmt
-        entry: cargo fmt -- --check
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-clippy
-        name: cargo clippy
-        entry: cargo clippy --quiet
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-deny
-        name: cargo deny
-        entry: cargo deny check
-        language: system
-        pass_filenames: false
-
-      - id: cargo-test-lib
-        name: cargo test lib
-        entry: cargo test --lib --quiet
+      - id: make-check
+        name: make check
+        entry: make check
         language: system
         types: [rust]
         pass_filenames: false

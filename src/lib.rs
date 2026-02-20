@@ -12,6 +12,8 @@ pub mod bridge;
 pub mod cli;
 /// Configuration handling for language servers and session settings.
 pub mod config;
+/// Filesystem-based advisory file locks for concurrent agent coordination.
+pub mod lock;
 /// LSP client implementation and server management.
 pub mod lsp;
 /// MCP server implementation and type definitions.
