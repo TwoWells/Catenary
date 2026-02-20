@@ -43,6 +43,24 @@ claude plugin marketplace add MarkWells-Dev/Catenary
 claude plugin install catenary@catenary
 ```
 
+### Updating after a new release
+
+Claude Code caches plugin files (including `hooks.json`) under
+`~/.claude/plugins/cache/` at install time. Updating the `catenary` binary alone
+does not refresh the cached hooks. To fully apply a Catenary update, remove and
+reinstall the plugin:
+
+```bash
+claude plugin remove catenary@catenary
+claude plugin install catenary@catenary
+```
+
+Then start a new Claude Code session. Running sessions use the hooks that were
+cached when the session started, and their MCP server process runs for the
+session lifetime — protocol changes require a fresh session.
+
+### Plugin source
+
 `.claude-plugin/marketplace.json` points to the plugin source directory:
 
 ```json
