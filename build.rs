@@ -17,6 +17,10 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
 
+    // Rebuild when hook definitions change (embedded via include_str!)
+    println!("cargo:rerun-if-changed=plugins/catenary/hooks/hooks.json");
+    println!("cargo:rerun-if-changed=hooks/hooks.json");
+
     let version = git_describe().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=CATENARY_VERSION={version}");
 }

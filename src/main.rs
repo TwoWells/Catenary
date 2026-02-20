@@ -1208,6 +1208,260 @@ fn format_diagnostics(lines: &[String], format: &str) -> String {
     .to_string()
 }
 
+/// Expected Claude Code hooks, embedded at compile time.
+const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../plugins/catenary/hooks/hooks.json");
+
+/// Expected Gemini CLI hooks, embedded at compile time.
+const GEMINI_HOOKS_EXPECTED: &str = include_str!("../hooks/hooks.json");
+
+/// Check Claude Code plugin hooks against the embedded expected hooks.
+fn check_claude_hooks(colors: &ColorConfig) {
+    let label = format!("{:<14}", "Claude Code");
+    let Ok(home_str) = std::env::var("HOME") else {
+        println!(
+            "  {label}{}",
+            colors.dim("- cannot determine home directory"),
+        );
+        return;
+    };
+    let home = PathBuf::from(home_str);
+
+    let plugins_file = home.join(".claude/plugins/installed_plugins.json");
+    let Ok(plugins_json) = std::fs::read_to_string(&plugins_file) else {
+        println!("  {label}{}", colors.dim("- not installed"));
+        return;
+    };
+
+    let Ok(plugins) = serde_json::from_str::<serde_json::Value>(&plugins_json) else {
+        println!(
+            "  {label}{}",
+            colors.yellow("? cannot parse installed_plugins.json"),
+        );
+        return;
+    };
+
+    // Look up catenary@catenary in plugins.plugins
+    let entries = match plugins
+        .get("plugins")
+        .and_then(|p| p.get("catenary@catenary"))
+        .and_then(serde_json::Value::as_array)
+    {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => {
+            println!("  {label}{}", colors.dim("- not installed"));
+            return;
+        }
+    };
+
+    // Use the first (most recent) entry
+    let entry = &entries[0];
+    let version = entry
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let Some(install_path_str) = entry.get("installPath").and_then(serde_json::Value::as_str)
+    else {
+        println!(
+            "  {label}{version:<8}{}",
+            colors.yellow("? missing installPath"),
+        );
+        return;
+    };
+    let install_path = PathBuf::from(install_path_str);
+
+    // Determine marketplace source type
+    let source_type = read_marketplace_source(&home);
+    let version_display = source_type
+        .as_deref()
+        .map_or_else(|| version.to_string(), |src| format!("{version} ({src})"));
+    let ver_col = format!("{version_display:<20}");
+
+    // Read installed hooks and compare
+    let hooks_path = install_path.join("hooks/hooks.json");
+    match std::fs::read_to_string(&hooks_path) {
+        Ok(installed) => {
+            if normalize_json(&installed) == normalize_json(CLAUDE_HOOKS_EXPECTED) {
+                println!("  {label}{ver_col}{}", colors.green("✓ hooks match"));
+            } else {
+                println!(
+                    "  {label}{ver_col}{}",
+                    colors.red("✗ stale hooks (reinstall: claude mcp remove catenary@catenary && claude mcp install catenary@catenary)"),
+                );
+            }
+        }
+        Err(_) => {
+            println!(
+                "  {label}{ver_col}{}",
+                colors.red("✗ hooks.json not found in plugin cache"),
+            );
+        }
+    }
+}
+
+/// Read the catenary marketplace source type from `known_marketplaces.json`.
+fn read_marketplace_source(home: &Path) -> Option<String> {
+    let path = home.join(".claude/plugins/known_marketplaces.json");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    json.get("catenary")
+        .and_then(|c| c.get("source"))
+        .and_then(|s| s.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .map(std::string::ToString::to_string)
+}
+
+/// Check Gemini CLI extension hooks against the embedded expected hooks.
+fn check_gemini_hooks(colors: &ColorConfig) {
+    let label = format!("{:<14}", "Gemini CLI");
+    let Ok(home_str) = std::env::var("HOME") else {
+        println!(
+            "  {label}{}",
+            colors.dim("- cannot determine home directory"),
+        );
+        return;
+    };
+    let home = PathBuf::from(home_str);
+
+    // Look for the extension directory
+    let ext_dir = home.join(".gemini/extensions");
+    let candidates = ["Catenary", "catenary"];
+    let ext_path = candidates
+        .iter()
+        .map(|name| ext_dir.join(name))
+        .find(|p| p.is_dir());
+
+    let Some(ext_path) = ext_path else {
+        println!("  {label}{}", colors.dim("- not installed"));
+        return;
+    };
+
+    // Read .gemini-extension-install.json to determine install type and source.
+    // Gemini CLI writes this metadata file for both linked and installed extensions.
+    let install_meta_path = ext_path.join(".gemini-extension-install.json");
+    let install_meta = std::fs::read_to_string(&install_meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let install_type = install_meta
+        .as_ref()
+        .and_then(|m| m.get("type").and_then(serde_json::Value::as_str))
+        .unwrap_or("unknown");
+
+    // For linked extensions, the source field is a local path to the actual
+    // extension files. For installed extensions (github-release, etc.), the
+    // files are cloned into the extension directory itself.
+    let resolved = if install_type == "link" {
+        install_meta
+            .as_ref()
+            .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ext_path.clone())
+    } else {
+        ext_path.clone()
+    };
+
+    // Read the extension manifest for version info
+    let manifest_path = resolved.join("gemini-extension.json");
+    let version = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("version")
+                .and_then(serde_json::Value::as_str)
+                .map(std::string::ToString::to_string)
+        });
+
+    let type_label = if install_type == "link" {
+        "linked"
+    } else {
+        "installed"
+    };
+    let version_display = version
+        .as_deref()
+        .map_or_else(|| type_label.to_string(), |v| format!("{v} ({type_label})"));
+    let ver_col = format!("{version_display:<20}");
+
+    // Read hooks and compare against embedded
+    let hooks_path = resolved.join("hooks/hooks.json");
+    match std::fs::read_to_string(&hooks_path) {
+        Ok(installed) => {
+            if normalize_json(&installed) == normalize_json(GEMINI_HOOKS_EXPECTED) {
+                println!("  {label}{ver_col}{}", colors.green("✓ hooks match"));
+            } else {
+                println!(
+                    "  {label}{ver_col}{}",
+                    colors.red("✗ stale hooks (update extension)"),
+                );
+            }
+        }
+        Err(_) => {
+            println!(
+                "  {label}{ver_col}{}",
+                colors.yellow("? hooks.json not found"),
+            );
+        }
+    }
+}
+
+/// Check whether the running binary matches what `$PATH` would resolve.
+fn check_path_binary(colors: &ColorConfig) {
+    let label = format!("{:<14}", "PATH");
+    let spacer = " ".repeat(20);
+
+    let Some(current_exe) = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+    else {
+        println!(
+            "  {label}{}",
+            colors.yellow("? cannot determine current executable"),
+        );
+        return;
+    };
+
+    // Find catenary on PATH
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let Some(path_binary) = std::env::split_paths(&path_var)
+        .map(|dir| dir.join("catenary"))
+        .find(|p| p.is_file())
+    else {
+        println!(
+            "  {label}{spacer}{}",
+            colors.red("✗ catenary not found on PATH"),
+        );
+        return;
+    };
+
+    let resolved_path = std::fs::canonicalize(&path_binary).unwrap_or(path_binary);
+
+    if current_exe == resolved_path {
+        println!(
+            "  {label}{spacer}{}",
+            colors.green(&format!("✓ {}", resolved_path.display())),
+        );
+    } else {
+        println!(
+            "  {label}{spacer}{}",
+            colors.red(&format!(
+                "✗ {} differs from {}",
+                resolved_path.display(),
+                current_exe.display(),
+            )),
+        );
+    }
+}
+
+/// Normalize a JSON string for comparison (parse and re-serialize).
+///
+/// Returns the compact re-serialized form, or the original string (trimmed)
+/// if parsing fails.
+fn normalize_json(s: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(s)
+        .ok()
+        .and_then(|v| serde_json::to_string(&v).ok())
+        .unwrap_or_else(|| s.trim().to_string())
+}
+
 /// Run the doctor command: check language server health for the current workspace.
 ///
 /// # Errors
@@ -1219,6 +1473,10 @@ fn format_diagnostics(lines: &[String], format: &str) -> String {
 )]
 async fn run_doctor(args: Args, nocolor: bool) -> Result<()> {
     let colors = ColorConfig::new(nocolor);
+
+    // Print version header
+    println!("Catenary {}", env!("CATENARY_VERSION"));
+    println!();
 
     // Load configuration (same as run_server)
     let mut config = catenary_mcp::config::Config::load(args.config.clone())?;
@@ -1379,6 +1637,13 @@ async fn run_doctor(args: Args, nocolor: bool) -> Result<()> {
         // Shutdown cleanly
         let _ = client.shutdown().await;
     }
+
+    // Hooks health section
+    println!();
+    println!("{}:", colors.bold("Hooks"));
+    check_claude_hooks(&colors);
+    check_gemini_hooks(&colors);
+    check_path_binary(&colors);
 
     Ok(())
 }
