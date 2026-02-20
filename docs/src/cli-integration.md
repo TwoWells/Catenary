@@ -53,7 +53,7 @@ Location: `~/.gemini/policies/` (user) or `.gemini/settings.json` (workspace)
     ensures the model sees LSP diagnostics immediately.
 
     ```bash
-    gemini ext install markwells.catenary
+    gemini extensions install https://github.com/MarkWells-Dev/Catenary
     ```
 
 2.  **Constrained mode.** Use the Policy Engine to deny text-scanning commands while

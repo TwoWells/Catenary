@@ -72,7 +72,7 @@ Inside `plugins/catenary/`:
 Installed via:
 
 ```bash
-gemini ext install markwells.catenary
+gemini extensions install https://github.com/MarkWells-Dev/Catenary
 ```
 
 The extension root is the repository root. Two files matter:

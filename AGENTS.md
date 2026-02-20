@@ -9,6 +9,50 @@ This file serves as the single point of truth for AI agents (Claude, Gemini, etc
 - **Dependency Policy:** `@./deny.toml`
 - **Documentation:** `docs/src/`
 
+## How Catenary Works
+
+Catenary is an MCP server that gives AI agents LSP-powered code intelligence. It
+multiplexes one or more LSP servers (e.g., rust-analyzer, typescript-language-server)
+behind a single MCP interface, providing hover, go-to-definition, diagnostics,
+find-references, rename, and search without shell-based text scanning.
+
+### Core concepts
+
+- **Session:** A running Catenary instance. Each session has a unique ID (opaque
+  string), a PID, and one or more workspace roots. Sessions are discoverable via
+  `catenary list` and monitorable via `catenary monitor <id>`. See `src/session.rs`.
+- **MCP tools:** The tools exposed to agents (search, hover, definition,
+  diagnostics, etc.) are defined in the MCP server. Each tool delegates to one or
+  more LSP servers under the hood.
+- **Hooks:** Catenary integrates with host CLIs (Claude Code, Gemini CLI) via
+  hooks that fire before/after tool use. Hook definitions live in
+  `plugins/catenary/hooks/hooks.json` (Claude Code) and `hooks/hooks.json`
+  (Gemini CLI). See `docs/src/plugin-architecture.md` for the full hook contract.
+- **File locking:** The `catenary lock` subsystem (`src/lock.rs`) serializes
+  concurrent file edits across agents. Locks are advisory, filesystem-based, and
+  keyed by absolute file path. Ownership is tracked by an `owner` string built
+  from `session_id` (+ `agent_id` if present) from the hook JSON.
+  - `lock acquire` (PreToolUse on Edit/Write): blocks until the lock is available.
+    Also runs stale-read detection — compares the file's current mtime against
+    the last value recorded by `track-read` for this owner, and warns if they
+    differ.
+  - `lock release` (PostToolUse on Edit/Write): sets a grace period (default 30s)
+    so the same owner can re-acquire without contention during diagnostics→fix
+    cycles.
+  - `lock track-read` (PostToolUse on Read): records the file's mtime so future
+    `lock acquire` calls can detect external modifications.
+- **Diagnostics:** `catenary notify` (PostToolUse on Edit/Write) sends the edited
+  file path to the session and returns LSP diagnostics to the agent.
+- **Root sync:** `catenary sync-roots` (PreToolUse, Claude Code only) scans the
+  transcript for `/add-dir` workspace additions and forwards them to the session.
+
+### Architecture references
+
+- `docs/src/plugin-architecture.md` — plugin layout, hook contracts, version management.
+- `src/lock.rs` — file locking and read tracking implementation.
+- `src/session.rs` — session lifecycle and event broadcasting.
+- `docs/src/` — full documentation source.
+
 ## Coding Standards
 - **Edition:** Rust 2024.
 - **Safety:** `unsafe` code is strictly forbidden (`forbid(unsafe_code)`).
