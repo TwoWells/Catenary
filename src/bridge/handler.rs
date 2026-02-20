@@ -274,7 +274,7 @@ impl LspBridgeHandler {
             return CallToolResult::text("No LSP servers running");
         }
 
-        let mut output = Vec::new();
+        let mut output = vec![format!("Catenary {}", env!("CATENARY_VERSION"))];
         for status in statuses {
             let state_str = match status.state {
                 ServerState::Initializing => "Initializing",

@@ -30,6 +30,7 @@ use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
 #[derive(Parser, Debug)]
 #[command(name = "catenary")]
 #[command(about = "Multiplexing bridge between MCP and multiple LSP servers")]
+#[command(version = env!("CATENARY_VERSION"))]
 struct Args {
     /// The subcommand to run.
     #[command(subcommand)]

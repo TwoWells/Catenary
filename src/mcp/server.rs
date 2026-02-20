@@ -280,7 +280,7 @@ impl<H: ToolHandler> McpServer<H> {
             },
             server_info: ServerInfo {
                 name: "catenary".to_string(),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                version: Some(env!("CATENARY_VERSION").to_string()),
             },
             instructions: Some(
                 "Catenary provides LSP-backed code intelligence tools. \
