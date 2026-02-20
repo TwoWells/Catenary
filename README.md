@@ -62,7 +62,7 @@ args = ["--stdio"]
 
 **Claude Code**
 ```
-/plugin marketplace add https://github.com/MarkWells-Dev/Catenary
+/plugin marketplace add MarkWells-Dev/Catenary
 /plugin install catenary@catenary
 ```
 

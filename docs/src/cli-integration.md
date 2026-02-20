@@ -48,7 +48,7 @@ Location: `~/.gemini/policies/` (user) or `.gemini/settings.json` (workspace)
 
 **Recommended: Extension + Constrained Mode.**
 
-1.  **Install the Extension:** The `markwells.catenary` extension provides an
+1.  **Install the Extension:** The Catenary extension provides an
     `AfterTool` hook that runs `catenary notify` after every file edit. This
     ensures the model sees LSP diagnostics immediately.
 

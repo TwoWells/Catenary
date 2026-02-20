@@ -17,7 +17,7 @@ missing, hooks will silently do nothing.
 ### 2. Install the plugin
 
 ```
-/plugin marketplace add https://github.com/MarkWells-Dev/Catenary
+/plugin marketplace add MarkWells-Dev/Catenary
 /plugin install catenary@catenary
 ```
 

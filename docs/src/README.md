@@ -37,7 +37,7 @@ diagnostics, file locking, and root sync. The binary must be on your PATH.
 
 *Claude Code:*
 ```
-/plugin marketplace add https://github.com/MarkWells-Dev/Catenary
+/plugin marketplace add MarkWells-Dev/Catenary
 /plugin install catenary@catenary
 ```
 
