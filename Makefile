@@ -17,8 +17,8 @@ VERSION_FILES := Cargo.toml .claude-plugin/marketplace.json gemini-extension.jso
 check:
 	@cargo fmt
 	@cargo clippy --tests --quiet -- -D warnings
-	@cargo deny check
-	@cargo nextest run
+	@cargo deny --log-level error check >/dev/null 2>&1
+	@cargo nextest run --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 # Verify we're in a good state for release
 pre-release-check:
