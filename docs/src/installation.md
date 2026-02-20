@@ -24,6 +24,11 @@ cargo build --release
 
 ## Add to Your MCP Client
 
+> **The `catenary` binary must be installed and on your PATH before
+> configuring any client.** Plugins and extensions provide hooks and MCP
+> server declarations but do not include the binary. If the binary is
+> missing, hooks will silently do nothing and you will get no diagnostics.
+
 ### Claude Code (CLI)
 
 **Option 1: Plugin (recommended)**
@@ -33,11 +38,18 @@ claude plugin marketplace add MarkWells-Dev/Catenary
 claude plugin install catenary@catenary
 ```
 
+The plugin registers the MCP server and hooks for post-edit diagnostics,
+file locking, and root sync. It requires the `catenary` binary on PATH.
+
 **Option 2: Manual**
 
 ```bash
 claude mcp add catenary -- catenary
 ```
+
+This registers the MCP server only. You will not get post-edit diagnostics
+or file locking unless you also configure hooks manually (see
+[CLI Integration](cli-integration.md)).
 
 ### Claude Desktop
 
@@ -57,6 +69,17 @@ Add to your config file:
 
 ### Gemini CLI
 
+**Option 1: Extension (recommended)**
+
+```bash
+gemini extensions install https://github.com/MarkWells-Dev/Catenary
+```
+
+The extension registers the MCP server and hooks for post-edit diagnostics
+and file locking. It requires the `catenary` binary on PATH.
+
+**Option 2: Manual**
+
 Add to `~/.gemini/settings.json`:
 
 ```json
@@ -68,6 +91,10 @@ Add to `~/.gemini/settings.json`:
   }
 }
 ```
+
+This registers the MCP server only. You will not get post-edit diagnostics
+or file locking unless you also install the extension or configure hooks
+manually (see [CLI Integration](cli-integration.md)).
 
 ### Other MCP Clients
 

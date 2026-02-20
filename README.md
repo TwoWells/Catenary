@@ -57,22 +57,25 @@ args = ["--stdio"]
 
 ### 3. Connect your AI assistant
 
+> Plugins and extensions register hooks and MCP server declarations but
+> **do not include the binary** — step 1 above is required.
+
 **Claude Code**
 ```
 /plugin marketplace add https://github.com/MarkWells-Dev/Catenary
 /plugin install catenary@catenary
 ```
 
-The plugin configures the MCP server and adds a `PostToolUse` hook that
-returns LSP diagnostics after every edit.
+The plugin registers the MCP server and adds hooks for post-edit
+diagnostics, file locking, and workspace root sync.
 
 **Gemini CLI**
 ```bash
 gemini extensions install https://github.com/MarkWells-Dev/Catenary
 ```
 
-The extension configures the MCP server and adds an `AfterTool` hook that
-returns LSP diagnostics after every edit.
+The extension registers the MCP server and adds hooks for post-edit
+diagnostics and file locking.
 
 Optionally, install the [policy file](https://markwells-dev.github.io/catenary/cli-integration.html#gemini-cli)
 to `~/.gemini/policies/catenary-constrained.toml` to block text-scanning

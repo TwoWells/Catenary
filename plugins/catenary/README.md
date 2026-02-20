@@ -4,20 +4,25 @@ A high-performance multiplexing bridge between MCP (Model Context Protocol) and 
 
 ## Installation
 
-### 1. Install Catenary
+### 1. Install the binary
 
 ```bash
 cargo install catenary-mcp
 ```
 
-### 2. Install the Plugin
+The `catenary` binary must be on your PATH. The plugin does not include it —
+it only registers hooks and the MCP server declaration. If the binary is
+missing, hooks will silently do nothing.
+
+### 2. Install the plugin
 
 ```
 /plugin marketplace add https://github.com/MarkWells-Dev/Catenary
 /plugin install catenary@catenary
 ```
 
-The plugin configures the MCP server and adds hooks for LSP diagnostics after edits and `/add-dir` root syncing.
+The plugin registers the MCP server and adds hooks for post-edit diagnostics,
+file locking, and workspace root sync.
 
 ## Configuration
 
