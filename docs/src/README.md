@@ -22,16 +22,32 @@ completions, rename, and more.
 
 ## Getting Started
 
+**1. Install the binary**
+
 ```bash
-# 1. Install Catenary
 cargo install catenary-mcp
-
-# 2. Create a config file
-mkdir -p ~/.config/catenary
-# See the Configuration page for details
-
-# 3. Add to your MCP client (e.g., Claude Code)
-claude mcp add catenary -- catenary
 ```
 
-Then check the [LSP Servers](lsp/README.md) page to set up language servers for your stack.
+**2. Configure language servers** — see [Configuration](configuration.md)
+
+**3. Connect your AI assistant**
+
+Plugins and extensions register the MCP server *and* hooks for post-edit
+diagnostics, file locking, and root sync. The binary must be on your PATH.
+
+*Claude Code:*
+```
+/plugin marketplace add https://github.com/MarkWells-Dev/Catenary
+/plugin install catenary@catenary
+```
+
+*Gemini CLI:*
+```bash
+gemini extensions install https://github.com/MarkWells-Dev/Catenary
+```
+
+See [Installation](installation.md) for Claude Desktop, manual setup, and
+other MCP clients.
+
+**4. Set up language servers** — see [LSP Servers](lsp/README.md) for
+per-language guides.

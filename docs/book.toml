@@ -10,5 +10,5 @@ build-dir = "book"
 
 [output.html]
 git-repository-url = "https://github.com/MarkWells-Dev/Catenary"
-edit-url-template = "https://github.com/MarkWells-Dev/Catenary/edit/main/docs/src/{path}"
+edit-url-template = "https://github.com/MarkWells-Dev/Catenary/edit/main/docs/{path}"
 no-section-label = true
