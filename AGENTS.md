@@ -71,7 +71,9 @@ find-references, rename, and search without shell-based text scanning.
 
 ## Development Commands
 - **Build:** `cargo build`
-- **Test:** `cargo test`
+- **Check (full):** `make check` — format, lint, deny, and test in one pass.
+- **Test (all):** `make test`
+- **Test (filtered):** `make test T=<filter>` — run only tests matching the filter (e.g., `make test T=json_diagnostics`).
 - **Lint:** `cargo clippy`
 - **Format:** `cargo fmt`
 

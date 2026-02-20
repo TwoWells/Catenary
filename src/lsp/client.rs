@@ -52,7 +52,7 @@ pub(crate) enum DiagnosticsWaitResult {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Time after spawn during which we consider the server to be "warming up".
-const WARMUP_PERIOD: Duration = Duration::from_secs(10);
+pub const WARMUP_PERIOD: Duration = Duration::from_secs(10);
 
 /// Timeout for waiting for fresh diagnostics after a file change.
 /// Used as the inactivity threshold (silence with no notifications or
@@ -1045,23 +1045,24 @@ impl LspClient {
         timeout: Duration,
     ) -> DiagnosticsWaitResult {
         if !self.has_published_diagnostics.load(Ordering::SeqCst) {
-            if !self.is_warming_up() {
-                // Past warmup and server has never published diagnostics —
-                // it likely doesn't support them. Don't block.
+            // Server has never published diagnostics. During warmup we
+            // give it the remaining warmup time; past warmup we give a
+            // short grace period. Servers like json-languageserver only
+            // publish after the first didOpen, so they miss the warmup
+            // window entirely — the grace period covers that case.
+            let grace = if self.is_warming_up() {
+                WARMUP_PERIOD.saturating_sub(self.spawn_time.elapsed())
+            } else {
+                Duration::from_secs(5)
+            };
+            if grace.is_zero() {
                 return DiagnosticsWaitResult::Updated;
             }
-            // During warmup, cap the wait to the remaining warmup time so
-            // we don't block for the full diagnostic timeout on servers
-            // that will never publish diagnostics.
-            let warmup_remaining = WARMUP_PERIOD.saturating_sub(self.spawn_time.elapsed());
-            if warmup_remaining.is_zero() {
-                return DiagnosticsWaitResult::Updated;
-            }
-            let deadline = tokio::time::Instant::now() + warmup_remaining;
+            let deadline = tokio::time::Instant::now() + grace;
             loop {
                 if self.diagnostics_generation(uri).await > snapshot {
-                    // Server published diagnostics during warmup — fall
-                    // through to the normal settle logic below.
+                    // Server published diagnostics — fall through to the
+                    // normal settle logic below.
                     break;
                 }
                 if !self.is_alive() {
@@ -1069,15 +1070,11 @@ impl LspClient {
                 }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    // Warmup expired and still no diagnostics — give up.
                     return DiagnosticsWaitResult::Updated;
                 }
                 match tokio::time::timeout(remaining, self.diagnostics_notify.notified()).await {
                     Ok(()) => {}
-                    Err(_) => {
-                        // Warmup expired without diagnostics — give up.
-                        return DiagnosticsWaitResult::Updated;
-                    }
+                    Err(_) => return DiagnosticsWaitResult::Updated,
                 }
             }
         }

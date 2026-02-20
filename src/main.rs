@@ -936,7 +936,10 @@ fn load_root_state(path: &Path) -> (u64, Vec<PathBuf>) {
 fn save_root_state(path: &Path, offset: u64, roots: &[PathBuf]) {
     let state = RootState {
         offset,
-        roots: roots.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        roots: roots
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
     };
     if let Ok(json) = serde_json::to_string(&state) {
         let _ = std::fs::write(path, json);
@@ -1182,23 +1185,26 @@ fn broadcast_lock_event(hook_json: &serde_json::Value, event: EventKind) {
 
 /// Format diagnostic lines for output.
 ///
-/// - `"gemini"`: wraps in a JSON envelope for Gemini CLI hooks.
-/// - Any other value (including `"plain"`): joins lines with newlines and a trailing newline.
+/// Both formats wrap diagnostics in a `hookSpecificOutput` JSON envelope
+/// so the host CLI can inject them into the model's context:
+///
+/// - `"gemini"`: uses `additionalContext` for Gemini CLI `AfterTool` hooks.
+/// - Any other value (including `"plain"`): uses `additionalContext` for
+///   Claude Code `PostToolUse` hooks.
 fn format_diagnostics(lines: &[String], format: &str) -> String {
-    if format == "gemini" {
-        let diagnostics = lines.join("\n");
-        let envelope = serde_json::json!({
-            "hookSpecificOutput": {
-                "additionalContext": format!("LSP Diagnostics:\n{diagnostics}")
-            }
-        });
-        // serde_json::to_string cannot fail on Value
-        envelope.to_string()
+    let diagnostics = lines.join("\n");
+    let context = if format == "gemini" {
+        format!("LSP Diagnostics:\n{diagnostics}")
     } else {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    }
+        diagnostics
+    };
+    // serde_json::to_string cannot fail on Value
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "additionalContext": context
+        }
+    })
+    .to_string()
 }
 
 /// Run the doctor command: check language server health for the current workspace.
@@ -1788,16 +1794,23 @@ mod tests {
     use anyhow::Context;
 
     #[test]
-    fn test_format_diagnostics_plain() {
+    fn test_format_diagnostics_plain() -> Result<()> {
         let lines = vec![
             "error[E0308]: mismatched types".into(),
             "  --> src/main.rs:5:10".into(),
         ];
         let output = format_diagnostics(&lines, "plain");
-        assert_eq!(
-            output,
-            "error[E0308]: mismatched types\n  --> src/main.rs:5:10\n"
-        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("plain format should produce valid JSON")?;
+
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .context("additionalContext should be a string")?;
+        assert!(context.contains("error[E0308]: mismatched types"));
+        assert!(context.contains("  --> src/main.rs:5:10"));
+        // Plain format should NOT have the "LSP Diagnostics:" prefix
+        assert!(!context.starts_with("LSP Diagnostics:"));
+        Ok(())
     }
 
     #[test]

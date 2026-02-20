@@ -10,7 +10,7 @@ pub mod protocol;
 /// Server state and progress tracking.
 pub mod state;
 
-pub use client::LspClient;
 pub(crate) use client::{DIAGNOSTICS_TIMEOUT, DiagnosticsWaitResult};
+pub use client::{LspClient, WARMUP_PERIOD};
 pub use manager::{ClientManager, detect_workspace_languages};
 pub use state::{ProgressTracker, ServerState, ServerStatus};
