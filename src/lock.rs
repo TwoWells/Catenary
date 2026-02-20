@@ -516,6 +516,31 @@ mod tests {
     }
 
     #[test]
+    fn self_edit_not_stale() {
+        let (mgr, dir) = setup();
+
+        // Create a file and track the read
+        let test_file = dir.path().join("selfed.rs");
+        std::fs::write(&test_file, "original content").ok().unwrap();
+        let file_str = test_file.to_string_lossy().to_string();
+        mgr.track_read(&file_str, "agent-a").ok().unwrap();
+
+        // Agent edits the file (mtime changes)
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&test_file, "edited content").ok().unwrap();
+
+        // Agent calls track_read again after its own edit (simulates the new hook)
+        mgr.track_read(&file_str, "agent-a").ok().unwrap();
+
+        // Acquire should NOT warn about stale read — the agent updated its own mtime
+        let result = mgr.acquire(&file_str, "agent-a", 5);
+        assert!(
+            matches!(result, AcquireResult::Acquired),
+            "Expected Acquired after self-edit + track_read, got {result:?}"
+        );
+    }
+
+    #[test]
     fn read_tracking_no_change() {
         let (mgr, dir) = setup();
 

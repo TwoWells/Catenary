@@ -13,7 +13,7 @@ use anyhow::Result;
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use regex::Regex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -733,11 +733,15 @@ fn run_notify(format: &str) {
     print!("{output}");
 }
 
-/// Sync `/add-dir` roots from Claude Code transcript to a running Catenary session.
+/// Sync workspace roots from Claude Code transcript to a running Catenary session.
 ///
-/// Reads hook JSON from stdin, scans the transcript for `/add-dir` confirmation
-/// messages, and sends newly discovered roots to the session's notify endpoint.
-/// Uses a byte-offset cache to avoid re-scanning the entire transcript each time.
+/// Reads hook JSON from stdin, scans the transcript for `/add-dir` additions
+/// and directory removal messages, and sends the full root set to the session's
+/// notify endpoint. The server diffs against its current state, handling both
+/// additions and removals.
+///
+/// Uses a persistent state file (`known_roots.json`) to track the byte offset
+/// and the full discovered root set across invocations.
 ///
 /// Silently succeeds on any error to avoid breaking Claude Code's flow.
 #[allow(
@@ -776,12 +780,19 @@ fn run_sync_roots(format: &str) {
 
     let session_dir = session::sessions_dir().join(&session.id);
 
-    // Read the byte offset from previous invocation
-    let offset_path = session_dir.join("transcript_offset");
-    let start_offset: u64 = std::fs::read_to_string(&offset_path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+    // Load persistent state: byte offset + known root set
+    let state_path = session_dir.join("known_roots.json");
+    let (start_offset, mut known_roots) = load_root_state(&state_path);
+
+    // Migrate from old transcript_offset file if known_roots.json doesn't exist
+    if start_offset == 0 && known_roots.is_empty() {
+        let legacy_path = session_dir.join("transcript_offset");
+        if legacy_path.exists() {
+            // Legacy file only stored offset; remove it and re-scan from
+            // beginning to build the full root set.
+            let _ = std::fs::remove_file(&legacy_path);
+        }
+    }
 
     // Open transcript and seek to offset
     let Ok(mut file) = std::fs::File::open(transcript_path) else {
@@ -792,60 +803,75 @@ fn run_sync_roots(format: &str) {
         return;
     }
 
-    // Scan new lines for /add-dir confirmation messages
-    let mut new_roots = Vec::new();
-    let reader = std::io::BufReader::new(&mut file);
+    // Transcript patterns (raw JSON-escaped forms):
+    // Add:    Added \u001b[1m/path\u001b[22m as a working directory
+    // Remove: Removed directory \u001b[1m/path\u001b[22m from workspace
+    let add_prefix = "Added \\u001b[1m";
+    let add_suffix = "\\u001b[22m as a working directory";
+    let remove_prefix = "Removed directory \\u001b[1m";
+    let remove_suffix = "\\u001b[22m from workspace";
 
-    // Pattern: Added \x1b[1m/path\x1b[22m as a working directory
-    // In the JSONL file, ESC (\x1b) is JSON-encoded as \u001b, and we're
-    // reading raw text lines (not deserializing), so match the escaped form.
-    let add_dir_pattern = "Added \\u001b[1m";
-    let add_dir_suffix = "\\u001b[22m as a working directory";
+    let mut changed = false;
+    let reader = std::io::BufReader::new(&mut file);
 
     for line in reader.lines() {
         let Ok(line) = line else {
             break;
         };
 
-        // Each line is a JSON object; look inside message.content for the pattern
-        if !line.contains(add_dir_pattern) {
-            continue;
+        // Scan for additions
+        if line.contains(add_prefix) {
+            let mut search_from = 0;
+            while let Some(start) = line[search_from..].find(add_prefix) {
+                let abs_start = search_from + start + add_prefix.len();
+                if let Some(end) = line[abs_start..].find(add_suffix) {
+                    let path_str = unescape_json_path(&line[abs_start..abs_start + end]);
+                    let resolved = resolve_transcript_path(&path_str, &cwd);
+                    if !known_roots.contains(&resolved) {
+                        known_roots.push(resolved);
+                        changed = true;
+                    }
+                    search_from = abs_start + end + add_suffix.len();
+                } else {
+                    break;
+                }
+            }
         }
 
-        // Extract all occurrences of the pattern from this line
-        let mut search_from = 0;
-        while let Some(start) = line[search_from..].find(add_dir_pattern) {
-            let abs_start = search_from + start + add_dir_pattern.len();
-            if let Some(end) = line[abs_start..].find(add_dir_suffix) {
-                let path_str = &line[abs_start..abs_start + end];
-                // Unescape JSON string escapes (the path is inside a JSON string)
-                let path_str = path_str
-                    .replace("\\\\", "\\")
-                    .replace("\\/", "/")
-                    .replace("\\\"", "\"");
-                let path = PathBuf::from(&path_str);
-                let resolved = if path.is_absolute() {
-                    path
+        // Scan for removals
+        if line.contains(remove_prefix) {
+            let mut search_from = 0;
+            while let Some(start) = line[search_from..].find(remove_prefix) {
+                let abs_start = search_from + start + remove_prefix.len();
+                if let Some(end) = line[abs_start..].find(remove_suffix) {
+                    let path_str = unescape_json_path(&line[abs_start..abs_start + end]);
+                    let resolved = resolve_transcript_path(&path_str, &cwd);
+                    if let Some(pos) = known_roots.iter().position(|r| r == &resolved) {
+                        known_roots.remove(pos);
+                        changed = true;
+                    }
+                    search_from = abs_start + end + remove_suffix.len();
                 } else {
-                    cwd.join(path)
-                };
-                if !new_roots.contains(&resolved) {
-                    new_roots.push(resolved);
+                    break;
                 }
-                search_from = abs_start + end + add_dir_suffix.len();
-            } else {
-                break;
             }
         }
     }
 
-    // Update the byte offset for next invocation
-    if let Ok(pos) = file.stream_position() {
-        let _ = std::fs::write(&offset_path, pos.to_string());
+    // Save updated state
+    let new_offset = file.stream_position().unwrap_or(start_offset);
+    save_root_state(&state_path, new_offset, &known_roots);
+
+    if !changed {
+        return;
     }
 
-    if new_roots.is_empty() {
-        return;
+    // Build the full root set: cwd is always present
+    let mut full_roots = vec![cwd];
+    for root in &known_roots {
+        if !full_roots.contains(root) {
+            full_roots.push(root.clone());
+        }
     }
 
     let endpoint = notify_endpoint(&session.id);
@@ -853,11 +879,11 @@ fn run_sync_roots(format: &str) {
         return;
     };
 
-    let root_strings: Vec<String> = new_roots
+    let root_strings: Vec<String> = full_roots
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    let request = serde_json::json!({ "add_roots": root_strings });
+    let request = serde_json::json!({ "sync_roots": root_strings });
     let lines = ipc_exchange(stream, &request);
 
     if lines.is_empty() {
@@ -866,6 +892,55 @@ fn run_sync_roots(format: &str) {
 
     let output = format_diagnostics(&lines, format);
     print!("{output}");
+}
+
+/// Unescape JSON string escapes from a transcript path.
+fn unescape_json_path(raw: &str) -> String {
+    raw.replace("\\\\", "\\")
+        .replace("\\/", "/")
+        .replace("\\\"", "\"")
+}
+
+/// Resolve a transcript path to an absolute path.
+fn resolve_transcript_path(path_str: &str, cwd: &Path) -> PathBuf {
+    let path = PathBuf::from(path_str);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// Persistent state for root tracking across `sync-roots` invocations.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RootState {
+    /// Byte offset into the transcript file.
+    offset: u64,
+    /// Known workspace roots (absolute paths).
+    roots: Vec<String>,
+}
+
+/// Loads the root state from a JSON file. Returns `(0, vec![])` on any error.
+fn load_root_state(path: &Path) -> (u64, Vec<PathBuf>) {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return (0, Vec::new());
+    };
+    let Ok(state) = serde_json::from_str::<RootState>(&data) else {
+        return (0, Vec::new());
+    };
+    let roots = state.roots.into_iter().map(PathBuf::from).collect();
+    (state.offset, roots)
+}
+
+/// Saves the root state to a JSON file. Silently ignores errors.
+fn save_root_state(path: &Path, offset: u64, roots: &[PathBuf]) {
+    let state = RootState {
+        offset,
+        roots: roots.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+    };
+    if let Ok(json) = serde_json::to_string(&state) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 /// Dispatch lock subcommands.

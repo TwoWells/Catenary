@@ -8,9 +8,10 @@
 //! and sends the changed file path. The server notifies the LSP, waits for
 //! fresh diagnostics, and returns them so they appear in the model's context.
 //!
-//! The server also accepts `add_roots` requests from `catenary sync-roots`,
-//! which adds new workspace roots discovered from `/add-dir` commands in the
-//! Claude Code transcript.
+//! The server also accepts `sync_roots` requests from `catenary sync-roots`,
+//! which synchronize workspace roots discovered from `/add-dir` and removal
+//! commands in the Claude Code transcript. The older `add_roots` request type
+//! is still supported for backwards compatibility.
 //!
 //! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
@@ -29,7 +30,7 @@ use crate::bridge::{DocumentManager, DocumentNotification, PathValidator};
 use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, DiagnosticsWaitResult, LspClient};
 use crate::session::{EventBroadcaster, EventKind};
 
-/// Request from `catenary notify` (file change) or `catenary sync-roots` (root addition).
+/// Request from `catenary notify` (file change) or `catenary sync-roots` (root sync).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum NotifyRequest {
@@ -38,7 +39,12 @@ enum NotifyRequest {
         /// Absolute path to the changed file.
         file: String,
     },
-    /// A request to add new workspace roots.
+    /// A request to synchronize workspace roots (full replacement).
+    SyncRoots {
+        /// Complete set of workspace roots — server diffs against current state.
+        sync_roots: Vec<String>,
+    },
+    /// A request to add new workspace roots (incremental).
     AddRoots {
         /// Absolute paths of directories to add as roots.
         add_roots: Vec<String>,
@@ -187,6 +193,10 @@ impl NotifyServer {
                 debug!("Notify: processing file {file}");
                 self.process_file(&file).await
             }
+            NotifyRequest::SyncRoots { sync_roots } => {
+                debug!("Notify: syncing {} root(s)", sync_roots.len());
+                self.process_sync_roots(&sync_roots).await
+            }
             NotifyRequest::AddRoots { add_roots } => {
                 debug!("Notify: adding {} root(s)", add_roots.len());
                 self.process_add_roots(&add_roots).await
@@ -334,6 +344,85 @@ impl NotifyServer {
         } else {
             Ok(format!("Diagnostics ({count}):\n{compact}"))
         }
+    }
+
+    /// Synchronizes the full workspace root set.
+    ///
+    /// Canonicalizes incoming paths, diffs against the current root set, and
+    /// applies both additions and removals. Uses `ClientManager::sync_roots()`
+    /// to send a single `didChangeWorkspaceFolders` notification per LSP client.
+    async fn process_sync_roots(&self, paths: &[String]) -> String {
+        match self.process_sync_roots_inner(paths).await {
+            Ok(msg) => msg,
+            Err(e) => format!("Notify error: {e}"),
+        }
+    }
+
+    /// Inner implementation for `process_sync_roots`.
+    async fn process_sync_roots_inner(&self, paths: &[String]) -> Result<String> {
+        let mut new_roots = Vec::new();
+        for p in paths {
+            let path = PathBuf::from(p);
+            match path.canonicalize() {
+                Ok(canonical) => {
+                    if !new_roots.contains(&canonical) {
+                        new_roots.push(canonical);
+                    }
+                }
+                Err(e) => {
+                    debug!("Skipping root {p}: {e}");
+                }
+            }
+        }
+
+        let current_roots = self.path_validator.read().await.roots().to_vec();
+
+        // Check if anything actually changed
+        if new_roots == current_roots {
+            return Ok(String::new());
+        }
+
+        let added: Vec<String> = new_roots
+            .iter()
+            .filter(|r| !current_roots.contains(r))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let removed: Vec<String> = current_roots
+            .iter()
+            .filter(|r| !new_roots.contains(r))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+
+        if added.is_empty() && removed.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Update path validator
+        self.path_validator
+            .write()
+            .await
+            .update_roots(new_roots.clone());
+
+        // Sync LSP clients (handles both additions and removals)
+        if let Err(e) = self.client_manager.sync_roots(new_roots).await {
+            warn!("Failed to sync roots with LSP clients: {e}");
+        }
+
+        // Spawn any new language servers for added roots
+        if !added.is_empty() {
+            self.client_manager.spawn_all().await;
+        }
+
+        let mut parts = Vec::new();
+        if !added.is_empty() {
+            info!("Added roots: {}", added.join(", "));
+            parts.push(format!("Added roots: {}", added.join(", ")));
+        }
+        if !removed.is_empty() {
+            info!("Removed roots: {}", removed.join(", "));
+            parts.push(format!("Removed roots: {}", removed.join(", ")));
+        }
+        Ok(parts.join("\n"))
     }
 
     /// Processes a request to add new workspace roots.

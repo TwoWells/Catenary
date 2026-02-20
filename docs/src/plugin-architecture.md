@@ -55,12 +55,13 @@ Inside `plugins/catenary/`:
 - **`hooks/hooks.json`** — registers hooks for diagnostics, root sync, and
   file locking:
   - `PreToolUse` (all tools): runs `catenary sync-roots` to pick up `/add-dir`
-    workspace additions.
+    workspace additions and directory removals.
   - `PreToolUse` on `Edit|Write|NotebookEdit`: runs `catenary lock acquire` to
     serialize concurrent edits across agents.
   - `PostToolUse` on `Edit|Write|NotebookEdit`: runs `catenary notify` for
-    post-edit LSP diagnostics, then `catenary lock release` to start the grace
-    period.
+    post-edit LSP diagnostics, then `catenary lock track-read` to update the
+    tracked mtime (preventing false stale-read warnings on self-edits), then
+    `catenary lock release` to start the grace period.
   - `PostToolUse` on `Read`: runs `catenary lock track-read` for change
     detection.
   - `PostToolUseFailure` on `Edit|Write|NotebookEdit`: runs
@@ -84,6 +85,8 @@ The extension root is the repository root. Two files matter:
     `catenary lock acquire --format=gemini` to serialize concurrent edits.
   - `AfterTool` on `read_file|write_file|replace`: runs
     `catenary notify --format=gemini` for post-edit LSP diagnostics.
+  - `AfterTool` on `write_file|replace`: runs
+    `catenary lock track-read --format=gemini` to update the tracked mtime.
   - `AfterTool` on `write_file|replace`: runs
     `catenary lock release --format=gemini` for lock grace period.
   - `AfterTool` on `read_file`: runs
@@ -116,8 +119,13 @@ the matching Catenary session, and returns LSP diagnostics to stdout.
 ### `catenary sync-roots`
 
 Triggered before each tool use (Claude Code only). Scans the Claude Code
-transcript for `/add-dir` confirmations and sends newly discovered roots to the
-running Catenary session.
+transcript for `/add-dir` additions and directory removals, then sends the full
+workspace root set to the running Catenary session. The server diffs against its
+current state, applying both additions and removals to LSP clients and the search
+index.
+
+State is persisted in `known_roots.json` (inside the session directory) to track
+the transcript byte offset and the full discovered root set across invocations.
 
 **Fields consumed from hook JSON:**
 

@@ -27,6 +27,16 @@
         "matcher": "write_file|replace",
         "hooks": [
           {
+            "name": "catenary-lock-track-read",
+            "type": "command",
+            "command": "catenary lock track-read --format=gemini"
+          }
+        ]
+      },
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
             "name": "catenary-lock-release",
             "type": "command",
             "command": "catenary lock release --format=gemini"
