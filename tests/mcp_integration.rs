@@ -53,6 +53,28 @@ macro_rules! require_taplo {
     };
 }
 
+macro_rules! require_yaml_lsp {
+    () => {
+        if !command_exists("yaml-language-server") {
+            tracing::warn!("Skipping test: yaml-language-server not installed");
+            return Ok(());
+        }
+    };
+}
+
+/// Skip test if rust-analyzer is not installed and working
+macro_rules! require_rust_analyzer {
+    () => {
+        let output = std::process::Command::new("rust-analyzer")
+            .arg("--version")
+            .output();
+        if output.is_err() || !output.map(|o| o.status.success()).unwrap_or(false) {
+            tracing::warn!("Skipping test: rust-analyzer not installed or not working");
+            return Ok(());
+        }
+    };
+}
+
 /// Helper to spawn the bridge and communicate with it
 struct BridgeProcess {
     child: std::process::Child,
@@ -88,9 +110,6 @@ impl BridgeProcess {
 
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        // Give LSP server time to initialize
-        std::thread::sleep(Duration::from_millis(500));
 
         Ok(Self {
             child,
@@ -477,6 +496,127 @@ fn test_mcp_hover_no_info() -> Result<()> {
     assert!(result["isError"].is_null() || result["isError"] == false);
 
     std::fs::remove_file(test_file).ok();
+    Ok(())
+}
+
+#[test]
+fn test_mcp_rust_analyzer_hover() -> Result<()> {
+    require_rust_analyzer!();
+
+    let dir = tempfile::tempdir().context("Failed to create temp dir")?;
+
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        r#"[package]
+name = "test"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )?;
+
+    std::fs::create_dir(dir.path().join("src"))?;
+    let main_rs = dir.path().join("src/main.rs");
+    let content = "fn main() {\n    let x: i32 = 42;\n}\n";
+    std::fs::write(&main_rs, content)?;
+
+    let root = dir.path().to_str().context("Invalid temp dir path")?;
+    let mut bridge = BridgeProcess::spawn(&["rust:rust-analyzer"], root)?;
+    bridge.initialize()?;
+
+    let (line, col) = find_position(content, "i32")?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 50,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": main_rs.to_str().context("Invalid main.rs path")?,
+                "line": line,
+                "character": col
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+
+    assert!(
+        response.get("result").is_some(),
+        "Hover call failed: {response:?}"
+    );
+
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Hover returned error: {result:?}"
+    );
+
+    let text = result["content"]
+        .as_array()
+        .context("Missing content array")?[0]["text"]
+        .as_str()
+        .context("Missing text in content")?;
+
+    assert!(
+        text.contains("i32"),
+        "Hover should contain 'i32' type info, got: {text}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_mcp_yaml_hover() -> Result<()> {
+    require_yaml_lsp!();
+
+    let root_dir = std::env::current_dir()?;
+    let root_str = root_dir.to_str().context("invalid root path")?;
+    let yaml_file = root_dir.join("tests/assets/yaml/settings.yaml");
+
+    let mut bridge =
+        BridgeProcess::spawn(&["yaml:yaml-language-server --stdio"], root_str)?;
+    bridge.initialize()?;
+
+    // Hover on "permissions" (line 1, character 0) — schema provides a description
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 60,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": yaml_file.to_str().context("Invalid yaml path")?,
+                "line": 1,
+                "character": 0
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+
+    assert!(
+        response.get("result").is_some(),
+        "Hover call failed: {response:?}"
+    );
+
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Hover returned error: {result:?}"
+    );
+
+    let text = result["content"]
+        .as_array()
+        .context("Missing content array")?[0]["text"]
+        .as_str()
+        .context("Missing text in content")?;
+
+    assert!(
+        text.contains("permissions"),
+        "Hover should contain schema info for 'permissions', got: {text}"
+    );
+
     Ok(())
 }
 

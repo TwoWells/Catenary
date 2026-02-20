@@ -8,7 +8,6 @@
 //! if the required server is not available.
 
 use anyhow::Result;
-use lsp_types::WorkDoneProgressParams;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -82,60 +81,6 @@ async fn test_bash_lsp_initialize() -> Result<()> {
     assert!(result.capabilities.hover_provider.is_some());
     assert!(result.capabilities.definition_provider.is_some());
     assert!(result.capabilities.completion_provider.is_some());
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_bash_lsp_hover() -> Result<()> {
-    require_bash_lsp!();
-
-    let dir = tempdir()?;
-    let script_path = dir.path().join("test.sh");
-    std::fs::write(&script_path, "#!/bin/bash\necho \"hello\"\n")?;
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "bash-language-server",
-        &["start"],
-        "shellscript",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    // Open the document
-    let uri: lsp_types::Uri = format!("file://{}", script_path.display()).parse()?;
-    client
-        .did_open(lsp_types::DidOpenTextDocumentParams {
-            text_document: lsp_types::TextDocumentItem {
-                uri: uri.clone(),
-                language_id: "shellscript".to_string(),
-                version: 1,
-                text: std::fs::read_to_string(&script_path)?,
-            },
-        })
-        .await?;
-
-    // Small delay to let LSP process
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    // Request hover on "echo"
-    let hover = client
-        .hover(lsp_types::HoverParams {
-            text_document_position_params: lsp_types::TextDocumentPositionParams {
-                text_document: lsp_types::TextDocumentIdentifier { uri },
-                position: lsp_types::Position {
-                    line: 1,
-                    character: 0,
-                },
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        })
-        .await?;
-
-    // echo is a builtin, should have hover info
-    assert!(hover.is_some(), "Expected hover info for 'echo'");
 
     client.shutdown().await?;
     Ok(())
@@ -255,70 +200,6 @@ edition = "2021"
 }
 
 #[tokio::test]
-async fn test_rust_analyzer_hover() -> Result<()> {
-    require_rust_analyzer!();
-
-    let dir = tempdir()?;
-
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        r#"[package]
-name = "test"
-version = "0.1.0"
-edition = "2021"
-"#,
-    )?;
-
-    std::fs::create_dir(dir.path().join("src"))?;
-    let main_rs = dir.path().join("src/main.rs");
-    std::fs::write(&main_rs, "fn main() {\n    let x: i32 = 42;\n}\n")?;
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "rust-analyzer",
-        &[],
-        "rust",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    client.initialize(&[dir.path().to_path_buf()], None).await?;
-    client.wait_ready().await;
-
-    let uri: lsp_types::Uri = format!("file://{}", main_rs.display()).parse()?;
-    client
-        .did_open(lsp_types::DidOpenTextDocumentParams {
-            text_document: lsp_types::TextDocumentItem {
-                uri: uri.clone(),
-                language_id: "rust".to_string(),
-                version: 1,
-                text: std::fs::read_to_string(&main_rs)?,
-            },
-        })
-        .await?;
-
-    // Give rust-analyzer time to index
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Request hover on "i32"
-    let hover = client
-        .hover(lsp_types::HoverParams {
-            text_document_position_params: lsp_types::TextDocumentPositionParams {
-                text_document: lsp_types::TextDocumentIdentifier { uri },
-                position: lsp_types::Position {
-                    line: 1,
-                    character: 11, // position on i32
-                },
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        })
-        .await?;
-
-    assert!(hover.is_some(), "Expected hover info for 'i32'");
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_yaml_lsp_initialize() -> Result<()> {
     require_yaml_lsp!();
 
@@ -334,58 +215,6 @@ async fn test_yaml_lsp_initialize() -> Result<()> {
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
 
     assert!(result.capabilities.hover_provider.is_some());
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_yaml_lsp_hover() -> Result<()> {
-    require_yaml_lsp!();
-
-    let dir = tempdir()?;
-    let yaml_path = dir.path().join("test.yaml");
-    std::fs::write(&yaml_path, "name: test\nversion: 1.0\n")?;
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "yaml-language-server",
-        &["--stdio"],
-        "yaml",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    let uri: lsp_types::Uri = format!("file://{}", yaml_path.display()).parse()?;
-    client
-        .did_open(lsp_types::DidOpenTextDocumentParams {
-            text_document: lsp_types::TextDocumentItem {
-                uri: uri.clone(),
-                language_id: "yaml".to_string(),
-                version: 1,
-                text: std::fs::read_to_string(&yaml_path)?,
-            },
-        })
-        .await?;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    // Request hover - yaml-language-server may or may not return info for plain YAML
-    let hover = client
-        .hover(lsp_types::HoverParams {
-            text_document_position_params: lsp_types::TextDocumentPositionParams {
-                text_document: lsp_types::TextDocumentIdentifier { uri },
-                position: lsp_types::Position {
-                    line: 0,
-                    character: 0,
-                },
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        })
-        .await?;
-
-    // Just verify the request succeeds (hover content depends on schema)
-    drop(hover);
 
     client.shutdown().await?;
     Ok(())

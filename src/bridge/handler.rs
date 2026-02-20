@@ -19,6 +19,7 @@ use lsp_types::{
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -305,6 +306,13 @@ impl LspBridgeHandler {
         CallToolResult::text(output.join("\n"))
     }
 
+    /// How long to wait for initial analysis after opening a document.
+    ///
+    /// We only need the first `publishDiagnostics` for the URI — not the
+    /// full settle phase the notify/diagnostics handlers use. Keeping this
+    /// short avoids blocking queries for too long when a server is slow.
+    const OPEN_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Ensures a document is open and synced with the LSP server.
     async fn ensure_document_open(
         &self,
@@ -322,7 +330,13 @@ impl LspBridgeHandler {
             ));
         }
 
+        let uri = doc_manager.uri_for_path(path)?;
+
         if let Some(notification) = doc_manager.ensure_open(path).await? {
+            // Snapshot generation *before* sending the notification so
+            // we can wait for the server to publish fresh diagnostics.
+            let snapshot = client.diagnostics_generation(&uri).await;
+
             match notification {
                 DocumentNotification::Open(params) => {
                     client.did_open(params).await?;
@@ -331,9 +345,20 @@ impl LspBridgeHandler {
                     client.did_change(params).await?;
                 }
             }
+
+            drop(doc_manager);
+
+            // Wait for the server to analyze the file before returning.
+            // Ignore the result — timeout/inactive is not fatal, the
+            // subsequent query may still succeed with partial analysis.
+            let _ = client
+                .wait_for_diagnostics_update(&uri, snapshot, Self::OPEN_ANALYSIS_TIMEOUT)
+                .await;
+
+            drop(client);
+            return Ok((uri, client_mutex.clone()));
         }
 
-        let uri = doc_manager.uri_for_path(path)?;
         drop(doc_manager);
         drop(client);
         Ok((uri, client_mutex.clone()))
