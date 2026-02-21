@@ -84,6 +84,9 @@ pub struct LspClient {
     state: Arc<AtomicU8>,
     /// The language identifier (e.g., "rust", "python") for error attribution.
     language: String,
+    /// Whether the server supports dynamic workspace folder changes
+    /// (both `supported` and `change_notifications` are advertised).
+    supports_workspace_folders: bool,
     _reader_handle: tokio::task::JoinHandle<()>,
     child: Child,
 }
@@ -193,6 +196,7 @@ impl LspClient {
             spawn_time: Instant::now(),
             state,
             language: language.to_string(),
+            supports_workspace_folders: false,
             _reader_handle: reader_handle,
             child,
         })
@@ -633,6 +637,29 @@ impl LspClient {
             debug!("Server did not specify position encoding, defaulting to UTF-16");
             self.encoding = PositionEncodingKind::UTF16;
         }
+
+        // Extract workspace folders capability
+        let wf = result
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|ws| ws.workspace_folders.as_ref());
+
+        let supported = wf.and_then(|wf| wf.supported).unwrap_or(false);
+        let accepts_changes = wf
+            .and_then(|wf| wf.change_notifications.as_ref())
+            .is_some_and(|cn| {
+                matches!(
+                    cn,
+                    lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_)
+                )
+            });
+
+        self.supports_workspace_folders = supported && accepts_changes;
+        debug!(
+            "Server workspace folders support: {} (supported={}, change_notifications={})",
+            self.supports_workspace_folders, supported, accepts_changes
+        );
 
         // Send initialized notification
         self.notify("initialized", InitializedParams {}).await?;
@@ -1141,6 +1168,11 @@ impl LspClient {
     /// Returns the language identifier for this client (e.g., "rust", "python").
     pub fn language(&self) -> &str {
         &self.language
+    }
+
+    /// Returns whether the server supports dynamic workspace folder changes.
+    pub const fn supports_workspace_folders(&self) -> bool {
+        self.supports_workspace_folders
     }
 
     /// Returns whether the LSP server process is still running.

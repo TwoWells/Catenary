@@ -574,8 +574,7 @@ fn test_mcp_yaml_hover() -> Result<()> {
     let root_str = root_dir.to_str().context("invalid root path")?;
     let yaml_file = root_dir.join("tests/assets/yaml/settings.yaml");
 
-    let mut bridge =
-        BridgeProcess::spawn(&["yaml:yaml-language-server --stdio"], root_str)?;
+    let mut bridge = BridgeProcess::spawn(&["yaml:yaml-language-server --stdio"], root_str)?;
     bridge.initialize()?;
 
     // Hover on "permissions" (line 1, character 0) — schema provides a description
@@ -1457,6 +1456,279 @@ fn test_multi_root_document_symbols() -> Result<()> {
     Ok(())
 }
 
+// ─── sync_roots capability tests ────────────────────────────────────────
+
+/// bash-language-server does NOT support `workspace/didChangeWorkspaceFolders`.
+/// When roots change, the server should be shut down and lazily respawned with
+/// the updated root set on the next query.
+#[test]
+fn test_sync_roots_restart_bash_lsp() -> Result<()> {
+    require_bash_lsp!();
+
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    let script_a = dir_a.path().join("funcs_a.sh");
+    std::fs::write(
+        &script_a,
+        "#!/bin/bash\nfunction unique_root_a_func() { echo a; }\nunique_root_a_func\n",
+    )?;
+
+    let script_b = dir_b.path().join("funcs_b.sh");
+    std::fs::write(
+        &script_b,
+        "#!/bin/bash\nfunction unique_root_b_func() { echo b; }\nunique_root_b_func\n",
+    )?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    // Spawn bridge with only root_a
+    let mut bridge = BridgeProcess::spawn(&["shellscript:bash-language-server start"], root_a)?;
+    bridge.initialize_with_roots(&[root_a])?;
+
+    // Hover on function in root_a — server should be working
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": script_a.to_str().context("Invalid script A path")?,
+                "line": 1,
+                "character": 9
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "Hover on root A function failed: {response:?}"
+    );
+
+    // Send roots/list_changed, respond with both roots
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed"
+    }))?;
+
+    let roots_request = bridge.recv()?;
+    let method = roots_request
+        .get("method")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| anyhow!("Expected roots/list request, got: {roots_request:?}"))?;
+    assert_eq!(method, "roots/list");
+
+    let request_id = roots_request
+        .get("id")
+        .ok_or_else(|| anyhow!("roots/list request missing id"))?
+        .clone();
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "roots": [
+                {"uri": format!("file://{root_a}")},
+                {"uri": format!("file://{root_b}")}
+            ]
+        }
+    }))?;
+
+    // Wait for server restart
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Definition in root_b — server should have been restarted with new roots.
+    // Retry loop to accommodate spawn + initialize time.
+    let mut success = false;
+    for i in 0..10 {
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 20 + i,
+            "method": "tools/call",
+            "params": {
+                "name": "definition",
+                "arguments": {
+                    "file": script_b.to_str().context("Invalid script B path")?,
+                    "line": 2,
+                    "character": 0
+                }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+        if result["isError"] == true {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let text = result["content"][0]["text"]
+            .as_str()
+            .context("Missing text")?;
+        if text.contains("funcs_b.sh") {
+            success = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    assert!(
+        success,
+        "Definition in root B should succeed after server restart with new roots"
+    );
+
+    Ok(())
+}
+
+/// rust-analyzer supports `workspace/didChangeWorkspaceFolders`. When roots
+/// change it should receive the notification and pick up the new root without
+/// a full server restart.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Complex integration test requires many steps"
+)]
+fn test_sync_roots_notification_rust_analyzer() -> Result<()> {
+    require_rust_analyzer!();
+
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    // Create a minimal Cargo project in root_a
+    std::fs::write(
+        dir_a.path().join("Cargo.toml"),
+        "[package]\nname = \"root-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::create_dir(dir_a.path().join("src"))?;
+    let main_a = dir_a.path().join("src/main.rs");
+    let content_a = "fn main() {\n    let x: i32 = 42;\n}\n";
+    std::fs::write(&main_a, content_a)?;
+
+    // Create a minimal Cargo project in root_b
+    std::fs::write(
+        dir_b.path().join("Cargo.toml"),
+        "[package]\nname = \"root-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::create_dir(dir_b.path().join("src"))?;
+    let main_b = dir_b.path().join("src/main.rs");
+    let content_b = "fn main() {\n    let y: u64 = 99;\n}\n";
+    std::fs::write(&main_b, content_b)?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    // Spawn bridge with only root_a
+    let mut bridge = BridgeProcess::spawn(&["rust:rust-analyzer"], root_a)?;
+    bridge.initialize_with_roots(&[root_a])?;
+
+    // Hover on i32 in root_a (with retry for indexing)
+    let (line_a, col_a) = find_position(content_a, "i32")?;
+    let mut success_a = false;
+    for i in 0..20 {
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 100 + i,
+            "method": "tools/call",
+            "params": {
+                "name": "hover",
+                "arguments": {
+                    "file": main_a.to_str().context("Invalid main_a path")?,
+                    "line": line_a,
+                    "character": col_a
+                }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+        if result["isError"] == true {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let text = result["content"][0]["text"]
+            .as_str()
+            .context("Missing text")?;
+        if text.contains("i32") {
+            success_a = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(success_a, "Hover on root A should return i32 info");
+
+    // Send roots/list_changed, respond with both roots
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed"
+    }))?;
+
+    let roots_request = bridge.recv()?;
+    let method = roots_request
+        .get("method")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| anyhow!("Expected roots/list request, got: {roots_request:?}"))?;
+    assert_eq!(method, "roots/list");
+
+    let request_id = roots_request
+        .get("id")
+        .ok_or_else(|| anyhow!("roots/list request missing id"))?
+        .clone();
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "roots": [
+                {"uri": format!("file://{root_a}")},
+                {"uri": format!("file://{root_b}")}
+            ]
+        }
+    }))?;
+
+    // Hover on u64 in root_b (with retry for indexing of new workspace folder)
+    let (line_b, col_b) = find_position(content_b, "u64")?;
+    let mut success_b = false;
+    for i in 0..30 {
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 200 + i,
+            "method": "tools/call",
+            "params": {
+                "name": "hover",
+                "arguments": {
+                    "file": main_b.to_str().context("Invalid main_b path")?,
+                    "line": line_b,
+                    "character": col_b
+                }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+        if result["isError"] == true {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let text = result["content"][0]["text"]
+            .as_str()
+            .context("Missing text")?;
+        if text.contains("u64") {
+            success_b = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        success_b,
+        "Hover on root B should return u64 info (via didChangeWorkspaceFolders notification)"
+    );
+
+    Ok(())
+}
+
 // ─── roots/list tests ───────────────────────────────────────────────────
 
 #[test]
@@ -1570,6 +1842,401 @@ fn test_no_roots_request_without_capability() -> Result<()> {
         .ok_or_else(|| anyhow!("Expected ping response, got: {response:?}"))?;
     assert_eq!(id, 300, "Should receive ping response, not roots/list");
     assert!(response.get("result").is_some());
+
+    Ok(())
+}
+
+// ─── mockls-based tests ─────────────────────────────────────────────────
+// These tests use mockls instead of real language servers, so they always
+// run regardless of installed toolchains.
+
+/// Build an `--lsp` argument for `BridgeProcess::spawn` using mockls.
+fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
+    let bin = env!("CARGO_BIN_EXE_mockls");
+    if flags.is_empty() {
+        format!("{lang}:{bin}")
+    } else {
+        format!("{lang}:{bin} {flags}")
+    }
+}
+
+#[test]
+fn test_mockls_hover_across_profiles() -> Result<()> {
+    let profiles: &[(&str, &str)] = &[("clean", ""), ("workspace-folders", "--workspace-folders")];
+
+    for (name, flags) in profiles {
+        let test_file = "/tmp/mockls_hover_test.sh";
+        std::fs::write(test_file, "#!/bin/bash\necho hello\n")?;
+
+        let lsp = mockls_lsp_arg("shellscript", flags);
+        let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+        bridge.initialize()?;
+
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "hover",
+                "arguments": {
+                    "file": test_file,
+                    "line": 1,
+                    "character": 0
+                }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+        assert!(
+            result["isError"].is_null() || result["isError"] == false,
+            "Profile {name}: hover failed: {response:?}"
+        );
+
+        let content = result["content"]
+            .as_array()
+            .context(format!("Profile {name}: missing content array"))?;
+        assert!(
+            !content.is_empty(),
+            "Profile {name}: expected hover content"
+        );
+
+        let text = content[0]["text"]
+            .as_str()
+            .context(format!("Profile {name}: missing text"))?;
+        assert!(
+            text.contains("echo"),
+            "Profile {name}: hover should contain 'echo', got: {text}"
+        );
+
+        std::fs::remove_file(test_file).ok();
+    }
+    Ok(())
+}
+
+#[test]
+fn test_mockls_definition_across_profiles() -> Result<()> {
+    let profiles: &[(&str, &str)] = &[("clean", ""), ("workspace-folders", "--workspace-folders")];
+
+    for (name, flags) in profiles {
+        let test_file = "/tmp/mockls_def_test.sh";
+        std::fs::write(
+            test_file,
+            "#!/bin/bash\nfn my_function() { echo hi; }\nmy_function\n",
+        )?;
+
+        let lsp = mockls_lsp_arg("shellscript", flags);
+        let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+        bridge.initialize()?;
+
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "definition",
+                "arguments": {
+                    "file": test_file,
+                    "line": 2,
+                    "character": 0
+                }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+        assert!(
+            result["isError"].is_null() || result["isError"] == false,
+            "Profile {name}: definition failed: {response:?}"
+        );
+
+        let content = result["content"]
+            .as_array()
+            .context(format!("Profile {name}: missing content array"))?;
+        assert!(
+            !content.is_empty(),
+            "Profile {name}: expected definition content"
+        );
+
+        let text = content[0]["text"]
+            .as_str()
+            .context(format!("Profile {name}: missing text"))?;
+        assert!(
+            text.contains(test_file),
+            "Profile {name}: definition should contain file path, got: {text}"
+        );
+
+        std::fs::remove_file(test_file).ok();
+    }
+    Ok(())
+}
+
+#[test]
+fn test_mockls_diagnostics_across_profiles() -> Result<()> {
+    let profiles: &[(&str, &str)] = &[
+        ("eager", ""),
+        ("on-save", "--diagnostics-on-save"),
+        ("suppressed", "--no-diagnostics"),
+    ];
+
+    for (name, flags) in profiles {
+        let test_file = "/tmp/mockls_diag_test.sh";
+        std::fs::write(test_file, "#!/bin/bash\necho hello\n")?;
+
+        let lsp = mockls_lsp_arg("shellscript", flags);
+        let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+        bridge.initialize()?;
+
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "diagnostics",
+                "arguments": {
+                    "file": test_file
+                }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+
+        // All profiles should return without hanging
+        let content = result["content"]
+            .as_array()
+            .context(format!("Profile {name}: missing content array"))?;
+
+        let text = content[0]["text"]
+            .as_str()
+            .context(format!("Profile {name}: missing text"))?;
+
+        if *name == "suppressed" {
+            assert!(
+                text.contains("No diagnostics") || text.contains("0 diagnostics"),
+                "Profile {name}: expected no diagnostics, got: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("mock diagnostic") || text.contains("mockls"),
+                "Profile {name}: expected mock diagnostics, got: {text}"
+            );
+        }
+
+        std::fs::remove_file(test_file).ok();
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Parameterized test iterates over profiles"
+)]
+fn test_mockls_sync_roots_across_profiles() -> Result<()> {
+    let profiles: &[(&str, &str)] = &[
+        ("no-workspace-folders", ""),
+        ("workspace-folders", "--workspace-folders"),
+    ];
+
+    for (name, flags) in profiles {
+        let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+        let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+        let script_a = dir_a.path().join("funcs_a.sh");
+        std::fs::write(
+            &script_a,
+            "#!/bin/bash\nfn unique_root_a_func() { echo a; }\nunique_root_a_func\n",
+        )?;
+
+        let script_b = dir_b.path().join("funcs_b.sh");
+        std::fs::write(
+            &script_b,
+            "#!/bin/bash\nfn unique_root_b_func() { echo b; }\nunique_root_b_func\n",
+        )?;
+
+        let root_a = dir_a.path().to_str().context("Invalid path A")?;
+        let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+        let lsp = mockls_lsp_arg("shellscript", flags);
+        let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
+        bridge.initialize_with_roots(&[root_a])?;
+
+        // Hover on function in root_a
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "hover",
+                "arguments": {
+                    "file": script_a.to_str().context("Invalid script A path")?,
+                    "line": 1,
+                    "character": 3
+                }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+        assert!(
+            result["isError"].is_null() || result["isError"] == false,
+            "Profile {name}: hover on root A failed: {response:?}"
+        );
+
+        // Send roots/list_changed with both roots
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/roots/list_changed"
+        }))?;
+
+        let roots_request = bridge.recv()?;
+        let method = roots_request
+            .get("method")
+            .and_then(|m| m.as_str())
+            .ok_or_else(|| {
+                anyhow!("Profile {name}: Expected roots/list, got: {roots_request:?}")
+            })?;
+        assert_eq!(method, "roots/list");
+
+        let request_id = roots_request
+            .get("id")
+            .ok_or_else(|| anyhow!("Profile {name}: roots/list missing id"))?
+            .clone();
+
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "roots": [
+                    {"uri": format!("file://{root_a}")},
+                    {"uri": format!("file://{root_b}")}
+                ]
+            }
+        }))?;
+
+        // Wait for server to process roots change (restart or notification)
+        std::thread::sleep(Duration::from_secs(2));
+
+        // Hover on function in root_b (with retry)
+        let mut success = false;
+        for i in 0..10 {
+            bridge.send(&json!({
+                "jsonrpc": "2.0",
+                "id": 20 + i,
+                "method": "tools/call",
+                "params": {
+                    "name": "hover",
+                    "arguments": {
+                        "file": script_b.to_str().context("Invalid script B path")?,
+                        "line": 1,
+                        "character": 3
+                    }
+                }
+            }))?;
+
+            let response = bridge.recv()?;
+            let result = &response["result"];
+            if result["isError"] == true {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            let text = result["content"][0]["text"]
+                .as_str()
+                .context("Missing text")?;
+            if text.contains("unique_root_b_func") {
+                success = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        assert!(
+            success,
+            "Profile {name}: hover on root B should succeed after root sync"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_mockls_multiplexing() -> Result<()> {
+    // Spawn two mockls instances as different languages
+    let dir = tempfile::tempdir()?;
+
+    let shell_file = dir.path().join("test.sh");
+    std::fs::write(&shell_file, "#!/bin/bash\necho hello\n")?;
+
+    let toml_file = dir.path().join("test.toml");
+    std::fs::write(&toml_file, "[package]\nname = \"test\"\n")?;
+
+    let lsp_shell = mockls_lsp_arg("shellscript", "");
+    let lsp_toml = mockls_lsp_arg("toml", "");
+    let root = dir.path().to_str().context("Invalid root path")?;
+
+    let mut bridge = BridgeProcess::spawn(&[&lsp_shell, &lsp_toml], root)?;
+    bridge.initialize()?;
+
+    // Hover on shell file
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 100,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": shell_file.to_str().context("Invalid shell file path")?,
+                "line": 1,
+                "character": 0
+            }
+        }
+    }))?;
+
+    let response_shell = bridge.recv()?;
+    let result_shell = &response_shell["result"];
+    assert!(
+        result_shell["isError"].is_null() || result_shell["isError"] == false,
+        "Shell hover failed: {response_shell:?}"
+    );
+
+    // Hover on TOML file
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": toml_file.to_str().context("Invalid toml file path")?,
+                "line": 1,
+                "character": 0
+            }
+        }
+    }))?;
+
+    let response_toml = bridge.recv()?;
+    let result_toml = &response_toml["result"];
+    assert!(
+        result_toml["isError"].is_null() || result_toml["isError"] == false,
+        "TOML hover failed: {response_toml:?}"
+    );
+
+    // Verify different servers responded (both should have hover content)
+    let text_shell = result_shell["content"][0]["text"]
+        .as_str()
+        .context("Missing shell hover text")?;
+    let text_toml = result_toml["content"][0]["text"]
+        .as_str()
+        .context("Missing toml hover text")?;
+
+    assert!(
+        text_shell.contains("echo"),
+        "Shell hover should contain 'echo', got: {text_shell}"
+    );
+    assert!(
+        text_toml.contains("name"),
+        "TOML hover should contain 'name', got: {text_toml}"
+    );
 
     Ok(())
 }

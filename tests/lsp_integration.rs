@@ -219,3 +219,106 @@ async fn test_yaml_lsp_initialize() -> Result<()> {
     client.shutdown().await?;
     Ok(())
 }
+
+// ─── mockls-based tests ─────────────────────────────────────────────────
+// These tests use mockls instead of real language servers, so they always
+// run regardless of installed toolchains.
+
+#[tokio::test]
+async fn test_mockls_initialize() -> Result<()> {
+    let dir = tempdir()?;
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[],
+        "shellscript",
+        catenary_mcp::session::EventBroadcaster::noop()?,
+    )?;
+
+    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    assert!(result.capabilities.hover_provider.is_some());
+    assert!(result.capabilities.definition_provider.is_some());
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mockls_initialize_workspace_folders() -> Result<()> {
+    let dir = tempdir()?;
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &["--workspace-folders"],
+        "shellscript",
+        catenary_mcp::session::EventBroadcaster::noop()?,
+    )?;
+
+    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    assert!(result.capabilities.hover_provider.is_some());
+    assert!(client.supports_workspace_folders());
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mockls_document_lifecycle() -> Result<()> {
+    let dir = tempdir()?;
+    let script_path = dir.path().join("lifecycle.sh");
+    std::fs::write(&script_path, "#!/bin/bash\nMY_VAR=1\n")?;
+
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[],
+        "shellscript",
+        catenary_mcp::session::EventBroadcaster::noop()?,
+    )?;
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    let uri: lsp_types::Uri = format!("file://{}", script_path.display()).parse()?;
+
+    // Open
+    client
+        .did_open(lsp_types::DidOpenTextDocumentParams {
+            text_document: lsp_types::TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "shellscript".to_string(),
+                version: 1,
+                text: "#!/bin/bash\nMY_VAR=1\n".to_string(),
+            },
+        })
+        .await?;
+
+    // Change
+    client
+        .did_change(lsp_types::DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "#!/bin/bash\nMY_VAR=2\necho $MY_VAR\n".to_string(),
+            }],
+        })
+        .await?;
+
+    // Close
+    client
+        .did_close(lsp_types::DidCloseTextDocumentParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri },
+        })
+        .await?;
+
+    client.shutdown().await?;
+    Ok(())
+}

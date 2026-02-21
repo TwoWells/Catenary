@@ -1354,10 +1354,9 @@ fn check_gemini_hooks(colors: &ColorConfig) {
         install_meta
             .as_ref()
             .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| ext_path.clone())
+            .map_or_else(|| ext_path.clone(), PathBuf::from)
     } else {
-        ext_path.clone()
+        ext_path
     };
 
     // Read the extension manifest for version info

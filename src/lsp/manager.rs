@@ -87,20 +87,36 @@ impl ClientManager {
 
         self.roots.lock().await.push(root);
 
-        // Notify all active clients
+        // Notify clients that support dynamic workspace folders,
+        // restart those that don't.
         let clients = self.active_clients.lock().await.clone();
-        for (lang, client_mutex) in clients {
+        let mut to_restart = Vec::new();
+        for (lang, client_mutex) in &clients {
             let client = client_mutex.lock().await;
-            if client.is_alive()
-                && let Err(e) = client
+            if !client.is_alive() {
+                continue;
+            }
+            if client.supports_workspace_folders() {
+                if let Err(e) = client
                     .did_change_workspace_folders(vec![folder.clone()], vec![])
                     .await
-            {
-                warn!(
-                    "Failed to notify {} server about new workspace folder: {}",
-                    lang, e
-                );
+                {
+                    warn!(
+                        "Failed to notify {} server about new workspace folder: {}",
+                        lang, e
+                    );
+                }
+            } else {
+                to_restart.push(lang.clone());
             }
+        }
+
+        for lang in &to_restart {
+            info!(
+                "{} server does not support workspace folder changes, restarting",
+                lang
+            );
+            self.shutdown_client(lang).await;
         }
 
         Ok(())
@@ -126,20 +142,36 @@ impl ClientManager {
 
         self.roots.lock().await.retain(|r| r != root);
 
-        // Notify all active clients
+        // Notify clients that support dynamic workspace folders,
+        // restart those that don't.
         let clients = self.active_clients.lock().await.clone();
-        for (lang, client_mutex) in clients {
+        let mut to_restart = Vec::new();
+        for (lang, client_mutex) in &clients {
             let client = client_mutex.lock().await;
-            if client.is_alive()
-                && let Err(e) = client
+            if !client.is_alive() {
+                continue;
+            }
+            if client.supports_workspace_folders() {
+                if let Err(e) = client
                     .did_change_workspace_folders(vec![], vec![folder.clone()])
                     .await
-            {
-                warn!(
-                    "Failed to notify {} server about removed workspace folder: {}",
-                    lang, e
-                );
+                {
+                    warn!(
+                        "Failed to notify {} server about removed workspace folder: {}",
+                        lang, e
+                    );
+                }
+            } else {
+                to_restart.push(lang.clone());
             }
+        }
+
+        for lang in &to_restart {
+            info!(
+                "{} server does not support workspace folder changes, restarting",
+                lang
+            );
+            self.shutdown_client(lang).await;
         }
 
         Ok(())
@@ -211,20 +243,36 @@ impl ClientManager {
         // Update internal state
         *self.roots.lock().await = new_roots;
 
-        // Notify all active clients
+        // Notify clients that support dynamic workspace folders,
+        // restart those that don't.
         let clients = self.active_clients.lock().await.clone();
-        for (lang, client_mutex) in clients {
+        let mut to_restart = Vec::new();
+        for (lang, client_mutex) in &clients {
             let client = client_mutex.lock().await;
-            if client.is_alive()
-                && let Err(e) = client
+            if !client.is_alive() {
+                continue;
+            }
+            if client.supports_workspace_folders() {
+                if let Err(e) = client
                     .did_change_workspace_folders(added_folders.clone(), removed_folders.clone())
                     .await
-            {
-                warn!(
-                    "Failed to notify {} server about workspace folder changes: {}",
-                    lang, e
-                );
+                {
+                    warn!(
+                        "Failed to notify {} server about workspace folder changes: {}",
+                        lang, e
+                    );
+                }
+            } else {
+                to_restart.push(lang.clone());
             }
+        }
+
+        for lang in &to_restart {
+            info!(
+                "{} server does not support workspace folder changes, restarting",
+                lang
+            );
+            self.shutdown_client(lang).await;
         }
 
         Ok(())
@@ -445,11 +493,58 @@ fn extension_to_config_key(ext: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
     use anyhow::Result;
 
     fn test_config() -> Config {
         Config {
             server: HashMap::new(),
+            idle_timeout: 300,
+        }
+    }
+
+    /// Locate the mockls binary in the same directory as the test executable.
+    /// During `cargo test`, all binaries are built into the same `target/debug/deps`
+    /// parent directory.
+    fn mockls_bin() -> PathBuf {
+        let test_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .map(|p| p.join("mockls"));
+        test_exe.unwrap_or_else(|| PathBuf::from("mockls"))
+    }
+
+    fn mockls_config() -> Config {
+        let bin = mockls_bin();
+        let mut server = HashMap::new();
+        server.insert(
+            "shellscript".to_string(),
+            ServerConfig {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![],
+                initialization_options: None,
+            },
+        );
+        Config {
+            server,
+            idle_timeout: 300,
+        }
+    }
+
+    fn mockls_workspace_folders_config() -> Config {
+        let bin = mockls_bin();
+        let mut server = HashMap::new();
+        server.insert(
+            "shellscript".to_string(),
+            ServerConfig {
+                command: bin.to_string_lossy().to_string(),
+                args: vec!["--workspace-folders".to_string()],
+                initialization_options: None,
+            },
+        );
+        Config {
+            server,
             idle_timeout: 300,
         }
     }
@@ -558,6 +653,69 @@ mod tests {
         let roots = manager.roots().await;
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0], PathBuf::from("/tmp/root_a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sync_roots_shuts_down_unsupported_client() -> Result<()> {
+        // mockls without --workspace-folders does NOT advertise workspace folder support.
+        // When roots change, the client should be shut down (and lazily respawned).
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(mockls_config(), vec![PathBuf::from("/tmp")], broadcaster);
+
+        let client = manager.get_client("shellscript").await?;
+        assert!(client.lock().await.is_alive());
+        assert!(
+            !client.lock().await.supports_workspace_folders(),
+            "mockls (no flags) should NOT support workspace folders"
+        );
+
+        assert!(manager.active_clients().await.contains_key("shellscript"));
+
+        // sync_roots should shut down the unsupported client
+        manager
+            .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
+            .await?;
+
+        assert!(
+            !manager.active_clients().await.contains_key("shellscript"),
+            "mockls client should be removed after sync_roots (no workspace folder support)"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sync_roots_notifies_supported_client() -> Result<()> {
+        // mockls with --workspace-folders DOES advertise workspace folder support.
+        // When roots change, it should receive a notification instead of being shut down.
+        let broadcaster = EventBroadcaster::noop()?;
+        let manager = ClientManager::new(
+            mockls_workspace_folders_config(),
+            vec![PathBuf::from("/tmp")],
+            broadcaster,
+        );
+
+        let client = manager.get_client("shellscript").await?;
+        assert!(client.lock().await.is_alive());
+        assert!(
+            client.lock().await.supports_workspace_folders(),
+            "mockls --workspace-folders should support workspace folders"
+        );
+
+        assert!(manager.active_clients().await.contains_key("shellscript"));
+
+        // sync_roots should send notification, NOT shut down the client
+        manager
+            .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
+            .await?;
+
+        // Client should still be active (not removed)
+        assert!(
+            manager.active_clients().await.contains_key("shellscript"),
+            "mockls client should still be active after sync_roots (workspace folders supported)"
+        );
+
         Ok(())
     }
 }

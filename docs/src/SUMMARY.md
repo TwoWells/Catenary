@@ -22,6 +22,7 @@
 - [🛡️ LSP Fault Model](lsp-fault-model.md)
 - [🔴 Adversarial Testing](adversarial-testing.md)
 - [🧪 Smoke Testing](smoke-testing.md)
+- [🧪 mockls](mockls.md)
 - [🗺️ Roadmap](roadmap.md)
 
 ---
