@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use chrono::{Local, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,18 @@ use catenary_mcp::cli::{self, ColorConfig, ColumnWidths};
 use catenary_mcp::lsp;
 use catenary_mcp::mcp::McpServer;
 use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
+
+/// Output format for hook commands.
+///
+/// Determines how hook output is structured for the host CLI.
+/// Required on all hook-facing subcommands (`notify`, `sync-roots`, `lock`).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HostFormat {
+    /// Claude Code hooks (`PostToolUse` / `PreToolUse`).
+    Claude,
+    /// Gemini CLI hooks (`AfterTool` / `BeforeTool`).
+    Gemini,
+}
 
 /// Command-line arguments for Catenary.
 #[derive(Parser, Debug)]
@@ -92,9 +104,9 @@ enum Command {
     /// Reads hook JSON from stdin, connects to the session's notify socket,
     /// and prints any LSP diagnostics to stdout.
     Notify {
-        /// Output format: "plain" (default) or "gemini".
-        #[arg(long, default_value = "plain")]
-        format: String,
+        /// Output format: "claude" or "gemini".
+        #[arg(long, value_enum)]
+        format: HostFormat,
     },
 
     /// Check language server health for the current workspace.
@@ -107,9 +119,9 @@ enum Command {
     /// Sync /add-dir roots from Claude Code transcript to a running session.
     /// Designed for `PreToolUse` hooks — reads hook JSON from stdin.
     SyncRoots {
-        /// Output format: "plain" (default) or "gemini".
-        #[arg(long, default_value = "plain")]
-        format: String,
+        /// Output format: "claude" or "gemini".
+        #[arg(long, value_enum)]
+        format: HostFormat,
     },
 
     /// Manage file locks for concurrent agent coordination.
@@ -123,7 +135,7 @@ enum Command {
 }
 
 /// Lock subcommands for concurrent agent coordination.
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Clone, Copy, Debug)]
 enum LockAction {
     /// Acquire a lock before editing a file.
     /// Blocks until the lock is available or the timeout expires.
@@ -133,9 +145,9 @@ enum LockAction {
         #[arg(long, default_value = "180")]
         timeout: u64,
 
-        /// Output format: "plain" (default) or "gemini".
-        #[arg(long, default_value = "plain")]
-        format: String,
+        /// Output format: "claude" or "gemini".
+        #[arg(long, value_enum)]
+        format: HostFormat,
     },
 
     /// Release a lock after editing a file.
@@ -145,21 +157,13 @@ enum LockAction {
         /// Grace period before the lock expires (seconds).
         #[arg(long, default_value = "30")]
         grace: u64,
-
-        /// Output format: "plain" (default) or "gemini".
-        #[arg(long, default_value = "plain")]
-        format: String,
     },
 
     /// Track a file read for change detection.
     /// Records the file's modification time so future lock acquisitions
     /// can warn if the file changed.
     /// Reads hook JSON from stdin.
-    TrackRead {
-        /// Output format: "plain" (default) or "gemini".
-        #[arg(long, default_value = "plain")]
-        format: String,
-    },
+    TrackRead,
 }
 
 /// Entry point for the Catenary binary.
@@ -182,12 +186,12 @@ async fn main() -> Result<()> {
         }) => run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => run_status(&id),
         Some(Command::Notify { format }) => {
-            run_notify(&format);
+            run_notify(format);
             Ok(())
         }
         Some(Command::Doctor { nocolor }) => run_doctor(args, nocolor).await,
         Some(Command::SyncRoots { format }) => {
-            run_sync_roots(&format);
+            run_sync_roots(format);
             Ok(())
         }
         Some(Command::Lock { action }) => {
@@ -539,6 +543,11 @@ fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Resu
 
     let mut reader = session::tail_events(&full_id)?;
 
+    // Track last progress (language, title) for line collapsing.
+    // When consecutive progress events share the same title, the monitor
+    // overwrites the previous line instead of scrolling.
+    let mut last_progress: Option<(String, String)> = None;
+
     loop {
         if let Some(event) = reader.next_event()? {
             // Apply filter if set
@@ -552,6 +561,22 @@ fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Resu
             if raw {
                 print_event_raw(&event);
             } else {
+                // Collapse consecutive progress lines with the same title
+                if let EventKind::Progress {
+                    ref language,
+                    ref title,
+                    ..
+                } = event.kind
+                {
+                    let key = (language.clone(), title.clone());
+                    if last_progress.as_ref() == Some(&key) {
+                        // Same progress context — erase previous line
+                        print!("\x1b[A\x1b[2K");
+                    }
+                    last_progress = Some(key);
+                } else {
+                    last_progress = None;
+                }
                 print_event_annotated(&event, &colors, term_width);
             }
         } else {
@@ -678,7 +703,7 @@ fn ipc_exchange(
 /// Reads hook JSON from stdin, finds the matching session by workspace,
 /// connects to its notify endpoint, and prints diagnostics to stdout.
 /// Silently succeeds on any error to avoid breaking Claude Code's flow.
-fn run_notify(format: &str) {
+fn run_notify(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -730,7 +755,7 @@ fn run_notify(format: &str) {
         return;
     }
 
-    let output = format_diagnostics(&lines, format);
+    let output = format_diagnostics(&lines, format, "PostToolUse");
     print!("{output}");
 }
 
@@ -749,7 +774,7 @@ fn run_notify(format: &str) {
     clippy::too_many_lines,
     reason = "Sequential hook processing with early returns"
 )]
-fn run_sync_roots(format: &str) {
+fn run_sync_roots(format: HostFormat) {
     use std::io::{BufRead, Seek, SeekFrom};
 
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
@@ -891,7 +916,7 @@ fn run_sync_roots(format: &str) {
         return;
     }
 
-    let output = format_diagnostics(&lines, format);
+    let output = format_diagnostics(&lines, format, "PreToolUse");
     print!("{output}");
 }
 
@@ -972,12 +997,12 @@ fn run_lock(action: LockAction) {
 
     match action {
         LockAction::Acquire { timeout, format } => {
-            run_lock_acquire(&mgr, &file_path, &owner, timeout, &format, &hook_json);
+            run_lock_acquire(&mgr, &file_path, &owner, timeout, format, &hook_json);
         }
-        LockAction::Release { grace, format: _ } => {
+        LockAction::Release { grace } => {
             run_lock_release(&mgr, &file_path, &owner, grace, &hook_json);
         }
-        LockAction::TrackRead { format: _ } => {
+        LockAction::TrackRead => {
             run_lock_track_read(&mgr, &file_path, &owner);
         }
     }
@@ -989,7 +1014,7 @@ fn run_lock_acquire(
     file_path: &str,
     owner: &str,
     timeout: u64,
-    format: &str,
+    format: HostFormat,
     hook_json: &serde_json::Value,
 ) {
     use catenary_mcp::lock::AcquireResult;
@@ -1105,11 +1130,11 @@ fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
 ///   was modified since the owner's last read.
 /// - `deny_reason`: injected when the lock acquisition timed out.
 fn format_lock_output(
-    format: &str,
+    format: HostFormat,
     additional_context: Option<&str>,
     deny_reason: Option<&str>,
 ) -> String {
-    let is_gemini = format == "gemini";
+    let is_gemini = matches!(format, HostFormat::Gemini);
 
     match (deny_reason, additional_context) {
         // Gemini BeforeTool uses top-level decision/reason
@@ -1189,23 +1214,27 @@ fn broadcast_lock_event(hook_json: &serde_json::Value, event: EventKind) {
 /// Both formats wrap diagnostics in a `hookSpecificOutput` JSON envelope
 /// so the host CLI can inject them into the model's context:
 ///
-/// - `"gemini"`: uses `additionalContext` for Gemini CLI `AfterTool` hooks.
-/// - Any other value (including `"plain"`): uses `additionalContext` for
-///   Claude Code `PostToolUse` hooks.
-fn format_diagnostics(lines: &[String], format: &str) -> String {
+/// - Gemini: uses `additionalContext` for Gemini CLI `AfterTool` hooks.
+/// - Claude: includes `hookEventName` + `additionalContext` for Claude Code
+///   hooks (required by the Claude Code hook contract).
+fn format_diagnostics(lines: &[String], format: HostFormat, hook_event: &str) -> String {
     let diagnostics = lines.join("\n");
-    let context = if format == "gemini" {
-        format!("LSP Diagnostics:\n{diagnostics}")
-    } else {
-        diagnostics
-    };
     // serde_json::to_string cannot fail on Value
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "additionalContext": context
-        }
-    })
-    .to_string()
+    match format {
+        HostFormat::Gemini => serde_json::json!({
+            "hookSpecificOutput": {
+                "additionalContext": format!("LSP Diagnostics:\n{diagnostics}")
+            }
+        })
+        .to_string(),
+        HostFormat::Claude => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": hook_event,
+                "additionalContext": diagnostics
+            }
+        })
+        .to_string(),
+    }
 }
 
 /// Expected Claude Code hooks, embedded at compile time.
@@ -1285,7 +1314,7 @@ fn check_claude_hooks(colors: &ColorConfig) {
             } else {
                 println!(
                     "  {label}{ver_col}{}",
-                    colors.red("✗ stale hooks (reinstall: claude mcp remove catenary@catenary && claude mcp install catenary@catenary)"),
+                    colors.red("✗ stale hooks (reinstall: claude plugin uninstall catenary@catenary && claude plugin install catenary@catenary)"),
                 );
             }
         }
@@ -2059,21 +2088,23 @@ mod tests {
     use anyhow::Context;
 
     #[test]
-    fn test_format_diagnostics_plain() -> Result<()> {
+    fn test_format_diagnostics_claude() -> Result<()> {
         let lines = vec![
             "error[E0308]: mismatched types".into(),
             "  --> src/main.rs:5:10".into(),
         ];
-        let output = format_diagnostics(&lines, "plain");
+        let output = format_diagnostics(&lines, HostFormat::Claude, "PostToolUse");
         let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("plain format should produce valid JSON")?;
+            serde_json::from_str(&output).context("claude format should produce valid JSON")?;
 
-        let context = parsed["hookSpecificOutput"]["additionalContext"]
+        let hook_output = &parsed["hookSpecificOutput"];
+        assert_eq!(hook_output["hookEventName"], "PostToolUse");
+        let context = hook_output["additionalContext"]
             .as_str()
             .context("additionalContext should be a string")?;
         assert!(context.contains("error[E0308]: mismatched types"));
         assert!(context.contains("  --> src/main.rs:5:10"));
-        // Plain format should NOT have the "LSP Diagnostics:" prefix
+        // Claude format should NOT have the "LSP Diagnostics:" prefix
         assert!(!context.starts_with("LSP Diagnostics:"));
         Ok(())
     }
@@ -2081,7 +2112,7 @@ mod tests {
     #[test]
     fn test_format_diagnostics_gemini() -> Result<()> {
         let lines = vec!["error[E0308]: mismatched types".into()];
-        let output = format_diagnostics(&lines, "gemini");
+        let output = format_diagnostics(&lines, HostFormat::Gemini, "PostToolUse");
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("gemini format should produce valid JSON")?;
 
@@ -2090,13 +2121,15 @@ mod tests {
             .context("additionalContext should be a string")?;
         assert!(context.starts_with("LSP Diagnostics:\n"));
         assert!(context.contains("error[E0308]: mismatched types"));
+        // Gemini format should NOT have hookEventName
+        assert!(parsed["hookSpecificOutput"]["hookEventName"].is_null());
         Ok(())
     }
 
     #[test]
     fn test_format_diagnostics_gemini_multiline() -> Result<()> {
         let lines = vec!["warning: unused variable".into(), "  --> lib.rs:3:9".into()];
-        let output = format_diagnostics(&lines, "gemini");
+        let output = format_diagnostics(&lines, HostFormat::Gemini, "PostToolUse");
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
         let context = parsed["hookSpecificOutput"]["additionalContext"]
@@ -2104,5 +2137,92 @@ mod tests {
             .context("additionalContext should be a string")?;
         assert!(context.contains("warning: unused variable\n  --> lib.rs:3:9"));
         Ok(())
+    }
+
+    #[test]
+    fn test_format_diagnostics_claude_propagates_hook_event() -> Result<()> {
+        let lines = vec!["Added roots: /tmp/foo".into()];
+        let output = format_diagnostics(&lines, HostFormat::Claude, "PreToolUse");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_lock_output_claude_stale_read() -> Result<()> {
+        let output = format_lock_output(
+            HostFormat::Claude,
+            Some("File was modified since your last read"),
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        let hook_output = &parsed["hookSpecificOutput"];
+        assert_eq!(hook_output["hookEventName"], "PreToolUse");
+        assert_eq!(hook_output["permissionDecision"], "allow");
+        assert_eq!(
+            hook_output["additionalContext"],
+            "File was modified since your last read"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_lock_output_claude_denied() -> Result<()> {
+        let output =
+            format_lock_output(HostFormat::Claude, None, Some("Lock held by another agent"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        let hook_output = &parsed["hookSpecificOutput"];
+        assert_eq!(hook_output["hookEventName"], "PreToolUse");
+        assert_eq!(hook_output["permissionDecision"], "deny");
+        assert_eq!(
+            hook_output["permissionDecisionReason"],
+            "Lock held by another agent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_lock_output_gemini_stale_read() -> Result<()> {
+        let output = format_lock_output(
+            HostFormat::Gemini,
+            Some("File was modified since your last read"),
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        assert_eq!(parsed["decision"], "deny");
+        assert_eq!(parsed["reason"], "File was modified since your last read");
+        // Gemini should not have hookSpecificOutput
+        assert!(parsed["hookSpecificOutput"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_lock_output_gemini_denied() -> Result<()> {
+        let output =
+            format_lock_output(HostFormat::Gemini, None, Some("Lock held by another agent"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        assert_eq!(parsed["decision"], "deny");
+        assert_eq!(parsed["reason"], "Lock held by another agent");
+        assert!(parsed["hookSpecificOutput"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_lock_output_no_output() {
+        let output = format_lock_output(HostFormat::Claude, None, None);
+        assert!(output.is_empty());
+
+        let output = format_lock_output(HostFormat::Gemini, None, None);
+        assert!(output.is_empty());
     }
 }

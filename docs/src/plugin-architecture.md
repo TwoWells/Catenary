@@ -128,11 +128,13 @@ the matching Catenary session, and returns LSP diagnostics to stdout.
 | `tool_input.file_path` or `tool_input.file` | File that was edited |
 | `cwd` | Resolving relative file paths (fallback: process CWD) |
 
-**Output format** depends on the `--format` flag:
+**Output format** depends on the `--format` flag. Both formats wrap
+diagnostics in a `hookSpecificOutput` JSON envelope:
 
-- Default (Claude Code): plain text, one diagnostic per line.
-- `--format=gemini`: wrapped in `<hook_context>` tags for Gemini's context
-  injection.
+- Default (Claude Code): includes `hookEventName: "PostToolUse"` and
+  `additionalContext` for Claude Code's `PostToolUse` hook contract.
+- `--format=gemini`: uses `additionalContext` with an "LSP Diagnostics"
+  prefix for Gemini CLI's `AfterTool` hooks.
 
 ### `catenary sync-roots`
 
@@ -169,10 +171,10 @@ serializes concurrent edits to the same file across multiple agents.
 
 **Flags:**
 
-| Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `--timeout` | 180 | Seconds to wait before giving up |
-| `--format` | plain | Output format (`plain` or `gemini`) |
+| Flag | Required | Description |
+| ---- | -------- | ----------- |
+| `--timeout` | no (default 180) | Seconds to wait before giving up |
+| `--format` | yes | Output format (`claude` or `gemini`) |
 
 **Output:** silent on success. On timeout, returns JSON with
 `permissionDecision: "deny"`. If the file was modified since the owner's last
@@ -195,10 +197,9 @@ without contention during the diagnostics→fix cycle.
 
 **Flags:**
 
-| Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `--grace` | 30 | Seconds before the lock expires |
-| `--format` | plain | Output format (`plain` or `gemini`) |
+| Flag | Required | Description |
+| ---- | -------- | ----------- |
+| `--grace` | no (default 30) | Seconds before the lock expires |
 
 ### `catenary lock track-read`
 

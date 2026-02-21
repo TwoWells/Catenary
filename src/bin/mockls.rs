@@ -64,6 +64,25 @@ struct Args {
     /// Send workspace/configuration request after initialize.
     #[arg(long)]
     send_configuration_request: bool,
+
+    /// Include `version` field in `publishDiagnostics` notifications.
+    #[arg(long)]
+    publish_version: bool,
+
+    /// Advertise `diagnosticProvider` capability and handle
+    /// `textDocument/diagnostic` requests.
+    #[arg(long)]
+    pull_diagnostics: bool,
+
+    /// Send progress tokens around diagnostic computation on `didChange`
+    /// (simulates cargo clippy progress).
+    #[arg(long)]
+    progress_on_change: bool,
+
+    /// Burn CPU for N milliseconds after `didChange` without sending any
+    /// notifications (simulates a server doing work without progress).
+    #[arg(long)]
+    cpu_busy: Option<u64>,
 }
 
 /// A JSON-RPC request.
@@ -230,6 +249,9 @@ impl MockServer {
             "textDocument/references" => self.handle_references(&request.params),
             "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
+            "textDocument/diagnostic" if self.args.pull_diagnostics => {
+                Some(self.handle_pull_diagnostics(&request.params))
+            }
             _ => {
                 self.send_response(&Response {
                     jsonrpc: "2.0".to_string(),
@@ -287,7 +309,17 @@ impl MockServer {
                         self.documents.insert(uri.to_string(), text.to_string());
                     }
 
-                    if !self.args.no_diagnostics && !self.args.diagnostics_on_save {
+                    // Simulate CPU-bound work without any notifications
+                    if let Some(busy_ms) = self.args.cpu_busy {
+                        let start = std::time::Instant::now();
+                        while start.elapsed() < Duration::from_millis(busy_ms) {
+                            std::hint::spin_loop();
+                        }
+                    }
+
+                    if self.args.progress_on_change {
+                        self.simulate_progress_around_diagnostics(uri);
+                    } else if !self.args.no_diagnostics && !self.args.diagnostics_on_save {
                         self.publish_diagnostics(uri);
                     }
                 }
@@ -335,6 +367,13 @@ impl MockServer {
                     "supported": true,
                     "changeNotifications": true
                 }
+            });
+        }
+
+        if self.args.pull_diagnostics {
+            capabilities["diagnosticProvider"] = serde_json::json!({
+                "interFileDependencies": false,
+                "workspaceDiagnostics": false
             });
         }
 
@@ -447,18 +486,47 @@ impl MockServer {
         Value::Array(all_symbols)
     }
 
+    #[allow(clippy::unused_self, reason = "Consistent with other handle_* methods")]
+    fn handle_pull_diagnostics(&self, params: &Value) -> Value {
+        let uri = params
+            .get("textDocument")
+            .and_then(|td| td.get("uri"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        serde_json::json!({
+            "kind": "full",
+            "items": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "severity": 2,
+                "source": "mockls",
+                "message": format!("mockls: pull diagnostic for {uri}")
+            }]
+        })
+    }
+
     fn publish_diagnostics(&self, uri: &str) {
         let delay = self.args.diagnostics_delay;
         let uri_owned = uri.to_string();
         let writer = self.writer.clone();
+        let publish_version = self.args.publish_version;
+        // Track a simple version counter per URI for version publishing
+        let version = if publish_version {
+            self.documents.get(uri).map(|_| 1)
+        } else {
+            None
+        };
 
         if delay > 0 {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(delay));
-                send_diagnostics_notification(&writer, &uri_owned);
+                send_diagnostics_notification(&writer, &uri_owned, version);
             });
         } else {
-            send_diagnostics_notification(&self.writer, &uri_owned);
+            send_diagnostics_notification(&self.writer, &uri_owned, version);
         }
     }
 
@@ -505,6 +573,69 @@ impl MockServer {
                     "params": {
                         "token": token,
                         "value": { "kind": "end", "message": "Indexing complete" }
+                    }
+                }),
+            );
+        });
+    }
+
+    fn simulate_progress_around_diagnostics(&self, uri: &str) {
+        let uri_owned = uri.to_string();
+        let writer = self.writer.clone();
+        let next_id = self.next_request_id.clone();
+        let no_diagnostics = self.args.no_diagnostics;
+        let publish_version = self.args.publish_version;
+        let diagnostics_delay = self.args.diagnostics_delay;
+
+        std::thread::spawn(move || {
+            let token = "mockls-checking";
+
+            let req_id = next_id.fetch_add(1, Ordering::SeqCst);
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "window/workDoneProgress/create",
+                    "params": { "token": token }
+                }),
+            );
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token,
+                        "value": { "kind": "begin", "title": "Checking", "percentage": 0 }
+                    }
+                }),
+            );
+
+            if diagnostics_delay > 0 {
+                std::thread::sleep(Duration::from_millis(diagnostics_delay));
+            } else {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            if !no_diagnostics {
+                let version = if publish_version { Some(1) } else { None };
+                send_diagnostics_notification(&writer, &uri_owned, version);
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token,
+                        "value": { "kind": "end", "message": "Checking complete" }
                     }
                 }),
             );
@@ -593,24 +724,30 @@ fn send_message(writer: &Writer, value: &Value) {
 }
 
 /// Send a `publishDiagnostics` notification.
-fn send_diagnostics_notification(writer: &Writer, uri: &str) {
+fn send_diagnostics_notification(writer: &Writer, uri: &str, version: Option<i32>) {
+    let mut params = serde_json::json!({
+        "uri": uri,
+        "diagnostics": [{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 1 }
+            },
+            "severity": 2,
+            "source": "mockls",
+            "message": "mockls: mock diagnostic"
+        }]
+    });
+
+    if let Some(v) = version {
+        params["version"] = serde_json::json!(v);
+    }
+
     send_message(
         writer,
         &serde_json::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/publishDiagnostics",
-            "params": {
-                "uri": uri,
-                "diagnostics": [{
-                    "range": {
-                        "start": { "line": 0, "character": 0 },
-                        "end": { "line": 0, "character": 1 }
-                    },
-                    "severity": 2,
-                    "source": "mockls",
-                    "message": "mockls: mock diagnostic"
-                }]
-            }
+            "params": params
         }),
     );
 }
@@ -753,6 +890,10 @@ mod tests {
             hang_on: vec![],
             fail_on: vec![],
             send_configuration_request: false,
+            publish_version: false,
+            pull_diagnostics: false,
+            progress_on_change: false,
+            cpu_busy: None,
         }
     }
 

@@ -3,6 +3,8 @@
 
 /// Low-level LSP client for communicating with a server process.
 pub mod client;
+/// Diagnostics strategy selection and activity monitoring.
+pub(crate) mod diagnostics;
 /// High-level manager for lazy-spawning and caching LSP clients.
 pub mod manager;
 /// LSP message protocol definitions.

@@ -221,7 +221,7 @@ in the model's context after every edit.
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify"
+            "command": "catenary notify --format=claude"
           }
         ]
       }

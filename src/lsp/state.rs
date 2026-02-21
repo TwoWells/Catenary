@@ -86,6 +86,10 @@ pub struct ServerStatus {
 #[derive(Debug, Default)]
 pub struct ProgressTracker {
     active_progress: HashMap<ProgressToken, ProgressState>,
+    /// Last broadcast title (used to deduplicate monitor output).
+    last_broadcast_title: Option<String>,
+    /// Last broadcast percentage (used to deduplicate monitor output).
+    last_broadcast_percentage: Option<u32>,
 }
 
 impl ProgressTracker {
@@ -139,6 +143,24 @@ impl ProgressTracker {
         self.active_progress
             .values()
             .min_by_key(|p| p.percentage.unwrap_or(0))
+    }
+
+    /// Returns `true` if the primary progress has changed since the last broadcast.
+    ///
+    /// Compares title and percentage only — per-file message changes are not
+    /// considered meaningful for monitor output, since LSP servers like
+    /// rust-analyzer send a notification for every individual file scanned.
+    /// Updates the cached state when returning `true`.
+    pub fn broadcast_changed(&mut self) -> bool {
+        let (title, pct) = self
+            .primary_progress()
+            .map_or((None, None), |p| (Some(p.title.clone()), p.percentage));
+        if title == self.last_broadcast_title && pct == self.last_broadcast_percentage {
+            return false;
+        }
+        self.last_broadcast_title = title;
+        self.last_broadcast_percentage = pct;
+        true
     }
 
     /// Clear all progress (e.g., on reconnect).

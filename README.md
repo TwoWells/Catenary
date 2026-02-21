@@ -89,7 +89,7 @@ commands and force LSP-first navigation.
 
 ### 4. Verify
 
-Check that your language servers are working:
+Check that your language servers and hooks are working:
 
 ```bash
 catenary doctor
@@ -103,10 +103,15 @@ python       pyright-langserver  ✓ ready
              hover definition references document_symbols search rename
 
 toml         taplo               - skipped (no matching files)
+
+Hooks:
+  Claude Code 1.3.6 (directory) ✓ hooks match
+  Gemini CLI  1.3.6 (linked)    ✓ hooks match
 ```
 
-Then edit any source file — you should see LSP diagnostics appear in the
-model's context after each edit. Catenary's `PostToolUse` hook automatically
+If hooks show as stale, reinstall the plugin/extension as indicated. Then
+edit any source file — you should see LSP diagnostics appear in the model's
+context after each edit. Catenary's `PostToolUse` hook automatically
 notifies the running LSP servers and returns any errors or warnings.
 
 ## Why This Matters

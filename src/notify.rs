@@ -223,6 +223,10 @@ impl NotifyServer {
         clippy::significant_drop_tightening,
         reason = "Locks held across async operations by design"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Diagnostics wait loop adds necessary branches"
+    )]
     async fn process_file_inner(&self, file_path: &str) -> Result<String> {
         let path = resolve_path(file_path)?;
 
@@ -271,46 +275,16 @@ impl NotifyServer {
 
             drop(doc_manager);
 
-            // Wait for diagnostics with retry-on-inactivity. If the server
-            // goes silent (e.g., CPU-starved under load), re-send didSave
-            // to nudge it back into action.
-            let max_retries: u32 = 3;
-            let mut server_died = false;
-
-            for attempt in 0..max_retries {
-                match client
-                    .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
-                    .await
-                {
-                    DiagnosticsWaitResult::Updated => break,
-                    DiagnosticsWaitResult::ServerDied => {
-                        server_died = true;
-                        break;
-                    }
-                    DiagnosticsWaitResult::Inactive => {
-                        if attempt + 1 < max_retries {
-                            warn!(
-                                "Server silent for {:?}, nudging with didSave (attempt {}/{})",
-                                DIAGNOSTICS_TIMEOUT,
-                                attempt + 2,
-                                max_retries
-                            );
-                            client.did_save(uri.clone()).await?;
-                        } else {
-                            warn!(
-                                "Server still silent after {} nudge attempts — \
-                                 proceeding with cached diagnostics",
-                                max_retries
-                            );
-                        }
-                    }
+            match client
+                .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
+                .await
+            {
+                DiagnosticsWaitResult::Updated => {}
+                DiagnosticsWaitResult::ServerDied => {
+                    return Ok(format!(
+                        "[{lang}] server died \u{2014} diagnostics unavailable"
+                    ));
                 }
-            }
-
-            if server_died {
-                return Ok(format!(
-                    "[{lang}] server died \u{2014} diagnostics unavailable"
-                ));
             }
         } else {
             drop(doc_manager);

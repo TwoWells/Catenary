@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary sync-roots"
+            "command": "catenary sync-roots --format=claude"
           }
         ]
       },
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary lock acquire"
+            "command": "catenary lock acquire --format=claude"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify"
+            "command": "catenary notify --format=claude"
           },
           {
             "type": "command",

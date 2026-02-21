@@ -29,7 +29,7 @@
           {
             "name": "catenary-lock-track-read",
             "type": "command",
-            "command": "catenary lock track-read --format=gemini"
+            "command": "catenary lock track-read"
           }
         ]
       },
@@ -39,7 +39,7 @@
           {
             "name": "catenary-lock-release",
             "type": "command",
-            "command": "catenary lock release --format=gemini"
+            "command": "catenary lock release"
           }
         ]
       },
@@ -49,7 +49,7 @@
           {
             "name": "catenary-lock-track-read",
             "type": "command",
-            "command": "catenary lock track-read --format=gemini"
+            "command": "catenary lock track-read"
           }
         ]
       }

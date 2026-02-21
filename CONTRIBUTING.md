@@ -81,6 +81,18 @@ cargo install --path .
 This places the updated binary at `~/.cargo/bin/catenary`. Restart your
 Claude Code or Gemini CLI session to pick up the new binary.
 
+If you change hook definitions in `plugins/catenary/hooks/hooks.json` or
+`hooks/hooks.json`, run `catenary doctor` to check whether the installed
+hooks match the new definitions:
+
+```
+Hooks:
+  Claude Code 1.3.6 (directory) ✗ stale hooks (reinstall: claude plugin uninstall catenary@catenary && claude plugin install catenary@catenary)
+  Gemini CLI  1.3.6 (linked)    ✓ hooks match
+```
+
+Reinstall the plugin/extension as indicated to pick up the new hooks.
+
 ## Licensing and Copyright
 
 **Catenary is dual-licensed.**
