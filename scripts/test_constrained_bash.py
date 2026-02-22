@@ -117,6 +117,29 @@ class TestHeredoc(unittest.TestCase):
     def test_gh_pr_create_heredoc(self):
         self.assertIsNone(check("gh pr create --body \"$(cat <<'EOF'\nbody text\nEOF\n)\""))
 
+    def test_heredoc_body_with_semicolons(self):
+        """Real-world case: commit message body contains ; and English words."""
+        cmd = (
+            'git commit -m "$(cat <<\'EOF\'\n'
+            'feat: fix hook deny response\n'
+            '\n'
+            '- Fix display; add suppressOutput and systemMessage\n'
+            '- Add chmod +x to script (missing execute bit)\n'
+            'EOF\n'
+            ')"'
+        )
+        self.assertIsNone(check(cmd))
+
+    def test_heredoc_body_with_parentheses(self):
+        """Heredoc body with ) that would truncate _SUBSHELL_RE capture."""
+        cmd = (
+            'git commit -m "$(cat <<\'EOF\'\n'
+            'fix(hook): missing execute bit was silently allowing blocked commands through)\n'
+            'EOF\n'
+            ')"'
+        )
+        self.assertIsNone(check(cmd))
+
     def test_cat_file_still_denied(self):
         self.assertIsNotNone(check("cat file.txt"))
 
