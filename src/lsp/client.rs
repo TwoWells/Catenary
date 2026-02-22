@@ -804,6 +804,10 @@ impl LspClient {
 
     /// Notifies the LSP server that workspace folders changed.
     ///
+    /// When folders are added, proactively marks the server as
+    /// [`ServerState::Indexing`] so that [`wait_ready`](Self::wait_ready)
+    /// blocks queries until re-indexing completes.
+    ///
     /// # Errors
     ///
     /// Returns an error if the notification fails.
@@ -812,6 +816,11 @@ impl LspClient {
         added: Vec<WorkspaceFolder>,
         removed: Vec<WorkspaceFolder>,
     ) -> Result<()> {
+        if !added.is_empty() && self.server_state() == ServerState::Ready {
+            self.state
+                .store(ServerState::Indexing.as_u8(), Ordering::SeqCst);
+        }
+
         self.notify(
             "workspace/didChangeWorkspaceFolders",
             DidChangeWorkspaceFoldersParams {
@@ -1447,6 +1456,11 @@ impl LspClient {
 
     /// Waits until server is ready (not indexing).
     ///
+    /// For servers that report `$/progress`, blocks until the progress
+    /// handler transitions state to [`ServerState::Ready`]. For servers
+    /// without progress support, falls back to activity settle (polls
+    /// activity counter and progress tracker until the server is quiet).
+    ///
     /// Returns `true` if ready, `false` if server died.
     pub async fn wait_ready(&self) -> bool {
         let poll_interval = Duration::from_millis(100);
@@ -1458,6 +1472,23 @@ impl LspClient {
             if !self.is_alive() {
                 return false;
             }
+
+            // Non-progress servers have no $/progress End to transition
+            // back to Ready. Fall back to activity settle.
+            if self.server_state() == ServerState::Indexing
+                && !self.has_sent_progress.load(Ordering::SeqCst)
+            {
+                let settled = self
+                    .wait_for_activity_settle(Duration::from_secs(2), Duration::from_secs(30))
+                    .await;
+                if settled {
+                    self.state
+                        .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+                    return true;
+                }
+                return false; // Server died
+            }
+
             tokio::time::sleep(poll_interval).await;
         }
     }

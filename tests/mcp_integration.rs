@@ -1624,40 +1624,35 @@ fn test_sync_roots_notification_rust_analyzer() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&["rust:rust-analyzer"], root_a)?;
     bridge.initialize_with_roots(&[root_a])?;
 
-    // Hover on i32 in root_a (with retry for indexing)
+    // Hover on i32 in root_a — bridge blocks until server is ready
     let (line_a, col_a) = find_position(content_a, "i32")?;
-    let mut success_a = false;
-    for i in 0..20 {
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 100 + i,
-            "method": "tools/call",
-            "params": {
-                "name": "hover",
-                "arguments": {
-                    "file": main_a.to_str().context("Invalid main_a path")?,
-                    "line": line_a,
-                    "character": col_a
-                }
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 100,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": main_a.to_str().context("Invalid main_a path")?,
+                "line": line_a,
+                "character": col_a
             }
-        }))?;
+        }
+    }))?;
 
-        let response = bridge.recv()?;
-        let result = &response["result"];
-        if result["isError"] == true {
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-        let text = result["content"][0]["text"]
-            .as_str()
-            .context("Missing text")?;
-        if text.contains("i32") {
-            success_a = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    assert!(success_a, "Hover on root A should return i32 info");
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"] != true,
+        "Hover on root A returned error: {response:?}"
+    );
+    let text_a = result["content"][0]["text"]
+        .as_str()
+        .context("Missing hover text for root A")?;
+    assert!(
+        text_a.contains("i32"),
+        "Hover on root A should return i32 info, got: {text_a}"
+    );
 
     // Send roots/list_changed, respond with both roots
     bridge.send(&json!({
@@ -1688,42 +1683,35 @@ fn test_sync_roots_notification_rust_analyzer() -> Result<()> {
         }
     }))?;
 
-    // Hover on u64 in root_b (with retry for indexing of new workspace folder)
+    // Hover on u64 in root_b — bridge blocks until re-indexing completes
+    // via wait_for_server_ready ($/progress cycle)
     let (line_b, col_b) = find_position(content_b, "u64")?;
-    let mut success_b = false;
-    for i in 0..30 {
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 200 + i,
-            "method": "tools/call",
-            "params": {
-                "name": "hover",
-                "arguments": {
-                    "file": main_b.to_str().context("Invalid main_b path")?,
-                    "line": line_b,
-                    "character": col_b
-                }
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 200,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": main_b.to_str().context("Invalid main_b path")?,
+                "line": line_b,
+                "character": col_b
             }
-        }))?;
+        }
+    }))?;
 
-        let response = bridge.recv()?;
-        let result = &response["result"];
-        if result["isError"] == true {
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-        let text = result["content"][0]["text"]
-            .as_str()
-            .context("Missing text")?;
-        if text.contains("u64") {
-            success_b = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    let response = bridge.recv()?;
+    let result = &response["result"];
     assert!(
-        success_b,
-        "Hover on root B should return u64 info (via didChangeWorkspaceFolders notification)"
+        result["isError"] != true,
+        "Hover on root B returned error: {response:?}"
+    );
+    let text_b = result["content"][0]["text"]
+        .as_str()
+        .context("Missing hover text for root B")?;
+    assert!(
+        text_b.contains("u64"),
+        "Hover on root B should return u64 info, got: {text_b}"
     );
 
     Ok(())
@@ -2115,47 +2103,137 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             }
         }))?;
 
-        // Wait for server to process roots change (restart or notification)
-        std::thread::sleep(Duration::from_secs(2));
-
-        // Hover on function in root_b (with retry)
-        let mut success = false;
-        for i in 0..10 {
-            bridge.send(&json!({
-                "jsonrpc": "2.0",
-                "id": 20 + i,
-                "method": "tools/call",
-                "params": {
-                    "name": "hover",
-                    "arguments": {
-                        "file": script_b.to_str().context("Invalid script B path")?,
-                        "line": 1,
-                        "character": 3
-                    }
+        // Hover on function in root_b — bridge blocks until ready
+        // (via wait_for_server_ready: activity settle for no-progress mockls,
+        // or after restart for servers without workspace folder support)
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "hover",
+                "arguments": {
+                    "file": script_b.to_str().context("Invalid script B path")?,
+                    "line": 1,
+                    "character": 3
                 }
-            }))?;
-
-            let response = bridge.recv()?;
-            let result = &response["result"];
-            if result["isError"] == true {
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
             }
-            let text = result["content"][0]["text"]
-                .as_str()
-                .context("Missing text")?;
-            if text.contains("unique_root_b_func") {
-                success = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        }))?;
 
+        let response = bridge.recv()?;
+        let result = &response["result"];
         assert!(
-            success,
-            "Profile {name}: hover on root B should succeed after root sync"
+            result["isError"] != true,
+            "Profile {name}: hover on root B returned error: {response:?}"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .context("Missing text")?;
+        assert!(
+            text.contains("unique_root_b_func"),
+            "Profile {name}: hover on root B should return unique_root_b_func, got: {text}"
         );
     }
+    Ok(())
+}
+
+/// Verifies that a server supporting workspace folders but not `$/progress`
+/// doesn't hang after a root is added. The `wait_ready()` activity settle
+/// fallback must transition the server back to `Ready`.
+#[test]
+fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    let file_a = dir_a.path().join("funcs_a.sh");
+    std::fs::write(&file_a, "#!/bin/bash\nfn hello() { echo hi; }\nhello\n")?;
+    let file_b = dir_b.path().join("funcs_b.sh");
+    std::fs::write(&file_b, "#!/bin/bash\nfn world() { echo world; }\nworld\n")?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    // mockls with --workspace-folders but NO --indexing-delay:
+    // supports didChangeWorkspaceFolders, never sends $/progress.
+    let lsp = mockls_lsp_arg("shellscript", "--workspace-folders");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
+    bridge.initialize_with_roots(&[root_a])?;
+
+    // Hover on root_a — establishes server is working
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": file_a.to_str().context("Invalid file A path")?,
+                "line": 1,
+                "character": 3
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Root A hover failed: {response:?}"
+    );
+
+    // Add root_b via roots/list_changed
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed"
+    }))?;
+
+    let roots_request = bridge.recv()?;
+    assert_eq!(
+        roots_request["method"], "roots/list",
+        "Expected roots/list request, got: {roots_request:?}"
+    );
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": roots_request["id"],
+        "result": {
+            "roots": [
+                {"uri": format!("file://{root_a}")},
+                {"uri": format!("file://{root_b}")}
+            ]
+        }
+    }))?;
+
+    // Hover on root_b — must not hang.
+    // did_change_workspace_folders sets state to Indexing.
+    // Since mockls never sends $/progress, wait_ready() uses
+    // the activity settle fallback to transition back to Ready.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "tools/call",
+        "params": {
+            "name": "hover",
+            "arguments": {
+                "file": file_b.to_str().context("Invalid file B path")?,
+                "line": 1,
+                "character": 3
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Root B hover should not hang or error: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing hover text for root B")?;
+    assert!(
+        text.contains("world"),
+        "Expected 'world' in hover, got: {text}"
+    );
+
     Ok(())
 }
 
