@@ -8,3 +8,5 @@ target/
 .idea/
 .vscode/
 *.log
+__pycache__/
+*.pyc
