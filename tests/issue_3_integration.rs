@@ -33,23 +33,24 @@ version = "0.1.0"
     )?;
 
     // 2. Start Catenary
-    let mut child = Command::new("cargo")
+    let mut child = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .args([
-            "run",
-            "--",
             "--root",
             dir.path().to_str().context("invalid path")?,
             "--lsp",
             "rust:rust-analyzer",
         ])
+        // Isolate from user-level config
+        .env("XDG_CONFIG_HOME", dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()
         .context("Failed to start catenary")?;
 
-    let stdin = child.stdin.as_mut().context("Failed to get stdin")?;
-    let stdout = child.stdout.as_mut().context("Failed to get stdout")?;
+    // Take ownership of stdin/stdout so we can drop stdin later for graceful shutdown
+    let mut stdin = child.stdin.take().context("Failed to get stdin")?;
+    let stdout = child.stdout.take().context("Failed to get stdout")?;
     let mut reader = BufReader::new(stdout);
 
     // 3. Initialize MCP
@@ -108,8 +109,12 @@ version = "0.1.0"
         "Diagnostics should contain the error after change. Got: {line}"
     );
 
-    // Cleanup
-    let _ = child.kill();
+    // Graceful shutdown: drop stdin so the MCP server exits its read loop,
+    // which triggers shutdown_all() → LSP shutdown/exit for rust-analyzer.
+    // This prevents the leaked process that nextest flags.
+    drop(stdin);
+    drop(reader);
     let _ = child.wait();
+
     Ok(())
 }

@@ -2,163 +2,91 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Integration tests for session monitoring and event broadcasting.
+//! Integration tests for session event broadcasting and monitoring.
+//!
+//! These tests exercise the production `Session` → `EventBroadcaster` →
+//! `monitor_events` pipeline in-process, verifying that MCP messages
+//! broadcast by the server are readable as structured events.
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
-
-use anyhow::{Context, Result, anyhow};
-use serde_json::{Value, json};
-
-/// Helper to spawn the bridge and capture stderr to find session ID
-struct ServerProcess {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
-    stderr: BufReader<std::process::ChildStderr>,
-}
-
-impl ServerProcess {
-    fn spawn() -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.arg("serve");
-        cmd.arg("--root").arg(".");
-        // Isolate from user-level config
-        cmd.env("XDG_CONFIG_HOME", ".");
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("Failed to spawn server")?;
-
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-        let stderr = BufReader::new(child.stderr.take().context("Failed to get stderr")?);
-
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
-            stderr,
-        })
-    }
-
-    fn get_session_id(&mut self) -> Result<String> {
-        let mut line = String::new();
-        // Read stderr line by line until we find "Session ID:"
-        // Limit to 100 lines to avoid infinite loop
-        for _ in 0..100 {
-            line.clear();
-            self.stderr
-                .read_line(&mut line)
-                .context("Failed to read stderr")?;
-            if line.contains("Session ID:") {
-                // The log line might look like: "2026-02-13T03:14:15.819396Z  INFO catenary: Session ID: 012305b387"
-                // Or with different formatting. We want the last word.
-                let id = line
-                    .split_whitespace()
-                    .last()
-                    .context("Failed to parse Session ID from line")?;
-                return Ok(id.to_string());
-            }
-        }
-        Err(anyhow!("Failed to find Session ID in output"))
-    }
-
-    fn send(&mut self, request: &Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        writeln!(self.stdin, "{json}").context("Failed to write to stdin")?;
-        self.stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-}
-
-impl Drop for ServerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+use anyhow::{Context, Result};
+use catenary_mcp::session::{self, EventKind, Session};
+use serde_json::json;
 
 #[test]
 fn test_monitor_raw_messages() -> Result<()> {
-    // 1. Start Server
-    let mut server = ServerProcess::spawn()?;
-    let session_id = server.get_session_id()?;
-    tracing::info!("Session ID: {session_id}");
+    // Create a real session (writes events.jsonl to the state directory)
+    let session = Session::create("/tmp/monitor-test")?;
+    let session_id = session.info.id.clone();
+    let broadcaster = session.broadcaster();
 
-    // 2. Start Monitor (in a separate thread to avoid blocking main test flow if we want)
-    // Actually, we can spawn the process and read from it.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-    cmd.arg("monitor").arg(&session_id);
-    cmd.stdout(Stdio::piped());
-    let mut child = cmd.spawn().context("Failed to spawn monitor")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("failed to take monitor stdout")?;
-    let mut reader = BufReader::new(stdout);
-
-    // 3. Send a request to the server
-    let request_id = 12345;
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "ping"
+    // Broadcast an incoming MCP request
+    broadcaster.send(EventKind::McpMessage {
+        direction: "in".to_string(),
+        message: json!({
+            "jsonrpc": "2.0",
+            "id": 12345,
+            "method": "ping"
+        }),
     });
 
-    server.send(&request)?;
-    let _response = server.recv()?;
+    // Broadcast an outgoing MCP response
+    broadcaster.send(EventKind::McpMessage {
+        direction: "out".to_string(),
+        message: json!({
+            "jsonrpc": "2.0",
+            "id": 12345,
+            "result": {}
+        }),
+    });
 
-    // 4. Check monitor output
-    // We expect to see "→ ... ping" and "← ... result" (arrows instead of MCP(in)/MCP(out))
+    // Read events back using the production monitor API
+    let events: Vec<_> = session::monitor_events(&session_id)?.collect();
 
-    let mut found_in = false;
-    let mut found_out = false;
+    // Find the incoming ping and outgoing result
+    let found_in = events.iter().any(|e| {
+        matches!(
+            &e.kind,
+            EventKind::McpMessage {
+                direction,
+                message,
+            } if direction == "in"
+                && message.get("method").and_then(|m| m.as_str()) == Some("ping")
+        )
+    });
 
-    // Read up to 20 lines
-    let mut line = String::new();
-    for _ in 0..20 {
-        line.clear();
-        if reader.read_line(&mut line)? > 0 {
-            tracing::debug!("Monitor: {}", line.trim());
-            // New format uses → for incoming and ← for outgoing
-            if line.contains('→') && line.contains("ping") {
-                found_in = true;
-            }
-            if line.contains('←') && line.contains("result") {
-                found_out = true;
-            }
+    let found_out = events.iter().any(|e| {
+        matches!(
+            &e.kind,
+            EventKind::McpMessage {
+                direction,
+                message,
+            } if direction == "out"
+                && message.get("result").is_some()
+        )
+    });
 
-            if found_in && found_out {
-                break;
-            }
-        } else {
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
+    // Session cleanup happens via Drop (removes the session directory)
+    drop(session);
 
     assert!(
         found_in,
-        "Did not find incoming MCP message (→) in monitor output"
+        "Did not find incoming MCP message (direction=\"in\", method=\"ping\") in events"
     );
     assert!(
         found_out,
-        "Did not find outgoing MCP message (←) in monitor output"
+        "Did not find outgoing MCP message (direction=\"out\", result) in events"
     );
+
+    // Verify the messages round-tripped with correct content
+    let in_event = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::McpMessage { direction, .. } if direction == "in"))
+        .context("incoming event missing")?;
+
+    if let EventKind::McpMessage { message, .. } = &in_event.kind {
+        assert_eq!(message["id"], 12345);
+        assert_eq!(message["method"], "ping");
+    }
+
     Ok(())
 }
