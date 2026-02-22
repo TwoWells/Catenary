@@ -187,6 +187,40 @@ Then add the MCP server to `.gemini/settings.json`:
 }
 ```
 
+**Alternative: constrained-bash hook.** Instead of the policy engine, you can
+use the same `scripts/constrained-bash.py` script from the repo with Gemini's
+`BeforeTool` hook system.
+
+**Install:**
+
+```bash
+cp /path/to/catenary/scripts/constrained-bash.py ~/.gemini/hooks/constrained-bash.py
+chmod +x ~/.gemini/hooks/constrained-bash.py
+```
+
+**Configure** in `~/.gemini/settings.json`:
+
+```json
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.gemini/hooks/constrained-bash.py --format=gemini"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The `--format=gemini` flag switches the denial response to Gemini's
+`{"decision": "deny", "reason": "..."}` format.
+
 **Built-in tool names** (from `packages/core/src/tools/tool-names.ts`):
 
 | Tool              | Internal Name       |
@@ -264,113 +298,44 @@ records the file's mtime, and releases the lock. It exits silently on any
 error so it never blocks Claude Code's flow.
 
 **Alternative: Constrained mode.** Keep Claude Code's native `Read`, `Edit`,
-`Write`, and `Bash` tools but deny text-scanning commands to force LSP-first
-navigation. This deny list blocks grep, file listing, manual reads, text
-processing, shell wrappers, and framework tools that would bypass Catenary.
+`Write`, and `Bash` tools but block text-scanning commands to force LSP-first
+navigation. The repo includes a hook script that implements an allowlist:
+only `make`, `git`, `gh`, and a handful of filesystem utilities are permitted.
+Everything else is denied with guidance pointing to the appropriate Catenary
+tool.
+
+**Install:**
+
+```bash
+# Symlink so the live hook stays in sync with the repo
+mkdir -p ~/.claude/hooks
+ln -s /path/to/catenary/scripts/constrained-bash.py ~/.claude/hooks/constrained-bash.py
+chmod +x /path/to/catenary/scripts/constrained-bash.py
+```
+
+**Configure** in `~/.claude/settings.json`:
 
 ```json
 {
-  "permissions": {
-    "allow": [
-      "WebSearch",
-      "WebFetch",
-      "mcp__catenary__*",
-      "mcp__plugin_catenary_catenary__*",
-      "ToolSearch",
-      "AskUserQuestion",
-      "Bash"
-    ],
-    "deny": [
-      "// --- 1. Search (Grep Family) ---",
-      "Bash(rg *)",
-      "Bash(ag *)",
-      "Bash(ack *)",
-      "Bash(fd *)",
-      "Bash(grep *)",
-      "Bash(egrep *)",
-      "Bash(fgrep *)",
-      "Bash(rgrep *)",
-      "Bash(zgrep *)",
-      "Bash(git grep *)",
-      "// --- 2. Navigation (Listing Family) ---",
-      "Bash(ls *)",
-      "Bash(dir *)",
-      "Bash(vdir *)",
-      "Bash(tree *)",
-      "Bash(find *)",
-      "Bash(locate *)",
-      "Bash(mlocate *)",
-      "Bash(whereis *)",
-      "Bash(which *)",
-      "Bash(git ls-files *)",
-      "Bash(git ls-tree *)",
-      "// --- 3. Peeking (Reading Family) ---",
-      "Bash(cat *)",
-      "Bash(head *)",
-      "Bash(tail *)",
-      "Bash(more *)",
-      "Bash(less *)",
-      "Bash(nl *)",
-      "Bash(od *)",
-      "Bash(hexdump *)",
-      "Bash(xxd *)",
-      "Bash(strings *)",
-      "Bash(dd *)",
-      "Bash(tee *)",
-      "// --- 4. Text Processing (Scripting Family) ---",
-      "Bash(awk *)",
-      "Bash(sed *)",
-      "Bash(perl *)",
-      "Bash(cut *)",
-      "Bash(paste *)",
-      "Bash(sort *)",
-      "Bash(uniq *)",
-      "Bash(join *)",
-      "// --- 5. Reconnaissance (Metadata Family) ---",
-      "Bash(file *)",
-      "Bash(stat *)",
-      "Bash(du *)",
-      "Bash(df *)",
-      "// --- 6. Executors & Shells (The Wrapper Family) ---",
-      "Bash(bash *)",
-      "Bash(sh *)",
-      "Bash(zsh *)",
-      "Bash(dash *)",
-      "Bash(fish *)",
-      "Bash(ash *)",
-      "Bash(csh *)",
-      "Bash(ksh *)",
-      "Bash(tcsh *)",
-      "// --- 7. The Command Runners (Prevents Masquerading) ---",
-      "Bash(env *)",
-      "Bash(sudo *)",
-      "Bash(su *)",
-      "Bash(nohup *)",
-      "Bash(timeout *)",
-      "Bash(watch *)",
-      "Bash(time *)",
-      "Bash(eval *)",
-      "Bash(exec *)",
-      "Bash(command *)",
-      "Bash(builtin *)",
-      "Bash(type *)",
-      "Bash(hash *)",
-      "// --- 8. The Multiplexers ---",
-      "Bash(xargs *)",
-      "Bash(parallel *)",
-      "// --- 9. Framework Blocks ---",
-      "Grep",
-      "Glob",
-      "Task"
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/constrained-bash.py"
+          }
+        ]
+      }
     ]
-  },
-  "mcpServers": {
-    "catenary": {
-      "command": "catenary"
-    }
   }
 }
 ```
+
+The script provides specific guidance per command (`Use Catenary's search tool
+instead.`, `Use the Read tool instead.`, etc.) so the model corrects course
+immediately rather than attempting workarounds.
 
 This keeps `Bash` available for build/test/git commands while blocking every
 path that would let the model fall back to text scanning. The model uses:
