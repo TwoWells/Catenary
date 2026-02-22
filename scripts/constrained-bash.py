@@ -172,7 +172,8 @@ def deny_response(fmt, command, reason):
     """Build the host-specific denial JSON."""
     if fmt == "claude":
         return {
-            "systemMessage": f"Denied: {command} → {reason}",
+            "suppressOutput": True,
+            "systemMessage": f"Blocked: {command}",
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",

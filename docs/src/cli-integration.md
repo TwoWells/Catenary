@@ -337,6 +337,29 @@ The script provides specific guidance per command (`Use Catenary's search tool
 instead.`, `Use the Read tool instead.`, etc.) so the model corrects course
 immediately rather than attempting workarounds.
 
+**Troubleshooting:**
+
+- **Hook silently allows blocked commands.** The script must be executable.
+  `chmod +x` on the script file (or the repo file if you use a symlink) is
+  required. Without it, Claude Code gets a permission error, treats the hook as
+  a non-blocking failure, and lets the command through.
+
+- **Hook allows blocked commands and logs a JSON parse error.** Claude Code
+  spawns a shell that sources your profile. If `~/.zshrc` or `~/.bashrc` prints
+  anything unconditionally (e.g. `fastfetch`, `neofetch`, a startup banner),
+  that output is prepended to the hook's JSON and corrupts the parse. Add this
+  guard at the very top of both files:
+
+  ```zsh
+  # Skip the rest of this file for non-interactive shells (e.g. hook runners)
+  [[ -o interactive ]] || return
+  ```
+
+- **Blocked commands appear as "Read" in the UI.** Claude Code relabels Bash
+  commands that contain `tail`, `head`, or `cat` as a native Read operation in
+  the transcript view. The hook still fires on the Bash event and blocks
+  correctly — the relabeling is cosmetic only.
+
 This keeps `Bash` available for build/test/git commands while blocking every
 path that would let the model fall back to text scanning. The model uses:
 
