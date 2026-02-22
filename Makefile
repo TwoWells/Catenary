@@ -82,6 +82,7 @@ release: pre-release-check
 		echo "Error: Version not specified. Use 'make release V=x.y.z' or 'make release-patch'"; \
 		exit 1; \
 	fi
+	@cargo update --quiet
 	@$(MAKE) bump-version V=$(V)
 	@if ! $(MAKE) check; then \
 		echo "Checks failed. Rolling back version bump..."; \

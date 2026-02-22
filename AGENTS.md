@@ -84,19 +84,17 @@ Versioning and releases are managed via the `Makefile`.
 
 These commands automatically:
 1. Verify the working tree is clean and on `main`.
-2. Bump versions in `Cargo.toml` and `.claude-plugin/marketplace.json`.
-3. Run all tests and linting checks.
-4. Commit the changes and create a git tag.
+2. Run `cargo update` to ensure `Cargo.lock` is fresh.
+3. Bump versions in `Cargo.toml` and `.claude-plugin/marketplace.json`.
+4. Run all tests and linting checks.
+5. Commit the changes and create a git tag.
 
 To complete the release, push the changes and tags:
 `git push && git push --tags`
 
 ### Pre-release checklist
 Before running `make release-*`:
-1. Run `cargo update` to ensure `Cargo.lock` is fresh. The release
-   commit's pre-commit hook runs `cargo-lock-check --locked`, which
-   fails if any dependency has a newer compatible version available.
-2. Ensure `git push` has been run so local `main` matches `origin/main`.
+1. Ensure `git push` has been run so local `main` matches `origin/main`.
 
 If checks or the commit fail, the Makefile automatically rolls back
 the version bump — it is safe to re-run `make release-*` after fixing
