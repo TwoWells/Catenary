@@ -54,6 +54,33 @@ import sys
 # not handled but are rare in practice.
 _SUBSHELL_RE = re.compile(r'\$\(([^)]*)\)|<\(([^)]*)\)|`([^`]*)`')
 
+# Matches heredoc start markers: <<EOF, <<'EOF', <<"EOF", <<-EOF, <<-'EOF', <<\EOF
+_HEREDOC_MARKER_RE = re.compile(r'<<-?\s*\\?[\'"]?(\w+)[\'"]?')
+
+
+def _strip_heredoc_bodies(cmd_string):
+    """Remove heredoc bodies, keeping markers and closing delimiters.
+
+    Heredoc bodies are literal text, not shell commands, but the recursive
+    subshell checker would otherwise parse them as commands — triggering
+    false denials on natural language containing ; && || or denied words.
+    """
+    lines = cmd_string.split('\n')
+    result = []
+    skip_until = None
+    for line in lines:
+        if skip_until is not None:
+            if line.strip() == skip_until:
+                skip_until = None
+                result.append(line)
+            continue
+        result.append(line)
+        m = _HEREDOC_MARKER_RE.search(line)
+        if m:
+            skip_until = m.group(1)
+    return '\n'.join(result)
+
+
 # Commands agents are allowed to run
 ALLOWED = {"make", "git", "gh", "cp", "rm", "touch", "mkdir", "mv", "chmod", "sleep"}
 
@@ -104,6 +131,7 @@ def find_command(tokens):
 
 def check(cmd_string):
     """Check all commands in the string. Return deny reason or None."""
+    cmd_string = _strip_heredoc_bodies(cmd_string)
     # Split on sequential operators first (&& || ;).
     # Do NOT split on bare | here — pipelines are handled in the inner loop so
     # we can allow PIPELINE_SAFE commands that read from stdin (mid-pipeline)
