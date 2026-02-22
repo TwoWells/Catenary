@@ -115,6 +115,8 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// Column width configuration for the list command.
+///
+/// Languages are displayed on a second line, so they are not included here.
 #[derive(Debug)]
 pub struct ColumnWidths {
     /// Width of the row number column.
@@ -123,19 +125,17 @@ pub struct ColumnWidths {
     pub id: usize,
     /// Width of the PID column.
     pub pid: usize,
-    /// Width of the workspace column.
-    pub workspace: usize,
     /// Width of the client column.
     pub client: usize,
-    /// Width of the languages column.
-    pub languages: usize,
+    /// Width of the workspace column.
+    pub workspace: usize,
     /// Width of the started time column.
     pub started: usize,
 }
 
 impl ColumnWidths {
     /// Calculate column widths based on terminal width.
-    /// Columns: # | ID | PID | WORKSPACE | CLIENT | LANGUAGES | STARTED
+    /// Columns: # | ID | PID | CLIENT | WORKSPACE | STARTED
     #[must_use]
     pub const fn calculate(term_width: usize) -> Self {
         // Fixed minimum widths
@@ -144,39 +144,34 @@ impl ColumnWidths {
         let started = 12; // "STARTED"
 
         // Calculate flexible widths
-        // Reserve space for separators (6 spaces between columns)
-        let fixed_space = row_num + pid + started + 6;
+        // Reserve space for separators (5 spaces between 6 columns)
+        let fixed_space = row_num + pid + started + 5;
         let flexible_space = term_width.saturating_sub(fixed_space);
 
-        // Distribute flexible space: ID(12), WORKSPACE(flex), CLIENT(20), LANGUAGES(15)
         let min_id = 12;
-        let min_client = 15;
-        let min_languages = 10;
+        let min_client = 20;
         let min_workspace = 20;
 
-        let total_min_flex = min_id + min_client + min_languages + min_workspace;
+        let total_min_flex = min_id + min_client + min_workspace;
 
         if flexible_space <= total_min_flex {
-            // Use minimum widths
             Self {
                 row_num,
                 id: min_id,
                 pid,
-                workspace: min_workspace,
                 client: min_client,
-                languages: min_languages,
+                workspace: min_workspace,
                 started,
             }
         } else {
-            // Distribute extra space primarily to workspace
+            // All extra space goes to workspace
             let extra = flexible_space - total_min_flex;
             Self {
                 row_num,
                 id: min_id,
                 pid,
-                workspace: min_workspace + extra,
                 client: min_client,
-                languages: min_languages,
+                workspace: min_workspace + extra,
                 started,
             }
         }
@@ -226,8 +221,7 @@ mod tests {
         // Flexible columns should have reasonable widths
         assert!(widths.id >= 12);
         assert!(widths.workspace >= 20);
-        assert!(widths.client >= 15);
-        assert!(widths.languages >= 10);
+        assert!(widths.client >= 20);
     }
 
     #[test]
@@ -236,7 +230,20 @@ mod tests {
         // Should use minimum widths for narrow terminals
         assert_eq!(widths.id, 12);
         assert_eq!(widths.workspace, 20);
-        assert_eq!(widths.client, 15);
-        assert_eq!(widths.languages, 10);
+        assert_eq!(widths.client, 20);
+    }
+
+    #[test]
+    fn test_calculate_column_widths_wide() {
+        // Wide terminal: all extra space goes to workspace
+        let widths = ColumnWidths::calculate(200);
+        assert!(
+            widths.workspace > widths.client,
+            "workspace ({}) should be wider than client ({})",
+            widths.workspace,
+            widths.client,
+        );
+        // Client stays at minimum
+        assert_eq!(widths.client, 20);
     }
 }

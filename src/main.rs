@@ -405,24 +405,26 @@ fn run_list() -> Result<()> {
 
     let term_width = cli::terminal_width();
     let widths = ColumnWidths::calculate(term_width);
+    let colors = cli::ColorConfig::new(false);
 
     // Print header
     println!(
-        "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_ws$} {:<width_client$} {:<width_lang$} STARTED",
+        "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_client$} {:<width_ws$} STARTED",
         "#",
         "ID",
         "PID",
-        "WORKSPACE",
         "CLIENT",
-        "LANGUAGES",
+        "WORKSPACE",
         width_num = widths.row_num,
         width_id = widths.id,
         width_pid = widths.pid,
-        width_ws = widths.workspace,
         width_client = widths.client,
-        width_lang = widths.languages,
+        width_ws = widths.workspace,
     );
     println!("{}", "-".repeat(term_width.min(120)));
+
+    // Indent for the second line (aligns with ID column)
+    let indent = " ".repeat(widths.row_num + 1);
 
     for (idx, s) in sessions.iter().enumerate() {
         let client = match (&s.client_name, &s.client_version) {
@@ -433,38 +435,35 @@ fn run_list() -> Result<()> {
 
         let ago = format_duration_ago(s.started_at);
 
-        // Get active languages for this session
-        let languages = session::active_languages(&s.id)
-            .unwrap_or_default()
-            .join(",");
-        let languages = if languages.is_empty() {
-            "-".to_string()
-        } else {
-            languages
-        };
-
         // Truncate fields to fit column widths
         let id = cli::truncate(&s.id, widths.id);
         let workspace = cli::truncate(&s.workspace, widths.workspace);
         let client = cli::truncate(&client, widths.client);
-        let languages = cli::truncate(&languages, widths.languages);
 
         println!(
-            "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_ws$} {:<width_client$} {:<width_lang$} {}",
+            "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_client$} {:<width_ws$} {}",
             idx + 1,
             id,
             s.pid,
-            workspace,
             client,
-            languages,
+            workspace,
             ago,
             width_num = widths.row_num,
             width_id = widths.id,
             width_pid = widths.pid,
-            width_ws = widths.workspace,
             width_client = widths.client,
-            width_lang = widths.languages,
+            width_ws = widths.workspace,
         );
+
+        // Get active languages for this session (shown on second line)
+        let languages = session::active_languages(&s.id).unwrap_or_default();
+        if !languages.is_empty() {
+            let lang_str = languages.join(", ");
+            println!(
+                "{}",
+                colors.dim(&format!("{indent}language servers: {lang_str}"))
+            );
+        }
     }
 
     Ok(())
@@ -690,6 +689,7 @@ fn run_acquire(timeout: u64, format: HostFormat) {
     };
 
     let owner = extract_owner(&hook_json);
+    let tool = extract_tool_name(&hook_json);
     let Some(file_path) = extract_file_path(&hook_json) else {
         return;
     };
@@ -707,6 +707,7 @@ fn run_acquire(timeout: u64, format: HostFormat) {
                 EventKind::LockAcquired {
                     file: file_path,
                     owner,
+                    tool,
                 },
             );
         }
@@ -716,6 +717,7 @@ fn run_acquire(timeout: u64, format: HostFormat) {
                 EventKind::LockAcquired {
                     file: file_path,
                     owner,
+                    tool,
                 },
             );
             let output = format_lock_output(format, Some(&context), None);
@@ -759,6 +761,7 @@ fn run_release(grace: u64, format: Option<HostFormat>) {
     };
 
     let owner = extract_owner(&hook_json);
+    let tool = extract_tool_name(&hook_json);
     let Some(file_path) = extract_file_path(&hook_json) else {
         return;
     };
@@ -800,6 +803,7 @@ fn run_release(grace: u64, format: Option<HostFormat>) {
             EventKind::LockReleased {
                 file: file_path,
                 owner,
+                tool,
             },
         );
     }
@@ -1034,6 +1038,14 @@ fn extract_owner(hook_json: &serde_json::Value) -> String {
         || session_id.to_string(),
         |aid| format!("{session_id}:{aid}"),
     )
+}
+
+/// Extracts the tool name from hook JSON (e.g. "Edit", "Read", "Write").
+fn extract_tool_name(hook_json: &serde_json::Value) -> Option<String> {
+    hook_json
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Extracts the file path from hook JSON's `tool_input`.
@@ -1801,23 +1813,25 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 println!("{time_str} {basename}: {label}{detail}");
             }
         }
-        EventKind::LockAcquired { file, owner } => {
+        EventKind::LockAcquired { file, owner, tool } => {
             let basename = std::path::Path::new(file.as_str())
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(file);
             let lock_icon = colors.green("locked");
+            let tool_label = tool.as_ref().map(|t| format!(" ({t})")).unwrap_or_default();
             let short_owner = cli::truncate(owner, 20);
-            println!("{time_str} {basename}: {lock_icon} by {short_owner}");
+            println!("{time_str} {basename}: {lock_icon}{tool_label} by {short_owner}");
         }
-        EventKind::LockReleased { file, owner } => {
+        EventKind::LockReleased { file, owner, tool } => {
             let basename = std::path::Path::new(file.as_str())
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(file);
             let unlock_icon = colors.dim("unlocked");
+            let tool_label = tool.as_ref().map(|t| format!(" ({t})")).unwrap_or_default();
             let short_owner = cli::truncate(owner, 20);
-            println!("{time_str} {basename}: {unlock_icon} by {short_owner}");
+            println!("{time_str} {basename}: {unlock_icon}{tool_label} by {short_owner}");
         }
         EventKind::LockDenied {
             file,

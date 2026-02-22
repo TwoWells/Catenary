@@ -136,7 +136,7 @@ fn test_list_shows_row_numbers() -> Result<()> {
 }
 
 #[test]
-fn test_list_shows_languages_column() -> Result<()> {
+fn test_list_shows_language_servers_line() -> Result<()> {
     // Start a server
     let mut server = ServerProcess::spawn()?;
     let _session_id = server.get_session_id()?;
@@ -152,10 +152,14 @@ fn test_list_shows_languages_column() -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Check for LANGUAGES column header
+    // Languages are displayed on a second line per session, not as a column header
     assert!(
-        stdout.contains("LANGUAGES"),
-        "List output should contain LANGUAGES column header"
+        stdout.contains("CLIENT"),
+        "List output should contain CLIENT column header"
+    );
+    assert!(
+        stdout.contains("WORKSPACE"),
+        "List output should contain WORKSPACE column header"
     );
     Ok(())
 }

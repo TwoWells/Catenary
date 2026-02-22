@@ -113,6 +113,9 @@ pub enum EventKind {
         file: String,
         /// The lock owner identity.
         owner: String,
+        /// The host tool that triggered the lock (e.g. "Read", "Edit").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
     },
     /// File lock released by an agent.
     LockReleased {
@@ -120,6 +123,9 @@ pub enum EventKind {
         file: String,
         /// The lock owner identity.
         owner: String,
+        /// The host tool that triggered the lock (e.g. "Read", "Edit").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
     },
     /// File lock acquisition denied (timeout).
     LockDenied {
