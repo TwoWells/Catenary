@@ -12,6 +12,7 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 check = _mod.check
+deny_response = _mod.deny_response
 
 
 class TestAllowed(unittest.TestCase):
@@ -55,6 +56,7 @@ class TestDenied(unittest.TestCase):
     def test_cargo(self):
         self.assertIsNotNone(check("cargo build"))
         self.assertIsNotNone(check("cargo test"))
+        self.assertIsNotNone(check("cargo build 2>&1"))
 
     def test_full_path(self):
         self.assertIsNotNone(check("/usr/bin/grep foo bar"))
@@ -237,6 +239,30 @@ class TestAdversarial(unittest.TestCase):
 
     def test_git_diff_process_substitution_denied(self):
         self.assertIsNotNone(check("git diff <(cat file1) <(cat file2)"))
+
+
+class TestDenyResponse(unittest.TestCase):
+    def test_claude_system_message_contains_command(self):
+        response = deny_response("claude", "cargo build 2>&1", "Use a make target instead.")
+        self.assertIn("systemMessage", response)
+        self.assertIn("cargo build 2>&1", response["systemMessage"])
+
+    def test_claude_suppress_output(self):
+        response = deny_response("claude", "cargo build 2>&1", "Use a make target instead.")
+        self.assertTrue(response.get("suppressOutput"))
+
+    def test_claude_hook_specific_output(self):
+        response = deny_response("claude", "cargo build 2>&1", "Use a make target instead.")
+        hso = response.get("hookSpecificOutput", {})
+        self.assertEqual(hso.get("hookEventName"), "PreToolUse")
+        self.assertEqual(hso.get("permissionDecision"), "deny")
+        self.assertEqual(hso.get("permissionDecisionReason"), "Use a make target instead.")
+
+    def test_gemini_format(self):
+        response = deny_response("gemini", "cargo build 2>&1", "Use a make target instead.")
+        self.assertEqual(response.get("decision"), "deny")
+        self.assertEqual(response.get("reason"), "Use a make target instead.")
+        self.assertNotIn("hookSpecificOutput", response)
 
 
 if __name__ == "__main__":

@@ -103,6 +103,10 @@ enum Command {
         /// Disable colored output.
         #[arg(long)]
         nocolor: bool,
+
+        /// Show a unified diff for every stale file (hooks.json and constrained-bash.py).
+        #[arg(long)]
+        diff: bool,
     },
 
     /// Sync /add-dir roots from Claude Code transcript to a running session.
@@ -164,7 +168,7 @@ async fn main() -> Result<()> {
             filter,
         }) => run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => run_status(&id),
-        Some(Command::Doctor { nocolor }) => run_doctor(args, nocolor).await,
+        Some(Command::Doctor { nocolor, diff }) => run_doctor(args, nocolor, diff).await,
         Some(Command::SyncRoots { format }) => {
             run_sync_roots(format);
             Ok(())
@@ -1228,8 +1232,11 @@ const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../plugins/catenary/hooks/hook
 /// Expected Gemini CLI hooks, embedded at compile time.
 const GEMINI_HOOKS_EXPECTED: &str = include_str!("../hooks/hooks.json");
 
+/// Expected constrained-bash hook script, embedded at compile time.
+const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../scripts/constrained-bash.py");
+
 /// Check Claude Code plugin hooks against the embedded expected hooks.
-fn check_claude_hooks(colors: &ColorConfig) {
+fn check_claude_hooks(colors: &ColorConfig, show_diff: bool) {
     let label = format!("{:<14}", "Claude Code");
     let Ok(home_str) = std::env::var("HOME") else {
         println!(
@@ -1301,6 +1308,14 @@ fn check_claude_hooks(colors: &ColorConfig) {
                     "  {label}{ver_col}{}",
                     colors.red("✗ stale hooks (reinstall: claude plugin uninstall catenary@catenary && claude plugin install catenary@catenary)"),
                 );
+                if show_diff {
+                    show_unified_diff(
+                        &pretty_json(&installed),
+                        &pretty_json(CLAUDE_HOOKS_EXPECTED),
+                        "installed",
+                        "expected",
+                    );
+                }
             }
         }
         Err(_) => {
@@ -1325,7 +1340,7 @@ fn read_marketplace_source(home: &Path) -> Option<String> {
 }
 
 /// Check Gemini CLI extension hooks against the embedded expected hooks.
-fn check_gemini_hooks(colors: &ColorConfig) {
+fn check_gemini_hooks(colors: &ColorConfig, show_diff: bool) {
     let label = format!("{:<14}", "Gemini CLI");
     let Ok(home_str) = std::env::var("HOME") else {
         println!(
@@ -1405,6 +1420,14 @@ fn check_gemini_hooks(colors: &ColorConfig) {
                     "  {label}{ver_col}{}",
                     colors.red("✗ stale hooks (update extension)"),
                 );
+                if show_diff {
+                    show_unified_diff(
+                        &pretty_json(&installed),
+                        &pretty_json(GEMINI_HOOKS_EXPECTED),
+                        "installed",
+                        "expected",
+                    );
+                }
             }
         }
         Err(_) => {
@@ -1464,6 +1487,124 @@ fn check_path_binary(colors: &ColorConfig) {
     }
 }
 
+/// Check the constrained-bash script referenced in `~/.claude/settings.json`.
+fn check_constrained_bash_claude(colors: &ColorConfig, show_diff: bool) {
+    let label = format!("{:<14}", "Claude Code");
+
+    let Ok(home_str) = std::env::var("HOME") else {
+        println!(
+            "  {label}{}",
+            colors.dim("- cannot determine home directory")
+        );
+        return;
+    };
+    let home = PathBuf::from(home_str);
+
+    let settings_path = home.join(".claude/settings.json");
+    let Ok(settings_json) = std::fs::read_to_string(&settings_path) else {
+        println!("  {label}{}", colors.dim("- not configured"));
+        return;
+    };
+
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings_json) else {
+        println!("  {label}{}", colors.yellow("? cannot parse settings.json"));
+        return;
+    };
+
+    let Some(script_token) = find_script_path_in_json(&settings, "constrained-bash.py") else {
+        println!("  {label}{}", colors.dim("- not configured"));
+        return;
+    };
+
+    let script_path = expand_home(&script_token, &home);
+
+    match std::fs::read_to_string(&script_path) {
+        Ok(installed) => {
+            if installed == CONSTRAINED_BASH_EXPECTED {
+                println!("  {label}{}", colors.green("✓ up to date"));
+            } else if show_diff {
+                println!("  {label}{}", colors.red("✗ out of date"));
+                show_unified_diff(
+                    &installed,
+                    CONSTRAINED_BASH_EXPECTED,
+                    "installed",
+                    "expected",
+                );
+            } else {
+                println!(
+                    "  {label}{}",
+                    colors.red("✗ out of date (run catenary doctor --diff to see changes)"),
+                );
+            }
+        }
+        Err(_) => {
+            println!(
+                "  {label}{}",
+                colors.red(&format!("✗ not found at {}", script_path.display())),
+            );
+        }
+    }
+}
+
+/// Check the constrained-bash script referenced in `~/.gemini/settings.json`.
+fn check_constrained_bash_gemini(colors: &ColorConfig, show_diff: bool) {
+    let label = format!("{:<14}", "Gemini CLI");
+
+    let Ok(home_str) = std::env::var("HOME") else {
+        println!(
+            "  {label}{}",
+            colors.dim("- cannot determine home directory")
+        );
+        return;
+    };
+    let home = PathBuf::from(home_str);
+
+    let settings_path = home.join(".gemini/settings.json");
+    let Ok(settings_json) = std::fs::read_to_string(&settings_path) else {
+        println!("  {label}{}", colors.dim("- not configured"));
+        return;
+    };
+
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings_json) else {
+        println!("  {label}{}", colors.yellow("? cannot parse settings.json"));
+        return;
+    };
+
+    let Some(script_token) = find_script_path_in_json(&settings, "constrained-bash.py") else {
+        println!("  {label}{}", colors.dim("- not configured"));
+        return;
+    };
+
+    let script_path = expand_home(&script_token, &home);
+
+    match std::fs::read_to_string(&script_path) {
+        Ok(installed) => {
+            if installed == CONSTRAINED_BASH_EXPECTED {
+                println!("  {label}{}", colors.green("✓ up to date"));
+            } else if show_diff {
+                println!("  {label}{}", colors.red("✗ out of date"));
+                show_unified_diff(
+                    &installed,
+                    CONSTRAINED_BASH_EXPECTED,
+                    "installed",
+                    "expected",
+                );
+            } else {
+                println!(
+                    "  {label}{}",
+                    colors.red("✗ out of date (run catenary doctor --diff to see changes)"),
+                );
+            }
+        }
+        Err(_) => {
+            println!(
+                "  {label}{}",
+                colors.red(&format!("✗ not found at {}", script_path.display())),
+            );
+        }
+    }
+}
+
 /// Normalize a JSON string for comparison (parse and re-serialize).
 ///
 /// Returns the compact re-serialized form, or the original string (trimmed)
@@ -1475,6 +1616,65 @@ fn normalize_json(s: &str) -> String {
         .unwrap_or_else(|| s.trim().to_string())
 }
 
+/// Pretty-print a JSON string for use in human-readable diffs.
+///
+/// Returns the pretty-printed form, or the original string if parsing fails.
+fn pretty_json(s: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(s)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| s.to_string())
+}
+
+/// Print a unified diff between `old` and `new` using the `similar` crate.
+fn show_unified_diff(old: &str, new: &str, old_label: &str, new_label: &str) {
+    use similar::TextDiff;
+    let diff = TextDiff::from_lines(old, new);
+    print!(
+        "{}",
+        diff.unified_diff()
+            .context_radius(3)
+            .header(old_label, new_label)
+    );
+}
+
+/// Walk all string values in `json` and return the whitespace-split token
+/// that contains `needle`, searching depth-first.
+///
+/// Returns `None` if no string value in the tree mentions `needle`.
+fn find_script_path_in_json(json: &serde_json::Value, needle: &str) -> Option<String> {
+    match json {
+        serde_json::Value::String(s) if s.contains(needle) => s
+            .split_whitespace()
+            .find(|token| token.contains(needle))
+            .map(std::string::ToString::to_string),
+        serde_json::Value::Object(map) => map
+            .values()
+            .find_map(|v| find_script_path_in_json(v, needle)),
+        serde_json::Value::Array(arr) => {
+            arr.iter().find_map(|v| find_script_path_in_json(v, needle))
+        }
+        _ => None,
+    }
+}
+
+/// Expand `$HOME/` and `~/` prefixes in a path string.
+fn expand_home(path_str: &str, home: &Path) -> PathBuf {
+    path_str
+        .strip_prefix("$HOME/")
+        .or_else(|| path_str.strip_prefix("~/"))
+        .map_or_else(
+            || {
+                if path_str == "$HOME" || path_str == "~" {
+                    home.to_path_buf()
+                } else {
+                    PathBuf::from(path_str)
+                }
+            },
+            |rest| home.join(rest),
+        )
+}
+
 /// Run the doctor command: check language server health for the current workspace.
 ///
 /// # Errors
@@ -1484,7 +1684,7 @@ fn normalize_json(s: &str) -> String {
     clippy::too_many_lines,
     reason = "Doctor command has sequential output logic"
 )]
-async fn run_doctor(args: Args, nocolor: bool) -> Result<()> {
+async fn run_doctor(args: Args, nocolor: bool, show_diff: bool) -> Result<()> {
     let colors = ColorConfig::new(nocolor);
 
     // Print version header
@@ -1654,9 +1854,15 @@ async fn run_doctor(args: Args, nocolor: bool) -> Result<()> {
     // Hooks health section
     println!();
     println!("{}:", colors.bold("Hooks"));
-    check_claude_hooks(&colors);
-    check_gemini_hooks(&colors);
+    check_claude_hooks(&colors, show_diff);
+    check_gemini_hooks(&colors, show_diff);
     check_path_binary(&colors);
+
+    // Scripts health section
+    println!();
+    println!("{}:", colors.bold("Scripts"));
+    check_constrained_bash_claude(&colors, show_diff);
+    check_constrained_bash_gemini(&colors, show_diff);
 
     Ok(())
 }
