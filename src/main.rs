@@ -13,6 +13,7 @@ use anyhow::Result;
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use regex::Regex;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,9 +71,6 @@ struct Args {
 /// Subcommands supported by Catenary.
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the MCP server (default if no subcommand given).
-    Serve,
-
     /// List active Catenary sessions.
     List,
 
@@ -151,7 +149,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        None | Some(Command::Serve) => run_server(args).await,
+        None => {
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                run_dashboard()
+            } else {
+                run_server(args).await
+            }
+        }
         Some(Command::List) => run_list(),
         Some(Command::Monitor {
             id,
@@ -174,6 +178,17 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Launch the interactive dashboard (Phase 2: replaced by TUI).
+///
+/// Interim behaviour: falls back to the session list until `src/tui.rs` is implemented.
+///
+/// # Errors
+///
+/// Returns an error if listing sessions fails.
+fn run_dashboard() -> Result<()> {
+    run_list()
 }
 
 /// Run the MCP server (main functionality)
@@ -426,7 +441,7 @@ fn run_list() -> Result<()> {
     // Indent for the second line (aligns with ID column)
     let indent = " ".repeat(widths.row_num + 1);
 
-    for (idx, s) in sessions.iter().enumerate() {
+    for (idx, (s, alive)) in sessions.iter().enumerate() {
         let client = match (&s.client_name, &s.client_version) {
             (Some(name), Some(ver)) => format!("{name} v{ver}"),
             (Some(name), None) => name.clone(),
@@ -440,7 +455,7 @@ fn run_list() -> Result<()> {
         let workspace = cli::truncate(&s.workspace, widths.workspace);
         let client = cli::truncate(&client, widths.client);
 
-        println!(
+        let row_str = format!(
             "{:>width_num$} {:<width_id$} {:<width_pid$} {:<width_client$} {:<width_ws$} {}",
             idx + 1,
             id,
@@ -455,14 +470,19 @@ fn run_list() -> Result<()> {
             width_ws = widths.workspace,
         );
 
-        // Get active languages for this session (shown on second line)
-        let languages = session::active_languages(&s.id).unwrap_or_default();
-        if !languages.is_empty() {
-            let lang_str = languages.join(", ");
-            println!(
-                "{}",
-                colors.dim(&format!("{indent}language servers: {lang_str}"))
-            );
+        if *alive {
+            println!("{row_str}");
+            // Get active languages for this session (shown on second line)
+            let languages = session::active_languages(&s.id).unwrap_or_default();
+            if !languages.is_empty() {
+                let lang_str = languages.join(", ");
+                println!(
+                    "{}",
+                    colors.dim(&format!("{indent}language servers: {lang_str}"))
+                );
+            }
+        } else {
+            println!("{} (dead)", colors.dim(&row_str));
         }
     }
 
@@ -476,7 +496,7 @@ fn resolve_session_id(id: &str) -> Result<session::SessionInfo> {
         && row_num > 0
     {
         let sessions = session::list_sessions()?;
-        if let Some(s) = sessions.get(row_num - 1) {
+        if let Some((s, _)) = sessions.get(row_num - 1) {
             return Ok(s.clone());
         }
         // Row number out of range — try as session ID prefix before giving up.
@@ -523,39 +543,56 @@ fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Resu
     let mut last_progress: Option<(String, String)> = None;
 
     loop {
-        if let Some(event) = reader.next_event()? {
-            // Apply filter if set
-            if let Some(ref re) = filter_regex {
-                let event_str = format!("{:?}", event.kind);
-                if !re.is_match(&event_str) {
-                    continue;
-                }
-            }
-
-            if raw {
-                print_event_raw(&event);
-            } else {
-                // Collapse consecutive progress lines with the same title
-                if let EventKind::Progress {
-                    ref language,
-                    ref title,
-                    ..
-                } = event.kind
-                {
-                    let key = (language.clone(), title.clone());
-                    if last_progress.as_ref() == Some(&key) {
-                        // Same progress context — erase previous line
-                        print!("\x1b[A\x1b[2K");
+        match reader.try_next_event() {
+            Ok(Some(event)) => {
+                // Apply filter if set
+                if let Some(ref re) = filter_regex {
+                    let event_str = format!("{:?}", event.kind);
+                    if !re.is_match(&event_str) {
+                        continue;
                     }
-                    last_progress = Some(key);
-                } else {
-                    last_progress = None;
                 }
-                print_event_annotated(&event, &colors, term_width);
+
+                if raw {
+                    print_event_raw(&event);
+                } else {
+                    // Collapse consecutive progress lines with the same title
+                    if let EventKind::Progress {
+                        ref language,
+                        ref title,
+                        ..
+                    } = event.kind
+                    {
+                        let key = (language.clone(), title.clone());
+                        if last_progress.as_ref() == Some(&key) {
+                            // Same progress context — erase previous line
+                            print!("\x1b[A\x1b[2K");
+                        }
+                        last_progress = Some(key);
+                    } else {
+                        last_progress = None;
+                    }
+                    print_event_annotated(&event, &colors, term_width);
+                }
             }
-        } else {
-            println!("\nSession ended");
-            break;
+            Ok(None) => {
+                // No new event — check liveness
+                std::thread::sleep(Duration::from_millis(100));
+
+                if let Ok(Some((_, alive))) = session::get_session(&full_id) {
+                    if !alive {
+                        println!("\nSession ended (process dead)");
+                        break;
+                    }
+                } else {
+                    println!("\nSession ended (files removed)");
+                    break;
+                }
+            }
+            Err(_) => {
+                println!("\nSession ended");
+                break;
+            }
         }
     }
 
@@ -777,9 +814,9 @@ fn run_release(grace: u64, format: Option<HostFormat>) {
         let sessions = session::list_sessions().unwrap_or_default();
         let session = sessions
             .iter()
-            .find(|s| abs_path.to_string_lossy().starts_with(&s.workspace));
+            .find(|(s, _)| abs_path.to_string_lossy().starts_with(&s.workspace));
 
-        if let Some(session) = session {
+        if let Some((session, _)) = session {
             let endpoint = notify_endpoint(&session.id);
             if let Some(stream) = notify_connect(&endpoint) {
                 let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
@@ -848,9 +885,11 @@ fn run_sync_roots(format: HostFormat) {
     // Find the session whose workspace matches cwd
     let sessions = session::list_sessions().unwrap_or_default();
     let cwd_str = cwd.to_string_lossy();
-    let session = sessions.iter().find(|s| cwd_str.starts_with(&s.workspace));
+    let session = sessions
+        .iter()
+        .find(|(s, _)| cwd_str.starts_with(&s.workspace));
 
-    let Some(session) = session else {
+    let Some((session, _)) = session else {
         return;
     };
 
@@ -1127,7 +1166,8 @@ fn broadcast_lock_event(hook_json: &serde_json::Value, event: EventKind) {
     let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
 
     let sessions = session::list_sessions().unwrap_or_default();
-    let Some(session_info) = sessions.iter().find(|s| cwd.starts_with(&s.workspace)) else {
+    let Some((session_info, _)) = sessions.iter().find(|(s, _)| cwd.starts_with(&s.workspace))
+    else {
         return;
     };
 
@@ -1676,20 +1716,23 @@ fn extract_capabilities(caps: &lsp_types::ServerCapabilities) -> Vec<&'static st
 /// Find session by ID or prefix
 fn find_session(id: &str) -> Result<session::SessionInfo> {
     // Try exact match first
-    if let Some(s) = session::get_session(id)? {
+    if let Some((s, _)) = session::get_session(id)? {
         return Ok(s);
     }
 
     // Try prefix match
     let sessions = session::list_sessions()?;
-    let matches: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(id)).collect();
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|(s, _)| s.id.starts_with(id))
+        .collect();
 
     match matches.len() {
         0 => anyhow::bail!("No session found matching '{id}'"),
-        1 => Ok(matches[0].clone()),
+        1 => Ok(matches[0].0.clone()),
         _ => {
             eprintln!("Multiple sessions match '{id}':");
-            for s in matches {
+            for (s, _) in matches {
                 eprintln!("  {}", s.id);
             }
             anyhow::bail!("Please specify a more complete session ID")
@@ -1818,9 +1861,9 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(file);
-            let lock_icon = colors.green("locked");
+            let lock_icon = colors.green("acquired");
             let tool_label = tool.as_ref().map(|t| format!(" ({t})")).unwrap_or_default();
-            let short_owner = cli::truncate(owner, 20);
+            let short_owner = cli::truncate(owner, 8);
             println!("{time_str} {basename}: {lock_icon}{tool_label} by {short_owner}");
         }
         EventKind::LockReleased { file, owner, tool } => {
@@ -1828,9 +1871,9 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(file);
-            let unlock_icon = colors.dim("unlocked");
+            let unlock_icon = colors.dim("released");
             let tool_label = tool.as_ref().map(|t| format!(" ({t})")).unwrap_or_default();
-            let short_owner = cli::truncate(owner, 20);
+            let short_owner = cli::truncate(owner, 8);
             println!("{time_str} {basename}: {unlock_icon}{tool_label} by {short_owner}");
         }
         EventKind::LockDenied {
@@ -1842,9 +1885,9 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(file);
-            let denied = colors.red("lock denied");
-            let short_owner = cli::truncate(owner, 20);
-            let short_held = cli::truncate(held_by, 20);
+            let denied = colors.red("acquire denied");
+            let short_owner = cli::truncate(owner, 8);
+            let short_held = cli::truncate(held_by, 8);
             println!("{time_str} {basename}: {denied} for {short_owner} (held by {short_held})");
         }
         EventKind::McpMessage { direction, message } => {

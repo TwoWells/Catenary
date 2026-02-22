@@ -13,7 +13,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing::warn;
 
 /// Session metadata stored in info.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +319,10 @@ impl Drop for Session {
 
         self.broadcast(EventKind::Shutdown);
 
+        // Write a dead marker so observers can tell the session ended cleanly
+        // even if the PID is later reused by another process.
+        let _ = File::create(self.dir.join("dead"));
+
         // Clean up notify socket (Unix only — named pipes are kernel
         // objects cleaned up automatically when all handles close)
         #[cfg(unix)]
@@ -327,11 +330,8 @@ impl Drop for Session {
             let _ = fs::remove_file(sock);
         }
 
-        // Clean up session directory
-
-        if let Err(e) = fs::remove_dir_all(&self.dir) {
-            warn!("Failed to clean up session directory: {}", e);
-        }
+        // Session directory is intentionally retained for post-mortem inspection.
+        // Pruning is handled separately based on log_retention_days.
     }
 }
 
@@ -381,12 +381,14 @@ impl EventBroadcaster {
     }
 }
 
-/// List all active sessions.
+/// List all sessions (active and inactive).
+///
+/// Returns a list of sessions and their status (true = active, false = dead).
 ///
 /// # Errors
 ///
 /// Returns an error if the sessions directory cannot be read.
-pub fn list_sessions() -> Result<Vec<SessionInfo>> {
+pub fn list_sessions() -> Result<Vec<(SessionInfo, bool)>> {
     let sessions_base = sessions_dir();
 
     if !sessions_base.exists() {
@@ -403,29 +405,25 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
             && let Ok(file) = File::open(&info_path)
             && let Ok(info) = serde_json::from_reader::<_, SessionInfo>(file)
         {
-            // Check if process is still alive
-            if is_process_alive(info.pid) {
-                sessions.push(info);
-            } else {
-                // Clean up dead session
-                warn!("Cleaning up dead session {} (pid {})", info.id, info.pid);
-                let _ = fs::remove_dir_all(entry.path());
-            }
+            let alive = session_is_alive(&entry.path(), info.pid);
+            sessions.push((info, alive));
         }
     }
 
     // Sort by start time (most recent first)
-    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    sessions.sort_by(|(a, _), (b, _)| b.started_at.cmp(&a.started_at));
 
     Ok(sessions)
 }
 
 /// Get a specific session by ID.
 ///
+/// Returns the session info and its status (true = active, false = dead).
+///
 /// # Errors
 ///
 /// Returns an error if the session info file exists but cannot be read or parsed.
-pub fn get_session(id: &str) -> Result<Option<SessionInfo>> {
+pub fn get_session(id: &str) -> Result<Option<(SessionInfo, bool)>> {
     let sessions_base = sessions_dir();
     let info_path = sessions_base.join(id).join("info.json");
 
@@ -435,14 +433,10 @@ pub fn get_session(id: &str) -> Result<Option<SessionInfo>> {
 
     let file = File::open(&info_path)?;
     let info: SessionInfo = serde_json::from_reader(file)?;
+    let session_dir = sessions_base.join(id);
+    let alive = session_is_alive(&session_dir, info.pid);
 
-    if is_process_alive(info.pid) {
-        Ok(Some(info))
-    } else {
-        // Clean up dead session
-        let _ = fs::remove_dir_all(sessions_base.join(id));
-        Ok(None)
-    }
+    Ok(Some((info, alive)))
 }
 
 /// Monitor events from a session (blocking iterator).
@@ -503,52 +497,64 @@ impl TailReader {
         })
     }
 
-    /// Read the next event, blocking if necessary.
+    /// Read the next event if available. Returns `None` if no new event is currently in the file.
     ///
     /// # Errors
     ///
     /// Returns an error if reading from the file fails.
-    pub fn next_event(&mut self) -> Result<Option<SessionEvent>> {
+    pub fn try_next_event(&mut self) -> Result<Option<SessionEvent>> {
         use std::io::Seek;
 
-        loop {
-            let mut line = String::new();
-            let bytes_read = self.reader.read_line(&mut line)?;
+        let mut line = String::new();
+        let bytes_read = self.reader.read_line(&mut line)?;
 
-            if bytes_read > 0 {
-                let line = line.trim();
-                if !line.is_empty()
-                    && let Ok(event) = serde_json::from_str::<SessionEvent>(line)
-                {
+        if bytes_read > 0 {
+            let line = line.trim();
+            if !line.is_empty() {
+                // If parse fails, we just skip it (log error?) or return None?
+                // Original code ignored parse errors implicitly by looping.
+                // Let's return None if parse fails to avoid breaking the loop in caller,
+                // but ideally we should log it. For now, let's match original behavior:
+                // if parse ok -> return Some.
+                if let Ok(event) = serde_json::from_str::<SessionEvent>(line) {
                     return Ok(Some(event));
                 }
-            } else {
-                // Check if file was truncated or if we should wait
-                if let Ok(metadata) = fs::metadata(&self.path) {
-                    if metadata.len() < self.last_size {
-                        // File was truncated, reopen
-                        let file = File::open(&self.path)?;
-                        self.reader = BufReader::new(file);
-                        self.last_size = 0;
-                        continue;
-                    }
-
-                    if metadata.len() > self.last_size {
-                        // File grew — reset BufReader's EOF state so
-                        // it reads new data on the next iteration.
-                        self.reader.stream_position()?;
-                    }
-
-                    self.last_size = metadata.len();
-                } else {
-                    // File was deleted, session ended
-                    return Ok(None);
-                }
-
-                // Wait a bit before checking again
-                std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            // Empty line or parse error: treat as "read something but no event"
+            // We can return None (so caller sleeps) or recurse?
+            // Let's return None. Caller will sleep 100ms and retry.
+            return Ok(None);
         }
+
+        // Check if file was truncated or if we should wait
+        if let Ok(metadata) = fs::metadata(&self.path) {
+            if metadata.len() < self.last_size {
+                // File was truncated, reopen
+                let file = File::open(&self.path)?;
+                self.reader = BufReader::new(file);
+                self.last_size = 0;
+                // Retry reading immediately? Or just return None and let caller loop?
+                // Return None.
+                return Ok(None);
+            }
+
+            if metadata.len() > self.last_size {
+                // File grew — reset BufReader's EOF state so
+                // it reads new data on the next iteration.
+                self.reader.stream_position()?;
+            }
+
+            self.last_size = metadata.len();
+        } else {
+            // File was deleted
+            // We could return a special error or just let the caller handle it.
+            // But if file is deleted, `run_monitor` usually exits.
+            // Since we don't delete files anymore, this case is rare (manual deletion).
+            // Let's return error to signal "Stop".
+            anyhow::bail!("Events file deleted");
+        }
+
+        Ok(None)
     }
 }
 
@@ -588,6 +594,17 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
     let mut languages: Vec<String> = states.keys().cloned().collect();
     languages.sort();
     Ok(languages)
+}
+
+/// Determine whether a session is alive.
+///
+/// A session is dead if it wrote a `dead` marker on shutdown, or if its
+/// recorded PID is no longer running (crash / SIGKILL recovery).
+fn session_is_alive(session_dir: &std::path::Path, pid: u32) -> bool {
+    if session_dir.join("dead").exists() {
+        return false;
+    }
+    is_process_alive(pid)
 }
 
 /// Check if a process is still running.
@@ -632,19 +649,25 @@ mod tests {
 
         // Should appear in list
         let sessions = list_sessions()?;
-        assert!(sessions.iter().any(|s| s.id == id));
+        assert!(sessions.iter().any(|(s, _)| s.id == id));
 
         // Should be retrievable
         let found = get_session(&id)?;
-        let found_session = found.context("missing session")?;
+        let (found_session, _) = found.context("missing session")?;
         assert_eq!(found_session.workspace, "/tmp/test-workspace");
 
         // Drop session
         drop(session);
 
-        // Should be cleaned up
+        // Should NOT be cleaned up immediately anymore (changed behavior)
+        // But get_session should still return it (as dead)
         let found = get_session(&id)?;
-        assert!(found.is_none());
+        let (_, alive) = found.context("missing session after drop")?;
+        assert!(!alive, "Session should be dead after drop");
+
+        // Manual cleanup
+        let _ = fs::remove_dir_all(sessions_dir().join(id));
+
         Ok(())
     }
 

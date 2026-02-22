@@ -23,7 +23,6 @@ struct ServerProcess {
 impl ServerProcess {
     fn spawn() -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.arg("serve");
         cmd.arg("--root").arg(".");
         // Isolate from user-level config
         cmd.env("XDG_CONFIG_HOME", ".");

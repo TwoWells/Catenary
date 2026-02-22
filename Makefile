@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: check test release release-patch release-minor release-major tag-current
+.PHONY: build-release check test release release-patch release-minor release-major tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -14,15 +14,18 @@ CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/vers
 VERSION_FILES := Cargo.toml .claude-plugin/marketplace.json gemini-extension.json
 
 # Default target: run all checks
+build-release:
+	@cargo build --release
+
 check:
 	@cargo fmt
-	@cargo clippy --tests --quiet -- -D warnings
+	@cargo clippy --tests --features mockls --quiet -- -D warnings
 	@cargo deny --log-level error check >/dev/null 2>&1
-	@cargo nextest run --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	@cargo nextest run --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 # Run tests. Pass T= to filter, e.g.: make test T=json_diagnostics
 test:
-	@cargo nextest run --status-level fail --final-status-level slow --cargo-quiet $(if $(T),$(if $(filter !%,$(T)),-E 'not test($(patsubst !%,%,$(T)))',-E 'test($(T))'),)
+	@cargo nextest run --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(T),$(if $(filter !%,$(T)),-E 'not test($(patsubst !%,%,$(T)))',-E 'test($(T))'),)
 
 # Verify we're in a good state for release
 pre-release-check:

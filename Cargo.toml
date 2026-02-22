@@ -20,6 +20,10 @@ path = "src/main.rs"
 [[bin]]
 name = "mockls"
 path = "src/bin/mockls.rs"
+required-features = ["mockls"]
+
+[features]
+mockls = []
 
 [dependencies]
 anyhow = "1.0.100"

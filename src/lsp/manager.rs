@@ -500,6 +500,7 @@ mod tests {
         Config {
             server: HashMap::new(),
             idle_timeout: 300,
+            log_retention_days: 7,
         }
     }
 
@@ -529,6 +530,7 @@ mod tests {
         Config {
             server,
             idle_timeout: 300,
+            log_retention_days: 7,
         }
     }
 
@@ -546,6 +548,7 @@ mod tests {
         Config {
             server,
             idle_timeout: 300,
+            log_retention_days: 7,
         }
     }
 
