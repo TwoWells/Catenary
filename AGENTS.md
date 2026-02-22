@@ -72,6 +72,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Check (full):** `make check` — format, lint, deny, and test in one pass.
 - **Test (all):** `make test`
 - **Test (filtered):** `make test T=<filter>` — run only tests matching the filter (e.g., `make test T=json_diagnostics`).
+- **Test (repeat):** `make test T=<filter> N=<count>` — stress-test by repeating N times (e.g., `make test T=flaky_test N=5`).
 - **Lint:** `cargo clippy`
 - **Format:** `cargo fmt`
 

@@ -142,6 +142,14 @@ Catenary:
 2. Diffs the new roots against the current set.
 3. Updates the `PathValidator` security boundary.
 4. Sends a batched `workspace/didChangeWorkspaceFolders` notification to each
-   active LSP server.
+   active LSP server. When folders are added, the server is proactively marked
+   as `Indexing` so that subsequent queries block until re-indexing completes.
 5. Spawns any newly needed LSP servers for languages detected in the added
    roots.
+
+The readiness wait after step 4 uses the same `wait_ready()` mechanism as
+initial startup. For servers that report `$/progress` (e.g., rust-analyzer),
+the wait is event-driven — queries unblock when the progress cycle completes.
+For servers without progress support, Catenary falls back to activity settle
+(the same `ProcessMonitor`-style polling used by the diagnostics system),
+transitioning to `Ready` once the server has been quiet for 2 seconds.
