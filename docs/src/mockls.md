@@ -36,6 +36,9 @@ Flags are composable behavioral axes, not named presets.
 | `--hang-on <method>` | none | Never respond to this method (repeatable) |
 | `--fail-on <method>` | none | Return `InternalError` (-32603) for this method (repeatable) |
 | `--send-configuration-request` | off | Send `workspace/configuration` request after initialize |
+| `--publish-version` | off | Include `version` field in `publishDiagnostics` notifications |
+| `--progress-on-change` | off | Send `$/progress` tokens around diagnostic computation on `didChange` |
+| `--cpu-busy <ms>` | none | Burn CPU for N milliseconds after `didChange` without sending notifications |
 
 ### Example profiles
 
@@ -93,7 +96,7 @@ The flags document exactly what behavior each test targets.
 |---|---|
 | `textDocument/publishDiagnostics` | One warning per document on line 0: "mockls: mock diagnostic" |
 | `window/workDoneProgress/create` | Before indexing simulation |
-| `$/progress` (begin/end) | During indexing simulation |
+| `$/progress` (begin/end) | During indexing simulation (`--indexing-delay`) or around diagnostics (`--progress-on-change`) |
 | `workspace/configuration` | If `--send-configuration-request` is set |
 
 ## Diagnostics Trigger Behavior
@@ -106,13 +109,19 @@ mockls never publishes diagnostics spontaneously at startup — only in response
 | `--diagnostics-on-save` | no | no | publishes |
 | `--no-diagnostics` | no | no | no |
 | `--diagnostics-delay <ms>` | publishes after delay | publishes after delay | publishes after delay |
+| `--publish-version` | version field included | version field included | version field included |
+| `--progress-on-change` | no | progress + publishes | no |
+| `--cpu-busy <ms>` | no | burns CPU, no publish | no |
 
 These map to specific code paths in Catenary's `wait_for_diagnostics_update`:
 
-- **Default:** Server publishes promptly on `didOpen`, exercises Phase 1 generation advance.
-- **`--diagnostics-on-save`:** Server ignores `didOpen`/`didChange`, goes silent. Catenary detects inactivity, re-sends `didSave`, mockls publishes on the nudge.
+- **Default:** Server publishes promptly on `didOpen`, exercises Phase 1 generation advance via the `ProcessMonitor` strategy (no progress tokens, no version).
+- **`--diagnostics-on-save`:** Server ignores `didOpen`/`didChange`. Catenary sends `didSave` unconditionally after every change, which triggers mockls to publish.
 - **`--no-diagnostics`:** Exercises the "never published" grace period timeout path. Catenary handles servers that never emit diagnostics without hanging.
 - **`--diagnostics-delay`:** Diagnostics arrive late, exercises Phase 1 activity tracking.
+- **`--publish-version`:** Exercises the `Version` strategy — Catenary waits for `publishDiagnostics` with a version field, matching generation advance.
+- **`--progress-on-change`:** Exercises the `TokenMonitor` strategy — Catenary waits for `$/progress` Active -> Idle cycle around diagnostic computation.
+- **`--cpu-busy`:** Exercises the `ProcessMonitor` strategy under load — server burns CPU without sending progress or diagnostics, testing trust-based patience decay.
 
 ## Usage in Tests
 

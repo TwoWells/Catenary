@@ -22,7 +22,7 @@ check:
 
 # Run tests. Pass T= to filter, e.g.: make test T=json_diagnostics
 test:
-	@cargo nextest run --status-level fail --final-status-level slow --cargo-quiet $(if $(T),-E 'test($(T))',)
+	@cargo nextest run --status-level fail --final-status-level slow --cargo-quiet $(if $(T),$(if $(filter !%,$(T)),-E 'not test($(patsubst !%,%,$(T)))',-E 'test($(T))'),)
 
 # Verify we're in a good state for release
 pre-release-check:

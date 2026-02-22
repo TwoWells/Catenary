@@ -28,21 +28,19 @@ find-references, rename, and search without shell-based text scanning.
   hooks that fire before/after tool use. Hook definitions live in
   `plugins/catenary/hooks/hooks.json` (Claude Code) and `hooks/hooks.json`
   (Gemini CLI). See `docs/src/plugin-architecture.md` for the full hook contract.
-- **File locking:** The `catenary lock` subsystem (`src/lock.rs`) serializes
-  concurrent file edits across agents. Locks are advisory, filesystem-based, and
+- **File locking and diagnostics:** The `catenary acquire` / `catenary release`
+  commands (`src/lock.rs` for locking, `src/notify.rs` for diagnostics) manage
+  the full pre/post-tool lifecycle. Locks are advisory, filesystem-based, and
   keyed by absolute file path. Ownership is tracked by an `owner` string built
   from `session_id` (+ `agent_id` if present) from the hook JSON.
-  - `lock acquire` (PreToolUse on Edit/Write): blocks until the lock is available.
-    Also runs stale-read detection — compares the file's current mtime against
-    the last value recorded by `track-read` for this owner, and warns if they
-    differ.
-  - `lock release` (PostToolUse on Edit/Write): sets a grace period (default 30s)
-    so the same owner can re-acquire without contention during diagnostics→fix
-    cycles.
-  - `lock track-read` (PostToolUse on Read): records the file's mtime so future
-    `lock acquire` calls can detect external modifications.
-- **Diagnostics:** `catenary notify` (PostToolUse on Edit/Write) sends the edited
-  file path to the session and returns LSP diagnostics to the agent.
+  - `catenary acquire` (PreToolUse on Edit/Write/Read): blocks until the lock is
+    available. Also runs stale-read detection — compares the file's current mtime
+    against the last tracked value for this owner, and warns if they differ.
+  - `catenary release` (PostToolUse on Edit/Write/Read): runs diagnostics notify,
+    records the file's mtime (track-read), then releases the lock with a grace
+    period (default 30s) so the same owner can re-acquire without contention
+    during diagnostics→fix cycles. On failure (`--grace 0`, no `--format`), just
+    releases the lock immediately.
 - **Root sync:** `catenary sync-roots` (PreToolUse, Claude Code only) scans the
   transcript for `/add-dir` workspace additions and forwards them to the session.
 

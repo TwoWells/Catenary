@@ -27,7 +27,7 @@ Instead of reading a 500-line file to find a type signature, the agent asks
 the language server directly — `hover` returns 50 tokens instead of 2,000.
 Instead of grepping across 20 files to find a definition, `definition` returns
 the exact location in one query. Instead of re-reading a file after editing it
-to check for errors, the `catenary notify` hook returns diagnostics inline.
+to check for errors, the `catenary release` hook returns diagnostics inline.
 
 Each LSP query is small and stateless. Nothing accumulates. The context stays
 lean across the entire session, regardless of how long the agent works.
@@ -58,7 +58,7 @@ lean across the entire session, regardless of how long the agent works.
 Catenary bridges [MCP](https://modelcontextprotocol.io/) and
 [LSP](https://microsoft.github.io/language-server-protocol/). It manages
 multiple language servers, routes requests by file type, and provides automatic
-post-edit diagnostics via the `catenary notify` hook — all through a single MCP
+post-edit diagnostics via the `catenary release` hook — all through a single MCP
 server. The agent never needs to know which server handles which language.
 
 ## Constrained Mode
@@ -68,7 +68,7 @@ supplement. In constrained mode, the host CLI's text-scanning commands (grep,
 cat, find, ls, etc.) are denied via permissions, forcing the agent to use LSP
 queries for navigation. The host's native file I/O tools remain available for
 reading and editing, with Catenary providing post-edit diagnostics via the
-`catenary notify` hook.
+`catenary release` hook.
 
 See [CLI Integration](cli-integration.md) for setup instructions.
 
@@ -116,7 +116,7 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 
 File reading and editing is handled by the host tool's native file operations
 (e.g. Claude Code's `Read`, `Edit`, `Write`). Catenary provides **post-edit
-LSP diagnostics** via the `catenary notify` hook — diagnostics appear in the
+LSP diagnostics** via the `catenary release` hook — diagnostics appear in the
 model's context after every edit. See [CLI Integration](cli-integration.md)
 for hook configuration.
 

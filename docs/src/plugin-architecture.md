@@ -74,16 +74,13 @@ Inside `plugins/catenary/`:
   file locking:
   - `PreToolUse` (all tools): runs `catenary sync-roots` to pick up `/add-dir`
     workspace additions and directory removals.
-  - `PreToolUse` on `Edit|Write|NotebookEdit`: runs `catenary lock acquire` to
-    serialize concurrent edits across agents.
-  - `PostToolUse` on `Edit|Write|NotebookEdit`: runs `catenary notify` for
-    post-edit LSP diagnostics, then `catenary lock track-read` to update the
-    tracked mtime (preventing false stale-read warnings on self-edits), then
-    `catenary lock release` to start the grace period.
-  - `PostToolUse` on `Read`: runs `catenary lock track-read` for change
-    detection.
-  - `PostToolUseFailure` on `Edit|Write|NotebookEdit`: runs
-    `catenary lock release --grace 0` for immediate lock release on failure.
+  - `PreToolUse` on `Edit|Write|NotebookEdit|Read`: runs `catenary acquire` to
+    serialize concurrent file access across agents.
+  - `PostToolUse` on `Edit|Write|NotebookEdit|Read`: runs `catenary release`
+    which handles the full post-tool pipeline — diagnostics notify, mtime
+    tracking, then lock release with grace period.
+  - `PostToolUseFailure` on `Edit|Write|NotebookEdit|Read`: runs
+    `catenary release --grace 0` for immediate lock release on failure.
 - **`config.example.toml`** — example Catenary configuration.
 
 ## Gemini CLI Extension
@@ -99,66 +96,24 @@ The extension root is the repository root. Two files matter:
 - **`gemini-extension.json`** — manifest declaring the MCP server. Does **not**
   contain hooks (Gemini CLI ignores hooks defined in the manifest).
 - **`hooks/hooks.json`** — registers hooks for diagnostics and file locking:
-  - `BeforeTool` on `write_file|replace`: runs
-    `catenary lock acquire --format=gemini` to serialize concurrent edits.
+  - `BeforeTool` on `read_file|write_file|replace`: runs
+    `catenary acquire --format=gemini` to serialize concurrent file access.
   - `AfterTool` on `read_file|write_file|replace`: runs
-    `catenary notify --format=gemini` for post-edit LSP diagnostics.
-  - `AfterTool` on `write_file|replace`: runs
-    `catenary lock track-read --format=gemini` to update the tracked mtime.
-  - `AfterTool` on `write_file|replace`: runs
-    `catenary lock release --format=gemini` for lock grace period.
-  - `AfterTool` on `read_file`: runs
-    `catenary lock track-read --format=gemini` for change detection.
+    `catenary release --format=gemini` which handles the full post-tool
+    pipeline — diagnostics notify, mtime tracking, then lock release.
 
 ## Hook Contracts
 
-All hook commands (`catenary notify`, `catenary sync-roots`, `catenary lock`)
+All hook commands (`catenary acquire`, `catenary release`, `catenary sync-roots`)
 read hook JSON from stdin. They silently succeed on any error to avoid breaking
 the host CLI's flow.
 
-### `catenary notify`
+### `catenary acquire`
 
-Triggered after file edits. Reads the hook JSON, extracts the file path, finds
-the matching Catenary session, and returns LSP diagnostics to stdout.
-
-**Fields consumed from hook JSON:**
-
-| Field | Used for |
-| ----- | -------- |
-| `tool_input.file_path` or `tool_input.file` | File that was edited |
-| `cwd` | Resolving relative file paths (fallback: process CWD) |
-
-**Output format** depends on the `--format` flag. Both formats wrap
-diagnostics in a `hookSpecificOutput` JSON envelope:
-
-- Default (Claude Code): includes `hookEventName: "PostToolUse"` and
-  `additionalContext` for Claude Code's `PostToolUse` hook contract.
-- `--format=gemini`: uses `additionalContext` with an "LSP Diagnostics"
-  prefix for Gemini CLI's `AfterTool` hooks.
-
-### `catenary sync-roots`
-
-Triggered before each tool use (Claude Code only). Scans the Claude Code
-transcript for `/add-dir` additions and directory removals, then sends the full
-workspace root set to the running Catenary session. The server diffs against its
-current state, applying both additions and removals to LSP clients and the search
-index.
-
-State is persisted in `known_roots.json` (inside the session directory) to track
-the transcript byte offset and the full discovered root set across invocations.
-
-**Fields consumed from hook JSON:**
-
-| Field | Used for |
-| ----- | -------- |
-| `transcript_path` | Path to the Claude Code transcript file |
-| `cwd` | Identifying which Catenary session to update |
-
-### `catenary lock acquire`
-
-Triggered before file edits (Claude Code `PreToolUse`, Gemini `BeforeTool`). Acquires a file-level
-advisory lock, blocking until the lock is available or the timeout expires. This
-serializes concurrent edits to the same file across multiple agents.
+Triggered before file reads or edits (Claude Code `PreToolUse`, Gemini
+`BeforeTool`). Acquires a file-level advisory lock, blocking until the lock is
+available or the timeout expires. This serializes concurrent access to the same
+file across multiple agents.
 
 **Fields consumed from hook JSON:**
 
@@ -180,11 +135,20 @@ serializes concurrent edits to the same file across multiple agents.
 `permissionDecision: "deny"`. If the file was modified since the owner's last
 read, returns JSON with `additionalContext` warning.
 
-### `catenary lock release`
+### `catenary release`
 
-Triggered after file edits (Claude Code `PostToolUse`, Gemini `AfterTool`).
-Releases the lock with a grace period, allowing the same agent to re-acquire
-without contention during the diagnostics→fix cycle.
+Triggered after file reads or edits (Claude Code `PostToolUse`, Gemini
+`AfterTool`). Runs the full post-tool pipeline:
+
+1. **Diagnostics notify** — connects to the session's notify socket and returns
+   LSP diagnostics to stdout (when `--format` is provided).
+2. **Track read** — records the file's mtime so future `acquire` calls can
+   detect external modifications (when `--format` is provided).
+3. **Lock release** — releases the lock with a grace period, allowing the same
+   agent to re-acquire without contention during diagnostics→fix cycles.
+
+When `--format` is omitted (failure path, e.g. `--grace 0`), skips diagnostics
+and track-read, just releasing the lock immediately.
 
 **Fields consumed from hook JSON:**
 
@@ -193,27 +157,32 @@ without contention during the diagnostics→fix cycle.
 | `session_id` | Lock owner identity |
 | `agent_id` | Lock owner identity (appended if present) |
 | `tool_input.file_path` or `tool_input.file` | File to unlock |
-| `cwd` | Finding the session for monitor events |
+| `cwd` | Resolving relative file paths and finding the session for diagnostics/monitor events |
 
 **Flags:**
 
 | Flag | Required | Description |
 | ---- | -------- | ----------- |
 | `--grace` | no (default 30) | Seconds before the lock expires |
+| `--format` | no | Output format (`claude` or `gemini`). When set, runs diagnostics and track-read before releasing |
 
-### `catenary lock track-read`
+### `catenary sync-roots`
 
-Triggered after file reads (Claude Code `PostToolUse` on `Read`, Gemini
-`AfterTool` on `read_file`). Records the file's modification time so future
-lock acquisitions can detect if the file changed since the agent last read it.
+Triggered before each tool use (Claude Code only). Scans the Claude Code
+transcript for `/add-dir` additions and directory removals, then sends the full
+workspace root set to the running Catenary session. The server diffs against its
+current state, applying both additions and removals to LSP clients and the search
+index.
+
+State is persisted in `known_roots.json` (inside the session directory) to track
+the transcript byte offset and the full discovered root set across invocations.
 
 **Fields consumed from hook JSON:**
 
 | Field | Used for |
 | ----- | -------- |
-| `session_id` | Owner identity for tracking |
-| `agent_id` | Owner identity (appended if present) |
-| `tool_input.file_path` or `tool_input.file` | File to track |
+| `transcript_path` | Path to the Claude Code transcript file |
+| `cwd` | Identifying which Catenary session to update |
 
 ## Version Management
 

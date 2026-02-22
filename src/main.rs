@@ -29,7 +29,7 @@ use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
 /// Output format for hook commands.
 ///
 /// Determines how hook output is structured for the host CLI.
-/// Required on all hook-facing subcommands (`notify`, `sync-roots`, `lock`).
+/// Required on all hook-facing subcommands (`acquire`, `release`, `sync-roots`).
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum HostFormat {
     /// Claude Code hooks (`PostToolUse` / `PreToolUse`).
@@ -100,15 +100,6 @@ enum Command {
         id: String,
     },
 
-    /// Notify a running session of a file change (used by `PostToolUse` hooks).
-    /// Reads hook JSON from stdin, connects to the session's notify socket,
-    /// and prints any LSP diagnostics to stdout.
-    Notify {
-        /// Output format: "claude" or "gemini".
-        #[arg(long, value_enum)]
-        format: HostFormat,
-    },
-
     /// Check language server health for the current workspace.
     Doctor {
         /// Disable colored output.
@@ -124,21 +115,7 @@ enum Command {
         format: HostFormat,
     },
 
-    /// Manage file locks for concurrent agent coordination.
-    /// Used by `PreToolUse` and `PostToolUse` hooks to serialize file edits
-    /// across multiple agents.
-    Lock {
-        /// The lock action to perform.
-        #[command(subcommand)]
-        action: LockAction,
-    },
-}
-
-/// Lock subcommands for concurrent agent coordination.
-#[derive(Subcommand, Clone, Copy, Debug)]
-enum LockAction {
-    /// Acquire a lock before editing a file.
-    /// Blocks until the lock is available or the timeout expires.
+    /// Acquire a file lock before reading or editing.
     /// Reads hook JSON from stdin.
     Acquire {
         /// Maximum time to wait for the lock (seconds).
@@ -150,20 +127,18 @@ enum LockAction {
         format: HostFormat,
     },
 
-    /// Release a lock after editing a file.
-    /// Sets a grace period before the lock becomes available to other agents.
+    /// Release a file lock after reading or editing.
+    /// Runs diagnostics notify and track-read before releasing.
     /// Reads hook JSON from stdin.
     Release {
         /// Grace period before the lock expires (seconds).
         #[arg(long, default_value = "30")]
         grace: u64,
-    },
 
-    /// Track a file read for change detection.
-    /// Records the file's modification time so future lock acquisitions
-    /// can warn if the file changed.
-    /// Reads hook JSON from stdin.
-    TrackRead,
+        /// Output format. When set, runs diagnostics and track-read before releasing.
+        #[arg(long, value_enum)]
+        format: Option<HostFormat>,
+    },
 }
 
 /// Entry point for the Catenary binary.
@@ -185,17 +160,17 @@ async fn main() -> Result<()> {
             filter,
         }) => run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => run_status(&id),
-        Some(Command::Notify { format }) => {
-            run_notify(format);
-            Ok(())
-        }
         Some(Command::Doctor { nocolor }) => run_doctor(args, nocolor).await,
         Some(Command::SyncRoots { format }) => {
             run_sync_roots(format);
             Ok(())
         }
-        Some(Command::Lock { action }) => {
-            run_lock(action);
+        Some(Command::Acquire { timeout, format }) => {
+            run_acquire(timeout, format);
+            Ok(())
+        }
+        Some(Command::Release { grace, format }) => {
+            run_release(grace, format);
             Ok(())
         }
     }
@@ -698,12 +673,14 @@ fn ipc_exchange(
     lines
 }
 
-/// Notify a running session of a file change (`PostToolUse` hook handler).
+/// Acquire a file lock before reading or editing (`PreToolUse` hook handler).
 ///
-/// Reads hook JSON from stdin, finds the matching session by workspace,
-/// connects to its notify endpoint, and prints diagnostics to stdout.
-/// Silently succeeds on any error to avoid breaking Claude Code's flow.
-fn run_notify(format: HostFormat) {
+/// Reads hook JSON from stdin, extracts the owner and file path, and acquires
+/// the lock. Blocks until the lock is available or the timeout expires.
+/// Silently succeeds on any error to avoid breaking the host CLI's flow.
+fn run_acquire(timeout: u64, format: HostFormat) {
+    use catenary_mcp::lock::AcquireResult;
+
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -712,51 +689,120 @@ fn run_notify(format: HostFormat) {
         return;
     };
 
-    // Extract file_path from tool_input
-    let file_path = hook_json
-        .get("tool_input")
-        .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
-        .and_then(|fp| fp.as_str());
-
-    let Some(file_path) = file_path else {
+    let owner = extract_owner(&hook_json);
+    let Some(file_path) = extract_file_path(&hook_json) else {
         return;
     };
 
-    // Resolve to absolute path using cwd from hook JSON (matching run_sync_roots)
-    let abs_path = if std::path::Path::new(file_path).is_absolute() {
-        std::path::PathBuf::from(file_path)
-    } else {
-        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
-            || std::env::current_dir().unwrap_or_default(),
-            PathBuf::from,
-        );
-        cwd.join(file_path)
-    };
-
-    // Find session whose workspace contains this file
-    let sessions = session::list_sessions().unwrap_or_default();
-    let session = sessions
-        .iter()
-        .find(|s| abs_path.to_string_lossy().starts_with(&s.workspace));
-
-    let Some(session) = session else {
+    let Ok(mgr) = catenary_mcp::lock::FileLockManager::new() else {
         return;
     };
 
-    let endpoint = notify_endpoint(&session.id);
-    let Some(stream) = notify_connect(&endpoint) else {
+    let result = mgr.acquire(&file_path, &owner, timeout);
+
+    match result {
+        AcquireResult::Acquired => {
+            broadcast_lock_event(
+                &hook_json,
+                EventKind::LockAcquired {
+                    file: file_path,
+                    owner,
+                },
+            );
+        }
+        AcquireResult::AcquiredStaleRead { context } => {
+            broadcast_lock_event(
+                &hook_json,
+                EventKind::LockAcquired {
+                    file: file_path,
+                    owner,
+                },
+            );
+            let output = format_lock_output(format, Some(&context), None);
+            print!("{output}");
+        }
+        AcquireResult::Denied { reason } => {
+            broadcast_lock_event(
+                &hook_json,
+                EventKind::LockDenied {
+                    file: file_path,
+                    owner,
+                    held_by: "unknown".to_string(),
+                },
+            );
+            let output = format_lock_output(format, None, Some(&reason));
+            print!("{output}");
+        }
+    }
+}
+
+/// Release a file lock after reading or editing (`PostToolUse` hook handler).
+///
+/// When `format` is `Some`, runs the full post-tool pipeline before releasing:
+/// 1. Notify the session (diagnostics)
+/// 2. Track the file read (mtime recording)
+/// 3. Release the lock
+///
+/// When `format` is `None` (failure path), just releases the lock immediately.
+/// Silently succeeds on any error to avoid breaking the host CLI's flow.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Sequential post-tool pipeline with early returns"
+)]
+fn run_release(grace: u64, format: Option<HostFormat>) {
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
 
-    let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
-    let lines = ipc_exchange(stream, &request);
-
-    if lines.is_empty() {
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
         return;
+    };
+
+    let owner = extract_owner(&hook_json);
+    let Some(file_path) = extract_file_path(&hook_json) else {
+        return;
+    };
+
+    let Ok(mgr) = catenary_mcp::lock::FileLockManager::new() else {
+        return;
+    };
+
+    // When format is provided, run diagnostics and track-read before releasing
+    if let Some(fmt) = format {
+        // Step 1: Notify session for diagnostics
+        let abs_path = PathBuf::from(&file_path);
+        let sessions = session::list_sessions().unwrap_or_default();
+        let session = sessions
+            .iter()
+            .find(|s| abs_path.to_string_lossy().starts_with(&s.workspace));
+
+        if let Some(session) = session {
+            let endpoint = notify_endpoint(&session.id);
+            if let Some(stream) = notify_connect(&endpoint) {
+                let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
+                let lines = ipc_exchange(stream, &request);
+
+                if !lines.is_empty() {
+                    let output = format_diagnostics(&lines, fmt, "PostToolUse");
+                    print!("{output}");
+                }
+            }
+        }
+
+        // Step 2: Track read (record mtime)
+        let _ = mgr.track_read(&file_path, &owner);
     }
 
-    let output = format_diagnostics(&lines, format, "PostToolUse");
-    print!("{output}");
+    // Step 3: Release lock
+    if mgr.release(&file_path, &owner, grace).is_ok() {
+        broadcast_lock_event(
+            &hook_json,
+            EventKind::LockReleased {
+                file: file_path,
+                owner,
+            },
+        );
+    }
 }
 
 /// Sync workspace roots from Claude Code transcript to a running Catenary session.
@@ -970,119 +1016,6 @@ fn save_root_state(path: &Path, offset: u64, roots: &[PathBuf]) {
     if let Ok(json) = serde_json::to_string(&state) {
         let _ = std::fs::write(path, json);
     }
-}
-
-/// Dispatch lock subcommands.
-///
-/// Reads hook JSON from stdin, extracts owner identity and file path,
-/// and performs the requested lock operation. Silently succeeds on any
-/// error to avoid breaking the host CLI's flow.
-fn run_lock(action: LockAction) {
-    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
-        return;
-    };
-
-    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
-        return;
-    };
-
-    let owner = extract_owner(&hook_json);
-    let Some(file_path) = extract_file_path(&hook_json) else {
-        return;
-    };
-
-    let Ok(mgr) = catenary_mcp::lock::FileLockManager::new() else {
-        return;
-    };
-
-    match action {
-        LockAction::Acquire { timeout, format } => {
-            run_lock_acquire(&mgr, &file_path, &owner, timeout, format, &hook_json);
-        }
-        LockAction::Release { grace } => {
-            run_lock_release(&mgr, &file_path, &owner, grace, &hook_json);
-        }
-        LockAction::TrackRead => {
-            run_lock_track_read(&mgr, &file_path, &owner);
-        }
-    }
-}
-
-/// Acquires a file lock, blocking until available or timeout.
-fn run_lock_acquire(
-    mgr: &catenary_mcp::lock::FileLockManager,
-    file_path: &str,
-    owner: &str,
-    timeout: u64,
-    format: HostFormat,
-    hook_json: &serde_json::Value,
-) {
-    use catenary_mcp::lock::AcquireResult;
-
-    let result = mgr.acquire(file_path, owner, timeout);
-
-    // Broadcast event to monitor (best-effort)
-    match &result {
-        AcquireResult::Acquired | AcquireResult::AcquiredStaleRead { .. } => {
-            broadcast_lock_event(
-                hook_json,
-                EventKind::LockAcquired {
-                    file: file_path.to_string(),
-                    owner: owner.to_string(),
-                },
-            );
-        }
-        AcquireResult::Denied { .. } => {
-            // Read the lock to find who's holding it
-            let held_by = "unknown".to_string();
-            broadcast_lock_event(
-                hook_json,
-                EventKind::LockDenied {
-                    file: file_path.to_string(),
-                    owner: owner.to_string(),
-                    held_by,
-                },
-            );
-        }
-    }
-
-    match result {
-        AcquireResult::Acquired => {
-            // Silent success
-        }
-        AcquireResult::AcquiredStaleRead { context } => {
-            let output = format_lock_output(format, Some(&context), None);
-            print!("{output}");
-        }
-        AcquireResult::Denied { reason } => {
-            let output = format_lock_output(format, None, Some(&reason));
-            print!("{output}");
-        }
-    }
-}
-
-/// Releases a file lock with an optional grace period.
-fn run_lock_release(
-    mgr: &catenary_mcp::lock::FileLockManager,
-    file_path: &str,
-    owner: &str,
-    grace: u64,
-    hook_json: &serde_json::Value,
-) {
-    if mgr.release(file_path, owner, grace).is_ok() {
-        broadcast_lock_event(
-            hook_json,
-            EventKind::LockReleased {
-                file: file_path.to_string(),
-                owner: owner.to_string(),
-            },
-        );
-    }
-}
-
-/// Records a file read for change detection.
-fn run_lock_track_read(mgr: &catenary_mcp::lock::FileLockManager, file_path: &str, owner: &str) {
-    let _ = mgr.track_read(file_path, owner);
 }
 
 /// Extracts the owner identity from hook JSON.

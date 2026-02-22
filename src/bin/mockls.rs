@@ -69,11 +69,6 @@ struct Args {
     #[arg(long)]
     publish_version: bool,
 
-    /// Advertise `diagnosticProvider` capability and handle
-    /// `textDocument/diagnostic` requests.
-    #[arg(long)]
-    pull_diagnostics: bool,
-
     /// Send progress tokens around diagnostic computation on `didChange`
     /// (simulates cargo clippy progress).
     #[arg(long)]
@@ -153,6 +148,8 @@ impl Write for SharedVecWriter {
 struct MockServer {
     args: Args,
     documents: HashMap<String, String>,
+    /// Tracks the document version from `didOpen`/`didChange` per URI.
+    versions: HashMap<String, i32>,
     response_count: u64,
     writer: Writer,
     shutdown_flag: Arc<AtomicBool>,
@@ -164,6 +161,7 @@ impl MockServer {
         Self {
             args,
             documents: HashMap::new(),
+            versions: HashMap::new(),
             response_count: 0,
             writer,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -249,9 +247,6 @@ impl MockServer {
             "textDocument/references" => self.handle_references(&request.params),
             "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
-            "textDocument/diagnostic" if self.args.pull_diagnostics => {
-                Some(self.handle_pull_diagnostics(&request.params))
-            }
             _ => {
                 self.send_response(&Response {
                     jsonrpc: "2.0".to_string(),
@@ -289,7 +284,13 @@ impl MockServer {
                 if let Some(td) = params.get("textDocument") {
                     let uri = td.get("uri").and_then(Value::as_str).unwrap_or_default();
                     let text = td.get("text").and_then(Value::as_str).unwrap_or_default();
+                    let version = td
+                        .get("version")
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(1);
                     self.documents.insert(uri.to_string(), text.to_string());
+                    self.versions.insert(uri.to_string(), version);
 
                     if !self.args.no_diagnostics && !self.args.diagnostics_on_save {
                         self.publish_diagnostics(uri);
@@ -299,6 +300,12 @@ impl MockServer {
             "textDocument/didChange" => {
                 if let Some(td) = params.get("textDocument") {
                     let uri = td.get("uri").and_then(Value::as_str).unwrap_or_default();
+                    let version = td
+                        .get("version")
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(1);
+                    self.versions.insert(uri.to_string(), version);
                     if let Some(text) = params
                         .get("contentChanges")
                         .and_then(Value::as_array)
@@ -367,13 +374,6 @@ impl MockServer {
                     "supported": true,
                     "changeNotifications": true
                 }
-            });
-        }
-
-        if self.args.pull_diagnostics {
-            capabilities["diagnosticProvider"] = serde_json::json!({
-                "interFileDependencies": false,
-                "workspaceDiagnostics": false
             });
         }
 
@@ -486,47 +486,27 @@ impl MockServer {
         Value::Array(all_symbols)
     }
 
-    #[allow(clippy::unused_self, reason = "Consistent with other handle_* methods")]
-    fn handle_pull_diagnostics(&self, params: &Value) -> Value {
-        let uri = params
-            .get("textDocument")
-            .and_then(|td| td.get("uri"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        serde_json::json!({
-            "kind": "full",
-            "items": [{
-                "range": {
-                    "start": { "line": 0, "character": 0 },
-                    "end": { "line": 0, "character": 1 }
-                },
-                "severity": 2,
-                "source": "mockls",
-                "message": format!("mockls: pull diagnostic for {uri}")
-            }]
-        })
-    }
-
     fn publish_diagnostics(&self, uri: &str) {
         let delay = self.args.diagnostics_delay;
         let uri_owned = uri.to_string();
         let writer = self.writer.clone();
         let publish_version = self.args.publish_version;
-        // Track a simple version counter per URI for version publishing
         let version = if publish_version {
-            self.documents.get(uri).map(|_| 1)
+            Some(self.versions.get(uri).copied().unwrap_or(1))
         } else {
             None
         };
+        // Capture line count at publish time so delayed publications
+        // reflect the content that triggered them, not later edits.
+        let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
 
         if delay > 0 {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(delay));
-                send_diagnostics_notification(&writer, &uri_owned, version);
+                send_diagnostics_notification(&writer, &uri_owned, version, line_count);
             });
         } else {
-            send_diagnostics_notification(&self.writer, &uri_owned, version);
+            send_diagnostics_notification(&self.writer, &uri_owned, version, line_count);
         }
     }
 
@@ -586,6 +566,12 @@ impl MockServer {
         let no_diagnostics = self.args.no_diagnostics;
         let publish_version = self.args.publish_version;
         let diagnostics_delay = self.args.diagnostics_delay;
+        let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
+        let version = if publish_version {
+            Some(self.versions.get(uri).copied().unwrap_or(1))
+        } else {
+            None
+        };
 
         std::thread::spawn(move || {
             let token = "mockls-checking";
@@ -622,8 +608,7 @@ impl MockServer {
             }
 
             if !no_diagnostics {
-                let version = if publish_version { Some(1) } else { None };
-                send_diagnostics_notification(&writer, &uri_owned, version);
+                send_diagnostics_notification(&writer, &uri_owned, version, line_count);
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -724,7 +709,12 @@ fn send_message(writer: &Writer, value: &Value) {
 }
 
 /// Send a `publishDiagnostics` notification.
-fn send_diagnostics_notification(writer: &Writer, uri: &str, version: Option<i32>) {
+fn send_diagnostics_notification(
+    writer: &Writer,
+    uri: &str,
+    version: Option<i32>,
+    line_count: usize,
+) {
     let mut params = serde_json::json!({
         "uri": uri,
         "diagnostics": [{
@@ -734,7 +724,7 @@ fn send_diagnostics_notification(writer: &Writer, uri: &str, version: Option<i32
             },
             "severity": 2,
             "source": "mockls",
-            "message": "mockls: mock diagnostic"
+            "message": format!("mockls: mock diagnostic ({line_count} lines)")
         }]
     });
 
@@ -891,7 +881,6 @@ mod tests {
             fail_on: vec![],
             send_configuration_request: false,
             publish_version: false,
-            pull_diagnostics: false,
             progress_on_change: false,
             cpu_busy: None,
         }

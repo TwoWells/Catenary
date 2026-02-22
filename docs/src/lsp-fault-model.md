@@ -102,9 +102,13 @@ All LSP-originated errors are now prefixed with `[language]`, e.g., `[rust] requ
 
 ### ~~Timeout Ambiguity~~ (Resolved)
 
-`wait_for_diagnostics_update` now returns a three-variant enum (`DiagnosticsWaitResult`) instead of a boolean, distinguishing `Updated`, `Inactive` (server alive but silent), and `ServerDied`. Phase 1 tracks server activity (notification counter + progress tokens) and waits indefinitely while the server shows signs of life. When the server goes completely silent for `DIAGNOSTICS_TIMEOUT` (30s) but is still alive, it returns `Inactive` rather than aborting.
+`wait_for_diagnostics_update` returns a two-variant enum (`DiagnosticsWaitResult`): `Updated` or `ServerDied`. Each LSP server is assigned a `DiagnosticsStrategy` based on runtime observations:
 
-Callers (`handle_diagnostics` in `handler.rs`, `process_file_inner` in `notify.rs`) implement a nudge-and-retry loop: on `Inactive`, they re-send `didSave` to wake the server and retry up to 3 times. This handles CPU-starved servers under concurrent load that may miss or deprioritize the initial notification. On `ServerDied`, callers report the error. After all retries exhaust, callers proceed with cached diagnostics (graceful degradation) rather than returning an error.
+- **Version** — server includes `version` in `publishDiagnostics`. Wait for generation advance.
+- **`TokenMonitor`** — server sends `$/progress` tokens. Wait for Active -> Idle cycle with a hard timeout.
+- **`ProcessMonitor`** — no progress tokens, no version. Poll CPU time via `/proc/<pid>/stat` (Linux) or `ps` (macOS). Trust-based patience decays on consecutive timeouts without diagnostics.
+
+All strategies include a Phase 2 settle: 2 seconds of silence with no active progress tokens, catching servers that publish diagnostics in multiple rounds. Callers send `didSave` unconditionally after every change (handling servers that only run diagnostics on save) and make a single `wait_for_diagnostics_update` call — no retry loop.
 
 ### URI Trust
 

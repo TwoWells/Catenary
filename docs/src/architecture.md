@@ -103,18 +103,33 @@ and returning results. Because the snapshot is taken before the change is sent,
 there is no race window: any publication that arrives after the snapshot
 necessarily reflects the change or something newer.
 
-After the counter advances, Catenary continues to observe the server's
-notification stream and progress state. A polling loop checks every 100 ms
-for new notifications or active progress tokens (e.g., flycheck running
-`cargo check`). If the server sends any further notifications or has
-background work in progress, the quiet timer resets. Only when the server
-has been completely silent for 2 seconds with no active progress tokens does
-Catenary read the cache and return. This catches servers like rust-analyzer
-that publish diagnostics in multiple rounds — fast warnings from native
-analysis followed by slower type-checking errors from flycheck.
+The wait is split into two phases. Phase 1 uses a strategy selected per-server
+based on runtime observations:
+
+- **Version** — the server includes a `version` field in `publishDiagnostics`.
+  Catenary waits for the generation counter to advance past the snapshot. This
+  is the strongest signal but has not been observed from any server in practice.
+- **`TokenMonitor`** — the server sends `$/progress` tokens (e.g.,
+  rust-analyzer's flycheck). Catenary waits for the server to cycle from Active
+  to Idle, indicating analysis is complete. A hard timeout prevents infinite
+  hangs if the server never starts work for a given change.
+- **`ProcessMonitor`** — the server sends neither version nor progress tokens.
+  Catenary polls the server process's CPU time via `/proc/<pid>/stat` (Linux)
+  or `ps` (macOS) to infer activity. Trust-based patience decays on consecutive
+  timeouts without diagnostics arriving (120s → 60s → 30s → 5s), preventing
+  long waits on servers that consistently don't produce diagnostics for certain
+  change patterns.
+
+Phase 2 is a 2-second activity settle, shared by all strategies. After Phase 1
+signals completion, Catenary continues observing the server's notification
+stream and progress state. Only when the server has been completely silent for
+2 seconds with no active progress tokens does Catenary read the cache and
+return. This catches servers like rust-analyzer that publish diagnostics in
+multiple rounds — fast warnings from native analysis followed by slower
+type-checking errors from flycheck.
 
 This mechanism applies to the paths that return diagnostics after a change:
-the `catenary notify` hook (for post-edit diagnostics) and the `diagnostics`
+the `catenary release` hook (for post-edit diagnostics) and the `diagnostics`
 tool. Request/response tools like `hover` and `document_symbols` do not need
 it — their results come directly from the server response, not from the cache.
 

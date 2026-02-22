@@ -41,7 +41,7 @@ pub type DiagnosticsCache = Arc<Mutex<HashMap<Uri, (Option<i32>, Vec<Diagnostic>
 
 /// Result of waiting for diagnostics to update after a file change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DiagnosticsWaitResult {
+pub enum DiagnosticsWaitResult {
     /// Diagnostics were obtained (via pull, version match, or settle).
     Updated,
     /// Server process died during the wait.
@@ -95,6 +95,9 @@ pub struct LspClient {
     /// when `publishDiagnostics` arrives. Used by `ProcessMonitor` to
     /// decay patience.
     cpu_trust_failures: Arc<AtomicU32>,
+    /// Last document version sent via `did_open`/`did_change` per URI.
+    /// Used to detect stale diagnostics from prior document versions.
+    last_sent_version: Arc<Mutex<HashMap<Uri, i32>>>,
     _reader_handle: tokio::task::JoinHandle<()>,
     child: Child,
 }
@@ -214,6 +217,7 @@ impl LspClient {
             publishes_version,
             has_sent_progress,
             cpu_trust_failures,
+            last_sent_version: Arc::new(Mutex::new(HashMap::new())),
             _reader_handle: reader_handle,
             child,
         })
@@ -752,6 +756,9 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) -> Result<()> {
+        let uri = params.text_document.uri.clone();
+        let version = params.text_document.version;
+        self.last_sent_version.lock().await.insert(uri, version);
         self.notify("textDocument/didOpen", params).await
     }
 
@@ -761,6 +768,9 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<()> {
+        let uri = params.text_document.uri.clone();
+        let version = params.text_document.version;
+        self.last_sent_version.lock().await.insert(uri, version);
         self.notify("textDocument/didChange", params).await
     }
 
@@ -1063,6 +1073,24 @@ impl LspClient {
         cache.get(uri).and_then(|(version, _)| *version)
     }
 
+    /// Returns whether cached diagnostics match the last-sent document version.
+    ///
+    /// Returns `true` (assume current) when the server doesn't publish version
+    /// info or when no version has been tracked for this URI — we can't
+    /// distinguish stale from fresh without version data.
+    async fn is_diagnostics_version_current(&self, uri: &Uri) -> bool {
+        if !self.publishes_version.load(Ordering::SeqCst) {
+            return true;
+        }
+        let sent = self.last_sent_version.lock().await;
+        let Some(sent_v) = sent.get(uri).copied() else {
+            return true;
+        };
+        drop(sent);
+        let cached_v = self.cached_diagnostics_version(uri).await;
+        cached_v.is_some_and(|v| v >= sent_v)
+    }
+
     /// Returns the current diagnostics generation for a URI.
     ///
     /// Callers should snapshot this *before* sending a change notification,
@@ -1148,10 +1176,9 @@ impl LspClient {
     /// sending the change that triggers new diagnostics.
     ///
     /// The strategy is dispatched as follows:
-    /// - **Pull:** Not handled here — callers should use [`pull_diagnostics`] directly.
-    /// - **`PushVersion`:** Waits for `publishDiagnostics` with `version >= expected_version`.
-    /// - **`PushTokenMonitor`:** Waits for progress tokens to end (server idle).
-    /// - **`PushProcessMonitor`:** Polls CPU time with trust-based timeout.
+    /// - **Version:** Waits for `publishDiagnostics` with generation advance.
+    /// - **`TokenMonitor`:** Waits for `$/progress` tokens to cycle Active -> Idle.
+    /// - **`ProcessMonitor`:** Polls CPU time with trust-based timeout decay.
     ///
     /// All push strategies include a Phase 2 settle (2 seconds of silence)
     /// after the initial signal to catch late-arriving diagnostic rounds.
@@ -1159,7 +1186,7 @@ impl LspClient {
         clippy::too_many_lines,
         reason = "Strategy dispatch requires many branches"
     )]
-    pub(crate) async fn wait_for_diagnostics_update(
+    pub async fn wait_for_diagnostics_update(
         &self,
         uri: &Uri,
         snapshot: u64,
@@ -1203,14 +1230,16 @@ impl LspClient {
         match strategy {
             DiagnosticsStrategy::Version => {
                 // Wait for publishDiagnostics with a version >= our change.
-                // The version in publishDiagnostics matches the document
-                // version from didChange. We also accept generation advances
-                // as a fallback.
+                // Generation advance alone is insufficient — stale diagnostics
+                // from a prior document version can bump the counter. We gate
+                // on version freshness to avoid the cross-change leak.
                 let poll_interval = Duration::from_millis(100);
                 let deadline = tokio::time::Instant::now() + timeout;
 
                 loop {
-                    if self.diagnostics_generation(uri).await > snapshot {
+                    if self.diagnostics_generation(uri).await > snapshot
+                        && self.is_diagnostics_version_current(uri).await
+                    {
                         break;
                     }
                     if !self.is_alive() {
@@ -1233,7 +1262,9 @@ impl LspClient {
                 let mut ever_active = false;
 
                 loop {
-                    if self.diagnostics_generation(uri).await > snapshot {
+                    if self.diagnostics_generation(uri).await > snapshot
+                        && self.is_diagnostics_version_current(uri).await
+                    {
                         break;
                     }
 
@@ -1288,7 +1319,9 @@ impl LspClient {
                 let mut ever_active = false;
 
                 loop {
-                    if self.diagnostics_generation(uri).await > snapshot {
+                    if self.diagnostics_generation(uri).await > snapshot
+                        && self.is_diagnostics_version_current(uri).await
+                    {
                         break;
                     }
 

@@ -4,7 +4,7 @@
 //! IPC server for file-change notifications and root management.
 //!
 //! When Claude Code's native `Edit` or `Write` tools modify a file, a
-//! `PostToolUse` hook runs `catenary notify`, which connects to this server
+//! `PostToolUse` hook runs `catenary release`, which connects to this server
 //! and sends the changed file path. The server notifies the LSP, waits for
 //! fresh diagnostics, and returns them so they appear in the model's context.
 //!
@@ -30,7 +30,7 @@ use crate::bridge::{DocumentManager, DocumentNotification, PathValidator};
 use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, DiagnosticsWaitResult, LspClient};
 use crate::session::{EventBroadcaster, EventKind};
 
-/// Request from `catenary notify` (file change) or `catenary sync-roots` (root sync).
+/// Request from `catenary release` (file change) or `catenary sync-roots` (root sync).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum NotifyRequest {

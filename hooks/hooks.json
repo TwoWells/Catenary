@@ -2,12 +2,12 @@
   "hooks": {
     "BeforeTool": [
       {
-        "matcher": "write_file|replace",
+        "matcher": "read_file|write_file|replace",
         "hooks": [
           {
-            "name": "catenary-lock-acquire",
+            "name": "catenary-acquire",
             "type": "command",
-            "command": "catenary lock acquire --format=gemini"
+            "command": "catenary acquire --format=gemini"
           }
         ]
       }
@@ -17,39 +17,9 @@
         "matcher": "read_file|write_file|replace",
         "hooks": [
           {
-            "name": "catenary-notify",
+            "name": "catenary-release",
             "type": "command",
-            "command": "catenary notify --format=gemini"
-          }
-        ]
-      },
-      {
-        "matcher": "write_file|replace",
-        "hooks": [
-          {
-            "name": "catenary-lock-track-read",
-            "type": "command",
-            "command": "catenary lock track-read"
-          }
-        ]
-      },
-      {
-        "matcher": "write_file|replace",
-        "hooks": [
-          {
-            "name": "catenary-lock-release",
-            "type": "command",
-            "command": "catenary lock release"
-          }
-        ]
-      },
-      {
-        "matcher": "read_file",
-        "hooks": [
-          {
-            "name": "catenary-lock-track-read",
-            "type": "command",
-            "command": "catenary lock track-read"
+            "command": "catenary release --format=gemini"
           }
         ]
       }

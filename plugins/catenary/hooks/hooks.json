@@ -12,50 +12,33 @@
         ]
       },
       {
-        "matcher": "Edit|Write|NotebookEdit",
+        "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary lock acquire --format=claude"
+            "command": "catenary acquire --format=claude"
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit",
+        "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
-          },
-          {
-            "type": "command",
-            "command": "catenary lock track-read"
-          },
-          {
-            "type": "command",
-            "command": "catenary lock release"
-          }
-        ]
-      },
-      {
-        "matcher": "Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary lock track-read"
+            "command": "catenary release --format=claude"
           }
         ]
       }
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "Edit|Write|NotebookEdit",
+        "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary lock release --grace 0"
+            "command": "catenary release --grace 0"
           }
         ]
       }

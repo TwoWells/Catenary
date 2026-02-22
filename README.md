@@ -143,7 +143,7 @@ don't fix this — they just let you waste more before hitting the wall.
 | `search` | Symbol search with grep fallback |
 | `diagnostics` | Errors and warnings |
 | `list_directory` | List directory contents |
-| `catenary notify` | PostToolUse hook — returns LSP diagnostics after edits |
+| `catenary release` | PostToolUse hook — returns LSP diagnostics and releases file lock |
 | ... | [See all tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
 
 ## Known Limitations
