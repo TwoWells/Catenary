@@ -13,6 +13,12 @@ pub struct Config {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
 
+    /// Log retention in days (default: 7).
+    /// 0 = no persistent logging (cleanup on exit).
+    /// -1 = retain logs forever.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: i64,
+
     /// Server definitions keyed by language ID (e.g., "rust", "python").
     #[serde(default)]
     pub server: HashMap<String, ServerConfig>,
@@ -37,6 +43,10 @@ const fn default_idle_timeout() -> u64 {
     300
 }
 
+const fn default_log_retention_days() -> i64 {
+    7
+}
+
 impl Config {
     /// Load configuration from standard paths or a specific file.
     ///
@@ -51,6 +61,7 @@ impl Config {
 
         // 1. Start with defaults
         builder = builder.set_default("idle_timeout", 300)?;
+        builder = builder.set_default("log_retention_days", 7)?;
 
         // 2. Load from user config directory (~/.config/catenary/config.toml)
         if let Some(config_dir) = dirs::config_dir() {
