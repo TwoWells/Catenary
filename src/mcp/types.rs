@@ -294,6 +294,10 @@ impl CallToolResult {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use anyhow::{Context, Result};

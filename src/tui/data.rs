@@ -190,6 +190,10 @@ impl EventTail for MockEventTail {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use chrono::Utc;

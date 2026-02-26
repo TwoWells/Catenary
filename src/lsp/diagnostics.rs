@@ -89,6 +89,10 @@ impl ProgressMonitor for TokenMonitor {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU8};

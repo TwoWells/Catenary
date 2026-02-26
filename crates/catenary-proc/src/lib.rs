@@ -367,6 +367,10 @@ mod platform {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
 
@@ -375,10 +379,7 @@ mod tests {
     #[test]
     fn sample_self_succeeds() {
         let pid = std::process::id();
-        let result = sample(pid);
-        assert!(result.is_some(), "Should be able to sample own process");
-
-        let s = result.unwrap();
+        let s = sample(pid).expect("should be able to sample own process");
         assert!(s.cpu_ticks > 0, "Own process should have consumed some CPU");
     }
 
@@ -391,10 +392,7 @@ mod tests {
     #[test]
     fn sample_self_state_is_running() {
         let pid = std::process::id();
-        let result = sample(pid);
-        assert!(result.is_some());
-
-        let s = result.unwrap();
+        let s = sample(pid).expect("should be able to sample own process");
         // During test execution, our process should be Running
         assert_eq!(
             s.state,

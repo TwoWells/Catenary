@@ -169,6 +169,10 @@ impl Config {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -214,7 +218,7 @@ mod tests {
             config
                 .server
                 .get("rust")
-                .context("missing rust server")?
+                .expect("rust server config")
                 .command,
             "rust-analyzer-local"
         );

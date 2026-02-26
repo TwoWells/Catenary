@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 //! Regression test for issue #3: LSP diagnostics timing.
 //!
 //! Verifies that Catenary correctly waits for the LSP server to complete

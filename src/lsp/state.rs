@@ -170,10 +170,12 @@ impl ProgressTracker {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
-    use anyhow::{Context, Result};
-
     fn make_progress_params(token: &str, progress: WorkDoneProgress) -> ProgressParams {
         ProgressParams {
             token: NumberOrString::String(token.to_string()),
@@ -182,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_progress_begin_end() -> Result<()> {
+    fn test_progress_begin_end() {
         let mut tracker = ProgressTracker::new();
         assert!(!tracker.is_busy());
 
@@ -199,7 +201,7 @@ mod tests {
         tracker.update(&begin);
 
         assert!(tracker.is_busy());
-        let primary = tracker.primary_progress().context("missing progress")?;
+        let primary = tracker.primary_progress().expect("active progress");
         assert_eq!(primary.title, "Indexing");
         assert_eq!(primary.message, Some("src/main.rs".to_string()));
         assert_eq!(primary.percentage, Some(0));
@@ -212,11 +214,10 @@ mod tests {
         tracker.update(&end);
 
         assert!(!tracker.is_busy());
-        Ok(())
     }
 
     #[test]
-    fn test_progress_report() -> Result<()> {
+    fn test_progress_report() {
         let mut tracker = ProgressTracker::new();
 
         // Begin
@@ -242,14 +243,13 @@ mod tests {
         );
         tracker.update(&report);
 
-        let primary = tracker.primary_progress().context("missing progress")?;
+        let primary = tracker.primary_progress().expect("active progress");
         assert_eq!(primary.percentage, Some(50));
         assert_eq!(primary.message, Some("50% done".to_string()));
-        Ok(())
     }
 
     #[test]
-    fn test_multiple_progress_tokens() -> Result<()> {
+    fn test_multiple_progress_tokens() {
         let mut tracker = ProgressTracker::new();
 
         // Begin two progress operations
@@ -277,7 +277,7 @@ mod tests {
         assert!(tracker.is_busy());
 
         // Primary should be the one with lower percentage
-        let primary = tracker.primary_progress().context("missing progress")?;
+        let primary = tracker.primary_progress().expect("active progress");
         assert_eq!(primary.title, "Analyzing");
         assert_eq!(primary.percentage, Some(10));
 
@@ -289,9 +289,8 @@ mod tests {
         tracker.update(&end1);
 
         assert!(tracker.is_busy());
-        let primary = tracker.primary_progress().context("missing progress")?;
+        let primary = tracker.primary_progress().expect("active progress");
         assert_eq!(primary.title, "Analyzing");
-        Ok(())
     }
 
     #[test]

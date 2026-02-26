@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 //! Ensures that the Cargo.toml version matches the Claude Plugin version.
 //! This runs as part of `cargo test`, which is triggered by cargo-husky on push.
 

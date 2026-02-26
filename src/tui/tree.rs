@@ -421,6 +421,10 @@ pub fn render_tree(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use chrono::{TimeDelta, Utc};
@@ -445,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_groups_by_workspace() -> anyhow::Result<()> {
+    fn test_tree_groups_by_workspace() {
         let sessions = vec![
             make_session("aaa11111", "/ws/alpha", true, 5),
             make_session("bbb22222", "/ws/beta", true, 3),
@@ -458,15 +462,14 @@ mod tests {
             .workspaces
             .iter()
             .find(|w| w.path == "/ws/alpha")
-            .ok_or_else(|| anyhow::anyhow!("alpha workspace not found"))?;
+            .expect("alpha workspace");
         assert_eq!(alpha.sessions.len(), 2);
         let beta = tree
             .workspaces
             .iter()
             .find(|w| w.path == "/ws/beta")
-            .ok_or_else(|| anyhow::anyhow!("beta workspace not found"))?;
+            .expect("beta workspace");
         assert_eq!(beta.sessions.len(), 1);
-        Ok(())
     }
 
     #[test]
@@ -485,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_workspace_active_icon() -> anyhow::Result<()> {
+    fn test_tree_workspace_active_icon() {
         let sessions = vec![
             make_session("live0001", "/ws/active", true, 5),
             make_session("dead0001", "/ws/active", false, 10),
@@ -497,15 +500,14 @@ mod tests {
             .workspaces
             .iter()
             .find(|w| w.path == "/ws/active")
-            .ok_or_else(|| anyhow::anyhow!("active workspace not found"))?;
+            .expect("active workspace");
         assert!(active_ws.has_active);
         let dead_ws = tree
             .workspaces
             .iter()
             .find(|w| w.path == "/ws/dead")
-            .ok_or_else(|| anyhow::anyhow!("dead workspace not found"))?;
+            .expect("dead workspace");
         assert!(!dead_ws.has_active);
-        Ok(())
     }
 
     #[test]
@@ -536,7 +538,7 @@ mod tests {
             .workspaces
             .iter()
             .position(|w| w.path == "/ws/alpha")
-            .unwrap_or(0);
+            .expect("alpha workspace");
         tree.workspaces[alpha_idx].collapsed = true;
         let items = tree.visible_items();
         // Alpha collapsed (2 sessions hidden) → 1 ws + 1 ws + 1 session = 3.
@@ -613,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_render_basic() -> anyhow::Result<()> {
+    fn test_tree_render_basic() {
         let sessions = vec![
             make_session("aaa11111", "/ws/alpha", true, 5),
             make_session("bbb22222", "/ws/alpha", false, 10),
@@ -623,11 +625,13 @@ mod tests {
         let icons = IconSet::from_config(crate::config::IconConfig::default());
 
         let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|f| {
-            let area = f.area();
-            render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
-        })?;
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
+            })
+            .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
@@ -638,11 +642,10 @@ mod tests {
         assert!(content.contains("bbb22222"), "expected second session ID");
         // Should contain status icon for active workspace.
         assert!(content.contains('●'), "expected active icon");
-        Ok(())
     }
 
     #[test]
-    fn test_tree_render_cheatsheet() -> anyhow::Result<()> {
+    fn test_tree_render_cheatsheet() {
         let sessions = vec![make_session("aaa11111", "/ws/alpha", true, 5)];
         let mut tree = SessionTree::from_sessions(sessions);
         tree.show_cheatsheet = true;
@@ -650,18 +653,19 @@ mod tests {
         let icons = IconSet::from_config(crate::config::IconConfig::default());
 
         let backend = TestBackend::new(40, 25);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|f| {
-            let area = f.area();
-            render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
-        })?;
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
+            })
+            .expect("draw");
 
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
         assert!(content.contains("Keys"), "expected cheatsheet separator");
         assert!(content.contains("navigate"), "expected cheatsheet content");
-        Ok(())
     }
 
     /// Convert a ratatui buffer to a single string for assertion matching.

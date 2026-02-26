@@ -298,6 +298,10 @@ fn detect_language_id(path: &Path) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use std::io::Write;
