@@ -9,6 +9,7 @@
 - [Overview](overview.md)
 - [Installation](installation.md)
 - [Configuration](configuration.md)
+- [Dashboard](dashboard.md)
 - [CLI Integration](cli-integration.md)
 
 ---
@@ -18,7 +19,9 @@
 - [🏗️ Architecture](architecture.md)
 - [🔌 Plugin Architecture](plugin-architecture.md)
 - [🛠️ Language Servers](lsp/README.md)
+  - [Landscape](lsp/landscape.md)
 - [🤖 AI Agents](ai-agents.md)
+- [⏱️ Wait Model](wait-model.md)
 - [🛡️ LSP Fault Model](lsp-fault-model.md)
 - [🔴 Adversarial Testing](adversarial-testing.md)
 - [🧪 Smoke Testing](smoke-testing.md)

@@ -27,9 +27,8 @@ impl BridgeProcess {
         if let Some(arg) = lsp_args {
             cmd.arg("--lsp").arg(arg);
         } else {
-            // Default for existing tests
-            cmd.arg("--lsp")
-                .arg("shellscript:bash-language-server start");
+            let bin = env!("CARGO_BIN_EXE_mockls");
+            cmd.arg("--lsp").arg(format!("shellscript:{bin}"));
         }
 
         for root in roots {
@@ -47,9 +46,6 @@ impl BridgeProcess {
         let mut child = cmd.spawn().context("Failed to spawn bridge")?;
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        // Wait for initialization
-        std::thread::sleep(Duration::from_millis(500));
 
         Ok(Self {
             child,
@@ -152,24 +148,12 @@ fn test_codebase_map_basic() -> Result<()> {
 
 #[test]
 fn test_codebase_map_with_symbols() -> Result<()> {
-    // Requires bash-language-server
-    if Command::new("which")
-        .arg("bash-language-server")
-        .output()
-        .is_err()
-    {
-        return Ok(());
-    }
-
     let temp = tempfile::tempdir()?;
     let script = temp.path().join("script.sh");
     std::fs::write(&script, "#!/bin/bash\nfunction my_func() { echo hi; }\n")?;
 
     let mut bridge = BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, None)?;
     bridge.initialize()?;
-
-    // Give LSP time to wake up if lazy
-    std::thread::sleep(Duration::from_millis(500));
 
     bridge.send(&json!({
         "jsonrpc": "2.0",
@@ -179,7 +163,8 @@ fn test_codebase_map_with_symbols() -> Result<()> {
             "name": "codebase_map",
             "arguments": {
                 "path": temp.path().to_str().context("invalid path")?,
-                "include_symbols": true
+                "include_symbols": true,
+                "detail_level": "signatures"
             }
         }
     }))?;
@@ -193,49 +178,39 @@ fn test_codebase_map_with_symbols() -> Result<()> {
     tracing::debug!("Map with Symbols Output:\n{content}");
 
     assert!(content.contains("script.sh"));
-    // Bash LSP should report 'my_func' as a Function
-    if !content.contains("my_func") {
-        tracing::warn!(
-            "WARNING: Symbols not found. Check if bash-language-server is running correctly."
-        );
-    }
+    assert!(
+        content.contains("my_func"),
+        "codebase_map should return symbols, got:\n{content}"
+    );
     Ok(())
 }
 
+/// Verifies that mockls returns document symbols via the `document_symbols`
+/// MCP tool. Uses mockls instead of marksman for deterministic behavior.
 #[test]
-fn test_codebase_map_markdown() -> Result<()> {
-    if Command::new("which").arg("marksman").output().is_err() {
-        return Ok(());
-    }
-
+fn test_mockls_document_symbols() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    // Create .git to help Marksman detect root
-    std::fs::create_dir(temp.path().join(".git"))?;
-
-    let md_path = temp.path().join("README.md");
+    let script = temp.path().join("helpers.sh");
     std::fs::write(
-        &md_path,
-        "# Title\n\n## Section 1\nContent\n\n### Subsection\nMore content",
+        &script,
+        "#!/bin/bash\nfunction setup_env() { echo setup; }\nfunction run_tests() { echo test; }\n",
     )?;
 
-    let mut bridge = BridgeProcess::spawn(
-        temp.path().to_str().context("invalid path")?,
-        Some("markdown:marksman server"),
-    )?;
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let lsp = format!("shellscript:{mockls_bin}");
+
+    let mut bridge =
+        BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, Some(&lsp))?;
     bridge.initialize()?;
-
-    // Give LSP time to scan
-    std::thread::sleep(Duration::from_secs(5));
 
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 3,
         "method": "tools/call",
         "params": {
-            "name": "codebase_map",
+            "name": "document_symbols",
             "arguments": {
-                "path": temp.path().to_str().context("invalid path")?,
-                "include_symbols": true
+                "file": script.to_str().context("file path")?
             }
         }
     }))?;
@@ -246,14 +221,17 @@ fn test_codebase_map_markdown() -> Result<()> {
         .as_str()
         .context("Missing text in content")?;
 
-    tracing::debug!("Markdown Map Output:\n{content}");
-
-    assert!(content.contains("README.md"));
-    // Marksman usually reports headings as symbols
-    assert!(content.contains("Title"), "Should contain Title symbol");
     assert!(
-        content.contains("Section 1"),
-        "Should contain Section 1 symbol"
+        content.contains("setup_env"),
+        "Should contain setup_env symbol, got:\n{content}"
+    );
+    assert!(
+        content.contains("run_tests"),
+        "Should contain run_tests symbol, got:\n{content}"
+    );
+    assert!(
+        content.contains("Function"),
+        "Symbols should be typed as Function, got:\n{content}"
     );
     Ok(())
 }

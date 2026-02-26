@@ -9,7 +9,7 @@ use lsp_types::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 use tokio::fs;
 use tracing::{debug, trace};
 
@@ -18,7 +18,6 @@ struct OpenDocument {
     version: i32,
     content: String,
     mtime: SystemTime,
-    last_accessed: Instant,
 }
 
 /// Manages document lifecycle for the LSP server.
@@ -70,7 +69,6 @@ impl DocumentManager {
                     doc.version += 1;
                     doc.content.clone_from(&content);
                     doc.mtime = mtime;
-                    doc.last_accessed = Instant::now();
 
                     debug!("Document changed on disk: {}", path.display());
 
@@ -90,7 +88,6 @@ impl DocumentManager {
                 }
             }
 
-            doc.last_accessed = Instant::now();
             trace!("Document already open: {}", path.display());
             return Ok(None);
         }
@@ -106,7 +103,6 @@ impl DocumentManager {
             version: 1,
             content: content.clone(),
             mtime,
-            last_accessed: Instant::now(),
         };
 
         self.documents.insert(path.clone(), doc);
@@ -142,23 +138,6 @@ impl DocumentManager {
         } else {
             Ok(None)
         }
-    }
-
-    /// Returns paths of documents that haven't been accessed within the timeout.
-    #[must_use]
-    pub fn stale_documents(&self, timeout_secs: u64) -> Vec<PathBuf> {
-        let now = Instant::now();
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-        self.documents
-            .iter()
-            .filter_map(|(path, doc)| {
-                if now.duration_since(doc.last_accessed) >= timeout {
-                    Some(path.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 
     /// Returns the URI for an open document.
@@ -206,8 +185,6 @@ impl DocumentManager {
             doc.version += 1;
             doc.content = content.to_string();
             doc.mtime = mtime;
-            doc.last_accessed = Instant::now();
-
             debug!("External write (change): {}", path.display());
 
             Ok(DocumentNotification::Change(DidChangeTextDocumentParams {
@@ -229,7 +206,6 @@ impl DocumentManager {
                 version: 1,
                 content: content.to_string(),
                 mtime,
-                last_accessed: Instant::now(),
             };
 
             self.documents.insert(path.clone(), doc);
@@ -402,27 +378,6 @@ mod tests {
         // Closing again should return None
         let close_params2 = manager.close(file.path())?;
         assert!(close_params2.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_stale_documents() -> Result<()> {
-        let mut file = NamedTempFile::with_suffix(".txt")?;
-        writeln!(file, "test")?;
-
-        let mut manager = DocumentManager::new();
-        manager.ensure_open(file.path()).await?;
-
-        // Wait a moment so the document becomes stale
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // With 0 second timeout, document should be stale (100ms > 0s)
-        let stale = manager.stale_documents(0);
-        assert_eq!(stale.len(), 1);
-
-        // With large timeout, nothing should be stale
-        let stale = manager.stale_documents(3600);
-        assert!(stale.is_empty());
         Ok(())
     }
 

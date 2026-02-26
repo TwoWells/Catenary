@@ -2,15 +2,15 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Integration test for JSON language server diagnostics timing.
+//! Integration test for diagnostics timing after warmup.
 //!
 //! Verifies that Catenary's post-warmup grace period correctly catches
-//! diagnostics from language servers (like vscode-json-language-server)
-//! that only publish diagnostics after a file is opened, not at startup.
+//! diagnostics from language servers that only publish diagnostics after a
+//! file is opened, not at startup.
 //!
 //! This reproduces the scenario where:
-//! 1. The JSON LSP starts and passes the 10-second warmup without any
-//!    files being opened (so `has_published_diagnostics` remains false).
+//! 1. The LSP starts and passes the 10-second warmup without any files
+//!    being opened (so `has_published_diagnostics` remains false).
 //! 2. The first file is opened after warmup.
 //! 3. Without the grace period, `wait_for_diagnostics_update` would
 //!    short-circuit and return 0 diagnostics.
@@ -18,45 +18,28 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use tempfile::tempdir;
 
-/// Check if a command exists in PATH.
-fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[test]
-fn test_json_diagnostics_on_first_open_past_warmup() -> Result<()> {
-    if !command_exists("vscode-json-language-server") {
-        tracing::warn!("Skipping test: vscode-json-language-server not installed");
-        return Ok(());
-    }
-
-    // 1. Create workspace with invalid JSON (trailing comma → parse error)
+fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
+    // 1. Create workspace with a test file
     let dir = tempdir()?;
-    let file_path = dir.path().join("test.json");
-    std::fs::write(
-        &file_path,
-        r#"{
-  "name": "test",
-}"#,
-    )?;
+    let file_path = dir.path().join("test.sh");
+    std::fs::write(&file_path, "#!/bin/bash\necho hello\n")?;
 
-    // 2. Start Catenary with only the JSON LSP
-    let mut child = Command::new("cargo")
+    // 2. Start Catenary with mockls using --publish-version (versioned diagnostics)
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let lsp_arg = format!("shellscript:{mockls_bin} --publish-version");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_catenary"))
         .args([
-            "run",
-            "--",
             "--root",
             dir.path().to_str().context("invalid path")?,
             "--lsp",
-            "json:vscode-json-language-server --stdio",
+            &lsp_arg,
         ])
+        .env("XDG_CONFIG_HOME", dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -92,12 +75,12 @@ fn test_json_diagnostics_on_first_open_past_warmup() -> Result<()> {
 
     // 4. Wait past the warmup period.
     //
-    // During this time the JSON LSP is running but has no open files,
+    // During this time the LSP is running but has no open files,
     // so it never publishes diagnostics. After warmup expires,
     // has_published_diagnostics is still false.
     std::thread::sleep(catenary_mcp::lsp::WARMUP_PERIOD + std::time::Duration::from_secs(1));
 
-    // 5. Request diagnostics on the invalid JSON file.
+    // 5. Request diagnostics on the test file.
     //
     // This is the first file interaction. Without the post-warmup grace
     // period, wait_for_diagnostics_update would short-circuit and return
@@ -121,14 +104,27 @@ fn test_json_diagnostics_on_first_open_past_warmup() -> Result<()> {
         .read_line(&mut line)
         .context("Failed to read diagnostics response")?;
 
-    // 6. Verify diagnostics were returned.
+    // 6. Verify the response completed without error or timeout.
     //
-    // The JSON LSP should report a trailing comma error. The response
-    // must NOT be "No diagnostics" — that would mean the grace period
-    // failed and we short-circuited past the LSP's response.
+    // mockls with --publish-version publishes diagnostics after didOpen,
+    // so the grace period should catch them.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&line).context("Response should be valid JSON")?;
     assert!(
-        !line.contains("No diagnostics"),
-        "JSON diagnostics should be returned on first file open past warmup. Got: {line}"
+        parsed.get("result").is_some(),
+        "Response should contain a result (no RPC error). Got: {line}"
+    );
+
+    let result = &parsed["result"];
+    let content = result["content"]
+        .as_array()
+        .context("Missing content array")?;
+    let text = content[0]["text"]
+        .as_str()
+        .context("Missing text in content")?;
+    assert!(
+        text.contains("mock diagnostic") || text.contains("mockls"),
+        "Expected mock diagnostics from mockls, got: {text}"
     );
 
     // Cleanup

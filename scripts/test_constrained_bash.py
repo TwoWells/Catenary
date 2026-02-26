@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""Unit tests for the constrained-bash hook."""
+"""Unit tests for the constrained_bash hook."""
 
-import importlib.util
+import sys
 import os
 import unittest
 
-# Load by path since the filename contains a hyphen (invalid import syntax)
-_SCRIPT = os.path.join(os.path.dirname(__file__), "constrained-bash.py")
-_spec = importlib.util.spec_from_file_location("constrained_bash", _SCRIPT)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
+# Add scripts/ to the import path so constrained_bash can be imported directly.
+sys.path.insert(0, os.path.dirname(__file__))
 
-check = _mod.check
-deny_response = _mod.deny_response
+from constrained_bash import check, deny_response
 
 
 class TestAllowed(unittest.TestCase):

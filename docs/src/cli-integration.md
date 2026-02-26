@@ -188,14 +188,14 @@ Then add the MCP server to `.gemini/settings.json`:
 ```
 
 **Alternative: constrained-bash hook.** Instead of the policy engine, you can
-use the same `scripts/constrained-bash.py` script from the repo with Gemini's
+use the same `scripts/constrained_bash.py` script from the repo with Gemini's
 `BeforeTool` hook system.
 
 **Install:**
 
 ```bash
-cp /path/to/catenary/scripts/constrained-bash.py ~/.gemini/hooks/constrained-bash.py
-chmod +x ~/.gemini/hooks/constrained-bash.py
+cp /path/to/catenary/scripts/constrained_bash.py ~/.gemini/hooks/constrained_bash.py
+chmod +x ~/.gemini/hooks/constrained_bash.py
 ```
 
 **Configure** in `~/.gemini/settings.json`:
@@ -209,7 +209,7 @@ chmod +x ~/.gemini/hooks/constrained-bash.py
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.gemini/hooks/constrained-bash.py --format=gemini"
+            "command": "$HOME/.gemini/hooks/constrained_bash.py --format=gemini"
           }
         ]
       }
@@ -309,8 +309,8 @@ tool.
 ```bash
 # Symlink so the live hook stays in sync with the repo
 mkdir -p ~/.claude/hooks
-ln -s /path/to/catenary/scripts/constrained-bash.py ~/.claude/hooks/constrained-bash.py
-chmod +x /path/to/catenary/scripts/constrained-bash.py
+ln -s /path/to/catenary/scripts/constrained_bash.py ~/.claude/hooks/constrained_bash.py
+chmod +x /path/to/catenary/scripts/constrained_bash.py
 ```
 
 **Configure** in `~/.claude/settings.json`:
@@ -324,7 +324,7 @@ chmod +x /path/to/catenary/scripts/constrained-bash.py
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/hooks/constrained-bash.py"
+            "command": "$HOME/.claude/hooks/constrained_bash.py"
           }
         ]
       }

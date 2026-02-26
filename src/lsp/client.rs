@@ -6,30 +6,28 @@ use bytes::BytesMut;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    ClientCapabilities, CodeActionParams, CodeActionResponse, CompletionParams, CompletionResponse,
-    Diagnostic, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
+    ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
     InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
-    PublishDiagnosticsParams, ReferenceParams, RenameParams, SignatureHelp, SignatureHelpParams,
-    TextDocumentIdentifier, TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceEdit,
+    PublishDiagnosticsParams, ReferenceParams, TextDocumentIdentifier, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
     WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify, oneshot};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::protocol::{self, NotificationMessage, RequestId, RequestMessage, ResponseMessage};
 use super::state::{ProgressTracker, ServerState, ServerStatus};
+use super::wait::load_aware_grace;
 use crate::session::{EventBroadcaster, EventKind};
 
 /// Cached diagnostics for a file: `(version, diagnostics)`.
@@ -40,24 +38,44 @@ use crate::session::{EventBroadcaster, EventKind};
 pub type DiagnosticsCache = Arc<Mutex<HashMap<Uri, (Option<i32>, Vec<Diagnostic>)>>>;
 
 /// Result of waiting for diagnostics to update after a file change.
+///
+/// The agent never sees infrastructure details — only "trusted
+/// diagnostics are in the cache" or "nothing available."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticsWaitResult {
-    /// Diagnostics were obtained (via pull, version match, or settle).
-    Updated,
-    /// Server process died during the wait.
-    ServerDied,
+    /// Trusted diagnostics are in the cache — safe to read.
+    Diagnostics,
+    /// No trusted diagnostics available. Covers server death, budget
+    /// exhaustion, and servers without version/progress support.
+    Nothing,
 }
-
-/// Default timeout for LSP requests.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Time after spawn during which we consider the server to be "warming up".
 pub const WARMUP_PERIOD: Duration = Duration::from_secs(10);
 
-/// Timeout for waiting for fresh diagnostics after a file change.
-/// Used as the inactivity threshold (silence with no notifications or
-/// active progress tokens) and as the Phase 2 settle timeout.
-pub(crate) const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(30);
+/// CPU tick threshold for diagnostics wait: 1000 ticks = 10 CPU-seconds.
+const DIAGNOSTICS_THRESHOLD: u64 = 1000;
+
+/// CPU tick threshold for preamble windows (grace, discovery, progress grace).
+const PREAMBLE_THRESHOLD: u64 = 500;
+
+/// CPU tick threshold for request timeout: 1000 ticks = 10 CPU-seconds.
+///
+/// The initialize request is the most expensive, taking several seconds of
+/// CPU time on complex servers. Normal requests (definition, references)
+/// are sub-second, so 10 CPU-seconds is generous. The threshold only
+/// counts unexplained work — if the server is sleeping (waiting on cargo,
+/// NFS, etc.), it doesn't drain.
+const REQUEST_THRESHOLD: u64 = 1000;
+
+/// CPU tick threshold for `wait_ready`: 1000 ticks = 10 CPU-seconds.
+const READY_THRESHOLD: u64 = 1000;
+
+/// Poll interval for diagnostics wait main loops.
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Wall-clock safety cap (5 minutes) for diagnostics wait.
+const SAFETY_CAP: Duration = Duration::from_secs(300);
 
 /// Manages communication with an LSP server process.
 pub struct LspClient {
@@ -69,18 +87,21 @@ pub struct LspClient {
     diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
     /// Wakes waiters when any URI receives fresh diagnostics.
     diagnostics_notify: Arc<Notify>,
+    /// Wakes waiters when capability flags (`publishes_version`, `has_sent_progress`) change.
+    capability_notify: Arc<Notify>,
+    /// Wakes waiters on `$/progress` state transitions.
+    progress_notify: Arc<Notify>,
+    /// Wakes waiters on `ServerState` changes.
+    state_notify: Arc<Notify>,
     /// Whether this server has ever published diagnostics.
     has_published_diagnostics: Arc<AtomicBool>,
-    /// Incremented on every incoming server notification; used by the
-    /// activity-settle loop to detect when the server goes quiet.
-    activity_counter: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     encoding: PositionEncodingKind,
     /// Progress tracking for `$/progress` notifications.
     progress: Arc<Mutex<ProgressTracker>>,
     /// Time when this client was spawned.
     spawn_time: Instant,
-    /// Current server state (0=Initializing, 1=Indexing, 2=Ready, 3=Dead).
+    /// Current server state (0=Initializing, 1=Busy, 2=Ready, 3=Dead).
     state: Arc<AtomicU8>,
     /// The language identifier (e.g., "rust", "python") for error attribution.
     language: String,
@@ -91,13 +112,15 @@ pub struct LspClient {
     publishes_version: Arc<AtomicBool>,
     /// Whether the server has ever sent `$/progress` notifications.
     has_sent_progress: Arc<AtomicBool>,
-    /// Consecutive CPU-path timeouts without new diagnostics. Reset to 0
-    /// when `publishDiagnostics` arrives. Used by `ProcessMonitor` to
-    /// decay patience.
-    cpu_trust_failures: Arc<AtomicU32>,
+    /// Logged once when a server is detected as lacking diagnostics support.
+    logged_no_diagnostics_support: AtomicBool,
     /// Last document version sent via `did_open`/`did_change` per URI.
     /// Used to detect stale diagnostics from prior document versions.
     last_sent_version: Arc<Mutex<HashMap<Uri, i32>>>,
+    /// Persistent process monitor for CPU-tick failure detection.
+    monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
+    /// Whether the server advertised `textDocumentSync.save` support.
+    wants_did_save: bool,
     _reader_handle: tokio::task::JoinHandle<()>,
     child: Child,
 }
@@ -133,6 +156,10 @@ impl LspClient {
         Self::spawn_inner(program, args, language, broadcaster, Stdio::null())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Spawn requires many sequential initialization steps"
+    )]
     fn spawn_inner(
         program: &str,
         args: &[&str],
@@ -147,6 +174,9 @@ impl LspClient {
             .stderr(stderr)
             .spawn()
             .with_context(|| format!("Failed to spawn LSP server: {program}"))?;
+
+        // Create ProcessMonitor from child PID (before taking stdin/stdout)
+        let monitor = child.id().and_then(catenary_proc::ProcessMonitor::new);
 
         let stdin = child
             .stdin
@@ -164,14 +194,15 @@ impl LspClient {
         let diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics_notify = Arc::new(Notify::new());
+        let capability_notify = Arc::new(Notify::new());
+        let progress_notify = Arc::new(Notify::new());
+        let state_notify = Arc::new(Notify::new());
         let has_published_diagnostics = Arc::new(AtomicBool::new(false));
-        let activity_counter = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let progress = Arc::new(Mutex::new(ProgressTracker::new()));
         let state = Arc::new(AtomicU8::new(ServerState::Initializing.as_u8()));
         let publishes_version = Arc::new(AtomicBool::new(false));
         let has_sent_progress = Arc::new(AtomicBool::new(false));
-        let cpu_trust_failures = Arc::new(AtomicU32::new(0));
 
         // Broadcast initial state
         broadcaster.send(EventKind::ServerState {
@@ -186,8 +217,10 @@ impl LspClient {
             diagnostics.clone(),
             diagnostics_generation.clone(),
             diagnostics_notify.clone(),
+            capability_notify.clone(),
+            progress_notify.clone(),
+            state_notify.clone(),
             has_published_diagnostics.clone(),
-            activity_counter.clone(),
             alive.clone(),
             progress.clone(),
             state.clone(),
@@ -195,7 +228,6 @@ impl LspClient {
             broadcaster,
             publishes_version.clone(),
             has_sent_progress.clone(),
-            cpu_trust_failures.clone(),
         ));
 
         Ok(Self {
@@ -205,8 +237,10 @@ impl LspClient {
             diagnostics,
             diagnostics_generation,
             diagnostics_notify,
+            capability_notify,
+            progress_notify,
+            state_notify,
             has_published_diagnostics,
-            activity_counter,
             alive,
             encoding: PositionEncodingKind::UTF16, // Default per spec
             progress,
@@ -216,8 +250,10 @@ impl LspClient {
             supports_workspace_folders: false,
             publishes_version,
             has_sent_progress,
-            cpu_trust_failures,
+            logged_no_diagnostics_support: AtomicBool::new(false),
             last_sent_version: Arc::new(Mutex::new(HashMap::new())),
+            monitor: std::sync::Mutex::new(monitor),
+            wants_did_save: false,
             _reader_handle: reader_handle,
             child,
         })
@@ -236,8 +272,10 @@ impl LspClient {
         diagnostics: DiagnosticsCache,
         diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
         diagnostics_notify: Arc<Notify>,
+        capability_notify: Arc<Notify>,
+        progress_notify: Arc<Notify>,
+        state_notify: Arc<Notify>,
         has_published_diagnostics: Arc<AtomicBool>,
-        activity_counter: Arc<AtomicU64>,
         alive: Arc<AtomicBool>,
         progress: Arc<Mutex<ProgressTracker>>,
         state: Arc<AtomicU8>,
@@ -245,7 +283,6 @@ impl LspClient {
         broadcaster: EventBroadcaster,
         publishes_version: Arc<AtomicBool>,
         has_sent_progress: Arc<AtomicBool>,
-        cpu_trust_failures: Arc<AtomicU32>,
     ) {
         let mut reader = BufReader::new(stdout);
         let mut buffer = BytesMut::with_capacity(8192);
@@ -341,6 +378,9 @@ impl LspClient {
                                 &diagnostics,
                                 &diagnostics_generation,
                                 &diagnostics_notify,
+                                &capability_notify,
+                                &progress_notify,
+                                &state_notify,
                                 &has_published_diagnostics,
                                 &progress,
                                 &state,
@@ -348,10 +388,8 @@ impl LspClient {
                                 &broadcaster,
                                 &publishes_version,
                                 &has_sent_progress,
-                                &cpu_trust_failures,
                             )
                             .await;
-                            activity_counter.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                 } else if value.get("id").is_some() {
@@ -377,6 +415,7 @@ impl LspClient {
         state.store(ServerState::Dead.as_u8(), Ordering::SeqCst);
         progress.lock().await.clear();
         diagnostics_notify.notify_waiters();
+        state_notify.notify_waiters();
         warn!("LSP reader task exiting - server connection lost");
     }
 
@@ -413,6 +452,9 @@ impl LspClient {
         diagnostics: &DiagnosticsCache,
         diagnostics_generation: &Arc<Mutex<HashMap<Uri, u64>>>,
         diagnostics_notify: &Notify,
+        capability_notify: &Notify,
+        progress_notify: &Notify,
+        state_notify: &Notify,
         has_published_diagnostics: &Arc<AtomicBool>,
         progress: &Arc<Mutex<ProgressTracker>>,
         state: &Arc<AtomicU8>,
@@ -420,7 +462,6 @@ impl LspClient {
         broadcaster: &EventBroadcaster,
         publishes_version: &Arc<AtomicBool>,
         has_sent_progress: &Arc<AtomicBool>,
-        cpu_trust_failures: &Arc<AtomicU32>,
     ) {
         match notification.method.as_str() {
             "textDocument/publishDiagnostics" => {
@@ -436,12 +477,9 @@ impl LspClient {
                     has_published_diagnostics.store(true, Ordering::SeqCst);
 
                     // Track whether server provides version in diagnostics
-                    if params.version.is_some() {
-                        publishes_version.store(true, Ordering::SeqCst);
+                    if params.version.is_some() && !publishes_version.swap(true, Ordering::SeqCst) {
+                        capability_notify.notify_waiters();
                     }
-
-                    // Reset CPU-path trust counter — server delivered diagnostics
-                    cpu_trust_failures.store(0, Ordering::SeqCst);
 
                     let mut cache = diagnostics.lock().await;
                     cache.insert(params.uri.clone(), (params.version, params.diagnostics));
@@ -461,7 +499,9 @@ impl LspClient {
                 if let Ok(params) =
                     serde_json::from_value::<ProgressParams>(notification.params.clone())
                 {
-                    has_sent_progress.store(true, Ordering::SeqCst);
+                    if !has_sent_progress.swap(true, Ordering::SeqCst) {
+                        capability_notify.notify_waiters();
+                    }
 
                     let mut tracker = progress.lock().await;
                     tracker.update(&params);
@@ -470,7 +510,7 @@ impl LspClient {
                     let current_state = ServerState::from_u8(state.load(Ordering::SeqCst));
                     if current_state != ServerState::Dead {
                         if tracker.is_busy() {
-                            state.store(ServerState::Indexing.as_u8(), Ordering::SeqCst);
+                            state.store(ServerState::Busy.as_u8(), Ordering::SeqCst);
                             if tracker.broadcast_changed()
                                 && let Some(p) = tracker.primary_progress()
                             {
@@ -485,18 +525,19 @@ impl LspClient {
                         } else {
                             state.store(ServerState::Ready.as_u8(), Ordering::SeqCst);
                             debug!("Server ready (progress completed)");
-                            // Broadcast ready event
                             broadcaster.send(EventKind::ProgressEnd {
                                 language: language.to_string(),
                             });
                         }
+                        // Fire notifies after state update
+                        progress_notify.notify_waiters();
+                        state_notify.notify_waiters();
                     }
                 } else {
                     warn!("Failed to parse $/progress params");
                 }
             }
             "window/logMessage" | "window/showMessage" => {
-                // Log messages from the server
                 if let Some(message) = notification.params.get("message").and_then(|m| m.as_str()) {
                     debug!("LSP server message: {}", message);
                 }
@@ -510,7 +551,37 @@ impl LspClient {
         }
     }
 
-    /// Sends a request and waits for the response with timeout.
+    /// Samples the server process via the persistent `ProcessMonitor`.
+    ///
+    /// Returns `(delta, state)` where delta is ticks since the last sample.
+    /// Returns `None` if the process is gone or monitoring is unavailable.
+    fn sample_monitor(&self) -> Option<(u64, catenary_proc::ProcessState)> {
+        self.monitor.lock().ok()?.as_mut()?.sample()
+    }
+
+    /// Returns whether the server has active `$/progress` tokens.
+    ///
+    /// Checks the actual progress tracker instead of using `ServerState`
+    /// as a proxy. `ServerState::Busy` can be set proactively (e.g., after
+    /// `workspace/didChangeWorkspaceFolders`) without actual `$/progress`
+    /// tokens, which would prevent the failure threshold from draining.
+    fn progress_active(&self) -> bool {
+        self.progress
+            .try_lock()
+            .map_or(true, |tracker| tracker.is_busy())
+    }
+
+    /// Sends a request and waits for the response with failure detection.
+    ///
+    /// Uses CPU-tick failure detection instead of wall-clock timeout.
+    /// Falls back to a 30-second wall-clock timeout when the process
+    /// monitor is unavailable (e.g., mockls in tests).
+    /// Retries on `ContentModified` by waiting for the server to become
+    /// ready before retrying.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Request retry logic with failure detection"
+    )]
     async fn request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -519,7 +590,7 @@ impl LspClient {
         let params_value = serde_json::to_value(params)?;
 
         // Retry loop for ContentModified errors
-        for i in 0..3 {
+        for _attempt in 0..3 {
             let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
 
             let request = RequestMessage {
@@ -537,28 +608,76 @@ impl LspClient {
 
             self.send_message(&request).await?;
 
-            // Wait for response with timeout
-            let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) => return Err(anyhow!("[{}] server closed connection", self.language)),
-                Err(_) => {
-                    self.pending.lock().await.remove(&id);
-                    return Err(anyhow!("[{}] request '{method}' timed out", self.language));
+            // Wait for response: select on rx + failure detection timer
+            let response = {
+                let mut rx = rx;
+                let wall_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                let mut budget = i64::try_from(REQUEST_THRESHOLD).unwrap_or(1000);
+
+                loop {
+                    tokio::select! {
+                        result = &mut rx => {
+                            match result {
+                                Ok(resp) => break Ok(resp),
+                                Err(_) => break Err(anyhow!(
+                                    "[{}] server closed connection", self.language
+                                )),
+                            }
+                        }
+                        () = tokio::time::sleep(POLL_INTERVAL) => {
+                            // Failure detection
+                            if let Some((delta, state)) = self.sample_monitor() {
+                                if state == catenary_proc::ProcessState::Dead {
+                                    self.pending.lock().await.remove(&id);
+                                    break Err(anyhow!(
+                                        "[{}] server died during '{method}'",
+                                        self.language
+                                    ));
+                                }
+                                if state == catenary_proc::ProcessState::Running
+                                    && delta > 0
+                                    && !self.progress_active()
+                                {
+                                    budget -= i64::try_from(delta)
+                                        .unwrap_or(budget);
+                                }
+                            } else if !self.is_alive() {
+                                self.pending.lock().await.remove(&id);
+                                break Err(anyhow!(
+                                    "[{}] server died during '{method}'",
+                                    self.language
+                                ));
+                            }
+
+                            if budget <= 0 {
+                                self.pending.lock().await.remove(&id);
+                                break Err(anyhow!(
+                                    "[{}] request '{method}' failed \
+                                     (server stuck)",
+                                    self.language
+                                ));
+                            }
+                            if tokio::time::Instant::now() >= wall_deadline {
+                                self.pending.lock().await.remove(&id);
+                                break Err(anyhow!(
+                                    "[{}] request '{method}' timed out",
+                                    self.language
+                                ));
+                            }
+                        }
+                    }
                 }
-            };
+            }?;
 
             if let Some(error) = response.error {
                 // Check for ContentModified (-32801) or RequestCancelled (-32800)
                 if error.code == -32801 || error.code == -32800 {
                     debug!(
-                        "LSP request '{}' cancelled/modified, retrying ({}/3)...",
+                        "LSP request '{}' cancelled/modified, waiting for ready then retrying...",
                         method,
-                        i + 1
                     );
-                    tokio::time::sleep(Duration::from_millis(
-                        100 * u64::try_from(i + 1).unwrap_or(1),
-                    ))
-                    .await;
+                    // Wait for server to finish instead of fixed sleep
+                    self.wait_ready().await;
                     continue;
                 }
                 return Err(anyhow!(
@@ -651,25 +770,45 @@ impl LspClient {
                     ..Default::default()
                 }),
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                    code_action: Some(lsp_types::CodeActionClientCapabilities {
-                        code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
-                            code_action_kind: lsp_types::CodeActionKindLiteralSupport {
-                                value_set: vec![
-                                    "quickfix".to_string(),
-                                    "refactor".to_string(),
-                                    "refactor.extract".to_string(),
-                                    "refactor.inline".to_string(),
-                                    "refactor.rewrite".to_string(),
-                                    "source".to_string(),
-                                    "source.organizeImports".to_string(),
-                                ],
-                            },
-                        }),
-                        data_support: Some(true),
-                        resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
-                            properties: vec!["edit".to_string()],
-                        }),
+                    synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+                        did_save: Some(true),
+                        dynamic_registration: Some(false),
+                        will_save: Some(false),
+                        will_save_wait_until: Some(false),
+                    }),
+                    publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                        version_support: Some(true),
                         ..Default::default()
+                    }),
+                    definition: Some(lsp_types::GotoCapability {
+                        dynamic_registration: Some(false),
+                        link_support: Some(true),
+                    }),
+                    type_definition: Some(lsp_types::GotoCapability {
+                        dynamic_registration: Some(false),
+                        link_support: Some(true),
+                    }),
+                    implementation: Some(lsp_types::GotoCapability {
+                        dynamic_registration: Some(false),
+                        link_support: Some(true),
+                    }),
+                    declaration: Some(lsp_types::GotoCapability {
+                        dynamic_registration: Some(false),
+                        link_support: Some(true),
+                    }),
+                    references: Some(lsp_types::DynamicRegistrationClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
+                        dynamic_registration: Some(false),
+                        hierarchical_document_symbol_support: Some(true),
+                        ..Default::default()
+                    }),
+                    call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities {
+                        dynamic_registration: Some(false),
                     }),
                     ..Default::default()
                 }),
@@ -721,6 +860,23 @@ impl LspClient {
         debug!(
             "Server workspace folders support: {} (supported={}, change_notifications={})",
             self.supports_workspace_folders, supported, accepts_changes
+        );
+
+        // Extract textDocumentSync.save capability.
+        // When the server advertises Options with an explicit `save` field,
+        // trust it. When the server uses the short-form Kind (Full/Incremental),
+        // LSP spec says this is equivalent to Options with save=SaveOptions{},
+        // meaning the server accepts didSave.
+        self.wants_did_save = match &result.capabilities.text_document_sync {
+            Some(lsp_types::TextDocumentSyncCapability::Kind(kind)) => {
+                *kind != lsp_types::TextDocumentSyncKind::NONE
+            }
+            Some(lsp_types::TextDocumentSyncCapability::Options(opts)) => opts.save.is_some(),
+            None => false,
+        };
+        debug!(
+            "[{}] server wants didSave: {}",
+            self.language, self.wants_did_save
         );
 
         // Send initialized notification
@@ -805,8 +961,8 @@ impl LspClient {
     /// Notifies the LSP server that workspace folders changed.
     ///
     /// When folders are added, proactively marks the server as
-    /// [`ServerState::Indexing`] so that [`wait_ready`](Self::wait_ready)
-    /// blocks queries until re-indexing completes.
+    /// [`ServerState::Busy`] so that [`wait_ready`](Self::wait_ready)
+    /// blocks queries until the server is ready again.
     ///
     /// # Errors
     ///
@@ -818,7 +974,7 @@ impl LspClient {
     ) -> Result<()> {
         if !added.is_empty() && self.server_state() == ServerState::Ready {
             self.state
-                .store(ServerState::Indexing.as_u8(), Ordering::SeqCst);
+                .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
         }
 
         self.notify(
@@ -828,15 +984,6 @@ impl LspClient {
             },
         )
         .await
-    }
-
-    /// Gets hover information for a position in a document.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        self.request("textDocument/hover", params).await
     }
 
     /// Gets the definition location for a symbol.
@@ -909,84 +1056,6 @@ impl LspClient {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
         self.request("workspace/symbol", params).await
-    }
-
-    /// Gets code actions (quick fixes, refactorings) for a range.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn code_actions(
-        &self,
-        params: CodeActionParams,
-    ) -> Result<Option<CodeActionResponse>> {
-        self.request("textDocument/codeAction", params).await
-    }
-
-    /// Resolves a code action (e.g. fills in the 'edit' property).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn resolve_code_action(
-        &self,
-        code_action: lsp_types::CodeAction,
-    ) -> Result<lsp_types::CodeAction> {
-        self.request("codeAction/resolve", code_action).await
-    }
-
-    /// Computes a rename operation across the workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        self.request("textDocument/rename", params).await
-    }
-
-    /// Gets completion suggestions at a position.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        self.request("textDocument/completion", params).await
-    }
-
-    /// Gets signature help for a function call.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn signature_help(
-        &self,
-        params: SignatureHelpParams,
-    ) -> Result<Option<SignatureHelp>> {
-        self.request("textDocument/signatureHelp", params).await
-    }
-
-    /// Formats an entire document.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn formatting(
-        &self,
-        params: DocumentFormattingParams,
-    ) -> Result<Option<Vec<TextEdit>>> {
-        self.request("textDocument/formatting", params).await
-    }
-
-    /// Formats a range within a document.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn range_formatting(
-        &self,
-        params: DocumentRangeFormattingParams,
-    ) -> Result<Option<Vec<TextEdit>>> {
-        self.request("textDocument/rangeFormatting", params).await
     }
 
     /// Prepares call hierarchy for a position.
@@ -1110,70 +1179,69 @@ impl LspClient {
         generations.get(uri).copied().unwrap_or(0)
     }
 
-    /// Waits until the server is both quiet and not busy with background work.
-    ///
-    /// Polls every 100 ms, tracking when the last activity occurred (either a
-    /// notification via `activity_counter` or an active progress token). Only
-    /// returns once the server has been quiet for `settle_duration` **and**
-    /// has no active progress tokens (e.g., flycheck).
-    ///
-    /// Returns `true` if settled or the overall timeout expired, `false` if
-    /// the server died.
-    async fn wait_for_activity_settle(&self, settle_duration: Duration, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let poll_interval = Duration::from_millis(100);
-        let mut last_counter = self.activity_counter.load(Ordering::SeqCst);
-        let mut last_activity = tokio::time::Instant::now();
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return true;
-            }
-
-            tokio::time::sleep(remaining.min(poll_interval)).await;
-
-            let current_counter = self.activity_counter.load(Ordering::SeqCst);
-            let has_active_progress = self.progress.lock().await.is_busy();
-
-            if current_counter != last_counter {
-                last_counter = current_counter;
-                last_activity = tokio::time::Instant::now();
-            }
-
-            if has_active_progress {
-                last_activity = tokio::time::Instant::now();
-            }
-
-            let quiet = last_activity.elapsed();
-            if quiet >= settle_duration && !has_active_progress {
-                return true;
-            }
-
-            if !self.is_alive() {
-                return false;
-            }
-        }
-    }
-
-    /// Returns the diagnostics strategy for this server.
+    /// Returns the diagnostics strategy for this server, if any.
     ///
     /// Selected based on runtime observations: whether the server has
     /// included `version` in `publishDiagnostics`, or sent `$/progress`
-    /// tokens. Checked on each call since runtime flags can change.
-    pub(crate) fn diagnostics_strategy(&self) -> super::diagnostics::DiagnosticsStrategy {
+    /// tokens. Returns `None` for servers without either signal —
+    /// they do not participate in the diagnostics lifecycle.
+    ///
+    /// When both signals are present, prefers `TokenMonitor` because
+    /// multi-round servers (rust-analyzer, clangd, gopls) publish fast
+    /// native diagnostics first (matching version), then slower flycheck
+    /// results under a progress token. The Active → Idle transition
+    /// spans the full work.
+    pub(crate) fn diagnostics_strategy(&self) -> Option<super::diagnostics::DiagnosticsStrategy> {
         use super::diagnostics::DiagnosticsStrategy;
 
-        if self.publishes_version.load(Ordering::SeqCst) {
-            DiagnosticsStrategy::Version
-        } else if self.has_sent_progress.load(Ordering::SeqCst) {
-            DiagnosticsStrategy::TokenMonitor
+        if self.has_sent_progress.load(Ordering::SeqCst) {
+            Some(DiagnosticsStrategy::TokenMonitor)
+        } else if self.publishes_version.load(Ordering::SeqCst) {
+            Some(DiagnosticsStrategy::Version)
         } else {
-            DiagnosticsStrategy::ProcessMonitor
+            None
         }
     }
 
+    /// Returns whether this server supports the diagnostics wait lifecycle.
+    ///
+    /// Servers must provide at least one of:
+    /// - `version` field in `publishDiagnostics` (LSP 3.15+)
+    /// - `$/progress` tokens
+    ///
+    /// Servers without either still receive `didOpen`/`didChange` for code
+    /// intelligence but do not get `didSave` and are not waited on for
+    /// diagnostics.
+    pub fn supports_diagnostics_wait(&self) -> bool {
+        if self.publishes_version.load(Ordering::SeqCst)
+            || self.has_sent_progress.load(Ordering::SeqCst)
+        {
+            return true;
+        }
+        // Log once when we determine the server lacks support (after warmup)
+        if !self.is_warming_up()
+            && !self
+                .logged_no_diagnostics_support
+                .swap(true, Ordering::SeqCst)
+        {
+            info!(
+                "[{}] server lacks version/progress support \u{2014} diagnostics disabled",
+                self.language
+            );
+        }
+        false
+    }
+
+    /// Returns whether the server advertised `textDocumentSync.save` support.
+    ///
+    /// When `false`, `did_save` should not be sent — the server doesn't
+    /// want it and may not run diagnostics on save.
+    pub const fn wants_did_save(&self) -> bool {
+        self.wants_did_save
+    }
+
     /// Returns the PID of the server process, if available.
+    #[allow(dead_code, reason = "Used by diagnostics tests and session status")]
     pub(crate) fn pid(&self) -> Option<u32> {
         self.child.id()
     }
@@ -1184,13 +1252,14 @@ impl LspClient {
     /// `snapshot` should be obtained via [`diagnostics_generation`] **before**
     /// sending the change that triggers new diagnostics.
     ///
-    /// The strategy is dispatched as follows:
-    /// - **Version:** Waits for `publishDiagnostics` with generation advance.
-    /// - **`TokenMonitor`:** Waits for `$/progress` tokens to cycle Active -> Idle.
-    /// - **`ProcessMonitor`:** Polls CPU time with trust-based timeout decay.
+    /// Uses CPU tick failure detection instead of wall-clock timeouts.
+    /// The failure threshold only drains when the server process is Running
+    /// with advancing ticks and no active progress — starvation, sleeping,
+    /// blocked I/O, and explained work are free waits.
     ///
-    /// All push strategies include a Phase 2 settle (2 seconds of silence)
-    /// after the initial signal to catch late-arriving diagnostic rounds.
+    /// Returns [`DiagnosticsWaitResult::Diagnostics`] when trusted
+    /// diagnostics are in the cache, or [`DiagnosticsWaitResult::Nothing`]
+    /// when no trusted diagnostics are available.
     #[allow(
         clippy::too_many_lines,
         reason = "Strategy dispatch requires many branches"
@@ -1199,190 +1268,191 @@ impl LspClient {
         &self,
         uri: &Uri,
         snapshot: u64,
-        timeout: Duration,
     ) -> DiagnosticsWaitResult {
         use super::diagnostics::{ActivityState, DiagnosticsStrategy, ProgressMonitor};
 
-        // Grace period for servers that haven't published diagnostics yet
+        // ── Grace period ─────────────────────────────────────────────
+        // For servers that haven't published diagnostics yet, wait for
+        // the first publishDiagnostics using load-aware failure detection.
         if !self.has_published_diagnostics.load(Ordering::SeqCst) {
-            let grace = if self.is_warming_up() {
-                WARMUP_PERIOD.saturating_sub(self.spawn_time.elapsed())
-            } else {
-                Duration::from_secs(5)
-            };
-            if grace.is_zero() {
-                return DiagnosticsWaitResult::Updated;
-            }
-            let deadline = tokio::time::Instant::now() + grace;
-            loop {
-                if self.diagnostics_generation(uri).await > snapshot {
-                    break;
-                }
-                if !self.is_alive() {
-                    return DiagnosticsWaitResult::ServerDied;
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return DiagnosticsWaitResult::Updated;
-                }
-                match tokio::time::timeout(remaining, self.diagnostics_notify.notified()).await {
-                    Ok(()) => {}
-                    Err(_) => return DiagnosticsWaitResult::Updated,
-                }
+            let grace_ok = load_aware_grace(
+                &mut || self.sample_monitor(),
+                PREAMBLE_THRESHOLD,
+                Some(Duration::from_secs(10)),
+                &self.diagnostics_notify,
+                || self.progress_active(),
+                || async { self.diagnostics_generation(uri).await > snapshot },
+            )
+            .await;
+
+            if !grace_ok {
+                return DiagnosticsWaitResult::Nothing;
             }
         }
 
-        let strategy = self.diagnostics_strategy();
-        debug!("Diagnostics strategy: {:?}", strategy);
+        // ── Strategy discovery ────────────────────────────────────────
+        // Allow a short window for the server to demonstrate its strategy
+        // (e.g., progress tokens sent in response to didChange).
+        // Uses a wall-clock timeout: the server may be sleeping (not
+        // consuming CPU) while deciding what capability to expose, so
+        // tick-based thresholds would wait indefinitely.
+        let strategy = if let Some(s) = self.diagnostics_strategy() {
+            s
+        } else {
+            let discovery_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(s) = self.diagnostics_strategy() {
+                    break s;
+                }
+                if !self.is_alive() || tokio::time::Instant::now() >= discovery_deadline {
+                    return DiagnosticsWaitResult::Nothing;
+                }
+                tokio::select! {
+                    () = self.capability_notify.notified() => {}
+                    () = tokio::time::sleep(POLL_INTERVAL) => {}
+                }
+            }
+        };
+        debug!(
+            "Diagnostics strategy: {:?} (has_progress={}, publishes_version={})",
+            strategy,
+            self.has_sent_progress.load(Ordering::SeqCst),
+            self.publishes_version.load(Ordering::SeqCst),
+        );
 
-        // Phase 1: Wait for initial diagnostics signal
+        let wall_deadline = tokio::time::Instant::now() + SAFETY_CAP;
+        let mut budget: i64 = i64::try_from(DIAGNOSTICS_THRESHOLD).unwrap_or(1000);
+
+        // ── Main wait loops ──────────────────────────────────────────
         match strategy {
             DiagnosticsStrategy::Version => {
-                // Wait for publishDiagnostics with a version >= our change.
-                // Generation advance alone is insufficient — stale diagnostics
-                // from a prior document version can bump the counter. We gate
-                // on version freshness to avoid the cross-change leak.
-                let poll_interval = Duration::from_millis(100);
-                let deadline = tokio::time::Instant::now() + timeout;
-
+                // Wait for publishDiagnostics with version >= our change.
                 loop {
                     if self.diagnostics_generation(uri).await > snapshot
                         && self.is_diagnostics_version_current(uri).await
                     {
-                        break;
+                        return DiagnosticsWaitResult::Diagnostics;
                     }
-                    if !self.is_alive() {
-                        return DiagnosticsWaitResult::ServerDied;
+
+                    // Event-driven wake + failure detection
+                    tokio::select! {
+                        () = self.diagnostics_notify.notified() => {
+                            // Check condition at top of loop
+                            continue;
+                        }
+                        () = tokio::time::sleep(POLL_INTERVAL) => {}
                     }
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        debug!("PushVersion: timeout waiting for diagnostics");
-                        return DiagnosticsWaitResult::Updated;
+
+                    // Failure detection
+                    if let Some((delta, state)) = self.sample_monitor() {
+                        if state == catenary_proc::ProcessState::Dead {
+                            return DiagnosticsWaitResult::Nothing;
+                        }
+                        if state == catenary_proc::ProcessState::Running
+                            && delta > 0
+                            && !self.progress_active()
+                        {
+                            budget -= i64::try_from(delta).unwrap_or(budget);
+                        }
+                    } else if !self.is_alive() {
+                        return DiagnosticsWaitResult::Nothing;
                     }
-                    tokio::time::sleep(remaining.min(poll_interval)).await;
+
+                    if budget <= 0 {
+                        debug!("Version: tick budget exhausted");
+                        return DiagnosticsWaitResult::Nothing;
+                    }
+                    if tokio::time::Instant::now() >= wall_deadline {
+                        debug!("Version: safety cap reached");
+                        return DiagnosticsWaitResult::Nothing;
+                    }
                 }
             }
             DiagnosticsStrategy::TokenMonitor => {
                 let mut monitor =
                     super::diagnostics::TokenMonitor::new(self.state.clone(), self.alive.clone());
-
-                let poll_interval = Duration::from_millis(100);
-                let deadline = tokio::time::Instant::now() + timeout;
                 let mut ever_active = false;
 
+                // Progress grace: if diagnostics arrive before progress tokens,
+                // wait briefly for progress to start.
+                let mut generation_advanced_at: Option<tokio::time::Instant> = None;
+
                 loop {
-                    if self.diagnostics_generation(uri).await > snapshot
-                        && self.is_diagnostics_version_current(uri).await
-                    {
-                        break;
+                    let gen_advanced = self.diagnostics_generation(uri).await > snapshot
+                        && self.is_diagnostics_version_current(uri).await;
+
+                    if gen_advanced && generation_advanced_at.is_none() {
+                        generation_advanced_at = Some(tokio::time::Instant::now());
+                    }
+
+                    // If diagnostics arrived but no progress tokens, use
+                    // load_aware_grace for the progress grace window.
+                    if generation_advanced_at.is_some() && !ever_active {
+                        let progress_started = load_aware_grace(
+                            &mut || self.sample_monitor(),
+                            PREAMBLE_THRESHOLD,
+                            Some(Duration::from_secs(2)),
+                            &self.progress_notify,
+                            || self.progress_active(),
+                            || async { self.progress_active() },
+                        )
+                        .await;
+
+                        if !progress_started {
+                            // No progress tokens arrived — return what we have
+                            return DiagnosticsWaitResult::Diagnostics;
+                        }
+                        ever_active = true;
+                        continue;
                     }
 
                     match monitor.poll() {
-                        ActivityState::Dead => return DiagnosticsWaitResult::ServerDied,
+                        ActivityState::Dead => return DiagnosticsWaitResult::Nothing,
                         ActivityState::Active => {
                             ever_active = true;
                         }
                         ActivityState::Idle if ever_active => {
-                            // Server went Active → Idle without publishing
-                            // new diagnostics. Change had no diagnostic impact.
-                            debug!(
-                                "TokenMonitor: server completed work without \
-                                 new diagnostics — using cached"
-                            );
-                            break;
+                            // Active → Idle: the full progress cycle completed.
+                            // Check for diagnostics one more time.
+                            if self.diagnostics_generation(uri).await > snapshot {
+                                return DiagnosticsWaitResult::Diagnostics;
+                            }
+                            debug!("TokenMonitor: Active \u{2192} Idle without new diagnostics");
+                            return DiagnosticsWaitResult::Nothing;
                         }
-                        ActivityState::Idle => {
-                            // Server hasn't started work yet (e.g., flycheck
-                            // debounce). Keep waiting — we know it will send
-                            // progress tokens.
+                        ActivityState::Idle => {}
+                    }
+
+                    // Event-driven wake + failure detection
+                    tokio::select! {
+                        () = self.diagnostics_notify.notified() => continue,
+                        () = self.progress_notify.notified() => continue,
+                        () = tokio::time::sleep(POLL_INTERVAL) => {}
+                    }
+
+                    // Failure detection (progress-aware)
+                    if let Some((delta, state)) = self.sample_monitor() {
+                        if state == catenary_proc::ProcessState::Dead {
+                            return DiagnosticsWaitResult::Nothing;
+                        }
+                        if state == catenary_proc::ProcessState::Running
+                            && delta > 0
+                            && !self.progress_active()
+                        {
+                            budget -= i64::try_from(delta).unwrap_or(budget);
                         }
                     }
 
-                    // Hard timeout prevents infinite hang if the server
-                    // never starts work for this change.
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        debug!("TokenMonitor: hard timeout, using cached diagnostics");
-                        break;
+                    if budget <= 0 {
+                        debug!("TokenMonitor: tick budget exhausted");
+                        return DiagnosticsWaitResult::Nothing;
                     }
-
-                    tokio::time::sleep(poll_interval.min(remaining)).await;
+                    if tokio::time::Instant::now() >= wall_deadline {
+                        debug!("TokenMonitor: safety cap reached");
+                        return DiagnosticsWaitResult::Nothing;
+                    }
                 }
             }
-            DiagnosticsStrategy::ProcessMonitor => {
-                let Some(pid) = self.pid() else {
-                    // Can't monitor without a PID — fall through to settle
-                    debug!("ProcessMonitor: no PID available");
-                    return DiagnosticsWaitResult::Updated;
-                };
-
-                let mut monitor = super::diagnostics::ProcessMonitor::new(
-                    pid,
-                    self.alive.clone(),
-                    self.cpu_trust_failures.clone(),
-                );
-
-                let poll_interval = Duration::from_millis(200);
-                let patience = monitor.patience();
-                let deadline = tokio::time::Instant::now() + patience;
-                let mut ever_active = false;
-
-                loop {
-                    if self.diagnostics_generation(uri).await > snapshot
-                        && self.is_diagnostics_version_current(uri).await
-                    {
-                        break;
-                    }
-
-                    match monitor.poll() {
-                        ActivityState::Dead => return DiagnosticsWaitResult::ServerDied,
-                        ActivityState::Active => {
-                            ever_active = true;
-                            // CPU advancing — keep waiting unless patience expired
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            if remaining.is_zero() {
-                                debug!("ProcessMonitor: patience expired");
-                                self.cpu_trust_failures.fetch_add(1, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                        ActivityState::Idle if ever_active => {
-                            debug!(
-                                "ProcessMonitor: server completed work without \
-                                 new diagnostics — using cached"
-                            );
-                            break;
-                        }
-                        ActivityState::Idle => {
-                            // Server hasn't started yet. Use patience as
-                            // the timeout since we have no better signal.
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            if remaining.is_zero() {
-                                debug!("ProcessMonitor: patience expired (never active)");
-                                self.cpu_trust_failures.fetch_add(1, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                    }
-
-                    tokio::time::sleep(poll_interval).await;
-                }
-            }
-        }
-
-        // Phase 2: Wait for server activity to settle.
-        // After the initial signal, the server may still be publishing
-        // additional diagnostic rounds or running flycheck. Wait for 2
-        // seconds of silence with no active progress tokens.
-        if self
-            .wait_for_activity_settle(Duration::from_secs(2), timeout)
-            .await
-        {
-            DiagnosticsWaitResult::Updated
-        } else {
-            DiagnosticsWaitResult::ServerDied
         }
     }
 
@@ -1417,16 +1487,25 @@ impl LspClient {
     }
 
     /// Returns true if server is ready to handle requests.
+    ///
+    /// Checks `ServerState::Ready` and confirms the process is idle
+    /// via `ProcessMonitor`. A server that is Ready and Sleeping has
+    /// finished initialization and is waiting for requests.
+    ///
+    /// During warmup (first 3 seconds), requires the process to be
+    /// Sleeping to avoid premature readiness before indexing starts.
+    /// After warmup, Ready state alone is sufficient.
     pub fn is_ready(&self) -> bool {
-        let state = self.server_state();
-        if state != ServerState::Ready || !self.is_alive() {
+        if self.server_state() != ServerState::Ready || !self.is_alive() {
             return false;
         }
 
-        // Even if state is Ready, if we just spawned, wait a bit to see if
-        // the server starts indexing (e.g. rust-analyzer takes a moment to send $/progress).
-        if self.spawn_time.elapsed() < Duration::from_millis(3000) {
-            return false;
+        // During warmup, verify the server is actually idle
+        if self.spawn_time.elapsed() < Duration::from_secs(3) {
+            let Some((_delta, state)) = self.sample_monitor() else {
+                return false;
+            };
+            return state == catenary_proc::ProcessState::Sleeping;
         }
 
         true
@@ -1456,50 +1535,63 @@ impl LspClient {
 
     /// Waits until server is ready (not indexing).
     ///
-    /// For servers that report `$/progress`, blocks until the progress
-    /// handler transitions state to [`ServerState::Ready`]. For servers
-    /// without progress support, falls back to activity settle (polls
-    /// activity counter and progress tracker until the server is quiet).
+    /// Uses load-aware failure detection instead of wall-clock timeouts.
+    /// For servers with `$/progress`, wakes on progress state transitions.
+    /// The failure threshold only counts unexplained CPU consumption.
     ///
-    /// Returns `true` if ready, `false` if server died.
+    /// For non-progress servers that get set to `Busy` (e.g. after a
+    /// workspace folder change), detects activity settle: if the server is
+    /// `Busy`, `Sleeping`, and has flat ticks for consecutive samples,
+    /// it has finished processing the notification and is transitioned back
+    /// to `Ready`.
+    ///
+    /// Returns `true` if ready, `false` if server died or is stuck.
     pub async fn wait_ready(&self) -> bool {
-        let poll_interval = Duration::from_millis(100);
+        /// Consecutive flat+sleeping samples required to settle back to Ready.
+        const SETTLE_SAMPLES: u32 = 3;
 
-        loop {
-            if self.is_ready() {
-                return true;
-            }
-            if !self.is_alive() {
-                return false;
-            }
+        let flat_count = AtomicU32::new(0);
 
-            // Non-progress servers have no $/progress End to transition
-            // back to Ready. Fall back to activity settle.
-            if self.server_state() == ServerState::Indexing
-                && !self.has_sent_progress.load(Ordering::SeqCst)
-            {
-                let settled = self
-                    .wait_for_activity_settle(Duration::from_secs(2), Duration::from_secs(30))
-                    .await;
-                if settled {
-                    self.state
-                        .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+        load_aware_grace(
+            &mut || self.sample_monitor(),
+            READY_THRESHOLD,
+            None, // Use default 5-minute safety cap
+            &self.state_notify,
+            || self.progress_active(),
+            || async {
+                if self.is_ready() {
                     return true;
                 }
-                return false; // Server died
-            }
 
-            tokio::time::sleep(poll_interval).await;
-        }
-    }
+                // Activity settle for non-progress servers: if state is
+                // Busy and the process is sleeping with flat ticks,
+                // the server accepted the notification and went idle.
+                if self.server_state() == ServerState::Busy && self.is_alive() {
+                    if let Some((delta, process_state)) = self.sample_monitor() {
+                        if process_state == catenary_proc::ProcessState::Sleeping && delta == 0 {
+                            let count = flat_count.fetch_add(1, Ordering::SeqCst) + 1;
+                            if count >= SETTLE_SAMPLES {
+                                tracing::debug!(
+                                    "wait_ready: activity settle — non-progress server \
+                                     idle for {count} samples, transitioning to Ready"
+                                );
+                                self.state
+                                    .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+                                self.state_notify.notify_waiters();
+                                return true;
+                            }
+                        } else {
+                            flat_count.store(0, Ordering::SeqCst);
+                        }
+                    }
+                } else {
+                    flat_count.store(0, Ordering::SeqCst);
+                }
 
-    /// Robustly waits for analysis to complete after a change.
-    ///
-    /// Includes a grace period to allow the server to start indexing.
-    pub async fn wait_for_analysis(&self) -> bool {
-        // Give server a moment to start indexing
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        self.wait_ready().await
+                false
+            },
+        )
+        .await
     }
 }
 

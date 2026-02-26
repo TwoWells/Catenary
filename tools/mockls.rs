@@ -78,6 +78,49 @@ struct Args {
     /// notifications (simulates a server doing work without progress).
     #[arg(long)]
     cpu_busy: Option<u64>,
+
+    /// Command to spawn on `didSave` (simulates flycheck/cargo check).
+    /// Wraps the subprocess in a `$/progress` Begin/End bracket.
+    /// Use with mockc to create the real scheduling pattern:
+    /// `--flycheck-command "mockc --ticks 20"`
+    #[arg(long)]
+    flycheck_command: Option<String>,
+
+    /// Include `textDocumentSync.save` in `ServerCapabilities`.
+    /// Required for the server to receive `textDocument/didSave`.
+    #[arg(long)]
+    advertise_save: bool,
+
+    /// Write every received notification method to a JSONL file.
+    /// Each line is `{"method":"...","uri":"..."}` (uri if available).
+    /// Tests read after shutdown to verify notification delivery.
+    #[arg(long)]
+    notification_log: Option<String>,
+
+    /// Return `ContentModified` (-32801) on the first `textDocument/definition`
+    /// request, then succeed on retry. Tests the retry path.
+    #[arg(long)]
+    content_modified_once: bool,
+
+    /// Burn CPU for N milliseconds on `workspace/didChangeWorkspaceFolders`.
+    /// No progress tokens are sent. Tests `wait_ready` failure detection.
+    #[arg(long)]
+    cpu_on_workspace_change: Option<u64>,
+
+    /// Burn CPU for N milliseconds on `initialized` notification (before
+    /// indexing simulation). Tests warmup observation in `is_ready()`.
+    #[arg(long)]
+    cpu_on_initialized: Option<u64>,
+
+    /// Write the `initialize` request params JSON to the specified file.
+    /// Tests can read this to verify client capabilities.
+    #[arg(long)]
+    log_init_params: Option<String>,
+
+    /// Override the number of ticks passed to the flycheck subprocess.
+    /// Appends `--ticks <N>` to the flycheck command args.
+    #[arg(long)]
+    flycheck_ticks: Option<u64>,
 }
 
 /// A JSON-RPC request.
@@ -154,10 +197,19 @@ struct MockServer {
     writer: Writer,
     shutdown_flag: Arc<AtomicBool>,
     next_request_id: Arc<AtomicU64>,
+    /// Optional notification log file for test verification.
+    notification_log: Option<std::fs::File>,
+    /// Whether the first definition request has been seen (for `--content-modified-once`).
+    definition_failed_once: bool,
 }
 
 impl MockServer {
     fn new(args: Args, writer: Writer) -> Self {
+        let notification_log = args
+            .notification_log
+            .as_ref()
+            .and_then(|path| std::fs::File::create(path).ok());
+
         Self {
             args,
             documents: HashMap::new(),
@@ -166,6 +218,8 @@ impl MockServer {
             writer,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             next_request_id: Arc::new(AtomicU64::new(1)),
+            notification_log,
+            definition_failed_once: false,
         }
     }
 
@@ -240,10 +294,31 @@ impl MockServer {
         }
 
         let result = match method {
-            "initialize" => Some(self.handle_initialize()),
+            "initialize" => {
+                if let Some(ref path) = self.args.log_init_params {
+                    let json = serde_json::to_string_pretty(&request.params).unwrap_or_default();
+                    let _ = std::fs::write(path, json);
+                }
+                Some(self.handle_initialize())
+            }
             "shutdown" => Some(Value::Null),
             "textDocument/hover" => self.handle_hover(&request.params),
-            "textDocument/definition" => self.handle_definition(&request.params),
+            "textDocument/definition" => {
+                if self.args.content_modified_once && !self.definition_failed_once {
+                    self.definition_failed_once = true;
+                    self.send_response(&Response {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32801,
+                            message: "ContentModified".to_string(),
+                        }),
+                    });
+                    return;
+                }
+                self.handle_definition(&request.params)
+            }
             "textDocument/references" => self.handle_references(&request.params),
             "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
@@ -274,8 +349,25 @@ impl MockServer {
     }
 
     fn handle_notification(&mut self, method: &str, params: &Value) {
+        // Log notification if configured
+        if let Some(ref mut log) = self.notification_log {
+            let uri = params
+                .get("textDocument")
+                .and_then(|td| td.get("uri"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let entry = serde_json::json!({"method": method, "uri": uri});
+            let _ = writeln!(log, "{entry}");
+        }
+
         match method {
             "initialized" => {
+                if let Some(busy_ms) = self.args.cpu_on_initialized {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(busy_ms) {
+                        std::hint::spin_loop();
+                    }
+                }
                 if self.args.indexing_delay > 0 {
                     self.start_indexing_simulation();
                 }
@@ -334,7 +426,9 @@ impl MockServer {
             "textDocument/didSave" => {
                 if let Some(td) = params.get("textDocument") {
                     let uri = td.get("uri").and_then(Value::as_str).unwrap_or_default();
-                    if !self.args.no_diagnostics {
+                    if let Some(ref cmd) = self.args.flycheck_command {
+                        self.run_flycheck(uri, cmd);
+                    } else if !self.args.no_diagnostics {
                         self.publish_diagnostics(uri);
                     }
                 }
@@ -349,23 +443,35 @@ impl MockServer {
                 self.shutdown_flag.store(true, Ordering::SeqCst);
                 std::process::exit(0);
             }
-            // workspace/didChangeWorkspaceFolders and all others are silently accepted
+            "workspace/didChangeWorkspaceFolders" => {
+                if let Some(busy_ms) = self.args.cpu_on_workspace_change {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(busy_ms) {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            // All other notifications are silently accepted
             _ => {}
         }
     }
 
     fn handle_initialize(&self) -> Value {
+        let mut text_doc_sync = serde_json::json!({
+            "openClose": true,
+            "change": 1
+        });
+        if self.args.advertise_save {
+            text_doc_sync["save"] = serde_json::json!({ "includeText": false });
+        }
+
         let mut capabilities = serde_json::json!({
             "hoverProvider": true,
             "definitionProvider": true,
             "referencesProvider": true,
             "documentSymbolProvider": true,
             "workspaceSymbolProvider": true,
-            "textDocumentSync": {
-                "openClose": true,
-                "change": 1,
-                "save": { "includeText": false }
-            }
+            "textDocumentSync": text_doc_sync
         });
 
         if self.args.workspace_folders {
@@ -621,6 +727,90 @@ impl MockServer {
                     "params": {
                         "token": token,
                         "value": { "kind": "end", "message": "Checking complete" }
+                    }
+                }),
+            );
+        });
+    }
+
+    /// Simulates flycheck: progress Begin → spawn subprocess → wait →
+    /// publish diagnostics → progress End. Runs in a background thread
+    /// so the main message loop stays responsive.
+    fn run_flycheck(&self, uri: &str, command: &str) {
+        let uri_owned = uri.to_string();
+        let command_owned = command.to_string();
+        let writer = self.writer.clone();
+        let next_id = self.next_request_id.clone();
+        let no_diagnostics = self.args.no_diagnostics;
+        let publish_version = self.args.publish_version;
+        let flycheck_ticks = self.args.flycheck_ticks;
+        let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
+        let version = if publish_version {
+            Some(self.versions.get(uri).copied().unwrap_or(1))
+        } else {
+            None
+        };
+
+        std::thread::spawn(move || {
+            let token = "mockls-flycheck";
+
+            // Create progress token
+            let req_id = next_id.fetch_add(1, Ordering::SeqCst);
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "window/workDoneProgress/create",
+                    "params": { "token": token }
+                }),
+            );
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Progress Begin
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token,
+                        "value": { "kind": "begin", "title": "Flycheck", "percentage": 0 }
+                    }
+                }),
+            );
+
+            // Spawn the flycheck subprocess and wait for it to exit.
+            // This is where mockls goes to Sleeping while mockc burns CPU.
+            let parts: Vec<&str> = command_owned.split_whitespace().collect();
+            if let Some((program, cmd_args)) = parts.split_first() {
+                let mut cmd = std::process::Command::new(program);
+                cmd.args(cmd_args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if let Some(ticks) = flycheck_ticks {
+                    cmd.arg("--ticks").arg(ticks.to_string());
+                }
+                let _ = cmd.status();
+            }
+
+            // Publish diagnostics after subprocess completes
+            if !no_diagnostics {
+                send_diagnostics_notification(&writer, &uri_owned, version, line_count);
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Progress End
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token,
+                        "value": { "kind": "end", "message": "Flycheck complete" }
                     }
                 }),
             );
@@ -883,6 +1073,14 @@ mod tests {
             publish_version: false,
             progress_on_change: false,
             cpu_busy: None,
+            flycheck_command: None,
+            advertise_save: false,
+            notification_log: None,
+            content_modified_once: false,
+            cpu_on_workspace_change: None,
+            cpu_on_initialized: None,
+            log_init_params: None,
+            flycheck_ticks: None,
         }
     }
 

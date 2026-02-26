@@ -226,7 +226,10 @@ impl Session {
 
     /// Generate a short unique session ID.
     fn generate_id() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -235,22 +238,11 @@ impl Session {
 
         let pid = std::process::id();
 
-        // Use thread ID to avoid collisions in tests
+        // Atomic counter guarantees uniqueness within the same process,
+        // even when multiple sessions are created in the same millisecond.
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        let tid = format!("{:?}", std::thread::current().id());
-
-        // Simple hash of tid to keep it short
-
-        let tid_hash = tid
-            .bytes()
-            .fold(0u32, |acc, x| acc.wrapping_add(u32::from(x)));
-
-        format!(
-            "{:x}{:x}{:x}",
-            u32::try_from(now).unwrap_or(0),
-            pid,
-            tid_hash
-        )
+        format!("{:x}{:x}{:x}", u32::try_from(now).unwrap_or(0), pid, seq)
     }
 
     /// Returns the path to the notify IPC endpoint for this session.
@@ -461,7 +453,7 @@ pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
     }))
 }
 
-/// Tail events from a session (follows new events).
+/// Tail events from a session (follows new events from the beginning).
 ///
 /// # Errors
 ///
@@ -477,6 +469,25 @@ pub fn tail_events(id: &str) -> Result<TailReader> {
     TailReader::new(events_path)
 }
 
+/// Tail only *new* events from a session (seeks to end of file first).
+///
+/// Use this when historical events have already been loaded separately
+/// and you only want events written after this call.
+///
+/// # Errors
+///
+/// Returns an error if the session does not exist or the events file cannot be opened.
+pub fn tail_events_new(id: &str) -> Result<TailReader> {
+    let sessions_base = sessions_dir();
+    let events_path = sessions_base.join(id).join("events.jsonl");
+
+    if !events_path.exists() {
+        anyhow::bail!("Session not found: {id}");
+    }
+
+    TailReader::new_from_end(events_path)
+}
+
 /// Reader that tails a file for new content.
 pub struct TailReader {
     path: PathBuf,
@@ -489,6 +500,23 @@ impl TailReader {
         let file = File::open(&path)?;
         let metadata = file.metadata()?;
         let reader = BufReader::new(file);
+
+        Ok(Self {
+            path,
+            reader,
+            last_size: metadata.len(),
+        })
+    }
+
+    /// Create a reader positioned at the end of the file, so it only
+    /// picks up events written after this call.
+    fn new_from_end(path: PathBuf) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+
+        let file = File::open(&path)?;
+        let metadata = file.metadata()?;
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::End(0))?;
 
         Ok(Self {
             path,
@@ -596,6 +624,73 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
     Ok(languages)
 }
 
+/// Remove dead session directories older than the configured retention period.
+///
+/// - `retention_days == -1`: retain forever (no-op).
+/// - `retention_days == 0`: remove all dead sessions regardless of age.
+/// - `retention_days > 0`: remove dead sessions whose `started_at` is older
+///   than `retention_days` days ago.
+///
+/// Active sessions are never pruned.
+///
+/// # Errors
+///
+/// Returns an error if the sessions directory cannot be read.  Individual
+/// session removal failures are logged and skipped.
+pub fn prune_sessions(retention_days: i64) -> Result<usize> {
+    if retention_days < 0 {
+        return Ok(0);
+    }
+
+    let sessions_base = sessions_dir();
+    if !sessions_base.exists() {
+        return Ok(0);
+    }
+
+    let cutoff = if retention_days == 0 {
+        // Remove all dead sessions — use a far-future cutoff so everything qualifies.
+        Utc::now() + chrono::Duration::days(1)
+    } else {
+        Utc::now() - chrono::Duration::days(retention_days)
+    };
+
+    let mut removed = 0usize;
+
+    for entry in fs::read_dir(&sessions_base)? {
+        let entry = entry?;
+        let dir = entry.path();
+
+        let info_path = dir.join("info.json");
+        if !info_path.exists() {
+            continue;
+        }
+
+        // Parse session info to get PID and age.
+        let Ok(file) = File::open(&info_path) else {
+            continue;
+        };
+        let Ok(info) = serde_json::from_reader::<_, SessionInfo>(file) else {
+            continue;
+        };
+
+        // Never prune active sessions.
+        if session_is_alive(&dir, info.pid) {
+            continue;
+        }
+
+        // Only prune if older than cutoff.
+        if info.started_at < cutoff {
+            if let Err(e) = fs::remove_dir_all(&dir) {
+                tracing::warn!("Failed to prune session {}: {e}", dir.display());
+            } else {
+                removed += 1;
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
 /// Determine whether a session is alive.
 ///
 /// A session is dead if it wrote a `dead` marker on shutdown, or if its
@@ -678,7 +773,7 @@ mod tests {
 
         session.broadcast(EventKind::ServerState {
             language: "rust".to_string(),
-            state: "Indexing".to_string(),
+            state: "Busy".to_string(),
         });
 
         session.broadcast(EventKind::Progress {
@@ -776,6 +871,60 @@ mod tests {
         assert_eq!(langs, vec!["python", "rust", "typescript"]);
 
         drop(session);
+        Ok(())
+    }
+
+    /// Helper: create a dead session, optionally backdated.
+    fn create_dead_session(workspace: &str, backdate_days: Option<i64>) -> Result<PathBuf> {
+        let session = Session::create(workspace)?;
+        let id = session.info.id.clone();
+        let dir = sessions_dir().join(&id);
+        drop(session);
+
+        if let Some(days) = backdate_days {
+            let info_path = dir.join("info.json");
+            let file = File::open(&info_path)?;
+            let mut info: SessionInfo = serde_json::from_reader(file)?;
+            info.started_at = Utc::now() - chrono::Duration::days(days);
+            let file = File::create(&info_path)?;
+            serde_json::to_writer_pretty(file, &info)?;
+        }
+        Ok(dir)
+    }
+
+    /// Single sequential test covering all `prune_sessions` behaviours.
+    ///
+    /// These must run in sequence because `prune_sessions` operates on the
+    /// shared `sessions_dir()` and parallel execution causes interference.
+    #[test]
+    fn test_prune_sessions() -> Result<()> {
+        // -- retention=-1 retains forever --
+        let dir_forever = create_dead_session("/tmp/test-prune-forever", Some(365))?;
+        let removed = prune_sessions(-1)?;
+        assert_eq!(removed, 0, "retention=-1 should never prune");
+        assert!(dir_forever.exists());
+        let _ = fs::remove_dir_all(&dir_forever);
+
+        // -- retention=7 keeps recent, removes old --
+        let dir_recent = create_dead_session("/tmp/test-prune-recent", None)?;
+        let dir_old = create_dead_session("/tmp/test-prune-old", Some(10))?;
+
+        let _ = prune_sessions(7)?;
+        assert!(
+            dir_recent.exists(),
+            "recent dead session should survive prune"
+        );
+        assert!(!dir_old.exists(), "old dead session should be pruned");
+        let _ = fs::remove_dir_all(&dir_recent);
+
+        // -- retention=0 removes all dead --
+        let dir_zero = create_dead_session("/tmp/test-prune-zero", None)?;
+        let _ = prune_sessions(0)?;
+        assert!(
+            !dir_zero.exists(),
+            "dead session should be removed with retention=0"
+        );
+
         Ok(())
     }
 }

@@ -178,12 +178,54 @@ make test
 
 ## Relationship to Real-Server Tests
 
-All existing tests that use real language servers remain in the suite. They serve a different purpose: verifying Catenary works with actual LSP implementations. They continue to skip when the server isn't installed. mockls tests and real-server tests are complementary:
+The test suite uses no real language servers. Real-server validation happens
+organically every session via `catenary monitor` — the operator sees every tool
+call, every diagnostics cycle, every progress token. That's the smoke test. It
+runs on real projects with real contention, which is better coverage than any
+synthetic test.
 
-- **mockls tests** verify Catenary's protocol handling against a controlled, deterministic server. They always run.
-- **Real-server tests** verify end-to-end behavior against production LSP implementations. They run when servers are available.
+The test suite's job is to verify the **model** — deterministically, on every
+machine, under any load. That means mockls + mockc only. Tests that previously
+used real servers (`require_rust_analyzer!()`, `require_bash_lsp!()`, etc.)
+were migrated to mockls or deleted. The `require_*` guard pattern — where a
+test silently skips if the server isn't installed — means CI coverage depends
+on what's installed on the runner. That's not testing.
+
+## mockc: Simulated Compiler Subprocess
+
+Real rust-analyzer delegates expensive work to `cargo check` → `rustc`. The LSP
+process goes to Sleeping while the child does the work. This is the exact
+scheduling pattern that wall-clock timeouts get wrong: the LSP has flat ticks
+(Sleeping), but real work is happening in a subprocess.
+
+mockc (`tools/mockc.rs`) replaces this with a deterministic binary. Its only
+job: burn CPU for a precise number of ticks, then exit. All durations are in CPU
+ticks (centiseconds, 100 Hz) — the same unit `ProcessMonitor` measures. On an
+idle machine, 50 ticks takes ~500ms wall time. On a loaded machine it takes
+longer, but the tick count is identical. Catenary's failure detector counts
+ticks, mockc produces ticks. The units match end-to-end.
+
+```
+mockc [OPTIONS]
+
+Options:
+  --ticks <N>         Burn CPU for N ticks / centiseconds (default: 10)
+  --exit-code <N>     Exit with this code (default: 0)
+  --output <text>     Write text to stdout before exiting
+  --hang              Never exit (simulate stuck compiler)
+```
+
+### Test profiles using mockc
+
+| Profile | mockls flags | mockc flags | Purpose |
+|---------|-------------|-------------|---------|
+| Fast flycheck | `--flycheck-command mockc` | default (10 ticks) | Basic flycheck cycle |
+| Near threshold | `--flycheck-command mockc --flycheck-ticks 900` | 900 ticks | 90% of 1000-tick threshold — passes because ticks are in subprocess |
+| Stuck compiler | `--flycheck-command "mockc --hang"` | never exits | Verifies failure detection on progress cycle |
+| Compiler crash | `--flycheck-command "mockc --exit-code 1"` | immediate fail | Progress End with no diagnostics |
 
 ## Source
 
-- `src/bin/mockls.rs` — the mock server binary and its unit tests
-- `Cargo.toml` — `[[bin]]` entry for mockls
+- `tools/mockls.rs` — the mock server binary and its unit tests
+- `tools/mockc.rs` — the simulated compiler subprocess
+- `Cargo.toml` — `[[bin]]` entries for both

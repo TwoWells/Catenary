@@ -7,26 +7,21 @@ use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCall,
-    CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, CodeActionContext,
-    CodeActionOrCommand, CodeActionParams, Diagnostic, DiagnosticSeverity, DocumentChanges,
+    CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, Diagnostic, DiagnosticSeverity,
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, Location, LocationLink, Position, Range,
-    ReferenceContext, ReferenceParams, RenameParams, SymbolInformation, TextDocumentIdentifier,
-    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkspaceEdit,
+    GotoDefinitionResponse, Location, LocationLink, Position, ReferenceContext, ReferenceParams,
+    SymbolInformation, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::lsp::{
-    ClientManager, DIAGNOSTICS_TIMEOUT, DiagnosticsWaitResult, LspClient, ServerState,
-};
+use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient, ServerState};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
@@ -99,25 +94,6 @@ pub struct FindReferencesInput {
 pub struct SearchInput {
     /// One or more search queries.
     pub queries: Vec<String>,
-}
-
-/// Input for code actions.
-#[derive(Debug, Deserialize)]
-pub struct CodeActionInput {
-    pub file: String,
-    pub start_line: u32,
-    pub start_character: u32,
-    pub end_line: u32,
-    pub end_character: u32,
-}
-
-/// Input for rename.
-#[derive(Debug, Deserialize)]
-pub struct RenameInput {
-    pub file: String,
-    pub line: u32,
-    pub character: u32,
-    pub new_name: String,
 }
 
 /// Input for call hierarchy.
@@ -279,7 +255,7 @@ impl LspBridgeHandler {
         for status in statuses {
             let state_str = match status.state {
                 ServerState::Initializing => "Initializing",
-                ServerState::Indexing => "Indexing",
+                ServerState::Busy => "Busy",
                 ServerState::Ready => "Ready",
                 ServerState::Dead => "Dead",
             };
@@ -306,13 +282,6 @@ impl LspBridgeHandler {
         CallToolResult::text(output.join("\n"))
     }
 
-    /// How long to wait for initial analysis after opening a document.
-    ///
-    /// We only need the first `publishDiagnostics` for the URI — not the
-    /// full settle phase the notify/diagnostics handlers use. Keeping this
-    /// short avoids blocking queries for too long when a server is slow.
-    const OPEN_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(5);
-
     /// Ensures a document is open and synced with the LSP server.
     async fn ensure_document_open(
         &self,
@@ -333,10 +302,6 @@ impl LspBridgeHandler {
         let uri = doc_manager.uri_for_path(path)?;
 
         if let Some(notification) = doc_manager.ensure_open(path).await? {
-            // Snapshot generation *before* sending the notification so
-            // we can wait for the server to publish fresh diagnostics.
-            let snapshot = client.diagnostics_generation(&uri).await;
-
             match notification {
                 DocumentNotification::Open(params) => {
                     client.did_open(params).await?;
@@ -347,14 +312,6 @@ impl LspBridgeHandler {
             }
 
             drop(doc_manager);
-
-            // Wait for the server to analyze the file before returning.
-            // Ignore the result — timeout/inactive is not fatal, the
-            // subsequent query may still succeed with partial analysis.
-            let _ = client
-                .wait_for_diagnostics_update(&uri, snapshot, Self::OPEN_ANALYSIS_TIMEOUT)
-                .await;
-
             drop(client);
             return Ok((uri, client_mutex.clone()));
         }
@@ -399,32 +356,6 @@ impl LspBridgeHandler {
             let path = Self::resolve_path(file)?;
             Ok((path, Position { line, character }))
         }
-    }
-
-    fn handle_hover(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: SymbolOrPositionInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-        let (path, position) = self.resolve_symbol_or_position(&input)?;
-
-        debug!("Hover request: {}:{}", path.display(), position.line);
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = HoverParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-            };
-            client_mutex.lock().await.hover(params).await
-        })?;
-
-        result.map_or_else(
-            || Ok(CallToolResult::text("No hover information available")),
-            |hover| Ok(CallToolResult::text(format_hover(&hover))),
-        )
     }
 
     fn handle_definition(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
@@ -672,7 +603,7 @@ impl LspBridgeHandler {
         let result = self.runtime.block_on(async {
             let (uri, client_mutex) = self.ensure_document_open(&path).await?;
 
-            if !client_mutex.lock().await.wait_for_analysis().await {
+            if !client_mutex.lock().await.wait_ready().await {
                 return Err(anyhow!("LSP server stopped responding during analysis"));
             }
 
@@ -857,93 +788,6 @@ impl LspBridgeHandler {
         output
     }
 
-    fn handle_code_actions(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: CodeActionInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!(
-            "Code actions request: {} [{},{}]-[{},{}]",
-            input.file,
-            input.start_line,
-            input.start_character,
-            input.end_line,
-            input.end_character
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-
-            // Get diagnostics for the range to include in context
-            let diagnostics = client_mutex.lock().await.get_diagnostics(&uri).await;
-
-            let params = CodeActionParams {
-                text_document: TextDocumentIdentifier { uri },
-                range: Range {
-                    start: Position {
-                        line: input.start_line,
-                        character: input.start_character,
-                    },
-                    end: Position {
-                        line: input.end_line,
-                        character: input.end_character,
-                    },
-                },
-                context: CodeActionContext {
-                    diagnostics,
-                    only: None,
-                    trigger_kind: None,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-            client_mutex.lock().await.code_actions(params).await
-        })?;
-
-        match result {
-            Some(actions) if !actions.is_empty() => {
-                Ok(CallToolResult::text(format_code_actions(&actions)))
-            }
-            _ => Ok(CallToolResult::text("No code actions available")),
-        }
-    }
-
-    fn handle_rename(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: RenameInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!(
-            "Rename request: {}:{}:{} -> {}",
-            input.file, input.line, input.character, input.new_name
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = RenameParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position {
-                        line: input.line,
-                        character: input.character,
-                    },
-                },
-                new_name: input.new_name,
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-            };
-            client_mutex.lock().await.rename(params).await
-        })?;
-
-        Ok(result.map_or_else(
-            || CallToolResult::text("Rename not supported at this location"),
-            |edit| CallToolResult::text(format_workspace_edit(&edit)),
-        ))
-    }
-
     fn handle_diagnostics(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: FileInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
@@ -959,10 +803,7 @@ impl LspBridgeHandler {
             let client = client_mutex.lock().await;
 
             if !client.is_alive() {
-                return Err(anyhow!(
-                    "[{}] server is no longer running",
-                    client.language()
-                ));
+                return Ok(Vec::new());
             }
 
             let uri = doc_manager.uri_for_path(&path)?;
@@ -981,21 +822,16 @@ impl LspBridgeHandler {
                 }
 
                 // Trigger flycheck on servers that only run diagnostics on save
-                client.did_save(uri.clone()).await?;
+                if client.wants_did_save() {
+                    client.did_save(uri.clone()).await?;
+                }
 
                 drop(doc_manager);
 
-                match client
-                    .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
-                    .await
+                if client.wait_for_diagnostics_update(&uri, snapshot).await
+                    == DiagnosticsWaitResult::Nothing
                 {
-                    DiagnosticsWaitResult::Updated => {}
-                    DiagnosticsWaitResult::ServerDied => {
-                        return Err(anyhow!(
-                            "[{}] server died during analysis",
-                            client.language()
-                        ));
-                    }
+                    return Ok(Vec::new());
                 }
             } else {
                 drop(doc_manager);
@@ -1294,7 +1130,6 @@ impl LspBridgeHandler {
                     }
 
                     if let Ok(client_mutex) = self.client_manager.get_client(&lang_id).await {
-                        // Attempt to open and get symbols with a short timeout
                         if let Ok((uri, _)) = self.ensure_document_open(&entry.path).await {
                             let params = DocumentSymbolParams {
                                 text_document: TextDocumentIdentifier { uri },
@@ -1304,17 +1139,10 @@ impl LspBridgeHandler {
                             };
 
                             let client = client_mutex.lock().await;
-                            let symbols_future = client.document_symbols(params);
-
-                            // 1s timeout per file to keep map generation snappy but reliable
-                            let timeout_result = tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
-                                symbols_future,
-                            )
-                            .await;
+                            let result = client.document_symbols(params).await;
                             drop(client);
 
-                            if let Ok(Ok(Some(response))) = timeout_result {
+                            if let Ok(Some(response)) = result {
                                 entry.symbols =
                                     Some(format_compact_symbols(&response, detail_level));
                             }
@@ -1401,11 +1229,6 @@ impl ToolHandler for LspBridgeHandler {
     fn list_tools(&self) -> Vec<Tool> {
         let tools = vec![
             Tool {
-                name: "hover".to_string(),
-                description: Some("Get hover information (documentation, type info) for a symbol. Accepts a symbol name or file/line/character position.".to_string()),
-                input_schema: symbol_or_position_schema(),
-            },
-            Tool {
                 name: "definition".to_string(),
                 description: Some("Go to the definition of a symbol. Accepts a symbol name or file/line/character position.".to_string()),
                 input_schema: symbol_or_position_schema(),
@@ -1452,35 +1275,6 @@ impl ToolHandler for LspBridgeHandler {
                         }
                     },
                     "required": ["queries"]
-                }),
-            },
-            Tool {
-                name: "code_actions".to_string(),
-                description: Some("Get available code actions (quick fixes, refactorings) for a range.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "start_line": { "type": "integer", "description": "Start line (0-indexed)" },
-                        "start_character": { "type": "integer", "description": "Start character (0-indexed)" },
-                        "end_line": { "type": "integer", "description": "End line (0-indexed)" },
-                        "end_character": { "type": "integer", "description": "End character (0-indexed)" }
-                    },
-                    "required": ["file", "start_line", "start_character", "end_line", "end_character"]
-                }),
-            },
-            Tool {
-                name: "rename".to_string(),
-                description: Some("Compute the edits needed to rename a symbol across the codebase. Returns proposed changes — does not modify files.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Absolute path to the file" },
-                        "line": { "type": "integer", "description": "Line number (0-indexed)" },
-                        "character": { "type": "integer", "description": "Character position (0-indexed)" },
-                        "new_name": { "type": "string", "description": "New name for the symbol" }
-                    },
-                    "required": ["file", "line", "character", "new_name"]
                 }),
             },
             Tool {
@@ -1611,15 +1405,12 @@ impl ToolHandler for LspBridgeHandler {
         }
 
         let result = match name {
-            "hover" => self.handle_hover(arguments),
             "definition" => self.handle_definition(arguments),
             "type_definition" => self.handle_type_definition(arguments),
             "implementation" => self.handle_implementation(arguments),
             "find_references" => self.handle_find_references(arguments),
             "document_symbols" => self.handle_document_symbols(arguments),
             "search" => self.handle_search(arguments),
-            "code_actions" => self.handle_code_actions(arguments),
-            "rename" => self.handle_rename(arguments),
             "diagnostics" => self.handle_diagnostics(arguments),
             "call_hierarchy" => self.handle_call_hierarchy(arguments),
             "type_hierarchy" => self.handle_type_hierarchy(arguments),
@@ -1719,28 +1510,6 @@ fn file_schema() -> serde_json::Value {
 }
 
 // Formatting helpers
-fn format_hover(hover: &Hover) -> String {
-    use lsp_types::HoverContents;
-    match &hover.contents {
-        HoverContents::Scalar(marked_string) => format_marked_string(marked_string),
-        HoverContents::Array(strings) => strings
-            .iter()
-            .map(format_marked_string)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        HoverContents::Markup(markup) => markup.value.clone(),
-    }
-}
-
-fn format_marked_string(marked: &lsp_types::MarkedString) -> String {
-    match marked {
-        lsp_types::MarkedString::String(s) => s.clone(),
-        lsp_types::MarkedString::LanguageString(ls) => {
-            format!("```{}\n{}\n```", ls.language, ls.value)
-        }
-    }
-}
-
 fn format_definition_response(response: &GotoDefinitionResponse) -> String {
     match response {
         GotoDefinitionResponse::Scalar(location) => format_location(location),
@@ -1984,121 +1753,6 @@ fn format_workspace_symbols(response: &WorkspaceSymbolResponse) -> Option<String
                 )
             }
         }
-    }
-}
-
-fn format_code_actions(actions: &[CodeActionOrCommand]) -> String {
-    actions
-        .iter()
-        .enumerate()
-        .map(|(i, action)| match action {
-            CodeActionOrCommand::Command(cmd) => format!("{}. [Command] {}", i + 1, cmd.title),
-            CodeActionOrCommand::CodeAction(ca) => {
-                let kind = ca
-                    .kind
-                    .as_ref()
-                    .map(|k| format!(" ({})", k.as_str()))
-                    .unwrap_or_default();
-                format!("{}. {}{}", i + 1, ca.title, kind)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn format_workspace_edit(edit: &WorkspaceEdit) -> String {
-    let mut result = Vec::new();
-
-    if let Some(changes) = &edit.changes {
-        for (uri, edits) in changes {
-            result.push(format!("File: {}", uri.path()));
-            for e in edits {
-                result.push(format!(
-                    "  L{}:{}-L{}:{}: {}",
-                    e.range.start.line + 1,
-                    e.range.start.character + 1,
-                    e.range.end.line + 1,
-                    e.range.end.character + 1,
-                    e.new_text.replace('\n', "\\n")
-                ));
-            }
-        }
-    }
-
-    if let Some(doc_changes) = &edit.document_changes {
-        match doc_changes {
-            DocumentChanges::Edits(edits) => {
-                for edit in edits {
-                    result.push(format!("File: {}", edit.text_document.uri.path()));
-                    for e in &edit.edits {
-                        match e {
-                            lsp_types::OneOf::Left(text_edit) => {
-                                result.push(format!(
-                                    "  L{}:{}-L{}:{}: {}",
-                                    text_edit.range.start.line + 1,
-                                    text_edit.range.start.character + 1,
-                                    text_edit.range.end.line + 1,
-                                    text_edit.range.end.character + 1,
-                                    text_edit.new_text.replace('\n', "\\n")
-                                ));
-                            }
-                            lsp_types::OneOf::Right(annotated) => {
-                                result.push(format!(
-                                    "  L{}:{}-L{}:{}: {}",
-                                    annotated.text_edit.range.start.line + 1,
-                                    annotated.text_edit.range.start.character + 1,
-                                    annotated.text_edit.range.end.line + 1,
-                                    annotated.text_edit.range.end.character + 1,
-                                    annotated.text_edit.new_text.replace('\n', "\\n")
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            DocumentChanges::Operations(ops) => {
-                for op in ops {
-                    match op {
-                        lsp_types::DocumentChangeOperation::Op(resource_op) => {
-                            result.push(format!("Operation: {resource_op:?}"));
-                        }
-                        lsp_types::DocumentChangeOperation::Edit(edit) => {
-                            result.push(format!("File: {}", edit.text_document.uri.path()));
-                            for e in &edit.edits {
-                                match e {
-                                    lsp_types::OneOf::Left(text_edit) => {
-                                        result.push(format!(
-                                            "  L{}:{}-L{}:{}: {}",
-                                            text_edit.range.start.line + 1,
-                                            text_edit.range.start.character + 1,
-                                            text_edit.range.end.line + 1,
-                                            text_edit.range.end.character + 1,
-                                            text_edit.new_text.replace('\n', "\\n")
-                                        ));
-                                    }
-                                    lsp_types::OneOf::Right(annotated) => {
-                                        result.push(format!(
-                                            "  L{}:{}-L{}:{}: {}",
-                                            annotated.text_edit.range.start.line + 1,
-                                            annotated.text_edit.range.start.character + 1,
-                                            annotated.text_edit.range.end.line + 1,
-                                            annotated.text_edit.range.end.character + 1,
-                                            annotated.text_edit.new_text.replace('\n', "\\n")
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if result.is_empty() {
-        "No changes".to_string()
-    } else {
-        result.join("\n")
     }
 }
 

@@ -493,7 +493,7 @@ fn extension_to_config_key(ext: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerConfig;
+    use crate::config::{IconConfig, ServerConfig};
     use anyhow::Result;
 
     fn test_config() -> Config {
@@ -501,6 +501,7 @@ mod tests {
             server: HashMap::new(),
             idle_timeout: 300,
             log_retention_days: 7,
+            icons: IconConfig::default(),
         }
     }
 
@@ -531,6 +532,7 @@ mod tests {
             server,
             idle_timeout: 300,
             log_retention_days: 7,
+            icons: IconConfig::default(),
         }
     }
 
@@ -549,6 +551,7 @@ mod tests {
             server,
             idle_timeout: 300,
             log_retention_days: 7,
+            icons: IconConfig::default(),
         }
     }
 

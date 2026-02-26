@@ -27,7 +27,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::bridge::{DocumentManager, DocumentNotification, PathValidator};
-use crate::lsp::{ClientManager, DIAGNOSTICS_TIMEOUT, DiagnosticsWaitResult, LspClient};
+use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient};
 use crate::session::{EventBroadcaster, EventKind};
 
 /// Request from `catenary release` (file change) or `catenary sync-roots` (root sync).
@@ -246,12 +246,9 @@ impl NotifyServer {
 
         let mut doc_manager = self.doc_manager.lock().await;
         let client = client_mutex.lock().await;
-        let lang = client.language().to_string();
 
         if !client.is_alive() {
-            return Ok(format!(
-                "[{lang}] server is not running \u{2014} diagnostics unavailable"
-            ));
+            return Ok(String::new());
         }
 
         let uri = doc_manager.uri_for_path(&canonical)?;
@@ -271,20 +268,16 @@ impl NotifyServer {
             }
 
             // Trigger flycheck on servers that only run diagnostics on save
-            client.did_save(uri.clone()).await?;
+            if client.wants_did_save() {
+                client.did_save(uri.clone()).await?;
+            }
 
             drop(doc_manager);
 
-            match client
-                .wait_for_diagnostics_update(&uri, snapshot, DIAGNOSTICS_TIMEOUT)
-                .await
+            if client.wait_for_diagnostics_update(&uri, snapshot).await
+                == DiagnosticsWaitResult::Nothing
             {
-                DiagnosticsWaitResult::Updated => {}
-                DiagnosticsWaitResult::ServerDied => {
-                    return Ok(format!(
-                        "[{lang}] server died \u{2014} diagnostics unavailable"
-                    ));
-                }
+                return Ok(String::new());
             }
         } else {
             drop(doc_manager);

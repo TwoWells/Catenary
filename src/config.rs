@@ -22,6 +22,10 @@ pub struct Config {
     /// Server definitions keyed by language ID (e.g., "rust", "python").
     #[serde(default)]
     pub server: HashMap<String, ServerConfig>,
+
+    /// Icon theme configuration.
+    #[serde(default)]
+    pub icons: IconConfig,
 }
 
 /// Configuration for a specific LSP server.
@@ -37,6 +41,68 @@ pub struct ServerConfig {
     /// Initialization options to pass to the LSP server.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
+}
+
+/// Icon preset selecting a base set of icons.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IconPreset {
+    /// Safe Unicode symbols that render on any terminal font.
+    #[default]
+    Unicode,
+    /// Nerd Font glyphs (requires a patched font).
+    Nerd,
+}
+
+/// Icon theme configuration.
+///
+/// Set `preset` to choose a base icon set, then override individual icons
+/// as needed. Each override replaces the preset default for that slot.
+///
+/// # Examples
+///
+/// ```toml
+/// [icons]
+/// preset = "nerd"
+/// ```
+///
+/// ```toml
+/// [icons]
+/// preset = "nerd"
+/// lock = "🔒 "
+/// unlock = "🔑 "
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct IconConfig {
+    /// Base icon preset (default: `unicode`).
+    #[serde(default)]
+    pub preset: IconPreset,
+    /// Diagnostic error icon.
+    pub diag_error: Option<String>,
+    /// Diagnostic warning icon.
+    pub diag_warn: Option<String>,
+    /// Diagnostic info icon.
+    pub diag_info: Option<String>,
+    /// Diagnostic ok (clean) icon.
+    pub diag_ok: Option<String>,
+    /// Lock acquired icon.
+    pub lock: Option<String>,
+    /// Lock released icon.
+    pub unlock: Option<String>,
+    /// Search tool icon.
+    pub tool_search: Option<String>,
+    /// Codebase map tool icon.
+    pub tool_map: Option<String>,
+    /// Hover tool icon.
+    pub tool_hover: Option<String>,
+    /// Go-to-definition tool icon.
+    pub tool_goto: Option<String>,
+    /// Find references tool icon.
+    pub tool_refs: Option<String>,
+    /// Diagnostics tool icon.
+    pub tool_diagnostics: Option<String>,
+    /// Default tool icon (fallback).
+    pub tool_default: Option<String>,
 }
 
 const fn default_idle_timeout() -> u64 {
@@ -62,6 +128,7 @@ impl Config {
         // 1. Start with defaults
         builder = builder.set_default("idle_timeout", 300)?;
         builder = builder.set_default("log_retention_days", 7)?;
+        builder = builder.set_default("icons.preset", "unicode")?;
 
         // 2. Load from user config directory (~/.config/catenary/config.toml)
         if let Some(config_dir) = dirs::config_dir() {
@@ -90,7 +157,8 @@ impl Config {
         }
 
         // 4. Load from environment variables (CATENARY_IDLE_TIMEOUT, etc.)
-        builder = builder.add_source(config::Environment::with_prefix("CATENARY"));
+        // Use "__" as separator for nested keys (e.g. CATENARY_ICONS__PRESET=nerd).
+        builder = builder.add_source(config::Environment::with_prefix("CATENARY").separator("__"));
 
         let config = builder.build().context("Failed to build configuration")?;
 
