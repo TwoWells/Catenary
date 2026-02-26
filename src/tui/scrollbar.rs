@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Sub-character scrollbar with fractional block characters (1/8 precision)
-//! and overflow count indicators (`▲N` / `▼N`).
+//! and overflow count indicators (`N▲` / `N▼`).
 //!
 //! The right border of each panel doubles as the scrollbar track. The thumb
 //! size is proportional to the viewport/buffer ratio. When content fits in the
@@ -272,10 +272,11 @@ pub fn render_scrollbar(
 
 /// Render overflow count indicators into the content area.
 ///
-/// - If `above > 0`: render `▲{above}` right-aligned in the first row.
-/// - If `below > 0`: render `▼{below}` right-aligned in the last row.
+/// - If `above > 0`: render ` {above}▲` right-aligned in the first row.
+/// - If `below > 0`: render ` {below}▼` right-aligned in the last row.
 ///
-/// Counts overlay event text (right-aligned).
+/// A leading space separates the count from event text. Counts overlay
+/// event content (right-aligned).
 #[allow(
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
@@ -291,7 +292,7 @@ pub fn render_overflow_counts(
     }
 
     if counts.above > 0 {
-        let text = format!("▲{}", counts.above);
+        let text = format!(" {}▲", counts.above);
         let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
         if text_width <= content_area.width {
             let x = content_area.x + content_area.width - text_width;
@@ -302,7 +303,7 @@ pub fn render_overflow_counts(
     }
 
     if counts.below > 0 {
-        let text = format!("▼{}", counts.below);
+        let text = format!(" {}▼", counts.below);
         let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
         if text_width <= content_area.width {
             let x = content_area.x + content_area.width - text_width;
@@ -558,24 +559,24 @@ mod tests {
 
         let buf = terminal.backend().buffer().clone();
 
-        // Check top-right for "▲15".
+        // Check top-right for " 15▲" (space + number + arrow).
         let mut top_right = String::new();
-        for x in 37..40 {
+        for x in 36..40 {
             top_right.push_str(buf[(x, 0)].symbol());
         }
         assert!(
-            top_right.contains("▲15"),
-            "expected ▲15 in top-right, got: {top_right:?}"
+            top_right.contains("15▲"),
+            "expected 15▲ in top-right, got: {top_right:?}"
         );
 
-        // Check bottom-right for "▼30".
+        // Check bottom-right for " 30▼".
         let mut bottom_right = String::new();
-        for x in 37..40 {
+        for x in 36..40 {
             bottom_right.push_str(buf[(x, 9)].symbol());
         }
         assert!(
-            bottom_right.contains("▼30"),
-            "expected ▼30 in bottom-right, got: {bottom_right:?}"
+            bottom_right.contains("30▼"),
+            "expected 30▼ in bottom-right, got: {bottom_right:?}"
         );
     }
 
