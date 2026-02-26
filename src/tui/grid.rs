@@ -67,7 +67,7 @@ impl<'a> EventsGrid<'a> {
 
         let new_count = self.panels.len();
         self.composition = closest_composition(&self.composition, new_count);
-        self.layout_cycle_index = 0;
+        self.sync_cycle_index();
 
         if new_count == 1 {
             self.focused = Some(0);
@@ -91,7 +91,7 @@ impl<'a> EventsGrid<'a> {
 
         let new_count = self.panels.len();
         self.composition = closest_composition(&self.composition, new_count);
-        self.layout_cycle_index = 0;
+        self.sync_cycle_index();
 
         if new_count == 0 {
             self.focused = None;
@@ -162,6 +162,16 @@ impl<'a> EventsGrid<'a> {
         for panel in &mut self.panels {
             panel.pinned = false;
         }
+    }
+
+    /// Sync `layout_cycle_index` to the position of the current composition
+    /// in the curated list. Falls back to 0 if no match is found.
+    fn sync_cycle_index(&mut self) {
+        let layouts = curated_layouts(self.panels.len());
+        self.layout_cycle_index = layouts
+            .iter()
+            .position(|c| *c == self.composition)
+            .unwrap_or(0);
     }
 
     /// Cycle to the next curated layout for the current panel count (w).
@@ -463,19 +473,13 @@ mod tests {
         grid.open_panel("s2".to_string());
         grid.open_panel("s3".to_string());
 
-        // Curated layouts for n=3: [1,1,1], [3], [2,1], [1,2].
-        // Collect all compositions across a full cycle to verify they change.
-        let mut seen = vec![grid.composition.clone()];
-        let num_curated = curated_layouts(3).len();
-        for _ in 0..num_curated {
-            grid.cycle_layout();
-            seen.push(grid.composition.clone());
-        }
-        // At least two distinct compositions across the full cycle.
-        seen.dedup();
-        assert!(
-            seen.len() >= 2,
-            "expected at least 2 distinct compositions, got {seen:?}"
+        let initial = grid.composition.clone();
+        // cycle_index is synced to the curated list, so the first w press
+        // always advances to a different composition.
+        grid.cycle_layout();
+        assert_ne!(
+            grid.composition, initial,
+            "first cycle should change composition"
         );
     }
 

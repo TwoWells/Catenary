@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
-use super::theme::{IconSet, Theme, format_event_styled};
+use super::theme::{IconSet, Theme, diag_style, format_event_styled};
 use crate::session::{EventKind, SessionEvent};
 
 // ── Data types ──────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ pub enum FlatLine {
 }
 
 /// State for a single Events panel.
-pub struct PanelState {
+pub struct PanelState<'a> {
     /// Session ID this panel is tailing.
     pub session_id: String,
     /// All events loaded for this session.
@@ -82,17 +82,21 @@ pub struct PanelState {
     pub language_servers: Vec<LanguageServerStatus>,
     /// Indices of expanded events (in the events Vec).
     pub expanded: HashSet<usize>,
+    /// Semantic color theme (borrowed from the application).
+    pub theme: &'a Theme,
+    /// Resolved icon set (borrowed from the application).
+    pub icons: &'a IconSet,
 }
 
 // ── Construction & navigation ───────────────────────────────────────────
 
-impl PanelState {
+impl<'a> PanelState<'a> {
     /// Create a new panel for the given session.
     ///
     /// Starts with empty events, cursor at 0, tail attached, no horizontal
     /// scroll, not pinned.
     #[must_use]
-    pub fn new(session_id: String) -> Self {
+    pub fn new(session_id: String, theme: &'a Theme, icons: &'a IconSet) -> Self {
         Self {
             session_id,
             events: Vec::new(),
@@ -103,6 +107,8 @@ impl PanelState {
             pinned: false,
             language_servers: Vec::new(),
             expanded: HashSet::new(),
+            theme,
+            icons,
         }
     }
 
@@ -278,7 +284,7 @@ impl PanelState {
         for &(event_index, ev) in &collapsed {
             lines.push(FlatLine::EventHeader { event_index });
             if self.expanded.contains(&event_index) {
-                let count = detail_line_count(ev);
+                let count = detail_lines(ev, self.theme, self.icons).len();
                 for detail_index in 0..count {
                     lines.push(FlatLine::Detail {
                         event_index,
@@ -365,33 +371,6 @@ fn collapse_progress_indexed(events: &[SessionEvent]) -> Vec<(usize, &SessionEve
     result
 }
 
-/// Count how many detail lines an event would expand into.
-fn detail_line_count(event: &SessionEvent) -> usize {
-    match &event.kind {
-        EventKind::Diagnostics { count, preview, .. } => {
-            if *count == 0 {
-                return 0;
-            }
-            preview.split(" | ").filter(|s| !s.is_empty()).count()
-        }
-        EventKind::ToolResult { .. }
-        | EventKind::LockDenied { .. }
-        | EventKind::ToolCall { file: Some(_), .. } => 1,
-        _ => 0,
-    }
-}
-
-/// Parse severity and message from a single diagnostic entry like `[Error] L12: msg`.
-fn parse_severity(entry: &str) -> Option<(&str, &str)> {
-    if !entry.starts_with('[') {
-        return None;
-    }
-    let close = entry.find(']')?;
-    let severity = entry[1..close].trim();
-    let rest = entry[close + 1..].trim();
-    Some((severity, rest))
-}
-
 /// Generate styled detail lines for an expanded event.
 ///
 /// Returns an empty vec for events with no expandable detail.
@@ -405,27 +384,16 @@ pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec
                 return Vec::new();
             }
             preview
-                .split(" | ")
-                .filter(|s| !s.is_empty())
-                .map(|entry| {
-                    if let Some((severity, rest)) = parse_severity(entry) {
-                        let (icon, style) = match severity.to_lowercase().as_str() {
-                            "error" => (&icons.diag_error, theme.error),
-                            "info" | "hint" => (&icons.diag_info, theme.info),
-                            // "warning" and anything unrecognized default to warning style.
-                            _ => (&icons.diag_warn, theme.warning),
-                        };
-                        Line::from(vec![
-                            Span::raw(indent.to_string()),
-                            Span::styled(icon.clone(), style),
-                            Span::styled(rest.to_string(), style),
-                        ])
-                    } else {
-                        Line::from(vec![
-                            Span::raw(indent.to_string()),
-                            Span::styled(entry.to_string(), theme.warning),
-                        ])
-                    }
+                .lines()
+                .filter(|s| !s.trim().is_empty())
+                .map(|line| {
+                    let trimmed = line.trim();
+                    let (icon, style) = diag_style(1, trimmed, icons, theme);
+                    Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(icon.to_string(), style),
+                        Span::styled(trimmed.to_string(), style),
+                    ])
                 })
                 .collect()
         }
@@ -488,7 +456,7 @@ const fn ls_status_icon(state: &LsState) -> &'static str {
 }
 
 /// Build the title line for a panel.
-fn build_title(state: &PanelState) -> Line<'static> {
+fn build_title(state: &PanelState<'_>) -> Line<'static> {
     let id_short = if state.session_id.len() > 8 {
         &state.session_id[..8]
     } else {
@@ -642,22 +610,15 @@ fn clip_line_horizontal(line: &Line<'_>, h_scroll: usize, width: usize) -> Line<
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
 )]
-pub fn render_panel(
-    state: &PanelState,
-    area: Rect,
-    buf: &mut Buffer,
-    theme: &Theme,
-    icons: &IconSet,
-    focused: bool,
-) {
+pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focused: bool) {
     if area.width < 4 || area.height < 2 {
         return;
     }
 
     let border_style = if focused {
-        theme.border_focused
+        state.theme.border_focused
     } else {
-        theme.border_unfocused
+        state.theme.border_unfocused
     };
 
     let title = build_title(state);
@@ -694,14 +655,16 @@ pub fn render_panel(
 
         let line = match fl {
             FlatLine::EventHeader { event_index } => {
-                format_event_styled(&state.events[*event_index], icons, theme)
+                format_event_styled(&state.events[*event_index], state.icons, state.theme)
             }
             FlatLine::Detail {
                 event_index,
                 detail_index,
             } => detail_cache
                 .entry(*event_index)
-                .or_insert_with(|| detail_lines(&state.events[*event_index], theme, icons))
+                .or_insert_with(|| {
+                    detail_lines(&state.events[*event_index], state.theme, state.icons)
+                })
                 .get(*detail_index)
                 .cloned()
                 .unwrap_or_default(),
@@ -726,7 +689,7 @@ pub fn render_panel(
         if line_index == state.cursor {
             // Set selection style on the entire row first.
             for x in inner.x..inner.x + inner.width {
-                buf[(x, y)].set_style(theme.selection);
+                buf[(x, y)].set_style(state.theme.selection);
             }
         }
 
@@ -735,7 +698,7 @@ pub fn render_panel(
         // Re-apply selection style on top of content for cursor row.
         if line_index == state.cursor {
             for x in inner.x..inner.x + inner.width {
-                buf[(x, y)].set_style(theme.selection);
+                buf[(x, y)].set_style(state.theme.selection);
             }
         }
     }
@@ -753,6 +716,14 @@ mod tests {
 
     use crate::config::IconConfig;
     use crate::session::EventKind;
+
+    fn test_theme() -> Theme {
+        Theme::new()
+    }
+
+    fn test_icons() -> IconSet {
+        IconSet::from_config(IconConfig::default())
+    }
 
     fn make_event(kind: EventKind) -> SessionEvent {
         SessionEvent {
@@ -776,7 +747,9 @@ mod tests {
 
     #[test]
     fn test_panel_new_tail_attached() {
-        let panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let panel = PanelState::new("abc123".to_string(), &theme, &icons);
         assert!(panel.tail_attached);
         assert_eq!(panel.cursor, 0);
         assert_eq!(panel.scroll_offset, 0);
@@ -787,7 +760,9 @@ mod tests {
 
     #[test]
     fn test_panel_load_events() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..10).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
         assert_eq!(panel.events.len(), 10);
@@ -797,7 +772,9 @@ mod tests {
 
     #[test]
     fn test_panel_push_event_attached() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
         assert_eq!(panel.cursor, 4);
@@ -810,7 +787,9 @@ mod tests {
 
     #[test]
     fn test_panel_push_event_detached() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -827,7 +806,9 @@ mod tests {
 
     #[test]
     fn test_panel_navigate_up_detaches() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..10).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
         assert_eq!(panel.cursor, 9);
@@ -840,7 +821,9 @@ mod tests {
 
     #[test]
     fn test_panel_navigate_down_past_end_reattaches() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -862,7 +845,9 @@ mod tests {
 
     #[test]
     fn test_panel_scroll_to_top() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..20).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -874,7 +859,9 @@ mod tests {
 
     #[test]
     fn test_panel_scroll_to_bottom() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..20).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -888,7 +875,9 @@ mod tests {
 
     #[test]
     fn test_panel_visible_range() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..100).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -904,7 +893,9 @@ mod tests {
 
     #[test]
     fn test_panel_visible_range_at_top() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..100).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -919,7 +910,9 @@ mod tests {
 
     #[test]
     fn test_panel_visible_range_at_bottom() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..100).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -934,6 +927,8 @@ mod tests {
 
     #[test]
     fn test_panel_render_events() {
+        let theme = test_theme();
+        let icons = test_icons();
         let events: Vec<SessionEvent> = vec![
             make_event(EventKind::ToolCall {
                 tool: "hover".to_string(),
@@ -949,18 +944,15 @@ mod tests {
             }),
         ];
 
-        let mut panel = PanelState::new("test1234".to_string());
+        let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
         panel.load_events(events);
-
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
 
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), &theme, &icons, true);
+                render_panel(&panel, area, f.buffer_mut(), true);
             })
             .expect("draw");
 
@@ -977,16 +969,16 @@ mod tests {
 
     #[test]
     fn test_panel_render_empty() {
-        let panel = PanelState::new("empty123".to_string());
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
+        let theme = test_theme();
+        let icons = test_icons();
+        let panel = PanelState::new("empty123".to_string(), &theme, &icons);
 
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), &theme, &icons, true);
+                render_panel(&panel, area, f.buffer_mut(), true);
             })
             .expect("draw");
 
@@ -999,6 +991,8 @@ mod tests {
 
     #[test]
     fn test_panel_render_cursor_highlight() {
+        let theme = test_theme();
+        let icons = test_icons();
         let events: Vec<SessionEvent> = (0..5)
             .map(|_| {
                 make_event(EventKind::ToolCall {
@@ -1008,21 +1002,18 @@ mod tests {
             })
             .collect();
 
-        let mut panel = PanelState::new("test1234".to_string());
+        let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
         panel.load_events(events);
         // Set cursor to row 1 (second event in visible area).
         panel.cursor = 1;
         panel.snap_viewport(8);
-
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
 
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), &theme, &icons, true);
+                render_panel(&panel, area, f.buffer_mut(), true);
             })
             .expect("draw");
 
@@ -1044,7 +1035,9 @@ mod tests {
 
     #[test]
     fn test_panel_language_server_status() {
-        let mut panel = PanelState::new("abc123".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         panel.events = vec![
             make_event(EventKind::ServerState {
                 language: "rust".to_string(),
@@ -1066,9 +1059,22 @@ mod tests {
 
     // ── Expansion tests (ticket 04) ─────────────────────────────────────
 
+    /// Build a diagnostic preview in the format produced by
+    /// `format_diagnostics_compact` (one `  line:col [severity] source: msg`
+    /// per diagnostic, joined by newlines).
+    fn diag_preview(entries: &[(&str, u32, &str)]) -> String {
+        entries
+            .iter()
+            .map(|(sev, line, msg)| format!("  {line}:1 [{sev}] rustc: {msg}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn test_flat_lines_no_expansion() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
         panel.load_events(events);
 
@@ -1081,13 +1087,19 @@ mod tests {
 
     #[test]
     fn test_flat_lines_one_expanded() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let events = vec![
             make_event(EventKind::Started),
             make_event(EventKind::Diagnostics {
                 file: "/src/lib.rs".to_string(),
                 count: 3,
-                preview: "[Error] L12: one | [Warning] L34: two | [Error] L56: three".to_string(),
+                preview: diag_preview(&[
+                    ("error", 12, "one"),
+                    ("warning", 34, "two"),
+                    ("error", 56, "three"),
+                ]),
             }),
             make_event(EventKind::Shutdown),
         ];
@@ -1124,18 +1136,20 @@ mod tests {
 
     #[test]
     fn test_flat_lines_multiple_expanded() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let events = vec![
             make_event(EventKind::Diagnostics {
                 file: "/a.rs".to_string(),
                 count: 2,
-                preview: "[Error] L1: a | [Warning] L2: b".to_string(),
+                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b")]),
             }),
             make_event(EventKind::Started),
             make_event(EventKind::Diagnostics {
                 file: "/b.rs".to_string(),
                 count: 1,
-                preview: "[Error] L5: c".to_string(),
+                preview: diag_preview(&[("error", 5, "c")]),
             }),
         ];
         panel.load_events(events);
@@ -1173,13 +1187,15 @@ mod tests {
 
     #[test]
     fn test_toggle_expansion_header() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let events = vec![
             make_event(EventKind::Started),
             make_event(EventKind::Diagnostics {
                 file: "/a.rs".to_string(),
                 count: 2,
-                preview: "[Error] L1: a | [Warning] L2: b".to_string(),
+                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b")]),
             }),
         ];
         panel.load_events(events);
@@ -1195,13 +1211,15 @@ mod tests {
 
     #[test]
     fn test_toggle_expansion_detail() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let events = vec![
             make_event(EventKind::Started),
             make_event(EventKind::Diagnostics {
                 file: "/a.rs".to_string(),
                 count: 2,
-                preview: "[Error] L1: a | [Warning] L2: b".to_string(),
+                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b")]),
             }),
             make_event(EventKind::Shutdown),
         ];
@@ -1218,7 +1236,9 @@ mod tests {
 
     #[test]
     fn test_toggle_expansion_no_detail() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let events = vec![make_event(EventKind::Progress {
             language: "rust".to_string(),
             title: "Indexing".to_string(),
@@ -1234,13 +1254,15 @@ mod tests {
 
     #[test]
     fn test_cursor_walks_detail_lines() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let events = vec![
             make_event(EventKind::Started),
             make_event(EventKind::Diagnostics {
                 file: "/a.rs".to_string(),
                 count: 3,
-                preview: "[Error] L1: a | [Warning] L2: b | [Error] L3: c".to_string(),
+                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b"), ("error", 3, "c")]),
             }),
             make_event(EventKind::Shutdown),
         ];
@@ -1283,22 +1305,22 @@ mod tests {
         let ev = make_event(EventKind::Diagnostics {
             file: "/src/lib.rs".to_string(),
             count: 2,
-            preview: "[Error] L12: something | [Warning] L34: other".to_string(),
+            preview: diag_preview(&[("error", 12, "something"), ("warning", 34, "other")]),
         });
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
+        let theme = test_theme();
+        let icons = test_icons();
 
         let lines = detail_lines(&ev, &theme, &icons);
         assert_eq!(lines.len(), 2);
         let text0: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            text0.contains("L12: something"),
-            "first detail should contain L12"
+            text0.contains("rustc: something"),
+            "first detail should contain diagnostic message"
         );
         let text1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            text1.contains("L34: other"),
-            "second detail should contain L34"
+            text1.contains("rustc: other"),
+            "second detail should contain diagnostic message"
         );
     }
 
@@ -1310,8 +1332,8 @@ mod tests {
             message: None,
             percentage: None,
         });
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
+        let theme = test_theme();
+        let icons = test_icons();
 
         let lines = detail_lines(&ev, &theme, &icons);
         assert!(lines.is_empty());
@@ -1319,14 +1341,21 @@ mod tests {
 
     #[test]
     fn test_visible_range_with_expansion() {
-        let mut panel = PanelState::new("test".to_string());
+        let theme = test_theme();
+        let icons = test_icons();
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         let mut events: Vec<SessionEvent> =
             (0..10).map(|_| make_event(EventKind::Started)).collect();
         // Replace event 5 with a Diagnostics that has 4 detail lines.
         events[5] = make_event(EventKind::Diagnostics {
             file: "/a.rs".to_string(),
             count: 4,
-            preview: "[Error] L1: a | [Error] L2: b | [Warning] L3: c | [Error] L4: d".to_string(),
+            preview: diag_preview(&[
+                ("error", 1, "a"),
+                ("error", 2, "b"),
+                ("warning", 3, "c"),
+                ("error", 4, "d"),
+            ]),
         });
         panel.load_events(events);
         panel.expanded.insert(5);
@@ -1345,27 +1374,29 @@ mod tests {
 
     #[test]
     fn test_render_expanded_event() {
+        let theme = test_theme();
+        let icons = test_icons();
         let events = vec![make_event(EventKind::Diagnostics {
             file: "/src/lib.rs".to_string(),
             count: 2,
-            preview: "[Error] L12: something wrong | [Warning] L34: might be bad".to_string(),
+            preview: diag_preview(&[
+                ("error", 12, "something wrong"),
+                ("warning", 34, "might be bad"),
+            ]),
         })];
 
-        let mut panel = PanelState::new("test1234".to_string());
+        let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
         panel.load_events(events);
         panel.expanded.insert(0);
         panel.cursor = 0;
         panel.snap_viewport(8);
-
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
 
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_panel(&panel, area, f.buffer_mut(), &theme, &icons, true);
+                render_panel(&panel, area, f.buffer_mut(), true);
             })
             .expect("draw");
 
@@ -1376,11 +1407,11 @@ mod tests {
         assert!(content.contains("lib.rs"), "expected file name in header");
         // Detail lines should contain the diagnostic messages.
         assert!(
-            content.contains("L12: something wrong"),
+            content.contains("something wrong"),
             "expected first diagnostic detail"
         );
         assert!(
-            content.contains("L34: might be bad"),
+            content.contains("might be bad"),
             "expected second diagnostic detail"
         );
     }
