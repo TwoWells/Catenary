@@ -39,6 +39,15 @@ make check         # format + lint + deny + full test suite
 All TUI tests live in `src/tui/*.rs` modules. The nextest filter `test(tui)`
 matches any test with "tui" in its module path.
 
+## Gotchas
+
+- **Crate names in `Cargo.toml` use hyphens, not underscores.** Rust
+  normalizes hyphens to underscores for `use` statements, but `Cargo.toml`
+  keys must match the crates.io package name (e.g., `unicode-width`, not
+  `unicode_width`). Cargo will reject the wrong form.
+- **`Line::into_owned()` does not exist in ratatui 0.30.** Use
+  `panel::to_owned_line()` to convert `Line<'a>` to `Line<'static>`.
+
 ## Picking up a ticket
 
 Find the first unchecked (`- [ ]`) ticket in the checklist below whose
@@ -57,7 +66,7 @@ If multiple tickets are eligible, pick the lowest-numbered one.
 - [x] **01** — BSP layout engine & border junctions (`01_layout.md`)
 - [x] **02** — Sessions tree widget (`02_tree.md`)
 - [x] **03** — Events panel core (`03_panel.md`)
-- [ ] **04** — Event expansion & detail lines (`04_expansion.md`)
+- [x] **04** — Event expansion & detail lines (`04_expansion.md`)
 - [ ] **05** — Multi-panel grid & tab/pinning (`05_grid.md`)
 - [ ] **06** — Sub-character scrollbar & overflow counts (`06_scrollbar.md`)
 - [ ] **07** — Visual selection & copy (`07_selection.md`)

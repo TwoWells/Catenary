@@ -7,6 +7,8 @@
 //! This is the core building block — later tickets add expansion (04),
 //! multi-panel grid (05), scrollbar (06), and selection (07) on top of this.
 
+use std::collections::{HashMap, HashSet};
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -14,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
-use super::theme::{IconSet, Theme, collapse_progress, format_event_styled};
+use super::theme::{IconSet, Theme, format_event_styled};
 use crate::session::{EventKind, SessionEvent};
 
 // ── Data types ──────────────────────────────────────────────────────────
@@ -43,6 +45,23 @@ pub struct LanguageServerStatus {
     pub state: LsState,
 }
 
+/// A line in the flattened view — either an event header or a detail line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlatLine {
+    /// An event header (the one-line summary).
+    EventHeader {
+        /// Index into the events vec.
+        event_index: usize,
+    },
+    /// A detail line within an expanded event.
+    Detail {
+        /// Index into the events vec.
+        event_index: usize,
+        /// Index of this detail line within the expansion.
+        detail_index: usize,
+    },
+}
+
 /// State for a single Events panel.
 pub struct PanelState {
     /// Session ID this panel is tailing.
@@ -61,6 +80,8 @@ pub struct PanelState {
     pub pinned: bool,
     /// Language server statuses for the title bar.
     pub language_servers: Vec<LanguageServerStatus>,
+    /// Indices of expanded events (in the events Vec).
+    pub expanded: HashSet<usize>,
 }
 
 // ── Construction & navigation ───────────────────────────────────────────
@@ -71,7 +92,7 @@ impl PanelState {
     /// Starts with empty events, cursor at 0, tail attached, no horizontal
     /// scroll, not pinned.
     #[must_use]
-    pub const fn new(session_id: String) -> Self {
+    pub fn new(session_id: String) -> Self {
         Self {
             session_id,
             events: Vec::new(),
@@ -81,18 +102,19 @@ impl PanelState {
             horizontal_scroll: 0,
             pinned: false,
             language_servers: Vec::new(),
+            expanded: HashSet::new(),
         }
     }
 
-    /// Total number of visible lines after progress collapse.
+    /// Total number of visible lines (flat lines including expanded detail).
     fn total_lines(&self) -> usize {
-        let refs: Vec<&SessionEvent> = self.events.iter().collect();
-        collapse_progress(refs).len()
+        self.flat_lines().len()
     }
 
     /// Load historical events. Sets cursor to the last event and attaches tail.
     pub fn load_events(&mut self, events: Vec<SessionEvent>) {
         self.events = events;
+        self.expanded.clear();
         let total = self.total_lines();
         self.cursor = total.saturating_sub(1);
         self.tail_attached = true;
@@ -197,8 +219,6 @@ impl PanelState {
     ///
     /// Tracks the latest state per language.
     pub fn update_language_servers(&mut self) {
-        use std::collections::HashMap;
-
         let mut map: HashMap<String, LsState> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
 
@@ -245,6 +265,204 @@ impl PanelState {
         }
         let target = self.cursor.saturating_sub(h / 2);
         self.scroll_offset = target.min(total.saturating_sub(h));
+    }
+
+    // ── Expansion ───────────────────────────────────────────────────────
+
+    /// Build a flat list of lines: event headers interleaved with detail lines
+    /// for any expanded events.
+    #[must_use]
+    pub fn flat_lines(&self) -> Vec<FlatLine> {
+        let collapsed = collapse_progress_indexed(&self.events);
+        let mut lines = Vec::new();
+        for &(event_index, ev) in &collapsed {
+            lines.push(FlatLine::EventHeader { event_index });
+            if self.expanded.contains(&event_index) {
+                let count = detail_line_count(ev);
+                for detail_index in 0..count {
+                    lines.push(FlatLine::Detail {
+                        event_index,
+                        detail_index,
+                    });
+                }
+            }
+        }
+        lines
+    }
+
+    /// Quick check: does this event type have expandable detail?
+    #[must_use]
+    pub fn has_detail(&self, event_index: usize) -> bool {
+        self.events
+            .get(event_index)
+            .is_some_and(|ev| match &ev.kind {
+                EventKind::Diagnostics { count, .. } => *count > 0,
+                EventKind::ToolResult { .. } | EventKind::LockDenied { .. } => true,
+                EventKind::ToolCall { file, .. } => file.is_some(),
+                _ => false,
+            })
+    }
+
+    /// Toggle expansion of the event under the cursor.
+    ///
+    /// - On an `EventHeader`: toggle the event in/out of `expanded`.
+    /// - On a `Detail` line: collapse the parent event, move cursor to its header.
+    /// - On an event with no detail: no-op.
+    pub fn toggle_expansion(&mut self) {
+        let flat = self.flat_lines();
+        let Some(current) = flat.get(self.cursor) else {
+            return;
+        };
+        match *current {
+            FlatLine::EventHeader { event_index } => {
+                if !self.has_detail(event_index) {
+                    return;
+                }
+                if self.expanded.contains(&event_index) {
+                    self.expanded.remove(&event_index);
+                } else {
+                    self.expanded.insert(event_index);
+                }
+            }
+            FlatLine::Detail { event_index, .. } => {
+                self.expanded.remove(&event_index);
+                // Move cursor to the parent header.
+                let new_flat = self.flat_lines();
+                if let Some(pos) = new_flat.iter().position(|fl| {
+                    matches!(fl, FlatLine::EventHeader { event_index: ei } if *ei == event_index)
+                }) {
+                    self.cursor = pos;
+                }
+            }
+        }
+        self.snap_viewport(0);
+    }
+}
+
+// ── Expansion helpers ───────────────────────────────────────────────────
+
+/// Collapse consecutive progress events, preserving original indices into
+/// the events vec.
+fn collapse_progress_indexed(events: &[SessionEvent]) -> Vec<(usize, &SessionEvent)> {
+    let mut result: Vec<(usize, &SessionEvent)> = Vec::with_capacity(events.len());
+    for (idx, ev) in events.iter().enumerate() {
+        if let EventKind::Progress {
+            language, title, ..
+        } = &ev.kind
+            && let Some((_, last)) = result.last()
+            && let EventKind::Progress {
+                language: prev_lang,
+                title: prev_title,
+                ..
+            } = &last.kind
+            && prev_lang == language
+            && prev_title == title
+        {
+            result.pop();
+        }
+        result.push((idx, ev));
+    }
+    result
+}
+
+/// Count how many detail lines an event would expand into.
+fn detail_line_count(event: &SessionEvent) -> usize {
+    match &event.kind {
+        EventKind::Diagnostics { count, preview, .. } => {
+            if *count == 0 {
+                return 0;
+            }
+            preview.split(" | ").filter(|s| !s.is_empty()).count()
+        }
+        EventKind::ToolResult { .. }
+        | EventKind::LockDenied { .. }
+        | EventKind::ToolCall { file: Some(_), .. } => 1,
+        _ => 0,
+    }
+}
+
+/// Parse severity and message from a single diagnostic entry like `[Error] L12: msg`.
+fn parse_severity(entry: &str) -> Option<(&str, &str)> {
+    if !entry.starts_with('[') {
+        return None;
+    }
+    let close = entry.find(']')?;
+    let severity = entry[1..close].trim();
+    let rest = entry[close + 1..].trim();
+    Some((severity, rest))
+}
+
+/// Generate styled detail lines for an expanded event.
+///
+/// Returns an empty vec for events with no expandable detail.
+#[must_use]
+pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec<Line<'static>> {
+    // Indent to align past the timestamp column ("HH:MM:SS  " = 10 chars).
+    let indent = "          ";
+    match &event.kind {
+        EventKind::Diagnostics { count, preview, .. } => {
+            if *count == 0 {
+                return Vec::new();
+            }
+            preview
+                .split(" | ")
+                .filter(|s| !s.is_empty())
+                .map(|entry| {
+                    if let Some((severity, rest)) = parse_severity(entry) {
+                        let (icon, style) = match severity.to_lowercase().as_str() {
+                            "error" => (&icons.diag_error, theme.error),
+                            "info" | "hint" => (&icons.diag_info, theme.info),
+                            // "warning" and anything unrecognized default to warning style.
+                            _ => (&icons.diag_warn, theme.warning),
+                        };
+                        Line::from(vec![
+                            Span::raw(indent.to_string()),
+                            Span::styled(icon.clone(), style),
+                            Span::styled(rest.to_string(), style),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw(indent.to_string()),
+                            Span::styled(entry.to_string(), theme.warning),
+                        ])
+                    }
+                })
+                .collect()
+        }
+        EventKind::ToolResult {
+            tool,
+            success,
+            duration_ms,
+        } => {
+            let (status, style) = if *success {
+                ("ok", theme.success)
+            } else {
+                ("error", theme.error)
+            };
+            vec![Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(format!("{tool}: {status} ({duration_ms}ms)"), style),
+            ])]
+        }
+        EventKind::ToolCall {
+            file: Some(path), ..
+        } => {
+            vec![Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(path.clone(), theme.muted),
+            ])]
+        }
+        EventKind::LockDenied {
+            file,
+            owner,
+            held_by,
+        } => {
+            vec![Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(format!("{file}: {owner} blocked by {held_by}"), theme.error),
+            ])]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -454,28 +672,40 @@ pub fn render_panel(
         return;
     }
 
-    // Build collapsed event lines.
-    let event_refs: Vec<&SessionEvent> = state.events.iter().collect();
-    let collapsed = collapse_progress(event_refs);
-    let all_lines: Vec<Line<'_>> = collapsed
-        .iter()
-        .map(|ev| format_event_styled(ev, icons, theme))
-        .collect();
+    // Build flat line list (headers + expanded detail lines).
+    let flat = state.flat_lines();
 
     // Viewport slicing.
     let height = inner.height as usize;
-    let total = all_lines.len();
+    let total = flat.len();
     let start = state.scroll_offset.min(total);
     let end = (start + height).min(total);
-    let visible = &all_lines[start..end];
+
+    // Cache detail lines per expanded event to avoid recomputation.
+    let mut detail_cache: HashMap<usize, Vec<Line<'static>>> = HashMap::new();
 
     // Render each visible line.
     let content_width = inner.width as usize;
-    for (i, line) in visible.iter().enumerate() {
+    for (i, fl) in flat[start..end].iter().enumerate() {
         let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
         }
+
+        let line = match fl {
+            FlatLine::EventHeader { event_index } => {
+                format_event_styled(&state.events[*event_index], icons, theme)
+            }
+            FlatLine::Detail {
+                event_index,
+                detail_index,
+            } => detail_cache
+                .entry(*event_index)
+                .or_insert_with(|| detail_lines(&state.events[*event_index], theme, icons))
+                .get(*detail_index)
+                .cloned()
+                .unwrap_or_default(),
+        };
 
         let display_line = if state.horizontal_scroll > 0
             || UnicodeWidthStr::width(
@@ -486,9 +716,9 @@ pub fn render_panel(
                     .as_str(),
             ) > content_width
         {
-            clip_line_horizontal(line, state.horizontal_scroll, content_width)
+            clip_line_horizontal(&line, state.horizontal_scroll, content_width)
         } else {
-            to_owned_line(line)
+            to_owned_line(&line)
         };
 
         // Apply cursor highlight to the entire row.
@@ -832,5 +1062,326 @@ mod tests {
         assert_eq!(panel.language_servers[0].state, LsState::Healthy);
         assert_eq!(panel.language_servers[1].name, "ts");
         assert_eq!(panel.language_servers[1].state, LsState::Initializing);
+    }
+
+    // ── Expansion tests (ticket 04) ─────────────────────────────────────
+
+    #[test]
+    fn test_flat_lines_no_expansion() {
+        let mut panel = PanelState::new("test".to_string());
+        let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
+        panel.load_events(events);
+
+        let flat = panel.flat_lines();
+        assert_eq!(flat.len(), 5);
+        for (i, fl) in flat.iter().enumerate() {
+            assert_eq!(*fl, FlatLine::EventHeader { event_index: i });
+        }
+    }
+
+    #[test]
+    fn test_flat_lines_one_expanded() {
+        let mut panel = PanelState::new("test".to_string());
+        let events = vec![
+            make_event(EventKind::Started),
+            make_event(EventKind::Diagnostics {
+                file: "/src/lib.rs".to_string(),
+                count: 3,
+                preview: "[Error] L12: one | [Warning] L34: two | [Error] L56: three".to_string(),
+            }),
+            make_event(EventKind::Shutdown),
+        ];
+        panel.load_events(events);
+        panel.expanded.insert(1);
+
+        let flat = panel.flat_lines();
+        assert_eq!(flat.len(), 6);
+        assert_eq!(flat[0], FlatLine::EventHeader { event_index: 0 });
+        assert_eq!(flat[1], FlatLine::EventHeader { event_index: 1 });
+        assert_eq!(
+            flat[2],
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 0
+            }
+        );
+        assert_eq!(
+            flat[3],
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 1
+            }
+        );
+        assert_eq!(
+            flat[4],
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 2
+            }
+        );
+        assert_eq!(flat[5], FlatLine::EventHeader { event_index: 2 });
+    }
+
+    #[test]
+    fn test_flat_lines_multiple_expanded() {
+        let mut panel = PanelState::new("test".to_string());
+        let events = vec![
+            make_event(EventKind::Diagnostics {
+                file: "/a.rs".to_string(),
+                count: 2,
+                preview: "[Error] L1: a | [Warning] L2: b".to_string(),
+            }),
+            make_event(EventKind::Started),
+            make_event(EventKind::Diagnostics {
+                file: "/b.rs".to_string(),
+                count: 1,
+                preview: "[Error] L5: c".to_string(),
+            }),
+        ];
+        panel.load_events(events);
+        panel.expanded.insert(0);
+        panel.expanded.insert(2);
+
+        let flat = panel.flat_lines();
+        // H0, D0.0, D0.1, H1, H2, D2.0
+        assert_eq!(flat.len(), 6);
+        assert_eq!(flat[0], FlatLine::EventHeader { event_index: 0 });
+        assert_eq!(
+            flat[1],
+            FlatLine::Detail {
+                event_index: 0,
+                detail_index: 0
+            }
+        );
+        assert_eq!(
+            flat[2],
+            FlatLine::Detail {
+                event_index: 0,
+                detail_index: 1
+            }
+        );
+        assert_eq!(flat[3], FlatLine::EventHeader { event_index: 1 });
+        assert_eq!(flat[4], FlatLine::EventHeader { event_index: 2 });
+        assert_eq!(
+            flat[5],
+            FlatLine::Detail {
+                event_index: 2,
+                detail_index: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_toggle_expansion_header() {
+        let mut panel = PanelState::new("test".to_string());
+        let events = vec![
+            make_event(EventKind::Started),
+            make_event(EventKind::Diagnostics {
+                file: "/a.rs".to_string(),
+                count: 2,
+                preview: "[Error] L1: a | [Warning] L2: b".to_string(),
+            }),
+        ];
+        panel.load_events(events);
+        // Cursor on event 1 (the Diagnostics header).
+        panel.cursor = 1;
+
+        panel.toggle_expansion();
+        assert!(panel.expanded.contains(&1));
+
+        panel.toggle_expansion();
+        assert!(!panel.expanded.contains(&1));
+    }
+
+    #[test]
+    fn test_toggle_expansion_detail() {
+        let mut panel = PanelState::new("test".to_string());
+        let events = vec![
+            make_event(EventKind::Started),
+            make_event(EventKind::Diagnostics {
+                file: "/a.rs".to_string(),
+                count: 2,
+                preview: "[Error] L1: a | [Warning] L2: b".to_string(),
+            }),
+            make_event(EventKind::Shutdown),
+        ];
+        panel.load_events(events);
+        panel.expanded.insert(1);
+        // flat: [H0, H1, D1.0, D1.1, H2] → cursor at 3 (D1.1)
+        panel.cursor = 3;
+
+        panel.toggle_expansion();
+        assert!(!panel.expanded.contains(&1));
+        // After collapse: [H0, H1, H2] → header of event 1 is at index 1.
+        assert_eq!(panel.cursor, 1);
+    }
+
+    #[test]
+    fn test_toggle_expansion_no_detail() {
+        let mut panel = PanelState::new("test".to_string());
+        let events = vec![make_event(EventKind::Progress {
+            language: "rust".to_string(),
+            title: "Indexing".to_string(),
+            message: None,
+            percentage: None,
+        })];
+        panel.load_events(events);
+        panel.cursor = 0;
+
+        panel.toggle_expansion();
+        assert!(panel.expanded.is_empty());
+    }
+
+    #[test]
+    fn test_cursor_walks_detail_lines() {
+        let mut panel = PanelState::new("test".to_string());
+        let events = vec![
+            make_event(EventKind::Started),
+            make_event(EventKind::Diagnostics {
+                file: "/a.rs".to_string(),
+                count: 3,
+                preview: "[Error] L1: a | [Warning] L2: b | [Error] L3: c".to_string(),
+            }),
+            make_event(EventKind::Shutdown),
+        ];
+        panel.load_events(events);
+        panel.expanded.insert(1);
+
+        // flat: [H0, H1, D1.0, D1.1, D1.2, H2]
+        panel.cursor = 0;
+        panel.tail_attached = false;
+
+        let expected = [
+            FlatLine::EventHeader { event_index: 0 },
+            FlatLine::EventHeader { event_index: 1 },
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 0,
+            },
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 1,
+            },
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 2,
+            },
+            FlatLine::EventHeader { event_index: 2 },
+        ];
+
+        let flat = panel.flat_lines();
+        assert_eq!(flat[panel.cursor], expected[0]);
+        for exp in &expected[1..] {
+            panel.navigate(1);
+            let flat = panel.flat_lines();
+            assert_eq!(flat[panel.cursor], *exp);
+        }
+    }
+
+    #[test]
+    fn test_detail_lines_diagnostics() {
+        let ev = make_event(EventKind::Diagnostics {
+            file: "/src/lib.rs".to_string(),
+            count: 2,
+            preview: "[Error] L12: something | [Warning] L34: other".to_string(),
+        });
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        assert_eq!(lines.len(), 2);
+        let text0: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text0.contains("L12: something"),
+            "first detail should contain L12"
+        );
+        let text1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text1.contains("L34: other"),
+            "second detail should contain L34"
+        );
+    }
+
+    #[test]
+    fn test_detail_lines_empty_for_progress() {
+        let ev = make_event(EventKind::Progress {
+            language: "rust".to_string(),
+            title: "Indexing".to_string(),
+            message: None,
+            percentage: None,
+        });
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_visible_range_with_expansion() {
+        let mut panel = PanelState::new("test".to_string());
+        let mut events: Vec<SessionEvent> =
+            (0..10).map(|_| make_event(EventKind::Started)).collect();
+        // Replace event 5 with a Diagnostics that has 4 detail lines.
+        events[5] = make_event(EventKind::Diagnostics {
+            file: "/a.rs".to_string(),
+            count: 4,
+            preview: "[Error] L1: a | [Error] L2: b | [Warning] L3: c | [Error] L4: d".to_string(),
+        });
+        panel.load_events(events);
+        panel.expanded.insert(5);
+
+        // Total flat lines: 10 headers + 4 details = 14.
+        let flat = panel.flat_lines();
+        assert_eq!(flat.len(), 14);
+
+        // Set cursor to 0, snap viewport.
+        panel.cursor = 0;
+        panel.snap_viewport(10);
+        let (start, end) = panel.visible_range(10);
+        assert_eq!(start, 0);
+        assert_eq!(end, 10);
+    }
+
+    #[test]
+    fn test_render_expanded_event() {
+        let events = vec![make_event(EventKind::Diagnostics {
+            file: "/src/lib.rs".to_string(),
+            count: 2,
+            preview: "[Error] L12: something wrong | [Warning] L34: might be bad".to_string(),
+        })];
+
+        let mut panel = PanelState::new("test1234".to_string());
+        panel.load_events(events);
+        panel.expanded.insert(0);
+        panel.cursor = 0;
+        panel.snap_viewport(8);
+
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_panel(&panel, area, f.buffer_mut(), &theme, &icons, true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Header should show the diagnostics summary.
+        assert!(content.contains("lib.rs"), "expected file name in header");
+        // Detail lines should contain the diagnostic messages.
+        assert!(
+            content.contains("L12: something wrong"),
+            "expected first diagnostic detail"
+        );
+        assert!(
+            content.contains("L34: might be bad"),
+            "expected second diagnostic detail"
+        );
     }
 }
