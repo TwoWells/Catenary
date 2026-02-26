@@ -314,6 +314,58 @@ pub fn render_overflow_counts(
     }
 }
 
+/// Which overflow indicator was clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowHit {
+    /// Clicked the top indicator — jump to top.
+    Top,
+    /// Clicked the bottom indicator — jump to bottom.
+    Bottom,
+}
+
+/// Hit-test a click against the overflow count indicators.
+///
+/// The hit zone covers the digits and arrow (`15▲`) but excludes the
+/// leading padding space. Returns `None` if the click didn't land on
+/// either indicator.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "terminal coordinates are always small"
+)]
+pub fn overflow_hit_test(
+    x: u16,
+    y: u16,
+    content_area: Rect,
+    counts: &OverflowCounts,
+) -> Option<OverflowHit> {
+    if content_area.width == 0 || content_area.height == 0 {
+        return None;
+    }
+
+    let right = content_area.x + content_area.width;
+
+    if counts.above > 0 && y == content_area.y {
+        // Hit zone: digits + arrow, excluding the leading space.
+        let label = format!("{}▲", counts.above);
+        let label_width = UnicodeWidthStr::width(label.as_str()) as u16;
+        if label_width <= content_area.width && x >= right - label_width && x < right {
+            return Some(OverflowHit::Top);
+        }
+    }
+
+    let bottom_y = content_area.y + content_area.height - 1;
+    if counts.below > 0 && y == bottom_y {
+        let label = format!("{}▼", counts.below);
+        let label_width = UnicodeWidthStr::width(label.as_str()) as u16;
+        if label_width <= content_area.width && x >= right - label_width && x < right {
+            return Some(OverflowHit::Bottom);
+        }
+    }
+
+    None
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -605,5 +657,57 @@ mod tests {
         // Click at bottom should give max position.
         let pos_bottom = scroll_position_from_click(19, track_area, &metrics);
         assert_eq!(pos_bottom, 180, "click at bottom should give max position");
+    }
+
+    #[test]
+    fn test_overflow_hit_test_top() {
+        let content_area = Rect::new(0, 0, 40, 10);
+        let counts = OverflowCounts {
+            above: 15,
+            below: 5,
+        };
+
+        // "15▲" is 3 columns wide, right-aligned at columns 37..40.
+        // Click on the digits (x=37) → Top.
+        assert_eq!(
+            overflow_hit_test(37, 0, content_area, &counts),
+            Some(OverflowHit::Top)
+        );
+        // Click on the arrow (x=39).
+        assert_eq!(
+            overflow_hit_test(39, 0, content_area, &counts),
+            Some(OverflowHit::Top)
+        );
+        // Click on the leading space (x=36) → miss.
+        assert_eq!(overflow_hit_test(36, 0, content_area, &counts), None);
+        // Click on the right row but wrong y → miss.
+        assert_eq!(overflow_hit_test(38, 1, content_area, &counts), None);
+    }
+
+    #[test]
+    fn test_overflow_hit_test_bottom() {
+        let content_area = Rect::new(0, 0, 40, 10);
+        let counts = OverflowCounts { above: 0, below: 5 };
+
+        // "5▼" is 2 columns wide, right-aligned at columns 38..40.
+        assert_eq!(
+            overflow_hit_test(38, 9, content_area, &counts),
+            Some(OverflowHit::Bottom)
+        );
+        assert_eq!(
+            overflow_hit_test(39, 9, content_area, &counts),
+            Some(OverflowHit::Bottom)
+        );
+        // Leading space at x=37 → miss.
+        assert_eq!(overflow_hit_test(37, 9, content_area, &counts), None);
+    }
+
+    #[test]
+    fn test_overflow_hit_test_no_overflow() {
+        let content_area = Rect::new(0, 0, 40, 10);
+        let counts = OverflowCounts { above: 0, below: 0 };
+
+        assert_eq!(overflow_hit_test(39, 0, content_area, &counts), None);
+        assert_eq!(overflow_hit_test(39, 9, content_area, &counts), None);
     }
 }
