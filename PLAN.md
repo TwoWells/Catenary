@@ -36,9 +36,9 @@ management.
       build, clippy, and test steps
 - [x] Add `--no-fail-fast` to nextest in `make check`
 
-### constrained-bash hook (`scripts/constrained-bash.py`)
-- [x] Move script into repo (`scripts/constrained-bash.py`); symlink replaces
-      `~/.claude/hooks/constrained-bash.py`
+### constrained-bash hook (`scripts/constrained_bash.py`)
+- [x] Move script into repo (`scripts/constrained_bash.py`); symlink replaces
+      `~/.claude/hooks/constrained_bash.py`
 - [x] Add `--format=claude|gemini` flag for dual-host support
 - [x] Pipeline-safe allowlist: `grep`/`head`/`tail`/`wc`/`jq` allowed
       mid-pipeline (reading stdin), denied at pipeline start (reading files)
@@ -51,7 +51,7 @@ management.
       and `$HOME`-based paths (tilde not reliably expanded in hook commands)
 - [x] `catenary doctor` constrained-bash check — implementation notes:
       - Embed the canonical script at compile time:
-        `const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../scripts/constrained-bash.py");`
+        `const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../scripts/constrained_bash.py");`
       - Add `--diff` flag to the `Doctor` subcommand in the CLI struct
       - Add `check_constrained_bash_claude(colors, show_diff)` and
         `check_constrained_bash_gemini(colors, show_diff)` — mirrors the
@@ -59,7 +59,7 @@ management.
         `src/main.rs`
       - Detection: parse `~/.claude/settings.json` and `~/.gemini/settings.json`
         as JSON; walk all hook command strings looking for any that contain
-        `"constrained-bash.py"`; extract the script path (first whitespace-
+        `"constrained_bash.py"`; extract the script path (first whitespace-
         delimited token of the command value); expand `$HOME`
       - If not found in either file: print dimmed `- not configured` and return
         (opt-in feature — absence is not an error)
@@ -68,7 +68,7 @@ management.
         `✗ out of date (run catenary doctor --diff to see changes)`
       - `--diff`: when set, show a unified diff using the `similar` crate
         (MIT licensed — permitted by `deny.toml`). Apply to all stale checks
-        (hooks.json files and constrained-bash.py) so one flag shows everything.
+        (hooks.json files and constrained_bash.py) so one flag shows everything.
       - Wire both checks into `run_doctor` after the existing hooks section,
         under a `Scripts:` header to mirror the `Hooks:` header
 - [x] Debug hook not blocking: root cause was missing `chmod +x` on the repo
@@ -96,24 +96,45 @@ management.
 - [x] TTY detection in `main.rs`: dispatch to MCP server when
       `!stdin.is_terminal() && !stdout.is_terminal()`, otherwise launch TUI
       (interim: `run_dashboard` calls `run_list` until Phase 2)
-- [ ] Add `prune_sessions(retention_days: i64)` to remove directories older
+- [x] Add `prune_sessions(retention_days: i64)` to remove directories older
       than the configured threshold
+- [x] Fix session ID collision: replace tid_hash with atomic counter so
+      multiple sessions created in the same millisecond get unique IDs
 
 ### Phase 2 — TUI Scaffolding
-- [ ] Add `ratatui` dependency (crossterm already present)
-- [ ] Create `src/tui.rs` with two-pane layout skeleton
-- [ ] Verify `crossterm` version is compatible with chosen `ratatui` version
+- [x] Add `ratatui 0.30` dependency (`crossterm_0_28` feature; 0.28/0.29
+      failed cargo-deny due to unmaintained `paste` advisory RUSTSEC-2024-0436)
+- [x] Create `src/tui.rs` with two-pane layout skeleton
+- [x] Verify `crossterm` version is compatible with chosen `ratatui` version
+- [x] Add `deny` target to Makefile for isolated license/advisory checks
 
 ### Phase 3 — Session Browser (Top Pane)
-- [ ] Scrollable session list with Active/Dead status indicators
-- [ ] `j`/`k` navigation
+- [x] Scrollable session list with Active/Dead status indicators
+- [x] `j`/`k` navigation
+- [x] `r` to refresh session list
 
 ### Phase 4 — Event Tailer (Bottom Pane)
-- [ ] Live tail of selected session's `events.jsonl`
-- [ ] Works for both active and dead sessions
-- [ ] `f` to focus/filter by agent or lock-owner
+- [x] Live tail of selected session's `events.jsonl`
+- [x] Works for both active and dead sessions
+- [x] `f` to focus/filter events (case-insensitive substring match on
+      formatted event line; `F` clears; Enter applies; Esc cancels input)
 
 ### Phase 5 — Pruning
-- [ ] Call `prune_sessions` on TUI startup
-- [ ] Respect `log_retention_days` from config
-- [ ] `x` keybind in TUI to manually delete a dead session log
+- [x] Call `prune_sessions` on TUI startup (in `run_dashboard`)
+- [x] Respect `log_retention_days` from config
+- [x] `x` keybind in TUI to manually delete a dead session log
+      (refuses active sessions; shows status message on success/failure)
+
+### Phase 6 — TUI Polish
+- [x] Show active language servers as a dim second line under each session row
+- [x] Separate keybinding hints into a footer bar (out of panel titles)
+- [x] Footer says `x delete log` to clarify it only removes log data
+- [x] Only load last N events on session switch (avoids replay flash)
+- [x] Colored events using ratatui `Span` + `Style` (matches
+      `print_event_annotated` color scheme: dim timestamps, cyan languages,
+      green/blue tool arrows, red errors, yellow warnings)
+- [x] Nerd Font icons for events:
+      -  / / / diagnostics (error/warn/info/ok)
+      -  lock /  unlock
+      -  search /  map /  hover /  goto /  refs /  diagnostics
+      - `◆` server state / `⟳` progress / `◇` MCP / `●`/`○` start/stop

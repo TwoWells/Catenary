@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/catenary-proc"]
+
 [package]
 name = "catenary-mcp"
 version = "1.4.0"
@@ -19,19 +22,26 @@ path = "src/main.rs"
 
 [[bin]]
 name = "mockls"
-path = "src/bin/mockls.rs"
+path = "tools/mockls.rs"
+required-features = ["mockls"]
+
+[[bin]]
+name = "mockc"
+path = "tools/mockc.rs"
 required-features = ["mockls"]
 
 [features]
 mockls = []
 
 [dependencies]
+catenary-proc = { path = "crates/catenary-proc" }
 anyhow = "1.0.100"
 bytes = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
 config = "0.15.19"
 crossterm = "0.28"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_28"] }
 dirs = "6.0.0"
 ignore = "0.4.25"
 libc = "0.2"

@@ -26,7 +26,7 @@ This document catalogs the failure modes, current handling, and required invaria
 |---------|---------|-----------------|--------|
 | Server won't start | Bad command, missing binary, permission error | `LspClient::spawn()` returns `Err`, propagated to `get_client()` | OK |
 | Server crashes mid-session | Segfault, OOM, unhandled exception | Reader task detects stdout close, sets `alive=false`. Next request triggers restart via `get_client()` | OK |
-| Server hangs (no response) | Deadlock, infinite loop | `REQUEST_TIMEOUT` (30s) fires, returns timeout error. Diagnostics wait uses activity tracking + nudge-and-retry — see [Timeout Ambiguity](#timeout-ambiguity-resolved) | OK |
+| Server hangs (no response) | Deadlock, infinite loop | CPU-tick failure detection (1000-tick threshold, 30s wall-clock backstop). Diagnostics: load-aware failure detection via `ProcessMonitor` — see [Wait Model](wait-model.md) and [Timeout Ambiguity](#timeout-ambiguity-resolved) | OK |
 | Server exits during initialize | Crash on startup | `initialize()` request times out or gets channel-closed error | OK |
 | Server produces no stdout | Blocks on stderr, misconfigured pipes | Timeout on first request | OK |
 

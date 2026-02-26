@@ -11,8 +11,9 @@ pub mod manager;
 pub mod protocol;
 /// Server state and progress tracking.
 pub mod state;
+/// Unified wait infrastructure for load-aware failure detection.
+pub(crate) mod wait;
 
-pub(crate) use client::DIAGNOSTICS_TIMEOUT;
 pub use client::DiagnosticsWaitResult;
 pub use client::{LspClient, WARMUP_PERIOD};
 pub use manager::{ClientManager, detect_workspace_languages};

@@ -30,8 +30,8 @@ pub struct ProgressState {
 pub enum ServerState {
     /// Server just spawned, may be initializing.
     Initializing,
-    /// Server actively indexing/processing.
-    Indexing,
+    /// Server is busy (processing progress, workspace changes, etc.).
+    Busy,
     /// Server ready to handle requests.
     Ready,
     /// Server connection lost.
@@ -44,7 +44,7 @@ impl ServerState {
     pub const fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::Initializing,
-            1 => Self::Indexing,
+            1 => Self::Busy,
             2 => Self::Ready,
             _ => Self::Dead,
         }
@@ -55,7 +55,7 @@ impl ServerState {
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::Initializing => 0,
-            Self::Indexing => 1,
+            Self::Busy => 1,
             Self::Ready => 2,
             Self::Dead => 3,
         }
@@ -297,13 +297,13 @@ mod tests {
     #[test]
     fn test_server_state_conversion() {
         assert_eq!(ServerState::from_u8(0), ServerState::Initializing);
-        assert_eq!(ServerState::from_u8(1), ServerState::Indexing);
+        assert_eq!(ServerState::from_u8(1), ServerState::Busy);
         assert_eq!(ServerState::from_u8(2), ServerState::Ready);
         assert_eq!(ServerState::from_u8(3), ServerState::Dead);
         assert_eq!(ServerState::from_u8(99), ServerState::Dead);
 
         assert_eq!(ServerState::Initializing.as_u8(), 0);
-        assert_eq!(ServerState::Indexing.as_u8(), 1);
+        assert_eq!(ServerState::Busy.as_u8(), 1);
         assert_eq!(ServerState::Ready.as_u8(), 2);
         assert_eq!(ServerState::Dead.as_u8(), 3);
     }

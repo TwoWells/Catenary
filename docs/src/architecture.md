@@ -82,56 +82,53 @@ request.
 
 ## Diagnostics Consistency
 
-LSP has two interaction models. Request/response operations — hover,
-go-to-definition, document symbols — return consistent results directly: the
-server computes the answer on demand and sends it back. Diagnostics work
-differently. Servers push them asynchronously via `textDocument/publishDiagnostics`
-whenever analysis completes, and Catenary caches whatever arrived last.
+LSP has two interaction models. Request/response operations — go-to-definition,
+document symbols — return consistent results directly: the server computes the
+answer on demand and sends it back. Diagnostics work differently. Servers push
+them asynchronously via `textDocument/publishDiagnostics` whenever analysis
+completes, and Catenary caches whatever arrived last.
 
 This creates a consistency problem. After a file change is sent to the server,
 there is a window where the diagnostics cache still holds results from before
 the change. If the result is returned during this window, the agent receives
 stale diagnostics and may proceed unaware of errors it just introduced.
 
-Catenary buffers this eventually consistent gap to ensure diagnostics are
-current before returning them. Each URI has a generation counter that
-increments every time `publishDiagnostics` arrives for it. Before sending a
-change notification (`didOpen`/`didChange`) to the server, Catenary snapshots
-the counter. After sending, it waits for the server to publish diagnostics for
-that URI — advancing the counter past the snapshot — before reading the cache
-and returning results. Because the snapshot is taken before the change is sent,
-there is no race window: any publication that arrives after the snapshot
-necessarily reflects the change or something newer.
+Catenary buffers this gap to ensure diagnostics are current before returning
+them. Each URI has a generation counter that increments every time
+`publishDiagnostics` arrives for it. Before sending a change notification
+(`didOpen`/`didChange`) to the server, Catenary snapshots the counter. After
+sending, it waits for the server to publish diagnostics for that URI —
+advancing the counter past the snapshot — before reading the cache and
+returning results.
 
-The wait is split into two phases. Phase 1 uses a strategy selected per-server
-based on runtime observations:
+The wait uses a strategy selected per-server based on runtime observations:
 
 - **Version** — the server includes a `version` field in `publishDiagnostics`.
-  Catenary waits for the generation counter to advance past the snapshot. This
-  is the strongest signal but has not been observed from any server in practice.
+  Catenary waits for a version match — causal proof the server processed the
+  change.
 - **`TokenMonitor`** — the server sends `$/progress` tokens (e.g.,
-  rust-analyzer's flycheck). Catenary waits for the server to cycle from Active
-  to Idle, indicating analysis is complete. A hard timeout prevents infinite
-  hangs if the server never starts work for a given change.
-- **`ProcessMonitor`** — the server sends neither version nor progress tokens.
-  Catenary polls the server process's CPU time via `/proc/<pid>/stat` (Linux)
-  or `ps` (macOS) to infer activity. Trust-based patience decays on consecutive
-  timeouts without diagnostics arriving (120s → 60s → 30s → 5s), preventing
-  long waits on servers that consistently don't produce diagnostics for certain
-  change patterns.
+  rust-analyzer's flycheck). Catenary waits for the Active → Idle transition.
 
-Phase 2 is a 2-second activity settle, shared by all strategies. After Phase 1
-signals completion, Catenary continues observing the server's notification
-stream and progress state. Only when the server has been completely silent for
-2 seconds with no active progress tokens does Catenary read the cache and
-return. This catches servers like rust-analyzer that publish diagnostics in
-multiple rounds — fast warnings from native analysis followed by slower
-type-checking errors from flycheck.
+Servers that provide neither version nor progress do not participate in the
+diagnostics lifecycle. They still receive `didOpen`/`didChange` for code
+intelligence but no diagnostics are returned.
+
+Failure detection uses CPU ticks instead of wall-clock timeouts. A
+`ProcessMonitor` (backed by `/proc/<pid>/stat` on Linux, `proc_pidinfo` on
+macOS, `GetProcessTimes` on Windows) tracks the server's CPU consumption. Only
+unexplained work — Running with advancing ticks and no active `$/progress`
+tokens — drains the failure threshold (1000 ticks = 10 CPU-seconds). Sleeping,
+blocked, starved, and progress-explained ticks are free waits.
+
+`didSave` is gated on `textDocumentSync.save` from `ServerCapabilities`. Only
+servers that advertise save support receive `textDocument/didSave`.
 
 This mechanism applies to the paths that return diagnostics after a change:
 the `catenary release` hook (for post-edit diagnostics) and the `diagnostics`
-tool. Request/response tools like `hover` and `document_symbols` do not need
+tool. Request/response tools (`definition`, `document_symbols`) do not need
 it — their results come directly from the server response, not from the cache.
+
+See [Wait Model](wait-model.md) for full design details.
 
 ## Root Synchronization
 

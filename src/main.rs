@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler, PathValidator};
@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
     match args.command {
         None => {
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                run_dashboard()
+                run_dashboard(&args)
             } else {
                 run_server(args).await
             }
@@ -184,15 +184,23 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Launch the interactive dashboard (Phase 2: replaced by TUI).
+/// Launch the interactive TUI dashboard.
 ///
-/// Interim behaviour: falls back to the session list until `src/tui.rs` is implemented.
+/// Prunes stale sessions based on the configured retention policy, then
+/// enters a two-pane terminal interface showing sessions and events.
 ///
 /// # Errors
 ///
-/// Returns an error if listing sessions fails.
-fn run_dashboard() -> Result<()> {
-    run_list()
+/// Returns an error if configuration loading, session pruning, or TUI
+/// initialisation fails.
+fn run_dashboard(args: &Args) -> Result<()> {
+    let config = catenary_mcp::config::Config::load(args.config.clone())?;
+
+    if let Err(e) = session::prune_sessions(config.log_retention_days) {
+        warn!("session pruning failed: {e}");
+    }
+
+    catenary_mcp::tui::run(config.icons)
 }
 
 /// Run the MCP server (main functionality)
@@ -280,8 +288,6 @@ async fn run_server(args: Args) -> Result<()> {
             .id
     );
     info!("Workspace roots: {}", workspace_display);
-    info!("Document idle timeout: {}s", config.idle_timeout);
-
     // Create managers
     let client_manager = Arc::new(lsp::ClientManager::new(
         config.clone(),
@@ -292,19 +298,6 @@ async fn run_server(args: Args) -> Result<()> {
 
     let doc_manager = Arc::new(Mutex::new(DocumentManager::new()));
     let runtime = tokio::runtime::Handle::current();
-
-    // Start document cleanup task if timeout is enabled
-    let cleanup_handle = if config.idle_timeout > 0 {
-        let client_manager_clone = client_manager.clone();
-        let doc_manager_clone = doc_manager.clone();
-        let idle_timeout = config.idle_timeout;
-
-        Some(tokio::spawn(async move {
-            document_cleanup_task(client_manager_clone, doc_manager_clone, idle_timeout).await;
-        }))
-    } else {
-        None
-    };
 
     let current_roots = client_manager.roots().await;
 
@@ -392,12 +385,6 @@ async fn run_server(args: Args) -> Result<()> {
     // Stop notify socket server
     notify_handle.abort();
     let _ = notify_handle.await;
-
-    // Stop cleanup task
-    if let Some(handle) = cleanup_handle {
-        handle.abort();
-        let _ = handle.await;
-    }
 
     // Shutdown LSP clients gracefully
     info!("Shutting down LSP servers");
@@ -1233,7 +1220,7 @@ const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../plugins/catenary/hooks/hook
 const GEMINI_HOOKS_EXPECTED: &str = include_str!("../hooks/hooks.json");
 
 /// Expected constrained-bash hook script, embedded at compile time.
-const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../scripts/constrained-bash.py");
+const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../scripts/constrained_bash.py");
 
 /// Check Claude Code plugin hooks against the embedded expected hooks.
 fn check_claude_hooks(colors: &ColorConfig, show_diff: bool) {
@@ -1511,7 +1498,7 @@ fn check_constrained_bash_claude(colors: &ColorConfig, show_diff: bool) {
         return;
     };
 
-    let Some(script_token) = find_script_path_in_json(&settings, "constrained-bash.py") else {
+    let Some(script_token) = find_script_path_in_json(&settings, "constrained_bash.py") else {
         println!("  {label}{}", colors.dim("- not configured"));
         return;
     };
@@ -1570,7 +1557,7 @@ fn check_constrained_bash_gemini(colors: &ColorConfig, show_diff: bool) {
         return;
     };
 
-    let Some(script_token) = find_script_path_in_json(&settings, "constrained-bash.py") else {
+    let Some(script_token) = find_script_path_in_json(&settings, "constrained_bash.py") else {
         println!("  {label}{}", colors.dim("- not configured"));
         return;
     };
@@ -2208,74 +2195,6 @@ fn print_event(event: &SessionEvent) {
     let colors = ColorConfig::new(false);
     let term_width = cli::terminal_width();
     print_event_annotated(event, &colors, term_width);
-}
-
-/// Background task that periodically closes idle documents.
-async fn document_cleanup_task(
-    client_manager: Arc<lsp::ClientManager>,
-    doc_manager: Arc<Mutex<DocumentManager>>,
-    idle_timeout_secs: u64,
-) {
-    // Check every 60 seconds or half the timeout, whichever is smaller
-    let check_interval = Duration::from_secs(idle_timeout_secs.min(60));
-
-    loop {
-        tokio::time::sleep(check_interval).await;
-
-        // Find and close stale documents
-        let stale_paths = {
-            let doc_manager = doc_manager.lock().await;
-            doc_manager.stale_documents(idle_timeout_secs)
-        };
-
-        if !stale_paths.is_empty() {
-            debug!("Closing {} stale documents", stale_paths.len());
-
-            for path in stale_paths {
-                let (lang, close_params) = {
-                    let mut doc_manager = doc_manager.lock().await;
-                    let lang = doc_manager.language_id_for_path(&path).to_string();
-                    (lang, doc_manager.close(&path))
-                };
-
-                if let Ok(Some(params)) = close_params {
-                    // Only try to close if the client is active
-                    let active_clients = client_manager.active_clients().await;
-                    if let Some(client_mutex) = active_clients.get(&lang) {
-                        let client = client_mutex.lock().await;
-                        if let Err(e) = client.did_close(params).await {
-                            warn!("Failed to close document {}: {}", path.display(), e);
-                        } else {
-                            debug!("Closed stale document: {}", path.display());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check for idle servers (no open documents) and shut them down
-        let active_langs: Vec<String> = client_manager
-            .active_clients()
-            .await
-            .keys()
-            .cloned()
-            .collect();
-        for lang in active_langs {
-            let has_docs = {
-                let doc_manager = doc_manager.lock().await;
-                doc_manager.has_open_documents(&lang)
-            };
-
-            if !has_docs {
-                // No open documents for this language? Shut it down.
-                // Note: This might be aggressive if the user just closed the last file
-                // and intends to open another one soon.
-                // But since we check on `idle_timeout` interval (e.g. 60s), it's probably fine.
-                // Ideally we'd track "server idle time" separately, but this is a good start.
-                client_manager.shutdown_client(&lang).await;
-            }
-        }
-    }
 }
 
 #[cfg(test)]

@@ -2,11 +2,11 @@
 
 Catenary loads configuration from multiple sources, in order of priority (last one wins):
 
-1.  **Defaults**: `idle_timeout = 300`.
+1.  **Defaults**: `idle_timeout = 300`, `log_retention_days = 7`.
 2.  **User Config**: `~/.config/catenary/config.toml`.
 3.  **Project Config**: `.catenary.toml` in the current directory or any parent directory (searches upwards).
 4.  **Explicit File**: Specified via `--config <path>`.
-5.  **Environment Variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_IDLE_TIMEOUT=600`).
+5.  **Environment Variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_IDLE_TIMEOUT=600`). Use `__` as a separator for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 6.  **CLI Arguments**: `--lsp` and `--idle-timeout`.
 
 ## Basic Structure
@@ -134,6 +134,57 @@ The `[server.<language-id>]` key must match the LSP language identifier. Catenar
 | Option | Default | Description |
 |--------|---------|-------------|
 | `idle_timeout` | `300` | Seconds before auto-closing idle documents. Set to `0` to disable. |
+| `log_retention_days` | `7` | Days to keep dead session logs. `0` = remove all dead sessions on startup. `-1` = retain forever. |
+
+## Icons
+
+The `[icons]` table controls the icons shown in the [dashboard](dashboard.md)
+event stream. Choose a base preset and optionally override individual icons.
+
+### Presets
+
+| Preset | Description |
+|--------|-------------|
+| `unicode` (default) | Safe symbols that render on any terminal font. |
+| `nerd` | Nerd Font glyphs (requires a [patched font](https://www.nerdfonts.com/)). |
+
+### Example
+
+```toml
+# Use Nerd Font icons
+[icons]
+preset = "nerd"
+```
+
+```toml
+# Use Nerd Font icons but override lock/unlock
+[icons]
+preset = "nerd"
+lock = "\U0001F512 "
+unlock = "\U0001F511 "
+```
+
+### Override keys
+
+Each key replaces the preset default for that icon slot. The value is an
+arbitrary string (typically one or two characters plus a trailing space for
+alignment).
+
+| Key | Unicode default | Nerd default | Used for |
+|-----|-----------------|--------------|----------|
+| `diag_error` | `\u2717 ` (✗) | ` ` | Diagnostic error |
+| `diag_warn` | `\u26A0 ` (⚠) | ` ` | Diagnostic warning |
+| `diag_info` | `\u2139 ` (ℹ) | ` ` | Diagnostic info |
+| `diag_ok` | `\u2713 ` (✓) | ` ` | Clean diagnostics |
+| `lock` | `\u25B6 ` (▶) | ` ` | Lock acquired |
+| `unlock` | `\u25C0 ` (◀) | ` ` | Lock released |
+| `tool_search` | `\u2192 ` (→) | ` ` | Search tool |
+| `tool_map` | `\u2192 ` (→) | ` ` | Codebase map tool |
+| `tool_hover` | `\u2192 ` (→) | ` ` | Hover tool |
+| `tool_goto` | `\u2192 ` (→) | ` ` | Go-to-definition tool |
+| `tool_refs` | `\u2192 ` (→) | ` ` | Find references tool |
+| `tool_diagnostics` | `\u2192 ` (→) | ` ` | Diagnostics tool |
+| `tool_default` | `\u2192 ` (→) | `\u2192 ` (→) | Fallback for other tools |
 
 ## CLI Override
 

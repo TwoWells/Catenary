@@ -22,3 +22,5 @@ pub mod mcp;
 pub mod notify;
 /// Session management and event broadcasting.
 pub mod session;
+/// Interactive TUI for session browsing and event tailing.
+pub mod tui;

@@ -2,227 +2,10 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Integration tests for LSP client functionality.
-//!
-//! These tests require an LSP server to be installed. They will be skipped
-//! if the required server is not available.
+//! Integration tests for LSP client functionality using mockls.
 
 use anyhow::Result;
-use std::process::Command;
 use tempfile::tempdir;
-
-/// Check if a command exists in PATH
-fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Skip test if bash-language-server is not installed
-macro_rules! require_bash_lsp {
-    () => {
-        if !command_exists("bash-language-server") {
-            tracing::warn!("Skipping test: bash-language-server not installed");
-            return Ok(());
-        }
-    };
-}
-
-/// Skip test if lua-language-server is not installed
-macro_rules! require_lua_lsp {
-    () => {
-        if !command_exists("lua-language-server") {
-            tracing::warn!("Skipping test: lua-language-server not installed");
-            return Ok(());
-        }
-    };
-}
-
-/// Skip test if rust-analyzer is not installed and working
-macro_rules! require_rust_analyzer {
-    () => {
-        // rust-analyzer via rustup proxy may exist but not work
-        let output = Command::new("rust-analyzer").arg("--version").output();
-        if output.is_err() || !output.map(|o| o.status.success()).unwrap_or(false) {
-            tracing::warn!("Skipping test: rust-analyzer not installed or not working");
-            return Ok(());
-        }
-    };
-}
-
-/// Skip test if yaml-language-server is not installed
-macro_rules! require_yaml_lsp {
-    () => {
-        if !command_exists("yaml-language-server") {
-            tracing::warn!("Skipping test: yaml-language-server not installed");
-            return Ok(());
-        }
-    };
-}
-
-#[tokio::test]
-async fn test_bash_lsp_initialize() -> Result<()> {
-    require_bash_lsp!();
-
-    let dir = tempdir()?;
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "bash-language-server",
-        &["start"],
-        "shellscript",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    // Verify bash-language-server capabilities
-    assert!(result.capabilities.hover_provider.is_some());
-    assert!(result.capabilities.definition_provider.is_some());
-    assert!(result.capabilities.completion_provider.is_some());
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_lua_lsp_initialize() -> Result<()> {
-    require_lua_lsp!();
-
-    let dir = tempdir()?;
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "lua-language-server",
-        &[],
-        "lua",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    assert!(result.capabilities.hover_provider.is_some());
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_document_lifecycle() -> Result<()> {
-    require_bash_lsp!();
-
-    let dir = tempdir()?;
-    let script_path = dir.path().join("lifecycle.sh");
-    std::fs::write(&script_path, "#!/bin/bash\nMY_VAR=1\n")?;
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "bash-language-server",
-        &["start"],
-        "shellscript",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    let uri: lsp_types::Uri = format!("file://{}", script_path.display()).parse()?;
-
-    // Open
-    client
-        .did_open(lsp_types::DidOpenTextDocumentParams {
-            text_document: lsp_types::TextDocumentItem {
-                uri: uri.clone(),
-                language_id: "shellscript".to_string(),
-                version: 1,
-                text: "#!/bin/bash\nMY_VAR=1\n".to_string(),
-            },
-        })
-        .await?;
-
-    // Change
-    client
-        .did_change(lsp_types::DidChangeTextDocumentParams {
-            text_document: lsp_types::VersionedTextDocumentIdentifier {
-                uri: uri.clone(),
-                version: 2,
-            },
-            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: "#!/bin/bash\nMY_VAR=2\necho $MY_VAR\n".to_string(),
-            }],
-        })
-        .await?;
-
-    // Close
-    client
-        .did_close(lsp_types::DidCloseTextDocumentParams {
-            text_document: lsp_types::TextDocumentIdentifier { uri },
-        })
-        .await?;
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_rust_analyzer_initialize() -> Result<()> {
-    require_rust_analyzer!();
-
-    let dir = tempdir()?;
-
-    // Create a minimal Cargo.toml so rust-analyzer is happy
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        r#"[package]
-name = "test"
-version = "0.1.0"
-edition = "2021"
-"#,
-    )?;
-
-    // Create src directory and main.rs
-    std::fs::create_dir(dir.path().join("src"))?;
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "rust-analyzer",
-        &[],
-        "rust",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    // rust-analyzer provides hover and definition
-    assert!(result.capabilities.hover_provider.is_some());
-    assert!(result.capabilities.definition_provider.is_some());
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_yaml_lsp_initialize() -> Result<()> {
-    require_yaml_lsp!();
-
-    let dir = tempdir()?;
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        "yaml-language-server",
-        &["--stdio"],
-        "yaml",
-        catenary_mcp::session::EventBroadcaster::noop()?,
-    )?;
-
-    let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    assert!(result.capabilities.hover_provider.is_some());
-
-    client.shutdown().await?;
-    Ok(())
-}
-
-// ─── mockls-based tests ─────────────────────────────────────────────────
-// These tests use mockls instead of real language servers, so they always
-// run regardless of installed toolchains.
 
 #[tokio::test]
 async fn test_mockls_initialize() -> Result<()> {
@@ -318,6 +101,111 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
             text_document: lsp_types::TextDocumentIdentifier { uri },
         })
         .await?;
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Verifies client capabilities sent during `initialize` (Gap 7).
+///
+/// mockls `--log-init-params` writes the full initialize request params
+/// to a file. We parse it and assert the capabilities Catenary advertises.
+#[tokio::test]
+async fn test_client_capabilities() -> Result<()> {
+    let dir = tempdir()?;
+    let init_log = dir.path().join("init_params.json");
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let log_path = init_log.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &["--log-init-params", log_path],
+        "shellscript",
+        catenary_mcp::session::EventBroadcaster::noop()?,
+    )?;
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    let params_json = std::fs::read_to_string(&init_log)?;
+    let params: serde_json::Value = serde_json::from_str(&params_json)?;
+    let caps = &params["capabilities"];
+    let text_doc = &caps["textDocument"];
+
+    // Capabilities that MUST be present
+    assert!(
+        text_doc.get("synchronization").is_some(),
+        "synchronization capability missing"
+    );
+    assert!(
+        text_doc.get("definition").is_some(),
+        "definition capability missing"
+    );
+    assert!(
+        text_doc.get("references").is_some(),
+        "references capability missing"
+    );
+    assert!(
+        text_doc.get("documentSymbol").is_some(),
+        "documentSymbol capability missing"
+    );
+    assert!(
+        text_doc.get("callHierarchy").is_some(),
+        "callHierarchy capability missing"
+    );
+    assert!(
+        text_doc.get("typeHierarchy").is_some(),
+        "typeHierarchy capability missing"
+    );
+    assert!(
+        text_doc.get("implementation").is_some(),
+        "implementation capability missing"
+    );
+    assert!(
+        text_doc.get("declaration").is_some(),
+        "declaration capability missing"
+    );
+    assert!(
+        text_doc.get("typeDefinition").is_some(),
+        "typeDefinition capability missing"
+    );
+
+    // `publishDiagnostics.versionSupport` must be true
+    assert_eq!(
+        text_doc["publishDiagnostics"]["versionSupport"], true,
+        "publishDiagnostics.versionSupport must be true"
+    );
+
+    // `window.workDoneProgress` must be true
+    assert_eq!(
+        caps["window"]["workDoneProgress"], true,
+        "window.workDoneProgress must be true"
+    );
+
+    // Capabilities that MUST NOT be present (tools were removed)
+    assert!(
+        text_doc.get("hover").is_none(),
+        "hover capability should not be advertised"
+    );
+    assert!(
+        text_doc.get("codeAction").is_none(),
+        "codeAction capability should not be advertised"
+    );
+    assert!(
+        text_doc.get("rename").is_none(),
+        "rename capability should not be advertised"
+    );
+    assert!(
+        text_doc.get("completion").is_none(),
+        "completion capability should not be advertised"
+    );
+    assert!(
+        text_doc.get("signatureHelp").is_none(),
+        "signatureHelp capability should not be advertised"
+    );
+    assert!(
+        text_doc.get("formatting").is_none(),
+        "formatting capability should not be advertised"
+    );
 
     client.shutdown().await?;
     Ok(())

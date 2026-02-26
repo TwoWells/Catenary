@@ -20,7 +20,7 @@ Claude Code — symlink into ~/.claude/hooks/ then add to ~/.claude/settings.jso
       "PreToolUse": [
         {
           "matcher": "Bash",
-          "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/constrained-bash.py"}]
+          "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/constrained_bash.py"}]
         }
       ]
     }
@@ -31,7 +31,7 @@ Gemini CLI — symlink into ~/.gemini/hooks/ then add to ~/.gemini/settings.json
       "BeforeTool": [
         {
           "matcher": "run_shell_command",
-          "hooks": [{"type": "command", "command": "$HOME/.gemini/hooks/constrained-bash.py --format=gemini"}]
+          "hooks": [{"type": "command", "command": "$HOME/.gemini/hooks/constrained_bash.py --format=gemini"}]
         }
       ]
     }
@@ -82,7 +82,7 @@ def _strip_heredoc_bodies(cmd_string):
 
 
 # Commands agents are allowed to run
-ALLOWED = {"make", "git", "gh", "cp", "rm", "touch", "mkdir", "mv", "chmod", "sleep"}
+ALLOWED = {"make", "git", "gh", "cp", "rm", "rmdir", "touch", "mkdir", "mv", "chmod", "sleep"}
 
 # git subcommands that are denied even though git is allowed
 DENIED_GIT = {"grep", "ls-files", "ls-tree"}

@@ -129,9 +129,10 @@ impl Drop for BridgeProcess {
 }
 
 /// Default mockls: publishes diagnostics on didOpen/didChange without
-/// version or progress tokens. Exercises the `ProcessMonitor` path.
+/// version or progress tokens. In the new model, servers without either
+/// signal do not participate in diagnostics — no didSave, no wait.
 #[test]
-fn test_diagnostics_process_monitor_path() -> Result<()> {
+fn test_diagnostics_degraded_mode() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("test.sh");
     std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
@@ -146,8 +147,8 @@ fn test_diagnostics_process_monitor_path() -> Result<()> {
         .unwrap_or("");
 
     assert!(
-        text.contains("mock diagnostic"),
-        "ProcessMonitor path should return diagnostics. Got: {text}"
+        text.contains("No diagnostics"),
+        "Degraded mode (no version/progress) should return no diagnostics. Got: {text}"
     );
 
     Ok(())
@@ -180,7 +181,11 @@ fn test_diagnostics_version_path() -> Result<()> {
 }
 
 /// mockls with `--progress-on-change`: sends progress tokens around
-/// diagnostic computation. Exercises the `TokenMonitor` strategy.
+/// diagnostic computation on `didChange`. Exercises the `TokenMonitor` strategy.
+///
+/// Progress tokens are only sent on `didChange` (not `didOpen`), so
+/// the first call opens the file (degraded mode), and the second call
+/// after modification triggers the progress path.
 #[test]
 fn test_diagnostics_token_monitor_path() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -193,7 +198,14 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    let response = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
+    // First call: opens the file via didOpen (no progress tokens sent)
+    let _ = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
+
+    // Modify file to trigger didChange on next call
+    std::fs::write(&file, "#!/bin/bash\necho changed\necho line3\n")?;
+
+    // Second call: triggers didChange → progress tokens → TokenMonitor
+    let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
     let text = response
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
@@ -201,7 +213,7 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
 
     assert!(
         text.contains("mock diagnostic"),
-        "TokenMonitor path should return diagnostics. Got: {text}"
+        "TokenMonitor path should return diagnostics on didChange. Got: {text}"
     );
 
     Ok(())
@@ -226,11 +238,10 @@ fn test_diagnostics_server_death() -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    // Should either get diagnostics (if server published before dying),
-    // "No diagnostics", or an error about the server dying
+    // Should either get diagnostics (if server published before dying)
+    // or "No diagnostics". No server infrastructure messages to agent.
     let is_acceptable = text.contains("mock diagnostic")
         || text.contains("No diagnostics")
-        || text.contains("server")
         || response.get("error").is_some();
 
     assert!(
@@ -328,12 +339,10 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
         .await?;
     client.did_save(uri.clone()).await?;
 
-    // Wait for diagnostics with snapshot=0 and generous timeout
-    let result = client
-        .wait_for_diagnostics_update(&uri, snapshot, Duration::from_secs(30))
-        .await;
+    // Wait for diagnostics with snapshot=0
+    let result = client.wait_for_diagnostics_update(&uri, snapshot).await;
 
-    assert_eq!(result, DiagnosticsWaitResult::Updated);
+    assert_eq!(result, DiagnosticsWaitResult::Diagnostics);
 
     // Check what diagnostics we got
     let diagnostics = client.get_diagnostics(&uri).await;
@@ -487,6 +496,56 @@ fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
+/// mockls with `--publish-version --advertise-save --flycheck-command mockc`:
+/// Exercises the multi-round diagnostics pattern (Gap 1). After `didSave`,
+/// mockls spawns mockc as a subprocess under a `$/progress` bracket. Native
+/// diagnostics arrive immediately; flycheck diagnostics arrive after mockc
+/// finishes. Catenary should wait for the full Active→Idle progress cycle,
+/// returning flycheck diagnostics (which contain "flycheck") rather than
+/// short-circuiting on the first native diagnostics.
+#[test]
+fn test_diagnostics_flycheck_multi_round() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("test.sh");
+    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+
+    let mockc_bin = env!("CARGO_BIN_EXE_mockc");
+    let mut bridge = BridgeProcess::spawn(
+        &[
+            "--publish-version",
+            "--advertise-save",
+            "--flycheck-command",
+            mockc_bin,
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    // First call: opens the file (native diagnostics only, no flycheck)
+    let _ = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
+
+    // Modify file to trigger didChange + didSave on next call
+    std::fs::write(&file, "#!/bin/bash\necho changed\necho line3\n")?;
+
+    // Second call: triggers didChange + didSave → flycheck subprocess
+    let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    // Should contain diagnostics reflecting the modified file (3 lines).
+    // The flycheck subprocess runs under a progress bracket; Catenary must
+    // wait for the full Active→Idle cycle to get the post-flycheck diagnostics.
+    assert!(
+        text.contains("mock diagnostic") && text.contains("3 lines"),
+        "Multi-round path should return flycheck diagnostics for \
+         the modified file (3 lines). Got: {text}"
+    );
+
+    Ok(())
+}
+
 /// mockls with `--progress-on-change --no-diagnostics`: server sends
 /// progress tokens but never publishes diagnostics. The `TokenMonitor`
 /// should detect Active → Idle and return cached (empty) diagnostics.
@@ -511,6 +570,61 @@ fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
     assert!(
         text.contains("No diagnostics"),
         "TokenMonitor with no diagnostics should return empty. Got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Near-threshold flycheck: mockc burns 900 ticks (~9s wall time) under
+/// a `$/progress` bracket. mockls is Sleeping while the subprocess runs,
+/// so the threshold does not drain (subprocess ticks don't count against
+/// mockls). After mockc finishes, mockls publishes diagnostics with a
+/// version match.
+#[test]
+fn test_near_threshold_flycheck() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("test.sh");
+    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+
+    let mockc_bin = env!("CARGO_BIN_EXE_mockc");
+    let mut bridge = BridgeProcess::spawn(
+        &[
+            "--publish-version",
+            "--advertise-save",
+            "--flycheck-command",
+            mockc_bin,
+            "--flycheck-ticks",
+            "900",
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    // First call opens the file and gets initial diagnostics
+    let response = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("mock diagnostic"),
+        "Initial diagnostics should arrive. Got: {text}"
+    );
+
+    // Modify the file to trigger flycheck on the second call
+    std::fs::write(&file, "#!/bin/bash\necho changed\necho line3\n")?;
+
+    // Second call: triggers didChange + didSave → flycheck with 900-tick mockc
+    let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    assert!(
+        text.contains("mock diagnostic"),
+        "Near-threshold flycheck should return diagnostics (mockls sleeps \
+         while mockc runs, threshold not drained). Got: {text}"
     );
 
     Ok(())

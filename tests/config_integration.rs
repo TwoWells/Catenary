@@ -11,31 +11,40 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+
+/// Create a temp config.toml that uses mockls for shellscript.
+fn write_mockls_config(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let config_path = dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "idle_timeout = 60\n\n[server.shellscript]\ncommand = \"{mockls_bin}\"\nargs = []\n"
+        ),
+    )?;
+    Ok(config_path)
+}
 
 #[test]
 fn test_config_loading() -> Result<()> {
     let root_dir = std::env::current_dir()?;
-    let config_path = root_dir.join("tests/assets/config.toml");
-    let bash_file = root_dir.join("tests/assets/bash/script.sh");
+    let tmp = tempfile::tempdir()?;
+    let config_path = write_mockls_config(tmp.path())?;
 
     // Spawn catenary using ONLY the config file (no --lsp args)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
-    cmd.arg("--root").arg(&root_dir); // Catenary root
+    cmd.arg("--root").arg(&root_dir);
     // Isolate from user-level config
     cmd.env("XDG_CONFIG_HOME", &root_dir);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()); // See logs
+        .stderr(Stdio::inherit());
 
     let mut child = cmd.spawn().context("Failed to spawn catenary")?;
     let mut stdin = child.stdin.take().context("Failed to get stdin")?;
     let mut stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-    // Wait for init
-    std::thread::sleep(Duration::from_secs(2));
 
     // Initialize MCP
     let init_req = json!({
@@ -69,22 +78,20 @@ fn test_config_loading() -> Result<()> {
     .to_string();
     writeln!(stdin, "{initialized_notif}").context("Failed to write to stdin")?;
 
-    // Test Bash Hover (should be enabled by config)
-    let hover_req = json!({
+    // Test search (verifies the server is functional)
+    let search_req = json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "hover",
+            "name": "search",
             "arguments": {
-                "file": bash_file.to_str().context("invalid bash file path")?,
-                "line": 2,
-                "character": 4
+                "queries": ["echo"]
             }
         }
     })
     .to_string();
-    writeln!(stdin, "{hover_req}").context("Failed to write to stdin")?;
+    writeln!(stdin, "{search_req}").context("Failed to write to stdin")?;
 
     line.clear();
     stdout
@@ -99,7 +106,7 @@ fn test_config_loading() -> Result<()> {
     let result = &response["result"];
     assert!(
         result["isError"].is_null() || result["isError"] == false,
-        "Bash hover failed: {response:?}"
+        "Search failed: {response:?}"
     );
     Ok(())
 }
@@ -107,15 +114,16 @@ fn test_config_loading() -> Result<()> {
 #[test]
 fn test_config_override() -> Result<()> {
     let root_dir = std::env::current_dir()?;
-    let config_path = root_dir.join("tests/assets/config.toml");
-    let rust_file = root_dir.join("src/main.rs");
+    let tmp = tempfile::tempdir()?;
+    let config_path = write_mockls_config(tmp.path())?;
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
 
     // Spawn catenary with config AND CLI override
-    // Config provides 'shellscript', CLI provides 'rust'
+    // Config provides 'shellscript' (mockls), CLI provides 'toml' (also mockls)
     // CLI also overrides idle_timeout to 10 (config has 60)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
-    cmd.arg("--lsp").arg("rust:rust-analyzer");
+    cmd.arg("--lsp").arg(format!("toml:{mockls_bin}"));
     cmd.arg("--idle-timeout").arg("10");
     cmd.arg("--root").arg(&root_dir);
     // Isolate from user-level config
@@ -128,9 +136,6 @@ fn test_config_override() -> Result<()> {
     let mut child = cmd.spawn().context("Failed to spawn catenary")?;
     let mut stdin = child.stdin.take().context("Failed to get stdin")?;
     let mut stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-    // Wait for init (Rust analyzer needs time)
-    std::thread::sleep(Duration::from_secs(3));
 
     // Initialize MCP
     let init_req = json!({
@@ -158,22 +163,20 @@ fn test_config_override() -> Result<()> {
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string();
     writeln!(stdin, "{initialized_notif}").context("Failed to write to stdin")?;
 
-    // Test Rust Hover (CLI arg) - should work
-    let hover_req = json!({
+    // Test search (CLI arg merged mockls for toml) - should work
+    let search_req = json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "hover",
+            "name": "search",
             "arguments": {
-                "file": rust_file.to_str().context("invalid rust file path")?,
-                "line": 1,
-                "character": 0
+                "queries": ["echo"]
             }
         }
     })
     .to_string();
-    writeln!(stdin, "{hover_req}").context("Failed to write to stdin")?;
+    writeln!(stdin, "{search_req}").context("Failed to write to stdin")?;
 
     line.clear();
     stdout
@@ -184,7 +187,7 @@ fn test_config_override() -> Result<()> {
     let result = &response["result"];
     assert!(
         result["isError"].is_null() || result["isError"] == false,
-        "Rust hover failed (CLI arg not merged?)"
+        "Search failed (CLI arg not merged?)"
     );
 
     // Cleanup - drop stdin to signal EOF, then wait for graceful exit
