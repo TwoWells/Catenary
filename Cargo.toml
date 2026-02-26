@@ -54,6 +54,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+unicode-width = "0.2"
 url = "2.5.8"
 
 [dev-dependencies]
