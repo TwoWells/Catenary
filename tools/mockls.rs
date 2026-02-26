@@ -1051,8 +1051,7 @@ fn main() {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    clippy::unwrap_used,
-    reason = "Tests use expect/unwrap for clear failure messages"
+    reason = "tests use expect for readable assertions"
 )]
 mod tests {
     use super::*;

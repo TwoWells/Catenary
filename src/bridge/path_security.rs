@@ -208,6 +208,10 @@ impl PathValidator {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -247,10 +251,7 @@ mod tests {
         let (_dir, validator) = setup_workspace()?;
         let result = validator.validate_read(Path::new("/etc/hostname"));
         assert!(result.is_err());
-        let err = result
-            .err()
-            .ok_or_else(|| anyhow!("Expected error"))?
-            .to_string();
+        let err = result.expect_err("expected error").to_string();
         assert!(
             err.contains("outside workspace roots"),
             "Error should mention workspace roots: {err}"
@@ -263,10 +264,7 @@ mod tests {
         let (dir, validator) = setup_workspace()?;
         let result = validator.validate_read(&dir.path().join("nonexistent.rs"));
         assert!(result.is_err());
-        let err = result
-            .err()
-            .ok_or_else(|| anyhow!("Expected error"))?
-            .to_string();
+        let err = result.expect_err("expected error").to_string();
         assert!(
             err.contains("does not exist"),
             "Error should mention file not existing: {err}"
@@ -329,10 +327,7 @@ mod tests {
 
         let result = validator.validate_write(&config_path);
         assert!(result.is_err());
-        let err = result
-            .err()
-            .ok_or_else(|| anyhow!("Expected error"))?
-            .to_string();
+        let err = result.expect_err("expected error").to_string();
         assert!(
             err.contains("configuration file"),
             "Error should mention config file: {err}"

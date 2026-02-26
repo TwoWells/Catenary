@@ -491,6 +491,10 @@ fn extension_to_config_key(ext: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use crate::config::{IconConfig, ServerConfig};

@@ -381,15 +381,17 @@ fn file_mtime_ms(path: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, reason = "Tests use unwrap for brevity")]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
 
     fn setup() -> (FileLockManager, tempfile::TempDir) {
-        let dir = tempfile::tempdir().ok().unwrap();
-        let mgr = FileLockManager::with_dir(dir.path().join("locks"))
-            .ok()
-            .unwrap();
+        let dir = tempfile::tempdir().expect("tempdir creation");
+        let mgr =
+            FileLockManager::with_dir(dir.path().join("locks")).expect("lock manager creation");
         (mgr, dir)
     }
 
@@ -407,7 +409,8 @@ mod tests {
         assert!(matches!(result, AcquireResult::Acquired));
 
         // Release with grace
-        mgr.release("/tmp/test.rs", "agent-a", 30).ok().unwrap();
+        mgr.release("/tmp/test.rs", "agent-a", 30)
+            .expect("release with grace");
 
         // Re-acquire by same owner should succeed immediately
         let result = mgr.acquire("/tmp/test.rs", "agent-a", 5);
@@ -436,7 +439,8 @@ mod tests {
         assert!(matches!(result, AcquireResult::Acquired));
 
         // Agent A releases with 0 grace (immediate)
-        mgr.release("/tmp/test.rs", "agent-a", 0).ok().unwrap();
+        mgr.release("/tmp/test.rs", "agent-a", 0)
+            .expect("immediate release");
 
         // Agent B should acquire immediately
         let result = mgr.acquire("/tmp/test.rs", "agent-b", 1);
@@ -450,7 +454,8 @@ mod tests {
         // Agent A acquires and releases with 1s grace
         let result = mgr.acquire("/tmp/test.rs", "agent-a", 5);
         assert!(matches!(result, AcquireResult::Acquired));
-        mgr.release("/tmp/test.rs", "agent-a", 1).ok().unwrap();
+        mgr.release("/tmp/test.rs", "agent-a", 1)
+            .expect("release with 1s grace");
 
         // Agent B tries immediately — lock is in grace, should wait then succeed
         // With 1s grace and 5s timeout, B should get it after ~1s
@@ -475,7 +480,8 @@ mod tests {
         assert!(matches!(result, AcquireResult::Acquired));
 
         // Agent B tries to release — should be a no-op
-        mgr.release("/tmp/test.rs", "agent-b", 0).ok().unwrap();
+        mgr.release("/tmp/test.rs", "agent-b", 0)
+            .expect("release by non-owner");
 
         // Agent A's lock should still be active
         let result = mgr.acquire("/tmp/test.rs", "agent-b", 1);
@@ -487,8 +493,7 @@ mod tests {
         let (mgr, _dir) = setup();
         // Releasing a file that was never locked should succeed silently
         mgr.release("/tmp/nonexistent.rs", "agent-a", 0)
-            .ok()
-            .unwrap();
+            .expect("release nonexistent file");
     }
 
     #[test]
@@ -497,15 +502,15 @@ mod tests {
 
         // Create a real file to track
         let test_file = dir.path().join("tracked.rs");
-        std::fs::write(&test_file, "original content").ok().unwrap();
+        std::fs::write(&test_file, "original content").expect("write test file");
         let file_str = test_file.to_string_lossy().to_string();
 
         // Track the read
-        mgr.track_read(&file_str, "agent-a").ok().unwrap();
+        mgr.track_read(&file_str, "agent-a").expect("track read");
 
         // Modify the file (change mtime)
         std::thread::sleep(Duration::from_millis(50));
-        std::fs::write(&test_file, "modified content").ok().unwrap();
+        std::fs::write(&test_file, "modified content").expect("modify test file");
 
         // Acquire should detect the stale read
         let result = mgr.acquire(&file_str, "agent-a", 5);
@@ -521,16 +526,17 @@ mod tests {
 
         // Create a file and track the read
         let test_file = dir.path().join("selfed.rs");
-        std::fs::write(&test_file, "original content").ok().unwrap();
+        std::fs::write(&test_file, "original content").expect("write test file");
         let file_str = test_file.to_string_lossy().to_string();
-        mgr.track_read(&file_str, "agent-a").ok().unwrap();
+        mgr.track_read(&file_str, "agent-a").expect("track read");
 
         // Agent edits the file (mtime changes)
         std::thread::sleep(Duration::from_millis(50));
-        std::fs::write(&test_file, "edited content").ok().unwrap();
+        std::fs::write(&test_file, "edited content").expect("write edited content");
 
         // Agent calls track_read again after its own edit (simulates the new hook)
-        mgr.track_read(&file_str, "agent-a").ok().unwrap();
+        mgr.track_read(&file_str, "agent-a")
+            .expect("track read after self-edit");
 
         // Acquire should NOT warn about stale read — the agent updated its own mtime
         let result = mgr.acquire(&file_str, "agent-a", 5);
@@ -546,11 +552,11 @@ mod tests {
 
         // Create a real file to track
         let test_file = dir.path().join("stable.rs");
-        std::fs::write(&test_file, "content").ok().unwrap();
+        std::fs::write(&test_file, "content").expect("write test file");
         let file_str = test_file.to_string_lossy().to_string();
 
         // Track the read
-        mgr.track_read(&file_str, "agent-a").ok().unwrap();
+        mgr.track_read(&file_str, "agent-a").expect("track read");
 
         // Acquire without modifying — should be clean
         let result = mgr.acquire(&file_str, "agent-a", 5);

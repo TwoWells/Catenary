@@ -126,6 +126,10 @@ pub fn try_parse_message(buffer: &mut BytesMut) -> Result<Option<String>> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
 

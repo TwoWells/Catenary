@@ -532,6 +532,10 @@ pub fn panel_at(layout: &PanelLayout, x: u16, y: u16) -> Option<usize> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
 

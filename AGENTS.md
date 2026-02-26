@@ -55,7 +55,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Edition:** Rust 2024.
 - **Safety:** `unsafe` code is strictly forbidden (`forbid(unsafe_code)`).
 - **Error Handling:** Use `anyhow` for application logic and `thiserror` for library errors.
-- **Strict Denials:** Do NOT use `unwrap()`, `expect()`, `panic!()`, `todo!()`, `unimplemented!()`, `dbg!()`, `println!()`, or `eprintln!()`. Use proper error handling and the `tracing` crate for logging.
+- **Strict Denials:** Do NOT use `unwrap()`, `panic!()`, `todo!()`, `unimplemented!()`, `dbg!()`, `println!()`, or `eprintln!()`. Use proper error handling and the `tracing` crate for logging. `expect()` is denied in production code but allowed in `#[cfg(test)]` modules — prefer `expect("reason")` over `anyhow` workarounds in tests.
 - **Imports:** No wildcard imports (`use crate::*`).
 - **Formatting:** Code must be formatted with `rustfmt`.
 - **Linting:** Must pass `cargo clippy` with `pedantic`, `nursery`, and `cargo` groups enabled.

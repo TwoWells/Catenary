@@ -504,6 +504,10 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use chrono::{TimeDelta, Utc};

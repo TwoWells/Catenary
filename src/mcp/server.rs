@@ -485,6 +485,10 @@ impl<H: ToolHandler> McpServer<H> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
 
@@ -538,7 +542,7 @@ mod tests {
         assert!(response.error.is_none());
 
         let result: InitializeResult =
-            serde_json::from_value(response.result.context("missing result")?)?;
+            serde_json::from_value(response.result.expect("response result"))?;
         assert_eq!(result.server_info.name, "catenary");
         assert_eq!(result.protocol_version, "2024-11-05");
         assert!(result.instructions.is_some());
@@ -560,7 +564,7 @@ mod tests {
         assert!(response.result.is_some());
 
         let result: ListToolsResult =
-            serde_json::from_value(response.result.context("missing result")?)?;
+            serde_json::from_value(response.result.expect("response result"))?;
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "test_tool");
         Ok(())
@@ -584,7 +588,7 @@ mod tests {
         assert!(response.result.is_some());
 
         let result: CallToolResult =
-            serde_json::from_value(response.result.context("missing result")?)?;
+            serde_json::from_value(response.result.expect("response result"))?;
         assert!(result.is_error.is_none());
         Ok(())
     }
@@ -606,7 +610,7 @@ mod tests {
         assert!(response.result.is_some());
 
         let result: CallToolResult =
-            serde_json::from_value(response.result.context("missing result")?)?;
+            serde_json::from_value(response.result.expect("response result"))?;
         assert_eq!(result.is_error, Some(true));
         Ok(())
     }
@@ -625,7 +629,7 @@ mod tests {
         let response = server.handle_request(request)?;
         assert!(response.error.is_some());
         assert_eq!(
-            response.error.context("missing error")?.code,
+            response.error.expect("response error").code,
             METHOD_NOT_FOUND
         );
         Ok(())

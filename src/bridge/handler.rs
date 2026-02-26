@@ -1846,9 +1846,12 @@ fn format_type_hierarchy_items(items: &[TypeHierarchyItem]) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
-    use anyhow::Context;
     use lsp_types::{
         DocumentSymbol, Range, SymbolInformation, SymbolKind, WorkspaceSymbolResponse,
     };
@@ -1913,8 +1916,7 @@ mod tests {
         ];
         let response = DocumentSymbolResponse::Flat(symbols);
 
-        let result =
-            find_symbol_in_document_response(&response, "bar").context("symbol not found")?;
+        let result = find_symbol_in_document_response(&response, "bar").expect("symbol match");
         assert_eq!(result.line, 10);
         Ok(())
     }
@@ -1928,8 +1930,7 @@ mod tests {
         let response = DocumentSymbolResponse::Flat(symbols);
 
         // Partial match "request"
-        let result =
-            find_symbol_in_document_response(&response, "request").context("symbol not found")?;
+        let result = find_symbol_in_document_response(&response, "request").expect("symbol match");
         assert_eq!(result.line, 5);
         Ok(())
     }
@@ -1943,14 +1944,13 @@ mod tests {
         let response = DocumentSymbolResponse::Flat(symbols);
 
         // Exact match "foo" should be preferred over partial match "foobar"
-        let result =
-            find_symbol_in_document_response(&response, "foo").context("symbol not found")?;
+        let result = find_symbol_in_document_response(&response, "foo").expect("symbol match");
         assert_eq!(result.line, 10);
         Ok(())
     }
 
     #[test]
-    fn test_find_symbol_nested() -> Result<()> {
+    fn test_find_symbol_nested() {
         let inner_symbol =
             make_document_symbol("inner_method", SymbolKind::METHOD, make_range(5, 0, 10, 0));
         let mut outer_symbol =
@@ -1959,14 +1959,13 @@ mod tests {
 
         let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
 
-        let result = find_symbol_in_document_response(&response, "inner_method")
-            .context("symbol not found")?;
+        let result =
+            find_symbol_in_document_response(&response, "inner_method").expect("symbol match");
         assert_eq!(result.line, 5);
-        Ok(())
     }
 
     #[test]
-    fn test_find_symbol_nested_partial_match() -> Result<()> {
+    fn test_find_symbol_nested_partial_match() {
         let inner_symbol = make_document_symbol(
             "handle_request",
             SymbolKind::METHOD,
@@ -1979,10 +1978,8 @@ mod tests {
         let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
 
         // Partial match should find inner_method
-        let result =
-            find_symbol_in_document_response(&response, "request").context("symbol not found")?;
+        let result = find_symbol_in_document_response(&response, "request").expect("symbol match");
         assert_eq!(result.line, 15);
-        Ok(())
     }
 
     #[test]
@@ -2009,7 +2006,7 @@ mod tests {
         let response = WorkspaceSymbolResponse::Flat(symbols);
 
         let result =
-            find_symbol_in_workspace_response(&response, "MyStruct").context("symbol not found")?;
+            find_symbol_in_workspace_response(&response, "MyStruct").expect("symbol match");
         let (path, position): (std::path::PathBuf, _) = result;
         assert_eq!(path.to_string_lossy(), "/src/lib.rs");
         assert_eq!(position.line, 10);
@@ -2026,8 +2023,7 @@ mod tests {
         )?];
         let response = WorkspaceSymbolResponse::Flat(symbols);
 
-        let result =
-            find_symbol_in_workspace_response(&response, "Bridge").context("symbol not found")?;
+        let result = find_symbol_in_workspace_response(&response, "Bridge").expect("symbol match");
         let (path, position): (std::path::PathBuf, _) = result;
         assert_eq!(path.to_string_lossy(), "/src/handler.rs");
         assert_eq!(position.line, 50);

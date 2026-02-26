@@ -2198,6 +2198,10 @@ fn print_event(event: &SessionEvent) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use anyhow::Context;
@@ -2216,7 +2220,7 @@ mod tests {
         assert_eq!(hook_output["hookEventName"], "PostToolUse");
         let context = hook_output["additionalContext"]
             .as_str()
-            .context("additionalContext should be a string")?;
+            .expect("additionalContext should be a string");
         assert!(context.contains("error[E0308]: mismatched types"));
         assert!(context.contains("  --> src/main.rs:5:10"));
         // Claude format should NOT have the "LSP Diagnostics:" prefix
@@ -2233,7 +2237,7 @@ mod tests {
 
         let context = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
-            .context("additionalContext should be a string")?;
+            .expect("additionalContext should be a string");
         assert!(context.starts_with("LSP Diagnostics:\n"));
         assert!(context.contains("error[E0308]: mismatched types"));
         // Gemini format should NOT have hookEventName
@@ -2249,7 +2253,7 @@ mod tests {
             serde_json::from_str(&output).context("should produce valid JSON")?;
         let context = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
-            .context("additionalContext should be a string")?;
+            .expect("additionalContext should be a string");
         assert!(context.contains("warning: unused variable\n  --> lib.rs:3:9"));
         Ok(())
     }

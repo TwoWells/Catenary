@@ -733,9 +733,13 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
-    use anyhow::{Context, Result};
+    use anyhow::Result;
 
     #[test]
     fn test_session_create_and_list() -> Result<()> {
@@ -748,7 +752,7 @@ mod tests {
 
         // Should be retrievable
         let found = get_session(&id)?;
-        let (found_session, _) = found.context("missing session")?;
+        let (found_session, _) = found.expect("session should be retrievable");
         assert_eq!(found_session.workspace, "/tmp/test-workspace");
 
         // Drop session
@@ -757,7 +761,7 @@ mod tests {
         // Should NOT be cleaned up immediately anymore (changed behavior)
         // But get_session should still return it (as dead)
         let found = get_session(&id)?;
-        let (_, alive) = found.context("missing session after drop")?;
+        let (_, alive) = found.expect("session should exist after drop");
         assert!(!alive, "Session should be dead after drop");
 
         // Manual cleanup
