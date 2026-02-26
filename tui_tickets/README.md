@@ -78,7 +78,7 @@ If multiple tickets are eligible, pick the lowest-numbered one.
 - [x] **03** — Events panel core (`03_panel.md`)
 - [x] **04** — Event expansion & detail lines (`04_expansion.md`)
 - [x] **05** — Multi-panel grid & tab/pinning (`05_grid.md`)
-- [ ] **06** — Sub-character scrollbar & overflow counts (`06_scrollbar.md`)
+- [x] **06** — Sub-character scrollbar & overflow counts (`06_scrollbar.md`)
 - [ ] **07** — Visual selection & copy (`07_selection.md`)
 - [ ] **08** — Filter system (`08_filter.md`)
 - [ ] **09** — Mouse support (`09_mouse.md`)

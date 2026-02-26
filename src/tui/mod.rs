@@ -17,6 +17,7 @@ pub mod data;
 pub mod grid;
 pub mod layout;
 pub mod panel;
+pub mod scrollbar;
 pub mod theme;
 pub mod tree;
 

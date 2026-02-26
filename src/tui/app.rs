@@ -19,11 +19,11 @@ pub enum FocusedPane {
 }
 
 /// Application state driving the TUI.
-pub struct App {
+pub struct App<'a> {
     /// Semantic color theme.
-    pub theme: Theme,
+    pub theme: &'a Theme,
     /// Resolved icon theme.
-    pub icons: IconSet,
+    pub icons: &'a IconSet,
     /// Which pane currently has focus.
     pub focus: FocusedPane,
     /// Data source for session and event data.
