@@ -47,6 +47,16 @@ matches any test with "tui" in its module path.
   `unicode_width`). Cargo will reject the wrong form.
 - **`Line::into_owned()` does not exist in ratatui 0.30.** Use
   `panel::to_owned_line()` to convert `Line<'a>` to `Line<'static>`.
+- **`PanelState<'a>` borrows `&'a Theme` and `&'a IconSet`.** Theme and
+  icons are created on the stack in `run()` and borrowed by `App`,
+  `EventsGrid`, and all `PanelState` instances via the `'a` lifetime.
+  `PanelState::new()` takes `(session_id, &theme, &icons)`.
+  `render_panel()` takes `(state, area, buf, focused)` — no separate
+  theme/icons params.
+- **Diagnostic preview is newline-delimited.** The `preview` field in
+  `EventKind::Diagnostics` contains the full output of
+  `format_diagnostics_compact()` — one `  line:col [severity] source: msg`
+  per diagnostic, joined by `\n`. Use `.lines()` to iterate.
 
 ## Picking up a ticket
 
@@ -67,7 +77,7 @@ If multiple tickets are eligible, pick the lowest-numbered one.
 - [x] **02** — Sessions tree widget (`02_tree.md`)
 - [x] **03** — Events panel core (`03_panel.md`)
 - [x] **04** — Event expansion & detail lines (`04_expansion.md`)
-- [ ] **05** — Multi-panel grid & tab/pinning (`05_grid.md`)
+- [x] **05** — Multi-panel grid & tab/pinning (`05_grid.md`)
 - [ ] **06** — Sub-character scrollbar & overflow counts (`06_scrollbar.md`)
 - [ ] **07** — Visual selection & copy (`07_selection.md`)
 - [ ] **08** — Filter system (`08_filter.md`)

@@ -14,6 +14,7 @@
 
 pub mod app;
 pub mod data;
+pub mod grid;
 pub mod layout;
 pub mod panel;
 pub mod theme;
