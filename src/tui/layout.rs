@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! BSP layout engine and border junction character computation.
+//! BSP layout engine and border junction character lookup.
 //!
 //! Pure geometry — no terminal I/O or rendering framework coupling.
-//! Divides a [`Rect`] into [`PanelRect`]s according to a [`Composition`],
-//! with optional pin-driven sizing. Computes Unicode box-drawing junction
-//! characters for shared borders with focused/unfocused heavy/light distinction.
+//! Divides a [`Rect`] into non-overlapping [`PanelRect`]s according to a
+//! [`Composition`], with optional pin-driven sizing.
+//!
+//! ## Border ownership
+//!
+//! Each panel owns its **top** row (title bar) and **right** column
+//! (scrollbar). A panel does NOT own its left or bottom edges — the left
+//! edge is the scrollbar of the neighbor to the left (or nothing if
+//! leftmost), and the bottom edge is the title bar of the panel below
+//! (or the hints/filter row).
+//!
+//! The [`box_char`] function provides a Unicode box-drawing character
+//! lookup from arm flags. Rendering code builds the flags based on which
+//! title bars and scrollbars meet at each junction point.
 
 use std::collections::HashSet;
 use std::hash::BuildHasher;
@@ -33,7 +44,8 @@ impl Composition {
 /// A positioned panel within the grid.
 #[derive(Debug, Clone)]
 pub struct PanelRect {
-    /// The screen area for this panel.
+    /// The screen area for this panel (non-overlapping, includes owned
+    /// top border row and right scrollbar column).
     pub rect: Rect,
     /// Which row this panel is in (0-indexed).
     pub row: usize,
@@ -54,8 +66,8 @@ pub struct PanelLayout {
 
 /// Compute the layout of panels within the given area.
 ///
-/// Adjacent panels share their border cells (rects overlap by 1 on shared
-/// edges). This produces correct junction characters at shared borders.
+/// Produces non-overlapping rects that tile the area exactly (sum of
+/// widths per row = area width, sum of heights across rows = area height).
 /// Pinned panels receive proportionally more space according to `pin_ratio`.
 /// Remainder pixels are distributed left-to-right, top-to-bottom.
 #[must_use]
@@ -82,21 +94,20 @@ pub fn compute_layout<S: BuildHasher>(
         })
         .collect();
 
-    // Compute row fence-post gaps (distribute H-1 among num_rows segments).
+    // Compute row heights with pin scaling.
     let row_weights: Vec<f64> = row_has_pin
         .iter()
         .map(|&has_pin| if has_pin { pin_ratio } else { 1.0 })
         .collect();
-    let row_gaps = distribute_weighted(area.height.saturating_sub(1), &row_weights);
+    let row_sizes = distribute_weighted(area.height, &row_weights);
 
     // Build panels row by row.
     let mut panels = Vec::with_capacity(composition.total());
-    let mut y_fence = area.y;
+    let mut y = area.y;
     let mut panel_index = 0usize;
 
     for (row_idx, &cols_in_row) in composition.0.iter().enumerate() {
-        let row_gap = row_gaps[row_idx];
-        let row_height = row_gap + 1;
+        let h = row_sizes[row_idx];
 
         // Column weights for this row.
         let col_weights: Vec<f64> = (0..cols_in_row)
@@ -109,27 +120,21 @@ pub fn compute_layout<S: BuildHasher>(
             })
             .collect();
 
-        // Distribute W-1 among cols_in_row segments.
-        let col_gaps = distribute_weighted(area.width.saturating_sub(1), &col_weights);
+        let col_widths = distribute_weighted(area.width, &col_weights);
 
-        let mut x_fence = area.x;
-        for (col_idx, &col_gap) in col_gaps.iter().enumerate() {
-            let col_width = col_gap + 1;
-
+        let mut x = area.x;
+        for (col_idx, &w) in col_widths.iter().enumerate() {
             panels.push(PanelRect {
-                rect: Rect::new(x_fence, y_fence, col_width, row_height),
+                rect: Rect::new(x, y, w, h),
                 row: row_idx,
                 col: col_idx,
                 index: panel_index,
             });
-
-            // Next panel starts at the shared border (overlap by 1).
-            x_fence += col_gap;
+            x += w;
             panel_index += 1;
         }
 
-        // Next row starts at the shared border (overlap by 1).
-        y_fence += row_gap;
+        y += h;
     }
 
     PanelLayout { panels }
@@ -306,137 +311,40 @@ pub fn closest_composition(old: &Composition, new_n: usize) -> Composition {
     Composition(rows)
 }
 
-// ── Junction characters ─────────────────────────────────────────────────
+// ── Box-drawing character lookup ────────────────────────────────────────
 
-/// Bit flags for junction arm presence and weight.
-const ARM_UP: u8 = 0b0000_0001;
-const ARM_DOWN: u8 = 0b0000_0010;
-const ARM_LEFT: u8 = 0b0000_0100;
-const ARM_RIGHT: u8 = 0b0000_1000;
-const HEAVY_UP: u8 = 0b0001_0000;
-const HEAVY_DOWN: u8 = 0b0010_0000;
-const HEAVY_LEFT: u8 = 0b0100_0000;
-const HEAVY_RIGHT: u8 = 0b1000_0000;
+/// Bit flags for junction arm presence.
+pub const ARM_UP: u8 = 0b0000_0001;
+/// Bit flag: arm extending downward.
+pub const ARM_DOWN: u8 = 0b0000_0010;
+/// Bit flag: arm extending left.
+pub const ARM_LEFT: u8 = 0b0000_0100;
+/// Bit flag: arm extending right.
+pub const ARM_RIGHT: u8 = 0b0000_1000;
+/// Bit flag: up arm is heavy (focused).
+pub const HEAVY_UP: u8 = 0b0001_0000;
+/// Bit flag: down arm is heavy (focused).
+pub const HEAVY_DOWN: u8 = 0b0010_0000;
+/// Bit flag: left arm is heavy (focused).
+pub const HEAVY_LEFT: u8 = 0b0100_0000;
+/// Bit flag: right arm is heavy (focused).
+pub const HEAVY_RIGHT: u8 = 0b1000_0000;
 
-/// At a given screen coordinate where borders meet, determine the correct
-/// Unicode box-drawing character.
+/// Look up the Unicode box-drawing character for a junction point.
 ///
-/// Arms belonging to the focused panel are heavy; all others are light.
-/// Returns a space if no border arms are present at `(x, y)`.
+/// `flags` is a bitfield combining arm presence (`ARM_*`) in the low
+/// nibble and heavy/light weight (`HEAVY_*`) in the high nibble.
+/// Rendering code builds the flags based on which title bars (horizontal)
+/// and scrollbars (vertical) meet at each junction point, then calls this
+/// function to get the correct character.
+///
+/// Returns a space if no arms are present.
 #[must_use]
-pub fn junction_char(focused: Option<usize>, panels: &[PanelRect], x: u16, y: u16) -> char {
-    let flags = compute_junction_flags(focused, panels, x, y);
-    let arms = flags & 0x0F;
-    if arms == 0 {
-        return ' ';
-    }
-    lookup_box_char(flags)
-}
-
-/// Compute the junction bitfield for a point.
-fn compute_junction_flags(focused: Option<usize>, panels: &[PanelRect], x: u16, y: u16) -> u8 {
-    let mut flags = 0u8;
-
-    for panel in panels {
-        let r = &panel.rect;
-        let left = r.x;
-        let right = r.x + r.width.saturating_sub(1);
-        let top = r.y;
-        let bottom = r.y + r.height.saturating_sub(1);
-        let is_focused = focused == Some(panel.index);
-
-        // Check if this panel contributes any arm at (x, y).
-        // A panel's border is on its edges.
-
-        // Top edge: horizontal segment from left..=right at y==top.
-        // Bottom edge: horizontal segment from left..=right at y==bottom.
-        // Left edge: vertical segment from top..=bottom at x==left.
-        // Right edge: vertical segment from top..=bottom at x==right.
-
-        // Up arm: panel's top edge is at y, and x is on that edge, and there's
-        // a vertical border going up (i.e., x is left or right of the panel).
-        // Actually, let's think about this differently.
-        //
-        // At point (x,y), an "up" arm exists if some panel has a vertical border
-        // segment from (x, y-1) to (x, y). That means x == left or x == right,
-        // and y-1 >= top and y <= bottom (the point is on the border).
-        //
-        // Similarly for down, left, right arms.
-
-        // Vertical borders (left and right edges of the panel).
-        if x == left && y >= top && y <= bottom {
-            // This panel has its left edge at x.
-            // Up arm: the segment from (x, y-1) to (x, y) exists if y > top.
-            if y > top {
-                flags |= ARM_UP;
-                if is_focused {
-                    flags |= HEAVY_UP;
-                }
-            }
-            // Down arm: segment from (x, y) to (x, y+1) exists if y < bottom.
-            if y < bottom {
-                flags |= ARM_DOWN;
-                if is_focused {
-                    flags |= HEAVY_DOWN;
-                }
-            }
-        }
-        if x == right && y >= top && y <= bottom {
-            // Right edge of this panel.
-            if y > top {
-                flags |= ARM_UP;
-                if is_focused {
-                    flags |= HEAVY_UP;
-                }
-            }
-            if y < bottom {
-                flags |= ARM_DOWN;
-                if is_focused {
-                    flags |= HEAVY_DOWN;
-                }
-            }
-        }
-
-        // Horizontal borders (top and bottom edges of the panel).
-        if y == top && x >= left && x <= right {
-            if x > left {
-                flags |= ARM_LEFT;
-                if is_focused {
-                    flags |= HEAVY_LEFT;
-                }
-            }
-            if x < right {
-                flags |= ARM_RIGHT;
-                if is_focused {
-                    flags |= HEAVY_RIGHT;
-                }
-            }
-        }
-        if y == bottom && x >= left && x <= right {
-            if x > left {
-                flags |= ARM_LEFT;
-                if is_focused {
-                    flags |= HEAVY_LEFT;
-                }
-            }
-            if x < right {
-                flags |= ARM_RIGHT;
-                if is_focused {
-                    flags |= HEAVY_RIGHT;
-                }
-            }
-        }
-    }
-
-    flags
-}
-
-/// Map junction flags to a Unicode box-drawing character.
 #[allow(
     clippy::too_many_lines,
     reason = "exhaustive match on junction flag combinations"
 )]
-const fn lookup_box_char(flags: u8) -> char {
+pub const fn box_char(flags: u8) -> char {
     let arms = flags & 0x0F;
     let heavy = flags >> 4;
 
@@ -452,7 +360,7 @@ const fn lookup_box_char(flags: u8) -> char {
     let right = arms & ARM_RIGHT != 0;
 
     match (up, down, left, right) {
-        // Single arms (straight segments).
+        // Straight segments.
         (true, true, false, false) => {
             if hu || hd {
                 '┃'
@@ -549,42 +457,26 @@ const fn lookup_box_char(flags: u8) -> char {
         }
 
         // Cross.
-        (true, true, true, true) => {
-            match (hu, hd, hl, hr) {
-                (false, false, false, false) => '┼',
-                (true, true, true, true) => '╋',
-                // Heavy vertical, light horizontal.
-                (true, true, false, false) => '╂',
-                // Light vertical, heavy horizontal.
-                (false, false, true, true) => '┿',
-                // Heavy up, light rest.
-                (true, false, false, false) => '╀',
-                // Heavy down, light rest.
-                (false, true, false, false) => '╁',
-                // Heavy left, light rest.
-                (false, false, true, false) => '┽',
-                // Heavy right, light rest.
-                (false, false, false, true) => '┾',
-                // Heavy up+left.
-                (true, false, true, false) => '╃',
-                // Heavy up+right.
-                (true, false, false, true) => '╄',
-                // Heavy down+left.
-                (false, true, true, false) => '╅',
-                // Heavy down+right.
-                (false, true, false, true) => '╆',
-                // Heavy up+left+right (heavy up, heavy horizontal).
-                (true, false, true, true) => '╇',
-                // Heavy down+left+right.
-                (false, true, true, true) => '╈',
-                // Heavy up+down+left.
-                (true, true, true, false) => '╉',
-                // Heavy up+down+right.
-                (true, true, false, true) => '╊',
-            }
-        }
+        (true, true, true, true) => match (hu, hd, hl, hr) {
+            (false, false, false, false) => '┼',
+            (true, true, true, true) => '╋',
+            (true, true, false, false) => '╂',
+            (false, false, true, true) => '┿',
+            (true, false, false, false) => '╀',
+            (false, true, false, false) => '╁',
+            (false, false, true, false) => '┽',
+            (false, false, false, true) => '┾',
+            (true, false, true, false) => '╃',
+            (true, false, false, true) => '╄',
+            (false, true, true, false) => '╅',
+            (false, true, false, true) => '╆',
+            (true, false, true, true) => '╇',
+            (false, true, true, true) => '╈',
+            (true, true, true, false) => '╉',
+            (true, true, false, true) => '╊',
+        },
 
-        // Single arm or no arms — shouldn't normally happen in a grid.
+        // Single arms.
         (true, false, false, false) => {
             if hu {
                 '╹'
@@ -622,17 +514,17 @@ const fn lookup_box_char(flags: u8) -> char {
 
 /// Which panel contains the given screen coordinate?
 ///
-/// Returns the panel index or `None` if the point is on a border or outside.
+/// A panel's chrome is its **top** row (title bar) and **right** column
+/// (scrollbar). Points on chrome return `None`. Points in the content
+/// interior return the panel index.
 #[must_use]
 pub fn panel_at(layout: &PanelLayout, x: u16, y: u16) -> Option<usize> {
     for panel in &layout.panels {
         let r = &panel.rect;
-        // Interior: strictly inside the border (not on the edge).
-        if x > r.x
-            && x < r.x + r.width.saturating_sub(1)
-            && y > r.y
-            && y < r.y + r.height.saturating_sub(1)
-        {
+        let right = r.x + r.width.saturating_sub(1);
+        // Content interior: below the top title row, left of the right
+        // scrollbar column. Left edge and bottom edge are content.
+        if x >= r.x && x < right && y > r.y && y <= r.y + r.height.saturating_sub(1) {
             return Some(panel.index);
         }
     }
@@ -642,26 +534,6 @@ pub fn panel_at(layout: &PanelLayout, x: u16, y: u16) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Assert that panels in a row cover the full width with no gaps.
-    /// Adjacent panels overlap by exactly 1 (shared border).
-    fn assert_row_coverage(panels: &[&PanelRect], area: Rect) {
-        assert_eq!(panels[0].rect.x, area.x, "first panel starts at area.x");
-        if let Some(last) = panels.last() {
-            assert_eq!(
-                last.rect.x + last.rect.width,
-                area.x + area.width,
-                "last panel ends at area edge"
-            );
-        }
-        for w in panels.windows(2) {
-            let right_edge = w[0].rect.x + w[0].rect.width - 1;
-            assert_eq!(
-                w[1].rect.x, right_edge,
-                "adjacent panels share border column"
-            );
-        }
-    }
 
     #[test]
     fn test_single_panel_fills_area() {
@@ -681,12 +553,17 @@ mod tests {
         // Both full width.
         assert_eq!(layout.panels[0].rect.width, 80);
         assert_eq!(layout.panels[1].rect.width, 80);
-        // Stacked vertically with shared border (overlap by 1).
+        // Each roughly half height, no overlap.
+        assert_eq!(
+            layout.panels[0].rect.height + layout.panels[1].rect.height,
+            24
+        );
+        // Stacked vertically, no gap.
         assert_eq!(layout.panels[0].rect.y, 0);
-        let shared_y = layout.panels[0].rect.y + layout.panels[0].rect.height - 1;
-        assert_eq!(layout.panels[1].rect.y, shared_y, "rows share border row");
-        // Together they cover the full height.
-        assert_eq!(layout.panels[1].rect.y + layout.panels[1].rect.height, 24);
+        assert_eq!(
+            layout.panels[1].rect.y, layout.panels[0].rect.height,
+            "second panel starts where first ends"
+        );
     }
 
     #[test]
@@ -698,12 +575,17 @@ mod tests {
         // Both full height.
         assert_eq!(layout.panels[0].rect.height, 24);
         assert_eq!(layout.panels[1].rect.height, 24);
-        // Side by side with shared border.
+        // Each roughly half width, no overlap.
+        assert_eq!(
+            layout.panels[0].rect.width + layout.panels[1].rect.width,
+            80
+        );
+        // Side by side, no gap.
         assert_eq!(layout.panels[0].rect.x, 0);
-        let shared_x = layout.panels[0].rect.x + layout.panels[0].rect.width - 1;
-        assert_eq!(layout.panels[1].rect.x, shared_x, "panels share border col");
-        // Together they cover the full width.
-        assert_eq!(layout.panels[1].rect.x + layout.panels[1].rect.width, 80);
+        assert_eq!(
+            layout.panels[1].rect.x, layout.panels[0].rect.width,
+            "second panel starts where first ends"
+        );
     }
 
     #[test]
@@ -712,16 +594,21 @@ mod tests {
         let comp = Composition(vec![2, 1]);
         let layout = compute_layout(area, &comp, &HashSet::new(), 1.0);
         assert_eq!(layout.panels.len(), 3);
-        // Top row: two panels sharing a border.
-        let top: Vec<&PanelRect> = layout.panels.iter().filter(|p| p.row == 0).collect();
-        assert_row_coverage(&top, area);
+        // Top row: two panels, widths sum to 80.
+        assert_eq!(
+            layout.panels[0].rect.width + layout.panels[1].rect.width,
+            80
+        );
         // Bottom row: one panel full width.
         assert_eq!(layout.panels[2].rect.width, 80);
         assert_eq!(layout.panels[2].rect.x, 0);
-        // Rows share a border.
-        let shared_y = layout.panels[0].rect.y + layout.panels[0].rect.height - 1;
-        assert_eq!(layout.panels[2].rect.y, shared_y);
-        assert_eq!(layout.panels[2].rect.y + layout.panels[2].rect.height, 24);
+        // Heights sum to 24.
+        assert_eq!(
+            layout.panels[0].rect.height + layout.panels[2].rect.height,
+            24
+        );
+        // Second row starts where first ends.
+        assert_eq!(layout.panels[2].rect.y, layout.panels[0].rect.height);
     }
 
     #[test]
@@ -739,9 +626,11 @@ mod tests {
             layout.panels[0].rect.width,
             layout.panels[1].rect.width,
         );
-        // Panels cover the full width (shared border).
-        let row: Vec<&PanelRect> = layout.panels.iter().collect();
-        assert_row_coverage(&row, area);
+        // Widths still sum to area width.
+        assert_eq!(
+            layout.panels[0].rect.width + layout.panels[1].rect.width,
+            80
+        );
     }
 
     #[test]
@@ -751,8 +640,8 @@ mod tests {
         // Single-row: 3 panels side by side.
         let comp = Composition(vec![3]);
         let layout = compute_layout(area, &comp, &HashSet::new(), 1.0);
-        let row: Vec<&PanelRect> = layout.panels.iter().collect();
-        assert_row_coverage(&row, area);
+        let total_width: u16 = layout.panels.iter().map(|p| p.rect.width).sum();
+        assert_eq!(total_width, 81, "widths sum to area width");
         for p in &layout.panels {
             assert_eq!(p.rect.height, 25, "single-row panels are full height");
         }
@@ -760,18 +649,8 @@ mod tests {
         // Single-column: 3 panels stacked.
         let comp2 = Composition(vec![1, 1, 1]);
         let layout2 = compute_layout(area, &comp2, &HashSet::new(), 1.0);
-        // First panel starts at top, last panel ends at bottom.
-        assert_eq!(layout2.panels[0].rect.y, 0);
-        assert_eq!(
-            layout2.panels[2].rect.y + layout2.panels[2].rect.height,
-            25,
-            "panels cover full height"
-        );
-        // Adjacent rows share borders.
-        for w in layout2.panels.windows(2) {
-            let shared = w[0].rect.y + w[0].rect.height - 1;
-            assert_eq!(w[1].rect.y, shared, "rows share border row");
-        }
+        let total_height: u16 = layout2.panels.iter().map(|p| p.rect.height).sum();
+        assert_eq!(total_height, 25, "heights sum to area height");
         for p in &layout2.panels {
             assert_eq!(p.rect.width, 81, "single-column panels are full width");
         }
@@ -797,7 +676,6 @@ mod tests {
         let old = Composition(vec![2, 1]);
         let result = closest_composition(&old, 4);
         assert_eq!(result.total(), 4);
-        // Should add to last row or append a new row.
         assert!(!result.0.is_empty());
     }
 
@@ -806,50 +684,40 @@ mod tests {
         let old = Composition(vec![2, 2]);
         let result = closest_composition(&old, 3);
         assert_eq!(result.total(), 3);
-        // Should remove from last row.
         assert_eq!(result.0, vec![2, 1]);
     }
 
     #[test]
-    fn test_junction_char_all_light() {
-        // 2x2 grid in a 9x5 area (enough for shared borders), no focus.
-        let area = Rect::new(0, 0, 9, 5);
-        let comp = Composition(vec![2, 2]);
-        let layout = compute_layout(area, &comp, &HashSet::new(), 1.0);
-
-        // Find the shared border column (panel 0's right edge = panel 1's left edge).
-        let shared_x = layout.panels[0].rect.x + layout.panels[0].rect.width - 1;
-        // Find the shared border row (panel 0's bottom edge = panel 2's top edge).
-        let shared_y = layout.panels[0].rect.y + layout.panels[0].rect.height - 1;
-
-        // Top-middle: T-junction pointing down (┬).
-        let ch = junction_char(None, &layout.panels, shared_x, 0);
-        assert_eq!(ch, '┬', "top middle should be ┬");
-
-        // Left-middle: T-junction pointing right (├).
-        let ch = junction_char(None, &layout.panels, 0, shared_y);
-        assert_eq!(ch, '├', "left middle should be ├");
-
-        // Center: cross (┼).
-        let ch = junction_char(None, &layout.panels, shared_x, shared_y);
-        assert_eq!(ch, '┼', "center should be ┼");
+    fn test_box_char_all_light() {
+        // All-light corners.
+        assert_eq!(box_char(ARM_DOWN | ARM_RIGHT), '┌');
+        assert_eq!(box_char(ARM_DOWN | ARM_LEFT), '┐');
+        assert_eq!(box_char(ARM_UP | ARM_RIGHT), '└');
+        assert_eq!(box_char(ARM_UP | ARM_LEFT), '┘');
+        // All-light T-junctions.
+        assert_eq!(box_char(ARM_DOWN | ARM_LEFT | ARM_RIGHT), '┬');
+        assert_eq!(box_char(ARM_UP | ARM_LEFT | ARM_RIGHT), '┴');
+        assert_eq!(box_char(ARM_UP | ARM_DOWN | ARM_RIGHT), '├');
+        assert_eq!(box_char(ARM_UP | ARM_DOWN | ARM_LEFT), '┤');
+        // All-light cross.
+        assert_eq!(box_char(ARM_UP | ARM_DOWN | ARM_LEFT | ARM_RIGHT), '┼');
     }
 
     #[test]
-    fn test_junction_char_focused_top_left() {
-        // 2x2 grid in a 9x5 area, focus on panel 0 (top-left).
-        let area = Rect::new(0, 0, 9, 5);
-        let comp = Composition(vec![2, 2]);
-        let layout = compute_layout(area, &comp, &HashSet::new(), 1.0);
+    fn test_box_char_focused_arms() {
+        // Scrollbar (vertical, heavy) meets title bar (horizontal, light)
+        // at a T-junction: heavy up+down, light right.
+        let flags = ARM_UP | ARM_DOWN | ARM_RIGHT | HEAVY_UP | HEAVY_DOWN;
+        assert_eq!(box_char(flags), '┠');
 
-        let shared_x = layout.panels[0].rect.x + layout.panels[0].rect.width - 1;
-        let shared_y = layout.panels[0].rect.y + layout.panels[0].rect.height - 1;
+        // Title bar corner: heavy right (title of focused panel), light
+        // down (scrollbar of unfocused panel below).
+        let flags = ARM_DOWN | ARM_RIGHT | HEAVY_RIGHT;
+        assert_eq!(box_char(flags), '┍');
 
-        // At the center junction, panel 0's right edge and bottom edge are heavy.
-        // Heavy: up arm (panel 0's right edge) and left arm (panel 0's bottom edge).
-        // Light: down arm and right arm (unfocused panels).
-        let ch = junction_char(Some(0), &layout.panels, shared_x, shared_y);
-        assert_eq!(ch, '╃', "center with focus on panel 0 should be ╃");
+        // Cross with focused panel owning top+right arms (heavy up, heavy left).
+        let flags = ARM_UP | ARM_DOWN | ARM_LEFT | ARM_RIGHT | HEAVY_UP | HEAVY_LEFT;
+        assert_eq!(box_char(flags), '╃');
     }
 
     #[test]
@@ -857,10 +725,10 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let comp = Composition(vec![2]);
         let layout = compute_layout(area, &comp, &HashSet::new(), 1.0);
-        // Point inside panel 0 (left half).
-        assert_eq!(panel_at(&layout, 10, 10), Some(0));
-        // Point inside panel 1 (right half, well past shared border).
-        assert_eq!(panel_at(&layout, 60, 10), Some(1));
+        // Point inside panel 0 content area.
+        assert_eq!(panel_at(&layout, 10, 5), Some(0));
+        // Point inside panel 1 content area.
+        assert_eq!(panel_at(&layout, 50, 5), Some(1));
     }
 
     #[test]
@@ -868,17 +736,34 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let comp = Composition(vec![2]);
         let layout = compute_layout(area, &comp, &HashSet::new(), 1.0);
-        // Point on the top border.
-        assert_eq!(panel_at(&layout, 10, 0), None);
-        // Shared border column: both panels claim it as a border.
-        let shared_x = layout.panels[0].rect.x + layout.panels[0].rect.width - 1;
+        let p0 = &layout.panels[0].rect;
+        let p1 = &layout.panels[1].rect;
+        // Top title row of panel 0 is chrome.
+        assert_eq!(panel_at(&layout, 10, p0.y), None, "top title row is chrome");
+        // Right scrollbar column of panel 0 is chrome.
+        let scrollbar_x = p0.x + p0.width - 1;
         assert_eq!(
-            panel_at(&layout, shared_x, 10),
+            panel_at(&layout, scrollbar_x, 5),
             None,
-            "shared border returns None"
+            "right scrollbar is chrome"
         );
-        // Outer borders also return None.
-        assert_eq!(panel_at(&layout, 0, 10), None, "left outer border");
-        assert_eq!(panel_at(&layout, 79, 10), None, "right outer border");
+        // Left edge of panel 0 is content (no left border).
+        assert_eq!(panel_at(&layout, p0.x, 1), Some(0), "left edge is content");
+        // Bottom edge of panel 0 is content (no bottom border).
+        let bottom_y = p0.y + p0.height - 1;
+        assert_eq!(
+            panel_at(&layout, 10, bottom_y),
+            Some(0),
+            "bottom edge is content"
+        );
+        // Top title row of panel 1 is chrome.
+        assert_eq!(panel_at(&layout, p1.x + 1, p1.y), None, "panel 1 title row");
+        // Right scrollbar of panel 1 is chrome.
+        let scrollbar_x1 = p1.x + p1.width - 1;
+        assert_eq!(
+            panel_at(&layout, scrollbar_x1, 5),
+            None,
+            "panel 1 scrollbar"
+        );
     }
 }
