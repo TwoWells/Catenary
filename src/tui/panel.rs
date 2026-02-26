@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use super::selection::VisualSelection;
 use super::theme::{IconSet, Theme, diag_style, format_event_styled};
 use crate::session::{EventKind, SessionEvent};
 
@@ -82,6 +83,8 @@ pub struct PanelState<'a> {
     pub language_servers: Vec<LanguageServerStatus>,
     /// Indices of expanded events (in the events Vec).
     pub expanded: HashSet<usize>,
+    /// Active visual selection, if any.
+    pub visual_selection: Option<VisualSelection>,
     /// Semantic color theme (borrowed from the application).
     pub theme: &'a Theme,
     /// Resolved icon set (borrowed from the application).
@@ -107,6 +110,7 @@ impl<'a> PanelState<'a> {
             pinned: false,
             language_servers: Vec::new(),
             expanded: HashSet::new(),
+            visual_selection: None,
             theme,
             icons,
         }

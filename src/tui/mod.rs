@@ -18,6 +18,7 @@ pub mod grid;
 pub mod layout;
 pub mod panel;
 pub mod scrollbar;
+pub mod selection;
 pub mod theme;
 pub mod tree;
 
