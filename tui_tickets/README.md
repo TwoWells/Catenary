@@ -55,7 +55,7 @@ If multiple tickets are eligible, pick the lowest-numbered one.
 
 - [x] **00** — Module scaffold & data abstraction (`00_scaffold.md`)
 - [x] **01** — BSP layout engine & border junctions (`01_layout.md`)
-- [ ] **02** — Sessions tree widget (`02_tree.md`)
+- [x] **02** — Sessions tree widget (`02_tree.md`)
 - [ ] **03** — Events panel core (`03_panel.md`)
 - [ ] **04** — Event expansion & detail lines (`04_expansion.md`)
 - [ ] **05** — Multi-panel grid & tab/pinning (`05_grid.md`)

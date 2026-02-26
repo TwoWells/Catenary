@@ -16,6 +16,7 @@ pub mod app;
 pub mod data;
 pub mod layout;
 pub mod theme;
+pub mod tree;
 
 // Future tickets add more modules here.
 
