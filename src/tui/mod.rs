@@ -15,10 +15,9 @@
 pub mod app;
 pub mod data;
 pub mod layout;
+pub mod panel;
 pub mod theme;
 pub mod tree;
-
-// Future tickets add more modules here.
 
 pub use app::App;
 pub use data::{DataSource, MockDataSource};
