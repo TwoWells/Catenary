@@ -298,7 +298,8 @@ fn build_title(state: &PanelState) -> Line<'static> {
 }
 
 /// Convert a borrowed `Line` into a fully owned `Line<'static>`.
-fn to_owned_line(line: &Line<'_>) -> Line<'static> {
+#[must_use]
+pub fn to_owned_line(line: &Line<'_>) -> Line<'static> {
     Line::from(
         line.spans
             .iter()
