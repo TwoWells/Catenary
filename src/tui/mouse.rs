@@ -9,7 +9,7 @@
 
 use ratatui::layout::Rect;
 
-use super::layout::{PanelLayout, PanelRect, panel_at};
+use super::layout::{PanelLayout, PanelRect, PanelZone, panel_zone_at};
 use super::scrollbar::{OverflowCounts, OverflowHit, overflow_hit_test};
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -161,48 +161,33 @@ pub fn resolve_click(
         };
     }
 
-    // Check panel title bars (top row of each panel rect).
-    for panel_rect in &grid_layout.panels {
-        let r = &panel_rect.rect;
-        if y == r.y && x >= r.x && x < r.x + r.width {
-            return MouseAction::TogglePin(panel_rect.index);
-        }
-    }
-
-    // Check panel scrollbar (right column of each panel rect).
-    for panel_rect in &grid_layout.panels {
-        let r = &panel_rect.rect;
-        let right_col = r.x + r.width.saturating_sub(1);
-        if x == right_col && y > r.y && y < r.y + r.height {
-            return MouseAction::StartScrollbarDrag {
-                panel: panel_rect.index,
-                y,
-            };
-        }
-    }
-
-    // Check panel content interior.
-    if let Some(panel_idx) = panel_at(grid_layout, x, y) {
+    // Single-pass panel zone hit-test.
+    if let Some((panel_idx, zone)) = panel_zone_at(grid_layout, x, y) {
         let panel_rect = &grid_layout.panels[panel_idx];
-
-        // Compute content area for overflow hit-test.
-        let content_area = content_area_of(panel_rect);
-
-        // Check overflow indicators first.
-        if let Some(counts) = overflow_counts.get(panel_idx)
-            && let Some(hit) = overflow_hit_test(x, y, content_area, counts)
-        {
-            return MouseAction::JumpOverflow {
+        return match zone {
+            PanelZone::TitleBar => MouseAction::TogglePin(panel_idx),
+            PanelZone::Scrollbar => MouseAction::StartScrollbarDrag {
                 panel: panel_idx,
-                top: hit == OverflowHit::Top,
-            };
-        }
-
-        // Regular content click — compute flat-line index.
-        let line = compute_line_from_click(y, panel_rect, 0);
-        return MouseAction::ToggleExpansion {
-            panel: panel_idx,
-            line,
+                y,
+            },
+            PanelZone::Content => {
+                // Check overflow indicators first.
+                let content_area = content_area_of(panel_rect);
+                if let Some(counts) = overflow_counts.get(panel_idx)
+                    && let Some(hit) = overflow_hit_test(x, y, content_area, counts)
+                {
+                    return MouseAction::JumpOverflow {
+                        panel: panel_idx,
+                        top: hit == OverflowHit::Top,
+                    };
+                }
+                // Regular content click — compute flat-line index.
+                let line = compute_line_from_click(y, panel_rect, 0);
+                MouseAction::ToggleExpansion {
+                    panel: panel_idx,
+                    line,
+                }
+            }
         };
     }
 
