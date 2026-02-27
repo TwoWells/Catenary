@@ -10,4 +10,4 @@ target/
 *.log
 __pycache__/
 *.pyc
-internal/
+internal_repo/
