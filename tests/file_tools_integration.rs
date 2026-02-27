@@ -155,16 +155,33 @@ fn test_list_directory_basic() -> Result<()> {
 }
 
 #[test]
-fn test_list_directory_outside_root_fails() -> Result<()> {
+fn test_list_directory_outside_root_succeeds() -> Result<()> {
     let dir = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("hello.txt"), "hi")?;
 
     let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
-    let result = bridge.call_tool("list_directory", &json!({ "path": "/etc" }))?;
+    let result = bridge.call_tool(
+        "list_directory",
+        &json!({ "path": outside.path().to_string_lossy().as_ref() }),
+    )?;
 
     let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
-    assert_eq!(is_error, Some(true), "Should be an error");
+    assert_ne!(is_error, Some(true), "Should not be an error");
+
+    let text = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("hello.txt"),
+        "Should list files outside workspace roots: {text}"
+    );
     Ok(())
 }
 

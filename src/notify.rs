@@ -230,6 +230,8 @@ impl NotifyServer {
     async fn process_file_inner(&self, file_path: &str) -> Result<String> {
         let path = resolve_path(file_path)?;
 
+        // Gate on workspace roots: if the LSP server doesn't know about this
+        // file's directory, asking for diagnostics is a wasted round-trip.
         let canonical = self.path_validator.read().await.validate_read(&path)?;
 
         // Try to get the LSP client for this file's language

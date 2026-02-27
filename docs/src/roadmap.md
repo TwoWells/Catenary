@@ -101,9 +101,11 @@ Full toolset to replace CLI built-in tools.
 - [x] Emit `tools/list_changed` when allowlist changes (e.g., workspace added)
 - [x] Error messages on denied commands include the current allowlist
 
-**Security:**
-- [x] Path validation against workspace roots (read and write)
-- [x] Symlink traversal protection (`canonicalize()` + root check)
+**Security & LSP gating:**
+- [x] Path validation against workspace roots (LSP-awareness gate, not
+      a security boundary — prevents wasted round-trips for files the
+      language server doesn't know about)
+- [x] Symlink traversal protection (`canonicalize()` before root check)
 - [x] Config file self-modification protection (`.catenary.toml`,
       `~/.config/catenary/config.toml`)
 - [x] Direct command execution (no shell injection)
@@ -159,9 +161,9 @@ See [LSP Fault Model](lsp-fault-model.md) and
 - **~~Symlink traversal.~~** Resolved in Phase 7. File I/O tools use
   `canonicalize()` + workspace root validation. `list_directory` uses
   `symlink_metadata()` to avoid following symlinks.
-- **Unbounded LSP data.** Diagnostic caches grow without limit. Hover
-  responses, symbol trees, and workspace edit previews have no size caps.
-  A malicious or buggy LSP server can cause unbounded memory growth.
+- **Unbounded LSP data.** Diagnostic caches grow without limit. Symbol
+  trees and workspace edit previews have no size caps. A malicious or
+  buggy LSP server can cause unbounded memory growth.
 - **~~`apply_workspace_edit` trusts LSP URIs.~~** Resolved in Phase 6.5.
   `apply_workspace_edit` removed. All edit tools now return proposed
   edits as text; the MCP client applies them.
@@ -170,12 +172,18 @@ See [LSP Fault Model](lsp-fault-model.md) and
 
 ## Low Priority
 
-- [ ] **Batch Operations:** Query hover/definition/references for multiple
-      positions in a single call
-- [ ] **References with Context:** Include surrounding lines (e.g., `-C 3`) in
-      reference results
 - [ ] **Multi-file Diagnostics:** Check diagnostics across multiple files in
       one call
+
+## Deprecations
+
+- **`hover`** — Being merged into `search`. Hover info (type signatures,
+  docs) will be inlined in the symbols tier, so agents get it at discovery
+  time without a separate call.
+- **`find_references`** — Being merged into `search`. The position-based
+  interface is an editor concept that agents consistently fumble. `search`
+  will return symbols (with hover), semantic references, and text matches
+  in one call.
 
 ---
 

@@ -125,7 +125,7 @@ notifies the running LSP servers and returns any errors or warnings.
 
 | LSP alternative | Tokens | Copies in context |
 |-----------------|--------|-------------------|
-| `hover` for type info | ~100 | 0 (stateless) |
+| `search` for symbols + references | ~200 | 0 (stateless) |
 | `definition` | ~50 | 0 |
 | Native edit + notify hook diagnostics | ~300 | 0 (no re-read needed) |
 | **Total** | **~450** | **0 copies** |
@@ -137,10 +137,8 @@ don't fix this — they just let you waste more before hitting the wall.
 
 | Tool | Description |
 |------|-------------|
-| `hover` | Documentation and type info |
+| `search` | Symbols, semantic references, and text matches |
 | `definition` | Go to definition |
-| `find_references` | Find all references |
-| `search` | Symbol search with grep fallback |
 | `diagnostics` | Errors and warnings |
 | `list_directory` | List directory contents |
 | `catenary release` | PostToolUse hook — returns LSP diagnostics and releases file lock |

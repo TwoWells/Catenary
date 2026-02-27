@@ -25,8 +25,6 @@ use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient, ServerState};
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
-use super::PathValidator;
-
 /// Tools that do not require LSP server readiness.
 /// Everything else waits by default — new tools are safe automatically.
 const METHODS_SKIP_WAIT: &[&str] = &["status", "list_directory"];
@@ -94,6 +92,10 @@ pub struct FindReferencesInput {
 pub struct SearchInput {
     /// One or more search queries.
     pub queries: Vec<String>,
+    /// Optional additional directories to include in the ripgrep heatmap.
+    /// Workspace roots are always searched; these paths are searched in addition.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 /// Input for call hierarchy.
@@ -160,7 +162,6 @@ pub struct LspBridgeHandler {
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
     pub(super) runtime: Handle,
     pub(super) broadcaster: EventBroadcaster,
-    pub(super) path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
 }
 
 impl LspBridgeHandler {
@@ -170,14 +171,12 @@ impl LspBridgeHandler {
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
         broadcaster: EventBroadcaster,
-        path_validator: Arc<tokio::sync::RwLock<PathValidator>>,
     ) -> Self {
         Self {
             client_manager,
             doc_manager,
             runtime,
             broadcaster,
-            path_validator,
         }
     }
     /// Gets the appropriate LSP client for the given file path.
@@ -631,17 +630,33 @@ impl LspBridgeHandler {
             return Err(anyhow!("queries must contain at least one search term"));
         }
 
+        let extra_paths: Vec<PathBuf> = input
+            .paths
+            .iter()
+            .filter_map(|p| {
+                Self::resolve_path(p)
+                    .ok()
+                    .and_then(|resolved| match resolved.canonicalize() {
+                        Ok(canonical) if canonical.is_dir() => Some(canonical),
+                        _ => {
+                            debug!("Skipping non-existent or non-directory search path: {p}");
+                            None
+                        }
+                    })
+            })
+            .collect();
+
         let mut sections = Vec::new();
 
         for query in &input.queries {
-            sections.push(self.search_single(query));
+            sections.push(self.search_single(query, &extra_paths));
         }
 
         Ok(CallToolResult::text(sections.join("\n")))
     }
 
     /// Executes a single search query: LSP workspace symbols + ripgrep file heatmap.
-    fn search_single(&self, query: &str) -> String {
+    fn search_single(&self, query: &str, extra_paths: &[PathBuf]) -> String {
         debug!("Search request: query={query}");
 
         // 1. Workspace symbols from all active LSP servers
@@ -671,8 +686,13 @@ impl LspBridgeHandler {
         });
 
         // 2. Ripgrep file heatmap (always, covers all non-ignored files)
-        let roots = self.runtime.block_on(self.client_manager.roots());
-        let heatmap = Self::ripgrep_heatmap(query, &roots);
+        let mut search_dirs = self.runtime.block_on(self.client_manager.roots());
+        for path in extra_paths {
+            if !search_dirs.contains(path) {
+                search_dirs.push(path.clone());
+            }
+        }
+        let heatmap = Self::ripgrep_heatmap(query, &search_dirs);
 
         // 3. Combine
         let has_symbols = !symbol_lines.is_empty();
@@ -1272,6 +1292,11 @@ impl ToolHandler for LspBridgeHandler {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Symbol names or text patterns to search for"
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Additional directories to include in the text search (heatmap only — no LSP symbol resolution). Workspace roots are always searched."
                         }
                     },
                     "required": ["queries"]
@@ -1342,7 +1367,7 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "list_directory".to_string(),
-                description: Some("List the contents of a directory. Shows directories, files with sizes, and symlinks with targets. Symlinks are not followed. Path must be within workspace roots.".to_string()),
+                description: Some("List the contents of a directory. Shows directories, files with sizes, and symlinks with targets. Symlinks are not followed.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
