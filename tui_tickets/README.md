@@ -84,7 +84,7 @@ If multiple tickets are eligible, pick the lowest-numbered one.
 - [x] **05** — Multi-panel grid & tab/pinning (`05_grid.md`)
 - [x] **06** — Sub-character scrollbar & overflow counts (`06_scrollbar.md`)
 - [x] **07** — Visual selection & copy (`07_selection.md`)
-- [ ] **08** — Filter system (`08_filter.md`)
+- [x] **08** — Filter system (`08_filter.md`)
 - [ ] **09** — Mouse support (`09_mouse.md`)
 - [ ] **10** — Responsive degradation (`10_degradation.md`)
 - [ ] **11** — Integration wiring, hints & cheatsheet (`11_integration.md`)
