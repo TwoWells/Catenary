@@ -294,12 +294,7 @@ impl NotifyServer {
         };
 
         // Broadcast diagnostics event for monitor visibility
-        let preview = compact
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let preview = compact.clone();
         self.broadcaster.send(EventKind::Diagnostics {
             file: file_path.to_string(),
             count,
