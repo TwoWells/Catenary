@@ -17,6 +17,7 @@ pub mod data;
 pub mod filter;
 pub mod grid;
 pub mod layout;
+pub mod mouse;
 pub mod panel;
 pub mod scrollbar;
 pub mod selection;
