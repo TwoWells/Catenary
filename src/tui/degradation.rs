@@ -350,7 +350,8 @@ pub fn degrade_title(session_id: &str, workspace: Option<&str>, max_width: u16) 
         return session_id
             .chars()
             .next()
-            .map_or_else(String::new, |c| c.to_string());
+            .map(String::from)
+            .unwrap_or_default();
     }
 
     String::new()
@@ -437,47 +438,63 @@ pub fn degrade_hints(max_width: u16) -> Vec<(&'static str, &'static str)> {
 
 /// Progressively truncate a workspace path to fit the available width.
 ///
-/// Degradation levels:
-/// - Full: `~/Projects/Catenary`
-/// - Medium: `…/Catenary`
-/// - Short: `Catenary`
-/// - Minimal: `Cat…`
+/// Smooth character-by-character erosion:
+/// ```text
+/// ~/Projects/Catenary       ← full
+/// …Projects/Catenary        ← erode from left (keeps path context)
+/// …rojects/Catenary
+/// …s/Catenary
+/// …/Catenary                ← last left-erosion step (still has /)
+/// Catenary                  ← basename only
+/// Catena…                   ← erode basename from right
+/// Cat…
+/// C…
+/// C                         ← single char
+/// ```
 #[must_use]
 pub fn degrade_sessions_path(path: &str, max_width: u16) -> String {
     let max = max_width as usize;
 
+    // Full path fits.
     if UnicodeWidthStr::width(path) <= max {
         return path.to_string();
     }
 
+    // Erode from the left: …<tail>, dropping more chars each step.
+    // Stop when the tail no longer contains `/` — beyond that the `…`
+    // prefix is confusing (e.g., `…atenary`).
+    let path_chars: Vec<char> = path.chars().collect();
+    for drop in 2..path_chars.len() {
+        let tail: String = path_chars[drop..].iter().collect();
+        if !tail.contains('/') {
+            break;
+        }
+        let candidate = format!("\u{2026}{tail}");
+        if UnicodeWidthStr::width(candidate.as_str()) <= max {
+            return candidate;
+        }
+    }
+
+    // Basename only.
     let basename = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(path);
 
-    // Medium: …/basename.
-    let medium = format!("\u{2026}/{basename}");
-    if UnicodeWidthStr::width(medium.as_str()) <= max {
-        return medium;
-    }
-
-    // Short: just basename.
     if UnicodeWidthStr::width(basename) <= max {
         return basename.to_string();
     }
 
-    // Minimal: truncated basename with ellipsis.
+    // Erode basename from the right: prefix…
+    let base_chars: Vec<char> = basename.chars().collect();
     if max >= 2 {
-        let char_budget = max - 1;
-        let truncated: String = basename.chars().take(char_budget).collect();
-        return format!("{truncated}\u{2026}");
+        let keep = max - 1; // 1 column for …
+        let prefix: String = base_chars.iter().take(keep).collect();
+        return format!("{prefix}\u{2026}");
     }
 
     if max == 1 {
-        return basename
-            .chars()
-            .next()
-            .map_or_else(String::new, |c| c.to_string());
+        return base_chars.first().map_or_else(String::new, char::to_string);
     }
 
     String::new()
@@ -689,14 +706,32 @@ mod tests {
 
     #[test]
     fn test_sessions_path_truncated() {
+        // Width 12: left-erosion should produce …ts/Catenary (12 cols).
         let result = degrade_sessions_path("~/Projects/Catenary", 12);
-        assert!(
-            result.contains("Catenary"),
-            "truncated path should contain basename: {result}"
+        assert_eq!(result, "\u{2026}ts/Catenary");
+    }
+
+    #[test]
+    fn test_sessions_path_erosion_chain() {
+        // Verify smooth left-erosion at each width.
+        assert_eq!(
+            degrade_sessions_path("~/Projects/Catenary", 18),
+            "\u{2026}Projects/Catenary"
         );
-        assert!(
-            !result.contains("~/Projects"),
-            "truncated path should not contain full prefix: {result}"
+        assert_eq!(
+            degrade_sessions_path("~/Projects/Catenary", 14),
+            "\u{2026}ects/Catenary"
+        );
+        assert_eq!(
+            degrade_sessions_path("~/Projects/Catenary", 10),
+            "\u{2026}/Catenary"
+        );
+        // Width 9: …/Catenary (10) doesn't fit, basename Catenary (8) does.
+        assert_eq!(degrade_sessions_path("~/Projects/Catenary", 9), "Catenary");
+        // Width 7: basename doesn't fit, erode from right.
+        assert_eq!(
+            degrade_sessions_path("~/Projects/Catenary", 7),
+            "Catena\u{2026}"
         );
     }
 
