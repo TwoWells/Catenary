@@ -9,10 +9,11 @@ use lsp_types::{
     ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
-    PublishDiagnosticsParams, ReferenceParams, TextDocumentIdentifier, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
-    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams,
+    PositionEncodingKind, ProgressParams, PublishDiagnosticsParams, ReferenceParams,
+    ServerCapabilities, TextDocumentIdentifier, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceFolder,
+    WorkspaceFoldersChangeEvent, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -121,6 +122,9 @@ pub struct LspClient {
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
     /// Whether the server advertised `textDocumentSync.save` support.
     wants_did_save: bool,
+    /// Server capabilities from the `initialize` response.
+    /// Populated after `initialize()` completes.
+    server_capabilities: ServerCapabilities,
     _reader_handle: tokio::task::JoinHandle<()>,
     child: Child,
 }
@@ -254,6 +258,7 @@ impl LspClient {
             last_sent_version: Arc::new(Mutex::new(HashMap::new())),
             monitor: std::sync::Mutex::new(monitor),
             wants_did_save: false,
+            server_capabilities: ServerCapabilities::default(),
             _reader_handle: reader_handle,
             child,
         })
@@ -879,6 +884,9 @@ impl LspClient {
             self.language, self.wants_did_save
         );
 
+        // Store server capabilities for capability gating
+        self.server_capabilities = result.capabilities.clone();
+
         // Send initialized notification
         self.notify("initialized", InitializedParams {}).await?;
 
@@ -892,6 +900,11 @@ impl LspClient {
     /// Returns the negotiated position encoding.
     pub fn encoding(&self) -> PositionEncodingKind {
         self.encoding.clone()
+    }
+
+    /// Returns the server capabilities from the `initialize` response.
+    pub const fn capabilities(&self) -> &ServerCapabilities {
+        &self.server_capabilities
     }
 
     /// Sends shutdown request and exit notification.
@@ -984,6 +997,15 @@ impl LspClient {
             },
         )
         .await
+    }
+
+    /// Gets hover information (signature, documentation) for a position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
+    pub async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.request("textDocument/hover", params).await
     }
 
     /// Gets the definition location for a symbol.

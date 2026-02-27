@@ -121,6 +121,12 @@ struct Args {
     /// Appends `--ticks <N>` to the flycheck command args.
     #[arg(long)]
     flycheck_ticks: Option<u64>,
+
+    /// Scan workspace roots on initialize and workspace folder changes.
+    /// Indexes all text files into `documents`, making them visible to
+    /// `workspace/symbol` without a prior `didOpen`.
+    #[arg(long)]
+    scan_roots: bool,
 }
 
 /// A JSON-RPC request.
@@ -201,6 +207,8 @@ struct MockServer {
     notification_log: Option<std::fs::File>,
     /// Whether the first definition request has been seen (for `--content-modified-once`).
     definition_failed_once: bool,
+    /// Workspace roots parsed from `initialize` params.
+    workspace_roots: Vec<String>,
 }
 
 impl MockServer {
@@ -220,6 +228,34 @@ impl MockServer {
             next_request_id: Arc::new(AtomicU64::new(1)),
             notification_log,
             definition_failed_once: false,
+            workspace_roots: Vec::new(),
+        }
+    }
+
+    /// Recursively scans a directory, indexing all text files into `self.documents`.
+    fn scan_directory(&mut self, dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip hidden directories
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+                {
+                    continue;
+                }
+                self.scan_directory(&path);
+            } else if path.is_file()
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                let abs = path.to_string_lossy();
+                let uri = format!("file://{abs}");
+                self.documents.insert(uri, content);
+            }
         }
     }
 
@@ -299,7 +335,7 @@ impl MockServer {
                     let json = serde_json::to_string_pretty(&request.params).unwrap_or_default();
                     let _ = std::fs::write(path, json);
                 }
-                Some(self.handle_initialize())
+                Some(self.handle_initialize(&request.params))
             }
             "shutdown" => Some(Value::Null),
             "textDocument/hover" => self.handle_hover(&request.params),
@@ -319,6 +355,7 @@ impl MockServer {
                 }
                 self.handle_definition(&request.params)
             }
+            "textDocument/typeDefinition" => self.handle_definition(&request.params),
             "textDocument/references" => self.handle_references(&request.params),
             "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
@@ -348,6 +385,10 @@ impl MockServer {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Notification dispatch handles many LSP methods with scan-roots logic"
+    )]
     fn handle_notification(&mut self, method: &str, params: &Value) {
         // Log notification if configured
         if let Some(ref mut log) = self.notification_log {
@@ -450,13 +491,67 @@ impl MockServer {
                         std::hint::spin_loop();
                     }
                 }
+
+                if self.args.scan_roots
+                    && let Some(event) = params.get("event")
+                {
+                    // Remove documents from removed folders
+                    if let Some(removed) = event.get("removed").and_then(Value::as_array) {
+                        for folder in removed {
+                            if let Some(uri) = folder.get("uri").and_then(Value::as_str) {
+                                let path = uri.strip_prefix("file://").unwrap_or(uri);
+                                self.workspace_roots.retain(|r| r != path);
+                                let prefix = format!("file://{path}");
+                                self.documents.retain(|k, _| !k.starts_with(&prefix));
+                            }
+                        }
+                    }
+                    // Scan added folders
+                    if let Some(added) = event.get("added").and_then(Value::as_array) {
+                        for folder in added {
+                            if let Some(uri) = folder.get("uri").and_then(Value::as_str) {
+                                let path = uri.strip_prefix("file://").unwrap_or(uri);
+                                if !self.workspace_roots.contains(&path.to_string()) {
+                                    self.workspace_roots.push(path.to_string());
+                                }
+                                self.scan_directory(std::path::Path::new(path));
+                            }
+                        }
+                    }
+                }
             }
             // All other notifications are silently accepted
             _ => {}
         }
     }
 
-    fn handle_initialize(&self) -> Value {
+    fn handle_initialize(&mut self, params: &Value) -> Value {
+        // Parse workspace roots from initialize params
+        let mut roots = Vec::new();
+        if let Some(uri) = params.get("rootUri").and_then(Value::as_str) {
+            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            if !path.is_empty() {
+                roots.push(path.to_string());
+            }
+        }
+        if let Some(folders) = params.get("workspaceFolders").and_then(Value::as_array) {
+            for folder in folders {
+                if let Some(uri) = folder.get("uri").and_then(Value::as_str) {
+                    let path = uri.strip_prefix("file://").unwrap_or(uri);
+                    if !path.is_empty() && !roots.contains(&path.to_string()) {
+                        roots.push(path.to_string());
+                    }
+                }
+            }
+        }
+
+        if self.args.scan_roots {
+            for root in &roots {
+                self.scan_directory(std::path::Path::new(root));
+            }
+        }
+        self.workspace_roots = roots;
+
         let mut text_doc_sync = serde_json::json!({
             "openClose": true,
             "change": 1
@@ -468,6 +563,7 @@ impl MockServer {
         let mut capabilities = serde_json::json!({
             "hoverProvider": true,
             "definitionProvider": true,
+            "typeDefinitionProvider": true,
             "referencesProvider": true,
             "documentSymbolProvider": true,
             "workspaceSymbolProvider": true,
@@ -1080,6 +1176,7 @@ mod tests {
             cpu_on_initialized: None,
             log_init_params: None,
             flycheck_ticks: None,
+            scan_roots: false,
         }
     }
 
