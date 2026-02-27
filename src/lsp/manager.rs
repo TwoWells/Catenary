@@ -506,6 +506,7 @@ mod tests {
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
+            tui: crate::config::TuiConfig::default(),
         }
     }
 
@@ -537,6 +538,7 @@ mod tests {
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
+            tui: crate::config::TuiConfig::default(),
         }
     }
 
@@ -556,6 +558,7 @@ mod tests {
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
+            tui: crate::config::TuiConfig::default(),
         }
     }
 

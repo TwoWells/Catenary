@@ -26,6 +26,10 @@ pub struct Config {
     /// Icon theme configuration.
     #[serde(default)]
     pub icons: IconConfig,
+
+    /// TUI configuration.
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 /// Configuration for a specific LSP server.
@@ -103,6 +107,43 @@ pub struct IconConfig {
     pub tool_diagnostics: Option<String>,
     /// Default tool icon (fallback).
     pub tool_default: Option<String>,
+}
+
+/// TUI configuration options.
+///
+/// Controls the interactive monitor's layout and behavior.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TuiConfig {
+    /// Automatically add new sessions to the grid (default: true).
+    #[serde(default = "default_true")]
+    pub auto_add_sessions: bool,
+
+    /// Preferred width of the Sessions tree as a fraction of the terminal
+    /// (default: 0.4).
+    #[serde(default = "default_sessions_width")]
+    pub sessions_width: f64,
+
+    /// Whether mouse hover changes focus (default: false).
+    #[serde(default)]
+    pub focus_follows_mouse: bool,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            auto_add_sessions: true,
+            sessions_width: 0.4,
+            focus_follows_mouse: false,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_sessions_width() -> f64 {
+    0.4
 }
 
 const fn default_idle_timeout() -> u64 {
