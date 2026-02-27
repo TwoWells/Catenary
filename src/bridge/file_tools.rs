@@ -3,7 +3,8 @@
 
 //! File I/O tool handlers: `list_directory`.
 //!
-//! Path operations validate paths against workspace roots before access.
+//! Directory listing has no workspace-root restriction — access control is
+//! delegated to the host CLI's permission layer (hooks / permission dialogs).
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
@@ -33,10 +34,9 @@ impl LspBridgeHandler {
 
         tracing::debug!("list_directory: {}", input.path);
 
-        let canonical = self
-            .runtime
-            .block_on(self.path_validator.read())
-            .validate_read(&path)?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| anyhow!("Path does not exist: {}: {e}", input.path))?;
 
         if !canonical.is_dir() {
             return Err(anyhow!("Not a directory: {}", input.path));

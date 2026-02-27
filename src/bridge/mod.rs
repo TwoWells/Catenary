@@ -7,7 +7,7 @@ mod document_manager;
 mod file_tools;
 /// Maps MCP tool calls to LSP requests.
 mod handler;
-/// Path validation and security for file I/O tools.
+/// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
 
 pub use document_manager::{DocumentManager, DocumentNotification};

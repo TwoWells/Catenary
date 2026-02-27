@@ -408,11 +408,9 @@ Catenary provides LSP intelligence and directory browsing:
 | Tool                | Category  | Notes                                    |
 | ------------------- | --------- | ---------------------------------------- |
 | `list_directory`    | File I/O  | Files, dirs, symlinks                    |
-| `search`            | LSP       | Workspace symbols + grep fallback        |
-| `find_references`   | LSP       | LSP references                           |
+| `search`            | LSP       | Symbols + semantic references + text matches |
 | `codebase_map`      | LSP       | File tree with symbols                   |
 | `document_symbols`  | LSP       | File structure                           |
-| `hover`             | LSP       | Type info, docs                          |
 | `diagnostics`       | LSP       | Errors, warnings                         |
 | ...                 | LSP       | [Full list](overview.md#available-tools) |
 

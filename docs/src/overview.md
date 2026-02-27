@@ -23,11 +23,11 @@ every turn. The problem scales with session length, not window size.
 
 Catenary replaces brute-force file scanning with **graph navigation**.
 
-Instead of reading a 500-line file to find a type signature, the agent asks
-the language server directly — `hover` returns 50 tokens instead of 2,000.
 Instead of grepping across 20 files to find a definition, `definition` returns
 the exact location in one query. Instead of re-reading a file after editing it
 to check for errors, the `catenary release` hook returns diagnostics inline.
+Instead of fumbling with line numbers to find usages, `search` returns symbols,
+semantic references, and text matches in a single call.
 
 Each LSP query is small and stateless. Nothing accumulates. The context stays
 lean across the entire session, regardless of how long the agent works.
@@ -40,7 +40,7 @@ lean across the entire session, regardless of how long the agent works.
 
 | Graph navigation | Tokens | Context cost |
 |------------------|--------|--------------|
-| `hover` for type info | ~100 | stateless |
+| `search` for symbols + references | ~200 | stateless |
 | Native edit + notify hook diagnostics | ~300 | no re-read |
 | `definition` | ~50 | stateless |
 
@@ -84,7 +84,7 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | **Eager Startup**     | Servers for detected languages start at launch; others start on first file access      |
 | **Smart Routing**     | Requests automatically route to the correct server based on file type                  |
 | **Universal Support** | Works with any LSP-compliant language server                                           |
-| **Full LSP Coverage** | Hover, definitions, references, diagnostics, rename, code actions, and more |
+| **Full LSP Coverage** | Definitions, references, diagnostics, rename, code actions, and more |
 | **File I/O**          | Read, write, and edit files with automatic LSP diagnostics                            |
 
 ## Available Tools
@@ -93,13 +93,11 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 
 | Tool                      | Description                                         |
 | ------------------------- | --------------------------------------------------- |
-| `hover`               | Get documentation and type info for a symbol        |
+| `search`         | Search for symbols, semantic references, and text matches (LSP workspace symbols + references + file heatmap) |
 | `definition`          | Jump to where a symbol is defined                   |
 | `type_definition`     | Jump to the type's definition                       |
 | `implementation`      | Find implementations of interfaces/traits           |
-| `find_references` | Find all references to a symbol (by name or position) |
 | `document_symbols`    | Get the outline of a file                                       |
-| `search`         | Search for a symbol or pattern (LSP workspace symbols + file heatmap) |
 | `code_actions`        | Get quick fixes and refactorings                    |
 | `rename`              | Compute rename edits (does not modify files)        |
 | `diagnostics`         | Get errors and warnings                             |
@@ -107,6 +105,13 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | `type_hierarchy`      | See type inheritance                                |
 | `status`         | Report status of all LSP servers (e.g. "Indexing")  |
 | `codebase_map`   | Generate a high-level file tree with symbols        |
+
+**Deprecated (being merged into `search`):**
+
+| Tool                      | Description                                         | Replacement |
+| ------------------------- | --------------------------------------------------- | ----------- |
+| `hover`               | Get documentation and type info for a symbol        | `search` (symbols tier with hover enrichment) |
+| `find_references` | Find all references to a symbol | `search` (references tier) |
 
 ### File I/O Tools
 
@@ -120,4 +125,9 @@ LSP diagnostics** via the `catenary release` hook — diagnostics appear in the
 model's context after every edit. See [CLI Integration](cli-integration.md)
 for hook configuration.
 
-All file paths are validated against workspace roots.
+`list_directory` and `search` (with the optional `paths` parameter) can
+operate outside workspace roots — access control is delegated to the host
+CLI's permission layer. LSP-backed operations (diagnostics, hover,
+definition, etc.) are gated to workspace roots because the language server
+has no knowledge of files outside them. Catenary config files are always
+protected from modification.

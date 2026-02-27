@@ -24,9 +24,14 @@ This document defines adversarial test scenarios. Each test targets a specific a
 
 ---
 
-## 1. Prompt Injection via Hover Content
+## 1. Prompt Injection via LSP Content
 
-LSP hover responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.
+> **Note:** `hover` is being merged into `search` (symbols tier with
+> hover enrichment). These concerns apply to any tool that surfaces LSP
+> content — workspace symbols in `search`, `document_symbols`,
+> `code_actions`, etc.
+
+LSP responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.
 
 ### 1.1 Docstring injection
 
@@ -387,7 +392,7 @@ Create a deeply nested directory structure approaching OS path length limits.
 
 ## 8. File I/O Path Validation
 
-Catenary's file I/O tools (`read_file`, `write_file`, `edit_file`, `list_directory`) validate all paths against workspace roots. These tests verify that validation cannot be bypassed.
+Catenary validates paths against workspace roots to avoid wasted LSP round-trips for files the language server has no knowledge of. This is not a security boundary — access control is delegated to the host CLI's permission layer. `list_directory` and `search` (heatmap) can operate outside workspace roots since they don't involve LSP. Config file protection (`.catenary.toml`) is the one true security invariant. These tests verify that config protection and LSP-gating cannot be bypassed.
 
 ### 8.1 Path traversal via `..`
 

@@ -28,11 +28,9 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 | Task | Use | Instead of |
 |------|-----|------------|
 | Find where something is defined | `definition` | grep/ripgrep |
-| Find all usages of a symbol | `find_references` | grep/ripgrep |
-| Get type info or documentation | `hover` | Reading entire files |
-| Understand a file's structure | `document_symbols` | Reading entire files |
+| Find all usages of a symbol | `search` | grep/ripgrep |
 | Find a class/function by name | `search` | grep/glob patterns |
-| See available methods on an object | `completion` | Reading class definitions |
+| Understand a file's structure | `document_symbols` | Reading entire files |
 | Find implementations of interface | `implementation` | grep for impl blocks |
 | Rename a symbol safely | `rename` | Find/replace with grep |
 | Check for errors after edits | `diagnostics` | Running compiler |
@@ -41,7 +39,7 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 ### Why This Matters
 
 - A single 500-line file read costs ~2000-4000 tokens
-- An `hover` call costs ~50-200 tokens
+- A `search` call costs ~200-500 tokens and returns symbols + references + text matches
 - One file read ≈ 10-20 targeted LSP queries
 - Reducing unnecessary reads prevents context compression and re-reads
 
@@ -82,7 +80,6 @@ so you immediately see any errors introduced by changes.
 **Use LSP tools** for:
 
 - Finding definitions, references, and symbols
-- Getting type info and documentation (hover)
 - Understanding file structure (document_symbols)
 - Checking errors after changes (diagnostics)
 
@@ -107,12 +104,10 @@ so you immediately see any errors introduced by changes.
 
 **Efficient approach:**
 
-1. `search` for "auth" - returns symbol names with locations
+1. `search` for "auth" — returns symbols, semantic references, and text matches
 2. `definition` to jump to the specific handler
-3. `hover` on unfamiliar types to understand them
-4. `find_references` to see how the handler is called
-5. Read the specific function you need to modify
-6. Edit to make the change — diagnostics returned via notify hook
+3. Read the specific function you need to modify
+4. Edit to make the change — diagnostics returned via notify hook
 
 ## Codebase Orientation
 
@@ -139,9 +134,8 @@ Typical token costs (approximate):
 | Operation                             | Tokens     |
 | ------------------------------------- | ---------- |
 | Read a 500-line file                  | ~2000-4000 |
-| `hover` response                  | ~50-200    |
+| `search` (symbols + references + heatmap) | ~200-500 |
 | `definition` response             | ~30-100    |
-| `find_references` (10 results) | ~200-500   |
 | `document_symbols`                | ~200-800   |
 | `codebase_map` (budget: 200) | ~800-1000  |
 
@@ -155,8 +149,8 @@ A single file read can cost as much as 10-20 targeted LSP queries.
 2. **Structure before content.** Use `document_symbols` or `codebase_map` to
    understand organization before reading implementation.
 
-3. **Hover before read.** Check `hover` for type signatures and docs before
-   reading source files.
+3. **Search before read.** Use `search` to find symbols, references, and
+   matches before reading source files.
 
 4. **References are precise.** `find_references` finds actual usages,
    not text matches. No false positives from comments or strings.

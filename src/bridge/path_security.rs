@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Path validation and security for file I/O tools.
+//! Path validation for LSP-aware operations.
 //!
-//! Ensures that all file operations are constrained to workspace roots
-//! and that Catenary's own configuration files cannot be modified by agents.
+//! Workspace-root checks here are **not** a security layer — access control
+//! is delegated to the host CLI's permission system (hooks, permission
+//! dialogs). Instead, these checks gate LSP queries: if a file is outside
+//! the roots we told the language server about, asking it for diagnostics
+//! or symbols is pointless. Config file protection is the one true security
+//! invariant — Catenary must not allow agents to modify its own config.
 
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
-/// Validates that file paths are within workspace roots and protects
-/// configuration files from modification.
+/// Checks whether file paths fall within the workspace roots known to LSP
+/// servers, and protects Catenary configuration files from modification.
+///
+/// The root check is an LSP-awareness gate, not a security boundary —
+/// host CLI permission layers handle access control.
 pub struct PathValidator {
     /// Canonical workspace root paths.
     roots: Vec<PathBuf>,
@@ -55,10 +62,12 @@ impl PathValidator {
         self.roots = roots;
     }
 
-    /// Validates a path for read access.
+    /// Validates that a path is within LSP-known workspace roots.
     ///
     /// Canonicalizes the path (resolving symlinks) and checks that the
-    /// canonical path is within at least one workspace root.
+    /// canonical path is within at least one workspace root. This is not
+    /// a security check — it prevents wasted LSP round-trips for files
+    /// the language server has no knowledge of.
     ///
     /// # Errors
     ///
@@ -80,11 +89,11 @@ impl PathValidator {
         Ok(canonical)
     }
 
-    /// Validates a path for write access.
+    /// Validates a path for write-side operations.
     ///
-    /// Performs all read validation checks, plus:
+    /// Performs the same LSP-awareness root check as [`validate_read`], plus:
     /// - Rejects Catenary configuration files (`.catenary.toml`,
-    ///   `~/.config/catenary/config.toml`).
+    ///   `~/.config/catenary/config.toml`) — the one true security invariant.
     ///
     /// For new files that don't exist yet, validates the parent directory
     /// is within workspace roots instead.
@@ -151,7 +160,7 @@ impl PathValidator {
         Ok(canonical)
     }
 
-    /// Checks if a canonical path is within any workspace root.
+    /// Checks if a canonical path is within any LSP-known workspace root.
     fn is_within_roots(&self, canonical: &Path) -> bool {
         self.roots.iter().any(|root| canonical.starts_with(root))
     }

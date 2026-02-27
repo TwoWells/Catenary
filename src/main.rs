@@ -327,7 +327,6 @@ async fn run_server(args: Args) -> Result<()> {
         doc_manager,
         runtime,
         broadcaster.clone(),
-        path_validator.clone(),
     );
 
     // Run MCP server (blocking - reads from stdin)
