@@ -14,6 +14,7 @@
 
 pub mod app;
 pub mod data;
+pub mod degradation;
 pub mod filter;
 pub mod grid;
 pub mod layout;

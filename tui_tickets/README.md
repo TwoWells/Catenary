@@ -86,7 +86,7 @@ If multiple tickets are eligible, pick the lowest-numbered one.
 - [x] **07** — Visual selection & copy (`07_selection.md`)
 - [x] **08** — Filter system (`08_filter.md`)
 - [x] **09** — Mouse support (`09_mouse.md`)
-- [ ] **10** — Responsive degradation (`10_degradation.md`)
+- [x] **10** — Responsive degradation (`10_degradation.md`)
 - [ ] **11** — Integration wiring, hints & cheatsheet (`11_integration.md`)
 
 ## Dependency graph
