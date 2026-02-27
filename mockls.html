@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7e0df5cd.js";
+            window.path_to_searchindex_js = "searchindex-b1c82dcb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9c5e5c2a.js"></script>
+        <script src="toc-cd5a037f.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -357,15 +357,55 @@ make test T=test_sync_roots
 make test
 </code></pre>
 <h2 id="relationship-to-real-server-tests"><a class="header" href="#relationship-to-real-server-tests">Relationship to Real-Server Tests</a></h2>
-<p>All existing tests that use real language servers remain in the suite. They serve a different purpose: verifying Catenary works with actual LSP implementations. They continue to skip when the server isn’t installed. mockls tests and real-server tests are complementary:</p>
-<ul>
-<li><strong>mockls tests</strong> verify Catenary’s protocol handling against a controlled, deterministic server. They always run.</li>
-<li><strong>Real-server tests</strong> verify end-to-end behavior against production LSP implementations. They run when servers are available.</li>
-</ul>
+<p>The test suite uses no real language servers. Real-server validation happens
+organically every session via <code>catenary monitor</code> — the operator sees every tool
+call, every diagnostics cycle, every progress token. That’s the smoke test. It
+runs on real projects with real contention, which is better coverage than any
+synthetic test.</p>
+<p>The test suite’s job is to verify the <strong>model</strong> — deterministically, on every
+machine, under any load. That means mockls + mockc only. Tests that previously
+used real servers (<code>require_rust_analyzer!()</code>, <code>require_bash_lsp!()</code>, etc.)
+were migrated to mockls or deleted. The <code>require_*</code> guard pattern — where a
+test silently skips if the server isn’t installed — means CI coverage depends
+on what’s installed on the runner. That’s not testing.</p>
+<h2 id="mockc-simulated-compiler-subprocess"><a class="header" href="#mockc-simulated-compiler-subprocess">mockc: Simulated Compiler Subprocess</a></h2>
+<p>Real rust-analyzer delegates expensive work to <code>cargo check</code> → <code>rustc</code>. The LSP
+process goes to Sleeping while the child does the work. This is the exact
+scheduling pattern that wall-clock timeouts get wrong: the LSP has flat ticks
+(Sleeping), but real work is happening in a subprocess.</p>
+<p>mockc (<code>tools/mockc.rs</code>) replaces this with a deterministic binary. Its only
+job: burn CPU for a precise number of ticks, then exit. All durations are in CPU
+ticks (centiseconds, 100 Hz) — the same unit <code>ProcessMonitor</code> measures. On an
+idle machine, 50 ticks takes ~500ms wall time. On a loaded machine it takes
+longer, but the tick count is identical. Catenary’s failure detector counts
+ticks, mockc produces ticks. The units match end-to-end.</p>
+<pre><code>mockc [OPTIONS]
+
+Options:
+  --ticks &lt;N&gt;         Burn CPU for N ticks / centiseconds (default: 10)
+  --exit-code &lt;N&gt;     Exit with this code (default: 0)
+  --output &lt;text&gt;     Write text to stdout before exiting
+  --hang              Never exit (simulate stuck compiler)
+</code></pre>
+<h3 id="test-profiles-using-mockc"><a class="header" href="#test-profiles-using-mockc">Test profiles using mockc</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Profile</th><th>mockls flags</th><th>mockc flags</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Fast flycheck</td><td><code>--flycheck-command mockc</code></td><td>default (10 ticks)</td><td>Basic flycheck cycle</td></tr>
+<tr><td>Near threshold</td><td><code>--flycheck-command mockc --flycheck-ticks 900</code></td><td>900 ticks</td><td>90% of 1000-tick threshold — passes because ticks are in subprocess</td></tr>
+<tr><td>Stuck compiler</td><td><code>--flycheck-command "mockc --hang"</code></td><td>never exits</td><td>Verifies failure detection on progress cycle</td></tr>
+<tr><td>Compiler crash</td><td><code>--flycheck-command "mockc --exit-code 1"</code></td><td>immediate fail</td><td>Progress End with no diagnostics</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="source"><a class="header" href="#source">Source</a></h2>
 <ul>
-<li><code>src/bin/mockls.rs</code> — the mock server binary and its unit tests</li>
-<li><code>Cargo.toml</code> — <code>[[bin]]</code> entry for mockls</li>
+<li><code>tools/mockls.rs</code> — the mock server binary and its unit tests</li>
+<li><code>tools/mockc.rs</code> — the simulated compiler subprocess</li>
+<li><code>Cargo.toml</code> — <code>[[bin]]</code> entries for both</li>
 </ul>
 
                     </main>

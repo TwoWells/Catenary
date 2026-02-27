@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7e0df5cd.js";
+            window.path_to_searchindex_js = "searchindex-b1c82dcb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9c5e5c2a.js"></script>
+        <script src="toc-cd5a037f.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -354,6 +354,32 @@ deny_message = "Use Catenary's list_directory tool instead."
   }
 }
 </code></pre>
+<p><strong>Alternative: constrained-bash hook.</strong> Instead of the policy engine, you can
+use the same <code>scripts/constrained_bash.py</code> script from the repo with Gemini’s
+<code>BeforeTool</code> hook system.</p>
+<p><strong>Install:</strong></p>
+<pre><code class="language-bash">cp /path/to/catenary/scripts/constrained_bash.py ~/.gemini/hooks/constrained_bash.py
+chmod +x ~/.gemini/hooks/constrained_bash.py
+</code></pre>
+<p><strong>Configure</strong> in <code>~/.gemini/settings.json</code>:</p>
+<pre><code class="language-json">{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.gemini/hooks/constrained_bash.py --format=gemini"
+          }
+        ]
+      }
+    ]
+  }
+}
+</code></pre>
+<p>The <code>--format=gemini</code> flag switches the denial response to Gemini’s
+<code>{"decision": "deny", "reason": "..."}</code> format.</p>
 <p><strong>Built-in tool names</strong> (from <code>packages/core/src/tools/tool-names.ts</code>):</p>
 <div class="table-wrapper">
 <table>
@@ -430,111 +456,61 @@ running Catenary session for the workspace, returns any LSP diagnostics,
 records the file’s mtime, and releases the lock. It exits silently on any
 error so it never blocks Claude Code’s flow.</p>
 <p><strong>Alternative: Constrained mode.</strong> Keep Claude Code’s native <code>Read</code>, <code>Edit</code>,
-<code>Write</code>, and <code>Bash</code> tools but deny text-scanning commands to force LSP-first
-navigation. This deny list blocks grep, file listing, manual reads, text
-processing, shell wrappers, and framework tools that would bypass Catenary.</p>
+<code>Write</code>, and <code>Bash</code> tools but block text-scanning commands to force LSP-first
+navigation. The repo includes a hook script that implements an allowlist:
+only <code>make</code>, <code>git</code>, <code>gh</code>, and a handful of filesystem utilities are permitted.
+Everything else is denied with guidance pointing to the appropriate Catenary
+tool.</p>
+<p><strong>Install:</strong></p>
+<pre><code class="language-bash"># Symlink so the live hook stays in sync with the repo
+mkdir -p ~/.claude/hooks
+ln -s /path/to/catenary/scripts/constrained_bash.py ~/.claude/hooks/constrained_bash.py
+chmod +x /path/to/catenary/scripts/constrained_bash.py
+</code></pre>
+<p><strong>Configure</strong> in <code>~/.claude/settings.json</code>:</p>
 <pre><code class="language-json">{
-  "permissions": {
-    "allow": [
-      "WebSearch",
-      "WebFetch",
-      "mcp__catenary__*",
-      "mcp__plugin_catenary_catenary__*",
-      "ToolSearch",
-      "AskUserQuestion",
-      "Bash"
-    ],
-    "deny": [
-      "// --- 1. Search (Grep Family) ---",
-      "Bash(rg *)",
-      "Bash(ag *)",
-      "Bash(ack *)",
-      "Bash(fd *)",
-      "Bash(grep *)",
-      "Bash(egrep *)",
-      "Bash(fgrep *)",
-      "Bash(rgrep *)",
-      "Bash(zgrep *)",
-      "Bash(git grep *)",
-      "// --- 2. Navigation (Listing Family) ---",
-      "Bash(ls *)",
-      "Bash(dir *)",
-      "Bash(vdir *)",
-      "Bash(tree *)",
-      "Bash(find *)",
-      "Bash(locate *)",
-      "Bash(mlocate *)",
-      "Bash(whereis *)",
-      "Bash(which *)",
-      "Bash(git ls-files *)",
-      "Bash(git ls-tree *)",
-      "// --- 3. Peeking (Reading Family) ---",
-      "Bash(cat *)",
-      "Bash(head *)",
-      "Bash(tail *)",
-      "Bash(more *)",
-      "Bash(less *)",
-      "Bash(nl *)",
-      "Bash(od *)",
-      "Bash(hexdump *)",
-      "Bash(xxd *)",
-      "Bash(strings *)",
-      "Bash(dd *)",
-      "Bash(tee *)",
-      "// --- 4. Text Processing (Scripting Family) ---",
-      "Bash(awk *)",
-      "Bash(sed *)",
-      "Bash(perl *)",
-      "Bash(cut *)",
-      "Bash(paste *)",
-      "Bash(sort *)",
-      "Bash(uniq *)",
-      "Bash(join *)",
-      "// --- 5. Reconnaissance (Metadata Family) ---",
-      "Bash(file *)",
-      "Bash(stat *)",
-      "Bash(du *)",
-      "Bash(df *)",
-      "// --- 6. Executors &amp; Shells (The Wrapper Family) ---",
-      "Bash(bash *)",
-      "Bash(sh *)",
-      "Bash(zsh *)",
-      "Bash(dash *)",
-      "Bash(fish *)",
-      "Bash(ash *)",
-      "Bash(csh *)",
-      "Bash(ksh *)",
-      "Bash(tcsh *)",
-      "// --- 7. The Command Runners (Prevents Masquerading) ---",
-      "Bash(env *)",
-      "Bash(sudo *)",
-      "Bash(su *)",
-      "Bash(nohup *)",
-      "Bash(timeout *)",
-      "Bash(watch *)",
-      "Bash(time *)",
-      "Bash(eval *)",
-      "Bash(exec *)",
-      "Bash(command *)",
-      "Bash(builtin *)",
-      "Bash(type *)",
-      "Bash(hash *)",
-      "// --- 8. The Multiplexers ---",
-      "Bash(xargs *)",
-      "Bash(parallel *)",
-      "// --- 9. Framework Blocks ---",
-      "Grep",
-      "Glob",
-      "Task"
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/constrained_bash.py"
+          }
+        ]
+      }
     ]
-  },
-  "mcpServers": {
-    "catenary": {
-      "command": "catenary"
-    }
   }
 }
 </code></pre>
+<p>The script provides specific guidance per command (<code>Use Catenary's search tool instead.</code>, <code>Use the Read tool instead.</code>, etc.) so the model corrects course
+immediately rather than attempting workarounds.</p>
+<p><strong>Troubleshooting:</strong></p>
+<ul>
+<li>
+<p><strong>Hook silently allows blocked commands.</strong> The script must be executable.
+<code>chmod +x</code> on the script file (or the repo file if you use a symlink) is
+required. Without it, Claude Code gets a permission error, treats the hook as
+a non-blocking failure, and lets the command through.</p>
+</li>
+<li>
+<p><strong>Hook allows blocked commands and logs a JSON parse error.</strong> Claude Code
+spawns a shell that sources your profile. If <code>~/.zshrc</code> or <code>~/.bashrc</code> prints
+anything unconditionally (e.g. <code>fastfetch</code>, <code>neofetch</code>, a startup banner),
+that output is prepended to the hook’s JSON and corrupts the parse. Add this
+guard at the very top of both files:</p>
+<pre><code class="language-zsh"># Skip the rest of this file for non-interactive shells (e.g. hook runners)
+[[ -o interactive ]] || return
+</code></pre>
+</li>
+<li>
+<p><strong>Blocked commands appear as “Read” in the UI.</strong> Claude Code relabels Bash
+commands that contain <code>tail</code>, <code>head</code>, or <code>cat</code> as a native Read operation in
+the transcript view. The hook still fires on the Bash event and blocks
+correctly — the relabeling is cosmetic only.</p>
+</li>
+</ul>
 <p>This keeps <code>Bash</code> available for build/test/git commands while blocking every
 path that would let the model fall back to text scanning. The model uses:</p>
 <ul>
@@ -583,11 +559,9 @@ by giving explicit deny messages instead of silently removing tools.</p>
 </thead>
 <tbody>
 <tr><td><code>list_directory</code></td><td>File I/O</td><td>Files, dirs, symlinks</td></tr>
-<tr><td><code>search</code></td><td>LSP</td><td>Workspace symbols + grep fallback</td></tr>
-<tr><td><code>find_references</code></td><td>LSP</td><td>LSP references</td></tr>
+<tr><td><code>search</code></td><td>LSP</td><td>Symbols + semantic references + text matches</td></tr>
 <tr><td><code>codebase_map</code></td><td>LSP</td><td>File tree with symbols</td></tr>
 <tr><td><code>document_symbols</code></td><td>LSP</td><td>File structure</td></tr>
-<tr><td><code>hover</code></td><td>LSP</td><td>Type info, docs</td></tr>
 <tr><td><code>diagnostics</code></td><td>LSP</td><td>Errors, warnings</td></tr>
 <tr><td>…</td><td>LSP</td><td><a href="overview.html#available-tools">Full list</a></td></tr>
 </tbody>
@@ -616,7 +590,7 @@ a grep fallback for basic text matching when no LSP server covers the file.</p>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="configuration.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="dashboard.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -630,7 +604,7 @@ a grep fallback for basic text matching when no LSP server covers the file.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="configuration.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="dashboard.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

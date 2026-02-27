@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7e0df5cd.js";
+            window.path_to_searchindex_js = "searchindex-b1c82dcb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9c5e5c2a.js"></script>
+        <script src="toc-cd5a037f.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -197,11 +197,11 @@ before hitting the wall, but every token still costs compute and latency on
 every turn. The problem scales with session length, not window size.</p>
 <h2 id="the-solution"><a class="header" href="#the-solution">The Solution</a></h2>
 <p>Catenary replaces brute-force file scanning with <strong>graph navigation</strong>.</p>
-<p>Instead of reading a 500-line file to find a type signature, the agent asks
-the language server directly — <code>hover</code> returns 50 tokens instead of 2,000.
-Instead of grepping across 20 files to find a definition, <code>definition</code> returns
+<p>Instead of grepping across 20 files to find a definition, <code>definition</code> returns
 the exact location in one query. Instead of re-reading a file after editing it
-to check for errors, the <code>catenary release</code> hook returns diagnostics inline.</p>
+to check for errors, the <code>catenary release</code> hook returns diagnostics inline.
+Instead of fumbling with line numbers to find usages, <code>search</code> returns symbols,
+semantic references, and text matches in a single call.</p>
 <p>Each LSP query is small and stateless. Nothing accumulates. The context stays
 lean across the entire session, regardless of how long the agent works.</p>
 <div class="table-wrapper">
@@ -222,7 +222,7 @@ lean across the entire session, regardless of how long the agent works.</p>
 <tr><th>Graph navigation</th><th>Tokens</th><th>Context cost</th></tr>
 </thead>
 <tbody>
-<tr><td><code>hover</code> for type info</td><td>~100</td><td>stateless</td></tr>
+<tr><td><code>search</code> for symbols + references</td><td>~200</td><td>stateless</td></tr>
 <tr><td>Native edit + notify hook diagnostics</td><td>~300</td><td>no re-read</td></tr>
 <tr><td><code>definition</code></td><td>~50</td><td>stateless</td></tr>
 </tbody>
@@ -265,7 +265,7 @@ grepping — and the efficiency gains are lost.</p>
 <tr><td><strong>Eager Startup</strong></td><td>Servers for detected languages start at launch; others start on first file access</td></tr>
 <tr><td><strong>Smart Routing</strong></td><td>Requests automatically route to the correct server based on file type</td></tr>
 <tr><td><strong>Universal Support</strong></td><td>Works with any LSP-compliant language server</td></tr>
-<tr><td><strong>Full LSP Coverage</strong></td><td>Hover, definitions, references, diagnostics, rename, code actions, and more</td></tr>
+<tr><td><strong>Full LSP Coverage</strong></td><td>Definitions, references, diagnostics, rename, code actions, and more</td></tr>
 <tr><td><strong>File I/O</strong></td><td>Read, write, and edit files with automatic LSP diagnostics</td></tr>
 </tbody>
 </table>
@@ -278,13 +278,11 @@ grepping — and the efficiency gains are lost.</p>
 <tr><th>Tool</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>hover</code></td><td>Get documentation and type info for a symbol</td></tr>
+<tr><td><code>search</code></td><td>Search for symbols, semantic references, and text matches (LSP workspace symbols + references + file heatmap)</td></tr>
 <tr><td><code>definition</code></td><td>Jump to where a symbol is defined</td></tr>
 <tr><td><code>type_definition</code></td><td>Jump to the type’s definition</td></tr>
 <tr><td><code>implementation</code></td><td>Find implementations of interfaces/traits</td></tr>
-<tr><td><code>find_references</code></td><td>Find all references to a symbol (by name or position)</td></tr>
 <tr><td><code>document_symbols</code></td><td>Get the outline of a file</td></tr>
-<tr><td><code>search</code></td><td>Search for a symbol or pattern (LSP workspace symbols + file heatmap)</td></tr>
 <tr><td><code>code_actions</code></td><td>Get quick fixes and refactorings</td></tr>
 <tr><td><code>rename</code></td><td>Compute rename edits (does not modify files)</td></tr>
 <tr><td><code>diagnostics</code></td><td>Get errors and warnings</td></tr>
@@ -292,6 +290,18 @@ grepping — and the efficiency gains are lost.</p>
 <tr><td><code>type_hierarchy</code></td><td>See type inheritance</td></tr>
 <tr><td><code>status</code></td><td>Report status of all LSP servers (e.g. “Indexing”)</td></tr>
 <tr><td><code>codebase_map</code></td><td>Generate a high-level file tree with symbols</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Deprecated (being merged into <code>search</code>):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tool</th><th>Description</th><th>Replacement</th></tr>
+</thead>
+<tbody>
+<tr><td><code>hover</code></td><td>Get documentation and type info for a symbol</td><td><code>search</code> (symbols tier with hover enrichment)</td></tr>
+<tr><td><code>find_references</code></td><td>Find all references to a symbol</td><td><code>search</code> (references tier)</td></tr>
 </tbody>
 </table>
 </div>
@@ -311,7 +321,12 @@ grepping — and the efficiency gains are lost.</p>
 LSP diagnostics</strong> via the <code>catenary release</code> hook — diagnostics appear in the
 model’s context after every edit. See <a href="cli-integration.html">CLI Integration</a>
 for hook configuration.</p>
-<p>All file paths are validated against workspace roots.</p>
+<p><code>list_directory</code> and <code>search</code> (with the optional <code>paths</code> parameter) can
+operate outside workspace roots — access control is delegated to the host
+CLI’s permission layer. LSP-backed operations (diagnostics, hover,
+definition, etc.) are gated to workspace roots because the language server
+has no knowledge of files outside them. Catenary config files are always
+protected from modification.</p>
 
                     </main>
 

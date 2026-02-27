@@ -1,0 +1,621 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Landscape - Catenary</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="LSP-powered tools for AI coding assistants">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-b1c82dcb.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-cd5a037f.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Catenary</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/MarkWells-Dev/Catenary" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/MarkWells-Dev/Catenary/edit/main/docs/src/lsp/landscape.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="language-server-landscape"><a class="header" href="#language-server-landscape">Language Server Landscape</a></h1>
+<p>Compiled from the <a href="https://microsoft.github.io/language-server-protocol/implementors/servers/">Microsoft LSP implementors list</a>
+and <a href="https://langserver.org/">langserver.org</a>.</p>
+<p><strong>Version</strong> = includes <code>version</code> field in <code>publishDiagnostics</code> (LSP 3.15+, 2019).
+<strong>Progress</strong> = sends <code>$/progress</code> tokens (LSP 3.15+).
+<strong>Strategy</strong> = what Catenary would use for done detection.</p>
+<p>Legend: Y = Yes, N = No, ? = Unverified, — = N/A (no diagnostics).</p>
+<p><strong>LSP spec (inherited)</strong>: The server uses a standard LSP library (e.g., <code>vscode-languageserver</code> for Node, <code>pygls</code> for Python, <code>tower-lsp</code> for Rust, or <code>eclipse.lsp4j</code> for Java). These libraries have implemented the LSP 3.15+ specification (2019) by default, meaning they automatically include the <code>version</code> field in diagnostics and handle progress tokens without manual developer intervention.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Language</th><th>Server</th><th>Version</th><th>Progress</th><th>Strategy</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td>1C Enterprise</td><td>BSL Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>ABAP</td><td>abaplint</td><td>Y</td><td>N</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>ActionScript 2.0</td><td>AS2 Language Support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ActionScript 3</td><td>vscode-nextgenas</td><td>Y</td><td>Y</td><td>Version</td><td>as3mxml / BowlerHatLLC</td></tr>
+<tr><td>Ada/SPARK</td><td>ada_language_server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Agda</td><td>agda-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>AML</td><td>AML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Angular</td><td>Angular Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Ansible</td><td>Ansible Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>ANTLR</td><td>AntlrVSIX</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Apache Camel</td><td>camel-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Apache Dispatcher</td><td>vscode-apache-dispatcher-config</td><td>Y</td><td>N</td><td>Version</td><td>BeardedFish / LSP spec</td></tr>
+<tr><td>Apex</td><td>VS Code Apex extension</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>APL</td><td>APL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>API Elements</td><td>vscode-apielements</td><td>Y</td><td>N</td><td>Version</td><td>XVincentX / LSP spec</td></tr>
+<tr><td>Astro</td><td>withastro/language-tools</td><td>Y</td><td>N</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>AWK</td><td>awk-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>B/ProB</td><td>B-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Ballerina</td><td>Ballerina Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Bash</td><td>bash-language-server</td><td>Y</td><td>N</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Batch</td><td>rech-editor-batch</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Bazel</td><td>bazel-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>BibTeX</td><td>citation-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Bicep</td><td>Bicep</td><td>Y</td><td>Y</td><td>Version</td><td>Microsoft / LSP spec</td></tr>
+<tr><td>BitBake</td><td>BitBake Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Boriel Basic</td><td>boriel-basic-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>BrightScript</td><td>brighterscript</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>C/C++</td><td>clangd</td><td>Y</td><td>Y</td><td>Version</td><td>clangd.llvm.org/extensions</td></tr>
+<tr><td>C/C++</td><td>ccls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>C/C++</td><td>cquery (archived)</td><td>?</td><td>N</td><td>?</td><td>?</td></tr>
+<tr><td>C#</td><td>omnisharp-roslyn</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>C#</td><td>csharp-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>C#</td><td>LanguageServer.NET</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Chapel</td><td>chapel-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Clarity</td><td>clarity-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Clojure</td><td>clojure-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>CMake</td><td>cmake-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>CMake</td><td>neocmakelsp</td><td>Y</td><td>N</td><td>Version</td><td>Source code (Rust)</td></tr>
+<tr><td>COBOL</td><td>COBOL Language Support</td><td>Y</td><td>Y</td><td>Version</td><td>eclipse.lsp4j (Java)</td></tr>
+<tr><td>COBOL</td><td>rech-editor-cobol</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CodeQL</td><td>codeql</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CoffeeScript</td><td>CoffeeSense</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Common Lisp</td><td>cl-lsp</td><td>?</td><td>?</td><td>?</td><td>Common Lisp (hand-rolled)</td></tr>
+<tr><td>Common Lisp</td><td>alive-lsp</td><td>?</td><td>?</td><td>?</td><td>Common Lisp (hand-rolled)</td></tr>
+<tr><td>Common Workflow Language</td><td>Benten</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Compose</td><td>docker-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Coq</td><td>coq-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>rocq-prover.org</td></tr>
+<tr><td>Coq</td><td>vscoq</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Crystal</td><td>Crystalline</td><td>Y</td><td>N</td><td>Version</td><td>crystal-lang.org</td></tr>
+<tr><td>Crystal</td><td>Scry</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CSS/LESS/SASS</td><td>vscode-css-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>Cucumber/Gherkin</td><td>Cucumber Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CWL</td><td>Benten</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Cython</td><td>cyright</td><td>Y</td><td>Y</td><td>Version</td><td>Pyright fork (node)</td></tr>
+<tr><td>D</td><td>serve-d</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>D</td><td>D Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Dart</td><td>Dart SDK (analysis_server)</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Data Pack</td><td>Data-pack Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Debian Packaging</td><td>debputy lsp server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Delphi</td><td>DelphiLSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Delphi</td><td>DelphiLSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>DenizenScript</td><td>DenizenVSCode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Deno</td><td>deno lsp</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Devicetree</td><td>dts-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Dockerfile</td><td>dockerfile-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Dockerfile</td><td>docker-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>DreamMaker</td><td>DreamMaker Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Egglog</td><td>egglog-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Elixir</td><td>elixir-ls</td><td>Y</td><td>Y</td><td>Version</td><td>Source, call hierarchy</td></tr>
+<tr><td>Elm</td><td>elm-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Emacs Lisp</td><td>ellsp</td><td>?</td><td>N</td><td>?</td><td>Emacs Lisp (hand-rolled)</td></tr>
+<tr><td>Ember</td><td>Ember Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erg</td><td>els</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erlang</td><td>erlang_ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erlang</td><td>ELP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erlang</td><td>sourcer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>F#</td><td>FsAutoComplete</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Fennel</td><td>fennel-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>fish</td><td>fish-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>fluent-bit</td><td>fluent-bit-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Flux</td><td>flux-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Fortran</td><td>fortls</td><td>Y</td><td>Y</td><td>Version</td><td>fortran-lang.org</td></tr>
+<tr><td>Fortran</td><td>fortran-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Fuzion</td><td>Fuzion Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Gauge</td><td>Gauge Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GDScript</td><td>Godot</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Gleam</td><td>gleam</td><td>Y</td><td>Y</td><td>Version</td><td>gleam.run</td></tr>
+<tr><td>Glimmer</td><td>Glint</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GLSL</td><td>glsl-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (C++)</td></tr>
+<tr><td>Gluon</td><td>Gluon Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GN</td><td>gn-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Go</td><td>gopls</td><td>Y</td><td>Y</td><td>Version</td><td>Source, issue #65801</td></tr>
+<tr><td>Grain</td><td>grain</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GraphQL</td><td>GraphQL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GraphQL</td><td>GQL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Graphviz/DOT</td><td>dot-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Groovy</td><td>groovy-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Hack</td><td>HHVM LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Haskell</td><td>Haskell Language Server (HLS)</td><td>Y</td><td>Y</td><td>Version</td><td>lsp Haskell library</td></tr>
+<tr><td>Haxe</td><td>Haxe Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Helm</td><td>helm-ls</td><td>Y</td><td>?</td><td>Version</td><td>Go (proxies yaml-ls)</td></tr>
+<tr><td>HLASM</td><td>HLASM Language Support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>HLSL</td><td>HLSL Tools</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>HTML</td><td>vscode-html-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>HTML</td><td>SuperHTML</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Idris2</td><td>idris2-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ink!</td><td>ink! Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Isabelle</td><td>Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Java</td><td>Eclipse JDT LS</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Java</td><td>javac API-based</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>JavaScript</td><td>quick-lint-js</td><td>?</td><td>N</td><td>?</td><td>?</td></tr>
+<tr><td>JavaScript (Flow)</td><td>flow</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>JavaScript/TypeScript</td><td>typescript-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>Source code, Changelog</td></tr>
+<tr><td>JavaScript/TypeScript</td><td>biome_lsp</td><td>Y</td><td>Y</td><td>Version</td><td>Source code</td></tr>
+<tr><td>JSON</td><td>vscode-json-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>Jsonnet</td><td>jsonnet-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Julia</td><td>LanguageServer.jl</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Kconfig</td><td>kconfig-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>KDL</td><td>vscode-kdl</td><td>Y</td><td>N</td><td>Version</td><td>kdl-org / LSP spec</td></tr>
+<tr><td>KDL</td><td>kdl-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Kedro</td><td>Kedro VSCode Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Kerboscript</td><td>kos-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>KerML/SysML v2</td><td>SysML2 Tools</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Kotlin</td><td>kotlin-language-server</td><td>Y</td><td>N</td><td>Version</td><td>github.com/fwcd</td></tr>
+<tr><td>Kotlin</td><td>kotlin-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Langium</td><td>langium</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>LanguageTool</td><td>ltex-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lark</td><td>lark-parser-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>LaTeX</td><td>texlab</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Lean4</td><td>Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Liquid</td><td>theme-check</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lox</td><td>loxcraft</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>LPC</td><td>lpc-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lua</td><td>lua-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Lua</td><td>lua-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lua</td><td>LuaHelper</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Make</td><td>make-lsp-vscode</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Make</td><td>make-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Markdown</td><td>Marksman</td><td>Y</td><td>Y</td><td>Version</td><td>Source code</td></tr>
+<tr><td>Markdown</td><td>vscode-markdown-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>MATLAB</td><td>MATLAB-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>MDX</td><td>mdx-js/mdx-analyzer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>MOCA</td><td>moca-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Motorola 68000</td><td>m68k-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>MSBuild</td><td>msbuild-project-tools-vscode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>NASM/GO/GAS Assembly</td><td>asm-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nextflow</td><td>language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nginx</td><td>nginx-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nim</td><td>nimlsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nix</td><td>nil</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nix</td><td>nixd</td><td>Y</td><td>Y</td><td>Version</td><td>Source code</td></tr>
+<tr><td>OCaml/Reason</td><td>ocamllsp</td><td>Y</td><td>N</td><td>Version</td><td>tarides.com</td></tr>
+<tr><td>Odin</td><td>ols</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>OpenAPI</td><td>AML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>OpenEdge ABL</td><td>ABL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>openVALIDATION</td><td>ov-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Papyrus</td><td>papyrus-lang</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PartiQL</td><td>aws-lsp-partiql</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Perl</td><td>Perl Navigator</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Perl</td><td>PLS</td><td>?</td><td>N</td><td>?</td><td>Pure Perl (hand-rolled)</td></tr>
+<tr><td>Perl</td><td>Perl::LanguageServer</td><td>?</td><td>N</td><td>?</td><td>Pure Perl/CPAN (hand-rolled)</td></tr>
+<tr><td>Pest</td><td>Pest IDE Tools</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHP</td><td>intelephense</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>PHP</td><td>phpactor</td><td>Y</td><td>N</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>PHP</td><td>Serenata</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHP</td><td>Phan</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHP</td><td>php-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHPUnit</td><td>phpunit-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PL/SQL</td><td>PL/SQL language server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PlantUML</td><td>plantuml-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Polymer</td><td>polymer-editor-service</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Pony</td><td>PonyLS</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PowerPC Assembly</td><td>PowerPC Support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PowerShell</td><td>PowerShell Editor Services</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>PromQL</td><td>promql-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Protocol Buffers</td><td>protols</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Protocol Buffers</td><td>buf-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Puppet</td><td>puppet-editor-services</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PureScript</td><td>purescript-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>Pyright</td><td>Y</td><td>Workspace only</td><td>Version</td><td>GitHub discussion #6818</td></tr>
+<tr><td>Python</td><td>Basedpyright</td><td>Y</td><td>Workspace only</td><td>Version</td><td>GitHub discussion #6818</td></tr>
+<tr><td>Python</td><td>python-lsp-server (pylsp)</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Python</td><td>jedi-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>pylyzer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>ty</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>Pyrefly</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Q#</td><td>Q# Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>QML</td><td>qmlls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>R</td><td>R languageserver</td><td>Y</td><td>N</td><td>Version</td><td>r-project.org</td></tr>
+<tr><td>Racket</td><td>racket-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Raku</td><td>Raku Navigator</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>RAML</td><td>AML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Rascal</td><td>util::LanguageServer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ReasonML</td><td>reason-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Red</td><td>redlangserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Rego</td><td>Regal</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ReScript</td><td>rescript-vscode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Robot Framework</td><td>robotframework-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Robot Framework</td><td>RobotCode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Robots.txt</td><td>vscode-robots-dot-txt-support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Ruby</td><td>Ruby LSP</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Ruby</td><td>Solargraph</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Ruby</td><td>Sorbet</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Rust</td><td>rust-analyzer</td><td>Y</td><td>Y</td><td>Version</td><td>Docs, issue trackers</td></tr>
+<tr><td>Scala</td><td>Metals</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Scheme</td><td>scheme-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Shader</td><td>shader-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Slint</td><td>slint-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Smalltalk/Pharo</td><td>Pharo Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Smithy</td><td>Smithy Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SPARQL</td><td>Qlue-ls</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Sphinx/RST</td><td>esbonio</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SQL</td><td>sqls</td><td>?</td><td>?</td><td>?</td><td>Go (unmaintained)</td></tr>
+<tr><td>SQL</td><td>sqlls</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Standard ML</td><td>Millet</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Stimulus</td><td>Stimulus LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Svelte</td><td>svelte-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Sway</td><td>sway-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Swift</td><td>SourceKit-LSP</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>systemd</td><td>systemd-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Systemtap</td><td>Systemtap LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>svls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>Verible</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>slang-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>Sigasi</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>T-SQL</td><td>VS Code SQL extension</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Tailwind CSS</td><td>Tailwind Intellisense</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Teal</td><td>teal-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Termux configs</td><td>termux-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>pygls (Python)</td></tr>
+<tr><td>Terraform</td><td>terraform-ls</td><td>N</td><td>Y</td><td>Progress</td><td>GitHub issue #1365</td></tr>
+<tr><td>Terraform</td><td>terraform-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Thrift</td><td>thrift-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>TOML</td><td>Taplo</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>TOML</td><td>Tombi</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>TTCN-3</td><td>ntt</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Turtle</td><td>Turtle Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Twig</td><td>Twig Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>TypeCobol</td><td>TypeCobol Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Typst</td><td>tinymist</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Typst</td><td>typst-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>V</td><td>v-analyzer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Vala</td><td>vala-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>VDM</td><td>VDMJ-LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Veryl</td><td>Veryl Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>VHDL</td><td>vhdl_ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>VHDL</td><td>Sigasi</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Viml</td><td>vim-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Visualforce</td><td>VS Code Visualforce extension</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Vue</td><td>vuejs/language-tools (Volar)</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Vue</td><td>vuejs/vetur (deprecated)</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>WebAssembly</td><td>wasm-language-tools</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>WGSL</td><td>wgsl-analyzer</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Wikitext</td><td>VSCode-WikiParser</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Wing</td><td>Wing</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Wolfram</td><td>lsp-wl</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Wolfram</td><td>LSPServer</td><td>Y</td><td>?</td><td>Version</td><td>Wolfram Research</td></tr>
+<tr><td>XML</td><td>LemMinX</td><td>Y</td><td>Y</td><td>Version</td><td>eclipse.lsp4j (Java)</td></tr>
+<tr><td>XML</td><td>XML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>YAML</td><td>yaml-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>YANG</td><td>yang-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>YARA</td><td>YARA Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Zig</td><td>zls</td><td>Y</td><td>Y</td><td>Version</td><td>Source</td></tr>
+<tr><td>Multi-language</td><td>SonarLint Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Multi-language</td><td>efm-langserver</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>Multi-language</td><td>diagnostic-languageserver</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>Multi-language</td><td>harper (prose)</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Multi-language</td><td>Copilot Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="verified-servers"><a class="header" href="#verified-servers">Verified Servers</a></h2>
+<p>These have been confirmed through documentation, source code, or issue trackers:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Language</th><th>Server</th><th>Version</th><th>Progress</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td>Rust</td><td>rust-analyzer</td><td>Y</td><td>Y</td><td>Docs, issue trackers</td></tr>
+<tr><td>Python</td><td>Pyright / Basedpyright</td><td>Y</td><td>Workspace only</td><td>GitHub discussion #6818</td></tr>
+<tr><td>TypeScript/JS</td><td>typescript-language-server</td><td>Y</td><td>Y</td><td>Source code, Changelog</td></tr>
+<tr><td>Go</td><td>gopls</td><td>Y</td><td>Y</td><td>Source, issue #65801</td></tr>
+<tr><td>C/C++</td><td>clangd</td><td>Y</td><td>Y</td><td>clangd.llvm.org/extensions</td></tr>
+<tr><td>C#</td><td>omnisharp-roslyn</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Java</td><td>Eclipse JDT LS</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>COBOL</td><td>COBOL Language Support</td><td>Y</td><td>Y</td><td>eclipse.lsp4j (Java)</td></tr>
+<tr><td>Lua</td><td>lua-language-server</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Dart</td><td>Dart SDK</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Deno</td><td>deno lsp</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Zig</td><td>zls</td><td>Y</td><td>Y</td><td>Source</td></tr>
+<tr><td>CSS/LESS/SASS</td><td>vscode-css-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>HTML</td><td>vscode-html-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>JSON</td><td>vscode-json-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>Markdown</td><td>vscode-markdown-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>Terraform</td><td>terraform-ls</td><td>N</td><td>Y</td><td>GitHub issue #1365</td></tr>
+<tr><td>Elixir</td><td>elixir-ls</td><td>Y</td><td>Y</td><td>Source, call hierarchy</td></tr>
+<tr><td>Haskell</td><td>HLS</td><td>Y</td><td>Y</td><td>lsp Haskell library</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="verification-sources"><a class="header" href="#verification-sources">Verification Sources</a></h2>
+<ul>
+<li><strong>typescript-language-server</strong>: Supported <code>workDoneProgress</code> confirmed in <a href="https://github.com/typescript-language-server/typescript-language-server/blob/master/CHANGELOG.md">CHANGELOG.md</a> (v0.29.0).</li>
+<li><strong>terraform-ls</strong>: <code>version</code> field in <code>publishDiagnostics</code> is an open enhancement request: <a href="https://github.com/hashicorp/terraform-ls/issues/1365">Issue #1365</a>.</li>
+<li><strong>elixir-ls</strong>: Supports LSP 3.15+ (call hierarchy added in v0.29.0). Uses <code>gen_lsp</code> which includes the <code>version</code> field.</li>
+<li><strong>Haskell Language Server (HLS)</strong>: Built on the <code>lsp</code> Haskell library which implements LSP 3.15.</li>
+<li><strong>bash-language-server</strong>: Uses <code>vscode-languageserver</code> node package (supports <code>version</code>). <code>workDoneProgress</code> is explicitly disabled for many providers in <code>server.ts</code>.</li>
+<li><strong>vscode-markdown-languageserver</strong>: Built-in VS Code server. Inherits <code>version</code> support from <code>vscode-languageserver</code> node package; does not typically use <code>$/progress</code> for its fast operations.</li>
+<li><strong>biome_lsp</strong>: Modern Rust-based server, supports <code>versionSupport</code> and <code>workDoneProgress</code>.</li>
+<li><strong>nixd</strong>: Adheres to standard LSP for diagnostic and progress reporting.</li>
+<li><strong>taplo</strong>: Supports <code>workDoneProgress</code> as confirmed in Helix and other LSP client logs.</li>
+<li><strong>termux-language-server</strong>: Python 3.10+, depends on <code>pygls</code>. Inherits <code>version</code> and <code>$/progress</code> from the library.</li>
+<li><strong>Perl Navigator</strong>: Node.js server by bscan. Uses <code>vscode-languageserver</code> (LSP 3.15+).</li>
+<li><strong>PLS</strong> (giraffate): Pure Perl implementation. Progress support absent; versioning unconfirmed.</li>
+<li><strong>Perl::LanguageServer</strong>: CPAN module. Progress support absent in feature list.</li>
+<li><strong>sqls</strong>: Legacy Go implementation, unmaintained. May not support modern fields.</li>
+<li><strong>sqlls</strong>: Modern Node.js successor. Inherits LSP 3.15+ from <code>vscode-languageserver</code>.</li>
+<li><strong>LemMinX</strong>: Java server using <code>eclipse.lsp4j</code>, which fully supports LSP 3.15+.</li>
+<li><strong>COBOL Language Support</strong>: Java server (Eclipse Che4z) using <code>eclipse.lsp4j</code>. Full LSP 3.15+.</li>
+<li><strong>dockerfile-language-server</strong>: Node.js by rcjsuen. Uses <code>vscode-languageserver</code>.</li>
+<li><strong>docker-language-server</strong>: Official Docker Node.js server. Full LSP 3.15+.</li>
+<li><strong>awk-language-server</strong>: Node.js by Beaglefoot. Uses <code>vscode-languageserver</code>.</li>
+<li><strong>MATLAB-language-server</strong>: Official MathWorks Node.js implementation. LSP 3.15+.</li>
+<li><strong>Wolfram LSPServer</strong>: Official by Wolfram Research. Supports <code>publishDiagnostics</code>; <code>$/progress</code> unconfirmed.</li>
+<li><strong>wasm-language-tools</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>wgsl-analyzer</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>cl-lsp</strong>: Early Common Lisp implementation. Versioning and progress unconfirmed/in development.</li>
+<li><strong>alive-lsp</strong>: Common Lisp implementation. Publishes diagnostics; versioning and progress unconfirmed.</li>
+<li><strong>ellsp</strong>: Emacs Lisp. Minimal implementation; progress and versioning likely unsupported.</li>
+<li><strong>elm-language-server</strong>: Node.js using <code>vscode-languageserver</code>. Full LSP 3.15+.</li>
+<li><strong>fish-lsp</strong>: Node.js using <code>vscode-languageserver</code>. Full LSP 3.15+.</li>
+<li><strong>helm-ls</strong>: Go by mrjosh. Proxies to <code>yaml-language-server</code> for most diagnostics.</li>
+<li><strong>kdl-lsp</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>shader-language-server</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>Qlue-ls</strong>: SPARQL server in Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>cyright</strong>: Cython fork of Pyright. Inherits <code>vscode-languageserver</code> implementation.</li>
+<li><strong>General</strong>: Many servers using <code>vscode-languageserver</code> (Node), <code>pygls</code> (Python), or <code>tower-lsp</code> (Rust) inherit support for these fields if updated recently.</li>
+</ul>
+<h2 id="observations"><a class="header" href="#observations">Observations</a></h2>
+<ol>
+<li>
+<p>Every verified major language server includes <code>version</code> in <code>publishDiagnostics</code>.
+The field has been in the LSP spec since 3.15 (2019). It costs nothing to implement.</p>
+</li>
+<li>
+<p><code>$/progress</code> is common but not universal. Servers that do heavy background work
+(indexing, type-checking) tend to support it. Lightweight servers (JSON, HTML, CSS)
+skip it because their operations are fast enough to not need progress reporting.</p>
+</li>
+<li>
+<p>The ProcessMonitor path (no version, no progress) is genuinely a last resort.
+The only servers that would land there are hand-rolled implementations in
+languages without a dominant LSP framework — Common Lisp and Emacs Lisp.
+The intersection of “using these servers” and “using Catenary with an AI
+agent” is vanishingly small.</p>
+</li>
+<li>
+<p>The framework is the story. <code>vscode-languageserver</code> (Node), <code>pygls</code> (Python),
+<code>tower-lsp</code> (Rust), and <code>eclipse.lsp4j</code> (Java) all implement LSP 3.15+ by
+default. Any server built on these frameworks gets <code>version</code> and <code>$/progress</code>
+for free.</p>
+</li>
+<li>
+<p>The <code>?</code> entries are not verified. Filling these in requires inspecting each server’s
+source or testing against a live instance. This is a living document.</p>
+</li>
+</ol>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../lsp/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../ai-agents.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../lsp/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../ai-agents.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

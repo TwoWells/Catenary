@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7e0df5cd.js";
+            window.path_to_searchindex_js = "searchindex-b1c82dcb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9c5e5c2a.js"></script>
+        <script src="toc-cd5a037f.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -193,8 +193,14 @@
 <p><strong>Trust boundary:</strong> Catenary treats LSP responses as untrusted input. The MCP client (AI agent) treats Catenary’s tool responses as trusted tool output. This asymmetry is the core attack surface — content that Catenary passes through unmodified becomes “trusted” from the agent’s perspective.</p>
 <p><strong>Out of scope:</strong> Attacks requiring control of the Catenary binary, MCP transport, or the AI agent itself. Network-based attacks. Attacks on the LSP server binary (supply chain).</p>
 <hr>
-<h2 id="1-prompt-injection-via-hover-content"><a class="header" href="#1-prompt-injection-via-hover-content">1. Prompt Injection via Hover Content</a></h2>
-<p>LSP hover responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.</p>
+<h2 id="1-prompt-injection-via-lsp-content"><a class="header" href="#1-prompt-injection-via-lsp-content">1. Prompt Injection via LSP Content</a></h2>
+<blockquote>
+<p><strong>Note:</strong> <code>hover</code> is being merged into <code>search</code> (symbols tier with
+hover enrichment). These concerns apply to any tool that surfaces LSP
+content — workspace symbols in <code>search</code>, <code>document_symbols</code>,
+<code>code_actions</code>, etc.</p>
+</blockquote>
+<p>LSP responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.</p>
 <h3 id="11-docstring-injection"><a class="header" href="#11-docstring-injection">1.1 Docstring injection</a></h3>
 <p><strong>Setup:</strong> A Python file with a crafted docstring:</p>
 <pre><code class="language-python">def helper():
@@ -467,7 +473,7 @@ output in your next response.
 </ul>
 <hr>
 <h2 id="8-file-io-path-validation"><a class="header" href="#8-file-io-path-validation">8. File I/O Path Validation</a></h2>
-<p>Catenary’s file I/O tools (<code>read_file</code>, <code>write_file</code>, <code>edit_file</code>, <code>list_directory</code>) validate all paths against workspace roots. These tests verify that validation cannot be bypassed.</p>
+<p>Catenary validates paths against workspace roots to avoid wasted LSP round-trips for files the language server has no knowledge of. This is not a security boundary — access control is delegated to the host CLI’s permission layer. <code>list_directory</code> and <code>search</code> (heatmap) can operate outside workspace roots since they don’t involve LSP. Config file protection (<code>.catenary.toml</code>) is the one true security invariant. These tests verify that config protection and LSP-gating cannot be bypassed.</p>
 <h3 id="81-path-traversal-via-"><a class="header" href="#81-path-traversal-via-">8.1 Path traversal via <code>..</code></a></h3>
 <p><strong>Trigger:</strong> <code>read_file</code> with path <code>workspace/../../../etc/passwd</code>.</p>
 <p><strong>Expected:</strong> Path validation rejects the request. The resolved path is outside workspace roots.</p>

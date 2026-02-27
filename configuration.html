@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7e0df5cd.js";
+            window.path_to_searchindex_js = "searchindex-b1c82dcb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9c5e5c2a.js"></script>
+        <script src="toc-cd5a037f.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -183,11 +183,11 @@
                         <h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
 <p>Catenary loads configuration from multiple sources, in order of priority (last one wins):</p>
 <ol>
-<li><strong>Defaults</strong>: <code>idle_timeout = 300</code>.</li>
+<li><strong>Defaults</strong>: <code>idle_timeout = 300</code>, <code>log_retention_days = 7</code>.</li>
 <li><strong>User Config</strong>: <code>~/.config/catenary/config.toml</code>.</li>
 <li><strong>Project Config</strong>: <code>.catenary.toml</code> in the current directory or any parent directory (searches upwards).</li>
 <li><strong>Explicit File</strong>: Specified via <code>--config &lt;path&gt;</code>.</li>
-<li><strong>Environment Variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_IDLE_TIMEOUT=600</code>).</li>
+<li><strong>Environment Variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_IDLE_TIMEOUT=600</code>). Use <code>__</code> as a separator for nested keys (e.g., <code>CATENARY_ICONS__PRESET=nerd</code>).</li>
 <li><strong>CLI Arguments</strong>: <code>--lsp</code> and <code>--idle-timeout</code>.</li>
 </ol>
 <h2 id="basic-structure"><a class="header" href="#basic-structure">Basic Structure</a></h2>
@@ -306,6 +306,59 @@ cargo.features = "all"
 </thead>
 <tbody>
 <tr><td><code>idle_timeout</code></td><td><code>300</code></td><td>Seconds before auto-closing idle documents. Set to <code>0</code> to disable.</td></tr>
+<tr><td><code>log_retention_days</code></td><td><code>7</code></td><td>Days to keep dead session logs. <code>0</code> = remove all dead sessions on startup. <code>-1</code> = retain forever.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="icons"><a class="header" href="#icons">Icons</a></h2>
+<p>The <code>[icons]</code> table controls the icons shown in the <a href="dashboard.html">dashboard</a>
+event stream. Choose a base preset and optionally override individual icons.</p>
+<h3 id="presets"><a class="header" href="#presets">Presets</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Preset</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>unicode</code> (default)</td><td>Safe symbols that render on any terminal font.</td></tr>
+<tr><td><code>nerd</code></td><td>Nerd Font glyphs (requires a <a href="https://www.nerdfonts.com/">patched font</a>).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="example"><a class="header" href="#example">Example</a></h3>
+<pre><code class="language-toml"># Use Nerd Font icons
+[icons]
+preset = "nerd"
+</code></pre>
+<pre><code class="language-toml"># Use Nerd Font icons but override lock/unlock
+[icons]
+preset = "nerd"
+lock = "\U0001F512 "
+unlock = "\U0001F511 "
+</code></pre>
+<h3 id="override-keys"><a class="header" href="#override-keys">Override keys</a></h3>
+<p>Each key replaces the preset default for that icon slot. The value is an
+arbitrary string (typically one or two characters plus a trailing space for
+alignment).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Unicode default</th><th>Nerd default</th><th>Used for</th></tr>
+</thead>
+<tbody>
+<tr><td><code>diag_error</code></td><td><code>\u2717 </code> (✗)</td><td><code> </code></td><td>Diagnostic error</td></tr>
+<tr><td><code>diag_warn</code></td><td><code>\u26A0 </code> (⚠)</td><td><code> </code></td><td>Diagnostic warning</td></tr>
+<tr><td><code>diag_info</code></td><td><code>\u2139 </code> (ℹ)</td><td><code> </code></td><td>Diagnostic info</td></tr>
+<tr><td><code>diag_ok</code></td><td><code>\u2713 </code> (✓)</td><td><code> </code></td><td>Clean diagnostics</td></tr>
+<tr><td><code>lock</code></td><td><code>\u25B6 </code> (▶)</td><td><code> </code></td><td>Lock acquired</td></tr>
+<tr><td><code>unlock</code></td><td><code>\u25C0 </code> (◀)</td><td><code> </code></td><td>Lock released</td></tr>
+<tr><td><code>tool_search</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Search tool</td></tr>
+<tr><td><code>tool_map</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Codebase map tool</td></tr>
+<tr><td><code>tool_hover</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Hover tool</td></tr>
+<tr><td><code>tool_goto</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Go-to-definition tool</td></tr>
+<tr><td><code>tool_refs</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Find references tool</td></tr>
+<tr><td><code>tool_diagnostics</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Diagnostics tool</td></tr>
+<tr><td><code>tool_default</code></td><td><code>\u2192 </code> (→)</td><td><code>\u2192 </code> (→)</td><td>Fallback for other tools</td></tr>
 </tbody>
 </table>
 </div>
@@ -348,7 +401,7 @@ workspace:</p>
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="cli-integration.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="dashboard.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -362,7 +415,7 @@ workspace:</p>
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="cli-integration.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="dashboard.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

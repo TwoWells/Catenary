@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7e0df5cd.js";
+            window.path_to_searchindex_js = "searchindex-b1c82dcb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9c5e5c2a.js"></script>
+        <script src="toc-cd5a037f.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -233,11 +233,11 @@ before hitting the wall, but every token still costs compute and latency on
 every turn. The problem scales with session length, not window size.</p>
 <h2 id="the-solution"><a class="header" href="#the-solution">The Solution</a></h2>
 <p>Catenary replaces brute-force file scanning with <strong>graph navigation</strong>.</p>
-<p>Instead of reading a 500-line file to find a type signature, the agent asks
-the language server directly — <code>hover</code> returns 50 tokens instead of 2,000.
-Instead of grepping across 20 files to find a definition, <code>definition</code> returns
+<p>Instead of grepping across 20 files to find a definition, <code>definition</code> returns
 the exact location in one query. Instead of re-reading a file after editing it
-to check for errors, the <code>catenary release</code> hook returns diagnostics inline.</p>
+to check for errors, the <code>catenary release</code> hook returns diagnostics inline.
+Instead of fumbling with line numbers to find usages, <code>search</code> returns symbols,
+semantic references, and text matches in a single call.</p>
 <p>Each LSP query is small and stateless. Nothing accumulates. The context stays
 lean across the entire session, regardless of how long the agent works.</p>
 <div class="table-wrapper">
@@ -258,7 +258,7 @@ lean across the entire session, regardless of how long the agent works.</p>
 <tr><th>Graph navigation</th><th>Tokens</th><th>Context cost</th></tr>
 </thead>
 <tbody>
-<tr><td><code>hover</code> for type info</td><td>~100</td><td>stateless</td></tr>
+<tr><td><code>search</code> for symbols + references</td><td>~200</td><td>stateless</td></tr>
 <tr><td>Native edit + notify hook diagnostics</td><td>~300</td><td>no re-read</td></tr>
 <tr><td><code>definition</code></td><td>~50</td><td>stateless</td></tr>
 </tbody>
@@ -301,7 +301,7 @@ grepping — and the efficiency gains are lost.</p>
 <tr><td><strong>Eager Startup</strong></td><td>Servers for detected languages start at launch; others start on first file access</td></tr>
 <tr><td><strong>Smart Routing</strong></td><td>Requests automatically route to the correct server based on file type</td></tr>
 <tr><td><strong>Universal Support</strong></td><td>Works with any LSP-compliant language server</td></tr>
-<tr><td><strong>Full LSP Coverage</strong></td><td>Hover, definitions, references, diagnostics, rename, code actions, and more</td></tr>
+<tr><td><strong>Full LSP Coverage</strong></td><td>Definitions, references, diagnostics, rename, code actions, and more</td></tr>
 <tr><td><strong>File I/O</strong></td><td>Read, write, and edit files with automatic LSP diagnostics</td></tr>
 </tbody>
 </table>
@@ -314,13 +314,11 @@ grepping — and the efficiency gains are lost.</p>
 <tr><th>Tool</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>hover</code></td><td>Get documentation and type info for a symbol</td></tr>
+<tr><td><code>search</code></td><td>Search for symbols, semantic references, and text matches (LSP workspace symbols + references + file heatmap)</td></tr>
 <tr><td><code>definition</code></td><td>Jump to where a symbol is defined</td></tr>
 <tr><td><code>type_definition</code></td><td>Jump to the type’s definition</td></tr>
 <tr><td><code>implementation</code></td><td>Find implementations of interfaces/traits</td></tr>
-<tr><td><code>find_references</code></td><td>Find all references to a symbol (by name or position)</td></tr>
 <tr><td><code>document_symbols</code></td><td>Get the outline of a file</td></tr>
-<tr><td><code>search</code></td><td>Search for a symbol or pattern (LSP workspace symbols + file heatmap)</td></tr>
 <tr><td><code>code_actions</code></td><td>Get quick fixes and refactorings</td></tr>
 <tr><td><code>rename</code></td><td>Compute rename edits (does not modify files)</td></tr>
 <tr><td><code>diagnostics</code></td><td>Get errors and warnings</td></tr>
@@ -328,6 +326,18 @@ grepping — and the efficiency gains are lost.</p>
 <tr><td><code>type_hierarchy</code></td><td>See type inheritance</td></tr>
 <tr><td><code>status</code></td><td>Report status of all LSP servers (e.g. “Indexing”)</td></tr>
 <tr><td><code>codebase_map</code></td><td>Generate a high-level file tree with symbols</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Deprecated (being merged into <code>search</code>):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tool</th><th>Description</th><th>Replacement</th></tr>
+</thead>
+<tbody>
+<tr><td><code>hover</code></td><td>Get documentation and type info for a symbol</td><td><code>search</code> (symbols tier with hover enrichment)</td></tr>
+<tr><td><code>find_references</code></td><td>Find all references to a symbol</td><td><code>search</code> (references tier)</td></tr>
 </tbody>
 </table>
 </div>
@@ -347,7 +357,12 @@ grepping — and the efficiency gains are lost.</p>
 LSP diagnostics</strong> via the <code>catenary release</code> hook — diagnostics appear in the
 model’s context after every edit. See <a href="#cli-integration">CLI Integration</a>
 for hook configuration.</p>
-<p>All file paths are validated against workspace roots.</p>
+<p><code>list_directory</code> and <code>search</code> (with the optional <code>paths</code> parameter) can
+operate outside workspace roots — access control is delegated to the host
+CLI’s permission layer. LSP-backed operations (diagnostics, hover,
+definition, etc.) are gated to workspace roots because the language server
+has no knowledge of files outside them. Catenary config files are always
+protected from modification.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="install"><a class="header" href="#install">Install</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
@@ -443,11 +458,11 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | catenary
 <h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
 <p>Catenary loads configuration from multiple sources, in order of priority (last one wins):</p>
 <ol>
-<li><strong>Defaults</strong>: <code>idle_timeout = 300</code>.</li>
+<li><strong>Defaults</strong>: <code>idle_timeout = 300</code>, <code>log_retention_days = 7</code>.</li>
 <li><strong>User Config</strong>: <code>~/.config/catenary/config.toml</code>.</li>
 <li><strong>Project Config</strong>: <code>.catenary.toml</code> in the current directory or any parent directory (searches upwards).</li>
 <li><strong>Explicit File</strong>: Specified via <code>--config &lt;path&gt;</code>.</li>
-<li><strong>Environment Variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_IDLE_TIMEOUT=600</code>).</li>
+<li><strong>Environment Variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_IDLE_TIMEOUT=600</code>). Use <code>__</code> as a separator for nested keys (e.g., <code>CATENARY_ICONS__PRESET=nerd</code>).</li>
 <li><strong>CLI Arguments</strong>: <code>--lsp</code> and <code>--idle-timeout</code>.</li>
 </ol>
 <h2 id="basic-structure"><a class="header" href="#basic-structure">Basic Structure</a></h2>
@@ -566,6 +581,59 @@ cargo.features = "all"
 </thead>
 <tbody>
 <tr><td><code>idle_timeout</code></td><td><code>300</code></td><td>Seconds before auto-closing idle documents. Set to <code>0</code> to disable.</td></tr>
+<tr><td><code>log_retention_days</code></td><td><code>7</code></td><td>Days to keep dead session logs. <code>0</code> = remove all dead sessions on startup. <code>-1</code> = retain forever.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="icons"><a class="header" href="#icons">Icons</a></h2>
+<p>The <code>[icons]</code> table controls the icons shown in the <a href="#dashboard">dashboard</a>
+event stream. Choose a base preset and optionally override individual icons.</p>
+<h3 id="presets"><a class="header" href="#presets">Presets</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Preset</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>unicode</code> (default)</td><td>Safe symbols that render on any terminal font.</td></tr>
+<tr><td><code>nerd</code></td><td>Nerd Font glyphs (requires a <a href="https://www.nerdfonts.com/">patched font</a>).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="example"><a class="header" href="#example">Example</a></h3>
+<pre><code class="language-toml"># Use Nerd Font icons
+[icons]
+preset = "nerd"
+</code></pre>
+<pre><code class="language-toml"># Use Nerd Font icons but override lock/unlock
+[icons]
+preset = "nerd"
+lock = "\U0001F512 "
+unlock = "\U0001F511 "
+</code></pre>
+<h3 id="override-keys"><a class="header" href="#override-keys">Override keys</a></h3>
+<p>Each key replaces the preset default for that icon slot. The value is an
+arbitrary string (typically one or two characters plus a trailing space for
+alignment).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Unicode default</th><th>Nerd default</th><th>Used for</th></tr>
+</thead>
+<tbody>
+<tr><td><code>diag_error</code></td><td><code>\u2717 </code> (✗)</td><td><code> </code></td><td>Diagnostic error</td></tr>
+<tr><td><code>diag_warn</code></td><td><code>\u26A0 </code> (⚠)</td><td><code> </code></td><td>Diagnostic warning</td></tr>
+<tr><td><code>diag_info</code></td><td><code>\u2139 </code> (ℹ)</td><td><code> </code></td><td>Diagnostic info</td></tr>
+<tr><td><code>diag_ok</code></td><td><code>\u2713 </code> (✓)</td><td><code> </code></td><td>Clean diagnostics</td></tr>
+<tr><td><code>lock</code></td><td><code>\u25B6 </code> (▶)</td><td><code> </code></td><td>Lock acquired</td></tr>
+<tr><td><code>unlock</code></td><td><code>\u25C0 </code> (◀)</td><td><code> </code></td><td>Lock released</td></tr>
+<tr><td><code>tool_search</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Search tool</td></tr>
+<tr><td><code>tool_map</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Codebase map tool</td></tr>
+<tr><td><code>tool_hover</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Hover tool</td></tr>
+<tr><td><code>tool_goto</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Go-to-definition tool</td></tr>
+<tr><td><code>tool_refs</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Find references tool</td></tr>
+<tr><td><code>tool_diagnostics</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Diagnostics tool</td></tr>
+<tr><td><code>tool_default</code></td><td><code>\u2192 </code> (→)</td><td><code>\u2192 </code> (→)</td><td>Fallback for other tools</td></tr>
 </tbody>
 </table>
 </div>
@@ -599,6 +667,85 @@ during initialization.</p>
 workspace:</p>
 <pre><code class="language-bash">catenary doctor --root /path/to/project
 </code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="dashboard"><a class="header" href="#dashboard">Dashboard</a></h1>
+<p>When you run <code>catenary</code> in an interactive terminal, it launches a TUI dashboard
+for browsing active and historical sessions. When stdin and stdout are both
+pipes (i.e. launched by an MCP client), Catenary serves MCP as usual — no flags
+needed.</p>
+<h2 id="layout"><a class="header" href="#layout">Layout</a></h2>
+<p>The dashboard has two panes, each with keybinding hints in its bottom-right
+border:</p>
+<ul>
+<li><strong>Session list</strong> (top pane) — all known sessions sorted with active first,
+most recent at the top. Each row shows the session ID, workspace name, client
+name, and age. Active sessions display a green <code>●</code>; dead sessions show a dim
+<code>○</code>. If a session has running language servers, they appear on a second line.</li>
+<li><strong>Event tail</strong> (bottom pane) — a live, colored stream of events from the
+selected session. Works for both active sessions (events arrive in real time)
+and dead sessions (historical replay). Events are color-coded: dim timestamps,
+cyan language tags, green/blue tool arrows, red errors, yellow warnings.
+Consecutive progress events for the same task are collapsed to the latest one.</li>
+</ul>
+<h2 id="keybindings"><a class="header" href="#keybindings">Keybindings</a></h2>
+<h3 id="session-list-top-pane"><a class="header" href="#session-list-top-pane">Session list (top pane)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>j</code> / <code>Down</code></td><td>Select next session</td></tr>
+<tr><td><code>k</code> / <code>Up</code></td><td>Select previous session</td></tr>
+<tr><td><code>r</code></td><td>Refresh session list</td></tr>
+<tr><td><code>x</code></td><td>Delete selected session’s log (dead sessions only)</td></tr>
+<tr><td><code>q</code> / <code>Esc</code></td><td>Quit</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="event-tail-bottom-pane"><a class="header" href="#event-tail-bottom-pane">Event tail (bottom pane)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Ctrl-u</code></td><td>Scroll events up (half page)</td></tr>
+<tr><td><code>Ctrl-d</code></td><td>Scroll events down (half page)</td></tr>
+<tr><td><code>G</code></td><td>Jump to latest event (clear scroll offset)</td></tr>
+<tr><td><code>f</code></td><td>Open filter input</td></tr>
+<tr><td><code>F</code></td><td>Clear active filter</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="filter-input-mode"><a class="header" href="#filter-input-mode">Filter input mode</a></h3>
+<p>When filter input is active (after pressing <code>f</code>), the events pane border shows
+a text input:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><em>any character</em></td><td>Append to filter string</td></tr>
+<tr><td><code>Backspace</code></td><td>Delete last character</td></tr>
+<tr><td><code>Enter</code></td><td>Apply filter</td></tr>
+<tr><td><code>Esc</code></td><td>Cancel and return to normal mode</td></tr>
+</tbody>
+</table>
+</div>
+<p>The filter performs a case-insensitive substring match on the plain-text
+rendering of each event line.</p>
+<h2 id="session-pruning"><a class="header" href="#session-pruning">Session Pruning</a></h2>
+<p>On startup, the dashboard automatically removes dead session logs older than
+the configured retention period. See
+<a href="#global-options"><code>log_retention_days</code></a> in the configuration
+reference.</p>
+<h2 id="icons-1"><a class="header" href="#icons-1">Icons</a></h2>
+<p>Event icons in the dashboard are configurable via the <code>[icons]</code> table in your
+config file. You can switch between a safe Unicode set (default) and Nerd Font
+glyphs, or override individual icons. See
+<a href="#icons"><code>[icons]</code></a> in the configuration reference.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="cli-integration"><a class="header" href="#cli-integration">CLI Integration</a></h1>
 <p>Integrate catenary-mcp with existing AI coding assistants (Claude Code, Gemini
@@ -774,6 +921,32 @@ deny_message = "Use Catenary's list_directory tool instead."
   }
 }
 </code></pre>
+<p><strong>Alternative: constrained-bash hook.</strong> Instead of the policy engine, you can
+use the same <code>scripts/constrained_bash.py</code> script from the repo with Gemini’s
+<code>BeforeTool</code> hook system.</p>
+<p><strong>Install:</strong></p>
+<pre><code class="language-bash">cp /path/to/catenary/scripts/constrained_bash.py ~/.gemini/hooks/constrained_bash.py
+chmod +x ~/.gemini/hooks/constrained_bash.py
+</code></pre>
+<p><strong>Configure</strong> in <code>~/.gemini/settings.json</code>:</p>
+<pre><code class="language-json">{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.gemini/hooks/constrained_bash.py --format=gemini"
+          }
+        ]
+      }
+    ]
+  }
+}
+</code></pre>
+<p>The <code>--format=gemini</code> flag switches the denial response to Gemini’s
+<code>{"decision": "deny", "reason": "..."}</code> format.</p>
 <p><strong>Built-in tool names</strong> (from <code>packages/core/src/tools/tool-names.ts</code>):</p>
 <div class="table-wrapper">
 <table>
@@ -850,111 +1023,61 @@ running Catenary session for the workspace, returns any LSP diagnostics,
 records the file’s mtime, and releases the lock. It exits silently on any
 error so it never blocks Claude Code’s flow.</p>
 <p><strong>Alternative: Constrained mode.</strong> Keep Claude Code’s native <code>Read</code>, <code>Edit</code>,
-<code>Write</code>, and <code>Bash</code> tools but deny text-scanning commands to force LSP-first
-navigation. This deny list blocks grep, file listing, manual reads, text
-processing, shell wrappers, and framework tools that would bypass Catenary.</p>
+<code>Write</code>, and <code>Bash</code> tools but block text-scanning commands to force LSP-first
+navigation. The repo includes a hook script that implements an allowlist:
+only <code>make</code>, <code>git</code>, <code>gh</code>, and a handful of filesystem utilities are permitted.
+Everything else is denied with guidance pointing to the appropriate Catenary
+tool.</p>
+<p><strong>Install:</strong></p>
+<pre><code class="language-bash"># Symlink so the live hook stays in sync with the repo
+mkdir -p ~/.claude/hooks
+ln -s /path/to/catenary/scripts/constrained_bash.py ~/.claude/hooks/constrained_bash.py
+chmod +x /path/to/catenary/scripts/constrained_bash.py
+</code></pre>
+<p><strong>Configure</strong> in <code>~/.claude/settings.json</code>:</p>
 <pre><code class="language-json">{
-  "permissions": {
-    "allow": [
-      "WebSearch",
-      "WebFetch",
-      "mcp__catenary__*",
-      "mcp__plugin_catenary_catenary__*",
-      "ToolSearch",
-      "AskUserQuestion",
-      "Bash"
-    ],
-    "deny": [
-      "// --- 1. Search (Grep Family) ---",
-      "Bash(rg *)",
-      "Bash(ag *)",
-      "Bash(ack *)",
-      "Bash(fd *)",
-      "Bash(grep *)",
-      "Bash(egrep *)",
-      "Bash(fgrep *)",
-      "Bash(rgrep *)",
-      "Bash(zgrep *)",
-      "Bash(git grep *)",
-      "// --- 2. Navigation (Listing Family) ---",
-      "Bash(ls *)",
-      "Bash(dir *)",
-      "Bash(vdir *)",
-      "Bash(tree *)",
-      "Bash(find *)",
-      "Bash(locate *)",
-      "Bash(mlocate *)",
-      "Bash(whereis *)",
-      "Bash(which *)",
-      "Bash(git ls-files *)",
-      "Bash(git ls-tree *)",
-      "// --- 3. Peeking (Reading Family) ---",
-      "Bash(cat *)",
-      "Bash(head *)",
-      "Bash(tail *)",
-      "Bash(more *)",
-      "Bash(less *)",
-      "Bash(nl *)",
-      "Bash(od *)",
-      "Bash(hexdump *)",
-      "Bash(xxd *)",
-      "Bash(strings *)",
-      "Bash(dd *)",
-      "Bash(tee *)",
-      "// --- 4. Text Processing (Scripting Family) ---",
-      "Bash(awk *)",
-      "Bash(sed *)",
-      "Bash(perl *)",
-      "Bash(cut *)",
-      "Bash(paste *)",
-      "Bash(sort *)",
-      "Bash(uniq *)",
-      "Bash(join *)",
-      "// --- 5. Reconnaissance (Metadata Family) ---",
-      "Bash(file *)",
-      "Bash(stat *)",
-      "Bash(du *)",
-      "Bash(df *)",
-      "// --- 6. Executors &amp; Shells (The Wrapper Family) ---",
-      "Bash(bash *)",
-      "Bash(sh *)",
-      "Bash(zsh *)",
-      "Bash(dash *)",
-      "Bash(fish *)",
-      "Bash(ash *)",
-      "Bash(csh *)",
-      "Bash(ksh *)",
-      "Bash(tcsh *)",
-      "// --- 7. The Command Runners (Prevents Masquerading) ---",
-      "Bash(env *)",
-      "Bash(sudo *)",
-      "Bash(su *)",
-      "Bash(nohup *)",
-      "Bash(timeout *)",
-      "Bash(watch *)",
-      "Bash(time *)",
-      "Bash(eval *)",
-      "Bash(exec *)",
-      "Bash(command *)",
-      "Bash(builtin *)",
-      "Bash(type *)",
-      "Bash(hash *)",
-      "// --- 8. The Multiplexers ---",
-      "Bash(xargs *)",
-      "Bash(parallel *)",
-      "// --- 9. Framework Blocks ---",
-      "Grep",
-      "Glob",
-      "Task"
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/constrained_bash.py"
+          }
+        ]
+      }
     ]
-  },
-  "mcpServers": {
-    "catenary": {
-      "command": "catenary"
-    }
   }
 }
 </code></pre>
+<p>The script provides specific guidance per command (<code>Use Catenary's search tool instead.</code>, <code>Use the Read tool instead.</code>, etc.) so the model corrects course
+immediately rather than attempting workarounds.</p>
+<p><strong>Troubleshooting:</strong></p>
+<ul>
+<li>
+<p><strong>Hook silently allows blocked commands.</strong> The script must be executable.
+<code>chmod +x</code> on the script file (or the repo file if you use a symlink) is
+required. Without it, Claude Code gets a permission error, treats the hook as
+a non-blocking failure, and lets the command through.</p>
+</li>
+<li>
+<p><strong>Hook allows blocked commands and logs a JSON parse error.</strong> Claude Code
+spawns a shell that sources your profile. If <code>~/.zshrc</code> or <code>~/.bashrc</code> prints
+anything unconditionally (e.g. <code>fastfetch</code>, <code>neofetch</code>, a startup banner),
+that output is prepended to the hook’s JSON and corrupts the parse. Add this
+guard at the very top of both files:</p>
+<pre><code class="language-zsh"># Skip the rest of this file for non-interactive shells (e.g. hook runners)
+[[ -o interactive ]] || return
+</code></pre>
+</li>
+<li>
+<p><strong>Blocked commands appear as “Read” in the UI.</strong> Claude Code relabels Bash
+commands that contain <code>tail</code>, <code>head</code>, or <code>cat</code> as a native Read operation in
+the transcript view. The hook still fires on the Bash event and blocks
+correctly — the relabeling is cosmetic only.</p>
+</li>
+</ul>
 <p>This keeps <code>Bash</code> available for build/test/git commands while blocking every
 path that would let the model fall back to text scanning. The model uses:</p>
 <ul>
@@ -1003,11 +1126,9 @@ by giving explicit deny messages instead of silently removing tools.</p>
 </thead>
 <tbody>
 <tr><td><code>list_directory</code></td><td>File I/O</td><td>Files, dirs, symlinks</td></tr>
-<tr><td><code>search</code></td><td>LSP</td><td>Workspace symbols + grep fallback</td></tr>
-<tr><td><code>find_references</code></td><td>LSP</td><td>LSP references</td></tr>
+<tr><td><code>search</code></td><td>LSP</td><td>Symbols + semantic references + text matches</td></tr>
 <tr><td><code>codebase_map</code></td><td>LSP</td><td>File tree with symbols</td></tr>
 <tr><td><code>document_symbols</code></td><td>LSP</td><td>File structure</td></tr>
-<tr><td><code>hover</code></td><td>LSP</td><td>Type info, docs</td></tr>
 <tr><td><code>diagnostics</code></td><td>LSP</td><td>Errors, warnings</td></tr>
 <tr><td>…</td><td>LSP</td><td><a href="#available-tools">Full list</a></td></tr>
 </tbody>
@@ -1105,52 +1226,46 @@ If a request arrives for a language whose server is not yet running, Catenary
 spawns it on demand. Dead servers are automatically restarted on the next
 request.</p>
 <h2 id="diagnostics-consistency"><a class="header" href="#diagnostics-consistency">Diagnostics Consistency</a></h2>
-<p>LSP has two interaction models. Request/response operations — hover,
-go-to-definition, document symbols — return consistent results directly: the
-server computes the answer on demand and sends it back. Diagnostics work
-differently. Servers push them asynchronously via <code>textDocument/publishDiagnostics</code>
-whenever analysis completes, and Catenary caches whatever arrived last.</p>
+<p>LSP has two interaction models. Request/response operations — go-to-definition,
+document symbols — return consistent results directly: the server computes the
+answer on demand and sends it back. Diagnostics work differently. Servers push
+them asynchronously via <code>textDocument/publishDiagnostics</code> whenever analysis
+completes, and Catenary caches whatever arrived last.</p>
 <p>This creates a consistency problem. After a file change is sent to the server,
 there is a window where the diagnostics cache still holds results from before
 the change. If the result is returned during this window, the agent receives
 stale diagnostics and may proceed unaware of errors it just introduced.</p>
-<p>Catenary buffers this eventually consistent gap to ensure diagnostics are
-current before returning them. Each URI has a generation counter that
-increments every time <code>publishDiagnostics</code> arrives for it. Before sending a
-change notification (<code>didOpen</code>/<code>didChange</code>) to the server, Catenary snapshots
-the counter. After sending, it waits for the server to publish diagnostics for
-that URI — advancing the counter past the snapshot — before reading the cache
-and returning results. Because the snapshot is taken before the change is sent,
-there is no race window: any publication that arrives after the snapshot
-necessarily reflects the change or something newer.</p>
-<p>The wait is split into two phases. Phase 1 uses a strategy selected per-server
-based on runtime observations:</p>
+<p>Catenary buffers this gap to ensure diagnostics are current before returning
+them. Each URI has a generation counter that increments every time
+<code>publishDiagnostics</code> arrives for it. Before sending a change notification
+(<code>didOpen</code>/<code>didChange</code>) to the server, Catenary snapshots the counter. After
+sending, it waits for the server to publish diagnostics for that URI —
+advancing the counter past the snapshot — before reading the cache and
+returning results.</p>
+<p>The wait uses a strategy selected per-server based on runtime observations:</p>
 <ul>
 <li><strong>Version</strong> — the server includes a <code>version</code> field in <code>publishDiagnostics</code>.
-Catenary waits for the generation counter to advance past the snapshot. This
-is the strongest signal but has not been observed from any server in practice.</li>
+Catenary waits for a version match — causal proof the server processed the
+change.</li>
 <li><strong><code>TokenMonitor</code></strong> — the server sends <code>$/progress</code> tokens (e.g.,
-rust-analyzer’s flycheck). Catenary waits for the server to cycle from Active
-to Idle, indicating analysis is complete. A hard timeout prevents infinite
-hangs if the server never starts work for a given change.</li>
-<li><strong><code>ProcessMonitor</code></strong> — the server sends neither version nor progress tokens.
-Catenary polls the server process’s CPU time via <code>/proc/&lt;pid&gt;/stat</code> (Linux)
-or <code>ps</code> (macOS) to infer activity. Trust-based patience decays on consecutive
-timeouts without diagnostics arriving (120s → 60s → 30s → 5s), preventing
-long waits on servers that consistently don’t produce diagnostics for certain
-change patterns.</li>
+rust-analyzer’s flycheck). Catenary waits for the Active → Idle transition.</li>
 </ul>
-<p>Phase 2 is a 2-second activity settle, shared by all strategies. After Phase 1
-signals completion, Catenary continues observing the server’s notification
-stream and progress state. Only when the server has been completely silent for
-2 seconds with no active progress tokens does Catenary read the cache and
-return. This catches servers like rust-analyzer that publish diagnostics in
-multiple rounds — fast warnings from native analysis followed by slower
-type-checking errors from flycheck.</p>
+<p>Servers that provide neither version nor progress do not participate in the
+diagnostics lifecycle. They still receive <code>didOpen</code>/<code>didChange</code> for code
+intelligence but no diagnostics are returned.</p>
+<p>Failure detection uses CPU ticks instead of wall-clock timeouts. A
+<code>ProcessMonitor</code> (backed by <code>/proc/&lt;pid&gt;/stat</code> on Linux, <code>proc_pidinfo</code> on
+macOS, <code>GetProcessTimes</code> on Windows) tracks the server’s CPU consumption. Only
+unexplained work — Running with advancing ticks and no active <code>$/progress</code>
+tokens — drains the failure threshold (1000 ticks = 10 CPU-seconds). Sleeping,
+blocked, starved, and progress-explained ticks are free waits.</p>
+<p><code>didSave</code> is gated on <code>textDocumentSync.save</code> from <code>ServerCapabilities</code>. Only
+servers that advertise save support receive <code>textDocument/didSave</code>.</p>
 <p>This mechanism applies to the paths that return diagnostics after a change:
 the <code>catenary release</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
-tool. Request/response tools like <code>hover</code> and <code>document_symbols</code> do not need
+tool. Request/response tools (<code>definition</code>, <code>document_symbols</code>) do not need
 it — their results come directly from the server response, not from the cache.</p>
+<p>See <a href="#wait-model">Wait Model</a> for full design details.</p>
 <h2 id="root-synchronization"><a class="header" href="#root-synchronization">Root Synchronization</a></h2>
 <p>When the MCP client sends a <code>notifications/roots/list_changed</code> notification,
 Catenary:</p>
@@ -1159,10 +1274,17 @@ Catenary:</p>
 <li>Diffs the new roots against the current set.</li>
 <li>Updates the <code>PathValidator</code> security boundary.</li>
 <li>Sends a batched <code>workspace/didChangeWorkspaceFolders</code> notification to each
-active LSP server.</li>
+active LSP server. When folders are added, the server is proactively marked
+as <code>Indexing</code> so that subsequent queries block until re-indexing completes.</li>
 <li>Spawns any newly needed LSP servers for languages detected in the added
 roots.</li>
 </ol>
+<p>The readiness wait after step 4 uses the same <code>wait_ready()</code> mechanism as
+initial startup. For servers that report <code>$/progress</code> (e.g., rust-analyzer),
+the wait is event-driven — queries unblock when the progress cycle completes.
+For servers without progress support, Catenary falls back to activity settle
+(the same <code>ProcessMonitor</code>-style polling used by the diagnostics system),
+transitioning to <code>Ready</code> once the server has been quiet for 2 seconds.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="plugin-architecture"><a class="header" href="#plugin-architecture">Plugin Architecture</a></h1>
 <p>Catenary ships plugins for two AI CLI hosts from a single repository. Each host
@@ -1439,6 +1561,388 @@ args = ["--stdio"]
 Any gotchas, tips, or links to official docs.
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="language-server-landscape"><a class="header" href="#language-server-landscape">Language Server Landscape</a></h1>
+<p>Compiled from the <a href="https://microsoft.github.io/language-server-protocol/implementors/servers/">Microsoft LSP implementors list</a>
+and <a href="https://langserver.org/">langserver.org</a>.</p>
+<p><strong>Version</strong> = includes <code>version</code> field in <code>publishDiagnostics</code> (LSP 3.15+, 2019).
+<strong>Progress</strong> = sends <code>$/progress</code> tokens (LSP 3.15+).
+<strong>Strategy</strong> = what Catenary would use for done detection.</p>
+<p>Legend: Y = Yes, N = No, ? = Unverified, — = N/A (no diagnostics).</p>
+<p><strong>LSP spec (inherited)</strong>: The server uses a standard LSP library (e.g., <code>vscode-languageserver</code> for Node, <code>pygls</code> for Python, <code>tower-lsp</code> for Rust, or <code>eclipse.lsp4j</code> for Java). These libraries have implemented the LSP 3.15+ specification (2019) by default, meaning they automatically include the <code>version</code> field in diagnostics and handle progress tokens without manual developer intervention.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Language</th><th>Server</th><th>Version</th><th>Progress</th><th>Strategy</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td>1C Enterprise</td><td>BSL Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>ABAP</td><td>abaplint</td><td>Y</td><td>N</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>ActionScript 2.0</td><td>AS2 Language Support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ActionScript 3</td><td>vscode-nextgenas</td><td>Y</td><td>Y</td><td>Version</td><td>as3mxml / BowlerHatLLC</td></tr>
+<tr><td>Ada/SPARK</td><td>ada_language_server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Agda</td><td>agda-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>AML</td><td>AML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Angular</td><td>Angular Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Ansible</td><td>Ansible Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>ANTLR</td><td>AntlrVSIX</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Apache Camel</td><td>camel-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Apache Dispatcher</td><td>vscode-apache-dispatcher-config</td><td>Y</td><td>N</td><td>Version</td><td>BeardedFish / LSP spec</td></tr>
+<tr><td>Apex</td><td>VS Code Apex extension</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>APL</td><td>APL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>API Elements</td><td>vscode-apielements</td><td>Y</td><td>N</td><td>Version</td><td>XVincentX / LSP spec</td></tr>
+<tr><td>Astro</td><td>withastro/language-tools</td><td>Y</td><td>N</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>AWK</td><td>awk-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>B/ProB</td><td>B-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Ballerina</td><td>Ballerina Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Bash</td><td>bash-language-server</td><td>Y</td><td>N</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Batch</td><td>rech-editor-batch</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Bazel</td><td>bazel-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>BibTeX</td><td>citation-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Bicep</td><td>Bicep</td><td>Y</td><td>Y</td><td>Version</td><td>Microsoft / LSP spec</td></tr>
+<tr><td>BitBake</td><td>BitBake Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Boriel Basic</td><td>boriel-basic-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>BrightScript</td><td>brighterscript</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>C/C++</td><td>clangd</td><td>Y</td><td>Y</td><td>Version</td><td>clangd.llvm.org/extensions</td></tr>
+<tr><td>C/C++</td><td>ccls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>C/C++</td><td>cquery (archived)</td><td>?</td><td>N</td><td>?</td><td>?</td></tr>
+<tr><td>C#</td><td>omnisharp-roslyn</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>C#</td><td>csharp-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>C#</td><td>LanguageServer.NET</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Chapel</td><td>chapel-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Clarity</td><td>clarity-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Clojure</td><td>clojure-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>CMake</td><td>cmake-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>CMake</td><td>neocmakelsp</td><td>Y</td><td>N</td><td>Version</td><td>Source code (Rust)</td></tr>
+<tr><td>COBOL</td><td>COBOL Language Support</td><td>Y</td><td>Y</td><td>Version</td><td>eclipse.lsp4j (Java)</td></tr>
+<tr><td>COBOL</td><td>rech-editor-cobol</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CodeQL</td><td>codeql</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CoffeeScript</td><td>CoffeeSense</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Common Lisp</td><td>cl-lsp</td><td>?</td><td>?</td><td>?</td><td>Common Lisp (hand-rolled)</td></tr>
+<tr><td>Common Lisp</td><td>alive-lsp</td><td>?</td><td>?</td><td>?</td><td>Common Lisp (hand-rolled)</td></tr>
+<tr><td>Common Workflow Language</td><td>Benten</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Compose</td><td>docker-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Coq</td><td>coq-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>rocq-prover.org</td></tr>
+<tr><td>Coq</td><td>vscoq</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Crystal</td><td>Crystalline</td><td>Y</td><td>N</td><td>Version</td><td>crystal-lang.org</td></tr>
+<tr><td>Crystal</td><td>Scry</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CSS/LESS/SASS</td><td>vscode-css-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>Cucumber/Gherkin</td><td>Cucumber Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>CWL</td><td>Benten</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Cython</td><td>cyright</td><td>Y</td><td>Y</td><td>Version</td><td>Pyright fork (node)</td></tr>
+<tr><td>D</td><td>serve-d</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>D</td><td>D Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Dart</td><td>Dart SDK (analysis_server)</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Data Pack</td><td>Data-pack Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Debian Packaging</td><td>debputy lsp server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Delphi</td><td>DelphiLSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Delphi</td><td>DelphiLSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>DenizenScript</td><td>DenizenVSCode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Deno</td><td>deno lsp</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Devicetree</td><td>dts-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Dockerfile</td><td>dockerfile-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Dockerfile</td><td>docker-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>DreamMaker</td><td>DreamMaker Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Egglog</td><td>egglog-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Elixir</td><td>elixir-ls</td><td>Y</td><td>Y</td><td>Version</td><td>Source, call hierarchy</td></tr>
+<tr><td>Elm</td><td>elm-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Emacs Lisp</td><td>ellsp</td><td>?</td><td>N</td><td>?</td><td>Emacs Lisp (hand-rolled)</td></tr>
+<tr><td>Ember</td><td>Ember Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erg</td><td>els</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erlang</td><td>erlang_ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erlang</td><td>ELP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Erlang</td><td>sourcer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>F#</td><td>FsAutoComplete</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Fennel</td><td>fennel-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>fish</td><td>fish-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>fluent-bit</td><td>fluent-bit-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Flux</td><td>flux-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Fortran</td><td>fortls</td><td>Y</td><td>Y</td><td>Version</td><td>fortran-lang.org</td></tr>
+<tr><td>Fortran</td><td>fortran-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Fuzion</td><td>Fuzion Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Gauge</td><td>Gauge Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GDScript</td><td>Godot</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Gleam</td><td>gleam</td><td>Y</td><td>Y</td><td>Version</td><td>gleam.run</td></tr>
+<tr><td>Glimmer</td><td>Glint</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GLSL</td><td>glsl-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (C++)</td></tr>
+<tr><td>Gluon</td><td>Gluon Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GN</td><td>gn-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Go</td><td>gopls</td><td>Y</td><td>Y</td><td>Version</td><td>Source, issue #65801</td></tr>
+<tr><td>Grain</td><td>grain</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GraphQL</td><td>GraphQL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>GraphQL</td><td>GQL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Graphviz/DOT</td><td>dot-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Groovy</td><td>groovy-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Hack</td><td>HHVM LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Haskell</td><td>Haskell Language Server (HLS)</td><td>Y</td><td>Y</td><td>Version</td><td>lsp Haskell library</td></tr>
+<tr><td>Haxe</td><td>Haxe Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Helm</td><td>helm-ls</td><td>Y</td><td>?</td><td>Version</td><td>Go (proxies yaml-ls)</td></tr>
+<tr><td>HLASM</td><td>HLASM Language Support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>HLSL</td><td>HLSL Tools</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>HTML</td><td>vscode-html-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>HTML</td><td>SuperHTML</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Idris2</td><td>idris2-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ink!</td><td>ink! Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Isabelle</td><td>Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Java</td><td>Eclipse JDT LS</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Java</td><td>javac API-based</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>JavaScript</td><td>quick-lint-js</td><td>?</td><td>N</td><td>?</td><td>?</td></tr>
+<tr><td>JavaScript (Flow)</td><td>flow</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>JavaScript/TypeScript</td><td>typescript-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>Source code, Changelog</td></tr>
+<tr><td>JavaScript/TypeScript</td><td>biome_lsp</td><td>Y</td><td>Y</td><td>Version</td><td>Source code</td></tr>
+<tr><td>JSON</td><td>vscode-json-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>Jsonnet</td><td>jsonnet-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Julia</td><td>LanguageServer.jl</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Kconfig</td><td>kconfig-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>KDL</td><td>vscode-kdl</td><td>Y</td><td>N</td><td>Version</td><td>kdl-org / LSP spec</td></tr>
+<tr><td>KDL</td><td>kdl-lsp</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Kedro</td><td>Kedro VSCode Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Kerboscript</td><td>kos-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>KerML/SysML v2</td><td>SysML2 Tools</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Kotlin</td><td>kotlin-language-server</td><td>Y</td><td>N</td><td>Version</td><td>github.com/fwcd</td></tr>
+<tr><td>Kotlin</td><td>kotlin-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Langium</td><td>langium</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>LanguageTool</td><td>ltex-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lark</td><td>lark-parser-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>LaTeX</td><td>texlab</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Lean4</td><td>Language Server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Liquid</td><td>theme-check</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lox</td><td>loxcraft</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>LPC</td><td>lpc-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lua</td><td>lua-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>Docs</td></tr>
+<tr><td>Lua</td><td>lua-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Lua</td><td>LuaHelper</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Make</td><td>make-lsp-vscode</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Make</td><td>make-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Markdown</td><td>Marksman</td><td>Y</td><td>Y</td><td>Version</td><td>Source code</td></tr>
+<tr><td>Markdown</td><td>vscode-markdown-languageserver</td><td>Y</td><td>N</td><td>Version</td><td>VS Code built-in</td></tr>
+<tr><td>MATLAB</td><td>MATLAB-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>MDX</td><td>mdx-js/mdx-analyzer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>MOCA</td><td>moca-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Motorola 68000</td><td>m68k-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>MSBuild</td><td>msbuild-project-tools-vscode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>NASM/GO/GAS Assembly</td><td>asm-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nextflow</td><td>language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nginx</td><td>nginx-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nim</td><td>nimlsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nix</td><td>nil</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Nix</td><td>nixd</td><td>Y</td><td>Y</td><td>Version</td><td>Source code</td></tr>
+<tr><td>OCaml/Reason</td><td>ocamllsp</td><td>Y</td><td>N</td><td>Version</td><td>tarides.com</td></tr>
+<tr><td>Odin</td><td>ols</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>OpenAPI</td><td>AML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>OpenEdge ABL</td><td>ABL Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>openVALIDATION</td><td>ov-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Papyrus</td><td>papyrus-lang</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PartiQL</td><td>aws-lsp-partiql</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Perl</td><td>Perl Navigator</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Perl</td><td>PLS</td><td>?</td><td>N</td><td>?</td><td>Pure Perl (hand-rolled)</td></tr>
+<tr><td>Perl</td><td>Perl::LanguageServer</td><td>?</td><td>N</td><td>?</td><td>Pure Perl/CPAN (hand-rolled)</td></tr>
+<tr><td>Pest</td><td>Pest IDE Tools</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHP</td><td>intelephense</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>PHP</td><td>phpactor</td><td>Y</td><td>N</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>PHP</td><td>Serenata</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHP</td><td>Phan</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHP</td><td>php-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PHPUnit</td><td>phpunit-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PL/SQL</td><td>PL/SQL language server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PlantUML</td><td>plantuml-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Polymer</td><td>polymer-editor-service</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Pony</td><td>PonyLS</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PowerPC Assembly</td><td>PowerPC Support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PowerShell</td><td>PowerShell Editor Services</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>PromQL</td><td>promql-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Protocol Buffers</td><td>protols</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Protocol Buffers</td><td>buf-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Puppet</td><td>puppet-editor-services</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>PureScript</td><td>purescript-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>Pyright</td><td>Y</td><td>Workspace only</td><td>Version</td><td>GitHub discussion #6818</td></tr>
+<tr><td>Python</td><td>Basedpyright</td><td>Y</td><td>Workspace only</td><td>Version</td><td>GitHub discussion #6818</td></tr>
+<tr><td>Python</td><td>python-lsp-server (pylsp)</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Python</td><td>jedi-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>pylyzer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>ty</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Python</td><td>Pyrefly</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Q#</td><td>Q# Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>QML</td><td>qmlls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>R</td><td>R languageserver</td><td>Y</td><td>N</td><td>Version</td><td>r-project.org</td></tr>
+<tr><td>Racket</td><td>racket-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Raku</td><td>Raku Navigator</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>RAML</td><td>AML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Rascal</td><td>util::LanguageServer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ReasonML</td><td>reason-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Red</td><td>redlangserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Rego</td><td>Regal</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>ReScript</td><td>rescript-vscode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Robot Framework</td><td>robotframework-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Robot Framework</td><td>RobotCode</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Robots.txt</td><td>vscode-robots-dot-txt-support</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Ruby</td><td>Ruby LSP</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Ruby</td><td>Solargraph</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Ruby</td><td>Sorbet</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Rust</td><td>rust-analyzer</td><td>Y</td><td>Y</td><td>Version</td><td>Docs, issue trackers</td></tr>
+<tr><td>Scala</td><td>Metals</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Scheme</td><td>scheme-langserver</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Shader</td><td>shader-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Slint</td><td>slint-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Smalltalk/Pharo</td><td>Pharo Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Smithy</td><td>Smithy Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SPARQL</td><td>Qlue-ls</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Sphinx/RST</td><td>esbonio</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SQL</td><td>sqls</td><td>?</td><td>?</td><td>?</td><td>Go (unmaintained)</td></tr>
+<tr><td>SQL</td><td>sqlls</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Standard ML</td><td>Millet</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Stimulus</td><td>Stimulus LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Svelte</td><td>svelte-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Sway</td><td>sway-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Swift</td><td>SourceKit-LSP</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>systemd</td><td>systemd-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Systemtap</td><td>Systemtap LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>svls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>Verible</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>slang-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>SystemVerilog</td><td>Sigasi</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>T-SQL</td><td>VS Code SQL extension</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Tailwind CSS</td><td>Tailwind Intellisense</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Teal</td><td>teal-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Termux configs</td><td>termux-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>pygls (Python)</td></tr>
+<tr><td>Terraform</td><td>terraform-ls</td><td>N</td><td>Y</td><td>Progress</td><td>GitHub issue #1365</td></tr>
+<tr><td>Terraform</td><td>terraform-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Thrift</td><td>thrift-ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>TOML</td><td>Taplo</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>TOML</td><td>Tombi</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>TTCN-3</td><td>ntt</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Turtle</td><td>Turtle Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Twig</td><td>Twig Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>TypeCobol</td><td>TypeCobol Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Typst</td><td>tinymist</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Typst</td><td>typst-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>V</td><td>v-analyzer</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Vala</td><td>vala-language-server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>VDM</td><td>VDMJ-LSP</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Veryl</td><td>Veryl Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>VHDL</td><td>vhdl_ls</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>VHDL</td><td>Sigasi</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Viml</td><td>vim-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Visualforce</td><td>VS Code Visualforce extension</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Vue</td><td>vuejs/language-tools (Volar)</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>Vue</td><td>vuejs/vetur (deprecated)</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>WebAssembly</td><td>wasm-language-tools</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>WGSL</td><td>wgsl-analyzer</td><td>Y</td><td>Y</td><td>Version</td><td>tower-lsp (Rust)</td></tr>
+<tr><td>Wikitext</td><td>VSCode-WikiParser</td><td>Y</td><td>Y</td><td>Version</td><td>vscode-languageserver (node)</td></tr>
+<tr><td>Wing</td><td>Wing</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Wolfram</td><td>lsp-wl</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Wolfram</td><td>LSPServer</td><td>Y</td><td>?</td><td>Version</td><td>Wolfram Research</td></tr>
+<tr><td>XML</td><td>LemMinX</td><td>Y</td><td>Y</td><td>Version</td><td>eclipse.lsp4j (Java)</td></tr>
+<tr><td>XML</td><td>XML Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>YAML</td><td>yaml-language-server</td><td>Y</td><td>Y</td><td>Version</td><td>LSP spec (inherited)</td></tr>
+<tr><td>YANG</td><td>yang-lsp</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>YARA</td><td>YARA Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Zig</td><td>zls</td><td>Y</td><td>Y</td><td>Version</td><td>Source</td></tr>
+<tr><td>Multi-language</td><td>SonarLint Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Multi-language</td><td>efm-langserver</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>Multi-language</td><td>diagnostic-languageserver</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>Multi-language</td><td>harper (prose)</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+<tr><td>Multi-language</td><td>Copilot Language Server</td><td>?</td><td>?</td><td>?</td><td>?</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="verified-servers"><a class="header" href="#verified-servers">Verified Servers</a></h2>
+<p>These have been confirmed through documentation, source code, or issue trackers:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Language</th><th>Server</th><th>Version</th><th>Progress</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td>Rust</td><td>rust-analyzer</td><td>Y</td><td>Y</td><td>Docs, issue trackers</td></tr>
+<tr><td>Python</td><td>Pyright / Basedpyright</td><td>Y</td><td>Workspace only</td><td>GitHub discussion #6818</td></tr>
+<tr><td>TypeScript/JS</td><td>typescript-language-server</td><td>Y</td><td>Y</td><td>Source code, Changelog</td></tr>
+<tr><td>Go</td><td>gopls</td><td>Y</td><td>Y</td><td>Source, issue #65801</td></tr>
+<tr><td>C/C++</td><td>clangd</td><td>Y</td><td>Y</td><td>clangd.llvm.org/extensions</td></tr>
+<tr><td>C#</td><td>omnisharp-roslyn</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Java</td><td>Eclipse JDT LS</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>COBOL</td><td>COBOL Language Support</td><td>Y</td><td>Y</td><td>eclipse.lsp4j (Java)</td></tr>
+<tr><td>Lua</td><td>lua-language-server</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Dart</td><td>Dart SDK</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Deno</td><td>deno lsp</td><td>Y</td><td>Y</td><td>Docs</td></tr>
+<tr><td>Zig</td><td>zls</td><td>Y</td><td>Y</td><td>Source</td></tr>
+<tr><td>CSS/LESS/SASS</td><td>vscode-css-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>HTML</td><td>vscode-html-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>JSON</td><td>vscode-json-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>Markdown</td><td>vscode-markdown-languageserver</td><td>Y</td><td>N</td><td>VS Code built-in</td></tr>
+<tr><td>Terraform</td><td>terraform-ls</td><td>N</td><td>Y</td><td>GitHub issue #1365</td></tr>
+<tr><td>Elixir</td><td>elixir-ls</td><td>Y</td><td>Y</td><td>Source, call hierarchy</td></tr>
+<tr><td>Haskell</td><td>HLS</td><td>Y</td><td>Y</td><td>lsp Haskell library</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="verification-sources"><a class="header" href="#verification-sources">Verification Sources</a></h2>
+<ul>
+<li><strong>typescript-language-server</strong>: Supported <code>workDoneProgress</code> confirmed in <a href="https://github.com/typescript-language-server/typescript-language-server/blob/master/CHANGELOG.md">CHANGELOG.md</a> (v0.29.0).</li>
+<li><strong>terraform-ls</strong>: <code>version</code> field in <code>publishDiagnostics</code> is an open enhancement request: <a href="https://github.com/hashicorp/terraform-ls/issues/1365">Issue #1365</a>.</li>
+<li><strong>elixir-ls</strong>: Supports LSP 3.15+ (call hierarchy added in v0.29.0). Uses <code>gen_lsp</code> which includes the <code>version</code> field.</li>
+<li><strong>Haskell Language Server (HLS)</strong>: Built on the <code>lsp</code> Haskell library which implements LSP 3.15.</li>
+<li><strong>bash-language-server</strong>: Uses <code>vscode-languageserver</code> node package (supports <code>version</code>). <code>workDoneProgress</code> is explicitly disabled for many providers in <code>server.ts</code>.</li>
+<li><strong>vscode-markdown-languageserver</strong>: Built-in VS Code server. Inherits <code>version</code> support from <code>vscode-languageserver</code> node package; does not typically use <code>$/progress</code> for its fast operations.</li>
+<li><strong>biome_lsp</strong>: Modern Rust-based server, supports <code>versionSupport</code> and <code>workDoneProgress</code>.</li>
+<li><strong>nixd</strong>: Adheres to standard LSP for diagnostic and progress reporting.</li>
+<li><strong>taplo</strong>: Supports <code>workDoneProgress</code> as confirmed in Helix and other LSP client logs.</li>
+<li><strong>termux-language-server</strong>: Python 3.10+, depends on <code>pygls</code>. Inherits <code>version</code> and <code>$/progress</code> from the library.</li>
+<li><strong>Perl Navigator</strong>: Node.js server by bscan. Uses <code>vscode-languageserver</code> (LSP 3.15+).</li>
+<li><strong>PLS</strong> (giraffate): Pure Perl implementation. Progress support absent; versioning unconfirmed.</li>
+<li><strong>Perl::LanguageServer</strong>: CPAN module. Progress support absent in feature list.</li>
+<li><strong>sqls</strong>: Legacy Go implementation, unmaintained. May not support modern fields.</li>
+<li><strong>sqlls</strong>: Modern Node.js successor. Inherits LSP 3.15+ from <code>vscode-languageserver</code>.</li>
+<li><strong>LemMinX</strong>: Java server using <code>eclipse.lsp4j</code>, which fully supports LSP 3.15+.</li>
+<li><strong>COBOL Language Support</strong>: Java server (Eclipse Che4z) using <code>eclipse.lsp4j</code>. Full LSP 3.15+.</li>
+<li><strong>dockerfile-language-server</strong>: Node.js by rcjsuen. Uses <code>vscode-languageserver</code>.</li>
+<li><strong>docker-language-server</strong>: Official Docker Node.js server. Full LSP 3.15+.</li>
+<li><strong>awk-language-server</strong>: Node.js by Beaglefoot. Uses <code>vscode-languageserver</code>.</li>
+<li><strong>MATLAB-language-server</strong>: Official MathWorks Node.js implementation. LSP 3.15+.</li>
+<li><strong>Wolfram LSPServer</strong>: Official by Wolfram Research. Supports <code>publishDiagnostics</code>; <code>$/progress</code> unconfirmed.</li>
+<li><strong>wasm-language-tools</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>wgsl-analyzer</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>cl-lsp</strong>: Early Common Lisp implementation. Versioning and progress unconfirmed/in development.</li>
+<li><strong>alive-lsp</strong>: Common Lisp implementation. Publishes diagnostics; versioning and progress unconfirmed.</li>
+<li><strong>ellsp</strong>: Emacs Lisp. Minimal implementation; progress and versioning likely unsupported.</li>
+<li><strong>elm-language-server</strong>: Node.js using <code>vscode-languageserver</code>. Full LSP 3.15+.</li>
+<li><strong>fish-lsp</strong>: Node.js using <code>vscode-languageserver</code>. Full LSP 3.15+.</li>
+<li><strong>helm-ls</strong>: Go by mrjosh. Proxies to <code>yaml-language-server</code> for most diagnostics.</li>
+<li><strong>kdl-lsp</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>shader-language-server</strong>: Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>Qlue-ls</strong>: SPARQL server in Rust using <code>tower-lsp</code>. Full LSP 3.15+.</li>
+<li><strong>cyright</strong>: Cython fork of Pyright. Inherits <code>vscode-languageserver</code> implementation.</li>
+<li><strong>General</strong>: Many servers using <code>vscode-languageserver</code> (Node), <code>pygls</code> (Python), or <code>tower-lsp</code> (Rust) inherit support for these fields if updated recently.</li>
+</ul>
+<h2 id="observations"><a class="header" href="#observations">Observations</a></h2>
+<ol>
+<li>
+<p>Every verified major language server includes <code>version</code> in <code>publishDiagnostics</code>.
+The field has been in the LSP spec since 3.15 (2019). It costs nothing to implement.</p>
+</li>
+<li>
+<p><code>$/progress</code> is common but not universal. Servers that do heavy background work
+(indexing, type-checking) tend to support it. Lightweight servers (JSON, HTML, CSS)
+skip it because their operations are fast enough to not need progress reporting.</p>
+</li>
+<li>
+<p>The ProcessMonitor path (no version, no progress) is genuinely a last resort.
+The only servers that would land there are hand-rolled implementations in
+languages without a dominant LSP framework — Common Lisp and Emacs Lisp.
+The intersection of “using these servers” and “using Catenary with an AI
+agent” is vanishingly small.</p>
+</li>
+<li>
+<p>The framework is the story. <code>vscode-languageserver</code> (Node), <code>pygls</code> (Python),
+<code>tower-lsp</code> (Rust), and <code>eclipse.lsp4j</code> (Java) all implement LSP 3.15+ by
+default. Any server built on these frameworks gets <code>version</code> and <code>$/progress</code>
+for free.</p>
+</li>
+<li>
+<p>The <code>?</code> entries are not verified. Filling these in requires inspecting each server’s
+source or testing against a live instance. This is a living document.</p>
+</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="ai-agent-integration"><a class="header" href="#ai-agent-integration">AI Agent Integration</a></h1>
 <p>This guide helps AI coding assistants use Catenary effectively. The goal is to
 reduce context bloat and token usage by using semantic LSP queries instead of
@@ -1461,11 +1965,9 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 | Task | Use | Instead of |
 |------|-----|------------|
 | Find where something is defined | `definition` | grep/ripgrep |
-| Find all usages of a symbol | `find_references` | grep/ripgrep |
-| Get type info or documentation | `hover` | Reading entire files |
-| Understand a file's structure | `document_symbols` | Reading entire files |
+| Find all usages of a symbol | `search` | grep/ripgrep |
 | Find a class/function by name | `search` | grep/glob patterns |
-| See available methods on an object | `completion` | Reading class definitions |
+| Understand a file's structure | `document_symbols` | Reading entire files |
 | Find implementations of interface | `implementation` | grep for impl blocks |
 | Rename a symbol safely | `rename` | Find/replace with grep |
 | Check for errors after edits | `diagnostics` | Running compiler |
@@ -1474,7 +1976,7 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 ### Why This Matters
 
 - A single 500-line file read costs ~2000-4000 tokens
-- An `hover` call costs ~50-200 tokens
+- A `search` call costs ~200-500 tokens and returns symbols + references + text matches
 - One file read ≈ 10-20 targeted LSP queries
 - Reducing unnecessary reads prevents context compression and re-reads
 
@@ -1507,7 +2009,6 @@ so you immediately see any errors introduced by changes.</p>
 <p><strong>Use LSP tools</strong> for:</p>
 <ul>
 <li>Finding definitions, references, and symbols</li>
-<li>Getting type info and documentation (hover)</li>
 <li>Understanding file structure (document_symbols)</li>
 <li>Checking errors after changes (diagnostics)</li>
 </ul>
@@ -1530,10 +2031,8 @@ so you immediately see any errors introduced by changes.</p>
 </ol>
 <p><strong>Efficient approach:</strong></p>
 <ol>
-<li><code>search</code> for “auth” - returns symbol names with locations</li>
+<li><code>search</code> for “auth” — returns symbols, semantic references, and text matches</li>
 <li><code>definition</code> to jump to the specific handler</li>
-<li><code>hover</code> on unfamiliar types to understand them</li>
-<li><code>find_references</code> to see how the handler is called</li>
 <li>Read the specific function you need to modify</li>
 <li>Edit to make the change — diagnostics returned via notify hook</li>
 </ol>
@@ -1559,9 +2058,8 @@ Read the specific code you need to understand
 </thead>
 <tbody>
 <tr><td>Read a 500-line file</td><td>~2000-4000</td></tr>
-<tr><td><code>hover</code> response</td><td>~50-200</td></tr>
+<tr><td><code>search</code> (symbols + references + heatmap)</td><td>~200-500</td></tr>
 <tr><td><code>definition</code> response</td><td>~30-100</td></tr>
-<tr><td><code>find_references</code> (10 results)</td><td>~200-500</td></tr>
 <tr><td><code>document_symbols</code></td><td>~200-800</td></tr>
 <tr><td><code>codebase_map</code> (budget: 200)</td><td>~800-1000</td></tr>
 </tbody>
@@ -1579,8 +2077,8 @@ use a targeted LSP query.</p>
 understand organization before reading implementation.</p>
 </li>
 <li>
-<p><strong>Hover before read.</strong> Check <code>hover</code> for type signatures and docs before
-reading source files.</p>
+<p><strong>Search before read.</strong> Use <code>search</code> to find symbols, references, and
+matches before reading source files.</p>
 </li>
 <li>
 <p><strong>References are precise.</strong> <code>find_references</code> finds actual usages,
@@ -1645,6 +2143,250 @@ Catenary session for the workspace, runs LSP diagnostics, records the file’s
 mtime, and releases the file lock. It exits silently on any error so it never
 blocks the host tool’s flow.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="wait-model"><a class="header" href="#wait-model">Wait Model</a></h1>
+<p>Catenary’s diagnostics contract: after an agent edits a file, Catenary delivers
+<strong>trusted diagnostics</strong> or <strong>nothing</strong>. Stale diagnostics are worse than no
+diagnostics — an agent that receives stale errors chases phantom problems, burns
+usage limits, and may introduce regressions fixing issues that don’t exist.</p>
+<h2 id="two-interaction-patterns"><a class="header" href="#two-interaction-patterns">Two Interaction Patterns</a></h2>
+<p>LSP has two fundamentally different patterns. Catenary handles both, but they
+have different wait characteristics.</p>
+<p><strong>Request/Response</strong> (definition, references, symbols): Catenary sends a
+request, the server responds when ready. The request <strong>blocks</strong>. Catenary’s job
+is to wait for the response and detect failure if the server is stuck or dead.</p>
+<p><strong>Server Push</strong> (diagnostics via <code>publishDiagnostics</code>): The server decides when
+to send diagnostics. Catenary has no request to wait on — it watches for an
+unsolicited notification. This requires a dedicated wait model with strategies
+to know when the server has finished.</p>
+<h2 id="strategies"><a class="header" href="#strategies">Strategies</a></h2>
+<p>Each LSP server is assigned a diagnostics strategy based on runtime observations.
+Strategy discovery happens during the first diagnostics cycle.</p>
+<h3 id="version-primary"><a class="header" href="#version-primary">Version (Primary)</a></h3>
+<p>The server includes a <code>version</code> field in <code>publishDiagnostics</code> matching the
+document version Catenary sent via <code>didChange</code>. This is causal proof — the
+server processed <em>this</em> version and published diagnostics for it.</p>
+<pre><code>loop:
+    select!:
+        diagnostics_notify fired →
+            if version match → return diagnostics (trusted)
+        poll_interval elapsed →
+            sample = monitor.sample()
+            if dead → return nothing
+            if running + ticks advancing + no active progress →
+                threshold -= delta   # unexplained work
+            if threshold &lt;= 0 → return nothing (server stuck)
+            if wall_clock &gt; safety_cap → return nothing (pathological)
+</code></pre>
+<p>Exits: version match (trusted), dead (nothing), threshold exhausted (nothing),
+safety cap (nothing).</p>
+<h3 id="tokenmonitor-progress-tokens"><a class="header" href="#tokenmonitor-progress-tokens"><code>TokenMonitor</code> (Progress Tokens)</a></h3>
+<p>The server sends <code>$/progress</code> tokens. Catenary waits for the Active → Idle
+transition — the server is telling us it finished.</p>
+<pre><code>loop:
+    select!:
+        diagnostics_notify or progress_notify fired →
+            if generation advanced and ever_active and now idle →
+                return diagnostics (trusted)
+        poll_interval elapsed →
+            poll token monitor state
+            sample = monitor.sample()
+            (same failure detection as Version)
+</code></pre>
+<p>Exits: Active → Idle (trusted), dead (nothing), threshold exhausted (nothing),
+safety cap (nothing).</p>
+<h3 id="no-version-no-progress"><a class="header" href="#no-version-no-progress">No Version, No Progress</a></h3>
+<p>The server provides neither signal. It still receives <code>didOpen</code> and <code>didChange</code>
+for code intelligence (definition, references, symbols). It does <strong>not</strong> receive
+<code>didSave</code>. It does not participate in the diagnostics lifecycle. No diagnostics
+are returned — not stale, not cached, nothing.</p>
+<p>A survey of 280+ language servers (<code>docs/src/lsp/landscape.md</code>) confirmed that
+every major server includes <code>version</code> in <code>publishDiagnostics</code> and/or sends
+<code>$/progress</code> tokens. Both features have been in the LSP spec since 3.15 (2019)
+and are provided automatically by every dominant LSP framework
+(<code>vscode-languageserver</code>, <code>pygls</code>, <code>tower-lsp</code>, <code>eclipse.lsp4j</code>).</p>
+<h2 id="failure-detection"><a class="header" href="#failure-detection">Failure Detection</a></h2>
+<p>The failure detector is not a budget. Catenary does not ration CPU time. The
+server can use as much CPU as it needs. The failure detector catches a single
+failure mode: <strong>the server is consuming CPU silently</strong> — Running with advancing
+ticks, but producing no responses, no diagnostics, no progress tokens.</p>
+<h3 id="units"><a class="header" href="#units">Units</a></h3>
+<p>CPU ticks are normalized to centiseconds (100 Hz) on all platforms:</p>
+<ul>
+<li><strong>Linux:</strong> <code>/proc/&lt;pid&gt;/stat</code> reports <code>utime + stime</code> in <code>USER_HZ</code> (always
+100). 1 tick = 10ms of CPU time. Stable kernel ABI.</li>
+<li><strong>macOS:</strong> <code>proc_pidinfo</code> with <code>PROC_PIDTASKINFO</code> reports Mach absolute time.
+Normalized via <code>mach_timebase_info()</code> to centiseconds.</li>
+<li><strong>Windows:</strong> <code>GetProcessTimes</code> reports in 100-nanosecond intervals. Divided
+by 100,000 for centiseconds.</li>
+</ul>
+<h3 id="thresholds"><a class="header" href="#thresholds">Thresholds</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Typical CPU time</th><th>Threshold</th><th>Headroom</th></tr>
+</thead>
+<tbody>
+<tr><td>Definition / References</td><td>10–150ms</td><td>1000 ticks (10 CPU-sec)</td><td>70–1000x</td></tr>
+<tr><td>Diagnostics (incremental)</td><td>&lt; 1s</td><td>1000 ticks</td><td>10x</td></tr>
+<tr><td>Flycheck (cargo check)</td><td>seconds</td><td>Progress-tracked</td><td>N/A</td></tr>
+<tr><td>Full indexing</td><td>tens of seconds</td><td>Progress-tracked</td><td>N/A</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="progress-aware-detection"><a class="header" href="#progress-aware-detection">Progress-Aware Detection</a></h3>
+<p>The failure detector distinguishes <strong>explained</strong> from <strong>unexplained</strong> work:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Server state</th><th>Progress</th><th>Threshold drains?</th><th>Reasoning</th></tr>
+</thead>
+<tbody>
+<tr><td>Running + ticks advancing</td><td>Active</td><td><strong>No</strong></td><td>Server is working and telling us</td></tr>
+<tr><td>Running + ticks advancing</td><td>None/Idle</td><td><strong>Yes</strong></td><td>Unexplained — server is silent</td></tr>
+<tr><td>Running + ticks flat</td><td>Any</td><td>No</td><td>CPU-starved — free wait</td></tr>
+<tr><td>Sleeping</td><td>Any</td><td>No</td><td>Waiting on I/O or subprocess</td></tr>
+<tr><td>Blocked (D-state)</td><td>Any</td><td>No</td><td>Kernel I/O — free wait</td></tr>
+<tr><td>Dead</td><td>Any</td><td>—</td><td>Bail immediately</td></tr>
+</tbody>
+</table>
+</div>
+<p>Only <strong>Running + ticks advancing + no active progress</strong> drains the threshold.
+Everything else is either explained (progress Active), or the server hasn’t had
+a chance to work (starved, sleeping, blocked).</p>
+<h3 id="safety-cap"><a class="header" href="#safety-cap">Safety Cap</a></h3>
+<p>A 5-minute wall-clock circuit breaker for pathological cases only: dead NFS
+mounts, processes stuck in D-state, zombies that never get reaped. This should
+never fire under normal operation.</p>
+<h2 id="catenary-proc-crate"><a class="header" href="#catenary-proc-crate"><code>catenary-proc</code> Crate</a></h2>
+<p><code>crates/catenary-proc/</code> provides the <code>ProcessMonitor</code> struct — a stateful
+process monitor with persistent OS handles. Created once at server spawn, lives
+on <code>LspClient</code> for the server’s lifetime. Encapsulates tick delta tracking and
+amortizes handle open costs.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>impl ProcessMonitor {
+    /// Opens persistent handles for the server's lifetime.
+    pub fn new(pid: u32) -&gt; Option&lt;Self&gt;;
+
+    /// Returns (delta, state) where delta is ticks since last sample.
+    pub fn sample(&amp;mut self) -&gt; Option&lt;(u64, ProcessState)&gt;;
+}
+<span class="boring">}</span></code></pre>
+<p>Platform implementations:</p>
+<ul>
+<li><strong>Linux:</strong> Persistent <code>File</code> handle to <code>/proc/&lt;pid&gt;/stat</code>. Seek + read into
+a reused buffer. 2 syscalls per sample.</li>
+<li><strong>macOS:</strong> <code>proc_pidinfo</code> — stateless syscall, no persistent handle needed.</li>
+<li><strong>Windows:</strong> Persistent <code>HANDLE</code> from <code>OpenProcess</code>. <code>CloseHandle</code> in <code>Drop</code>.</li>
+</ul>
+<h2 id="load_aware_grace--unified-wait-infrastructure"><a class="header" href="#load_aware_grace--unified-wait-infrastructure"><code>load_aware_grace</code> — Unified Wait Infrastructure</a></h2>
+<p><code>src/lsp/wait.rs</code> contains the single wait pattern used by all sites —
+diagnostics preamble, readiness, request timeouts.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub async fn load_aware_grace&lt;S, F, Fut&gt;(
+    sample_fn: &amp;mut S,
+    threshold: u64,
+    max_wall: Option&lt;Duration&gt;,
+    notify: &amp;Notify,
+    progress_active: impl Fn() -&gt; bool,
+    condition: F,
+) -&gt; bool
+<span class="boring">}</span></code></pre>
+<p>Key properties:</p>
+<ul>
+<li><strong>Event-driven wake:</strong> Condition is checked immediately when the notify fires.
+If diagnostics arrive 1ms into a 200ms poll interval, we wake at 1ms.</li>
+<li><strong>Progress-aware:</strong> Ticks during active progress are explained work and do not
+drain the threshold.</li>
+<li><strong>Failure detection, not budgeting:</strong> The threshold is generous relative to
+normal operation. It only fires for genuinely stuck servers.</li>
+</ul>
+<h2 id="did_save-gating"><a class="header" href="#did_save-gating"><code>did_save</code> Gating</a></h2>
+<p>Catenary reads <code>textDocumentSync.save</code> from <code>ServerCapabilities</code>. If the server
+advertises save support, Catenary sends <code>textDocument/didSave</code> unconditionally
+after every change — this is required to trigger diagnostics on servers that
+only run analysis on save (e.g., rust-analyzer’s flycheck). If the server does
+not advertise save, <code>didSave</code> is not sent.</p>
+<h2 id="readiness"><a class="header" href="#readiness">Readiness</a></h2>
+<p><code>is_ready()</code> checks that the server is in <code>ServerState::Ready</code> and confirms
+the process is idle via <code>ProcessMonitor</code>. During warmup (first 3 seconds from
+spawn), the process must be Sleeping — this catches the window between
+initialize completion and the start of indexing. After warmup, Ready state
+alone is sufficient.</p>
+<p><code>wait_ready()</code> uses <code>load_aware_grace</code> with a 1000-tick threshold. For servers
+set to Busy proactively (e.g., after workspace folder changes), it detects
+activity settle: consecutive samples of Sleeping + flat ticks transition the
+server back to Ready.</p>
+<h2 id="agent-facing-contract"><a class="header" href="#agent-facing-contract">Agent-Facing Contract</a></h2>
+<p>Catenary’s hook fires after an agent edits a file. The agent did not ask for
+diagnostics — Catenary injects them into the context. Therefore:</p>
+<ol>
+<li><strong>Trusted diagnostics</strong> → inject them.</li>
+<li><strong>No diagnostics</strong> → inject nothing. The agent doesn’t know the hook ran.</li>
+<li><strong>Server problems are never surfaced to the agent.</strong> No “server died”, no
+“diagnostics unavailable”. Server health is logged for the operator via
+<code>catenary monitor</code>.</li>
+</ol>
+<h2 id="capabilities-policy"><a class="header" href="#capabilities-policy">Capabilities Policy</a></h2>
+<p>Catenary advertises only capabilities it uses. Unnecessary capabilities cause
+servers to compute features nobody requested.</p>
+<p><strong>Advertised</strong> (must be present for correct behavior):
+<code>synchronization</code>, <code>definition</code>, <code>typeDefinition</code>, <code>implementation</code>,
+<code>declaration</code>, <code>references</code>, <code>documentSymbol</code>, <code>callHierarchy</code>,
+<code>typeHierarchy</code>, <code>publishDiagnostics</code> (with <code>versionSupport: true</code>),
+<code>window.workDoneProgress</code>.</p>
+<p><strong>Not advertised</strong> (tools removed or not applicable to agents):
+<code>hover</code>, <code>codeAction</code>, <code>rename</code>, <code>completion</code>, <code>signatureHelp</code>,
+<code>documentHighlight</code>, <code>codeLens</code>, <code>documentLink</code>, <code>colorProvider</code>,
+<code>formatting</code>, <code>foldingRange</code>, <code>selectionRange</code>, <code>semanticTokens</code>,
+<code>inlineValue</code>, <code>inlayHint</code>.</p>
+<h2 id="design-decisions"><a class="header" href="#design-decisions">Design Decisions</a></h2>
+<h3 id="why-cpu-ticks-not-wall-clock"><a class="header" href="#why-cpu-ticks-not-wall-clock">Why CPU ticks, not wall-clock</a></h3>
+<p>Wall time is the wrong unit for waiting on a process. On an idle machine, 30s
+means 30s of CPU work. Under load (test suite saturating cores), the server
+gets scheduled intermittently. A wall-clock timeout fires whether the server got
+zero CPU or saturated a core. CPU ticks measure actual work.</p>
+<h3 id="why-failure-detection-not-budgeting"><a class="header" href="#why-failure-detection-not-budgeting">Why failure detection, not budgeting</a></h3>
+<p>The threshold does not ration CPU time. It detects a specific pathology: the
+server burning CPU silently. A server indexing for 60 CPU-seconds with active
+progress never touches the threshold.</p>
+<h3 id="why-progress-aware"><a class="header" href="#why-progress-aware">Why progress-aware</a></h3>
+<p>If progress is Active, the ticks are explained — the server is working and
+telling us. Counting those ticks would create false positives during legitimate
+long operations (flycheck, indexing).</p>
+<h3 id="why-ready--sleeping--ready"><a class="header" href="#why-ready--sleeping--ready">Why Ready + Sleeping = ready</a></h3>
+<p>After initialize, the server may be about to start indexing but hasn’t sent
+<code>$/progress</code> yet. With <code>ProcessMonitor</code>, we observe the process state directly.
+Sleeping means the server has finished initialization and is waiting for
+requests. Running means it’s still working. This replaces a wall-clock guess
+with an observation.</p>
+<h3 id="why-requests-block"><a class="header" href="#why-requests-block">Why requests block</a></h3>
+<p>LSP requests go to a child process on the same machine (no network). If the
+server hasn’t responded, it’s busy, sleeping on a subprocess, dead, or stuck.
+The failure detector handles all cases. There is nothing “best-effort” about it.</p>
+<h3 id="why-servers-manage-their-own-memory"><a class="header" href="#why-servers-manage-their-own-memory">Why servers manage their own memory</a></h3>
+<p>Language servers use LRU eviction, lazy loading, and internal resource policies.
+Catenary does not send unsolicited <code>didClose</code> for memory management.</p>
+<h3 id="why-no-settle-phase"><a class="header" href="#why-no-settle-phase">Why no settle phase</a></h3>
+<p>The two-phase model (strategy wait + activity settle) was replaced by
+event-driven detection. The Version strategy exits on version match — causal
+proof. The <code>TokenMonitor</code> strategy exits on Active → Idle. Both are
+authoritative signals that don’t need a settle confirmation.</p>
+<h3 id="why-no-trust-decay"><a class="header" href="#why-no-trust-decay">Why no trust decay</a></h3>
+<p>Trust decay (120s → 60s → 30s → 5s patience) was a heuristic for the
+ProcessMonitor strategy (no version, no progress). That strategy was replaced:
+servers without version or progress simply don’t participate in diagnostics.</p>
+<h3 id="why-no-process-tree-walking"><a class="header" href="#why-no-process-tree-walking">Why no process tree walking</a></h3>
+<p>Subprocess ticks (e.g., cargo check spawned by rust-analyzer) don’t count
+against the LSP process. The LSP goes to Sleeping while the subprocess runs.
+The failure detector sees Sleeping + flat ticks on the LSP — free wait. No
+need to walk the process tree.</p>
+<h3 id="why-no-sentinel-file"><a class="header" href="#why-no-sentinel-file">Why no sentinel file</a></h3>
+<p>A sentinel file approach (write a marker, wait for the server to see it) was
+rejected because it requires filesystem coordination, doesn’t work for all
+servers, and LSP already provides the signals needed (version, progress).</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="lsp-fault-model"><a class="header" href="#lsp-fault-model">LSP Fault Model</a></h1>
 <p>Catenary consumes output from third-party language servers that we do not maintain. LSP server responses must be treated as <strong>unsanitized external input</strong> — equivalent to user-supplied data crossing a trust boundary. A broken or malicious language server must never crash Catenary, corrupt user files, or produce errors that appear to originate from Catenary itself.</p>
 <p>This document catalogs the failure modes, current handling, and required invariants.</p>
@@ -1675,7 +2417,7 @@ blocks the host tool’s flow.</p>
 <tbody>
 <tr><td>Server won’t start</td><td>Bad command, missing binary, permission error</td><td><code>LspClient::spawn()</code> returns <code>Err</code>, propagated to <code>get_client()</code></td><td>OK</td></tr>
 <tr><td>Server crashes mid-session</td><td>Segfault, OOM, unhandled exception</td><td>Reader task detects stdout close, sets <code>alive=false</code>. Next request triggers restart via <code>get_client()</code></td><td>OK</td></tr>
-<tr><td>Server hangs (no response)</td><td>Deadlock, infinite loop</td><td><code>REQUEST_TIMEOUT</code> (30s) fires, returns timeout error. Diagnostics wait uses activity tracking + nudge-and-retry — see <a href="#timeout-ambiguity-resolved">Timeout Ambiguity</a></td><td>OK</td></tr>
+<tr><td>Server hangs (no response)</td><td>Deadlock, infinite loop</td><td>CPU-tick failure detection (1000-tick threshold, 30s wall-clock backstop). Diagnostics: load-aware failure detection via <code>ProcessMonitor</code> — see <a href="#wait-model">Wait Model</a> and <a href="#timeout-ambiguity-resolved">Timeout Ambiguity</a></td><td>OK</td></tr>
 <tr><td>Server exits during initialize</td><td>Crash on startup</td><td><code>initialize()</code> request times out or gets channel-closed error</td><td>OK</td></tr>
 <tr><td>Server produces no stdout</td><td>Blocks on stderr, misconfigured pipes</td><td>Timeout on first request</td><td>OK</td></tr>
 </tbody>
@@ -1825,8 +2567,14 @@ blocks the host tool’s flow.</p>
 <p><strong>Trust boundary:</strong> Catenary treats LSP responses as untrusted input. The MCP client (AI agent) treats Catenary’s tool responses as trusted tool output. This asymmetry is the core attack surface — content that Catenary passes through unmodified becomes “trusted” from the agent’s perspective.</p>
 <p><strong>Out of scope:</strong> Attacks requiring control of the Catenary binary, MCP transport, or the AI agent itself. Network-based attacks. Attacks on the LSP server binary (supply chain).</p>
 <hr>
-<h2 id="1-prompt-injection-via-hover-content"><a class="header" href="#1-prompt-injection-via-hover-content">1. Prompt Injection via Hover Content</a></h2>
-<p>LSP hover responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.</p>
+<h2 id="1-prompt-injection-via-lsp-content"><a class="header" href="#1-prompt-injection-via-lsp-content">1. Prompt Injection via LSP Content</a></h2>
+<blockquote>
+<p><strong>Note:</strong> <code>hover</code> is being merged into <code>search</code> (symbols tier with
+hover enrichment). These concerns apply to any tool that surfaces LSP
+content — workspace symbols in <code>search</code>, <code>document_symbols</code>,
+<code>code_actions</code>, etc.</p>
+</blockquote>
+<p>LSP responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.</p>
 <h3 id="11-docstring-injection"><a class="header" href="#11-docstring-injection">1.1 Docstring injection</a></h3>
 <p><strong>Setup:</strong> A Python file with a crafted docstring:</p>
 <pre><code class="language-python">def helper():
@@ -2099,7 +2847,7 @@ output in your next response.
 </ul>
 <hr>
 <h2 id="8-file-io-path-validation"><a class="header" href="#8-file-io-path-validation">8. File I/O Path Validation</a></h2>
-<p>Catenary’s file I/O tools (<code>read_file</code>, <code>write_file</code>, <code>edit_file</code>, <code>list_directory</code>) validate all paths against workspace roots. These tests verify that validation cannot be bypassed.</p>
+<p>Catenary validates paths against workspace roots to avoid wasted LSP round-trips for files the language server has no knowledge of. This is not a security boundary — access control is delegated to the host CLI’s permission layer. <code>list_directory</code> and <code>search</code> (heatmap) can operate outside workspace roots since they don’t involve LSP. Config file protection (<code>.catenary.toml</code>) is the one true security invariant. These tests verify that config protection and LSP-gating cannot be bypassed.</p>
 <h3 id="81-path-traversal-via-"><a class="header" href="#81-path-traversal-via-">8.1 Path traversal via <code>..</code></a></h3>
 <p><strong>Trigger:</strong> <code>read_file</code> with path <code>workspace/../../../etc/passwd</code>.</p>
 <p><strong>Expected:</strong> Path validation rejects the request. The resolved path is outside workspace roots.</p>
@@ -2539,15 +3287,55 @@ make test T=test_sync_roots
 make test
 </code></pre>
 <h2 id="relationship-to-real-server-tests"><a class="header" href="#relationship-to-real-server-tests">Relationship to Real-Server Tests</a></h2>
-<p>All existing tests that use real language servers remain in the suite. They serve a different purpose: verifying Catenary works with actual LSP implementations. They continue to skip when the server isn’t installed. mockls tests and real-server tests are complementary:</p>
-<ul>
-<li><strong>mockls tests</strong> verify Catenary’s protocol handling against a controlled, deterministic server. They always run.</li>
-<li><strong>Real-server tests</strong> verify end-to-end behavior against production LSP implementations. They run when servers are available.</li>
-</ul>
+<p>The test suite uses no real language servers. Real-server validation happens
+organically every session via <code>catenary monitor</code> — the operator sees every tool
+call, every diagnostics cycle, every progress token. That’s the smoke test. It
+runs on real projects with real contention, which is better coverage than any
+synthetic test.</p>
+<p>The test suite’s job is to verify the <strong>model</strong> — deterministically, on every
+machine, under any load. That means mockls + mockc only. Tests that previously
+used real servers (<code>require_rust_analyzer!()</code>, <code>require_bash_lsp!()</code>, etc.)
+were migrated to mockls or deleted. The <code>require_*</code> guard pattern — where a
+test silently skips if the server isn’t installed — means CI coverage depends
+on what’s installed on the runner. That’s not testing.</p>
+<h2 id="mockc-simulated-compiler-subprocess"><a class="header" href="#mockc-simulated-compiler-subprocess">mockc: Simulated Compiler Subprocess</a></h2>
+<p>Real rust-analyzer delegates expensive work to <code>cargo check</code> → <code>rustc</code>. The LSP
+process goes to Sleeping while the child does the work. This is the exact
+scheduling pattern that wall-clock timeouts get wrong: the LSP has flat ticks
+(Sleeping), but real work is happening in a subprocess.</p>
+<p>mockc (<code>tools/mockc.rs</code>) replaces this with a deterministic binary. Its only
+job: burn CPU for a precise number of ticks, then exit. All durations are in CPU
+ticks (centiseconds, 100 Hz) — the same unit <code>ProcessMonitor</code> measures. On an
+idle machine, 50 ticks takes ~500ms wall time. On a loaded machine it takes
+longer, but the tick count is identical. Catenary’s failure detector counts
+ticks, mockc produces ticks. The units match end-to-end.</p>
+<pre><code>mockc [OPTIONS]
+
+Options:
+  --ticks &lt;N&gt;         Burn CPU for N ticks / centiseconds (default: 10)
+  --exit-code &lt;N&gt;     Exit with this code (default: 0)
+  --output &lt;text&gt;     Write text to stdout before exiting
+  --hang              Never exit (simulate stuck compiler)
+</code></pre>
+<h3 id="test-profiles-using-mockc"><a class="header" href="#test-profiles-using-mockc">Test profiles using mockc</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Profile</th><th>mockls flags</th><th>mockc flags</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Fast flycheck</td><td><code>--flycheck-command mockc</code></td><td>default (10 ticks)</td><td>Basic flycheck cycle</td></tr>
+<tr><td>Near threshold</td><td><code>--flycheck-command mockc --flycheck-ticks 900</code></td><td>900 ticks</td><td>90% of 1000-tick threshold — passes because ticks are in subprocess</td></tr>
+<tr><td>Stuck compiler</td><td><code>--flycheck-command "mockc --hang"</code></td><td>never exits</td><td>Verifies failure detection on progress cycle</td></tr>
+<tr><td>Compiler crash</td><td><code>--flycheck-command "mockc --exit-code 1"</code></td><td>immediate fail</td><td>Progress End with no diagnostics</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="source"><a class="header" href="#source">Source</a></h2>
 <ul>
-<li><code>src/bin/mockls.rs</code> — the mock server binary and its unit tests</li>
-<li><code>Cargo.toml</code> — <code>[[bin]]</code> entry for mockls</li>
+<li><code>tools/mockls.rs</code> — the mock server binary and its unit tests</li>
+<li><code>tools/mockc.rs</code> — the simulated compiler subprocess</li>
+<li><code>Cargo.toml</code> — <code>[[bin]]</code> entries for both</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="roadmap"><a class="header" href="#roadmap">Roadmap</a></h1>
@@ -2645,10 +3433,12 @@ matching files exist in the workspace</li>
 <li><input disabled="" type="checkbox" checked=""> Emit <code>tools/list_changed</code> when allowlist changes (e.g., workspace added)</li>
 <li><input disabled="" type="checkbox" checked=""> Error messages on denied commands include the current allowlist</li>
 </ul>
-<p><strong>Security:</strong></p>
+<p><strong>Security &amp; LSP gating:</strong></p>
 <ul>
-<li><input disabled="" type="checkbox" checked=""> Path validation against workspace roots (read and write)</li>
-<li><input disabled="" type="checkbox" checked=""> Symlink traversal protection (<code>canonicalize()</code> + root check)</li>
+<li><input disabled="" type="checkbox" checked=""> Path validation against workspace roots (LSP-awareness gate, not
+a security boundary — prevents wasted round-trips for files the
+language server doesn’t know about)</li>
+<li><input disabled="" type="checkbox" checked=""> Symlink traversal protection (<code>canonicalize()</code> before root check)</li>
 <li><input disabled="" type="checkbox" checked=""> Config file self-modification protection (<code>.catenary.toml</code>,
 <code>~/.config/catenary/config.toml</code>)</li>
 <li><input disabled="" type="checkbox" checked=""> Direct command execution (no shell injection)</li>
@@ -2696,9 +3486,9 @@ escape</li>
 <li><strong><del>Symlink traversal.</del></strong> Resolved in Phase 7. File I/O tools use
 <code>canonicalize()</code> + workspace root validation. <code>list_directory</code> uses
 <code>symlink_metadata()</code> to avoid following symlinks.</li>
-<li><strong>Unbounded LSP data.</strong> Diagnostic caches grow without limit. Hover
-responses, symbol trees, and workspace edit previews have no size caps.
-A malicious or buggy LSP server can cause unbounded memory growth.</li>
+<li><strong>Unbounded LSP data.</strong> Diagnostic caches grow without limit. Symbol
+trees and workspace edit previews have no size caps. A malicious or
+buggy LSP server can cause unbounded memory growth.</li>
 <li><strong><del><code>apply_workspace_edit</code> trusts LSP URIs.</del></strong> Resolved in Phase 6.5.
 <code>apply_workspace_edit</code> removed. All edit tools now return proposed
 edits as text; the MCP client applies them.</li>
@@ -2706,12 +3496,18 @@ edits as text; the MCP client applies them.</li>
 <hr>
 <h2 id="low-priority"><a class="header" href="#low-priority">Low Priority</a></h2>
 <ul>
-<li><input disabled="" type="checkbox"> <strong>Batch Operations:</strong> Query hover/definition/references for multiple
-positions in a single call</li>
-<li><input disabled="" type="checkbox"> <strong>References with Context:</strong> Include surrounding lines (e.g., <code>-C 3</code>) in
-reference results</li>
 <li><input disabled="" type="checkbox"> <strong>Multi-file Diagnostics:</strong> Check diagnostics across multiple files in
 one call</li>
+</ul>
+<h2 id="deprecations"><a class="header" href="#deprecations">Deprecations</a></h2>
+<ul>
+<li><strong><code>hover</code></strong> — Being merged into <code>search</code>. Hover info (type signatures,
+docs) will be inlined in the symbols tier, so agents get it at discovery
+time without a separate call.</li>
+<li><strong><code>find_references</code></strong> — Being merged into <code>search</code>. The position-based
+interface is an editor concept that agents consistently fumble. <code>search</code>
+will return symbols (with hover), semantic references, and text matches
+in one call.</li>
 </ul>
 <hr>
 <h2 id="abandoned"><a class="header" href="#abandoned">Abandoned</a></h2>
@@ -3186,7 +3982,7 @@ benefits from them when available.</p>
 <li><input disabled="" type="checkbox"> Which diff library? (<code>similar</code>, <code>diffy</code>)</li>
 <li><input disabled="" type="checkbox"> Syntax highlighting in diffs?</li>
 </ul>
-<h3 id="keybindings"><a class="header" href="#keybindings">Keybindings</a></h3>
+<h3 id="keybindings-1"><a class="header" href="#keybindings-1">Keybindings</a></h3>
 <ul>
 <li><input disabled="" type="checkbox"> Fixed keybindings or customizable?</li>
 <li><input disabled="" type="checkbox"> Vim-style navigation in conversation?</li>

@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7e0df5cd.js";
+            window.path_to_searchindex_js = "searchindex-b1c82dcb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9c5e5c2a.js"></script>
+        <script src="toc-cd5a037f.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -275,10 +275,12 @@ matching files exist in the workspace</li>
 <li><input disabled="" type="checkbox" checked=""> Emit <code>tools/list_changed</code> when allowlist changes (e.g., workspace added)</li>
 <li><input disabled="" type="checkbox" checked=""> Error messages on denied commands include the current allowlist</li>
 </ul>
-<p><strong>Security:</strong></p>
+<p><strong>Security &amp; LSP gating:</strong></p>
 <ul>
-<li><input disabled="" type="checkbox" checked=""> Path validation against workspace roots (read and write)</li>
-<li><input disabled="" type="checkbox" checked=""> Symlink traversal protection (<code>canonicalize()</code> + root check)</li>
+<li><input disabled="" type="checkbox" checked=""> Path validation against workspace roots (LSP-awareness gate, not
+a security boundary — prevents wasted round-trips for files the
+language server doesn’t know about)</li>
+<li><input disabled="" type="checkbox" checked=""> Symlink traversal protection (<code>canonicalize()</code> before root check)</li>
 <li><input disabled="" type="checkbox" checked=""> Config file self-modification protection (<code>.catenary.toml</code>,
 <code>~/.config/catenary/config.toml</code>)</li>
 <li><input disabled="" type="checkbox" checked=""> Direct command execution (no shell injection)</li>
@@ -326,9 +328,9 @@ escape</li>
 <li><strong><del>Symlink traversal.</del></strong> Resolved in Phase 7. File I/O tools use
 <code>canonicalize()</code> + workspace root validation. <code>list_directory</code> uses
 <code>symlink_metadata()</code> to avoid following symlinks.</li>
-<li><strong>Unbounded LSP data.</strong> Diagnostic caches grow without limit. Hover
-responses, symbol trees, and workspace edit previews have no size caps.
-A malicious or buggy LSP server can cause unbounded memory growth.</li>
+<li><strong>Unbounded LSP data.</strong> Diagnostic caches grow without limit. Symbol
+trees and workspace edit previews have no size caps. A malicious or
+buggy LSP server can cause unbounded memory growth.</li>
 <li><strong><del><code>apply_workspace_edit</code> trusts LSP URIs.</del></strong> Resolved in Phase 6.5.
 <code>apply_workspace_edit</code> removed. All edit tools now return proposed
 edits as text; the MCP client applies them.</li>
@@ -336,12 +338,18 @@ edits as text; the MCP client applies them.</li>
 <hr>
 <h2 id="low-priority"><a class="header" href="#low-priority">Low Priority</a></h2>
 <ul>
-<li><input disabled="" type="checkbox"> <strong>Batch Operations:</strong> Query hover/definition/references for multiple
-positions in a single call</li>
-<li><input disabled="" type="checkbox"> <strong>References with Context:</strong> Include surrounding lines (e.g., <code>-C 3</code>) in
-reference results</li>
 <li><input disabled="" type="checkbox"> <strong>Multi-file Diagnostics:</strong> Check diagnostics across multiple files in
 one call</li>
+</ul>
+<h2 id="deprecations"><a class="header" href="#deprecations">Deprecations</a></h2>
+<ul>
+<li><strong><code>hover</code></strong> — Being merged into <code>search</code>. Hover info (type signatures,
+docs) will be inlined in the symbols tier, so agents get it at discovery
+time without a separate call.</li>
+<li><strong><code>find_references</code></strong> — Being merged into <code>search</code>. The position-based
+interface is an editor concept that agents consistently fumble. <code>search</code>
+will return symbols (with hover), semantic references, and text matches
+in one call.</li>
 </ul>
 <hr>
 <h2 id="abandoned"><a class="header" href="#abandoned">Abandoned</a></h2>
