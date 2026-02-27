@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+
+//! Navigation hints bar rendered at the bottom of the grid.
+//!
+//! Uses degradation from [`super::degradation::degrade_hints`] to determine
+//! which hints fit, and renders them between styled border caps.
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
+
+use super::degradation::degrade_hints;
+use super::theme::Theme;
+
+/// Render navigation hints into a 1-row area at the bottom of the grid.
+///
+/// Uses [`degrade_hints`] to select which hints fit. Renders hints between
+/// border caps: `──┤ hints ├──┘` (light) or `━━┥ hints ┝━━┛` (heavy when
+/// `focused_on_bottom` is true).
+///
+/// When `filter_active` is true, no hints are rendered (the filter bar
+/// occupies this space). When `filter_locked` is true, the quit hint `q ✘`
+/// is replaced with `Esc ▓` to indicate the locked filter can be cleared.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "terminal coordinates are always small"
+)]
+pub fn render_hints(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    filter_active: bool,
+    filter_locked: bool,
+    focused_on_bottom: bool,
+) {
+    if area.width < 4 || area.height < 1 || filter_active {
+        return;
+    }
+
+    let hint_budget = area.width.saturating_sub(6);
+    let mut hints = degrade_hints(hint_budget);
+
+    if hints.is_empty() {
+        // Just render the border line.
+        render_border_only(area, buf, theme, focused_on_bottom);
+        return;
+    }
+
+    // Replace "q ✘" with "Esc ▓" when filter is locked.
+    if filter_locked {
+        for hint in &mut hints {
+            if hint.0 == "q" && hint.1 == "\u{2718}" {
+                *hint = ("Esc", "\u{2593}");
+            }
+        }
+    }
+
+    // Build hint spans.
+    let total_width_with_seps = hints_width_with_separators(&hints);
+    let total_width_spaced = hints_width_spaced(&hints);
+    let use_separators = total_width_with_seps <= hint_budget as usize;
+
+    let mut hint_spans: Vec<Span<'static>> = Vec::new();
+    for (i, (key, symbol)) in hints.iter().enumerate() {
+        if i > 0 {
+            if use_separators {
+                hint_spans.push(Span::styled(" \u{2571} ", theme.muted)); // ╱
+            } else {
+                hint_spans.push(Span::raw(" "));
+            }
+        }
+        hint_spans.push(Span::styled((*key).to_string(), theme.hint_key));
+        if !symbol.is_empty() {
+            hint_spans.push(Span::raw(" "));
+            hint_spans.push(Span::styled((*symbol).to_string(), theme.hint_label));
+        }
+    }
+
+    let hints_text_width = if use_separators {
+        total_width_with_seps
+    } else {
+        total_width_spaced
+    };
+
+    // Border characters.
+    let (h_line, left_cap, right_cap, corner) = if focused_on_bottom {
+        ("\u{2501}", "\u{2521}", "\u{251D}", "\u{251B}") // ━ ┡ ┝ ┛
+    } else {
+        ("\u{2500}", "\u{2524}", "\u{251C}", "\u{2518}") // ─ ┤ ├ ┘
+    };
+
+    // Compute left fill and right fill.
+    // Fill pattern: left_fill, left_cap, space, hints, space, right_cap, right_fill, corner
+    let inner_used = 1 + 1 + hints_text_width + 1 + 1 + 1; // left_cap, space, hints, space, right_cap, corner
+    let fill_total = (area.width as usize).saturating_sub(inner_used);
+    let fill_right = fill_total / 2;
+    let fill_left = fill_total.saturating_sub(fill_right);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // Left fill.
+    if fill_left > 0 {
+        spans.push(Span::styled(
+            h_line.repeat(fill_left),
+            theme.border_unfocused,
+        ));
+    }
+
+    // Left cap.
+    spans.push(Span::styled(left_cap.to_string(), theme.border_unfocused));
+    spans.push(Span::raw(" "));
+
+    // Hints content.
+    spans.extend(hint_spans);
+
+    // Right cap.
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(right_cap.to_string(), theme.border_unfocused));
+
+    // Right fill.
+    if fill_right > 0 {
+        spans.push(Span::styled(
+            h_line.repeat(fill_right),
+            theme.border_unfocused,
+        ));
+    }
+
+    // Corner.
+    spans.push(Span::styled(corner.to_string(), theme.border_unfocused));
+
+    let line = Line::from(spans);
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
+/// Render just the border line when no hints fit.
+fn render_border_only(area: Rect, buf: &mut Buffer, theme: &Theme, focused_on_bottom: bool) {
+    let (h_line, corner) = if focused_on_bottom {
+        ("\u{2501}", "\u{251B}") // ━ ┛
+    } else {
+        ("\u{2500}", "\u{2518}") // ─ ┘
+    };
+
+    let fill = area.width.saturating_sub(1) as usize;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if fill > 0 {
+        spans.push(Span::styled(h_line.repeat(fill), theme.border_unfocused));
+    }
+    spans.push(Span::styled(corner.to_string(), theme.border_unfocused));
+
+    let line = Line::from(spans);
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
+/// Display width of a single hint: `key symbol` or just `key`.
+fn hint_display_width(key: &str, symbol: &str) -> usize {
+    if symbol.is_empty() {
+        UnicodeWidthStr::width(key)
+    } else {
+        UnicodeWidthStr::width(key) + 1 + UnicodeWidthStr::width(symbol)
+    }
+}
+
+/// Total display width of hints joined by ` ╱ ` separators.
+fn hints_width_with_separators(hints: &[(&str, &str)]) -> usize {
+    if hints.is_empty() {
+        return 0;
+    }
+    let content: usize = hints.iter().map(|(k, s)| hint_display_width(k, s)).sum();
+    let seps = (hints.len() - 1) * 3;
+    content + seps
+}
+
+/// Total display width of hints joined by single spaces.
+fn hints_width_spaced(hints: &[(&str, &str)]) -> usize {
+    if hints.is_empty() {
+        return 0;
+    }
+    let content: usize = hints.iter().map(|(k, s)| hint_display_width(k, s)).sum();
+    content + hints.len() - 1
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Convert a ratatui buffer to a single string for assertion matching.
+    fn buffer_to_string(buf: &Buffer) -> String {
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                s.push_str(cell.symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn test_hints_render_full() {
+        let theme = Theme::new();
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, false, false, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Should contain hint keys.
+        assert!(content.contains('q'), "expected 'q' hint key in: {content}");
+        assert!(content.contains('?'), "expected '?' hint key in: {content}");
+    }
+
+    #[test]
+    fn test_hints_render_filter_mode() {
+        let theme = Theme::new();
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, true, false, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // With filter_active=true, no hints should be rendered.
+        assert!(
+            !content.contains('q'),
+            "no hints when filter active: {content}"
+        );
+        assert!(
+            !content.contains('?'),
+            "no hints when filter active: {content}"
+        );
+    }
+
+    #[test]
+    fn test_hints_render_locked_filter() {
+        let theme = Theme::new();
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, false, true, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // With filter_locked=true, "q ✘" should be replaced with "Esc ▓".
+        assert!(
+            content.contains("Esc"),
+            "expected 'Esc' for locked filter in: {content}"
+        );
+        assert!(
+            content.contains('\u{2593}'),
+            "expected '▓' for locked filter in: {content}"
+        );
+    }
+
+    #[test]
+    fn test_hints_heavy_caps_when_focused() {
+        let theme = Theme::new();
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, false, false, true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Heavy caps: ┡ and ┝.
+        assert!(
+            content.contains('\u{2521}'),
+            "expected heavy left cap '\u{2521}' in: {content}"
+        );
+        assert!(
+            content.contains('\u{251D}'),
+            "expected heavy right cap '\u{251D}' in: {content}"
+        );
+    }
+}
