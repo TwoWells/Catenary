@@ -18,18 +18,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-/// Find line and column (0-indexed) of a substring
-fn find_position(content: &str, substring: &str) -> Result<(u32, u32)> {
-    for (line_idx, line) in content.lines().enumerate() {
-        if let Some(col_idx) = line.find(substring) {
-            let line_u32 = u32::try_from(line_idx).context("line index overflow")?;
-            let col_u32 = u32::try_from(col_idx).context("column index overflow")?;
-            return Ok((line_u32, col_u32));
-        }
-    }
-    Err(anyhow!("Substring '{substring}' not found in content"))
-}
-
 /// Helper to spawn the bridge and communicate with it
 struct BridgeProcess {
     child: std::process::Child,
@@ -257,17 +245,11 @@ fn test_mcp_tools_list() -> Result<()> {
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Check all expected tools are present
+    // Check all expected tools are present (6 after search redesign)
     let expected_tools = [
-        "definition",
-        "type_definition",
-        "implementation",
-        "find_references",
-        "document_symbols",
         "search",
+        "document_symbols",
         "diagnostics",
-        "call_hierarchy",
-        "type_hierarchy",
         "status",
         "codebase_map",
         "list_directory",
@@ -294,40 +276,6 @@ fn test_mcp_tools_list() -> Result<()> {
             "Tool {name} has no properties"
         );
     }
-    Ok(())
-}
-
-#[test]
-fn test_mcp_tool_call_invalid_file() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
-    bridge.initialize()?;
-
-    // Request definition on non-existent file
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 6,
-        "method": "tools/call",
-        "params": {
-            "name": "definition",
-            "arguments": {
-                "file": "/tmp/nonexistent_file_12345.sh",
-                "line": 0,
-                "character": 0
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-
-    assert!(response.get("result").is_some());
-
-    let result = &response["result"];
-    // Should return an error result
-    assert_eq!(
-        result["isError"], true,
-        "Expected error for nonexistent file"
-    );
     Ok(())
 }
 
@@ -418,166 +366,6 @@ fn test_client_info_stored_in_session() -> Result<()> {
 }
 
 #[test]
-fn test_catenary_find_references_by_position() -> Result<()> {
-    // Create a test script with a function that's called multiple times
-    let test_file = "/tmp/mcp_test_find_refs.sh";
-    std::fs::write(
-        test_file,
-        r#"#!/bin/bash
-
-my_func() {
-    echo "hello"
-}
-
-my_func
-my_func
-"#,
-    )?;
-
-    let lsp = mockls_lsp_arg("shellscript", "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
-    bridge.initialize()?;
-
-    // Request references by position (on the function definition, line 2)
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 500,
-        "method": "tools/call",
-        "params": {
-            "name": "find_references",
-            "arguments": {
-                "file": test_file,
-                "line": 2,
-                "character": 0
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-
-    assert!(
-        response.get("result").is_some(),
-        "Find references call failed: {response:?}"
-    );
-
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "Expected success, got error: {result:?}"
-    );
-
-    let content_arr = result["content"]
-        .as_array()
-        .context("Missing content array")?;
-    let text = content_arr[0]["text"]
-        .as_str()
-        .context("Missing text in content")?;
-
-    // Should find at least the definition and calls
-    // The definition should be marked with [def]
-    assert!(
-        text.contains("[def]"),
-        "Expected definition marker [def] in output, got: {text}"
-    );
-
-    std::fs::remove_file(test_file).ok();
-    Ok(())
-}
-
-#[test]
-fn test_catenary_find_references_by_symbol() -> Result<()> {
-    // Create a test script with a function
-    let test_file = "/tmp/mcp_test_find_refs_symbol.sh";
-    std::fs::write(
-        test_file,
-        r#"#!/bin/bash
-
-unique_test_func() {
-    echo "hello"
-}
-
-unique_test_func
-"#,
-    )?;
-
-    let lsp = mockls_lsp_arg("shellscript", "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
-    bridge.initialize()?;
-
-    // Request references by symbol name
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 501,
-        "method": "tools/call",
-        "params": {
-            "name": "find_references",
-            "arguments": {
-                "symbol": "unique_test_func",
-                "file": test_file
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-
-    let result = &response["result"];
-
-    // mockls workspace/symbol only returns results for opened documents.
-    // The find_references tool may or may not open the file before the
-    // workspace/symbol lookup, so accept either success or "not found".
-    let content_arr = result["content"]
-        .as_array()
-        .context("Missing content array")?;
-    if result["isError"] == true {
-        let text = content_arr[0]["text"]
-            .as_str()
-            .context("Missing text in content")?;
-        assert!(
-            text.contains("not found") || text.contains("No references"),
-            "Unexpected error: {text}"
-        );
-    } else if !content_arr.is_empty() {
-        let text = content_arr[0]["text"]
-            .as_str()
-            .context("Missing text in content")?;
-        assert!(
-            text.contains(test_file) || text.contains("No references"),
-            "Expected references to contain file path, got: {text}"
-        );
-    }
-
-    std::fs::remove_file(test_file).ok();
-    Ok(())
-}
-
-#[test]
-fn test_catenary_find_references_missing_args() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
-    bridge.initialize()?;
-
-    // Request without symbol or file - should fail
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 502,
-        "method": "tools/call",
-        "params": {
-            "name": "find_references",
-            "arguments": {}
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-
-    let result = &response["result"];
-    assert_eq!(
-        result["isError"], true,
-        "Expected error for missing arguments"
-    );
-    Ok(())
-}
-
-#[test]
 fn test_multi_root_find_symbol() -> Result<()> {
     // Create two roots with unique function names
     let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
@@ -650,92 +438,6 @@ fn test_multi_root_find_symbol() -> Result<()> {
     assert!(
         text_b.contains("beta.sh"),
         "Expected search to find beta.sh, got: {text_b}"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_multi_root_definition() -> Result<()> {
-    // Create two roots, each with a function definition and a call
-    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
-    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
-
-    let script_a = dir_a.path().join("defs_a.sh");
-    std::fs::write(
-        &script_a,
-        "#!/bin/bash\nfunction greet_a() { echo hi; }\ngreet_a\n",
-    )?;
-
-    let script_b = dir_b.path().join("defs_b.sh");
-    std::fs::write(
-        &script_b,
-        "#!/bin/bash\nfunction greet_b() { echo hi; }\ngreet_b\n",
-    )?;
-
-    let root_a = dir_a.path().to_str().context("Invalid path A")?;
-    let root_b = dir_b.path().to_str().context("Invalid path B")?;
-
-    let lsp = mockls_lsp_arg("shellscript", "");
-    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
-    bridge.initialize()?;
-
-    // Go to definition of greet_a call in root A (line 2, char 0)
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 710,
-        "method": "tools/call",
-        "params": {
-            "name": "definition",
-            "arguments": {
-                "file": script_a.to_str().context("Invalid script A path")?,
-                "line": 2,
-                "character": 0
-            }
-        }
-    }))?;
-
-    let response_a = bridge.recv()?;
-    let result_a = &response_a["result"];
-    assert!(
-        result_a["isError"].is_null() || result_a["isError"] == false,
-        "Definition in root A failed: {response_a:?}"
-    );
-    let text_a = result_a["content"][0]["text"]
-        .as_str()
-        .context("Missing text for definition A")?;
-    assert!(
-        text_a.contains("defs_a.sh"),
-        "Definition should point to defs_a.sh, got: {text_a}"
-    );
-
-    // Go to definition of greet_b call in root B (line 2, char 0)
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 711,
-        "method": "tools/call",
-        "params": {
-            "name": "definition",
-            "arguments": {
-                "file": script_b.to_str().context("Invalid script B path")?,
-                "line": 2,
-                "character": 0
-            }
-        }
-    }))?;
-
-    let response_b = bridge.recv()?;
-    let result_b = &response_b["result"];
-    assert!(
-        result_b["isError"].is_null() || result_b["isError"] == false,
-        "Definition in root B failed: {response_b:?}"
-    );
-    let text_b = result_b["content"][0]["text"]
-        .as_str()
-        .context("Missing text for definition B")?;
-    assert!(
-        text_b.contains("defs_b.sh"),
-        "Definition should point to defs_b.sh, got: {text_b}"
     );
 
     Ok(())
@@ -858,22 +560,18 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
     let root_b = dir_b.path().to_str().context("Invalid path B")?;
 
     // Spawn bridge with only root_a
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg("shellscript", "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
     bridge.initialize_with_roots(&[root_a])?;
 
-    // Definition on function call in root_a — server should be working
+    // Search in root_a — server should be working
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 10,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": script_a.to_str().context("Invalid script A path")?,
-                "line": 2,
-                "character": 0
-            }
+            "name": "search",
+            "arguments": { "queries": ["unique_root_a_func"] }
         }
     }))?;
 
@@ -881,7 +579,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
     let result = &response["result"];
     assert!(
         result["isError"].is_null() || result["isError"] == false,
-        "Definition on root A function failed: {response:?}"
+        "Search in root A failed: {response:?}"
     );
 
     // Send roots/list_changed, respond with both roots
@@ -913,21 +611,18 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
         }
     }))?;
 
-    // Definition in root_b — server should have been restarted with new roots.
-    // Retry loop to accommodate spawn + initialize time.
+    // Search in root_b — server should have been restarted with new roots.
+    // search waits for all servers to be ready, but retry to accommodate restart.
     let mut success = false;
+    let mut last_text = String::new();
     for i in 0..10 {
         bridge.send(&json!({
             "jsonrpc": "2.0",
             "id": 20 + i,
             "method": "tools/call",
             "params": {
-                "name": "definition",
-                "arguments": {
-                    "file": script_b.to_str().context("Invalid script B path")?,
-                    "line": 2,
-                    "character": 0
-                }
+                "name": "search",
+                "arguments": { "queries": ["unique_root_b_func"] }
             }
         }))?;
 
@@ -940,7 +635,8 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
         let text = result["content"][0]["text"]
             .as_str()
             .context("Missing text")?;
-        if text.contains("funcs_b.sh") {
+        last_text = text.to_string();
+        if text.contains("## Symbols") && text.contains("funcs_b.sh") {
             success = true;
             break;
         }
@@ -949,7 +645,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
 
     assert!(
         success,
-        "Definition in root B should succeed after server restart with new roots"
+        "Search in root B should find ## Symbols with funcs_b.sh after server restart. Last output: {last_text}"
     );
 
     Ok(())
@@ -1084,63 +780,6 @@ fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
 }
 
 #[test]
-fn test_mockls_definition_across_profiles() -> Result<()> {
-    let profiles: &[(&str, &str)] = &[("clean", ""), ("workspace-folders", "--workspace-folders")];
-
-    for (name, flags) in profiles {
-        let test_file = "/tmp/mockls_def_test.sh";
-        std::fs::write(
-            test_file,
-            "#!/bin/bash\nfn my_function() { echo hi; }\nmy_function\n",
-        )?;
-
-        let lsp = mockls_lsp_arg("shellscript", flags);
-        let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
-        bridge.initialize()?;
-
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {
-                "name": "definition",
-                "arguments": {
-                    "file": test_file,
-                    "line": 2,
-                    "character": 0
-                }
-            }
-        }))?;
-
-        let response = bridge.recv()?;
-        let result = &response["result"];
-        assert!(
-            result["isError"].is_null() || result["isError"] == false,
-            "Profile {name}: definition failed: {response:?}"
-        );
-
-        let content = result["content"]
-            .as_array()
-            .context(format!("Profile {name}: missing content array"))?;
-        assert!(
-            !content.is_empty(),
-            "Profile {name}: expected definition content"
-        );
-
-        let text = content[0]["text"]
-            .as_str()
-            .context(format!("Profile {name}: missing text"))?;
-        assert!(
-            text.contains(test_file),
-            "Profile {name}: definition should contain file path, got: {text}"
-        );
-
-        std::fs::remove_file(test_file).ok();
-    }
-    Ok(())
-}
-
-#[test]
 fn test_mockls_diagnostics_across_profiles() -> Result<()> {
     let profiles: &[(&str, &str)] = &[
         ("version", "--publish-version"),
@@ -1208,8 +847,8 @@ fn test_mockls_diagnostics_across_profiles() -> Result<()> {
 )]
 fn test_mockls_sync_roots_across_profiles() -> Result<()> {
     let profiles: &[(&str, &str)] = &[
-        ("no-workspace-folders", ""),
-        ("workspace-folders", "--workspace-folders"),
+        ("no-workspace-folders", "--scan-roots"),
+        ("workspace-folders", "--workspace-folders --scan-roots"),
     ];
 
     for (name, flags) in profiles {
@@ -1235,18 +874,14 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
         let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
         bridge.initialize_with_roots(&[root_a])?;
 
-        // Definition on function call in root_a
+        // Search in root_a — server should be working
         bridge.send(&json!({
             "jsonrpc": "2.0",
             "id": 10,
             "method": "tools/call",
             "params": {
-                "name": "definition",
-                "arguments": {
-                    "file": script_a.to_str().context("Invalid script A path")?,
-                    "line": 2,
-                    "character": 0
-                }
+                "name": "search",
+                "arguments": { "queries": ["unique_root_a_func"] }
             }
         }))?;
 
@@ -1254,7 +889,7 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
         let result = &response["result"];
         assert!(
             result["isError"].is_null() || result["isError"] == false,
-            "Profile {name}: definition on root A failed: {response:?}"
+            "Profile {name}: search in root A failed: {response:?}"
         );
 
         // Send roots/list_changed with both roots
@@ -1288,20 +923,14 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             }
         }))?;
 
-        // Definition on function call in root_b — bridge blocks until ready
-        // (via wait_for_server_ready: activity settle for no-progress mockls,
-        // or after restart for servers without workspace folder support)
+        // Search in root_b — bridge waits for all servers to be ready
         bridge.send(&json!({
             "jsonrpc": "2.0",
             "id": 20,
             "method": "tools/call",
             "params": {
-                "name": "definition",
-                "arguments": {
-                    "file": script_b.to_str().context("Invalid script B path")?,
-                    "line": 2,
-                    "character": 0
-                }
+                "name": "search",
+                "arguments": { "queries": ["unique_root_b_func"] }
             }
         }))?;
 
@@ -1309,14 +938,14 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
         let result = &response["result"];
         assert!(
             result["isError"] != true,
-            "Profile {name}: definition on root B returned error: {response:?}"
+            "Profile {name}: search in root B returned error: {response:?}"
         );
         let text = result["content"][0]["text"]
             .as_str()
             .context("Missing text")?;
         assert!(
             text.contains("funcs_b.sh"),
-            "Profile {name}: definition on root B should reference funcs_b.sh, got: {text}"
+            "Profile {name}: search in root B should reference funcs_b.sh, got: {text}"
         );
     }
     Ok(())
@@ -1344,25 +973,21 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
     bridge.initialize_with_roots(&[root_a])?;
 
-    // Definition on root_a — establishes server is working
+    // Search in root_a — establishes server is working
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 10,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": file_a.to_str().context("Invalid file A path")?,
-                "line": 2,
-                "character": 0
-            }
+            "name": "search",
+            "arguments": { "queries": ["hello"] }
         }
     }))?;
 
     let response = bridge.recv()?;
     assert!(
         response["result"]["isError"] != true,
-        "Root A definition failed: {response:?}"
+        "Root A search failed: {response:?}"
     );
 
     // Add root_b via roots/list_changed
@@ -1388,7 +1013,7 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         }
     }))?;
 
-    // Definition on root_b — must not hang.
+    // Search in root_b — must not hang.
     // did_change_workspace_folders sets state to Busy.
     // Since mockls never sends $/progress, wait_ready() uses
     // the activity settle fallback to transition back to Ready.
@@ -1397,26 +1022,22 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         "id": 20,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": file_b.to_str().context("Invalid file B path")?,
-                "line": 2,
-                "character": 0
-            }
+            "name": "search",
+            "arguments": { "queries": ["world"] }
         }
     }))?;
 
     let response = bridge.recv()?;
     assert!(
         response["result"]["isError"] != true,
-        "Root B definition should not hang or error: {response:?}"
+        "Root B search should not hang or error: {response:?}"
     );
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .context("Missing definition text for root B")?;
+        .context("Missing search text for root B")?;
     assert!(
         text.contains("funcs_b.sh"),
-        "Expected 'funcs_b.sh' in definition, got: {text}"
+        "Expected 'funcs_b.sh' in search results, got: {text}"
     );
 
     Ok(())
@@ -1440,18 +1061,14 @@ fn test_mockls_multiplexing() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp_shell, &lsp_toml], root)?;
     bridge.initialize()?;
 
-    // Definition on shell file
+    // Search for "greet" — should find in shell file via ripgrep
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 100,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": shell_file.to_str().context("Invalid shell file path")?,
-                "line": 2,
-                "character": 0
-            }
+            "name": "search",
+            "arguments": { "queries": ["greet"] }
         }
     }))?;
 
@@ -1459,21 +1076,17 @@ fn test_mockls_multiplexing() -> Result<()> {
     let result_shell = &response_shell["result"];
     assert!(
         result_shell["isError"].is_null() || result_shell["isError"] == false,
-        "Shell definition failed: {response_shell:?}"
+        "Shell search failed: {response_shell:?}"
     );
 
-    // Definition on TOML file
+    // Search for "package" — should find in TOML file via ripgrep
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 101,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": toml_file.to_str().context("Invalid toml file path")?,
-                "line": 1,
-                "character": 0
-            }
+            "name": "search",
+            "arguments": { "queries": ["package"] }
         }
     }))?;
 
@@ -1481,24 +1094,23 @@ fn test_mockls_multiplexing() -> Result<()> {
     let result_toml = &response_toml["result"];
     assert!(
         result_toml["isError"].is_null() || result_toml["isError"] == false,
-        "TOML definition failed: {response_toml:?}"
+        "TOML search failed: {response_toml:?}"
     );
 
-    // Verify different servers responded (both should return content)
     let text_shell = result_shell["content"][0]["text"]
         .as_str()
-        .context("Missing shell definition text")?;
+        .context("Missing shell search text")?;
     let text_toml = result_toml["content"][0]["text"]
         .as_str()
-        .context("Missing toml definition text")?;
+        .context("Missing toml search text")?;
 
     assert!(
         text_shell.contains("test.sh"),
-        "Shell definition should reference test.sh, got: {text_shell}"
+        "Shell search should reference test.sh, got: {text_shell}"
     );
     assert!(
         text_toml.contains("test.toml"),
-        "TOML definition should reference test.toml, got: {text_toml}"
+        "TOML search should reference test.toml, got: {text_toml}"
     );
 
     Ok(())
@@ -1588,87 +1200,47 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that `ContentModified` (-32801) is retried transparently (Gap 5).
-/// mockls `--content-modified-once` returns `ContentModified` on the first
-/// definition request, then succeeds on retry.
+/// Verifies that search degrades gracefully when LSP methods fail.
+/// `--fail-on workspace/symbol` makes workspace/symbol return `InternalError`.
+/// Search should still return ripgrep file matches.
 #[test]
-fn test_mockls_content_modified_retry() -> Result<()> {
+fn test_search_graceful_degradation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let test_file = dir.path().join("test.sh");
-    let content = "#!/bin/bash\nfn greet() { echo hi; }\ngreet\n";
-    std::fs::write(&test_file, content)?;
+    std::fs::write(&test_file, "#!/bin/bash\nfn greet() { echo hi; }\ngreet\n")?;
 
-    let lsp = mockls_lsp_arg("shellscript", "--content-modified-once");
+    let lsp = mockls_lsp_arg("shellscript", "--scan-roots --fail-on workspace/symbol");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    let (line, col) = find_position(content, "greet")?;
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": test_file.to_str().context("file path")?,
-                "line": line,
-                "character": col
-            }
+            "name": "search",
+            "arguments": { "queries": ["greet"] }
         }
     }))?;
 
     let response = bridge.recv()?;
     assert!(
         response["result"]["isError"] != true,
-        "Definition should succeed after ContentModified retry: {response:?}"
+        "Search should succeed even when workspace/symbol fails: {response:?}"
     );
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .context("Missing definition text")?;
+        .context("Missing search text")?;
+    // Should still find via ripgrep
     assert!(
         text.contains("test.sh"),
-        "Definition result should contain file path, got: {text}"
+        "Search should find test.sh via ripgrep, got: {text}"
     );
-
-    Ok(())
-}
-
-/// Verifies that a hanging LSP request returns an error instead of blocking
-/// forever (Gap 4). mockls `--hang-on textDocument/definition` never responds
-/// to definition requests. Catenary's 30s wall-clock backstop should fire.
-#[test]
-fn test_mockls_request_hang_detection() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let test_file = dir.path().join("test.sh");
-    std::fs::write(&test_file, "#!/bin/bash\necho hello\n")?;
-
-    let lsp = mockls_lsp_arg("shellscript", "--hang-on textDocument/definition");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "definition",
-            "arguments": {
-                "file": test_file.to_str().context("file path")?,
-                "line": 1,
-                "character": 0
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-
-    // Should return an error, not hang forever
-    let result = &response["result"];
-    assert_eq!(
-        result["isError"], true,
-        "Hanging request should return error, got: {response:?}"
+    // Should NOT have a Symbols section (LSP failed)
+    assert!(
+        !text.contains("## Symbols"),
+        "Symbols section should be absent when workspace/symbol fails, got: {text}"
     );
 
     Ok(())
@@ -1733,18 +1305,14 @@ fn test_wait_ready_failure_detection() -> Result<()> {
     // Small delay for the workspace folder change to be sent to mockls
     std::thread::sleep(Duration::from_millis(200));
 
-    // Send a definition request — wait_ready should detect failure
+    // Send a search request — wait_ready should detect failure
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 10,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": test_file.to_str().context("file path")?,
-                "line": 1,
-                "character": 0
-            }
+            "name": "search",
+            "arguments": { "queries": ["hello"] }
         }
     }))?;
 
@@ -1764,7 +1332,7 @@ fn test_wait_ready_failure_detection() -> Result<()> {
 /// mockls `--cpu-on-initialized 3000` burns 3s of CPU on `initialized`.
 /// During warmup (<3s from spawn), the server is Running, so `is_ready()`
 /// returns false. After the burn completes, the server goes Sleeping,
-/// `is_ready()` returns true, and the definition request succeeds.
+/// `is_ready()` returns true, and the search request succeeds.
 #[test]
 fn test_warmup_observation() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1779,18 +1347,14 @@ fn test_warmup_observation() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Send definition immediately — server is still burning CPU
+    // Send search immediately — server is still burning CPU
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "definition",
-            "arguments": {
-                "file": test_file.to_str().context("file path")?,
-                "line": 2,
-                "character": 0
-            }
+            "name": "search",
+            "arguments": { "queries": ["my_function"] }
         }
     }))?;
 
@@ -1800,7 +1364,114 @@ fn test_warmup_observation() -> Result<()> {
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(
         text.contains("test.sh"),
-        "Definition should succeed after warmup observation. Got: {text}"
+        "Search should succeed after warmup observation. Got: {text}"
+    );
+
+    Ok(())
+}
+
+// ─── scan-roots and enrichment tests ─────────────────────────────────────
+
+/// Verifies that `--scan-roots` makes workspace symbols available without
+/// a prior `didOpen`. Without `--scan-roots`, search only finds text via
+/// ripgrep; with it, LSP workspace symbols appear in the `## Symbols` section.
+#[test]
+fn test_search_symbols_with_scan_roots() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let test_file = dir.path().join("greeter.sh");
+    std::fs::write(
+        &test_file,
+        "#!/bin/bash\nfn greet() { echo hello; }\ngreet\n",
+    )?;
+
+    let lsp = mockls_lsp_arg("shellscript", "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["greet"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    assert!(
+        text.contains("## Symbols"),
+        "Search with --scan-roots should produce ## Symbols section, got: {text}"
+    );
+    assert!(
+        text.contains("greet"),
+        "Symbols section should contain 'greet', got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that type definition enrichment appears in search output.
+/// mockls returns the same definition location for typeDefinition, which
+/// is always at a different location concept-wise, so the `Type:` field
+/// should appear in the enrichment output.
+#[test]
+fn test_search_type_definition_enrichment() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Create two files: one with a type definition on line 0, another
+    // with a call site. The call-site file has `let result` which
+    // workspace/symbol picks up as a Variable at line 1, and
+    // typeDefinition on that position returns the fn definition in
+    // the other file (different file → always shown).
+    let def_file = dir.path().join("types.sh");
+    std::fs::write(&def_file, "fn my_type() { echo type; }\n")?;
+
+    let use_file = dir.path().join("usage.sh");
+    std::fs::write(&use_file, "#!/bin/bash\nlet result = my_type\n")?;
+
+    let lsp = mockls_lsp_arg("shellscript", "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Search for 'result' — should find the variable in usage.sh
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["result"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got: {text}"
+    );
+    // The type definition enrichment should show Type: for the variable
+    // symbol, pointing to wherever mockls resolves the type definition.
+    assert!(
+        text.contains("Type:"),
+        "Expected Type: enrichment for variable symbol, got: {text}"
     );
 
     Ok(())

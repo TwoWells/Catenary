@@ -9,12 +9,13 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCall,
     CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, Diagnostic, DiagnosticSeverity,
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Location, LocationLink, Position, ReferenceContext, ReferenceParams,
-    SymbolInformation, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    GotoDefinitionResponse, HoverParams, Location, Position, ReferenceContext, ReferenceParams,
+    SymbolInformation, SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -48,43 +49,11 @@ const fn default_detail_level() -> DetailLevel {
     DetailLevel::Outline
 }
 
-/// Input for tools that accept either a symbol name or file/line/character position.
-#[derive(Debug, Deserialize)]
-pub struct SymbolOrPositionInput {
-    /// Symbol name to search for (uses workspace/document symbols).
-    pub symbol: Option<String>,
-    /// File path — required for position mode, optional for symbol mode (narrows search scope).
-    pub file: Option<String>,
-    /// 0-indexed line number — required if not using symbol.
-    pub line: Option<u32>,
-    /// 0-indexed character position — required if not using symbol.
-    pub character: Option<u32>,
-}
-
 /// Input for tools that need only a file path.
 #[derive(Debug, Deserialize)]
 pub struct FileInput {
     /// Path to the file.
     pub file: String,
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-/// Input for `find_references` - accepts either symbol name OR position.
-#[derive(Debug, Deserialize)]
-pub struct FindReferencesInput {
-    /// Symbol name to search for (uses workspace symbols)
-    pub symbol: Option<String>,
-    /// File path (required if using position, optional if using symbol to narrow scope)
-    pub file: Option<String>,
-    /// Line number (0-indexed) - required if not using symbol
-    pub line: Option<u32>,
-    /// Character position (0-indexed) - required if not using symbol
-    pub character: Option<u32>,
-    #[serde(default = "default_true")]
-    pub include_declaration: bool,
 }
 
 /// Input for unified search.
@@ -96,36 +65,6 @@ pub struct SearchInput {
     /// Workspace roots are always searched; these paths are searched in addition.
     #[serde(default)]
     pub paths: Vec<String>,
-}
-
-/// Input for call hierarchy.
-#[derive(Debug, Deserialize)]
-pub struct CallHierarchyInput {
-    /// Symbol name to search for (uses workspace/document symbols).
-    pub symbol: Option<String>,
-    /// File path — required for position mode, optional for symbol mode.
-    pub file: Option<String>,
-    /// 0-indexed line number — required if not using symbol.
-    pub line: Option<u32>,
-    /// 0-indexed character position — required if not using symbol.
-    pub character: Option<u32>,
-    /// "incoming" or "outgoing"
-    pub direction: String,
-}
-
-/// Input for type hierarchy.
-#[derive(Debug, Deserialize)]
-pub struct TypeHierarchyInput {
-    /// Symbol name to search for (uses workspace/document symbols).
-    pub symbol: Option<String>,
-    /// File path — required for position mode, optional for symbol mode.
-    pub file: Option<String>,
-    /// 0-indexed line number — required if not using symbol.
-    pub line: Option<u32>,
-    /// 0-indexed character position — required if not using symbol.
-    pub character: Option<u32>,
-    /// "supertypes" or "subtypes"
-    pub direction: String,
 }
 
 /// Input for codebase map.
@@ -332,261 +271,6 @@ impl LspBridgeHandler {
         }
     }
 
-    /// Resolves a [`SymbolOrPositionInput`] to a `(PathBuf, Position)`.
-    ///
-    /// If a symbol name is provided, delegates to [`resolve_symbol_position`].
-    /// Otherwise, requires file/line/character and resolves the path.
-    fn resolve_symbol_or_position(
-        &self,
-        input: &SymbolOrPositionInput,
-    ) -> Result<(PathBuf, Position)> {
-        if let Some(symbol) = &input.symbol {
-            self.resolve_symbol_position(symbol, input.file.as_deref())
-        } else {
-            let file = input.file.as_ref().ok_or_else(|| {
-                anyhow!("Either 'symbol' or 'file' with 'line'/'character' is required")
-            })?;
-            let line = input
-                .line
-                .ok_or_else(|| anyhow!("'line' is required when using position"))?;
-            let character = input
-                .character
-                .ok_or_else(|| anyhow!("'character' is required when using position"))?;
-            let path = Self::resolve_path(file)?;
-            Ok((path, Position { line, character }))
-        }
-    }
-
-    fn handle_definition(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: SymbolOrPositionInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-        let (path, position) = self.resolve_symbol_or_position(&input)?;
-
-        debug!("Definition request: {}:{}", path.display(), position.line);
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-            client_mutex.lock().await.definition(params).await
-        })?;
-
-        result.map_or_else(
-            || Ok(CallToolResult::text("No definition found")),
-            |response| Ok(CallToolResult::text(format_definition_response(&response))),
-        )
-    }
-
-    fn handle_type_definition(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: SymbolOrPositionInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-        let (path, position) = self.resolve_symbol_or_position(&input)?;
-
-        debug!(
-            "Type definition request: {}:{}",
-            path.display(),
-            position.line
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-            client_mutex.lock().await.type_definition(params).await
-        })?;
-
-        result.map_or_else(
-            || Ok(CallToolResult::text("No type definition found")),
-            |response| Ok(CallToolResult::text(format_definition_response(&response))),
-        )
-    }
-
-    fn handle_implementation(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: SymbolOrPositionInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-        let (path, position) = self.resolve_symbol_or_position(&input)?;
-
-        debug!(
-            "Implementation request: {}:{}",
-            path.display(),
-            position.line
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-            let params = GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-            client_mutex.lock().await.implementation(params).await
-        })?;
-
-        result.map_or_else(
-            || Ok(CallToolResult::text("No implementations found")),
-            |response| Ok(CallToolResult::text(format_definition_response(&response))),
-        )
-    }
-
-    fn handle_find_references(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: FindReferencesInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        // Resolve target position - either from symbol search or direct position
-        let sym_input = SymbolOrPositionInput {
-            symbol: input.symbol,
-            file: input.file,
-            line: input.line,
-            character: input.character,
-        };
-        let (target_path, target_position) = self.resolve_symbol_or_position(&sym_input)?;
-
-        let (references, definition) = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&target_path).await?;
-
-            let ref_params = ReferenceParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: uri.clone() },
-                    position: target_position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-                context: ReferenceContext {
-                    include_declaration: input.include_declaration,
-                },
-            };
-
-            let def_params = GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: target_position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-
-            let client = client_mutex.lock().await;
-            let refs = client.references(ref_params).await?;
-            let def = client.definition(def_params).await?;
-            drop(client);
-            Ok::<_, anyhow::Error>((refs, def))
-        })?;
-
-        match references {
-            Some(locations) if !locations.is_empty() => {
-                let def_loc = definition.as_ref().and_then(extract_definition_location);
-                Ok(CallToolResult::text(format_locations_with_definition(
-                    &locations,
-                    def_loc.as_ref(),
-                )))
-            }
-            _ => Ok(CallToolResult::text("No references found")),
-        }
-    }
-
-    /// Resolve a symbol name to a file path and position.
-    /// If `scope_file` is provided, searches within that file first.
-    fn resolve_symbol_position(
-        &self,
-        symbol: &str,
-        scope_file: Option<&str>,
-    ) -> Result<(std::path::PathBuf, Position)> {
-        // If a file is provided, try document symbols first for efficiency
-        if let Some(file) = scope_file {
-            let path = Self::resolve_path(file)?;
-            if let Some(result) = self.find_symbol_in_document(symbol, &path)? {
-                return Ok(result);
-            }
-        }
-
-        // Fall back to workspace symbol search
-        self.find_symbol_in_workspace(symbol)
-    }
-
-    fn find_symbol_in_document(
-        &self,
-        symbol: &str,
-        path: &std::path::Path,
-    ) -> Result<Option<(std::path::PathBuf, Position)>> {
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(path).await?;
-            let params = DocumentSymbolParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-            let response = client_mutex.lock().await.document_symbols(params).await?;
-            Ok::<_, anyhow::Error>((uri, response))
-        })?;
-
-        let (uri, response) = result;
-        if let Some(response) = response
-            && let Some(position) = find_symbol_in_document_response(&response, symbol)
-        {
-            let file_path = std::path::PathBuf::from(uri.path().as_str());
-            return Ok(Some((file_path, position)));
-        }
-        Ok(None)
-    }
-
-    /// Search for a symbol across the entire workspace.
-    fn find_symbol_in_workspace(&self, symbol: &str) -> Result<(std::path::PathBuf, Position)> {
-        let result = self.runtime.block_on(async {
-            let params = WorkspaceSymbolParams {
-                query: symbol.to_string(),
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-
-            let clients = self.client_manager.active_clients().await;
-
-            for client_mutex in clients.values() {
-                if let Ok(Some(response)) = client_mutex
-                    .lock()
-                    .await
-                    .workspace_symbols(params.clone())
-                    .await
-                    && let Some((path, position)) =
-                        find_symbol_in_workspace_response(&response, symbol)
-                {
-                    return Ok((path, position));
-                }
-            }
-
-            Err(anyhow!("Symbol '{symbol}' not found in workspace"))
-        })?;
-
-        Ok(result)
-    }
-
     fn handle_document_symbols(
         &self,
         arguments: Option<serde_json::Value>,
@@ -620,7 +304,8 @@ impl LspBridgeHandler {
         )
     }
 
-    /// Unified search: LSP workspace symbols with grep fallback.
+    /// Unified search: LSP workspace symbols with enrichment + ripgrep text matches.
+    #[allow(clippy::too_many_lines, reason = "Core search orchestration")]
     fn handle_search(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: SearchInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
@@ -655,12 +340,20 @@ impl LspBridgeHandler {
         Ok(CallToolResult::text(sections.join("\n")))
     }
 
-    /// Executes a single search query: LSP workspace symbols + ripgrep file heatmap.
+    /// Executes a single search query: enriched LSP symbols + references + ripgrep.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Core search logic with LSP enrichment"
+    )]
     fn search_single(&self, query: &str, extra_paths: &[PathBuf]) -> String {
+        use std::fmt::Write;
+
         debug!("Search request: query={query}");
 
-        // 1. Workspace symbols from all active LSP servers
-        let symbol_lines = self.runtime.block_on(async {
+        let roots = self.runtime.block_on(self.client_manager.roots());
+
+        // 1. Collect raw SymbolInformation from all active LSP servers
+        let symbols = self.runtime.block_on(async {
             let params = WorkspaceSymbolParams {
                 query: query.to_string(),
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
@@ -668,7 +361,7 @@ impl LspBridgeHandler {
             };
 
             let clients = self.client_manager.active_clients().await;
-            let mut lines = Vec::new();
+            let mut all_symbols: Vec<SymbolInformation> = Vec::new();
 
             for client_mutex in clients.values() {
                 if let Ok(Some(response)) = client_mutex
@@ -676,57 +369,391 @@ impl LspBridgeHandler {
                     .await
                     .workspace_symbols(params.clone())
                     .await
-                    && let Some(formatted) = format_workspace_symbols(&response)
                 {
-                    lines.push(formatted);
+                    collect_symbol_information(&response, &mut all_symbols);
                 }
             }
 
-            lines
+            all_symbols
         });
 
-        // 2. Ripgrep file heatmap (always, covers all non-ignored files)
-        let mut search_dirs = self.runtime.block_on(self.client_manager.roots());
+        // 2. Enrich each symbol and collect references
+        let mut symbol_sections = Vec::new();
+        let mut all_ref_lines: HashMap<String, HashSet<u32>> = HashMap::new();
+
+        for sym in &symbols {
+            let enrichment = self.enrich_symbol(sym);
+
+            // Collect reference lines for deduplication
+            for (file, lines) in &enrichment.ref_lines {
+                all_ref_lines.entry(file.clone()).or_default().extend(lines);
+            }
+
+            symbol_sections.push(format_enriched_symbol(sym, &enrichment, &roots));
+        }
+
+        // 3. Format References tier from collected reference locations
+        let references_output = self.runtime.block_on(async {
+            let mut ref_by_file: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+
+            for sym in &symbols {
+                let path = PathBuf::from(sym.location.uri.path().as_str());
+                let position = sym.location.range.start;
+                let def_file = sym.location.uri.path().to_string();
+                let def_line = sym.location.range.start.line + 1;
+
+                let refs = self.fetch_references(&path, position).await;
+                for loc in refs {
+                    let file = loc.uri.path().to_string();
+                    let line = loc.range.start.line + 1;
+                    let is_def = file == def_file && line == def_line;
+                    ref_by_file.entry(file).or_default().push((line, is_def));
+                }
+            }
+
+            ref_by_file
+        });
+
+        let references_formatted = format_clustered_references(&references_output, &roots);
+
+        // 4. Ripgrep text matches with reference deduplication
+        let mut search_dirs = roots;
         for path in extra_paths {
             if !search_dirs.contains(path) {
                 search_dirs.push(path.clone());
             }
         }
-        let heatmap = Self::ripgrep_heatmap(query, &search_dirs);
+        let rg_lines = Self::ripgrep_lines(query, &search_dirs);
+        let file_matches = format_clustered_file_matches(&rg_lines, &all_ref_lines, &search_dirs);
 
-        // 3. Combine
-        let has_symbols = !symbol_lines.is_empty();
-        let has_heatmap = !heatmap.is_empty();
+        // 5. Combine tiers
+        let has_symbols = !symbol_sections.is_empty();
+        let has_references = !references_formatted.is_empty();
+        let has_file_matches = !file_matches.is_empty();
 
-        if !has_symbols && !has_heatmap {
+        if !has_symbols && !has_references && !has_file_matches {
             return "No results found".to_string();
         }
 
         let mut output = String::new();
 
         if has_symbols {
-            output.push_str("## Symbols\n");
-            output.push_str(&symbol_lines.join("\n"));
+            let _ = writeln!(output, "## Symbols\n");
+            output.push_str(&symbol_sections.join("\n"));
         }
 
-        if has_heatmap {
+        if has_references {
             if has_symbols {
                 output.push_str("\n\n");
             }
-            output.push_str("## File matches\n");
-            output.push_str(&heatmap);
+            let _ = writeln!(output, "## References\n");
+            output.push_str(&references_formatted);
+        }
+
+        if has_file_matches {
+            if has_symbols || has_references {
+                output.push_str("\n\n");
+            }
+            let _ = writeln!(output, "## File matches\n");
+            output.push_str(&file_matches);
         }
 
         output
     }
 
-    /// Runs ripgrep and returns a file-level heatmap: file path, match count, line range.
-    ///
-    /// Searches all non-ignored files (no `--type` filter) so config files,
-    /// docs, and other non-code files are included.
-    fn ripgrep_heatmap(query: &str, roots: &[PathBuf]) -> String {
-        use std::collections::BTreeMap;
-        use std::fmt::Write;
+    /// Fetches references for a symbol position, returning empty vec on failure.
+    async fn fetch_references(&self, path: &Path, position: Position) -> Vec<Location> {
+        let Ok((uri, client_mutex)) = self.ensure_document_open(path).await else {
+            return Vec::new();
+        };
+
+        let client = client_mutex.lock().await;
+
+        if client.capabilities().references_provider.is_none() {
+            return Vec::new();
+        }
+
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        };
+
+        client
+            .references(params)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_default()
+    }
+
+    /// Enriches a symbol with hover, call hierarchy, type hierarchy, and implementations.
+    fn enrich_symbol(&self, sym: &SymbolInformation) -> SymbolEnrichment {
+        let path = PathBuf::from(sym.location.uri.path().as_str());
+        let position = sym.location.range.start;
+
+        self.runtime.block_on(async {
+            let mut enrichment = SymbolEnrichment::default();
+
+            let Ok((uri, client_mutex)) = self.ensure_document_open(&path).await else {
+                return enrichment;
+            };
+
+            let client = client_mutex.lock().await;
+            let caps = client.capabilities();
+
+            // Hover — signature + docs
+            if caps.hover_provider.is_some() {
+                let params = HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                };
+                if let Ok(Some(hover)) = client.hover(params).await {
+                    enrichment.hover = extract_hover_text(&hover);
+                }
+            }
+
+            // Note: definition() is not called here because workspace/symbol
+            // already returns symbols at their definition sites. Calling
+            // definition() on a definition site returns itself, which we'd
+            // suppress anyway. Definition enrichment would be useful when
+            // enriching symbols found at *use* sites (e.g., ripgrep hits).
+
+            // Type definition
+            if caps.type_definition_provider.is_some() {
+                let params = GotoDefinitionParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                    partial_result_params: lsp_types::PartialResultParams::default(),
+                };
+                if let Ok(Some(response)) = client.type_definition(params).await {
+                    let locations = extract_locations_from_definition(&response);
+                    if let Some(loc) = locations.into_iter().next() {
+                        enrichment.type_definition = Some(loc);
+                    }
+                }
+            }
+
+            // References — collect line numbers for dedup
+            if caps.references_provider.is_some() {
+                let params = ReferenceParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                    partial_result_params: lsp_types::PartialResultParams::default(),
+                    context: ReferenceContext {
+                        include_declaration: true,
+                    },
+                };
+                if let Ok(Some(refs)) = client.references(params).await {
+                    for loc in &refs {
+                        enrichment
+                            .ref_lines
+                            .entry(loc.uri.path().to_string())
+                            .or_default()
+                            .insert(loc.range.start.line + 1);
+                    }
+                }
+            }
+
+            // Kind-specific enrichment
+            match sym.kind {
+                SymbolKind::FUNCTION | SymbolKind::METHOD | SymbolKind::CONSTRUCTOR => {
+                    self.enrich_call_hierarchy(&client, &uri, position, &mut enrichment)
+                        .await;
+                }
+                SymbolKind::STRUCT | SymbolKind::CLASS | SymbolKind::ENUM => {
+                    self.enrich_implementations(&client, &uri, position, &mut enrichment)
+                        .await;
+                    self.enrich_type_hierarchy(&client, &uri, position, &mut enrichment)
+                        .await;
+                }
+                SymbolKind::INTERFACE => {
+                    self.enrich_implementations(&client, &uri, position, &mut enrichment)
+                        .await;
+                    self.enrich_subtypes(&client, &uri, position, &mut enrichment)
+                        .await;
+                }
+                _ => {}
+            }
+
+            enrichment
+        })
+    }
+
+    /// Fetches call hierarchy (incoming + outgoing) if the server supports it.
+    async fn enrich_call_hierarchy(
+        &self,
+        client: &LspClient,
+        uri: &lsp_types::Uri,
+        position: Position,
+        enrichment: &mut SymbolEnrichment,
+    ) {
+        if client.capabilities().call_hierarchy_provider.is_none() {
+            return;
+        }
+
+        let prepare_params = CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+        };
+
+        let Ok(Some(items)) = client.prepare_call_hierarchy(prepare_params).await else {
+            return;
+        };
+
+        let Some(item) = items.into_iter().next() else {
+            return;
+        };
+
+        // Incoming calls
+        let incoming_params = CallHierarchyIncomingCallsParams {
+            item: item.clone(),
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+        if let Ok(Some(calls)) = client.incoming_calls(incoming_params).await {
+            enrichment.incoming_calls = calls;
+        }
+
+        // Outgoing calls
+        let outgoing_params = CallHierarchyOutgoingCallsParams {
+            item,
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+        if let Ok(Some(calls)) = client.outgoing_calls(outgoing_params).await {
+            enrichment.outgoing_calls = calls;
+        }
+    }
+
+    /// Fetches implementations if the server supports it.
+    async fn enrich_implementations(
+        &self,
+        client: &LspClient,
+        uri: &lsp_types::Uri,
+        position: Position,
+        enrichment: &mut SymbolEnrichment,
+    ) {
+        if client.capabilities().implementation_provider.is_none() {
+            return;
+        }
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+
+        if let Ok(Some(response)) = client.implementation(params).await {
+            enrichment.implementations = extract_locations_from_definition(&response);
+        }
+    }
+
+    /// Fetches full type hierarchy (supertypes + subtypes) if the server supports it.
+    async fn enrich_type_hierarchy(
+        &self,
+        client: &LspClient,
+        uri: &lsp_types::Uri,
+        position: Position,
+        enrichment: &mut SymbolEnrichment,
+    ) {
+        // type_hierarchy_provider not in lsp_types::ServerCapabilities;
+        // attempt the call and gracefully handle errors.
+        let prepare_params = TypeHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+        };
+
+        let Ok(Some(items)) = client.prepare_type_hierarchy(prepare_params).await else {
+            return;
+        };
+
+        let Some(item) = items.into_iter().next() else {
+            return;
+        };
+
+        // Supertypes
+        let super_params = TypeHierarchySupertypesParams {
+            item: item.clone(),
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+        if let Ok(Some(types)) = client.supertypes(super_params).await {
+            enrichment.supertypes = types;
+        }
+
+        // Subtypes
+        let sub_params = TypeHierarchySubtypesParams {
+            item,
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+        if let Ok(Some(types)) = client.subtypes(sub_params).await {
+            enrichment.subtypes = types;
+        }
+    }
+
+    /// Fetches subtypes only (for traits/interfaces).
+    async fn enrich_subtypes(
+        &self,
+        client: &LspClient,
+        uri: &lsp_types::Uri,
+        position: Position,
+        enrichment: &mut SymbolEnrichment,
+    ) {
+        // type_hierarchy_provider not in lsp_types::ServerCapabilities;
+        // attempt the call and gracefully handle errors.
+        let prepare_params = TypeHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+        };
+
+        let Ok(Some(items)) = client.prepare_type_hierarchy(prepare_params).await else {
+            return;
+        };
+
+        let Some(item) = items.into_iter().next() else {
+            return;
+        };
+
+        let sub_params = TypeHierarchySubtypesParams {
+            item,
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+        if let Ok(Some(types)) = client.subtypes(sub_params).await {
+            enrichment.subtypes = types;
+        }
+    }
+
+    /// Runs ripgrep and returns per-file line numbers.
+    fn ripgrep_lines(query: &str, roots: &[PathBuf]) -> BTreeMap<String, Vec<u32>> {
         use std::process::Command;
 
         let mut cmd = Command::new("rg");
@@ -737,21 +764,17 @@ impl LspBridgeHandler {
         }
 
         let Ok(rg_output) = cmd.output() else {
-            return String::new();
+            return BTreeMap::new();
         };
 
         if !rg_output.status.success() && rg_output.stdout.is_empty() {
-            return String::new();
+            return BTreeMap::new();
         }
 
-        // Parse output lines: "file:line:content" — group by file
-        // Use BTreeMap for deterministic (sorted) file order
-        let mut file_stats: BTreeMap<String, (usize, u32, u32)> = BTreeMap::new();
+        let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let stdout = String::from_utf8_lossy(&rg_output.stdout);
 
         for line in stdout.lines() {
-            // Format: file:line_number:content
-            // Find second colon (first colon may be in Windows path, but we're on Linux)
             let Some((file, rest)) = line.split_once(':') else {
                 continue;
             };
@@ -762,50 +785,13 @@ impl LspBridgeHandler {
                 continue;
             };
 
-            let entry = file_stats
+            file_lines
                 .entry(file.to_string())
-                .or_insert((0, u32::MAX, 0));
-            entry.0 += 1; // count
-            entry.1 = entry.1.min(line_num); // min line
-            entry.2 = entry.2.max(line_num); // max line
+                .or_default()
+                .push(line_num);
         }
 
-        if file_stats.is_empty() {
-            return String::new();
-        }
-
-        // Sort by match count descending, then by file path
-        let mut sorted: Vec<_> = file_stats.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
-
-        // Show all files — the model has no way to retrieve omitted results
-        let mut output = String::new();
-        for (file, (count, min_line, max_line)) in sorted {
-            let display_path = roots
-                .iter()
-                .find_map(|root| {
-                    let root_str = root.to_string_lossy();
-                    file.strip_prefix(root_str.as_ref())
-                        .map(|rest| rest.strip_prefix('/').unwrap_or(rest).to_string())
-                })
-                .unwrap_or_else(|| file.clone());
-
-            let line_range = if min_line == max_line {
-                format!("line {min_line}")
-            } else {
-                format!("lines {min_line}-{max_line}")
-            };
-
-            let match_word = if count == 1 { "match" } else { "matches" };
-            let _ = writeln!(
-                output,
-                "{display_path}: {count} {match_word} ({line_range})"
-            );
-        }
-
-        // Remove trailing newline
-        output.truncate(output.trim_end().len());
-        output
+        file_lines
     }
 
     fn handle_diagnostics(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
@@ -867,169 +853,6 @@ impl LspBridgeHandler {
         }
     }
 
-    fn handle_call_hierarchy(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: CallHierarchyInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let sym_input = SymbolOrPositionInput {
-            symbol: input.symbol,
-            file: input.file,
-            line: input.line,
-            character: input.character,
-        };
-        let (path, position) = self.resolve_symbol_or_position(&sym_input)?;
-
-        debug!(
-            "Call hierarchy request: {}:{} direction={}",
-            path.display(),
-            position.line,
-            input.direction
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-
-            // First, prepare the call hierarchy
-            let prepare_params = CallHierarchyPrepareParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-            };
-
-            let client = client_mutex.lock().await;
-            let items = client.prepare_call_hierarchy(prepare_params).await?;
-
-            let Some(items) = items else {
-                return Ok::<_, anyhow::Error>(None);
-            };
-
-            if items.is_empty() {
-                return Ok(None);
-            }
-
-            // Get calls for the first item (safe: we checked is_empty above)
-            let Some(item) = items.into_iter().next() else {
-                return Ok(None);
-            };
-
-            match input.direction.as_str() {
-                "incoming" => {
-                    let params = CallHierarchyIncomingCallsParams {
-                        item,
-                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                        partial_result_params: lsp_types::PartialResultParams::default(),
-                    };
-                    let calls = client.incoming_calls(params).await?;
-                    drop(client);
-                    Ok(calls.map(|c| format_incoming_calls(&c)))
-                }
-                "outgoing" => {
-                    let params = CallHierarchyOutgoingCallsParams {
-                        item,
-                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                        partial_result_params: lsp_types::PartialResultParams::default(),
-                    };
-                    let calls = client.outgoing_calls(params).await?;
-                    drop(client);
-                    Ok(calls.map(|c| format_outgoing_calls(&c)))
-                }
-                _ => Err(anyhow!("direction must be 'incoming' or 'outgoing'")),
-            }
-        })?;
-
-        match result {
-            Some(text) if !text.is_empty() => Ok(CallToolResult::text(text)),
-            _ => Ok(CallToolResult::text("No call hierarchy found")),
-        }
-    }
-
-    fn handle_type_hierarchy(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: TypeHierarchyInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let sym_input = SymbolOrPositionInput {
-            symbol: input.symbol,
-            file: input.file,
-            line: input.line,
-            character: input.character,
-        };
-        let (path, position) = self.resolve_symbol_or_position(&sym_input)?;
-
-        debug!(
-            "Type hierarchy request: {}:{} direction={}",
-            path.display(),
-            position.line,
-            input.direction
-        );
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-
-            // First, prepare the type hierarchy
-            let prepare_params = TypeHierarchyPrepareParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position,
-                },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-            };
-
-            let client = client_mutex.lock().await;
-            let items = client.prepare_type_hierarchy(prepare_params).await?;
-
-            let Some(items) = items else {
-                return Ok::<_, anyhow::Error>(None);
-            };
-
-            if items.is_empty() {
-                return Ok(None);
-            }
-
-            // Get hierarchy for the first item (safe: we checked is_empty above)
-            let Some(item) = items.into_iter().next() else {
-                return Ok(None);
-            };
-
-            match input.direction.as_str() {
-                "supertypes" => {
-                    let params = TypeHierarchySupertypesParams {
-                        item,
-                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                        partial_result_params: lsp_types::PartialResultParams::default(),
-                    };
-                    let types = client.supertypes(params).await?;
-                    drop(client);
-                    Ok(types.map(|t| format_type_hierarchy_items(&t)))
-                }
-                "subtypes" => {
-                    let params = TypeHierarchySubtypesParams {
-                        item,
-                        work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                        partial_result_params: lsp_types::PartialResultParams::default(),
-                    };
-                    let types = client.subtypes(params).await?;
-                    drop(client);
-                    Ok(types.map(|t| format_type_hierarchy_items(&t)))
-                }
-                _ => Err(anyhow!("direction must be 'supertypes' or 'subtypes'")),
-            }
-        })?;
-
-        match result {
-            Some(text) if !text.is_empty() => Ok(CallToolResult::text(text)),
-            _ => Ok(CallToolResult::text("No type hierarchy found")),
-        }
-    }
     #[allow(
         clippy::too_many_lines,
         reason = "Complexity of codebase map generation requires many lines"
@@ -1245,43 +1068,8 @@ impl LspBridgeHandler {
 }
 
 impl ToolHandler for LspBridgeHandler {
-    #[allow(clippy::too_many_lines, reason = "Naturally long list of tools")]
     fn list_tools(&self) -> Vec<Tool> {
-        let tools = vec![
-            Tool {
-                name: "definition".to_string(),
-                description: Some("Go to the definition of a symbol. Accepts a symbol name or file/line/character position.".to_string()),
-                input_schema: symbol_or_position_schema(),
-            },
-            Tool {
-                name: "type_definition".to_string(),
-                description: Some("Go to the type definition of a symbol (e.g., for a variable, go to its type's definition). Accepts a symbol name or file/line/character position.".to_string()),
-                input_schema: symbol_or_position_schema(),
-            },
-            Tool {
-                name: "implementation".to_string(),
-                description: Some("Find implementations of an interface, trait, or abstract method. Accepts a symbol name or file/line/character position.".to_string()),
-                input_schema: symbol_or_position_schema(),
-            },
-            Tool {
-                name: "find_references".to_string(),
-                description: Some("Find all references to a symbol. Accepts either a symbol name (searched across workspace) or a file/line/character position. The definition is marked with [def] in results.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyClass', 'handleRequest'). If provided, the symbol will be found via workspace search." },
-                        "file": { "type": "string", "description": "Absolute or relative path to the file. Required if using line/character position; optional with symbol to narrow search scope." },
-                        "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
-                        "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." },
-                        "include_declaration": { "type": "boolean", "description": "Include the declaration in results (default: true)" }
-                    }
-                }),
-            },
-            Tool {
-                name: "document_symbols".to_string(),
-                description: Some("Get the symbol outline of a file (functions, classes, variables, etc.).".to_string()),
-                input_schema: file_schema(),
-            },
+        vec![
             Tool {
                 name: "search".to_string(),
                 description: Some("Search for a symbol or pattern across the workspace. Returns LSP workspace symbols (semantic) plus a file heatmap showing which files contain the query and where (match count + line range).".to_string()),
@@ -1303,39 +1091,14 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "diagnostics".to_string(),
-                description: Some("Get diagnostics (errors, warnings, hints) for a file.".to_string()),
+                name: "document_symbols".to_string(),
+                description: Some("Get the symbol outline of a file (functions, classes, variables, etc.).".to_string()),
                 input_schema: file_schema(),
             },
             Tool {
-                name: "call_hierarchy".to_string(),
-                description: Some("Get incoming or outgoing calls for a function/method. Accepts a symbol name or file/line/character position.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyStruct', 'handle_request'). If provided, position fields are optional." },
-                        "file": { "type": "string", "description": "Absolute or relative path to the file. Required when using line/character; optional with symbol to narrow search." },
-                        "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
-                        "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." },
-                        "direction": { "type": "string", "enum": ["incoming", "outgoing"], "description": "Direction: 'incoming' (who calls this?) or 'outgoing' (what does this call?)" }
-                    },
-                    "required": ["direction"]
-                }),
-            },
-            Tool {
-                name: "type_hierarchy".to_string(),
-                description: Some("Get supertypes or subtypes of a type. Accepts a symbol name or file/line/character position.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyStruct', 'handle_request'). If provided, position fields are optional." },
-                        "file": { "type": "string", "description": "Absolute or relative path to the file. Required when using line/character; optional with symbol to narrow search." },
-                        "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
-                        "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." },
-                        "direction": { "type": "string", "enum": ["supertypes", "subtypes"], "description": "Direction: 'supertypes' (parent types) or 'subtypes' (child types)" }
-                    },
-                    "required": ["direction"]
-                }),
+                name: "diagnostics".to_string(),
+                description: Some("Get diagnostics (errors, warnings, hints) for a file.".to_string()),
+                input_schema: file_schema(),
             },
             Tool {
                 name: "status".to_string(),
@@ -1367,7 +1130,7 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "list_directory".to_string(),
-                description: Some("List the contents of a directory. Shows directories, files with sizes, and symlinks with targets. Symlinks are not followed.".to_string()),
+                description: Some("List the contents of a directory. Shows directories, files with sizes, and symlinks with targets. Symlinks are not followed. Path must be within workspace roots.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1376,9 +1139,7 @@ impl ToolHandler for LspBridgeHandler {
                     "required": ["path"]
                 }),
             },
-        ];
-
-        tools
+        ]
     }
 
     fn call_tool(
@@ -1430,15 +1191,9 @@ impl ToolHandler for LspBridgeHandler {
         }
 
         let result = match name {
-            "definition" => self.handle_definition(arguments),
-            "type_definition" => self.handle_type_definition(arguments),
-            "implementation" => self.handle_implementation(arguments),
-            "find_references" => self.handle_find_references(arguments),
-            "document_symbols" => self.handle_document_symbols(arguments),
             "search" => self.handle_search(arguments),
+            "document_symbols" => self.handle_document_symbols(arguments),
             "diagnostics" => self.handle_diagnostics(arguments),
-            "call_hierarchy" => self.handle_call_hierarchy(arguments),
-            "type_hierarchy" => self.handle_type_hierarchy(arguments),
             "codebase_map" => self.handle_codebase_map(arguments),
             "list_directory" => self.handle_list_directory(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
@@ -1511,19 +1266,6 @@ const fn matches_detail_level(kind: lsp_types::SymbolKind, level: DetailLevel) -
     }
 }
 
-// Schema helpers
-fn symbol_or_position_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "symbol": { "type": "string", "description": "Symbol name to search for (e.g., 'MyStruct', 'handle_request'). If provided, position fields are optional." },
-            "file": { "type": "string", "description": "Absolute or relative path to the file. Required when using line/character; optional with symbol to narrow search." },
-            "line": { "type": "integer", "description": "Line number (0-indexed). Required if not using symbol." },
-            "character": { "type": "integer", "description": "Character position (0-indexed). Required if not using symbol." }
-        }
-    })
-}
-
 fn file_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -1534,180 +1276,11 @@ fn file_schema() -> serde_json::Value {
     })
 }
 
-// Formatting helpers
-fn format_definition_response(response: &GotoDefinitionResponse) -> String {
-    match response {
-        GotoDefinitionResponse::Scalar(location) => format_location(location),
-        GotoDefinitionResponse::Array(locations) => {
-            if locations.is_empty() {
-                "No results".to_string()
-            } else {
-                locations
-                    .iter()
-                    .map(format_location)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        }
-        GotoDefinitionResponse::Link(links) => {
-            if links.is_empty() {
-                "No results".to_string()
-            } else {
-                links
-                    .iter()
-                    .map(format_location_link)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        }
-    }
-}
-
-/// Find a symbol by name in a document symbol response, returning its position.
-fn find_symbol_in_document_response(
-    response: &DocumentSymbolResponse,
-    name: &str,
-) -> Option<Position> {
-    match response {
-        DocumentSymbolResponse::Flat(symbols) => {
-            // Exact match first
-            symbols
-                .iter()
-                .find(|s| s.name == name)
-                .or_else(|| symbols.iter().find(|s| s.name.contains(name)))
-                .map(|s| s.location.range.start)
-        }
-        DocumentSymbolResponse::Nested(symbols) => find_in_nested_symbols(symbols, name),
-    }
-}
-
-/// Recursively search nested document symbols.
-fn find_in_nested_symbols(symbols: &[DocumentSymbol], name: &str) -> Option<Position> {
-    for symbol in symbols {
-        if symbol.name == name {
-            return Some(symbol.selection_range.start);
-        }
-        if let Some(children) = &symbol.children
-            && let Some(pos) = find_in_nested_symbols(children, name)
-        {
-            return Some(pos);
-        }
-    }
-    // Second pass: partial match
-    for symbol in symbols {
-        if symbol.name.contains(name) {
-            return Some(symbol.selection_range.start);
-        }
-        if let Some(children) = &symbol.children
-            && let Some(pos) = find_in_nested_symbols(children, name)
-        {
-            return Some(pos);
-        }
-    }
-    None
-}
-
-/// Find a symbol by name in workspace symbol response, returning path and position.
-fn find_symbol_in_workspace_response(
-    response: &WorkspaceSymbolResponse,
-    name: &str,
-) -> Option<(std::path::PathBuf, Position)> {
-    match response {
-        WorkspaceSymbolResponse::Flat(symbols) => {
-            // Exact match first
-            let symbol = symbols
-                .iter()
-                .find(|s| s.name == name)
-                .or_else(|| symbols.iter().find(|s| s.name.contains(name)))?;
-            let path = std::path::PathBuf::from(symbol.location.uri.path().as_str());
-            Some((path, symbol.location.range.start))
-        }
-        WorkspaceSymbolResponse::Nested(symbols) => {
-            let symbol = symbols
-                .iter()
-                .find(|s| s.name == name)
-                .or_else(|| symbols.iter().find(|s| s.name.contains(name)))?;
-            match &symbol.location {
-                lsp_types::OneOf::Left(location) => {
-                    let path = std::path::PathBuf::from(location.uri.path().as_str());
-                    Some((path, location.range.start))
-                }
-                lsp_types::OneOf::Right(_) => None, // URI-only location, can't get position
-            }
-        }
-    }
-}
-
 fn format_location(location: &Location) -> String {
     let path = location.uri.path();
     let line = location.range.start.line + 1;
     let col = location.range.start.character + 1;
     format!("{path}:{line}:{col}")
-}
-
-fn format_location_link(loc_link: &LocationLink) -> String {
-    let path = loc_link.target_uri.path();
-    let line = loc_link.target_range.start.line + 1;
-    let col = loc_link.target_range.start.character + 1;
-    format!("{path}:{line}:{col}")
-}
-
-/// Format locations with the definition marked and listed first.
-fn format_locations_with_definition(
-    locations: &[Location],
-    definition: Option<&Location>,
-) -> String {
-    // Check if a location matches the definition
-    let is_definition = |loc: &Location| -> bool {
-        definition.is_some_and(|def| loc.uri == def.uri && loc.range.start == def.range.start)
-    };
-
-    // Sort: definition first, then by file path and line
-    let mut sorted: Vec<_> = locations.iter().collect();
-    sorted.sort_by(|a, b| {
-        let a_is_def = is_definition(a);
-        let b_is_def = is_definition(b);
-        match (a_is_def, b_is_def) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => {
-                // Sort by path, then line, then column
-                let path_cmp = a.uri.path().as_str().cmp(b.uri.path().as_str());
-                if path_cmp != std::cmp::Ordering::Equal {
-                    return path_cmp;
-                }
-                let line_cmp = a.range.start.line.cmp(&b.range.start.line);
-                if line_cmp != std::cmp::Ordering::Equal {
-                    return line_cmp;
-                }
-                a.range.start.character.cmp(&b.range.start.character)
-            }
-        }
-    });
-
-    sorted
-        .iter()
-        .map(|loc| {
-            if is_definition(loc) {
-                format!("{} [def]", format_location(loc))
-            } else {
-                format_location(loc)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Extract the first location from a `GotoDefinitionResponse`.
-fn extract_definition_location(response: &GotoDefinitionResponse) -> Option<Location> {
-    match response {
-        GotoDefinitionResponse::Scalar(loc) => Some(loc.clone()),
-        GotoDefinitionResponse::Array(locs) => locs.first().cloned(),
-        GotoDefinitionResponse::Link(links) => links.first().map(|link| Location {
-            uri: link.target_uri.clone(),
-            range: link.target_selection_range,
-        }),
-    }
 }
 
 fn format_document_symbols(response: &DocumentSymbolResponse) -> String {
@@ -1739,46 +1312,6 @@ fn format_nested_symbols(symbols: &[DocumentSymbol], indent: usize) -> String {
         }
     }
     result.join("\n")
-}
-
-fn format_workspace_symbols(response: &WorkspaceSymbolResponse) -> Option<String> {
-    match response {
-        WorkspaceSymbolResponse::Flat(symbols) => {
-            if symbols.is_empty() {
-                None
-            } else {
-                Some(
-                    symbols
-                        .iter()
-                        .map(format_symbol_info)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            }
-        }
-        WorkspaceSymbolResponse::Nested(symbols) => {
-            if symbols.is_empty() {
-                None
-            } else {
-                Some(
-                    symbols
-                        .iter()
-                        .map(|s| {
-                            let kind = format!("{:?}", s.kind);
-                            let loc = match &s.location {
-                                lsp_types::OneOf::Left(loc) => format_location(loc),
-                                lsp_types::OneOf::Right(uri_info) => {
-                                    uri_info.uri.path().to_string()
-                                }
-                            };
-                            format!("{} [{}] {}", s.name, kind, loc)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            }
-        }
-    }
 }
 
 fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
@@ -1817,57 +1350,356 @@ fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
         .join("\n")
 }
 
-fn format_incoming_calls(calls: &[CallHierarchyIncomingCall]) -> String {
-    if calls.is_empty() {
-        return "No incoming calls".to_string();
-    }
+// ─── Search enrichment types and formatting ─────────────────────────────
 
-    calls
-        .iter()
-        .map(|call| {
-            let path = call.from.uri.path();
-            let line = call.from.range.start.line + 1;
-            let name = &call.from.name;
-            let kind = format!("{:?}", call.from.kind);
-            format!("{name} [{kind}] {path}:{line}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Enrichment data collected for a single workspace symbol.
+#[derive(Default)]
+struct SymbolEnrichment {
+    /// Hover content (signature + docs).
+    hover: Option<String>,
+    /// Type definition location.
+    type_definition: Option<Location>,
+    /// Reference line numbers per file (for deduplication).
+    ref_lines: HashMap<String, HashSet<u32>>,
+    /// Incoming calls (who calls this function).
+    incoming_calls: Vec<CallHierarchyIncomingCall>,
+    /// Outgoing calls (what this function calls).
+    outgoing_calls: Vec<CallHierarchyOutgoingCall>,
+    /// Implementation locations (methods for structs, implementors for traits).
+    implementations: Vec<Location>,
+    /// Supertypes in the type hierarchy.
+    supertypes: Vec<TypeHierarchyItem>,
+    /// Subtypes in the type hierarchy.
+    subtypes: Vec<TypeHierarchyItem>,
 }
 
-fn format_outgoing_calls(calls: &[CallHierarchyOutgoingCall]) -> String {
-    if calls.is_empty() {
-        return "No outgoing calls".to_string();
+/// Collects `SymbolInformation` from a `WorkspaceSymbolResponse`.
+fn collect_symbol_information(
+    response: &WorkspaceSymbolResponse,
+    out: &mut Vec<SymbolInformation>,
+) {
+    match response {
+        WorkspaceSymbolResponse::Flat(symbols) => out.extend(symbols.iter().cloned()),
+        WorkspaceSymbolResponse::Nested(symbols) => {
+            for s in symbols {
+                if let lsp_types::OneOf::Left(location) = &s.location {
+                    #[allow(deprecated, reason = "LSP spec uses deprecated fields")]
+                    out.push(SymbolInformation {
+                        name: s.name.clone(),
+                        kind: s.kind,
+                        tags: s.tags.clone(),
+                        deprecated: None,
+                        location: location.clone(),
+                        container_name: s.container_name.clone(),
+                    });
+                }
+            }
+        }
     }
-
-    calls
-        .iter()
-        .map(|call| {
-            let path = call.to.uri.path();
-            let line = call.to.range.start.line + 1;
-            let name = &call.to.name;
-            let kind = format!("{:?}", call.to.kind);
-            format!("{name} [{kind}] {path}:{line}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
-fn format_type_hierarchy_items(items: &[TypeHierarchyItem]) -> String {
-    if items.is_empty() {
-        return "No types found".to_string();
+/// Extracts plain text from an LSP `Hover` response.
+fn extract_hover_text(hover: &lsp_types::Hover) -> Option<String> {
+    match &hover.contents {
+        lsp_types::HoverContents::Scalar(content) => Some(markup_content_to_string(content)),
+        lsp_types::HoverContents::Array(contents) => {
+            let texts: Vec<String> = contents.iter().map(markup_content_to_string).collect();
+            if texts.is_empty() {
+                None
+            } else {
+                Some(texts.join("\n"))
+            }
+        }
+        lsp_types::HoverContents::Markup(markup) => {
+            let text = markup.value.trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
+        }
+    }
+}
+
+/// Converts a `MarkedString` to plain text.
+fn markup_content_to_string(content: &lsp_types::MarkedString) -> String {
+    match content {
+        lsp_types::MarkedString::String(s) => s.clone(),
+        lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+    }
+}
+
+/// Extracts locations from a `GotoDefinitionResponse`.
+fn extract_locations_from_definition(response: &GotoDefinitionResponse) -> Vec<Location> {
+    match response {
+        GotoDefinitionResponse::Scalar(loc) => vec![loc.clone()],
+        GotoDefinitionResponse::Array(locs) => locs.clone(),
+        GotoDefinitionResponse::Link(links) => links
+            .iter()
+            .map(|link| Location {
+                uri: link.target_uri.clone(),
+                range: link.target_selection_range,
+            })
+            .collect(),
+    }
+}
+
+/// Makes a file path relative to the nearest root, for display.
+fn display_path(file: &str, roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .find_map(|root| {
+            let root_str = root.to_string_lossy();
+            file.strip_prefix(root_str.as_ref())
+                .map(|rest| rest.strip_prefix('/').unwrap_or(rest).to_string())
+        })
+        .unwrap_or_else(|| file.to_string())
+}
+
+/// Formats an enriched symbol for the Symbols tier.
+fn format_enriched_symbol(
+    sym: &SymbolInformation,
+    enrichment: &SymbolEnrichment,
+    roots: &[PathBuf],
+) -> String {
+    use std::fmt::Write;
+
+    let kind = format!("{:?}", sym.kind);
+    let path = display_path(sym.location.uri.path().as_str(), roots);
+    let line = sym.location.range.start.line + 1;
+
+    let mut out = format!("{} [{kind}] {path}:{line}", sym.name);
+
+    // Hover content (indented)
+    if let Some(hover) = &enrichment.hover {
+        for hover_line in hover.lines() {
+            let _ = write!(out, "\n  {hover_line}");
+        }
     }
 
-    items
-        .iter()
-        .map(|item| {
-            let path = item.uri.path();
-            let line = item.range.start.line + 1;
-            let kind = format!("{:?}", item.kind);
-            format!("{} [{}] {}:{}", item.name, kind, path, line)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    // Type definition
+    if let Some(td) = &enrichment.type_definition {
+        let td_path = display_path(td.uri.path().as_str(), roots);
+        let td_line = td.range.start.line + 1;
+        let _ = write!(out, "\n  Type: {td_path}:{td_line}");
+    }
+
+    // Call hierarchy (functions/methods)
+    if !enrichment.incoming_calls.is_empty() {
+        out.push_str("\n\n  Called by:");
+        for call in &enrichment.incoming_calls {
+            let call_path = display_path(call.from.uri.path().as_str(), roots);
+            let call_line = call.from.range.start.line + 1;
+            let _ = write!(out, "\n    {}  {call_path}:{call_line}", call.from.name);
+        }
+    }
+
+    if !enrichment.outgoing_calls.is_empty() {
+        out.push_str("\n\n  Calls:");
+        for call in &enrichment.outgoing_calls {
+            let call_path = display_path(call.to.uri.path().as_str(), roots);
+            let call_line = call.to.range.start.line + 1;
+            let _ = write!(out, "\n    {}  {call_path}:{call_line}", call.to.name);
+        }
+    }
+
+    // Implementations (structs/traits)
+    if !enrichment.implementations.is_empty() {
+        out.push_str("\n\n  Implementations:");
+        for loc in &enrichment.implementations {
+            let impl_path = display_path(loc.uri.path().as_str(), roots);
+            let impl_line = loc.range.start.line + 1;
+            let _ = write!(out, "\n    {impl_path}:{impl_line}");
+        }
+    }
+
+    // Type hierarchy
+    if !enrichment.supertypes.is_empty() {
+        out.push_str("\n\n  Supertypes:");
+        for item in &enrichment.supertypes {
+            let item_path = display_path(item.uri.path().as_str(), roots);
+            let item_line = item.range.start.line + 1;
+            let _ = write!(
+                out,
+                "\n    {} [{:?}]  {item_path}:{item_line}",
+                item.name, item.kind
+            );
+        }
+    }
+
+    if !enrichment.subtypes.is_empty() {
+        out.push_str("\n\n  Subtypes:");
+        for item in &enrichment.subtypes {
+            let item_path = display_path(item.uri.path().as_str(), roots);
+            let item_line = item.range.start.line + 1;
+            let _ = write!(
+                out,
+                "\n    {} [{:?}]  {item_path}:{item_line}",
+                item.name, item.kind
+            );
+        }
+    }
+
+    out
+}
+
+/// Gap-based clustering: groups sorted line numbers into clusters.
+///
+/// Merge distance = `ceil(sqrt(max_line))`. Lines within the merge distance
+/// are grouped together. Returns `Vec<(first_line, last_line, lines)>`.
+fn cluster_lines(lines: &[u32]) -> Vec<(u32, u32, Vec<u32>)> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = lines.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let max_line = *sorted.last().unwrap_or(&1);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "Line numbers safely fit in f64 and truncated u32"
+    )]
+    let merge_distance = (f64::from(max_line).sqrt().ceil()) as u32;
+    let merge_distance = merge_distance.max(1);
+
+    let mut clusters: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+    let mut cluster_start = sorted[0];
+    let mut cluster_end = sorted[0];
+    let mut cluster_lines = vec![sorted[0]];
+
+    for &line in &sorted[1..] {
+        if line - cluster_end <= merge_distance {
+            cluster_end = line;
+            cluster_lines.push(line);
+        } else {
+            clusters.push((cluster_start, cluster_end, cluster_lines));
+            cluster_start = line;
+            cluster_end = line;
+            cluster_lines = vec![line];
+        }
+    }
+    clusters.push((cluster_start, cluster_end, cluster_lines));
+
+    clusters
+}
+
+/// Formats a single cluster as `[start-end]: count (lines ...)` or `[line]: 1 (line N)`.
+fn format_cluster(start: u32, end: u32, lines: &[u32]) -> String {
+    let count = lines.len();
+    let range = format!("[{start}-{end}]");
+    let line_list = if count <= 5 {
+        let nums: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        if count == 1 {
+            format!("line {}", nums[0])
+        } else {
+            format!("lines {}", nums.join(", "))
+        }
+    } else {
+        let first_three: Vec<String> = lines[..3].iter().map(ToString::to_string).collect();
+        format!("lines {}, ... +{} more", first_three.join(", "), count - 3)
+    };
+
+    let match_word = if count == 1 { "match" } else { "matches" };
+    format!("  {range}: {count} {match_word} ({line_list})")
+}
+
+/// Formats the References tier with gap-based clustering.
+fn format_clustered_references(
+    ref_by_file: &BTreeMap<String, Vec<(u32, bool)>>,
+    roots: &[PathBuf],
+) -> String {
+    use std::fmt::Write;
+
+    if ref_by_file.is_empty() {
+        return String::new();
+    }
+
+    // Sort by total usage count descending
+    let mut sorted: Vec<_> = ref_by_file.iter().collect();
+    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+
+    let mut output = String::new();
+
+    for (file, entries) in sorted {
+        let path = display_path(file, roots);
+        let count = entries.len();
+        let usage_word = if count == 1 { "usage" } else { "usages" };
+        let _ = writeln!(output, "{path}: {count} {usage_word}");
+
+        // Build line list with def markers
+        let mut lines: Vec<u32> = entries.iter().map(|(l, _)| *l).collect();
+        lines.sort_unstable();
+        lines.dedup();
+
+        let def_lines: HashSet<u32> = entries
+            .iter()
+            .filter(|(_, is_def)| *is_def)
+            .map(|(l, _)| *l)
+            .collect();
+
+        let clusters = cluster_lines(&lines);
+        for (start, end, cluster_lines) in &clusters {
+            let mut cluster_str = format_cluster(*start, *end, cluster_lines);
+            // Append [def] marker if any line in this cluster is the definition
+            if cluster_lines.iter().any(|l| def_lines.contains(l)) {
+                cluster_str.push_str(" [def]");
+            }
+            let _ = writeln!(output, "{cluster_str}");
+        }
+    }
+
+    output.truncate(output.trim_end().len());
+    output
+}
+
+/// Formats the File matches tier with reference deduplication and clustering.
+fn format_clustered_file_matches(
+    rg_lines: &BTreeMap<String, Vec<u32>>,
+    ref_lines: &HashMap<String, HashSet<u32>>,
+    roots: &[PathBuf],
+) -> String {
+    use std::fmt::Write;
+
+    if rg_lines.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::new();
+
+    // Sort by match count descending
+    let mut sorted: Vec<_> = rg_lines.iter().collect();
+    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+
+    for (file, lines) in sorted {
+        // Subtract reference lines
+        let remaining: Vec<u32> = ref_lines.get(file.as_str()).map_or_else(
+            || lines.clone(),
+            |refs| {
+                lines
+                    .iter()
+                    .copied()
+                    .filter(|l| !refs.contains(l))
+                    .collect()
+            },
+        );
+
+        if remaining.is_empty() {
+            continue;
+        }
+
+        let path = display_path(file, roots);
+        let count = remaining.len();
+        let match_word = if count == 1 { "match" } else { "matches" };
+        let _ = writeln!(output, "{path}: {count} {match_word}");
+
+        let clusters = cluster_lines(&remaining);
+        for (start, end, cluster_lines) in &clusters {
+            let _ = writeln!(output, "{}", format_cluster(*start, *end, cluster_lines));
+        }
+    }
+
+    output.truncate(output.trim_end().len());
+    output
 }
 
 #[cfg(test)]
@@ -1877,9 +1709,7 @@ fn format_type_hierarchy_items(items: &[TypeHierarchyItem]) -> String {
 )]
 mod tests {
     use super::*;
-    use lsp_types::{
-        DocumentSymbol, Range, SymbolInformation, SymbolKind, WorkspaceSymbolResponse,
-    };
+    use lsp_types::{Range, SymbolInformation, SymbolKind, WorkspaceSymbolResponse};
 
     fn make_position(line: u32, character: u32) -> Position {
         Position { line, character }
@@ -1889,23 +1719,6 @@ mod tests {
         Range {
             start: make_position(start_line, start_char),
             end: make_position(end_line, end_char),
-        }
-    }
-
-    fn make_document_symbol(name: &str, kind: SymbolKind, range: Range) -> DocumentSymbol {
-        #[allow(
-            deprecated,
-            reason = "LSP spec uses deprecated fields in some versions"
-        )]
-        DocumentSymbol {
-            name: name.to_string(),
-            detail: None,
-            kind,
-            tags: None,
-            deprecated: None,
-            range,
-            selection_range: range,
-            children: None,
         }
     }
 
@@ -1932,162 +1745,195 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_find_symbol_exact_match_flat() -> Result<()> {
-        let symbols = vec![
-            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 0)?,
-            make_symbol_info("bar", SymbolKind::FUNCTION, "file:///test.rs", 10)?,
-            make_symbol_info("baz", SymbolKind::STRUCT, "file:///test.rs", 20)?,
-        ];
-        let response = DocumentSymbolResponse::Flat(symbols);
+    // ─── cluster_lines tests ─────────────────────────────────────────────
 
-        let result = find_symbol_in_document_response(&response, "bar").expect("symbol match");
-        assert_eq!(result.line, 10);
-        Ok(())
+    #[test]
+    fn test_cluster_lines_empty() {
+        assert!(cluster_lines(&[]).is_empty());
     }
 
     #[test]
-    fn test_find_symbol_partial_match_flat() -> Result<()> {
-        let symbols = vec![
-            make_symbol_info("handle_request", SymbolKind::FUNCTION, "file:///test.rs", 5)?,
-            make_symbol_info("process_data", SymbolKind::FUNCTION, "file:///test.rs", 15)?,
-        ];
-        let response = DocumentSymbolResponse::Flat(symbols);
-
-        // Partial match "request"
-        let result = find_symbol_in_document_response(&response, "request").expect("symbol match");
-        assert_eq!(result.line, 5);
-        Ok(())
+    fn test_cluster_lines_single() {
+        let clusters = cluster_lines(&[42]);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0], (42, 42, vec![42]));
     }
 
     #[test]
-    fn test_find_symbol_exact_preferred_over_partial() -> Result<()> {
-        let symbols = vec![
-            make_symbol_info("foobar", SymbolKind::FUNCTION, "file:///test.rs", 0)?,
-            make_symbol_info("foo", SymbolKind::FUNCTION, "file:///test.rs", 10)?,
-        ];
-        let response = DocumentSymbolResponse::Flat(symbols);
-
-        // Exact match "foo" should be preferred over partial match "foobar"
-        let result = find_symbol_in_document_response(&response, "foo").expect("symbol match");
-        assert_eq!(result.line, 10);
-        Ok(())
+    fn test_cluster_lines_close_together() {
+        let clusters = cluster_lines(&[10, 11, 12]);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].0, 10);
+        assert_eq!(clusters[0].1, 12);
     }
 
     #[test]
-    fn test_find_symbol_nested() {
-        let inner_symbol =
-            make_document_symbol("inner_method", SymbolKind::METHOD, make_range(5, 0, 10, 0));
-        let mut outer_symbol =
-            make_document_symbol("MyClass", SymbolKind::CLASS, make_range(0, 0, 20, 0));
-        outer_symbol.children = Some(vec![inner_symbol]);
-
-        let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
-
-        let result =
-            find_symbol_in_document_response(&response, "inner_method").expect("symbol match");
-        assert_eq!(result.line, 5);
+    fn test_cluster_lines_far_apart() {
+        // merge_distance = ceil(sqrt(1000)) = 32
+        let clusters = cluster_lines(&[1, 1000]);
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].2, vec![1]);
+        assert_eq!(clusters[1].2, vec![1000]);
     }
 
     #[test]
-    fn test_find_symbol_nested_partial_match() {
-        let inner_symbol = make_document_symbol(
-            "handle_request",
-            SymbolKind::METHOD,
-            make_range(15, 0, 20, 0),
+    fn test_cluster_lines_dedup() {
+        let clusters = cluster_lines(&[5, 5, 5]);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].2, vec![5]);
+    }
+
+    #[test]
+    fn test_cluster_lines_unsorted_and_sorted() {
+        // merge_distance = ceil(sqrt(30)) = 6, gaps of 10 → 3 clusters
+        let clusters = cluster_lines(&[30, 10, 20]);
+        assert_eq!(clusters.len(), 3);
+        assert_eq!(clusters[0].2, vec![10]);
+        assert_eq!(clusters[1].2, vec![20]);
+        assert_eq!(clusters[2].2, vec![30]);
+
+        // Lines within merge distance should cluster: sqrt(5) ≈ 3
+        let clusters = cluster_lines(&[3, 1, 5]);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].2, vec![1, 3, 5]);
+    }
+
+    // ─── display_path tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_display_path_strips_root() {
+        let roots = vec![PathBuf::from("/home/user/project")];
+        assert_eq!(
+            display_path("/home/user/project/src/main.rs", &roots),
+            "src/main.rs"
         );
-        let mut outer_symbol =
-            make_document_symbol("Handler", SymbolKind::CLASS, make_range(0, 0, 30, 0));
-        outer_symbol.children = Some(vec![inner_symbol]);
-
-        let response = DocumentSymbolResponse::Nested(vec![outer_symbol]);
-
-        // Partial match should find inner_method
-        let result = find_symbol_in_document_response(&response, "request").expect("symbol match");
-        assert_eq!(result.line, 15);
     }
 
     #[test]
-    fn test_find_symbol_not_found() -> Result<()> {
-        let symbols = vec![make_symbol_info(
-            "foo",
+    fn test_display_path_no_matching_root() {
+        let roots = vec![PathBuf::from("/home/user/project")];
+        assert_eq!(
+            display_path("/other/path/file.rs", &roots),
+            "/other/path/file.rs"
+        );
+    }
+
+    // ─── format_cluster tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_format_cluster_single_line() {
+        let result = format_cluster(42, 42, &[42]);
+        assert!(result.contains("[42-42]"));
+        assert!(result.contains("1 match"));
+        assert!(result.contains("line 42"));
+    }
+
+    #[test]
+    fn test_format_cluster_range() {
+        let result = format_cluster(10, 20, &[10, 15, 20]);
+        assert!(result.contains("[10-20]"));
+        assert!(result.contains("3 matches"));
+        assert!(result.contains("lines 10, 15, 20"));
+    }
+
+    #[test]
+    fn test_format_cluster_many_lines_truncated() {
+        let lines: Vec<u32> = (1..=10).collect();
+        let result = format_cluster(1, 10, &lines);
+        assert!(result.contains("10 matches"));
+        assert!(result.contains("+7 more"));
+    }
+
+    // ─── collect_symbol_information tests ────────────────────────────────
+
+    #[test]
+    fn test_collect_symbol_information_flat() -> Result<()> {
+        let sym = make_symbol_info("test_fn", SymbolKind::FUNCTION, "file:///test.rs", 0)?;
+        let response = WorkspaceSymbolResponse::Flat(vec![sym]);
+        let mut out = Vec::new();
+        collect_symbol_information(&response, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "test_fn");
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_symbol_information_empty() {
+        let response = WorkspaceSymbolResponse::Flat(vec![]);
+        let mut out = Vec::new();
+        collect_symbol_information(&response, &mut out);
+        assert!(out.is_empty());
+    }
+
+    // ─── format_clustered_file_matches dedup tests ───────────────────────
+
+    #[test]
+    fn test_file_matches_dedup_removes_ref_lines() {
+        let mut rg_lines = BTreeMap::new();
+        rg_lines.insert("/src/lib.rs".to_string(), vec![10, 20, 30]);
+
+        let mut ref_lines = HashMap::new();
+        ref_lines.insert("/src/lib.rs".to_string(), HashSet::from([10, 30]));
+
+        let roots = vec![PathBuf::from("/")];
+        let result = format_clustered_file_matches(&rg_lines, &ref_lines, &roots);
+
+        // Only line 20 should remain
+        assert!(result.contains("1 match"));
+        assert!(!result.contains("3 match"));
+    }
+
+    #[test]
+    fn test_file_matches_dedup_all_removed() {
+        let mut rg_lines = BTreeMap::new();
+        rg_lines.insert("/src/lib.rs".to_string(), vec![10, 20]);
+
+        let mut ref_lines = HashMap::new();
+        ref_lines.insert("/src/lib.rs".to_string(), HashSet::from([10, 20]));
+
+        let roots = vec![PathBuf::from("/")];
+        let result = format_clustered_file_matches(&rg_lines, &ref_lines, &roots);
+
+        // All lines deduped — file should be omitted
+        assert!(result.is_empty());
+    }
+
+    // ─── format_enriched_symbol tests ────────────────────────────────────
+
+    #[test]
+    fn test_format_enriched_symbol_basic() -> Result<()> {
+        let sym = make_symbol_info(
+            "my_func",
             SymbolKind::FUNCTION,
-            "file:///test.rs",
+            "file:///project/src/lib.rs",
+            42,
+        )?;
+        let enrichment = SymbolEnrichment::default();
+        let roots = vec![PathBuf::from("/project")];
+
+        let output = format_enriched_symbol(&sym, &enrichment, &roots);
+        assert!(output.contains("my_func"));
+        assert!(output.contains("[Function]"));
+        assert!(output.contains("src/lib.rs:43"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_enriched_symbol_with_hover() -> Result<()> {
+        let sym = make_symbol_info(
+            "my_func",
+            SymbolKind::FUNCTION,
+            "file:///project/src/lib.rs",
             0,
-        )?];
-        let response = DocumentSymbolResponse::Flat(symbols);
+        )?;
+        let enrichment = SymbolEnrichment {
+            hover: Some("pub fn my_func() -> bool".to_string()),
+            ..Default::default()
+        };
+        let roots = vec![PathBuf::from("/project")];
 
-        let result = find_symbol_in_document_response(&response, "nonexistent");
-        assert!(result.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_find_workspace_symbol_exact_match() -> Result<()> {
-        let symbols = vec![
-            make_symbol_info("MyStruct", SymbolKind::STRUCT, "file:///src/lib.rs", 10)?,
-            make_symbol_info("MyFunction", SymbolKind::FUNCTION, "file:///src/main.rs", 5)?,
-        ];
-        let response = WorkspaceSymbolResponse::Flat(symbols);
-
-        let result =
-            find_symbol_in_workspace_response(&response, "MyStruct").expect("symbol match");
-        let (path, position): (std::path::PathBuf, _) = result;
-        assert_eq!(path.to_string_lossy(), "/src/lib.rs");
-        assert_eq!(position.line, 10);
-        Ok(())
-    }
-
-    #[test]
-    fn test_find_workspace_symbol_partial_match() -> Result<()> {
-        let symbols = vec![make_symbol_info(
-            "LspBridgeHandler",
-            SymbolKind::STRUCT,
-            "file:///src/handler.rs",
-            50,
-        )?];
-        let response = WorkspaceSymbolResponse::Flat(symbols);
-
-        let result = find_symbol_in_workspace_response(&response, "Bridge").expect("symbol match");
-        let (path, position): (std::path::PathBuf, _) = result;
-        assert_eq!(path.to_string_lossy(), "/src/handler.rs");
-        assert_eq!(position.line, 50);
-        Ok(())
-    }
-
-    #[test]
-    fn test_find_references_input_validation() -> Result<()> {
-        // Test that FindReferencesInput can be deserialized with symbol
-        let json = serde_json::json!({
-            "symbol": "MyStruct"
-        });
-        let input: FindReferencesInput = serde_json::from_value(json)?;
-        assert_eq!(input.symbol, Some("MyStruct".to_string()));
-        assert!(input.file.is_none());
-        assert!(input.line.is_none());
-        assert!(input.character.is_none());
-        assert!(input.include_declaration); // default true
-
-        // Test with position
-        let json = serde_json::json!({
-            "file": "/path/to/file.rs",
-            "line": 10,
-            "character": 5
-        });
-        let input: FindReferencesInput = serde_json::from_value(json)?;
-        assert!(input.symbol.is_none());
-        assert_eq!(input.file, Some("/path/to/file.rs".to_string()));
-        assert_eq!(input.line, Some(10));
-        assert_eq!(input.character, Some(5));
-
-        // Test with both symbol and file (to narrow scope)
-        let json = serde_json::json!({
-            "symbol": "my_function",
-            "file": "/path/to/file.rs"
-        });
-        let input: FindReferencesInput = serde_json::from_value(json)?;
-        assert_eq!(input.symbol, Some("my_function".to_string()));
-        assert_eq!(input.file, Some("/path/to/file.rs".to_string()));
+        let output = format_enriched_symbol(&sym, &enrichment, &roots);
+        assert!(output.contains("pub fn my_func() -> bool"));
         Ok(())
     }
 }
