@@ -512,6 +512,17 @@ pub const fn box_char(flags: u8) -> char {
 
 // ── Hit testing ─────────────────────────────────────────────────────────
 
+/// Which zone of a panel the coordinate falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelZone {
+    /// Content interior (below title bar, left of scrollbar).
+    Content,
+    /// Top row (title bar).
+    TitleBar,
+    /// Right column (scrollbar track).
+    Scrollbar,
+}
+
 /// Which panel contains the given screen coordinate?
 ///
 /// A panel's chrome is its **top** row (title bar) and **right** column
@@ -519,14 +530,36 @@ pub const fn box_char(flags: u8) -> char {
 /// interior return the panel index.
 #[must_use]
 pub fn panel_at(layout: &PanelLayout, x: u16, y: u16) -> Option<usize> {
+    panel_zone_at(layout, x, y).and_then(|(idx, zone)| {
+        if zone == PanelZone::Content {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
+/// Hit-test a coordinate against the layout, returning the panel index and
+/// which zone was hit.
+///
+/// A panel's owned chrome is its **top** row (title bar) and **right**
+/// column (scrollbar). Points outside all panels return `None`.
+#[must_use]
+pub fn panel_zone_at(layout: &PanelLayout, x: u16, y: u16) -> Option<(usize, PanelZone)> {
     for panel in &layout.panels {
         let r = &panel.rect;
-        let right = r.x + r.width.saturating_sub(1);
-        // Content interior: below the top title row, left of the right
-        // scrollbar column. Left edge and bottom edge are content.
-        if x >= r.x && x < right && y > r.y && y <= r.y + r.height.saturating_sub(1) {
-            return Some(panel.index);
+        // Must be within the panel's bounding rect.
+        if x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height {
+            continue;
         }
+        let right = r.x + r.width.saturating_sub(1);
+        if y == r.y {
+            return Some((panel.index, PanelZone::TitleBar));
+        }
+        if x == right {
+            return Some((panel.index, PanelZone::Scrollbar));
+        }
+        return Some((panel.index, PanelZone::Content));
     }
     None
 }
