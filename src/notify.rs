@@ -240,11 +240,14 @@ impl NotifyServer {
             doc_manager.language_id_for_path(&canonical).to_string()
         };
 
-        let client_mutex: Arc<Mutex<LspClient>> =
-            match self.client_manager.get_client(&lang_id).await {
-                Ok(c) => c,
-                Err(_) => return Ok(String::new()), // No LSP server for this language
-            };
+        let client_mutex: Arc<Mutex<LspClient>> = match self
+            .client_manager
+            .get_client_for_path(&canonical, &lang_id)
+            .await
+        {
+            Ok(c) => c,
+            Err(_) => return Ok(String::new()), // No LSP server for this language
+        };
 
         let mut doc_manager = self.doc_manager.lock().await;
         let client = client_mutex.lock().await;

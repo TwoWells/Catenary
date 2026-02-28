@@ -14,6 +14,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+const MOCK_LANG_A: &str = "yX4Za";
+
 /// Helper to spawn the bridge
 struct BridgeProcess {
     child: std::process::Child,
@@ -32,7 +34,8 @@ impl BridgeProcess {
             cmd.arg("--lsp").arg(arg);
         } else {
             let bin = env!("CARGO_BIN_EXE_mockls");
-            cmd.arg("--lsp").arg(format!("shellscript:{bin}"));
+            cmd.arg("--lsp")
+                .arg(format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}"));
         }
 
         for root in roots {
@@ -153,8 +156,8 @@ fn test_codebase_map_basic() -> Result<()> {
 #[test]
 fn test_codebase_map_with_symbols() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let script = temp.path().join("script.sh");
-    std::fs::write(&script, "#!/bin/bash\nfunction my_func() { echo hi; }\n")?;
+    let script = temp.path().join(format!("script.{MOCK_LANG_A}"));
+    std::fs::write(&script, "function my_func()\nmy_func\n")?;
 
     let mut bridge = BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, None)?;
     bridge.initialize()?;
@@ -181,7 +184,7 @@ fn test_codebase_map_with_symbols() -> Result<()> {
 
     tracing::debug!("Map with Symbols Output:\n{content}");
 
-    assert!(content.contains("script.sh"));
+    assert!(content.contains(&format!("script.{MOCK_LANG_A}")));
     assert!(
         content.contains("my_func"),
         "codebase_map should return symbols, got:\n{content}"
@@ -194,14 +197,11 @@ fn test_codebase_map_with_symbols() -> Result<()> {
 #[test]
 fn test_mockls_document_symbols() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let script = temp.path().join("helpers.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/bash\nfunction setup_env() { echo setup; }\nfunction run_tests() { echo test; }\n",
-    )?;
+    let script = temp.path().join(format!("helpers.{MOCK_LANG_A}"));
+    std::fs::write(&script, "function setup_env()\nfunction run_tests()\n")?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let lsp = format!("shellscript:{mockls_bin}");
+    let lsp = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A}");
 
     let mut bridge =
         BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, Some(&lsp))?;

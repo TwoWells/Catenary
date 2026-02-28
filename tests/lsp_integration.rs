@@ -11,6 +11,8 @@
 use anyhow::Result;
 use tempfile::tempdir;
 
+const MOCK_LANG_A: &str = "yX4Za";
+
 #[tokio::test]
 async fn test_mockls_initialize() -> Result<()> {
     let dir = tempdir()?;
@@ -18,8 +20,8 @@ async fn test_mockls_initialize() -> Result<()> {
 
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
-        &[],
-        "shellscript",
+        &[MOCK_LANG_A],
+        MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
@@ -39,8 +41,8 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
 
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
-        &["--workspace-folders"],
-        "shellscript",
+        &[MOCK_LANG_A, "--workspace-folders"],
+        MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
@@ -56,15 +58,15 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
 #[tokio::test]
 async fn test_mockls_document_lifecycle() -> Result<()> {
     let dir = tempdir()?;
-    let script_path = dir.path().join("lifecycle.sh");
-    std::fs::write(&script_path, "#!/bin/bash\nMY_VAR=1\n")?;
+    let script_path = dir.path().join(format!("lifecycle.{MOCK_LANG_A}"));
+    std::fs::write(&script_path, "let MY_VAR\n")?;
 
     let bin = env!("CARGO_BIN_EXE_mockls");
 
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
-        &[],
-        "shellscript",
+        &[MOCK_LANG_A],
+        MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 
@@ -77,9 +79,9 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         .did_open(lsp_types::DidOpenTextDocumentParams {
             text_document: lsp_types::TextDocumentItem {
                 uri: uri.clone(),
-                language_id: "shellscript".to_string(),
+                language_id: MOCK_LANG_A.to_string(),
                 version: 1,
-                text: "#!/bin/bash\nMY_VAR=1\n".to_string(),
+                text: "let MY_VAR\n".to_string(),
             },
         })
         .await?;
@@ -94,7 +96,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
             content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
                 range: None,
                 range_length: None,
-                text: "#!/bin/bash\nMY_VAR=2\necho $MY_VAR\n".to_string(),
+                text: "let MY_VAR\nMY_VAR\n".to_string(),
             }],
         })
         .await?;
@@ -123,8 +125,8 @@ async fn test_client_capabilities() -> Result<()> {
     let log_path = init_log.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
-        &["--log-init-params", log_path],
-        "shellscript",
+        &[MOCK_LANG_A, "--log-init-params", log_path],
+        MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop()?,
     )?;
 

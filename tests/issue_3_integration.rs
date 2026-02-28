@@ -21,6 +21,8 @@ use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
+const MOCK_LANG_A: &str = "yX4Za";
+
 /// Helper matching the `BridgeProcess` pattern in other test files.
 struct BridgeProcess {
     child: std::process::Child,
@@ -107,15 +109,15 @@ impl Drop for BridgeProcess {
 #[test]
 fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file_path = dir.path().join("test.sh");
-    std::fs::write(&file_path, "#!/bin/bash\necho hello\n")?;
+    let file_path = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file_path, "echo hello\n")?;
 
     let mockc_bin = env!("CARGO_BIN_EXE_mockc");
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     // mockc defaults to --ticks 10 (~100ms CPU). No extra args needed,
     // avoiding quoting issues with Catenary's whitespace-split --lsp parser.
     let lsp = format!(
-        "shellscript:{mockls_bin} --publish-version --advertise-save \
+        "{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A} --publish-version --advertise-save \
          --flycheck-command {mockc_bin}"
     );
 
@@ -145,7 +147,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     );
 
     // Change the file on disk — simulates the agent editing the file
-    std::fs::write(&file_path, "#!/bin/bash\necho changed\necho line3\n")?;
+    std::fs::write(&file_path, "echo changed\necho line3\n")?;
 
     // Second diagnostics call IMMEDIATELY after change.
     // This triggers didChange + didSave. The flycheck subprocess (mockc)

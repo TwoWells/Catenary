@@ -25,16 +25,18 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
 use tempfile::tempdir;
 
+const MOCK_LANG_A: &str = "yX4Za";
+
 #[test]
 fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
     // 1. Create workspace with a test file
     let dir = tempdir()?;
-    let file_path = dir.path().join("test.sh");
-    std::fs::write(&file_path, "#!/bin/bash\necho hello\n")?;
+    let file_path = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file_path, "echo hello\n")?;
 
     // 2. Start Catenary with mockls using --publish-version (versioned diagnostics)
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let lsp_arg = format!("shellscript:{mockls_bin} --publish-version");
+    let lsp_arg = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A} --publish-version");
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_catenary"))
         .args([

@@ -16,14 +16,17 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
-/// Create a temp config.toml that uses mockls for shellscript.
+const MOCK_LANG_A: &str = "yX4Za";
+const MOCK_LANG_B: &str = "d5apI";
+
+/// Create a temp config.toml that uses mockls for mock.
 fn write_mockls_config(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let config_path = dir.join("config.toml");
     std::fs::write(
         &config_path,
         format!(
-            "idle_timeout = 60\n\n[server.shellscript]\ncommand = \"{mockls_bin}\"\nargs = []\n"
+            "idle_timeout = 60\n\n[server.{MOCK_LANG_A}]\ncommand = \"{mockls_bin}\"\nargs = [\"{MOCK_LANG_A}\"]\n"
         ),
     )?;
     Ok(config_path)
@@ -123,11 +126,12 @@ fn test_config_override() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
 
     // Spawn catenary with config AND CLI override
-    // Config provides 'shellscript' (mockls), CLI provides 'toml' (also mockls)
+    // Config provides MOCK_LANG_A (mockls), CLI provides MOCK_LANG_B (also mockls)
     // CLI also overrides idle_timeout to 10 (config has 60)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
-    cmd.arg("--lsp").arg(format!("toml:{mockls_bin}"));
+    cmd.arg("--lsp")
+        .arg(format!("{MOCK_LANG_B}:{mockls_bin} {MOCK_LANG_B}"));
     cmd.arg("--idle-timeout").arg("10");
     cmd.arg("--root").arg(&root_dir);
     // Isolate from user-level config

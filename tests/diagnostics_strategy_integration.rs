@@ -22,6 +22,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+const MOCK_LANG_A: &str = "yX4Za";
+
 /// Helper to spawn the bridge with mockls and communicate via MCP.
 struct BridgeProcess {
     child: std::process::Child,
@@ -36,7 +38,7 @@ impl BridgeProcess {
 
     fn spawn_with_state_home(mockls_args: &[&str], root: &str, state_home: &str) -> Result<Self> {
         let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-        let mut lsp_cmd = format!("shellscript:{mockls_bin}");
+        let mut lsp_cmd = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A}");
         for arg in mockls_args {
             lsp_cmd.push(' ');
             lsp_cmd.push_str(arg);
@@ -138,8 +140,8 @@ impl Drop for BridgeProcess {
 #[test]
 fn test_diagnostics_degraded_mode() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
-    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
 
     let mut bridge = BridgeProcess::spawn(&[], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
@@ -163,8 +165,8 @@ fn test_diagnostics_degraded_mode() -> Result<()> {
 #[test]
 fn test_diagnostics_version_path() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
-    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
 
     let mut bridge =
         BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
@@ -193,8 +195,8 @@ fn test_diagnostics_version_path() -> Result<()> {
 #[test]
 fn test_diagnostics_token_monitor_path() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
-    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
 
     let mut bridge = BridgeProcess::spawn(
         &["--progress-on-change"],
@@ -206,7 +208,7 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
     let _ = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
 
     // Modify file to trigger didChange on next call
-    std::fs::write(&file, "#!/bin/bash\necho changed\necho line3\n")?;
+    std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange → progress tokens → TokenMonitor
     let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
@@ -228,8 +230,8 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
 #[test]
 fn test_diagnostics_server_death() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
-    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
 
     let mut bridge =
         BridgeProcess::spawn(&["--drop-after", "2"], dir.path().to_str().context("path")?)?;
@@ -277,10 +279,10 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     use std::str::FromStr;
 
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
 
-    // Content v1: 2 lines
-    let v1 = "#!/bin/bash\necho v1\n";
+    // Content v1: 1 line
+    let v1 = "echo v1\n";
     std::fs::write(&file, v1)?;
 
     let uri_string = format!("file://{}", file.display());
@@ -291,8 +293,13 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     let broadcaster = EventBroadcaster::noop()?;
     let mut client = LspClient::spawn(
         mockls_bin,
-        &["--diagnostics-delay", "5000", "--publish-version"],
-        "shellscript",
+        &[
+            MOCK_LANG_A,
+            "--diagnostics-delay",
+            "5000",
+            "--publish-version",
+        ],
+        MOCK_LANG_A,
         broadcaster,
     )
     .context("spawn LspClient")?;
@@ -308,7 +315,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
         .did_open(lsp_types::DidOpenTextDocumentParams {
             text_document: lsp_types::TextDocumentItem {
                 uri: uri.clone(),
-                language_id: "shellscript".to_string(),
+                language_id: MOCK_LANG_A.to_string(),
                 version: 1,
                 text: v1.to_string(),
             },
@@ -323,8 +330,8 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     let snapshot = client.diagnostics_generation(&uri).await;
     assert_eq!(snapshot, 0, "No diagnostics should have arrived yet");
 
-    // Content v2: 5 lines
-    let v2 = "#!/bin/bash\necho v2\necho line3\necho line4\necho line5\n";
+    // Content v2: 4 lines
+    let v2 = "echo v2\necho line3\necho line4\necho line5\n";
     std::fs::write(&file, v2)?;
 
     // didChange(v2) + didSave at t≈4s
@@ -357,11 +364,11 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
 
     let msg = &diagnostics[0].message;
 
-    // BUG DEMONSTRATION: the diagnostics should reflect v2 (5 lines) but
-    // due to the stale leak, they reflect v1 (2 lines).
+    // BUG DEMONSTRATION: the diagnostics should reflect v2 (4 lines) but
+    // due to the stale leak, they reflect v1 (1 line).
     assert!(
-        msg.contains("(5 lines)"),
-        "Diagnostics should reflect current content (5 lines), \
+        msg.contains("(4 lines)"),
+        "Diagnostics should reflect current content (4 lines), \
          not stale content from previous version. Got: {msg}"
     );
 
@@ -376,8 +383,8 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
 /// data to be returned for v2's content.
 ///
 /// Timeline (5s diagnostics delay):
-/// - t=0: Task A sends notify for v1 (2 lines) → waits for diagnostics
-/// - t=4s: File updated to v2 (5 lines). Task B sends notify → waits
+/// - t=0: Task A sends notify for v1 (1 line) → waits for diagnostics
+/// - t=4s: File updated to v2 (4 lines). Task B sends notify → waits
 /// - t=5s: v1 diagnostics arrive → Task B's gen check satisfied
 /// - t=7s: Task B returns with stale v1 diagnostics
 /// - t=9s: v2 diagnostics arrive — too late for Task B
@@ -388,10 +395,10 @@ async fn test_diagnostics_stale_notify_socket() -> Result<()> {
 
     let dir = tempfile::tempdir()?;
     let state_dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
 
-    // Content v1: 2 lines
-    std::fs::write(&file, "#!/bin/bash\necho v1\n")?;
+    // Content v1: 1 line
+    std::fs::write(&file, "echo v1\n")?;
 
     // Spawn bridge with XDG_STATE_HOME so we can find the notify socket
     let root_str = dir.path().to_str().context("path")?;
@@ -409,7 +416,7 @@ async fn test_diagnostics_stale_notify_socket() -> Result<()> {
 
     let file_path = file.to_str().context("file path")?.to_string();
 
-    // Task A: notify for v1 content (2 lines)
+    // Task A: notify for v1 content (1 line)
     let socket_a = socket_path.clone();
     let file_a = file_path.clone();
     let task_a = tokio::spawn(async move {
@@ -431,13 +438,10 @@ async fn test_diagnostics_stale_notify_socket() -> Result<()> {
     // Sleep 4s — Task A still waiting (diagnostics delayed 5s)
     tokio::time::sleep(Duration::from_secs(4)).await;
 
-    // Modify file to v2: 5 lines
-    std::fs::write(
-        &file,
-        "#!/bin/bash\necho v2\necho line3\necho line4\necho line5\n",
-    )?;
+    // Modify file to v2: 4 lines
+    std::fs::write(&file, "echo v2\necho line3\necho line4\necho line5\n")?;
 
-    // Task B: notify for v2 content (5 lines)
+    // Task B: notify for v2 content (4 lines)
     let socket_b = socket_path.clone();
     let file_b = file_path.clone();
     let task_b = tokio::spawn(async move {
@@ -460,17 +464,17 @@ async fn test_diagnostics_stale_notify_socket() -> Result<()> {
     let response_a = task_a.await.context("Task A panicked")??;
     let response_b = task_b.await.context("Task B panicked")??;
 
-    // Task A should have v1 diagnostics (2 lines) — this is correct
+    // Task A should have v1 diagnostics (1 line) — this is correct
     assert!(
         response_a.contains("mock diagnostic"),
         "Task A should return diagnostics. Got: {response_a}"
     );
 
-    // Task B should have v2 diagnostics (5 lines), not stale v1 (2 lines).
+    // Task B should have v2 diagnostics (4 lines), not stale v1 (1 line).
     // BUG DEMONSTRATION: due to the stale leak, Task B gets v1's diagnostics.
     assert!(
-        response_b.contains("(5 lines)"),
-        "Task B should return diagnostics for current content (5 lines), \
+        response_b.contains("(4 lines)"),
+        "Task B should return diagnostics for current content (4 lines), \
          not stale diagnostics from previous version. Got: {response_b}"
     );
 
@@ -510,8 +514,8 @@ fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
 #[test]
 fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
-    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
 
     let mockc_bin = env!("CARGO_BIN_EXE_mockc");
     let mut bridge = BridgeProcess::spawn(
@@ -529,7 +533,7 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     let _ = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
 
     // Modify file to trigger didChange + didSave on next call
-    std::fs::write(&file, "#!/bin/bash\necho changed\necho line3\n")?;
+    std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange + didSave → flycheck subprocess
     let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
@@ -542,9 +546,9 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     // The flycheck subprocess runs under a progress bracket; Catenary must
     // wait for the full Active→Idle cycle to get the post-flycheck diagnostics.
     assert!(
-        text.contains("mock diagnostic") && text.contains("3 lines"),
+        text.contains("mock diagnostic") && text.contains("2 lines"),
         "Multi-round path should return flycheck diagnostics for \
-         the modified file (3 lines). Got: {text}"
+         the modified file (2 lines). Got: {text}"
     );
 
     Ok(())
@@ -556,8 +560,8 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
 #[test]
 fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
-    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
 
     let mut bridge = BridgeProcess::spawn(
         &["--progress-on-change", "--no-diagnostics"],
@@ -587,8 +591,8 @@ fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
 #[test]
 fn test_near_threshold_flycheck() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let file = dir.path().join("test.sh");
-    std::fs::write(&file, "#!/bin/bash\necho hello\n")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
 
     let mockc_bin = env!("CARGO_BIN_EXE_mockc");
     let mut bridge = BridgeProcess::spawn(
@@ -616,7 +620,7 @@ fn test_near_threshold_flycheck() -> Result<()> {
     );
 
     // Modify the file to trigger flycheck on the second call
-    std::fs::write(&file, "#!/bin/bash\necho changed\necho line3\n")?;
+    std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange + didSave → flycheck with 900-tick mockc
     let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
