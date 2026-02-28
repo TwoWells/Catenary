@@ -30,6 +30,9 @@ use crate::session::{EventBroadcaster, EventKind};
 /// Everything else waits by default — new tools are safe automatically.
 const METHODS_SKIP_WAIT: &[&str] = &["status", "list_directory"];
 
+/// Maximum total references before disambiguation falls back to flat rendering.
+const DISAMBIGUATION_REF_LIMIT: usize = 200;
+
 use super::{DocumentManager, DocumentNotification};
 
 /// Controls how much symbol detail to include in output.
@@ -125,7 +128,9 @@ impl LspBridgeHandler {
             doc_manager.language_id_for_path(path).to_string()
         };
 
-        self.client_manager.get_client(&lang_id).await
+        self.client_manager
+            .get_client_for_path(path, &lang_id)
+            .await
     }
 
     /// Waits for the server handling the given path to be ready.
@@ -393,28 +398,120 @@ impl LspBridgeHandler {
         }
 
         // 3. Format References tier from collected reference locations
-        let references_output = self.runtime.block_on(async {
-            let mut ref_by_file: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+        let references_formatted = self.runtime.block_on(async {
+            if symbols.len() <= 1 {
+                // Single symbol: flat path, zero extra LSP calls
+                let mut ref_by_file: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
 
-            for sym in &symbols {
-                let path = PathBuf::from(sym.location.uri.path().as_str());
-                let position = sym.location.range.start;
-                let def_file = sym.location.uri.path().to_string();
-                let def_line = sym.location.range.start.line + 1;
+                for sym in &symbols {
+                    let path = PathBuf::from(sym.location.uri.path().as_str());
+                    let position = sym.location.range.start;
+                    let def_file = sym.location.uri.path().to_string();
+                    let def_line = sym.location.range.start.line + 1;
 
-                let refs = self.fetch_references(&path, position).await;
-                for loc in refs {
-                    let file = loc.uri.path().to_string();
-                    let line = loc.range.start.line + 1;
-                    let is_def = file == def_file && line == def_line;
-                    ref_by_file.entry(file).or_default().push((line, is_def));
+                    let refs = self.fetch_references(&path, position).await;
+                    for loc in refs {
+                        let file = loc.uri.path().to_string();
+                        let line = loc.range.start.line + 1;
+                        let is_def = file == def_file && line == def_line;
+                        ref_by_file.entry(file).or_default().push((line, is_def));
+                    }
+                }
+
+                format_clustered_references(&ref_by_file, &roots)
+            } else {
+                // Multiple symbols: collect refs and potentially disambiguate
+                let mut refs_per_sym: Vec<Vec<Location>> = Vec::new();
+                let mut total_refs = 0;
+
+                for sym in &symbols {
+                    let path = PathBuf::from(sym.location.uri.path().as_str());
+                    let position = sym.location.range.start;
+                    let refs = self.fetch_references(&path, position).await;
+                    total_refs += refs.len();
+                    refs_per_sym.push(refs);
+                }
+
+                let def_locations: Vec<(String, u32)> = symbols
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.location.uri.path().to_string(),
+                            s.location.range.start.line,
+                        )
+                    })
+                    .collect();
+
+                if total_refs > DISAMBIGUATION_REF_LIMIT {
+                    // Too many refs — render flat
+                    let mut ref_by_file: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+                    for (sym_idx, refs) in refs_per_sym.iter().enumerate() {
+                        let def_file = &def_locations[sym_idx].0;
+                        let def_line = def_locations[sym_idx].1 + 1;
+                        for loc in refs {
+                            let file = loc.uri.path().to_string();
+                            let line = loc.range.start.line + 1;
+                            let is_def = file == *def_file && line == def_line;
+                            ref_by_file.entry(file).or_default().push((line, is_def));
+                        }
+                    }
+                    format_clustered_references(&ref_by_file, &roots)
+                } else {
+                    // Disambiguate: dedup refs, call definition for each, group by symbol
+                    let mut unique_refs: Vec<Location> = Vec::new();
+                    let mut seen: HashSet<(String, u32)> = HashSet::new();
+                    for refs in &refs_per_sym {
+                        for loc in refs {
+                            let key = (loc.uri.path().to_string(), loc.range.start.line);
+                            if seen.insert(key) {
+                                unique_refs.push(loc.clone());
+                            }
+                        }
+                    }
+
+                    let mut groups: Vec<BTreeMap<String, Vec<(u32, bool)>>> =
+                        vec![BTreeMap::new(); symbols.len()];
+                    let mut fallback: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+
+                    for loc in &unique_refs {
+                        let ref_file = loc.uri.path().to_string();
+                        let ref_line = loc.range.start.line + 1;
+                        let is_def = def_locations
+                            .iter()
+                            .any(|(f, l)| f == &ref_file && *l == loc.range.start.line);
+
+                        let ref_path = PathBuf::from(loc.uri.path().as_str());
+                        let def_result = self.fetch_definition(&ref_path, loc.range.start).await;
+
+                        let mut matched = false;
+                        if let Some(def_loc) = def_result {
+                            let resolved_file = def_loc.uri.path().to_string();
+                            let resolved_line = def_loc.range.start.line;
+
+                            for (i, (known_file, known_line)) in def_locations.iter().enumerate() {
+                                if resolved_file == *known_file && resolved_line == *known_line {
+                                    groups[i]
+                                        .entry(ref_file.clone())
+                                        .or_default()
+                                        .push((ref_line, is_def));
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !matched {
+                            fallback
+                                .entry(ref_file)
+                                .or_default()
+                                .push((ref_line, is_def));
+                        }
+                    }
+
+                    format_disambiguated_references(&symbols, &groups, &fallback, &roots)
                 }
             }
-
-            ref_by_file
         });
-
-        let references_formatted = format_clustered_references(&references_output, &roots);
 
         // 4. Ripgrep text matches with reference deduplication
         let mut search_dirs = roots;
@@ -490,6 +587,34 @@ impl LspBridgeHandler {
             .await
             .unwrap_or(None)
             .unwrap_or_default()
+    }
+
+    /// Fetches the definition for a position, returning the first location on success.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Client lock held across definition call"
+    )]
+    async fn fetch_definition(&self, path: &Path, position: Position) -> Option<Location> {
+        let Ok((uri, client_mutex)) = self.ensure_document_open(path).await else {
+            return None;
+        };
+
+        let client = client_mutex.lock().await;
+        client.capabilities().definition_provider.as_ref()?;
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+
+        let response = client.definition(params).await.ok()??;
+        extract_locations_from_definition(&response)
+            .into_iter()
+            .next()
     }
 
     /// Enriches a symbol with hover, call hierarchy, type hierarchy, and implementations.
@@ -968,11 +1093,11 @@ impl LspBridgeHandler {
                         doc_manager.language_id_for_path(&entry.path).to_string()
                     };
 
-                    if lang_id == "plaintext" {
-                        continue;
-                    }
-
-                    if let Ok(client_mutex) = self.client_manager.get_client(&lang_id).await {
+                    if let Ok(client_mutex) = self
+                        .client_manager
+                        .get_client_for_path(&entry.path, &lang_id)
+                        .await
+                    {
                         if let Ok((uri, _)) = self.ensure_document_open(&entry.path).await {
                             let params = DocumentSymbolParams {
                                 text_document: TextDocumentIdentifier { uri },
@@ -1645,6 +1770,42 @@ fn format_clustered_references(
                 cluster_str.push_str(" [def]");
             }
             let _ = writeln!(output, "{cluster_str}");
+        }
+    }
+
+    output.truncate(output.trim_end().len());
+    output
+}
+
+/// Formats disambiguated references grouped by owning symbol.
+fn format_disambiguated_references(
+    symbols: &[SymbolInformation],
+    groups: &[BTreeMap<String, Vec<(u32, bool)>>],
+    fallback: &BTreeMap<String, Vec<(u32, bool)>>,
+    roots: &[PathBuf],
+) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+
+    for (i, (sym, group)) in symbols.iter().zip(groups).enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+
+        let sym_path = display_path(sym.location.uri.path().as_str(), roots);
+        let _ = writeln!(output, "{sym_path} {} ({}):", sym.name, i + 1);
+        let group_formatted = format_clustered_references(group, roots);
+        for line in group_formatted.lines() {
+            let _ = writeln!(output, "  {line}");
+        }
+    }
+
+    if !fallback.is_empty() {
+        let _ = writeln!(output, "Unresolved:");
+        let fallback_formatted = format_clustered_references(fallback, roots);
+        for line in fallback_formatted.lines() {
+            let _ = writeln!(output, "  {line}");
         }
     }
 

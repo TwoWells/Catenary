@@ -339,6 +339,31 @@ impl ClientManager {
         Ok(client_mutex)
     }
 
+    /// Gets a client for a file path, trying the detected language ID first,
+    /// then the file extension as a direct config key.
+    ///
+    /// This handles custom or test languages where the file extension itself
+    /// is the configured server key (e.g., `.yX4Za` → config key `"yX4Za"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no LSP server matches the language ID or file extension.
+    pub async fn get_client_for_path(
+        &self,
+        path: &Path,
+        lang_id: &str,
+    ) -> Result<Arc<Mutex<LspClient>>> {
+        if let Ok(client) = self.get_client(lang_id).await {
+            return Ok(client);
+        }
+        // Fallback: try file extension as config key (custom/test languages)
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang_id}'"))?;
+        self.get_client(ext).await
+    }
+
     /// Returns a snapshot of all currently active clients.
     pub async fn active_clients(&self) -> HashMap<String, Arc<Mutex<LspClient>>> {
         self.active_clients.lock().await.clone()
@@ -430,11 +455,15 @@ pub fn detect_workspace_languages(
             }
 
             // Extension-based detection
-            if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && let Some(lang) = extension_to_config_key(ext)
-                && configured_keys.contains(lang)
-            {
-                detected.insert(lang.to_string());
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if let Some(lang) = extension_to_config_key(ext) {
+                    if configured_keys.contains(lang) {
+                        detected.insert(lang.to_string());
+                    }
+                } else if configured_keys.contains(ext) {
+                    // Extension itself is a configured key (e.g., custom test languages)
+                    detected.insert(ext.to_string());
+                }
             }
 
             if detected.len() == configured_keys.len() {
@@ -500,6 +529,8 @@ mod tests {
     use crate::config::{IconConfig, ServerConfig};
     use anyhow::Result;
 
+    const MOCK_LANG_A: &str = "yX4Za";
+
     fn test_config() -> Config {
         Config {
             server: HashMap::new(),
@@ -526,10 +557,10 @@ mod tests {
         let bin = mockls_bin();
         let mut server = HashMap::new();
         server.insert(
-            "shellscript".to_string(),
+            MOCK_LANG_A.to_string(),
             ServerConfig {
                 command: bin.to_string_lossy().to_string(),
-                args: vec![],
+                args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
             },
         );
@@ -546,10 +577,10 @@ mod tests {
         let bin = mockls_bin();
         let mut server = HashMap::new();
         server.insert(
-            "shellscript".to_string(),
+            MOCK_LANG_A.to_string(),
             ServerConfig {
                 command: bin.to_string_lossy().to_string(),
-                args: vec!["--workspace-folders".to_string()],
+                args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 initialization_options: None,
             },
         );
@@ -676,14 +707,14 @@ mod tests {
         let broadcaster = EventBroadcaster::noop()?;
         let manager = ClientManager::new(mockls_config(), vec![PathBuf::from("/tmp")], broadcaster);
 
-        let client = manager.get_client("shellscript").await?;
+        let client = manager.get_client(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
         assert!(
             !client.lock().await.supports_workspace_folders(),
             "mockls (no flags) should NOT support workspace folders"
         );
 
-        assert!(manager.active_clients().await.contains_key("shellscript"));
+        assert!(manager.active_clients().await.contains_key(MOCK_LANG_A));
 
         // sync_roots should shut down the unsupported client
         manager
@@ -691,7 +722,7 @@ mod tests {
             .await?;
 
         assert!(
-            !manager.active_clients().await.contains_key("shellscript"),
+            !manager.active_clients().await.contains_key(MOCK_LANG_A),
             "mockls client should be removed after sync_roots (no workspace folder support)"
         );
 
@@ -709,14 +740,14 @@ mod tests {
             broadcaster,
         );
 
-        let client = manager.get_client("shellscript").await?;
+        let client = manager.get_client(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
         assert!(
             client.lock().await.supports_workspace_folders(),
             "mockls --workspace-folders should support workspace folders"
         );
 
-        assert!(manager.active_clients().await.contains_key("shellscript"));
+        assert!(manager.active_clients().await.contains_key(MOCK_LANG_A));
 
         // sync_roots should send notification, NOT shut down the client
         manager
@@ -725,7 +756,7 @@ mod tests {
 
         // Client should still be active (not removed)
         assert!(
-            manager.active_clients().await.contains_key("shellscript"),
+            manager.active_clients().await.contains_key(MOCK_LANG_A),
             "mockls client should still be active after sync_roots (workspace folders supported)"
         );
 

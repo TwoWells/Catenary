@@ -25,6 +25,10 @@ use serde_json::Value;
     reason = "CLI flags are inherently boolean"
 )]
 struct Args {
+    /// Language name. Used as the file extension for --scan-roots filtering.
+    #[arg()]
+    name: String,
+
     /// Advertise workspace folder support with change notifications.
     #[arg(long)]
     workspace_folders: bool,
@@ -197,6 +201,11 @@ impl Write for SharedVecWriter {
 struct MockServer {
     args: Args,
     documents: HashMap<String, String>,
+    /// Mock type map: `symbol_name → type_name` extracted from `: TypeName` annotations.
+    types: HashMap<String, String>,
+    /// Import map: `(document_uri, imported_name) → source_file_fragment`.
+    /// Parsed from `from <file> import <name>` lines.
+    imports: HashMap<(String, String), String>,
     /// Tracks the document version from `didOpen`/`didChange` per URI.
     versions: HashMap<String, i32>,
     response_count: u64,
@@ -221,6 +230,8 @@ impl MockServer {
         Self {
             args,
             documents: HashMap::new(),
+            types: HashMap::new(),
+            imports: HashMap::new(),
             versions: HashMap::new(),
             response_count: 0,
             writer,
@@ -232,7 +243,7 @@ impl MockServer {
         }
     }
 
-    /// Recursively scans a directory, indexing all text files into `self.documents`.
+    /// Recursively scans a directory, indexing `.mock` files into `self.documents`.
     fn scan_directory(&mut self, dir: &std::path::Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -250,11 +261,45 @@ impl MockServer {
                 }
                 self.scan_directory(&path);
             } else if path.is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some(self.args.name.as_str())
                 && let Ok(content) = std::fs::read_to_string(&path)
             {
                 let abs = path.to_string_lossy();
                 let uri = format!("file://{abs}");
                 self.documents.insert(uri, content);
+            }
+        }
+    }
+
+    /// Rebuilds the type map from all open documents.
+    fn rebuild_types(&mut self) {
+        self.types.clear();
+        for content in self.documents.values() {
+            self.types.extend(extract_types(content));
+        }
+    }
+
+    /// Rebuilds the import map from all open documents.
+    /// Parses `from <file> import <name>` lines.
+    fn rebuild_imports(&mut self) {
+        self.imports.clear();
+        for (uri, content) in &self.documents {
+            for line_text in content.lines() {
+                let trimmed = line_text.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("from ") {
+                    let mut parts = rest.split_whitespace();
+                    let Some(file_fragment) = parts.next() else {
+                        continue;
+                    };
+                    if parts.next() != Some("import") {
+                        continue;
+                    }
+                    let Some(name) = parts.next() else {
+                        continue;
+                    };
+                    self.imports
+                        .insert((uri.clone(), name.to_string()), file_fragment.to_string());
+                }
             }
         }
     }
@@ -355,10 +400,23 @@ impl MockServer {
                 }
                 self.handle_definition(&request.params)
             }
-            "textDocument/typeDefinition" => self.handle_definition(&request.params),
-            "textDocument/references" => self.handle_references(&request.params),
+            "textDocument/typeDefinition" => self.handle_type_definition(&request.params),
+            "textDocument/references" | "textDocument/implementation" => {
+                self.handle_references(&request.params)
+            }
             "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
+            "textDocument/prepareCallHierarchy" => {
+                self.handle_call_hierarchy_prepare(&request.params)
+            }
+            "callHierarchy/incomingCalls" => self.handle_incoming_calls(&request.params),
+            "textDocument/prepareTypeHierarchy" => {
+                self.handle_type_hierarchy_prepare(&request.params)
+            }
+            "typeHierarchy/subtypes" => self.handle_type_hierarchy_subtypes(&request.params),
+            "callHierarchy/outgoingCalls" | "typeHierarchy/supertypes" => {
+                Some(Value::Array(Vec::new()))
+            }
             _ => {
                 self.send_response(&Response {
                     jsonrpc: "2.0".to_string(),
@@ -424,6 +482,8 @@ impl MockServer {
                         .unwrap_or(1);
                     self.documents.insert(uri.to_string(), text.to_string());
                     self.versions.insert(uri.to_string(), version);
+                    self.rebuild_types();
+                    self.rebuild_imports();
 
                     if !self.args.no_diagnostics && !self.args.diagnostics_on_save {
                         self.publish_diagnostics(uri);
@@ -447,6 +507,8 @@ impl MockServer {
                         .and_then(Value::as_str)
                     {
                         self.documents.insert(uri.to_string(), text.to_string());
+                        self.rebuild_types();
+                        self.rebuild_imports();
                     }
 
                     // Simulate CPU-bound work without any notifications
@@ -518,6 +580,8 @@ impl MockServer {
                             }
                         }
                     }
+                    self.rebuild_types();
+                    self.rebuild_imports();
                 }
             }
             // All other notifications are silently accepted
@@ -549,6 +613,8 @@ impl MockServer {
             for root in &roots {
                 self.scan_directory(std::path::Path::new(root));
             }
+            self.rebuild_types();
+            self.rebuild_imports();
         }
         self.workspace_roots = roots;
 
@@ -565,8 +631,10 @@ impl MockServer {
             "definitionProvider": true,
             "typeDefinitionProvider": true,
             "referencesProvider": true,
+            "implementationProvider": true,
             "documentSymbolProvider": true,
             "workspaceSymbolProvider": true,
+            "callHierarchyProvider": true,
             "textDocumentSync": text_doc_sync
         });
 
@@ -585,7 +653,7 @@ impl MockServer {
     fn handle_hover(&self, params: &Value) -> Option<Value> {
         let (uri, line, col) = extract_position(params)?;
         let content = self.documents.get(uri)?;
-        let word = extract_word(content, line, col)?;
+        let word = extract_symbol_name(content, line, col)?;
 
         Some(serde_json::json!({
             "contents": {
@@ -607,6 +675,16 @@ impl MockServer {
             format!("let {word}"),
             format!("const {word}"),
             format!("var {word}"),
+            format!("struct {word}"),
+            format!("class {word}"),
+            format!("enum {word}"),
+            format!("interface {word}"),
+            format!("trait {word}"),
+            format!("mod {word}"),
+            format!("module {word}"),
+            format!("type {word}"),
+            format!("method {word}"),
+            format!("field {word}"),
         ];
 
         for (line_idx, line_text) in content.lines().enumerate() {
@@ -622,10 +700,68 @@ impl MockServer {
             }
         }
 
-        // Fall back to first occurrence
+        // Import-scoped resolution: if this file imports the word, search
+        // only the source document for a definition pattern.
+        if let Some(source_fragment) = self.imports.get(&(uri.to_string(), word.clone())) {
+            for (doc_uri, doc_content) in &self.documents {
+                if !doc_uri.contains(source_fragment.as_str()) {
+                    continue;
+                }
+                for (line_idx, line_text) in doc_content.lines().enumerate() {
+                    for pattern in &def_patterns {
+                        if let Some(col_idx) = line_text.find(pattern.as_str()) {
+                            return Some(location_json(
+                                doc_uri,
+                                line_idx,
+                                col_idx,
+                                col_idx + pattern.len(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cross-file: search all other documents for a definition pattern
+        for (doc_uri, doc_content) in &self.documents {
+            if doc_uri == uri {
+                continue;
+            }
+            for (line_idx, line_text) in doc_content.lines().enumerate() {
+                for pattern in &def_patterns {
+                    if let Some(col_idx) = line_text.find(pattern.as_str()) {
+                        return Some(location_json(
+                            doc_uri,
+                            line_idx,
+                            col_idx,
+                            col_idx + pattern.len(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Fall back to first occurrence in current document
         for (line_idx, line_text) in content.lines().enumerate() {
             if let Some(col_idx) = line_text.find(&word) {
                 return Some(location_json(uri, line_idx, col_idx, col_idx + word.len()));
+            }
+        }
+
+        // Cross-file fallback: first occurrence in any other document
+        for (doc_uri, doc_content) in &self.documents {
+            if doc_uri == uri {
+                continue;
+            }
+            for (line_idx, line_text) in doc_content.lines().enumerate() {
+                if let Some(col_idx) = line_text.find(&word) {
+                    return Some(location_json(
+                        doc_uri,
+                        line_idx,
+                        col_idx,
+                        col_idx + word.len(),
+                    ));
+                }
             }
         }
 
@@ -635,19 +771,208 @@ impl MockServer {
     fn handle_references(&self, params: &Value) -> Option<Value> {
         let (uri, line, col) = extract_position(params)?;
         let content = self.documents.get(uri)?;
-        let word = extract_word(content, line, col)?;
+        let word = extract_symbol_name(content, line, col)?;
 
         let mut locations = Vec::new();
-        for (line_idx, line_text) in content.lines().enumerate() {
-            let mut start = 0;
-            while let Some(pos) = line_text[start..].find(&word) {
-                let col_idx = start + pos;
-                locations.push(location_json(uri, line_idx, col_idx, col_idx + word.len()));
-                start = col_idx + word.len();
+        // Cross-file: search all documents for the word
+        for (doc_uri, doc_content) in &self.documents {
+            for (line_idx, line_text) in doc_content.lines().enumerate() {
+                let mut start = 0;
+                while let Some(pos) = line_text[start..].find(&word) {
+                    let col_idx = start + pos;
+                    locations.push(location_json(
+                        doc_uri,
+                        line_idx,
+                        col_idx,
+                        col_idx + word.len(),
+                    ));
+                    start = col_idx + word.len();
+                }
             }
         }
 
         Some(Value::Array(locations))
+    }
+
+    fn handle_type_definition(&self, params: &Value) -> Option<Value> {
+        let (uri, line, col) = extract_position(params)?;
+        let content = self.documents.get(uri)?;
+        let name = extract_symbol_name(content, line, col)?;
+
+        // Look up name in type map. If not found, extract types from the
+        // current line as a fallback (handles cases where the cursor lands
+        // on a keyword and the name resolves but has no global type entry).
+        let type_name = self.types.get(&name).cloned().or_else(|| {
+            let line_text = content.lines().nth(line)?;
+            let line_types = extract_types(line_text);
+            line_types.into_values().next()
+        })?;
+
+        // Type declaration patterns
+        let type_decl_patterns = [
+            format!("struct {type_name}"),
+            format!("class {type_name}"),
+            format!("enum {type_name}"),
+            format!("interface {type_name}"),
+            format!("trait {type_name}"),
+            format!("type {type_name}"),
+        ];
+
+        // Search all documents for the type declaration
+        for (doc_uri, doc_content) in &self.documents {
+            for (line_idx, line_text) in doc_content.lines().enumerate() {
+                for pattern in &type_decl_patterns {
+                    if let Some(col_idx) = line_text.find(pattern.as_str()) {
+                        return Some(location_json(
+                            doc_uri,
+                            line_idx,
+                            col_idx,
+                            col_idx + pattern.len(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn handle_call_hierarchy_prepare(&self, params: &Value) -> Option<Value> {
+        let (uri, line, col) = extract_position(params)?;
+        let content = self.documents.get(uri)?;
+        let name = extract_symbol_name(content, line, col)?;
+        let line_text = content.lines().nth(line)?;
+
+        Some(serde_json::json!([{
+            "name": name,
+            "kind": 12,
+            "uri": uri,
+            "range": {
+                "start": { "line": line, "character": 0 },
+                "end": { "line": line, "character": line_text.len() }
+            },
+            "selectionRange": {
+                "start": { "line": line, "character": 0 },
+                "end": { "line": line, "character": line_text.len() }
+            }
+        }]))
+    }
+
+    fn handle_incoming_calls(&self, params: &Value) -> Option<Value> {
+        let item = params.get("item")?;
+        let name = item.get("name")?.as_str()?;
+        let def_uri = item.get("uri")?.as_str()?;
+        let def_line = item.get("range")?.get("start")?.get("line")?.as_u64()?;
+
+        let mut calls = Vec::new();
+
+        for (doc_uri, content) in &self.documents {
+            for (line_idx, line_text) in content.lines().enumerate() {
+                if doc_uri == def_uri && line_idx as u64 == def_line {
+                    continue;
+                }
+
+                if !line_text.contains(name) {
+                    continue;
+                }
+
+                if let Some((fn_name, fn_line)) = find_enclosing_function(content, line_idx) {
+                    let fn_line_text = content.lines().nth(fn_line).unwrap_or("");
+                    calls.push(serde_json::json!({
+                        "from": {
+                            "name": fn_name,
+                            "kind": 12,
+                            "uri": doc_uri,
+                            "range": {
+                                "start": { "line": fn_line, "character": 0 },
+                                "end": { "line": fn_line, "character": fn_line_text.len() }
+                            },
+                            "selectionRange": {
+                                "start": { "line": fn_line, "character": 0 },
+                                "end": { "line": fn_line, "character": fn_line_text.len() }
+                            }
+                        },
+                        "fromRanges": [{
+                            "start": { "line": line_idx, "character": 0 },
+                            "end": { "line": line_idx, "character": line_text.len() }
+                        }]
+                    }));
+                }
+            }
+        }
+
+        Some(Value::Array(calls))
+    }
+
+    fn handle_type_hierarchy_prepare(&self, params: &Value) -> Option<Value> {
+        let (uri, line, col) = extract_position(params)?;
+        let content = self.documents.get(uri)?;
+        let name = extract_symbol_name(content, line, col)?;
+        let line_text = content.lines().nth(line)?;
+
+        let trimmed = line_text.trim_start();
+        let kind: u32 = if trimmed.starts_with("interface ") || trimmed.starts_with("trait ") {
+            11
+        } else if trimmed.starts_with("class ") {
+            5
+        } else if trimmed.starts_with("enum ") {
+            10
+        } else {
+            23
+        };
+
+        Some(serde_json::json!([{
+            "name": name,
+            "kind": kind,
+            "uri": uri,
+            "range": {
+                "start": { "line": line, "character": 0 },
+                "end": { "line": line, "character": line_text.len() }
+            },
+            "selectionRange": {
+                "start": { "line": line, "character": 0 },
+                "end": { "line": line, "character": line_text.len() }
+            }
+        }]))
+    }
+
+    fn handle_type_hierarchy_subtypes(&self, params: &Value) -> Option<Value> {
+        let type_keywords = ["struct ", "class "];
+        let mut subtypes = Vec::new();
+
+        let _item = params.get("item")?;
+
+        for (doc_uri, content) in &self.documents {
+            for (line_idx, line_text) in content.lines().enumerate() {
+                let trimmed = line_text.trim_start();
+                for kw in &type_keywords {
+                    if let Some(after_kw) = trimmed.strip_prefix(kw) {
+                        let type_name: String = after_kw
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if !type_name.is_empty() {
+                            let kind: u32 = if *kw == "struct " { 23 } else { 5 };
+                            subtypes.push(serde_json::json!({
+                                "name": type_name,
+                                "kind": kind,
+                                "uri": doc_uri,
+                                "range": {
+                                    "start": { "line": line_idx, "character": 0 },
+                                    "end": { "line": line_idx, "character": line_text.len() }
+                                },
+                                "selectionRange": {
+                                    "start": { "line": line_idx, "character": 0 },
+                                    "end": { "line": line_idx, "character": line_text.len() }
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(Value::Array(subtypes))
     }
 
     fn handle_document_symbols(&self, params: &Value) -> Option<Value> {
@@ -1080,8 +1405,136 @@ fn extract_word(content: &str, line: usize, col: usize) -> Option<String> {
     Some(line_text[start..end].to_string())
 }
 
+/// Extract the symbol name from a declaration line. If the position lands on
+/// the keyword (e.g., `fn`, `let`), returns the name that follows it.
+fn extract_symbol_name(content: &str, line: usize, col: usize) -> Option<String> {
+    let word = extract_word(content, line, col)?;
+
+    let keywords = [
+        "fn",
+        "function",
+        "def",
+        "let",
+        "const",
+        "var",
+        "struct",
+        "class",
+        "enum",
+        "interface",
+        "trait",
+        "mod",
+        "module",
+        "type",
+        "method",
+        "field",
+    ];
+
+    if keywords.contains(&word.as_str()) {
+        let line_text = content.lines().nth(line)?;
+        let kw_with_space = format!("{word} ");
+        let kw_pos = line_text.find(&kw_with_space)?;
+        let after_kw = &line_text[kw_pos + kw_with_space.len()..];
+        let name: String = after_kw
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() { None } else { Some(name) }
+    } else {
+        Some(word)
+    }
+}
+
+/// Find the nearest enclosing function for a given line by searching backwards.
+fn find_enclosing_function(content: &str, target_line: usize) -> Option<(String, usize)> {
+    let fn_keywords = ["fn ", "function ", "def ", "method "];
+
+    for line_idx in (0..target_line).rev() {
+        let line_text = content.lines().nth(line_idx)?;
+        let trimmed = line_text.trim_start();
+
+        for kw in &fn_keywords {
+            if let Some(after_kw) = trimmed.strip_prefix(kw) {
+                let name: String = after_kw
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    return Some((name, line_idx));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 const fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Extract type annotations from content: maps `symbol_name → type_name`.
+///
+/// Looks for `: TypeName` after keyword-declared symbols.
+/// Example: `let count: Counter = 0` → `("count", "Counter")`.
+fn extract_types(content: &str) -> HashMap<String, String> {
+    let mut types = HashMap::new();
+    let keywords: &[&str] = &[
+        "fn ",
+        "function ",
+        "def ",
+        "let ",
+        "const ",
+        "var ",
+        "struct ",
+        "class ",
+        "enum ",
+        "interface ",
+        "trait ",
+        "mod ",
+        "module ",
+        "type ",
+        "method ",
+        "field ",
+    ];
+
+    for line_text in content.lines() {
+        let trimmed = line_text.trim_start();
+        let prefix_len = keywords
+            .iter()
+            .find_map(|kw| trimmed.starts_with(kw).then_some(kw.len()));
+
+        let Some(prefix_len) = prefix_len else {
+            continue;
+        };
+
+        let after_keyword = &trimmed[prefix_len..];
+        let name: String = after_keyword
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+
+        if name.is_empty() {
+            continue;
+        }
+
+        // Look for `: TypeName` after the name
+        let after_name = &after_keyword[name.len()..];
+        let Some(colon_pos) = after_name.find(": ") else {
+            continue;
+        };
+
+        let after_colon = &after_name[colon_pos + 2..];
+        let type_name: String = after_colon
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+
+        if !type_name.is_empty() {
+            types.insert(name, type_name);
+        }
+    }
+
+    types
 }
 
 /// Extract symbol definitions from content.
@@ -1102,6 +1555,26 @@ fn extract_symbols(content: &str) -> Vec<Value> {
             (14, 6)
         } else if trimmed.starts_with("var ") {
             (13, 4)
+        } else if trimmed.starts_with("struct ") {
+            (23, 7)
+        } else if trimmed.starts_with("class ") {
+            (5, 6)
+        } else if trimmed.starts_with("enum ") {
+            (10, 5)
+        } else if trimmed.starts_with("interface ") {
+            (11, 10)
+        } else if trimmed.starts_with("trait ") {
+            (11, 6)
+        } else if trimmed.starts_with("mod ") {
+            (2, 4)
+        } else if trimmed.starts_with("module ") {
+            (2, 7)
+        } else if trimmed.starts_with("type ") {
+            (26, 5)
+        } else if trimmed.starts_with("method ") {
+            (6, 7)
+        } else if trimmed.starts_with("field ") {
+            (8, 6)
         } else {
             continue;
         };
@@ -1153,8 +1626,11 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    const MOCK_LANG_A: &str = "yX4Za";
+
     fn default_args() -> Args {
         Args {
+            name: MOCK_LANG_A.to_string(),
             workspace_folders: false,
             indexing_delay: 0,
             response_delay: 0,
@@ -1250,7 +1726,7 @@ mod tests {
             "params": {
                 "textDocument": {
                     "uri": uri,
-                    "languageId": "shellscript",
+                    "languageId": "mock",
                     "version": 1,
                     "text": text
                 }
@@ -1325,32 +1801,50 @@ mod tests {
 
     #[test]
     fn test_hover_response_structure() {
-        let uri = "file:///tmp/test.sh";
-        let text = "#!/bin/bash\necho hello\n";
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello()\necho hello\n";
 
         let mut input = frame(&initialize_request(1));
         input.extend(frame(&did_open_notification(uri, text)));
+        // Hover on 'echo' (regular word)
         input.extend(frame(&hover_request(2, uri, 1, 0)));
-        input.extend(frame(&shutdown_request(3)));
+        // Hover on 'fn' keyword at (0,0) — should resolve to 'hello'
+        input.extend(frame(&hover_request(3, uri, 0, 0)));
+        input.extend(frame(&shutdown_request(4)));
 
         let messages = run_server_with(default_args(), &input);
 
-        let hover = messages
+        let hover_echo = messages
             .iter()
             .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
             .expect("hover response with id=2");
 
-        assert!(hover["error"].is_null(), "Expected no error");
-        let result = &hover["result"];
+        assert!(hover_echo["error"].is_null(), "Expected no error");
+        let result = &hover_echo["result"];
         assert!(result.is_object());
         assert_eq!(result["contents"]["kind"], "markdown");
         let value = result["contents"]["value"].as_str().unwrap_or("");
         assert!(value.contains("echo"), "Expected 'echo' in hover content");
+
+        // Hover on keyword should return symbol name, not 'fn'
+        let hover_kw = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("hover response with id=3");
+
+        assert!(hover_kw["error"].is_null(), "Expected no error");
+        let kw_value = hover_kw["result"]["contents"]["value"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            kw_value.contains("hello"),
+            "Hover on keyword should contain 'hello', got: {kw_value}"
+        );
     }
 
     #[test]
     fn test_definition_response_structure() {
-        let uri = "file:///tmp/test.sh";
+        let uri = "file:///tmp/test.yX4Za";
         let text = "fn my_func() {}\nmy_func\n";
 
         let mut input = frame(&initialize_request(1));
@@ -1373,7 +1867,7 @@ mod tests {
 
     #[test]
     fn test_diagnostics_notification_structure() {
-        let uri = "file:///tmp/test.sh";
+        let uri = "file:///tmp/test.yX4Za";
         let text = "#!/bin/bash\necho hello\n";
 
         let mut input = frame(&initialize_request(1));
@@ -1520,5 +2014,300 @@ mod tests {
             .iter()
             .find(|m| m.get("id").and_then(Value::as_str) == Some("string-id"));
         assert!(shutdown_resp.is_some(), "Shutdown should echo string id");
+    }
+
+    fn type_definition_request(id: u64, uri: &str, line: u64, character: u64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/typeDefinition",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_extract_symbols_all_kinds() {
+        let content = "\
+struct MyStruct
+class MyClass
+enum MyEnum
+interface MyInterface
+trait MyTrait
+mod my_mod
+module my_module
+type MyType
+method my_method
+field my_field
+fn my_func
+let my_var
+const MY_CONST
+";
+        let symbols = extract_symbols(content);
+        let kinds: Vec<(String, u64)> = symbols
+            .iter()
+            .map(|s| {
+                (
+                    s["name"].as_str().expect("name").to_string(),
+                    s["kind"].as_u64().expect("kind"),
+                )
+            })
+            .collect();
+
+        assert!(
+            kinds.contains(&("MyStruct".to_string(), 23)),
+            "struct → Struct(23)"
+        );
+        assert!(
+            kinds.contains(&("MyClass".to_string(), 5)),
+            "class → Class(5)"
+        );
+        assert!(
+            kinds.contains(&("MyEnum".to_string(), 10)),
+            "enum → Enum(10)"
+        );
+        assert!(
+            kinds.contains(&("MyInterface".to_string(), 11)),
+            "interface → Interface(11)"
+        );
+        assert!(
+            kinds.contains(&("MyTrait".to_string(), 11)),
+            "trait → Interface(11)"
+        );
+        assert!(
+            kinds.contains(&("my_mod".to_string(), 2)),
+            "mod → Module(2)"
+        );
+        assert!(
+            kinds.contains(&("my_module".to_string(), 2)),
+            "module → Module(2)"
+        );
+        assert!(
+            kinds.contains(&("MyType".to_string(), 26)),
+            "type → TypeParameter(26)"
+        );
+        assert!(
+            kinds.contains(&("my_method".to_string(), 6)),
+            "method → Method(6)"
+        );
+        assert!(
+            kinds.contains(&("my_field".to_string(), 8)),
+            "field → Field(8)"
+        );
+        assert!(
+            kinds.contains(&("my_func".to_string(), 12)),
+            "fn → Function(12)"
+        );
+        assert!(
+            kinds.contains(&("my_var".to_string(), 13)),
+            "let → Variable(13)"
+        );
+        assert!(
+            kinds.contains(&("MY_CONST".to_string(), 14)),
+            "const → Constant(14)"
+        );
+    }
+
+    #[test]
+    fn test_type_annotations_parsed() {
+        let content = "\
+let x: Foo
+fn bar: Result
+const PI: f64
+";
+        let types = extract_types(content);
+        assert_eq!(types.get("x").map(String::as_str), Some("Foo"));
+        assert_eq!(types.get("bar").map(String::as_str), Some("Result"));
+        assert_eq!(types.get("PI").map(String::as_str), Some("f64"));
+    }
+
+    #[test]
+    fn test_type_definition_cross_file() {
+        let uri_a = "file:///tmp/types.yX4Za";
+        let text_a = "struct Foo\n";
+        let uri_b = "file:///tmp/usage.yX4Za";
+        let text_b = "let x: Foo\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_a, text_a)));
+        input.extend(frame(&did_open_notification(uri_b, text_b)));
+        // Request typeDefinition on 'x' in uri_b (line 0, character 4)
+        input.extend(frame(&type_definition_request(2, uri_b, 0, 4)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let td = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("typeDefinition response with id=2");
+
+        assert!(td["error"].is_null(), "Expected no error");
+        let result = &td["result"];
+        assert_eq!(
+            result["uri"], uri_a,
+            "Type definition should point to the file with struct Foo"
+        );
+        assert_eq!(result["range"]["start"]["line"], 0);
+    }
+
+    #[test]
+    fn test_definition_cross_file() {
+        let uri_a = "file:///tmp/defs.yX4Za";
+        let text_a = "fn helper()\n";
+        let uri_b = "file:///tmp/caller.yX4Za";
+        let text_b = "helper\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_a, text_a)));
+        input.extend(frame(&did_open_notification(uri_b, text_b)));
+        // Request definition on 'helper' in uri_b (line 0, character 0)
+        input.extend(frame(&definition_request(2, uri_b, 0, 0)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let def = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("definition response with id=2");
+
+        assert!(def["error"].is_null(), "Expected no error");
+        let result = &def["result"];
+        assert_eq!(
+            result["uri"], uri_a,
+            "Definition should point to the file with fn helper()"
+        );
+        assert_eq!(result["range"]["start"]["line"], 0);
+    }
+
+    #[test]
+    fn test_hover_on_keyword_returns_symbol_name() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn callee()\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Hover at (0, 0) — lands on the 'fn' keyword
+        input.extend(frame(&hover_request(2, uri, 0, 0)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let hover = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("hover response with id=2");
+
+        let value = hover["result"]["contents"]["value"].as_str().unwrap_or("");
+        assert!(
+            value.contains("callee"),
+            "Hover on keyword should return 'callee', got: {value}"
+        );
+        assert!(
+            !value.contains("```\nfn\n```"),
+            "Hover should not be bare keyword 'fn', got: {value}"
+        );
+    }
+
+    #[test]
+    fn test_hover_on_symbol_name_returns_name() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn callee()\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Hover at (0, 3) — lands on the 'c' in 'callee'
+        input.extend(frame(&hover_request(2, uri, 0, 3)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let hover = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("hover response with id=2");
+
+        let value = hover["result"]["contents"]["value"].as_str().unwrap_or("");
+        assert!(
+            value.contains("callee"),
+            "Hover on symbol name should return 'callee', got: {value}"
+        );
+    }
+
+    #[test]
+    fn test_hover_on_struct_keyword() {
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "struct MyStruct\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Hover at (0, 0) — lands on the 'struct' keyword
+        input.extend(frame(&hover_request(2, uri, 0, 0)));
+        input.extend(frame(&shutdown_request(3)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let hover = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("hover response with id=2");
+
+        let value = hover["result"]["contents"]["value"].as_str().unwrap_or("");
+        assert!(
+            value.contains("MyStruct"),
+            "Hover on struct keyword should return 'MyStruct', got: {value}"
+        );
+        assert!(
+            !value.contains("```\nstruct\n```"),
+            "Hover should not be bare keyword 'struct', got: {value}"
+        );
+    }
+
+    #[test]
+    fn test_definition_with_imports() {
+        let uri_defs = "file:///tmp/defs.yX4Za";
+        let text_defs = "fn helper()\n";
+        let uri_a = "file:///tmp/a.yX4Za";
+        let text_a = "from defs import helper\nhelper\n";
+        let uri_b = "file:///tmp/b.yX4Za";
+        let text_b = "helper\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri_defs, text_defs)));
+        input.extend(frame(&did_open_notification(uri_a, text_a)));
+        input.extend(frame(&did_open_notification(uri_b, text_b)));
+        // Definition on 'helper' in a.sh (line 1, col 0) — import should resolve to defs.sh
+        input.extend(frame(&definition_request(2, uri_a, 1, 0)));
+        // Definition on 'helper' in b.sh (line 0, col 0) — no import, cross-file fallback
+        input.extend(frame(&definition_request(3, uri_b, 0, 0)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        // a.sh: import resolves to defs.sh
+        let def_a = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("definition response with id=2");
+        assert!(def_a["error"].is_null(), "Expected no error for a.yX4Za");
+        assert_eq!(
+            def_a["result"]["uri"], uri_defs,
+            "Import in a.yX4Za should resolve to defs.yX4Za"
+        );
+
+        // b.yX4Za: cross-file fallback also resolves to defs.yX4Za
+        let def_b = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("definition response with id=3");
+        assert!(def_b["error"].is_null(), "Expected no error for b.yX4Za");
+        assert_eq!(
+            def_b["result"]["uri"], uri_defs,
+            "Fallback in b.yX4Za should resolve to defs.yX4Za"
+        );
     }
 }

@@ -18,6 +18,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
+const MOCK_LANG_A: &str = "yX4Za";
+const MOCK_LANG_B: &str = "d5apI";
+
 /// Helper to spawn the bridge and communicate with it
 struct BridgeProcess {
     child: std::process::Child,
@@ -194,7 +197,7 @@ impl Drop for BridgeProcess {
 
 #[test]
 fn test_mcp_initialize() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
 
     bridge.send(&json!({
@@ -226,7 +229,7 @@ fn test_mcp_initialize() -> Result<()> {
 
 #[test]
 fn test_mcp_tools_list() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
     bridge.initialize()?;
 
@@ -281,7 +284,7 @@ fn test_mcp_tools_list() -> Result<()> {
 
 #[test]
 fn test_mcp_tool_call_unknown_tool() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
     bridge.initialize()?;
 
@@ -306,7 +309,7 @@ fn test_mcp_tool_call_unknown_tool() -> Result<()> {
 
 #[test]
 fn test_mcp_ping() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
     bridge.initialize()?;
 
@@ -325,7 +328,7 @@ fn test_mcp_ping() -> Result<()> {
 
 #[test]
 fn test_client_info_stored_in_session() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
 
     // Send initialize with specific client info
@@ -371,22 +374,16 @@ fn test_multi_root_find_symbol() -> Result<()> {
     let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
     let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
 
-    let script_a = dir_a.path().join("alpha.sh");
-    std::fs::write(
-        &script_a,
-        "#!/bin/bash\nfunction alpha_func() { echo alpha; }\n",
-    )?;
+    let script_a = dir_a.path().join(format!("alpha.{MOCK_LANG_A}"));
+    std::fs::write(&script_a, "function alpha_func()\nalpha_func\n")?;
 
-    let script_b = dir_b.path().join("beta.sh");
-    std::fs::write(
-        &script_b,
-        "#!/bin/bash\nfunction beta_func() { echo beta; }\n",
-    )?;
+    let script_b = dir_b.path().join(format!("beta.{MOCK_LANG_A}"));
+    std::fs::write(&script_b, "function beta_func()\nbeta_func\n")?;
 
     let root_a = dir_a.path().to_str().context("Invalid path A")?;
     let root_b = dir_b.path().to_str().context("Invalid path B")?;
 
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
     bridge.initialize()?;
 
@@ -411,8 +408,16 @@ fn test_multi_root_find_symbol() -> Result<()> {
         .as_str()
         .context("Missing text for alpha_func")?;
     assert!(
-        text_a.contains("alpha.sh"),
-        "Expected search to find alpha.sh, got: {text_a}"
+        text_a.contains(&format!("alpha.{MOCK_LANG_A}")),
+        "Expected search to find alpha.mock, got: {text_a}"
+    );
+    assert!(
+        text_a.contains("## Symbols"),
+        "Expected Symbols section for alpha_func, got: {text_a}"
+    );
+    assert!(
+        text_a.contains("[Function]"),
+        "Expected [Function] kind for alpha_func, got: {text_a}"
     );
 
     // Search should locate beta_func from root B (via symbols or heatmap)
@@ -436,8 +441,8 @@ fn test_multi_root_find_symbol() -> Result<()> {
         .as_str()
         .context("Missing text for beta_func")?;
     assert!(
-        text_b.contains("beta.sh"),
-        "Expected search to find beta.sh, got: {text_b}"
+        text_b.contains(&format!("beta.{MOCK_LANG_A}")),
+        "Expected search to find beta.mock, got: {text_b}"
     );
 
     Ok(())
@@ -449,22 +454,16 @@ fn test_multi_root_document_symbols() -> Result<()> {
     let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
     let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
 
-    let script_a = dir_a.path().join("syms_a.sh");
-    std::fs::write(
-        &script_a,
-        "#!/bin/bash\nfunction sym_alpha() { echo a; }\nfunction sym_beta() { echo b; }\n",
-    )?;
+    let script_a = dir_a.path().join(format!("syms_a.{MOCK_LANG_A}"));
+    std::fs::write(&script_a, "function sym_alpha()\nfunction sym_beta()\n")?;
 
-    let script_b = dir_b.path().join("syms_b.sh");
-    std::fs::write(
-        &script_b,
-        "#!/bin/bash\nfunction sym_gamma() { echo c; }\nfunction sym_delta() { echo d; }\n",
-    )?;
+    let script_b = dir_b.path().join(format!("syms_b.{MOCK_LANG_A}"));
+    std::fs::write(&script_b, "function sym_gamma()\nfunction sym_delta()\n")?;
 
     let root_a = dir_a.path().to_str().context("Invalid path A")?;
     let root_b = dir_b.path().to_str().context("Invalid path B")?;
 
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
     bridge.initialize()?;
 
@@ -544,23 +543,23 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
     let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
     let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
 
-    let script_a = dir_a.path().join("funcs_a.sh");
+    let script_a = dir_a.path().join(format!("funcs_a.{MOCK_LANG_A}"));
     std::fs::write(
         &script_a,
-        "#!/bin/bash\nfunction unique_root_a_func() { echo a; }\nunique_root_a_func\n",
+        "function unique_root_a_func()\nunique_root_a_func\n",
     )?;
 
-    let script_b = dir_b.path().join("funcs_b.sh");
+    let script_b = dir_b.path().join(format!("funcs_b.{MOCK_LANG_A}"));
     std::fs::write(
         &script_b,
-        "#!/bin/bash\nfunction unique_root_b_func() { echo b; }\nunique_root_b_func\n",
+        "function unique_root_b_func()\nunique_root_b_func\n",
     )?;
 
     let root_a = dir_a.path().to_str().context("Invalid path A")?;
     let root_b = dir_b.path().to_str().context("Invalid path B")?;
 
     // Spawn bridge with only root_a
-    let lsp = mockls_lsp_arg("shellscript", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
     bridge.initialize_with_roots(&[root_a])?;
 
@@ -636,7 +635,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
             .as_str()
             .context("Missing text")?;
         last_text = text.to_string();
-        if text.contains("## Symbols") && text.contains("funcs_b.sh") {
+        if text.contains("## Symbols") && text.contains(&format!("funcs_b.{MOCK_LANG_A}")) {
             success = true;
             break;
         }
@@ -645,7 +644,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
 
     assert!(
         success,
-        "Search in root B should find ## Symbols with funcs_b.sh after server restart. Last output: {last_text}"
+        "Search in root B should find ## Symbols with funcs_b.mock after server restart. Last output: {last_text}"
     );
 
     Ok(())
@@ -655,7 +654,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
 
 #[test]
 fn test_roots_list_after_initialize() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
 
     // Initialize with roots capability — this validates the full round-trip:
@@ -681,7 +680,7 @@ fn test_roots_list_after_initialize() -> Result<()> {
 
 #[test]
 fn test_roots_list_changed_notification() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
 
     // Initialize with roots capability
@@ -738,7 +737,7 @@ fn test_roots_list_changed_notification() -> Result<()> {
 
 #[test]
 fn test_no_roots_request_without_capability() -> Result<()> {
-    let lsp = mockls_lsp_arg("shellscript", "");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
 
     // Initialize WITHOUT roots capability
@@ -773,9 +772,9 @@ fn test_no_roots_request_without_capability() -> Result<()> {
 fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_mockls");
     if flags.is_empty() {
-        format!("{lang}:{bin}")
+        format!("{lang}:{bin} {lang}")
     } else {
-        format!("{lang}:{bin} {flags}")
+        format!("{lang}:{bin} {lang} {flags}")
     }
 }
 
@@ -792,11 +791,14 @@ fn test_mockls_diagnostics_across_profiles() -> Result<()> {
     ];
 
     for (name, flags) in profiles {
-        let test_file = "/tmp/mockls_diag_test.sh";
-        std::fs::write(test_file, "#!/bin/bash\necho hello\n")?;
+        let dir = tempfile::tempdir().context("Failed to create temp dir")?;
+        let test_file_path = dir.path().join(format!("mockls_diag_test.{MOCK_LANG_A}"));
+        std::fs::write(&test_file_path, "echo hello\n")?;
+        let test_file = test_file_path.to_str().context("Invalid test file path")?;
 
-        let lsp = mockls_lsp_arg("shellscript", flags);
-        let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+        let lsp = mockls_lsp_arg(MOCK_LANG_A, flags);
+        let root = dir.path().to_str().context("root path")?;
+        let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
         bridge.initialize()?;
 
         bridge.send(&json!({
@@ -834,8 +836,6 @@ fn test_mockls_diagnostics_across_profiles() -> Result<()> {
                 "Profile {name}: expected mock diagnostics, got: {text}"
             );
         }
-
-        std::fs::remove_file(test_file).ok();
     }
     Ok(())
 }
@@ -855,22 +855,16 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
         let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
         let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
 
-        let script_a = dir_a.path().join("funcs_a.sh");
-        std::fs::write(
-            &script_a,
-            "#!/bin/bash\nfn unique_root_a_func() { echo a; }\nunique_root_a_func\n",
-        )?;
+        let script_a = dir_a.path().join(format!("funcs_a.{MOCK_LANG_A}"));
+        std::fs::write(&script_a, "fn unique_root_a_func()\nunique_root_a_func\n")?;
 
-        let script_b = dir_b.path().join("funcs_b.sh");
-        std::fs::write(
-            &script_b,
-            "#!/bin/bash\nfn unique_root_b_func() { echo b; }\nunique_root_b_func\n",
-        )?;
+        let script_b = dir_b.path().join(format!("funcs_b.{MOCK_LANG_A}"));
+        std::fs::write(&script_b, "fn unique_root_b_func()\nunique_root_b_func\n")?;
 
         let root_a = dir_a.path().to_str().context("Invalid path A")?;
         let root_b = dir_b.path().to_str().context("Invalid path B")?;
 
-        let lsp = mockls_lsp_arg("shellscript", flags);
+        let lsp = mockls_lsp_arg(MOCK_LANG_A, flags);
         let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
         bridge.initialize_with_roots(&[root_a])?;
 
@@ -944,8 +938,12 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             .as_str()
             .context("Missing text")?;
         assert!(
-            text.contains("funcs_b.sh"),
-            "Profile {name}: search in root B should reference funcs_b.sh, got: {text}"
+            text.contains(&format!("funcs_b.{MOCK_LANG_A}")),
+            "Profile {name}: search in root B should reference funcs_b.mock, got: {text}"
+        );
+        assert!(
+            text.contains("## Symbols"),
+            "Profile {name}: search in root B should have Symbols section, got: {text}"
         );
     }
     Ok(())
@@ -959,17 +957,17 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
     let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
     let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
 
-    let file_a = dir_a.path().join("funcs_a.sh");
-    std::fs::write(&file_a, "#!/bin/bash\nfn hello() { echo hi; }\nhello\n")?;
-    let file_b = dir_b.path().join("funcs_b.sh");
-    std::fs::write(&file_b, "#!/bin/bash\nfn world() { echo world; }\nworld\n")?;
+    let file_a = dir_a.path().join(format!("funcs_a.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn hello()\nhello\n")?;
+    let file_b = dir_b.path().join(format!("funcs_b.{MOCK_LANG_A}"));
+    std::fs::write(&file_b, "fn world()\nworld\n")?;
 
     let root_a = dir_a.path().to_str().context("Invalid path A")?;
     let root_b = dir_b.path().to_str().context("Invalid path B")?;
 
-    // mockls with --workspace-folders but NO --indexing-delay:
+    // mockls with --workspace-folders and --scan-roots but NO --indexing-delay:
     // supports didChangeWorkspaceFolders, never sends $/progress.
-    let lsp = mockls_lsp_arg("shellscript", "--workspace-folders");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--workspace-folders --scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root_a)?;
     bridge.initialize_with_roots(&[root_a])?;
 
@@ -1036,8 +1034,12 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         .as_str()
         .context("Missing search text for root B")?;
     assert!(
-        text.contains("funcs_b.sh"),
-        "Expected 'funcs_b.sh' in search results, got: {text}"
+        text.contains(&format!("funcs_b.{MOCK_LANG_A}")),
+        "Expected 'funcs_b.mock' in search results, got: {text}"
+    );
+    assert!(
+        text.contains("## Symbols"),
+        "Root B search should have Symbols section, got: {text}"
     );
 
     Ok(())
@@ -1048,20 +1050,20 @@ fn test_mockls_multiplexing() -> Result<()> {
     // Spawn two mockls instances as different languages
     let dir = tempfile::tempdir()?;
 
-    let shell_file = dir.path().join("test.sh");
-    std::fs::write(&shell_file, "#!/bin/bash\nfn greet() { echo hi; }\ngreet\n")?;
+    let shell_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&shell_file, "fn greet()\ngreet\n")?;
 
-    let toml_file = dir.path().join("test.toml");
-    std::fs::write(&toml_file, "[package]\nname = \"test\"\n")?;
+    let second_file = dir.path().join(format!("test.{MOCK_LANG_B}"));
+    std::fs::write(&second_file, "[package]\nname = \"test\"\n")?;
 
-    let lsp_shell = mockls_lsp_arg("shellscript", "");
-    let lsp_toml = mockls_lsp_arg("toml", "");
+    let lsp_shell = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let lsp_second = mockls_lsp_arg(MOCK_LANG_B, "");
     let root = dir.path().to_str().context("Invalid root path")?;
 
-    let mut bridge = BridgeProcess::spawn(&[&lsp_shell, &lsp_toml], root)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp_shell, &lsp_second], root)?;
     bridge.initialize()?;
 
-    // Search for "greet" — should find in shell file via ripgrep
+    // Search for "greet" — should find in MOCK_LANG_A file
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 100,
@@ -1072,14 +1074,14 @@ fn test_mockls_multiplexing() -> Result<()> {
         }
     }))?;
 
-    let response_shell = bridge.recv()?;
-    let result_shell = &response_shell["result"];
+    let response_a = bridge.recv()?;
+    let result_a = &response_a["result"];
     assert!(
-        result_shell["isError"].is_null() || result_shell["isError"] == false,
-        "Shell search failed: {response_shell:?}"
+        result_a["isError"].is_null() || result_a["isError"] == false,
+        "Lang A search failed: {response_a:?}"
     );
 
-    // Search for "package" — should find in TOML file via ripgrep
+    // Search for "package" — should find in MOCK_LANG_B file
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 101,
@@ -1090,27 +1092,31 @@ fn test_mockls_multiplexing() -> Result<()> {
         }
     }))?;
 
-    let response_toml = bridge.recv()?;
-    let result_toml = &response_toml["result"];
+    let response_b = bridge.recv()?;
+    let result_b = &response_b["result"];
     assert!(
-        result_toml["isError"].is_null() || result_toml["isError"] == false,
-        "TOML search failed: {response_toml:?}"
+        result_b["isError"].is_null() || result_b["isError"] == false,
+        "Lang B search failed: {response_b:?}"
     );
 
-    let text_shell = result_shell["content"][0]["text"]
+    let text_a = result_a["content"][0]["text"]
         .as_str()
-        .context("Missing shell search text")?;
-    let text_toml = result_toml["content"][0]["text"]
+        .context("Missing lang A search text")?;
+    let text_b = result_b["content"][0]["text"]
         .as_str()
-        .context("Missing toml search text")?;
+        .context("Missing lang B search text")?;
 
     assert!(
-        text_shell.contains("test.sh"),
-        "Shell search should reference test.sh, got: {text_shell}"
+        text_a.contains(&format!("test.{MOCK_LANG_A}")),
+        "Lang A search should reference test file, got: {text_a}"
     );
     assert!(
-        text_toml.contains("test.toml"),
-        "TOML search should reference test.toml, got: {text_toml}"
+        text_a.contains("## Symbols"),
+        "Lang A search should have Symbols section, got: {text_a}"
+    );
+    assert!(
+        text_b.contains(&format!("test.{MOCK_LANG_B}")),
+        "Lang B search should reference test file, got: {text_b}"
     );
 
     Ok(())
@@ -1122,12 +1128,12 @@ fn test_mockls_multiplexing() -> Result<()> {
 fn test_mockls_did_save_not_sent_without_capability() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
-    let test_file = dir.path().join("test.sh");
-    std::fs::write(&test_file, "#!/bin/bash\necho hello\n")?;
+    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "echo hello\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;
     let lsp = mockls_lsp_arg(
-        "shellscript",
+        MOCK_LANG_A,
         &format!("--publish-version --notification-log {log_arg}"),
     );
     let root = dir.path().to_str().context("root path")?;
@@ -1165,12 +1171,12 @@ fn test_mockls_did_save_not_sent_without_capability() -> Result<()> {
 fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
-    let test_file = dir.path().join("test.sh");
-    std::fs::write(&test_file, "#!/bin/bash\necho hello\n")?;
+    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "echo hello\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;
     let lsp = mockls_lsp_arg(
-        "shellscript",
+        MOCK_LANG_A,
         &format!("--publish-version --advertise-save --notification-log {log_arg}"),
     );
     let root = dir.path().to_str().context("root path")?;
@@ -1206,10 +1212,10 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
 #[test]
 fn test_search_graceful_degradation() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let test_file = dir.path().join("test.sh");
-    std::fs::write(&test_file, "#!/bin/bash\nfn greet() { echo hi; }\ngreet\n")?;
+    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn greet()\ngreet\n")?;
 
-    let lsp = mockls_lsp_arg("shellscript", "--scan-roots --fail-on workspace/symbol");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --fail-on workspace/symbol");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
@@ -1234,8 +1240,8 @@ fn test_search_graceful_degradation() -> Result<()> {
         .context("Missing search text")?;
     // Should still find via ripgrep
     assert!(
-        text.contains("test.sh"),
-        "Search should find test.sh via ripgrep, got: {text}"
+        text.contains(&format!("test.{MOCK_LANG_A}")),
+        "Search should find test.mock via ripgrep, got: {text}"
     );
     // Should NOT have a Symbols section (LSP failed)
     assert!(
@@ -1257,13 +1263,13 @@ fn test_search_graceful_degradation() -> Result<()> {
 #[test]
 fn test_wait_ready_failure_detection() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let test_file = dir.path().join("test.sh");
-    std::fs::write(&test_file, "#!/bin/bash\necho hello\n")?;
+    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "echo hello\n")?;
 
     let dir2 = tempfile::tempdir()?;
 
     let lsp = mockls_lsp_arg(
-        "shellscript",
+        MOCK_LANG_A,
         "--workspace-folders --cpu-on-workspace-change 15000",
     );
     let root = dir.path().to_str().context("root path")?;
@@ -1336,13 +1342,10 @@ fn test_wait_ready_failure_detection() -> Result<()> {
 #[test]
 fn test_warmup_observation() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let test_file = dir.path().join("test.sh");
-    std::fs::write(
-        &test_file,
-        "#!/bin/bash\nfn my_function() { echo hi; }\nmy_function\n",
-    )?;
+    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn my_function()\nmy_function\n")?;
 
-    let lsp = mockls_lsp_arg("shellscript", "--cpu-on-initialized 3000");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --cpu-on-initialized 3000");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
@@ -1363,8 +1366,12 @@ fn test_warmup_observation() -> Result<()> {
     // Should succeed — wait_ready waits for CPU burn to finish
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(
-        text.contains("test.sh"),
+        text.contains(&format!("test.{MOCK_LANG_A}")),
         "Search should succeed after warmup observation. Got: {text}"
+    );
+    assert!(
+        text.contains("## Symbols"),
+        "Search after warmup should have Symbols section, got: {text}"
     );
 
     Ok(())
@@ -1378,13 +1385,10 @@ fn test_warmup_observation() -> Result<()> {
 #[test]
 fn test_search_symbols_with_scan_roots() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let test_file = dir.path().join("greeter.sh");
-    std::fs::write(
-        &test_file,
-        "#!/bin/bash\nfn greet() { echo hello; }\ngreet\n",
-    )?;
+    let test_file = dir.path().join(format!("greeter.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn greet()\ngreet\n")?;
 
-    let lsp = mockls_lsp_arg("shellscript", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
@@ -1421,29 +1425,26 @@ fn test_search_symbols_with_scan_roots() -> Result<()> {
 }
 
 /// Verifies that type definition enrichment appears in search output.
-/// mockls returns the same definition location for typeDefinition, which
-/// is always at a different location concept-wise, so the `Type:` field
-/// should appear in the enrichment output.
+/// mockls resolves `let result: MyType` to the `struct MyType` declaration
+/// in the other file, so the `Type:` field should appear in the enrichment.
 #[test]
 fn test_search_type_definition_enrichment() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // Create two files: one with a type definition on line 0, another
-    // with a call site. The call-site file has `let result` which
-    // workspace/symbol picks up as a Variable at line 1, and
-    // typeDefinition on that position returns the fn definition in
-    // the other file (different file → always shown).
-    let def_file = dir.path().join("types.sh");
-    std::fs::write(&def_file, "fn my_type() { echo type; }\n")?;
+    // Create two files: one with a type definition, another with a
+    // variable annotated with that type. typeDefinition on the variable
+    // resolves to the struct declaration in the other file.
+    let def_file = dir.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(&def_file, "struct MyType\n")?;
 
-    let use_file = dir.path().join("usage.sh");
-    std::fs::write(&use_file, "#!/bin/bash\nlet result = my_type\n")?;
+    let use_file = dir.path().join(format!("usage.{MOCK_LANG_A}"));
+    std::fs::write(&use_file, "let result: MyType\n")?;
 
-    let lsp = mockls_lsp_arg("shellscript", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Search for 'result' — should find the variable in usage.sh
+    // Search for 'result' — should find the variable in usage.mock
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1472,6 +1473,697 @@ fn test_search_type_definition_enrichment() -> Result<()> {
     assert!(
         text.contains("Type:"),
         "Expected Type: enrichment for variable symbol, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("types.{MOCK_LANG_A}")),
+        "Type: should reference types.mock, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that type definition enrichment points to the correct cross-file
+/// type declaration. File A has `struct Counter`, file B has `let count: Counter`.
+/// Searching for `count` should show `Type:` pointing to file A.
+#[test]
+fn test_search_type_definition_cross_file() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let type_file = dir.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(&type_file, "struct Counter\n")?;
+
+    let use_file = dir.path().join(format!("usage.{MOCK_LANG_A}"));
+    std::fs::write(&use_file, "let count: Counter\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["count"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got: {text}"
+    );
+    assert!(
+        text.contains("Type:"),
+        "Expected Type: enrichment for variable symbol, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("types.{MOCK_LANG_A}")),
+        "Type: should point to types.mock, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that call hierarchy enrichment appears for function symbols.
+/// File has `fn caller()` body calling `fn callee()`. Search for `callee`
+/// should show `Called by:` with `caller`.
+#[test]
+fn test_search_call_hierarchy_enrichment() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let test_file = dir.path().join(format!("calls.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn callee()\nfn caller()\n  callee\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["callee"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got: {text}"
+    );
+    assert!(
+        text.contains("Called by:"),
+        "Expected Called by: enrichment for function symbol, got: {text}"
+    );
+    assert!(
+        text.contains("caller"),
+        "Called by: should mention caller, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that struct symbols get implementation enrichment.
+/// File has `struct Foo` and references. Search for `Foo` should show
+/// `Implementations:`.
+#[test]
+fn test_search_struct_implementations() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let test_file = dir.path().join(format!("structs.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "struct Foo\nlet x: Foo\nFoo\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["Foo"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got: {text}"
+    );
+    assert!(
+        text.contains("Implementations:"),
+        "Expected Implementations: enrichment for struct symbol, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("structs.{MOCK_LANG_A}")),
+        "Implementations should reference structs.mock, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that interface symbols get subtype enrichment.
+/// File has `interface Animal` and a `struct Dog`. Search for `Animal`
+/// should show `Subtypes:`.
+#[test]
+fn test_search_interface_subtypes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let test_file = dir.path().join(format!("iface.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "interface Animal\nstruct Dog\nAnimal\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["Animal"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got: {text}"
+    );
+    assert!(
+        text.contains("Subtypes:"),
+        "Expected Subtypes: enrichment for interface symbol, got: {text}"
+    );
+    assert!(
+        text.contains("Dog"),
+        "Subtypes should contain Dog, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that when multiple symbols share a name, references are grouped
+/// under their respective definitions via import-based scope resolution.
+/// File A has `fn load_config()`, file B has `fn load_config()`,
+/// file C imports from A, file D imports from B.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "disambiguation test requires many assertions and group_1/group_2 variables"
+)]
+fn test_search_disambiguated_references() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file_a = dir.path().join(format!("mod_a.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn load_config()\n")?;
+
+    let file_b = dir.path().join(format!("mod_b.{MOCK_LANG_A}"));
+    std::fs::write(&file_b, "fn load_config()\n")?;
+
+    let file_c = dir.path().join(format!("caller_c.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file_c,
+        "from mod_a import load_config\nfn use_a()\n  load_config\n",
+    )?;
+
+    let file_d = dir.path().join(format!("caller_d.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file_d,
+        "from mod_b import load_config\nfn use_b()\n  load_config\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["load_config"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("mod_a.{MOCK_LANG_A}")),
+        "Expected mod_a.mock in output, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("mod_b.{MOCK_LANG_A}")),
+        "Expected mod_b.mock in output, got: {text}"
+    );
+    assert!(
+        text.contains("## References"),
+        "Expected References section for multiple symbols, got: {text}"
+    );
+    // Both disambiguation groups must exist
+    assert!(
+        text.contains("load_config (1):"),
+        "Expected disambiguation group (1), got:\n{text}"
+    );
+    assert!(
+        text.contains("load_config (2):"),
+        "Expected disambiguation group (2), got:\n{text}"
+    );
+
+    // Extract the References section
+    let refs_section = text
+        .split("## References")
+        .nth(1)
+        .and_then(|s| s.split("## File matches").next())
+        .unwrap_or("");
+
+    // Determine which group number each definition got
+    let mod_a_in_group_1 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (1):"));
+    let mod_a_in_group_2 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (2):"));
+    assert!(
+        mod_a_in_group_1 || mod_a_in_group_2,
+        "mod_a should appear in a group header, got:\n{refs_section}"
+    );
+
+    let mod_b_in_group_1 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (1):"));
+    let mod_b_in_group_2 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (2):"));
+    assert!(
+        mod_b_in_group_1 || mod_b_in_group_2,
+        "mod_b should appear in a group header, got:\n{refs_section}"
+    );
+
+    // They must be in different groups
+    assert!(
+        mod_a_in_group_1 != mod_b_in_group_1,
+        "mod_a and mod_b must be in different groups, got:\n{refs_section}"
+    );
+
+    // Split on group boundaries to get per-group content
+    let group_1_content = refs_section
+        .split("load_config (1):")
+        .nth(1)
+        .and_then(|s| s.split("load_config (2):").next())
+        .unwrap_or("");
+
+    let group_2_content = refs_section.split("load_config (2):").nth(1).unwrap_or("");
+
+    let (mod_a_refs, mod_b_refs) = if mod_a_in_group_1 {
+        (group_1_content, group_2_content)
+    } else {
+        (group_2_content, group_1_content)
+    };
+
+    // caller_c.mock imported from mod_a — must be in mod_a's group
+    assert!(
+        mod_a_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
+        "caller_c.mock should be in mod_a's group, got:\n{mod_a_refs}"
+    );
+    // caller_d.mock imported from mod_b — must be in mod_b's group
+    assert!(
+        mod_b_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
+        "caller_d.mock should be in mod_b's group, got:\n{mod_b_refs}"
+    );
+    // Negative: callers must NOT appear in the wrong group
+    assert!(
+        !mod_a_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
+        "caller_d.mock should NOT be in mod_a's group, got:\n{mod_a_refs}"
+    );
+    assert!(
+        !mod_b_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
+        "caller_c.mock should NOT be in mod_b's group, got:\n{mod_b_refs}"
+    );
+
+    Ok(())
+}
+
+/// Capstone test: exercises all three search tiers with a fixture that
+/// requires correct hover, references, and disambiguation to pass.
+///
+/// Guards against:
+/// - `handle_hover` returning keyword instead of symbol name
+/// - `handle_references` searching for keyword instead of symbol name
+/// - disambiguation grouping references under wrong definitions
+/// - file match dedup failing to subtract reference lines
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "capstone test requires exhaustive assertions across all three search tiers"
+)]
+fn test_search_full_payload() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Two definitions with the same name in different files
+    let mod_a = dir.path().join(format!("mod_a.{MOCK_LANG_A}"));
+    std::fs::write(&mod_a, "fn load_config()\n")?;
+
+    let mod_b = dir.path().join(format!("mod_b.{MOCK_LANG_A}"));
+    std::fs::write(&mod_b, "fn load_config()\n")?;
+
+    // Two callers, each scoped to one definition via import
+    let caller_c = dir.path().join(format!("caller_c.{MOCK_LANG_A}"));
+    std::fs::write(
+        &caller_c,
+        "from mod_a import load_config\nfn use_a()\n  load_config\n",
+    )?;
+
+    let caller_d = dir.path().join(format!("caller_d.{MOCK_LANG_A}"));
+    std::fs::write(
+        &caller_d,
+        "from mod_b import load_config\nfn use_b()\n  load_config\n",
+    )?;
+
+    // Non-code file: .txt is not indexed by scan_roots (only .mock),
+    // so it stays out of LSP references — exercising File matches.
+    let notes = dir.path().join("notes.txt");
+    std::fs::write(
+        &notes,
+        "The load_config function handles configuration loading.\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["load_config"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    // ── Symbols tier ──────────────────────────────────────────────
+
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got:\n{text}"
+    );
+
+    // Both definitions appear with correct kind
+    let function_count = text.matches("[Function]").count();
+    assert!(
+        function_count >= 2,
+        "Expected at least 2 [Function] symbols, found {function_count} in:\n{text}"
+    );
+
+    // Both definition files referenced in symbols
+    assert!(
+        text.contains(&format!("mod_a.{MOCK_LANG_A}")),
+        "Expected mod_a.mock in output, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("mod_b.{MOCK_LANG_A}")),
+        "Expected mod_b.mock in output, got:\n{text}"
+    );
+
+    // ── Hover content (guards against handle_hover bug) ───────────
+    //
+    // Extract the Symbols section (before References).
+    // With the fix: hover returns "load_config" → rendered in code block.
+    // Without the fix: hover returns "fn" → bare keyword.
+    let symbols_section = text.split("## References").next().unwrap_or(text);
+
+    // Indented hover lines (2-space indent, not 4-space which is
+    // call hierarchy content)
+    let hover_lines: Vec<&str> = symbols_section
+        .lines()
+        .filter(|l| l.starts_with("  ") && !l.starts_with("    "))
+        .filter(|l| l.trim() != "```")
+        .collect();
+
+    // At least one hover line should contain the symbol name
+    assert!(
+        hover_lines.iter().any(|l| l.contains("load_config")),
+        "Hover should contain 'load_config', got hover lines: {hover_lines:?}"
+    );
+
+    // No hover line should be just the keyword
+    assert!(
+        !hover_lines.iter().any(|l| l.trim() == "fn"),
+        "Hover should not be bare keyword 'fn', got hover lines: {hover_lines:?}"
+    );
+
+    // ── References tier ───────────────────────────────────────────
+
+    assert!(
+        text.contains("## References"),
+        "Expected References section, got:\n{text}"
+    );
+
+    // ── Disambiguation groups (guards against references bug) ─────
+    //
+    // Both groups must render.
+    assert!(
+        text.contains("load_config (1):"),
+        "Expected disambiguation group (1), got:\n{text}"
+    );
+    assert!(
+        text.contains("load_config (2):"),
+        "Expected disambiguation group (2), got:\n{text}"
+    );
+
+    // ── Caller routing (guards against scope resolution) ──────────
+    //
+    // Extract the References section.
+    let refs_section = text
+        .split("## References")
+        .nth(1)
+        .and_then(|s| s.split("## File matches").next())
+        .unwrap_or("");
+
+    // Determine which group number each definition got.
+    let mod_a_in_grp1 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (1):"));
+    let mod_a_in_grp2 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (2):"));
+    assert!(
+        mod_a_in_grp1 || mod_a_in_grp2,
+        "mod_a should appear in a group header, got:\n{refs_section}"
+    );
+
+    let mod_b_in_grp1 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (1):"));
+    let mod_b_in_grp2 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (2):"));
+    assert!(
+        mod_b_in_grp1 || mod_b_in_grp2,
+        "mod_b should appear in a group header, got:\n{refs_section}"
+    );
+
+    // They must be in different groups
+    assert!(
+        mod_a_in_grp1 != mod_b_in_grp1,
+        "mod_a and mod_b must be in different groups, got:\n{refs_section}"
+    );
+
+    // Split on group boundaries to get per-group content
+    let grp1_content = refs_section
+        .split("load_config (1):")
+        .nth(1)
+        .and_then(|s| s.split("load_config (2):").next())
+        .unwrap_or("");
+
+    let grp2_content = refs_section.split("load_config (2):").nth(1).unwrap_or("");
+
+    let (mod_a_refs, mod_b_refs) = if mod_a_in_grp1 {
+        (grp1_content, grp2_content)
+    } else {
+        (grp2_content, grp1_content)
+    };
+
+    // caller_c.mock imported from mod_a → must be in mod_a's group
+    assert!(
+        mod_a_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
+        "caller_c.mock should be in mod_a's group, got:\n{mod_a_refs}"
+    );
+
+    // caller_d.mock imported from mod_b → must be in mod_b's group
+    assert!(
+        mod_b_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
+        "caller_d.mock should be in mod_b's group, got:\n{mod_b_refs}"
+    );
+
+    // Negative: callers must NOT appear in the wrong group
+    assert!(
+        !mod_a_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
+        "caller_d.mock should NOT be in mod_a's group, got:\n{mod_a_refs}"
+    );
+    assert!(
+        !mod_b_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
+        "caller_c.mock should NOT be in mod_b's group, got:\n{mod_b_refs}"
+    );
+
+    // ── File matches tier ─────────────────────────────────────────
+    //
+    // notes.txt is not a .mock file, so scan_roots doesn't index it.
+    // Ripgrep finds it but LSP references don't cover it — it appears
+    // in File matches.
+    assert!(
+        text.contains("## File matches"),
+        "Expected File matches section, got:\n{text}"
+    );
+    assert!(
+        text.contains("notes.txt"),
+        "Expected notes.txt in file matches, got:\n{text}"
+    );
+
+    // Code files should NOT appear in File matches — their lines
+    // are already in References and should be deduped out.
+    let file_matches_section = text.split("## File matches").nth(1).unwrap_or("");
+
+    assert!(
+        !file_matches_section.contains(&format!("mod_a.{MOCK_LANG_A}")),
+        "mod_a.mock should be deduped from file matches, got:\n{file_matches_section}"
+    );
+    assert!(
+        !file_matches_section.contains(&format!("caller_c.{MOCK_LANG_A}")),
+        "caller_c.mock should be deduped from file matches, got:\n{file_matches_section}"
+    );
+
+    Ok(())
+}
+
+/// Verifies cross-language search disambiguation: two mockls instances
+/// serving different languages each define `fn perform_task()`. Search
+/// should return both symbols and group their references by language.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "cross-language disambiguation test requires thorough assertions"
+)]
+fn test_search_cross_language_disambiguation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file_a = dir.path().join(format!("mod_a.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn perform_task()\nperform_task\n")?;
+
+    let file_b = dir.path().join(format!("mod_b.{MOCK_LANG_B}"));
+    std::fs::write(&file_b, "fn perform_task()\nperform_task\n")?;
+
+    let lsp_a = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let lsp_b = mockls_lsp_arg(MOCK_LANG_B, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp_a, &lsp_b], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "queries": ["perform_task"] }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "Search should succeed: {response:?}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing search text")?;
+
+    // Both symbols should appear
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("mod_a.{MOCK_LANG_A}")),
+        "Expected mod_a.{MOCK_LANG_A} in output, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("mod_b.{MOCK_LANG_B}")),
+        "Expected mod_b.{MOCK_LANG_B} in output, got:\n{text}"
+    );
+
+    // Disambiguation groups must exist
+    assert!(
+        text.contains("## References"),
+        "Expected References section for cross-language symbols, got:\n{text}"
+    );
+    assert!(
+        text.contains("perform_task (1):"),
+        "Expected disambiguation group (1), got:\n{text}"
+    );
+    assert!(
+        text.contains("perform_task (2):"),
+        "Expected disambiguation group (2), got:\n{text}"
+    );
+
+    // Each group's references should stay within its own language file
+    let refs_section = text
+        .split("## References")
+        .nth(1)
+        .and_then(|s| s.split("## File matches").next())
+        .unwrap_or("");
+
+    let grp1_content = refs_section
+        .split("perform_task (1):")
+        .nth(1)
+        .and_then(|s| s.split("perform_task (2):").next())
+        .unwrap_or("");
+
+    let grp2_content = refs_section.split("perform_task (2):").nth(1).unwrap_or("");
+
+    let mod_a_in_grp1 = grp1_content.contains(&format!("mod_a.{MOCK_LANG_A}"));
+    let mod_b_in_grp2 = grp2_content.contains(&format!("mod_b.{MOCK_LANG_B}"));
+    let mod_b_in_grp1 = grp1_content.contains(&format!("mod_b.{MOCK_LANG_B}"));
+    let mod_a_in_grp2 = grp2_content.contains(&format!("mod_a.{MOCK_LANG_A}"));
+
+    // Each file should appear in exactly one group
+    assert!(
+        (mod_a_in_grp1 && mod_b_in_grp2) || (mod_b_in_grp1 && mod_a_in_grp2),
+        "Each language's file should be in a different group. \
+         grp1: {grp1_content}\ngrp2: {grp2_content}"
     );
 
     Ok(())
