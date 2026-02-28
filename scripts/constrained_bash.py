@@ -89,7 +89,7 @@ DENIED_GIT = {"grep", "ls-files", "ls-tree"}
 
 # Commands that are denied at the start of a pipeline (reading from files)
 # but allowed mid-pipeline (reading from stdin).
-PIPELINE_SAFE = {"grep", "egrep", "fgrep", "head", "tail", "wc", "jq"}
+PIPELINE_SAFE = {"grep", "egrep", "fgrep", "head", "tail", "wc", "jq", "awk", "sort", "sed", "tr", "cut", "uniq", "tee"}
 
 # Specific guidance for common denied commands
 GUIDANCE = {
