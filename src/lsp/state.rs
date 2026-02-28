@@ -36,6 +36,8 @@ pub enum ServerState {
     Ready,
     /// Server connection lost.
     Dead,
+    /// Server exhausted patience threshold but process is still alive.
+    Stuck,
 }
 
 impl ServerState {
@@ -46,6 +48,7 @@ impl ServerState {
             0 => Self::Initializing,
             1 => Self::Busy,
             2 => Self::Ready,
+            4 => Self::Stuck,
             _ => Self::Dead,
         }
     }
@@ -58,6 +61,7 @@ impl ServerState {
             Self::Busy => 1,
             Self::Ready => 2,
             Self::Dead => 3,
+            Self::Stuck => 4,
         }
     }
 }
@@ -299,11 +303,13 @@ mod tests {
         assert_eq!(ServerState::from_u8(1), ServerState::Busy);
         assert_eq!(ServerState::from_u8(2), ServerState::Ready);
         assert_eq!(ServerState::from_u8(3), ServerState::Dead);
+        assert_eq!(ServerState::from_u8(4), ServerState::Stuck);
         assert_eq!(ServerState::from_u8(99), ServerState::Dead);
 
         assert_eq!(ServerState::Initializing.as_u8(), 0);
         assert_eq!(ServerState::Busy.as_u8(), 1);
         assert_eq!(ServerState::Ready.as_u8(), 2);
         assert_eq!(ServerState::Dead.as_u8(), 3);
+        assert_eq!(ServerState::Stuck.as_u8(), 4);
     }
 }

@@ -1330,7 +1330,7 @@ fn test_wait_ready_failure_detection() -> Result<()> {
         "Dead server should degrade gracefully, not error. Got: {response:?}"
     );
 
-    // Offline notification should be prepended
+    // Unavailable notification should be prepended
     let content = result["content"]
         .as_array()
         .context("Missing content array")?;
@@ -1342,8 +1342,8 @@ fn test_wait_ready_failure_detection() -> Result<()> {
         .as_str()
         .context("Missing notification text")?;
     assert!(
-        notification.contains("server offline"),
-        "Expected offline notification. Got: {notification}"
+        notification.contains("server") && notification.contains("unavailable"),
+        "Expected unavailable notification. Got: {notification}"
     );
 
     Ok(())
