@@ -248,12 +248,11 @@ fn test_mcp_tools_list() -> Result<()> {
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Check all expected tools are present (6 after search redesign)
+    // Check all expected tools are present (5 after status removal)
     let expected_tools = [
         "search",
         "document_symbols",
         "diagnostics",
-        "status",
         "codebase_map",
         "list_directory",
     ];
@@ -1324,9 +1323,27 @@ fn test_wait_ready_failure_detection() -> Result<()> {
 
     let response = bridge.recv()?;
     let result = &response["result"];
-    assert_eq!(
-        result["isError"], true,
-        "wait_ready should detect failure when server burns CPU without progress. Got: {response:?}"
+
+    // Dead servers are non-fatal — search degrades gracefully with ripgrep results
+    assert!(
+        result.get("isError").is_none() || result["isError"] == false,
+        "Dead server should degrade gracefully, not error. Got: {response:?}"
+    );
+
+    // Offline notification should be prepended
+    let content = result["content"]
+        .as_array()
+        .context("Missing content array")?;
+    assert!(
+        content.len() >= 2,
+        "Expected notification + search results. Got: {content:?}"
+    );
+    let notification = content[0]["text"]
+        .as_str()
+        .context("Missing notification text")?;
+    assert!(
+        notification.contains("server offline"),
+        "Expected offline notification. Got: {notification}"
     );
 
     Ok(())

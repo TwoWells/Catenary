@@ -22,18 +22,26 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient, ServerState};
-use crate::mcp::{CallToolResult, Tool, ToolHandler};
+use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient};
+use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
 /// Tools that do not require LSP server readiness.
 /// Everything else waits by default — new tools are safe automatically.
-const METHODS_SKIP_WAIT: &[&str] = &["status", "list_directory"];
+const METHODS_SKIP_WAIT: &[&str] = &["list_directory"];
 
 /// Maximum total references before disambiguation falls back to flat rendering.
 const DISAMBIGUATION_REF_LIMIT: usize = 200;
 
 use super::{DocumentManager, DocumentNotification};
+
+/// Result of a server health check against touched language servers.
+struct ServerHealth {
+    /// Languages with dead servers.
+    dead: Vec<String>,
+    /// One-time batched notification for state transitions (offline/recovery).
+    notification: Option<String>,
+}
 
 /// Controls how much symbol detail to include in output.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -104,11 +112,14 @@ pub struct LspBridgeHandler {
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
     pub(super) runtime: Handle,
     pub(super) broadcaster: EventBroadcaster,
+    /// Languages whose servers have been reported offline to the agent.
+    /// Used for one-time notification: offline is reported once, recovery once.
+    notified_offline: std::sync::Mutex<HashSet<String>>,
 }
 
 impl LspBridgeHandler {
     /// Creates a new `LspBridgeHandler`.
-    pub const fn new(
+    pub fn new(
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
@@ -119,6 +130,7 @@ impl LspBridgeHandler {
             doc_manager,
             runtime,
             broadcaster,
+            notified_offline: std::sync::Mutex::new(HashSet::new()),
         }
     }
     /// Gets the appropriate LSP client for the given file path.
@@ -134,13 +146,16 @@ impl LspBridgeHandler {
     }
 
     /// Waits for the server handling the given path to be ready.
+    ///
+    /// Dead servers are non-fatal — the wait completes and the caller
+    /// uses [`check_server_health`] to detect the state.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "Client lock held across wait_ready call"
     )]
-    async fn wait_for_server_ready(&self, path: &Path) -> Result<()> {
+    async fn wait_for_server_ready(&self, path: &Path) {
         let Ok(client_mutex) = self.get_client_for_path(path).await else {
-            return Ok(()); // No LSP server configured for this language
+            return; // No LSP server configured for this language
         };
 
         let client = client_mutex.lock().await;
@@ -149,31 +164,101 @@ impl LspBridgeHandler {
         drop(client);
 
         if !is_ready {
-            return Err(anyhow!(
-                "[{lang}] server died while waiting for ready state"
-            ));
+            warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
         }
-
-        Ok(())
     }
 
     /// Waits for all active LSP servers to be ready.
     ///
-    /// Used for symbol-only queries that don't target a specific file,
-    /// since we don't know which server will handle the request.
-    async fn wait_for_all_servers_ready(&self) -> Result<()> {
+    /// Dead servers are non-fatal — the wait completes for each server
+    /// and the caller uses [`check_server_health`] to detect state.
+    /// Used for symbol-only queries that don't target a specific file.
+    async fn wait_for_all_servers_ready(&self) {
         let clients = self.client_manager.active_clients().await;
 
         for (lang, client_mutex) in clients {
-            let is_ready = client_mutex.lock().await.wait_ready().await;
-            if !is_ready {
-                return Err(anyhow!(
-                    "[{lang}] server died while waiting for ready state"
-                ));
+            if !client_mutex.lock().await.wait_ready().await {
+                warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
+            }
+        }
+    }
+
+    /// Checks server health for the given languages and generates one-time
+    /// state-transition notifications.
+    ///
+    /// Queries each server's liveness, partitions into alive/dead, and
+    /// compares against `notified_offline` to produce batched notifications:
+    /// - Newly dead servers get a single offline message with scope of impact.
+    /// - Previously-offline servers that recovered get a single recovery message.
+    fn check_server_health(&self, touched_servers: &[String]) -> ServerHealth {
+        let mut alive = Vec::new();
+        let mut dead = Vec::new();
+
+        // Classify each touched server by readiness (not just process liveness —
+        // a stuck server is alive but not ready)
+        let clients = self.runtime.block_on(self.client_manager.active_clients());
+        for lang in touched_servers {
+            let ready = clients
+                .get(lang)
+                .is_some_and(|c| self.runtime.block_on(async { c.lock().await.is_ready() }));
+
+            if ready {
+                alive.push(lang.clone());
+            } else {
+                dead.push(lang.clone());
             }
         }
 
-        Ok(())
+        // Determine state transitions against notified_offline
+        let mut notified = self
+            .notified_offline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut parts = Vec::new();
+
+        // Recovery: previously offline, now alive
+        let recovered: Vec<String> = alive
+            .iter()
+            .filter(|lang| notified.remove(lang.as_str()))
+            .cloned()
+            .collect();
+
+        if !recovered.is_empty() {
+            let langs = recovered.join(", ");
+            parts.push(format!(
+                "Language server{} back online: {langs} \u{2014} \
+                 diagnostics and language server enrichment re-enabled for \
+                 {langs} files.",
+                if recovered.len() == 1 { "" } else { "s" },
+            ));
+        }
+
+        // Offline: newly dead, not yet reported
+        let newly_dead: Vec<String> = dead
+            .iter()
+            .filter(|lang| notified.insert((*lang).clone()))
+            .cloned()
+            .collect();
+
+        if !newly_dead.is_empty() {
+            let langs = newly_dead.join(", ");
+            parts.push(format!(
+                "Language server{} offline: {langs} \u{2014} \
+                 diagnostics unavailable for {langs} files. \
+                 search and list_directory still work but without \
+                 language server enrichment.",
+                if newly_dead.len() == 1 { "" } else { "s" },
+            ));
+        }
+
+        let notification = if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        };
+
+        ServerHealth { dead, notification }
     }
 
     /// Extract file path from arguments if present.
@@ -184,45 +269,20 @@ impl LspBridgeHandler {
             .map(PathBuf::from)
     }
 
-    /// Handles the `status` tool.
-    fn handle_status(&self) -> CallToolResult {
-        let statuses = self
-            .runtime
-            .block_on(async { self.client_manager.all_server_status().await });
-
-        if statuses.is_empty() {
-            return CallToolResult::text("No LSP servers running");
-        }
-
-        let mut output = vec![format!("Catenary {}", env!("CATENARY_VERSION"))];
-        for status in statuses {
-            let state_str = match status.state {
-                ServerState::Initializing => "Initializing",
-                ServerState::Busy => "Busy",
-                ServerState::Ready => "Ready",
-                ServerState::Dead => "Dead",
-            };
-
-            let mut line = format!(
-                "{}: {} (uptime: {}s)",
-                status.language, state_str, status.uptime_secs
-            );
-
-            if let Some(title) = &status.progress_title {
-                use std::fmt::Write;
-                let _ = write!(line, " - {title}");
-                if let Some(pct) = status.progress_percentage {
-                    let _ = write!(line, " {pct}%");
-                }
-                if let Some(msg) = &status.progress_message {
-                    let _ = write!(line, " ({msg})");
-                }
-            }
-
-            output.push(line);
-        }
-
-        CallToolResult::text(output.join("\n"))
+    /// Returns the language key for a file path, matching the key used in
+    /// `active_clients()`. This may differ from the LSP language ID for
+    /// custom/test languages where the config key is the file extension.
+    async fn language_for_path(&self, path: &Path) -> Option<String> {
+        let lang_id = {
+            let doc_manager = self.doc_manager.lock().await;
+            doc_manager.language_id_for_path(path).to_string()
+        };
+        let client_mutex = self
+            .client_manager
+            .get_client_for_path(path, &lang_id)
+            .await
+            .ok()?;
+        Some(client_mutex.lock().await.language().to_string())
     }
 
     /// Ensures a document is open and synced with the LSP server.
@@ -1226,15 +1286,6 @@ impl ToolHandler for LspBridgeHandler {
                 input_schema: file_schema(),
             },
             Tool {
-                name: "status".to_string(),
-                description: Some("Report the status of all LSP servers (state, progress, uptime).".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            },
-            Tool {
                 name: "codebase_map".to_string(),
                 description: Some("Generate a high-level file tree of the project, optionally including symbols from LSP.".to_string()),
                 input_schema: serde_json::json!({
@@ -1273,8 +1324,8 @@ impl ToolHandler for LspBridgeHandler {
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let start = std::time::Instant::now();
-        let file =
-            Self::extract_file_path(arguments.as_ref()).map(|p| p.to_string_lossy().to_string());
+        let file_path = Self::extract_file_path(arguments.as_ref());
+        let file = file_path.as_ref().map(|p| p.to_string_lossy().to_string());
 
         // Broadcast tool call
         self.broadcaster.send(EventKind::ToolCall {
@@ -1291,31 +1342,44 @@ impl ToolHandler for LspBridgeHandler {
             });
         };
 
-        // Handle status tool separately (no file path)
-        if name == "status" {
-            let result = self.handle_status();
-            broadcast_result(result.is_error.is_none());
-            return Ok(result);
-        }
-
-        // Wait for LSP readiness on all tools that touch language servers.
-        // File-scoped calls wait for the specific server; symbol-only calls
-        // wait for all active servers since we don't know which will handle it.
-        if !METHODS_SKIP_WAIT.contains(&name) {
-            let wait_result = Self::extract_file_path(arguments.as_ref())
-                .as_ref()
-                .map_or_else(
-                    || self.runtime.block_on(self.wait_for_all_servers_ready()),
-                    |path| self.runtime.block_on(self.wait_for_server_ready(path)),
-                );
-
-            if let Err(e) = wait_result {
-                broadcast_result(false);
-                return Err(e);
+        // Wait for LSP readiness, then check server health.
+        // Dead servers are non-fatal — tools degrade gracefully.
+        let health = if METHODS_SKIP_WAIT.contains(&name) {
+            ServerHealth {
+                dead: vec![],
+                notification: None,
             }
+        } else if let Some(ref path) = file_path {
+            // File-scoped: wait for the specific server
+            self.runtime.block_on(self.wait_for_server_ready(path));
+            let touched: Vec<String> = self
+                .runtime
+                .block_on(self.language_for_path(path))
+                .into_iter()
+                .collect();
+            self.check_server_health(&touched)
+        } else {
+            // Symbol-only: wait for all servers
+            self.runtime.block_on(self.wait_for_all_servers_ready());
+            let touched: Vec<String> = self
+                .runtime
+                .block_on(self.client_manager.active_clients())
+                .keys()
+                .cloned()
+                .collect();
+            self.check_server_health(&touched)
+        };
+
+        // File-scoped tool with dead server: skip dispatch, return notification
+        if !health.dead.is_empty() && file_path.is_some() {
+            broadcast_result(true);
+            return Ok(CallToolResult::text(
+                health.notification.unwrap_or_default(),
+            ));
         }
 
-        let result = match name {
+        // Dispatch tool
+        let mut result = match name {
             "search" => self.handle_search(arguments),
             "document_symbols" => self.handle_document_symbols(arguments),
             "diagnostics" => self.handle_diagnostics(arguments),
@@ -1323,6 +1387,13 @@ impl ToolHandler for LspBridgeHandler {
             "list_directory" => self.handle_list_directory(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
+
+        // Prepend state-transition notification to the result
+        if let Some(note) = health.notification
+            && let Ok(ref mut res) = result
+        {
+            res.content.insert(0, ToolContent::Text { text: note });
+        }
 
         match &result {
             Ok(res) => broadcast_result(res.is_error.is_none()),
