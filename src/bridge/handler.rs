@@ -198,9 +198,15 @@ impl LspBridgeHandler {
         // a stuck server is alive but not ready)
         let clients = self.runtime.block_on(self.client_manager.active_clients());
         for lang in touched_servers {
-            let ready = clients
-                .get(lang)
-                .is_some_and(|c| self.runtime.block_on(async { c.lock().await.is_ready() }));
+            let ready = clients.get(lang).is_some_and(|c| {
+                self.runtime.block_on(async {
+                    let client = c.lock().await;
+                    // Lightweight idle probe: if a stuck server has gone idle,
+                    // recover it to Ready before checking readiness.
+                    client.try_idle_recover();
+                    client.is_ready()
+                })
+            });
 
             if ready {
                 alive.push(lang.clone());
@@ -217,7 +223,7 @@ impl LspBridgeHandler {
 
         let mut parts = Vec::new();
 
-        // Recovery: previously offline, now alive
+        // Recovery: previously unavailable, now alive
         let recovered: Vec<String> = alive
             .iter()
             .filter(|lang| notified.remove(lang.as_str()))
@@ -234,7 +240,7 @@ impl LspBridgeHandler {
             ));
         }
 
-        // Offline: newly dead, not yet reported
+        // Unavailable: newly dead or stuck, not yet reported
         let newly_dead: Vec<String> = dead
             .iter()
             .filter(|lang| notified.insert((*lang).clone()))
@@ -244,7 +250,7 @@ impl LspBridgeHandler {
         if !newly_dead.is_empty() {
             let langs = newly_dead.join(", ");
             parts.push(format!(
-                "Language server{} offline: {langs} \u{2014} \
+                "Language server{} unavailable: {langs} \u{2014} \
                  diagnostics unavailable for {langs} files. \
                  search and list_directory still work but without \
                  language server enrichment.",

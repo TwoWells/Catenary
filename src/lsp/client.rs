@@ -511,7 +511,10 @@ impl LspClient {
                     let mut tracker = progress.lock().await;
                     tracker.update(&params);
 
-                    // Update state based on progress
+                    // Update state based on progress.
+                    // The Dead guard is the only exclusion — Stuck servers
+                    // that send progress are naturally recovered here
+                    // (transitioned to Busy/Ready like any other state).
                     let current_state = ServerState::from_u8(state.load(Ordering::SeqCst));
                     if current_state != ServerState::Dead {
                         if tracker.is_busy() {
@@ -1572,9 +1575,17 @@ impl LspClient {
         /// Consecutive flat+sleeping samples required to settle back to Ready.
         const SETTLE_SAMPLES: u32 = 3;
 
+        // Stuck servers have already exhausted patience — don't wait again.
+        // Take an opportunistic sample to keep the baseline fresh for
+        // try_idle_recover() on the next check_server_health() call.
+        if self.server_state() == ServerState::Stuck {
+            let _ = self.sample_monitor();
+            return false;
+        }
+
         let flat_count = AtomicU32::new(0);
 
-        load_aware_grace(
+        let ready = load_aware_grace(
             &mut || self.sample_monitor(),
             READY_THRESHOLD,
             None, // Use default 5-minute safety cap
@@ -1613,7 +1624,42 @@ impl LspClient {
                 false
             },
         )
-        .await
+        .await;
+
+        // Patience exhausted but process is still alive — mark as stuck
+        // so future calls skip the full wait.
+        if !ready && self.is_alive() {
+            debug!("wait_ready: patience exhausted, server still alive — marking as Stuck");
+            self.state
+                .store(ServerState::Stuck.as_u8(), Ordering::SeqCst);
+            self.state_notify.notify_waiters();
+        }
+
+        ready
+    }
+
+    /// Lightweight idle probe for `Stuck` servers.
+    ///
+    /// If the server is `Stuck`, alive, and the process is sleeping with
+    /// flat CPU ticks, transitions to `Ready` and returns `true`.
+    /// Returns `false` in all other cases. Costs one process sample (~1ms).
+    pub fn try_idle_recover(&self) -> bool {
+        if self.server_state() != ServerState::Stuck || !self.is_alive() {
+            return false;
+        }
+
+        if let Some((delta, process_state)) = self.sample_monitor()
+            && process_state == catenary_proc::ProcessState::Sleeping
+            && delta == 0
+        {
+            debug!("try_idle_recover: stuck server is idle — transitioning to Ready");
+            self.state
+                .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+            self.state_notify.notify_waiters();
+            return true;
+        }
+
+        false
     }
 }
 

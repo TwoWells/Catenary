@@ -237,7 +237,7 @@ impl<'a> PanelState<'a> {
                 let ls_state = match state.as_str() {
                     "ready" | "running" => LsState::Healthy,
                     "initializing" | "starting" => LsState::Initializing,
-                    "exited" | "crashed" | "error" => LsState::Crashed,
+                    "exited" | "crashed" | "error" | "stuck" => LsState::Crashed,
                     _ => LsState::NotLoaded,
                 };
                 if !map.contains_key(language) {

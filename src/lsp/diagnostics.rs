@@ -116,6 +116,15 @@ mod tests {
     }
 
     #[test]
+    fn token_monitor_idle_when_stuck() {
+        let state = Arc::new(AtomicU8::new(crate::lsp::state::ServerState::Stuck.as_u8()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut monitor = TokenMonitor::new(state, alive);
+
+        assert_eq!(monitor.poll(), ActivityState::Idle);
+    }
+
+    #[test]
     fn token_monitor_dead_when_not_alive() {
         let state = Arc::new(AtomicU8::new(crate::lsp::state::ServerState::Ready.as_u8()));
         let alive = Arc::new(AtomicBool::new(false));
