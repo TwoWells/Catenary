@@ -103,7 +103,6 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | `diagnostics`         | Get errors and warnings                             |
 | `call_hierarchy`      | See who calls a function / what it calls            |
 | `type_hierarchy`      | See type inheritance                                |
-| `status`         | Report status of all LSP servers (e.g. "Indexing")  |
 | `codebase_map`   | Generate a high-level file tree with symbols        |
 
 **Deprecated (being merged into `search`):**
