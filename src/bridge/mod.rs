@@ -3,7 +3,7 @@
 
 /// Manages document lifecycle and sync between disk and LSP servers.
 mod document_manager;
-/// File I/O tool handlers.
+/// Glob tool handler: unified file/directory/pattern browsing.
 mod file_tools;
 /// Maps MCP tool calls to LSP requests.
 mod handler;

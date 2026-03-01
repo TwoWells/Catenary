@@ -248,14 +248,8 @@ fn test_mcp_tools_list() -> Result<()> {
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Check all expected tools are present (5 after status removal)
-    let expected_tools = [
-        "search",
-        "document_symbols",
-        "diagnostics",
-        "codebase_map",
-        "list_directory",
-    ];
+    // Check all expected tools are present (3 after glob consolidation)
+    let expected_tools = ["search", "diagnostics", "glob"];
 
     for expected in &expected_tools {
         assert!(tool_names.contains(expected), "Missing {expected} tool");
@@ -448,16 +442,16 @@ fn test_multi_root_find_symbol() -> Result<()> {
 }
 
 #[test]
-fn test_multi_root_document_symbols() -> Result<()> {
-    // Create two roots with different symbols
+fn test_multi_root_glob_file() -> Result<()> {
+    // Create two roots with different outline symbols
     let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
     let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
 
     let script_a = dir_a.path().join(format!("syms_a.{MOCK_LANG_A}"));
-    std::fs::write(&script_a, "function sym_alpha()\nfunction sym_beta()\n")?;
+    std::fs::write(&script_a, "struct AlphaType\nenum BetaMode\n")?;
 
     let script_b = dir_b.path().join(format!("syms_b.{MOCK_LANG_A}"));
-    std::fs::write(&script_b, "function sym_gamma()\nfunction sym_delta()\n")?;
+    std::fs::write(&script_b, "struct GammaType\nenum DeltaMode\n")?;
 
     let root_a = dir_a.path().to_str().context("Invalid path A")?;
     let root_b = dir_b.path().to_str().context("Invalid path B")?;
@@ -466,15 +460,15 @@ fn test_multi_root_document_symbols() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
     bridge.initialize()?;
 
-    // Get symbols from root A file
+    // Get outline from root A file
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 720,
         "method": "tools/call",
         "params": {
-            "name": "document_symbols",
+            "name": "glob",
             "arguments": {
-                "file": script_a.to_str().context("Invalid script A path")?
+                "pattern": script_a.to_str().context("Invalid script A path")?
             }
         }
     }))?;
@@ -483,29 +477,29 @@ fn test_multi_root_document_symbols() -> Result<()> {
     let result_a = &response_a["result"];
     assert!(
         result_a["isError"].is_null() || result_a["isError"] == false,
-        "Document symbols from root A failed: {response_a:?}"
+        "Glob file from root A failed: {response_a:?}"
     );
     let text_a = result_a["content"][0]["text"]
         .as_str()
         .context("Missing text for symbols A")?;
     assert!(
-        text_a.contains("sym_alpha"),
-        "Should contain sym_alpha, got: {text_a}"
+        text_a.contains("AlphaType"),
+        "Should contain AlphaType, got: {text_a}"
     );
     assert!(
-        text_a.contains("sym_beta"),
-        "Should contain sym_beta, got: {text_a}"
+        text_a.contains("BetaMode"),
+        "Should contain BetaMode, got: {text_a}"
     );
 
-    // Get symbols from root B file
+    // Get outline from root B file
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 721,
         "method": "tools/call",
         "params": {
-            "name": "document_symbols",
+            "name": "glob",
             "arguments": {
-                "file": script_b.to_str().context("Invalid script B path")?
+                "pattern": script_b.to_str().context("Invalid script B path")?
             }
         }
     }))?;
@@ -514,18 +508,18 @@ fn test_multi_root_document_symbols() -> Result<()> {
     let result_b = &response_b["result"];
     assert!(
         result_b["isError"].is_null() || result_b["isError"] == false,
-        "Document symbols from root B failed: {response_b:?}"
+        "Glob file from root B failed: {response_b:?}"
     );
     let text_b = result_b["content"][0]["text"]
         .as_str()
         .context("Missing text for symbols B")?;
     assert!(
-        text_b.contains("sym_gamma"),
-        "Should contain sym_gamma, got: {text_b}"
+        text_b.contains("GammaType"),
+        "Should contain GammaType, got: {text_b}"
     );
     assert!(
-        text_b.contains("sym_delta"),
-        "Should contain sym_delta, got: {text_b}"
+        text_b.contains("DeltaMode"),
+        "Should contain DeltaMode, got: {text_b}"
     );
 
     Ok(())

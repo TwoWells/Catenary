@@ -6,7 +6,7 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for codebase map tool.
+//! Integration tests for the `glob` tool (directory/file/pattern modes).
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -115,7 +115,7 @@ impl Drop for BridgeProcess {
 }
 
 #[test]
-fn test_codebase_map_basic() -> Result<()> {
+fn test_glob_directory_basic() -> Result<()> {
     let temp = tempfile::tempdir()?;
     std::fs::write(temp.path().join("file1.txt"), "content")?;
     std::fs::create_dir(temp.path().join("subdir"))?;
@@ -129,11 +129,9 @@ fn test_codebase_map_basic() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "codebase_map",
+            "name": "glob",
             "arguments": {
-                "path": temp.path().to_str().context("invalid path")?,
-                "max_depth": 5,
-                "include_symbols": false
+                "pattern": temp.path().to_str().context("invalid path")?
             }
         }
     }))?;
@@ -145,19 +143,23 @@ fn test_codebase_map_basic() -> Result<()> {
     let content = result["content"][0]["text"]
         .as_str()
         .context("Missing text in content")?;
-    tracing::debug!("Map Output:\n{content}");
 
-    assert!(content.contains("file1.txt"));
-    assert!(content.contains("subdir/"));
-    assert!(content.contains("file2.rs"));
+    assert!(
+        content.contains("file1.txt"),
+        "Should list file1.txt, got:\n{content}"
+    );
+    assert!(
+        content.contains("subdir/"),
+        "Should list subdir/, got:\n{content}"
+    );
     Ok(())
 }
 
 #[test]
-fn test_codebase_map_with_symbols() -> Result<()> {
+fn test_glob_directory_symbols() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let script = temp.path().join(format!("script.{MOCK_LANG_A}"));
-    std::fs::write(&script, "function my_func()\nmy_func\n")?;
+    let script = temp.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(&script, "struct Config\nenum Mode\nconst MAX_SIZE\n")?;
 
     let mut bridge = BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, None)?;
     bridge.initialize()?;
@@ -167,11 +169,9 @@ fn test_codebase_map_with_symbols() -> Result<()> {
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "codebase_map",
+            "name": "glob",
             "arguments": {
-                "path": temp.path().to_str().context("invalid path")?,
-                "include_symbols": true,
-                "detail_level": "signatures"
+                "pattern": temp.path().to_str().context("invalid path")?
             }
         }
     }))?;
@@ -182,23 +182,31 @@ fn test_codebase_map_with_symbols() -> Result<()> {
         .as_str()
         .context("Missing text in content")?;
 
-    tracing::debug!("Map with Symbols Output:\n{content}");
-
-    assert!(content.contains(&format!("script.{MOCK_LANG_A}")));
     assert!(
-        content.contains("my_func"),
-        "codebase_map should return symbols, got:\n{content}"
+        content.contains(&format!("types.{MOCK_LANG_A}")),
+        "Should list the file, got:\n{content}"
+    );
+    assert!(
+        content.contains("Config"),
+        "Should contain Config symbol, got:\n{content}"
+    );
+    assert!(
+        content.contains("Mode"),
+        "Should contain Mode symbol, got:\n{content}"
     );
     Ok(())
 }
 
-/// Verifies that mockls returns document symbols via the `document_symbols`
-/// MCP tool. Uses mockls instead of marksman for deterministic behavior.
+/// Verifies that glob returns outline symbols for a single file,
+/// filtering to outline kinds only.
 #[test]
-fn test_mockls_document_symbols() -> Result<()> {
+fn test_glob_file_outline() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let script = temp.path().join(format!("helpers.{MOCK_LANG_A}"));
-    std::fs::write(&script, "function setup_env()\nfunction run_tests()\n")?;
+    let script = temp.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(
+        &script,
+        "struct Config\nenum Mode\nconst MAX_SIZE\nfn do_work\n",
+    )?;
 
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let lsp = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A}");
@@ -212,9 +220,9 @@ fn test_mockls_document_symbols() -> Result<()> {
         "id": 3,
         "method": "tools/call",
         "params": {
-            "name": "document_symbols",
+            "name": "glob",
             "arguments": {
-                "file": script.to_str().context("file path")?
+                "pattern": script.to_str().context("file path")?
             }
         }
     }))?;
@@ -225,114 +233,58 @@ fn test_mockls_document_symbols() -> Result<()> {
         .as_str()
         .context("Missing text in content")?;
 
+    // Outline kinds should be present
     assert!(
-        content.contains("setup_env"),
-        "Should contain setup_env symbol, got:\n{content}"
+        content.contains("Config"),
+        "Should contain Config symbol, got:\n{content}"
     );
     assert!(
-        content.contains("run_tests"),
-        "Should contain run_tests symbol, got:\n{content}"
+        content.contains("Struct"),
+        "Config should have Struct kind, got:\n{content}"
     );
     assert!(
-        content.contains("Function"),
-        "Symbols should be typed as Function, got:\n{content}"
+        content.contains("Mode"),
+        "Should contain Mode symbol, got:\n{content}"
+    );
+    assert!(
+        content.contains("Enum"),
+        "Mode should have Enum kind, got:\n{content}"
+    );
+    assert!(
+        content.contains("MAX_SIZE"),
+        "Should contain MAX_SIZE symbol, got:\n{content}"
+    );
+    assert!(
+        content.contains("Constant"),
+        "MAX_SIZE should have Constant kind, got:\n{content}"
+    );
+
+    // Function kind should be excluded from outline
+    assert!(
+        !content.contains("do_work"),
+        "Function 'do_work' should be excluded from outline, got:\n{content}"
+    );
+
+    // Line numbers should be present
+    assert!(
+        content.contains("L1"),
+        "Should contain L1 line number, got:\n{content}"
+    );
+    assert!(
+        content.contains("L2"),
+        "Should contain L2 line number, got:\n{content}"
+    );
+
+    // Line count header
+    assert!(
+        content.contains("(4 lines)"),
+        "Should show line count, got:\n{content}"
     );
     Ok(())
 }
 
 #[test]
-fn test_codebase_map_multi_root() -> Result<()> {
-    // Create two workspace roots with distinct files
-    let dir_a = tempfile::tempdir()?;
-    let dir_b = tempfile::tempdir()?;
-
-    std::fs::write(dir_a.path().join("alpha.txt"), "content a")?;
-    std::fs::create_dir(dir_a.path().join("sub_a"))?;
-    std::fs::write(dir_a.path().join("sub_a/nested_a.rs"), "fn a() {}")?;
-
-    std::fs::write(dir_b.path().join("beta.txt"), "content b")?;
-    std::fs::create_dir(dir_b.path().join("sub_b"))?;
-    std::fs::write(dir_b.path().join("sub_b/nested_b.rs"), "fn b() {}")?;
-
-    let root_a = dir_a.path().to_str().context("invalid path A")?;
-    let root_b = dir_b.path().to_str().context("invalid path B")?;
-
-    let mut bridge = BridgeProcess::spawn_multi_root(&[root_a, root_b], None)?;
-    bridge.initialize()?;
-
-    // Request codebase_map without specifying a path — should show all roots
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 10,
-        "method": "tools/call",
-        "params": {
-            "name": "codebase_map",
-            "arguments": {
-                "max_depth": 5,
-                "include_symbols": false
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "codebase_map multi-root failed: {response:?}"
-    );
-
-    let content = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text in content")?;
-
-    tracing::debug!("Multi-root Map Output:\n{content}");
-
-    // Should contain files from both roots
-    assert!(
-        content.contains("alpha.txt"),
-        "Should contain alpha.txt from root A, got:\n{content}"
-    );
-    assert!(
-        content.contains("beta.txt"),
-        "Should contain beta.txt from root B, got:\n{content}"
-    );
-    assert!(
-        content.contains("nested_a.rs"),
-        "Should contain nested_a.rs from root A, got:\n{content}"
-    );
-    assert!(
-        content.contains("nested_b.rs"),
-        "Should contain nested_b.rs from root B, got:\n{content}"
-    );
-
-    // In multi-root mode, root directories should appear as top-level entries
-    // Get the directory names for the temp dirs
-    let names: Vec<String> = [&dir_a, &dir_b]
-        .iter()
-        .map(|d| {
-            d.path()
-                .file_name()
-                .context("no dirname")
-                .and_then(|n| n.to_str().context("invalid dirname").map(String::from))
-        })
-        .collect::<Result<_>>()?;
-
-    assert!(
-        content.contains(&format!("{}/", names[0])),
-        "Should contain root A directory prefix '{0}/', got:\n{content}",
-        names[0]
-    );
-    assert!(
-        content.contains(&format!("{}/", names[1])),
-        "Should contain root B directory prefix '{0}/', got:\n{content}",
-        names[1]
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_codebase_map_single_path_override() -> Result<()> {
+fn test_glob_directory_explicit_path() -> Result<()> {
     // When an explicit path is given, even in multi-root mode, only that path is shown
     let dir_a = tempfile::tempdir()?;
     let dir_b = tempfile::tempdir()?;
@@ -346,16 +298,15 @@ fn test_codebase_map_single_path_override() -> Result<()> {
     let mut bridge = BridgeProcess::spawn_multi_root(&[root_a, root_b], None)?;
     bridge.initialize()?;
 
-    // Request map with explicit path pointing to root A only
+    // Request glob with explicit path pointing to root A only
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 11,
         "method": "tools/call",
         "params": {
-            "name": "codebase_map",
+            "name": "glob",
             "arguments": {
-                "path": root_a,
-                "include_symbols": false
+                "pattern": root_a
             }
         }
     }))?;
@@ -364,7 +315,7 @@ fn test_codebase_map_single_path_override() -> Result<()> {
     let result = &response["result"];
     assert!(
         result["isError"].is_null() || result["isError"] == false,
-        "codebase_map with explicit path failed: {response:?}"
+        "glob with explicit path failed: {response:?}"
     );
 
     let content = result["content"][0]["text"]
