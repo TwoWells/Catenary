@@ -57,6 +57,55 @@ _SUBSHELL_RE = re.compile(r'\$\(([^)]*)\)|<\(([^)]*)\)|`([^`]*)`')
 # Matches heredoc start markers: <<EOF, <<'EOF', <<"EOF", <<-EOF, <<-'EOF', <<\EOF
 _HEREDOC_MARKER_RE = re.compile(r'<<-?\s*\\?[\'"]?(\w+)[\'"]?')
 
+# Pre-compiled patterns for splitting on sequential operators and pipes.
+_SEQ_SPLIT_RE = re.compile(r'\s*(?:&&|\|\||;)\s*')
+_PIPE_SPLIT_RE = re.compile(r'\s*(?<!\|)\|(?!\|)\s*')
+
+
+def _mask_quotes(s):
+    """Replace quoted content (including delimiters) with spaces.
+
+    This preserves string length and character positions so that regex
+    matches on the masked string can be mapped back to the original.
+    Prevents operators like && || ; | inside quoted arguments (e.g. awk
+    patterns) from being treated as shell operators.
+    """
+    out = list(s)
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "'":
+            j = s.find("'", i + 1)
+            if j == -1:
+                j = n - 1
+            for k in range(i, j + 1):
+                out[k] = ' '
+            i = j + 1
+        elif s[i] == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                if s[j] == '\\' and j + 1 < n:
+                    j += 1
+                j += 1
+            for k in range(i, min(j + 1, n)):
+                out[k] = ' '
+            i = j + 1
+        else:
+            i += 1
+    return ''.join(out)
+
+
+def _quote_aware_split(cmd, sep_re):
+    """Split cmd on sep_re, ignoring matches inside quoted strings."""
+    masked = _mask_quotes(cmd)
+    parts = []
+    last = 0
+    for m in sep_re.finditer(masked):
+        parts.append(cmd[last:m.start()])
+        last = m.end()
+    parts.append(cmd[last:])
+    return parts
+
 
 def _strip_heredoc_bodies(cmd_string):
     """Remove heredoc bodies, keeping markers and closing delimiters.
@@ -136,10 +185,10 @@ def check(cmd_string):
     # Do NOT split on bare | here — pipelines are handled in the inner loop so
     # we can allow PIPELINE_SAFE commands that read from stdin (mid-pipeline)
     # while still blocking them when they appear at the start (reading files).
-    sequential = re.split(r"\s*(?:&&|\|\||;)\s*", cmd_string)
+    sequential = _quote_aware_split(cmd_string, _SEQ_SPLIT_RE)
     for seq in sequential:
         # Split into pipeline stages on a bare | (not part of ||).
-        stages = re.split(r"\s*(?<!\|)\|(?!\|)\s*", seq)
+        stages = _quote_aware_split(seq, _PIPE_SPLIT_RE)
         for pipe_pos, segment in enumerate(stages):
             segment = segment.strip()
             if not segment:
