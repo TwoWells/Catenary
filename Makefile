@@ -32,8 +32,10 @@ test-scripts:
 	@python3 -m pytest scripts/test_constrained_bash.py -v 2>/dev/null || python3 scripts/test_constrained_bash.py
 
 # Run tests. Pass T= to filter, N= to repeat, e.g.: make test T=json_diagnostics N=5
+# Prefix with ! to exclude: make test T=\!flaky_test
+CLEAN_T = $(subst \,,$(subst !,,$(T)))
 test:
-	@cargo nextest run --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(filter !%,$(T)),-E 'not test($(patsubst !%,%,$(T)))',-E 'test($(T))'),)
+	@cargo nextest run --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # Verify we're in a good state for release
 pre-release-check:
