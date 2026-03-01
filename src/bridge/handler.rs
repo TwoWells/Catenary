@@ -6,12 +6,11 @@
 use anyhow::{Result, anyhow};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCall,
-    CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, Diagnostic, DiagnosticSeverity,
-    GotoDefinitionParams, GotoDefinitionResponse, HoverParams, Location, Position,
-    ReferenceContext, ReferenceParams, SymbolInformation, SymbolKind, TextDocumentIdentifier,
-    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, Location, Position, ReferenceContext, ReferenceParams,
+    SymbolInformation, SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -21,7 +20,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient};
+use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
@@ -36,13 +35,6 @@ struct ServerHealth {
     dead: Vec<String>,
     /// One-time batched notification for state transitions (offline/recovery).
     notification: Option<String>,
-}
-
-/// Input for tools that need only a file path.
-#[derive(Debug, Deserialize)]
-pub struct FileInput {
-    /// Path to the file.
-    pub file: String,
 }
 
 /// Input for unified search.
@@ -902,65 +894,6 @@ impl LspBridgeHandler {
 
         file_lines
     }
-
-    fn handle_diagnostics(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: FileInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!("Diagnostics request: {}", input.file);
-
-        let diagnostics = self.runtime.block_on(async {
-            let client_mutex = self.get_client_for_path(&path).await?;
-            let mut doc_manager = self.doc_manager.lock().await;
-            let client = client_mutex.lock().await;
-
-            if !client.is_alive() {
-                return Ok(Vec::new());
-            }
-
-            let uri = doc_manager.uri_for_path(&path)?;
-
-            if let Some(notification) = doc_manager.ensure_open(&path).await? {
-                // Snapshot generation *before* sending the change
-                let snapshot = client.diagnostics_generation(&uri).await;
-
-                match notification {
-                    super::DocumentNotification::Open(params) => {
-                        client.did_open(params).await?;
-                    }
-                    super::DocumentNotification::Change(params) => {
-                        client.did_change(params).await?;
-                    }
-                }
-
-                // Trigger flycheck on servers that only run diagnostics on save
-                if client.wants_did_save() {
-                    client.did_save(uri.clone()).await?;
-                }
-
-                drop(doc_manager);
-
-                if client.wait_for_diagnostics_update(&uri, snapshot).await
-                    == DiagnosticsWaitResult::Nothing
-                {
-                    return Ok(Vec::new());
-                }
-            } else {
-                drop(doc_manager);
-            }
-
-            Ok::<_, anyhow::Error>(client.get_diagnostics(&uri).await)
-        })?;
-
-        if diagnostics.is_empty() {
-            Ok(CallToolResult::text("No diagnostics"))
-        } else {
-            Ok(CallToolResult::text(format_diagnostics(&diagnostics)))
-        }
-    }
 }
 
 impl ToolHandler for LspBridgeHandler {
@@ -985,11 +918,6 @@ impl ToolHandler for LspBridgeHandler {
                     },
                     "required": ["queries"]
                 }),
-            },
-            Tool {
-                name: "diagnostics".to_string(),
-                description: Some("Get diagnostics (errors, warnings, hints) for a file.".to_string()),
-                input_schema: file_schema(),
             },
             Tool {
                 name: "glob".to_string(),
@@ -1073,7 +1001,6 @@ impl ToolHandler for LspBridgeHandler {
         // Dispatch tool
         let mut result = match name {
             "search" => self.handle_search(arguments),
-            "diagnostics" => self.handle_diagnostics(arguments),
             "glob" => self.handle_glob(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
@@ -1092,52 +1019,6 @@ impl ToolHandler for LspBridgeHandler {
 
         result
     }
-}
-
-fn file_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "file": { "type": "string", "description": "Absolute path to the file" }
-        },
-        "required": ["file"]
-    })
-}
-
-fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
-    diagnostics
-        .iter()
-        .map(|d| {
-            let severity = match d.severity {
-                Some(DiagnosticSeverity::ERROR) => "error",
-                Some(DiagnosticSeverity::WARNING) => "warning",
-                Some(DiagnosticSeverity::INFORMATION) => "info",
-                Some(DiagnosticSeverity::HINT) => "hint",
-                _ => "unknown",
-            };
-            let line = d.range.start.line + 1;
-            let col = d.range.start.character + 1;
-            let source = d.source.as_deref().unwrap_or("");
-            let code = d
-                .code
-                .as_ref()
-                .map(|c| match c {
-                    lsp_types::NumberOrString::Number(n) => n.to_string(),
-                    lsp_types::NumberOrString::String(s) => s.clone(),
-                })
-                .unwrap_or_default();
-
-            if code.is_empty() {
-                format!("{}:{}: [{}] {}: {}", line, col, severity, source, d.message)
-            } else {
-                format!(
-                    "{}:{}: [{}] {}({}): {}",
-                    line, col, severity, source, code, d.message
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 // ─── Search enrichment types and formatting ─────────────────────────────

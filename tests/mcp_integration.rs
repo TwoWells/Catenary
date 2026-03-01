@@ -11,7 +11,8 @@
 //! These tests spawn the actual bridge binary and communicate with it
 //! via stdin/stdout using the MCP protocol.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ struct BridgeProcess {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     stdout: Option<BufReader<std::process::ChildStdout>>,
+    state_home: Option<String>,
 }
 
 impl BridgeProcess {
@@ -47,6 +49,7 @@ impl BridgeProcess {
         // Isolate from user-level config
         if let Some(first_root) = roots.first() {
             cmd.env("XDG_CONFIG_HOME", first_root);
+            cmd.env("XDG_STATE_HOME", first_root);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -57,10 +60,13 @@ impl BridgeProcess {
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
 
+        let state_home = roots.first().map(std::string::ToString::to_string);
+
         Ok(Self {
             child,
             stdin: Some(stdin),
             stdout: Some(stdout),
+            state_home,
         })
     }
 
@@ -174,6 +180,56 @@ impl BridgeProcess {
         std::thread::sleep(Duration::from_millis(100));
         Ok(())
     }
+
+    /// Sends a file-change notification via the notify socket and returns
+    /// the diagnostics text. This exercises the production hook path
+    /// (`catenary release`) rather than the (removed) MCP `diagnostics` tool.
+    fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
+        let state_home = self.state_home.as_ref().context("state_home not set")?;
+        let sessions_dir = PathBuf::from(state_home).join("catenary").join("sessions");
+        let socket_path = find_notify_socket(&sessions_dir)?;
+
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+            .context("connect to notify socket")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .context("set read timeout")?;
+
+        let request = json!({"file": file});
+        writeln!(stream, "{request}").context("write to notify socket")?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .context("shutdown write")?;
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .context("read from notify socket")?;
+
+        Ok(response.trim().to_string())
+    }
+}
+
+/// Scans the sessions directory for a `notify.sock` file.
+fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+            for entry in entries.flatten() {
+                let sock = entry.path().join("notify.sock");
+                if sock.exists() {
+                    return Ok(sock);
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            bail!(
+                "No notify.sock found in {} within 5s",
+                sessions_dir.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 impl Drop for BridgeProcess {
@@ -248,8 +304,8 @@ fn test_mcp_tools_list() -> Result<()> {
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Check all expected tools are present (3 after glob consolidation)
-    let expected_tools = ["search", "diagnostics", "glob"];
+    // Check all expected tools are present (2 after diagnostics removal)
+    let expected_tools = ["search", "glob"];
 
     for expected in &expected_tools {
         assert!(tool_names.contains(expected), "Missing {expected} tool");
@@ -321,8 +377,30 @@ fn test_mcp_ping() -> Result<()> {
 
 #[test]
 fn test_client_info_stored_in_session() -> Result<()> {
+    let state_dir = tempfile::tempdir().context("Failed to create state dir")?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+
+    // Spawn bridge with isolated state dir so `catenary list` only sees this session
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    cmd.arg("--lsp")
+        .arg(&lsp)
+        .arg("--root")
+        .arg("/tmp")
+        .env("XDG_CONFIG_HOME", "/tmp")
+        .env("XDG_STATE_HOME", state_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().context("Failed to spawn bridge")?;
+    let stdin = child.stdin.take().context("Failed to get stdin")?;
+    let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+    let mut bridge = BridgeProcess {
+        child,
+        stdin: Some(stdin),
+        stdout: Some(stdout),
+        state_home: Some(state_dir.path().to_string_lossy().into_owned()),
+    };
 
     // Send initialize with specific client info
     bridge.send(&json!({
@@ -345,18 +423,18 @@ fn test_client_info_stored_in_session() -> Result<()> {
     // Small delay to allow session update
     std::thread::sleep(Duration::from_millis(200));
 
-    // Run catenary list and check output
+    // Run catenary list with the same isolated state dir
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .arg("list")
+        .env("XDG_STATE_HOME", state_dir.path())
         .output()
         .context("Failed to run catenary list")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
 
-    // Note: The client name may be truncated in the list output, so we only check for TestClient
     assert!(
-        stdout.contains("TestClient"),
-        "Expected client info 'TestClient' in catenary list output, got:\n{stdout}"
+        stdout_str.contains("TestClient"),
+        "Expected client info 'TestClient' in catenary list output, got:\n{stdout_str}"
     );
     Ok(())
 }
@@ -772,68 +850,6 @@ fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
 }
 
 #[test]
-fn test_mockls_diagnostics_across_profiles() -> Result<()> {
-    let profiles: &[(&str, &str)] = &[
-        ("version", "--publish-version"),
-        (
-            "on-save",
-            "--diagnostics-on-save --publish-version --advertise-save",
-        ),
-        ("suppressed", "--no-diagnostics"),
-        ("degraded", ""),
-    ];
-
-    for (name, flags) in profiles {
-        let dir = tempfile::tempdir().context("Failed to create temp dir")?;
-        let test_file_path = dir.path().join(format!("mockls_diag_test.{MOCK_LANG_A}"));
-        std::fs::write(&test_file_path, "echo hello\n")?;
-        let test_file = test_file_path.to_str().context("Invalid test file path")?;
-
-        let lsp = mockls_lsp_arg(MOCK_LANG_A, flags);
-        let root = dir.path().to_str().context("root path")?;
-        let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-        bridge.initialize()?;
-
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": {
-                "name": "diagnostics",
-                "arguments": {
-                    "file": test_file
-                }
-            }
-        }))?;
-
-        let response = bridge.recv()?;
-        let result = &response["result"];
-
-        // All profiles should return without hanging
-        let content = result["content"]
-            .as_array()
-            .context(format!("Profile {name}: missing content array"))?;
-
-        let text = content[0]["text"]
-            .as_str()
-            .context(format!("Profile {name}: missing text"))?;
-
-        if *name == "suppressed" || *name == "degraded" {
-            assert!(
-                text.contains("No diagnostics") || text.contains("0 diagnostics"),
-                "Profile {name}: expected no diagnostics, got: {text}"
-            );
-        } else {
-            assert!(
-                text.contains("mock diagnostic") || text.contains("mockls"),
-                "Profile {name}: expected mock diagnostics, got: {text}"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "Parameterized test iterates over profiles"
@@ -1133,17 +1149,8 @@ fn test_mockls_did_save_not_sent_without_capability() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Call diagnostics — this triggers didOpen + didSave internally
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "diagnostics",
-            "arguments": { "file": test_file.to_str().context("file path")? }
-        }
-    }))?;
-    let _ = bridge.recv()?;
+    // Notify via socket — this triggers didOpen + (possibly) didSave
+    let _ = bridge.call_diagnostics_via_notify(test_file.to_str().context("file path")?)?;
 
     // Shut down to flush the log
     drop(bridge);
@@ -1176,16 +1183,7 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "diagnostics",
-            "arguments": { "file": test_file.to_str().context("file path")? }
-        }
-    }))?;
-    let _ = bridge.recv()?;
+    let _ = bridge.call_diagnostics_via_notify(test_file.to_str().context("file path")?)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));

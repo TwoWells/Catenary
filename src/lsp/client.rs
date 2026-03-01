@@ -6,14 +6,15 @@ use bytes::BytesMut;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams,
-    PositionEncodingKind, ProgressParams, PublishDiagnosticsParams, ReferenceParams,
-    ServerCapabilities, TextDocumentIdentifier, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceFolder,
-    WorkspaceFoldersChangeEvent, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    ClientCapabilities, CodeActionParams, CodeActionResponse, Diagnostic,
+    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
+    PublishDiagnosticsParams, ReferenceParams, ServerCapabilities, TextDocumentIdentifier,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -818,6 +819,10 @@ impl LspClient {
                     type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities {
                         dynamic_registration: Some(false),
                     }),
+                    code_action: Some(lsp_types::CodeActionClientCapabilities {
+                        dynamic_registration: Some(false),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
@@ -1155,6 +1160,18 @@ impl LspClient {
         params: TypeHierarchySubtypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
         self.request("typeHierarchy/subtypes", params).await
+    }
+
+    /// Gets code actions (quick fixes, refactorings) for a range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
+    pub async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> Result<Option<CodeActionResponse>> {
+        self.request("textDocument/codeAction", params).await
     }
 
     /// Gets cached diagnostics for a specific URI.

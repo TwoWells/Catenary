@@ -29,6 +29,7 @@ struct BridgeProcess {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     stdout: Option<BufReader<std::process::ChildStdout>>,
+    state_home: Option<String>,
 }
 
 impl BridgeProcess {
@@ -63,6 +64,7 @@ impl BridgeProcess {
             child,
             stdin: Some(stdin),
             stdout: Some(stdout),
+            state_home: Some(state_home.to_string()),
         })
     }
 
@@ -112,17 +114,34 @@ impl BridgeProcess {
         Ok(())
     }
 
-    fn call_diagnostics(&mut self, id: u64, file: &str) -> Result<Value> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": {
-                "name": "diagnostics",
-                "arguments": { "file": file }
-            }
-        }))?;
-        self.recv()
+    /// Sends a file-change notification via the notify socket and returns
+    /// the diagnostics text. This exercises the production hook path
+    /// (`catenary release`) rather than the (removed) MCP `diagnostics` tool.
+    fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
+        use std::io::Read as _;
+
+        let state_home = self.state_home.as_ref().context("state_home not set")?;
+        let sessions_dir = PathBuf::from(state_home).join("catenary").join("sessions");
+        let socket_path = find_notify_socket(&sessions_dir)?;
+
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+            .context("connect to notify socket")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .context("set read timeout")?;
+
+        let request = json!({"file": file});
+        writeln!(stream, "{request}").context("write to notify socket")?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .context("shutdown write")?;
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .context("read from notify socket")?;
+
+        Ok(response.trim().to_string())
     }
 }
 
@@ -146,14 +165,10 @@ fn test_diagnostics_degraded_mode() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
-    let response = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
     assert!(
-        text.contains("No diagnostics"),
+        text.is_empty(),
         "Degraded mode (no version/progress) should return no diagnostics. Got: {text}"
     );
 
@@ -172,11 +187,7 @@ fn test_diagnostics_version_path() -> Result<()> {
         BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
-    let response = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -205,17 +216,13 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
     bridge.initialize()?;
 
     // First call: opens the file via didOpen (no progress tokens sent)
-    let _ = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
+    let _ = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
     // Modify file to trigger didChange on next call
     std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange → progress tokens → TokenMonitor
-    let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -238,21 +245,18 @@ fn test_diagnostics_server_death() -> Result<()> {
     bridge.initialize()?;
 
     // Server will die during or before diagnostics processing
-    let response = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge
+        .call_diagnostics_via_notify(file.to_str().context("path")?)
+        .unwrap_or_default();
 
     // Should either get diagnostics (if server published before dying)
-    // or "No diagnostics". No server infrastructure messages to agent.
-    let is_acceptable = text.contains("mock diagnostic")
-        || text.contains("No diagnostics")
-        || response.get("error").is_some();
+    // or empty string. No server infrastructure messages to agent.
+    let is_acceptable =
+        text.contains("mock diagnostic") || text.is_empty() || text.contains("Notify error");
 
     assert!(
         is_acceptable,
-        "Server death should be handled gracefully. Got: {response}"
+        "Server death should be handled gracefully. Got: {text}"
     );
 
     Ok(())
@@ -481,6 +485,99 @@ async fn test_diagnostics_stale_notify_socket() -> Result<()> {
     Ok(())
 }
 
+/// mockls with `--publish-version --no-code-actions`: server does not
+/// advertise `codeActionProvider`. Diagnostics should appear without
+/// any `fix:` lines (the capability gate in `process_file_inner` skips
+/// code action requests entirely).
+#[test]
+fn test_diagnostics_no_code_actions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = BridgeProcess::spawn(
+        &["--publish-version", "--no-code-actions"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("mock diagnostic"),
+        "Should contain diagnostics. Got: {text}"
+    );
+    assert!(
+        !text.contains("fix:"),
+        "Should NOT contain fix: lines when code actions are disabled. Got: {text}"
+    );
+
+    Ok(())
+}
+
+/// mockls with `--publish-version --multi-fix`: server returns multiple
+/// quickfix actions per diagnostic. Each diagnostic should have two
+/// `fix:` lines (the primary and the alternative).
+#[test]
+fn test_diagnostics_multi_fix() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = BridgeProcess::spawn(
+        &["--publish-version", "--multi-fix"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("mock diagnostic"),
+        "Should contain diagnostics. Got: {text}"
+    );
+
+    let fix_count = text.lines().filter(|l| l.contains("fix:")).count();
+    assert!(
+        fix_count >= 2,
+        "Multi-fix mode should produce at least 2 fix: lines. Got {fix_count} in: {text}"
+    );
+    assert!(
+        text.contains("fix: alternative for"),
+        "Should contain alternative fix. Got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Default mockls with `--publish-version` now always includes a
+/// `refactor` code action alongside quickfix actions. Verify that
+/// refactor actions are filtered out and only `fix:` lines from
+/// quickfix actions appear in the output.
+#[test]
+fn test_diagnostics_refactor_filtered() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge =
+        BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("fix:"),
+        "Should contain quickfix fix: lines. Got: {text}"
+    );
+    assert!(
+        !text.contains("refactor"),
+        "Refactor actions should be filtered out. Got: {text}"
+    );
+
+    Ok(())
+}
+
 /// Scans the sessions directory for a `notify.sock` file.
 fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
     // Poll briefly for the socket to appear (bridge may still be starting)
@@ -502,6 +599,37 @@ fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Verifies that quick-fix code actions from the LSP server appear as
+/// `fix:` lines in the hook diagnostics output.
+///
+/// mockls advertises `codeActionProvider: true` and returns quickfix
+/// code actions for diagnostics with source "mockls".
+#[test]
+fn test_diagnostics_code_action_enrichment() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge =
+        BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+
+    // mockls publishes diagnostics with source "mockls" and returns
+    // quickfix code actions with title "fix: <message>" for those.
+    assert!(
+        text.contains("mock diagnostic"),
+        "Should contain diagnostics. Got: {text}"
+    );
+    assert!(
+        text.contains("fix:"),
+        "Should contain fix: lines from code actions. Got: {text}"
+    );
+
+    Ok(())
 }
 
 /// mockls with `--publish-version --advertise-save --flycheck-command mockc`:
@@ -530,19 +658,15 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     bridge.initialize()?;
 
     // First call: opens the file (native diagnostics only, no flycheck)
-    let _ = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
+    let _ = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
     // Modify file to trigger didChange + didSave on next call
     std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange + didSave → flycheck subprocess
-    let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
-    // Should contain diagnostics reflecting the modified file (3 lines).
+    // Should contain diagnostics reflecting the modified file (2 lines).
     // The flycheck subprocess runs under a progress bracket; Catenary must
     // wait for the full Active→Idle cycle to get the post-flycheck diagnostics.
     assert!(
@@ -569,14 +693,10 @@ fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    let response = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
     assert!(
-        text.contains("No diagnostics"),
+        text.is_empty(),
         "TokenMonitor with no diagnostics should return empty. Got: {text}"
     );
 
@@ -609,11 +729,7 @@ fn test_near_threshold_flycheck() -> Result<()> {
     bridge.initialize()?;
 
     // First call opens the file and gets initial diagnostics
-    let response = bridge.call_diagnostics(1, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
     assert!(
         text.contains("mock diagnostic"),
         "Initial diagnostics should arrive. Got: {text}"
@@ -623,11 +739,7 @@ fn test_near_threshold_flycheck() -> Result<()> {
     std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange + didSave → flycheck with 900-tick mockc
-    let response = bridge.call_diagnostics(2, file.to_str().context("path")?)?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),

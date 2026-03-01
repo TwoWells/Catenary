@@ -84,49 +84,32 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 | **Eager Startup**     | Servers for detected languages start at launch; others start on first file access      |
 | **Smart Routing**     | Requests automatically route to the correct server based on file type                  |
 | **Universal Support** | Works with any LSP-compliant language server                                           |
-| **Full LSP Coverage** | Definitions, references, diagnostics, rename, code actions, and more |
+| **Full LSP Coverage** | Search, diagnostics with quick fixes, workspace browsing, and more |
 | **File I/O**          | Read, write, and edit files with automatic LSP diagnostics                            |
 
 ## Available Tools
 
-### LSP Tools
+### MCP Tools
 
-| Tool                      | Description                                         |
-| ------------------------- | --------------------------------------------------- |
-| `search`         | Search for symbols, semantic references, and text matches (LSP workspace symbols + references + file heatmap) |
-| `definition`          | Jump to where a symbol is defined                   |
-| `type_definition`     | Jump to the type's definition                       |
-| `implementation`      | Find implementations of interfaces/traits           |
-| `document_symbols`    | Get the outline of a file                                       |
-| `code_actions`        | Get quick fixes and refactorings                    |
-| `rename`              | Compute rename edits (does not modify files)        |
-| `diagnostics`         | Get errors and warnings                             |
-| `call_hierarchy`      | See who calls a function / what it calls            |
-| `type_hierarchy`      | See type inheritance                                |
-| `codebase_map`   | Generate a high-level file tree with symbols        |
+| Tool       | Description                                         |
+| ---------- | --------------------------------------------------- |
+| `search`   | Search for symbols, semantic references, and text matches (LSP workspace symbols + references + file heatmap) |
+| `glob`     | Browse the workspace — file outlines, directory listings, or glob pattern matches with symbols |
 
-**Deprecated (being merged into `search`):**
+### Hook-Driven Features
 
-| Tool                      | Description                                         | Replacement |
-| ------------------------- | --------------------------------------------------- | ----------- |
-| `hover`               | Get documentation and type info for a symbol        | `search` (symbols tier with hover enrichment) |
-| `find_references` | Find all references to a symbol | `search` (references tier) |
-
-### File I/O Tools
-
-| Tool                      | Description                                         |
-| ------------------------- | --------------------------------------------------- |
-| `list_directory`     | List directory contents (files, dirs, symlinks)      |
+| Feature          | Description                                         |
+| ---------------- | --------------------------------------------------- |
+| **Diagnostics**  | Errors, warnings, and quick-fix suggestions delivered inline after every edit via the `catenary release` PostToolUse hook |
 
 File reading and editing is handled by the host tool's native file operations
 (e.g. Claude Code's `Read`, `Edit`, `Write`). Catenary provides **post-edit
-LSP diagnostics** via the `catenary release` hook — diagnostics appear in the
-model's context after every edit. See [CLI Integration](cli-integration.md)
-for hook configuration.
+LSP diagnostics** (including quick-fix code actions) via the `catenary release`
+hook — diagnostics and fix suggestions appear in the model's context after
+every edit. See [CLI Integration](cli-integration.md) for hook configuration.
 
-`list_directory` and `search` (with the optional `paths` parameter) can
-operate outside workspace roots — access control is delegated to the host
-CLI's permission layer. LSP-backed operations (diagnostics, hover,
-definition, etc.) are gated to workspace roots because the language server
-has no knowledge of files outside them. Catenary config files are always
-protected from modification.
+`search` (with the optional `paths` parameter) and `glob` can operate outside
+workspace roots — access control is delegated to the host CLI's permission
+layer. LSP-backed operations (diagnostics, hover, definition, etc.) are gated
+to workspace roots because the language server has no knowledge of files
+outside them. Catenary config files are always protected from modification.

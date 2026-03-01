@@ -19,18 +19,43 @@
 //! 3. Without the grace period, `wait_for_diagnostics_update` would
 //!    short-circuit and return 0 diagnostics.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tempfile::tempdir;
 
 const MOCK_LANG_A: &str = "yX4Za";
+
+/// Scans the sessions directory for a `notify.sock` file.
+fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+            for entry in entries.flatten() {
+                let sock = entry.path().join("notify.sock");
+                if sock.exists() {
+                    return Ok(sock);
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            bail!(
+                "No notify.sock found in {} within 5s",
+                sessions_dir.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 #[test]
 fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
     // 1. Create workspace with a test file
     let dir = tempdir()?;
+    let state_dir = tempdir()?;
     let file_path = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file_path, "echo hello\n")?;
 
@@ -46,6 +71,7 @@ fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
             &lsp_arg,
         ])
         .env("XDG_CONFIG_HOME", dir.path())
+        .env("XDG_STATE_HOME", state_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -84,50 +110,38 @@ fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
     // During this time the LSP is running but has no open files,
     // so it never publishes diagnostics. After warmup expires,
     // has_published_diagnostics is still false.
-    std::thread::sleep(catenary_mcp::lsp::WARMUP_PERIOD + std::time::Duration::from_secs(1));
+    std::thread::sleep(catenary_mcp::lsp::WARMUP_PERIOD + Duration::from_secs(1));
 
-    // 5. Request diagnostics on the test file.
+    // 5. Request diagnostics via the notify socket.
     //
     // This is the first file interaction. Without the post-warmup grace
     // period, wait_for_diagnostics_update would short-circuit and return
-    // "No diagnostics" because has_published_diagnostics is false.
-    let diag_req = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "diagnostics",
-            "arguments": {
-                "file": file_path.to_str().context("invalid path")?
-            }
-        }
-    });
+    // empty because has_published_diagnostics is false.
+    let sessions_dir = state_dir.path().join("catenary").join("sessions");
+    let socket_path = find_notify_socket(&sessions_dir)?;
 
-    writeln!(stdin, "{diag_req}").context("Failed to write diagnostics request")?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+        .context("connect to notify socket")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .context("set read timeout")?;
 
-    line.clear();
-    reader
-        .read_line(&mut line)
-        .context("Failed to read diagnostics response")?;
+    let request = json!({"file": file_path.to_str().context("invalid path")?});
+    writeln!(stream, "{request}").context("write to notify socket")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("shutdown write")?;
 
-    // 6. Verify the response completed without error or timeout.
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("read from notify socket")?;
+
+    // 6. Verify the response contains diagnostics.
     //
     // mockls with --publish-version publishes diagnostics after didOpen,
     // so the grace period should catch them.
-    let parsed: serde_json::Value =
-        serde_json::from_str(&line).context("Response should be valid JSON")?;
-    assert!(
-        parsed.get("result").is_some(),
-        "Response should contain a result (no RPC error). Got: {line}"
-    );
-
-    let result = &parsed["result"];
-    let content = result["content"]
-        .as_array()
-        .context("Missing content array")?;
-    let text = content[0]["text"]
-        .as_str()
-        .context("Missing text in content")?;
+    let text = response.trim();
     assert!(
         text.contains("mock diagnostic") || text.contains("mockls"),
         "Expected mock diagnostics from mockls, got: {text}"

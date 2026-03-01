@@ -26,10 +26,9 @@ This document defines adversarial test scenarios. Each test targets a specific a
 
 ## 1. Prompt Injection via LSP Content
 
-> **Note:** `hover` is being merged into `search` (symbols tier with
-> hover enrichment). These concerns apply to any tool that surfaces LSP
-> content — workspace symbols in `search`, `document_symbols`,
-> `code_actions`, etc.
+> **Note:** These concerns apply to any tool or hook that surfaces LSP
+> content — workspace symbols in `search`, `glob` outlines, and
+> quick-fix titles in the diagnostics hook output.
 
 LSP responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.
 
