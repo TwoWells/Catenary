@@ -305,7 +305,7 @@ fn test_mcp_tools_list() -> Result<()> {
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     // Check all expected tools are present (2 after diagnostics removal)
-    let expected_tools = ["search", "glob"];
+    let expected_tools = ["grep", "glob"];
 
     for expected in &expected_tools {
         assert!(tool_names.contains(expected), "Missing {expected} tool");
@@ -464,8 +464,8 @@ fn test_multi_root_find_symbol() -> Result<()> {
         "id": 700,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["alpha_func"] }
+            "name": "grep",
+            "arguments": { "pattern": "alpha_func" }
         }
     }))?;
 
@@ -497,8 +497,8 @@ fn test_multi_root_find_symbol() -> Result<()> {
         "id": 701,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["beta_func"] }
+            "name": "grep",
+            "arguments": { "pattern": "beta_func" }
         }
     }))?;
 
@@ -640,8 +640,8 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
         "id": 10,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["unique_root_a_func"] }
+            "name": "grep",
+            "arguments": { "pattern": "unique_root_a_func" }
         }
     }))?;
 
@@ -691,8 +691,8 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
             "id": 20 + i,
             "method": "tools/call",
             "params": {
-                "name": "search",
-                "arguments": { "queries": ["unique_root_b_func"] }
+                "name": "grep",
+                "arguments": { "pattern": "unique_root_b_func" }
             }
         }))?;
 
@@ -883,8 +883,8 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             "id": 10,
             "method": "tools/call",
             "params": {
-                "name": "search",
-                "arguments": { "queries": ["unique_root_a_func"] }
+                "name": "grep",
+                "arguments": { "pattern": "unique_root_a_func" }
             }
         }))?;
 
@@ -932,8 +932,8 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             "id": 20,
             "method": "tools/call",
             "params": {
-                "name": "search",
-                "arguments": { "queries": ["unique_root_b_func"] }
+                "name": "grep",
+                "arguments": { "pattern": "unique_root_b_func" }
             }
         }))?;
 
@@ -986,8 +986,8 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         "id": 10,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["hello"] }
+            "name": "grep",
+            "arguments": { "pattern": "hello" }
         }
     }))?;
 
@@ -1029,8 +1029,8 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         "id": 20,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["world"] }
+            "name": "grep",
+            "arguments": { "pattern": "world" }
         }
     }))?;
 
@@ -1078,8 +1078,8 @@ fn test_mockls_multiplexing() -> Result<()> {
         "id": 100,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["greet"] }
+            "name": "grep",
+            "arguments": { "pattern": "greet" }
         }
     }))?;
 
@@ -1096,8 +1096,8 @@ fn test_mockls_multiplexing() -> Result<()> {
         "id": 101,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["package"] }
+            "name": "grep",
+            "arguments": { "pattern": "package" }
         }
     }))?;
 
@@ -1216,8 +1216,8 @@ fn test_search_graceful_degradation() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["greet"] }
+            "name": "grep",
+            "arguments": { "pattern": "greet" }
         }
     }))?;
 
@@ -1308,8 +1308,8 @@ fn test_wait_ready_failure_detection() -> Result<()> {
         "id": 10,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["hello"] }
+            "name": "grep",
+            "arguments": { "pattern": "hello" }
         }
     }))?;
 
@@ -1365,8 +1365,8 @@ fn test_warmup_observation() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["my_function"] }
+            "name": "grep",
+            "arguments": { "pattern": "my_function" }
         }
     }))?;
 
@@ -1407,8 +1407,8 @@ fn test_search_symbols_with_scan_roots() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["greet"] }
+            "name": "grep",
+            "arguments": { "pattern": "greet" }
         }
     }))?;
 
@@ -1459,8 +1459,8 @@ fn test_search_type_definition_enrichment() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["result"] }
+            "name": "grep",
+            "arguments": { "pattern": "result" }
         }
     }))?;
 
@@ -1514,8 +1514,8 @@ fn test_search_type_definition_cross_file() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["count"] }
+            "name": "grep",
+            "arguments": { "pattern": "count" }
         }
     }))?;
 
@@ -1564,8 +1564,8 @@ fn test_search_call_hierarchy_enrichment() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["callee"] }
+            "name": "grep",
+            "arguments": { "pattern": "callee" }
         }
     }))?;
 
@@ -1614,8 +1614,8 @@ fn test_search_struct_implementations() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["Foo"] }
+            "name": "grep",
+            "arguments": { "pattern": "Foo" }
         }
     }))?;
 
@@ -1664,8 +1664,8 @@ fn test_search_interface_subtypes() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["Animal"] }
+            "name": "grep",
+            "arguments": { "pattern": "Animal" }
         }
     }))?;
 
@@ -1735,8 +1735,8 @@ fn test_search_disambiguated_references() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["load_config"] }
+            "name": "grep",
+            "arguments": { "pattern": "load_config" }
         }
     }))?;
 
@@ -1896,8 +1896,8 @@ fn test_search_full_payload() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["load_config"] }
+            "name": "grep",
+            "arguments": { "pattern": "load_config" }
         }
     }))?;
 
@@ -2106,8 +2106,8 @@ fn test_search_cross_language_disambiguation() -> Result<()> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "search",
-            "arguments": { "queries": ["perform_task"] }
+            "name": "grep",
+            "arguments": { "pattern": "perform_task" }
         }
     }))?;
 
@@ -2174,6 +2174,149 @@ fn test_search_cross_language_disambiguation() -> Result<()> {
         "Each language's file should be in a different group. \
          grp1: {grp1_content}\ngrp2: {grp2_content}"
     );
+
+    Ok(())
+}
+
+/// Verifies that pipe-separated alternation finds symbols from both patterns.
+/// `pattern: "alpha_func|beta_func"` should find both across two roots.
+#[test]
+fn test_grep_alternation() -> Result<()> {
+    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
+    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+
+    let script_a = dir_a.path().join(format!("alpha.{MOCK_LANG_A}"));
+    std::fs::write(&script_a, "function alpha_func()\nalpha_func\n")?;
+
+    let script_b = dir_b.path().join(format!("beta.{MOCK_LANG_A}"));
+    std::fs::write(&script_b, "function beta_func()\nbeta_func\n")?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 800,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "alpha_func|beta_func" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep alternation failed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text for alternation")?;
+
+    // Both files should appear
+    assert!(
+        text.contains(&format!("alpha.{MOCK_LANG_A}")),
+        "Expected alpha.mock in alternation results, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("beta.{MOCK_LANG_A}")),
+        "Expected beta.mock in alternation results, got: {text}"
+    );
+
+    // Both symbols should appear
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section for alternation, got: {text}"
+    );
+    assert!(
+        text.contains("alpha_func"),
+        "Expected alpha_func symbol, got: {text}"
+    );
+    assert!(
+        text.contains("beta_func"),
+        "Expected beta_func symbol, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that >5 unique symbols skips enrichment: no References section,
+/// no hover content, but Symbols with name + kind + location are present.
+#[test]
+fn test_grep_enrichment_threshold_broad() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Create 6 unique functions to exceed GREP_ENRICHMENT_THRESHOLD (5)
+    let test_file = dir.path().join(format!("many.{MOCK_LANG_A}"));
+    std::fs::write(
+        &test_file,
+        "fn zz_broad_one()\nfn zz_broad_two()\nfn zz_broad_three()\n\
+         fn zz_broad_four()\nfn zz_broad_five()\nfn zz_broad_six()\n\
+         zz_broad_one\nzz_broad_two\nzz_broad_three\n\
+         zz_broad_four\nzz_broad_five\nzz_broad_six\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 810,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "zz_broad_one|zz_broad_two|zz_broad_three|zz_broad_four|zz_broad_five|zz_broad_six" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep broad should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text for broad search")?;
+
+    // Symbols tier should be present with names and kinds
+    assert!(
+        text.contains("## Symbols"),
+        "Expected Symbols section for broad search, got: {text}"
+    );
+    assert!(
+        text.contains("[Function]"),
+        "Expected [Function] kind in broad search, got: {text}"
+    );
+
+    // References tier should NOT be present (not enriched)
+    assert!(
+        !text.contains("## References"),
+        "References section should be absent for >5 symbols, got: {text}"
+    );
+
+    // Hover content should NOT be present (indented lines under symbol)
+    // Enriched symbols have hover on indented lines; non-enriched are single-line
+    let symbol_lines: Vec<&str> = text
+        .lines()
+        .skip_while(|l| !l.contains("## Symbols"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("## "))
+        .filter(|l| !l.is_empty())
+        .collect();
+    for line in &symbol_lines {
+        assert!(
+            !line.starts_with("  "),
+            "Non-enriched symbols should not have indented hover lines, got: {line}"
+        );
+    }
 
     Ok(())
 }

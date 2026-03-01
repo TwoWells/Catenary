@@ -27,6 +27,10 @@ use crate::session::{EventBroadcaster, EventKind};
 /// Maximum total references before disambiguation falls back to flat rendering.
 const DISAMBIGUATION_REF_LIMIT: usize = 200;
 
+/// Maximum unique LSP symbols for full enrichment (hover, references, hierarchy).
+/// Above this threshold, symbols are rendered with name + kind + location only.
+const GREP_ENRICHMENT_THRESHOLD: usize = 5;
+
 use super::{DocumentManager, DocumentNotification};
 
 /// Result of a server health check against touched language servers.
@@ -37,15 +41,11 @@ struct ServerHealth {
     notification: Option<String>,
 }
 
-/// Input for unified search.
+/// Input for grep tool.
 #[derive(Debug, Deserialize)]
-pub struct SearchInput {
-    /// One or more search queries.
-    pub queries: Vec<String>,
-    /// Optional additional directories to include in the ripgrep heatmap.
-    /// Workspace roots are always searched; these paths are searched in addition.
-    #[serde(default)]
-    pub paths: Vec<String>,
+pub struct GrepInput {
+    /// Search pattern (supports `|` for alternation, passed to ripgrep).
+    pub pattern: String,
 }
 
 /// Bridge handler that implements MCP `ToolHandler` trait.
@@ -285,227 +285,216 @@ impl LspBridgeHandler {
         }
     }
 
-    /// Unified search: LSP workspace symbols with enrichment + ripgrep text matches.
-    #[allow(clippy::too_many_lines, reason = "Core search orchestration")]
-    fn handle_search(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        let input: SearchInput =
+    /// Grep: ripgrep-first pipeline with LSP enrichment.
+    #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
+    fn handle_grep(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
+        use std::fmt::Write;
+
+        let input: GrepInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        if input.queries.is_empty() {
-            return Err(anyhow!("queries must contain at least one search term"));
+        if input.pattern.is_empty() {
+            return Err(anyhow!("pattern must be non-empty"));
         }
 
-        let extra_paths: Vec<PathBuf> = input
-            .paths
-            .iter()
-            .filter_map(|p| {
-                Self::resolve_path(p)
-                    .ok()
-                    .and_then(|resolved| match resolved.canonicalize() {
-                        Ok(canonical) if canonical.is_dir() => Some(canonical),
-                        _ => {
-                            debug!("Skipping non-existent or non-directory search path: {p}");
-                            None
-                        }
-                    })
-            })
-            .collect();
-
-        let mut sections = Vec::new();
-
-        for query in &input.queries {
-            sections.push(self.search_single(query, &extra_paths));
-        }
-
-        Ok(CallToolResult::text(sections.join("\n")))
-    }
-
-    /// Executes a single search query: enriched LSP symbols + references + ripgrep.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Core search logic with LSP enrichment"
-    )]
-    fn search_single(&self, query: &str, extra_paths: &[PathBuf]) -> String {
-        use std::fmt::Write;
-
-        debug!("Search request: query={query}");
+        debug!("Grep request: pattern={}", input.pattern);
 
         let roots = self.runtime.block_on(self.client_manager.roots());
 
-        // 1. Collect raw SymbolInformation from all active LSP servers
-        let symbols = self.runtime.block_on(async {
-            let params = WorkspaceSymbolParams {
-                query: query.to_string(),
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
+        // 1. Ripgrep: get matched strings + file/line heatmap in one pass
+        let rg = Self::ripgrep_matches(&input.pattern, &roots);
 
+        // 2. Dedupe matched strings → query LSP workspace/symbol for each
+        let symbols = self.runtime.block_on(async {
             let clients = self.client_manager.active_clients().await;
             let mut all_symbols: Vec<SymbolInformation> = Vec::new();
 
-            for client_mutex in clients.values() {
-                if let Ok(Some(response)) = client_mutex
-                    .lock()
-                    .await
-                    .workspace_symbols(params.clone())
-                    .await
-                {
-                    collect_symbol_information(&response, &mut all_symbols);
+            for matched in &rg.matched_strings {
+                let params = WorkspaceSymbolParams {
+                    query: matched.clone(),
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                    partial_result_params: lsp_types::PartialResultParams::default(),
+                };
+
+                for client_mutex in clients.values() {
+                    if let Ok(Some(response)) = client_mutex
+                        .lock()
+                        .await
+                        .workspace_symbols(params.clone())
+                        .await
+                    {
+                        collect_symbol_information(&response, &mut all_symbols);
+                    }
                 }
             }
+
+            // Dedupe by (name, uri, line)
+            let mut seen: HashSet<(String, String, u32)> = HashSet::new();
+            all_symbols.retain(|s| {
+                seen.insert((
+                    s.name.clone(),
+                    s.location.uri.to_string(),
+                    s.location.range.start.line,
+                ))
+            });
 
             all_symbols
         });
 
-        // 2. Enrich each symbol and collect references
+        let enrich = symbols.len() <= GREP_ENRICHMENT_THRESHOLD;
+
+        // 3. Build Symbols tier
         let mut symbol_sections = Vec::new();
         let mut all_ref_lines: HashMap<String, HashSet<u32>> = HashMap::new();
 
-        for sym in &symbols {
-            let enrichment = self.enrich_symbol(sym);
+        if enrich {
+            for sym in &symbols {
+                let enrichment = self.enrich_symbol(sym);
 
-            // Collect reference lines for deduplication
-            for (file, lines) in &enrichment.ref_lines {
-                all_ref_lines.entry(file.clone()).or_default().extend(lines);
+                // Collect reference lines for deduplication
+                for (file, lines) in &enrichment.ref_lines {
+                    all_ref_lines.entry(file.clone()).or_default().extend(lines);
+                }
+
+                symbol_sections.push(format_enriched_symbol(sym, &enrichment, &roots));
             }
-
-            symbol_sections.push(format_enriched_symbol(sym, &enrichment, &roots));
+        } else {
+            for sym in &symbols {
+                symbol_sections.push(format_symbol_name_only(sym, &roots));
+            }
         }
 
-        // 3. Format References tier from collected reference locations
-        let references_formatted = self.runtime.block_on(async {
-            if symbols.len() <= 1 {
-                // Single symbol: flat path, zero extra LSP calls
-                let mut ref_by_file: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
-
-                for sym in &symbols {
-                    let path = PathBuf::from(sym.location.uri.path().as_str());
-                    let position = sym.location.range.start;
-                    let def_file = sym.location.uri.path().to_string();
-                    let def_line = sym.location.range.start.line + 1;
-
-                    let refs = self.fetch_references(&path, position).await;
-                    for loc in refs {
-                        let file = loc.uri.path().to_string();
-                        let line = loc.range.start.line + 1;
-                        let is_def = file == def_file && line == def_line;
-                        ref_by_file.entry(file).or_default().push((line, is_def));
-                    }
-                }
-
-                format_clustered_references(&ref_by_file, &roots)
-            } else {
-                // Multiple symbols: collect refs and potentially disambiguate
-                let mut refs_per_sym: Vec<Vec<Location>> = Vec::new();
-                let mut total_refs = 0;
-
-                for sym in &symbols {
-                    let path = PathBuf::from(sym.location.uri.path().as_str());
-                    let position = sym.location.range.start;
-                    let refs = self.fetch_references(&path, position).await;
-                    total_refs += refs.len();
-                    refs_per_sym.push(refs);
-                }
-
-                let def_locations: Vec<(String, u32)> = symbols
-                    .iter()
-                    .map(|s| {
-                        (
-                            s.location.uri.path().to_string(),
-                            s.location.range.start.line,
-                        )
-                    })
-                    .collect();
-
-                if total_refs > DISAMBIGUATION_REF_LIMIT {
-                    // Too many refs — render flat
+        // 4. Format References tier (only when enriched)
+        let references_formatted = if enrich {
+            self.runtime.block_on(async {
+                if symbols.len() <= 1 {
                     let mut ref_by_file: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
-                    for (sym_idx, refs) in refs_per_sym.iter().enumerate() {
-                        let def_file = &def_locations[sym_idx].0;
-                        let def_line = def_locations[sym_idx].1 + 1;
+
+                    for sym in &symbols {
+                        let path = PathBuf::from(sym.location.uri.path().as_str());
+                        let position = sym.location.range.start;
+                        let def_file = sym.location.uri.path().to_string();
+                        let def_line = sym.location.range.start.line + 1;
+
+                        let refs = self.fetch_references(&path, position).await;
                         for loc in refs {
                             let file = loc.uri.path().to_string();
                             let line = loc.range.start.line + 1;
-                            let is_def = file == *def_file && line == def_line;
+                            let is_def = file == def_file && line == def_line;
                             ref_by_file.entry(file).or_default().push((line, is_def));
                         }
                     }
+
                     format_clustered_references(&ref_by_file, &roots)
                 } else {
-                    // Disambiguate: dedup refs, call definition for each, group by symbol
-                    let mut unique_refs: Vec<Location> = Vec::new();
-                    let mut seen: HashSet<(String, u32)> = HashSet::new();
-                    for refs in &refs_per_sym {
-                        for loc in refs {
-                            let key = (loc.uri.path().to_string(), loc.range.start.line);
-                            if seen.insert(key) {
-                                unique_refs.push(loc.clone());
-                            }
-                        }
+                    let mut refs_per_sym: Vec<Vec<Location>> = Vec::new();
+                    let mut total_refs = 0;
+
+                    for sym in &symbols {
+                        let path = PathBuf::from(sym.location.uri.path().as_str());
+                        let position = sym.location.range.start;
+                        let refs = self.fetch_references(&path, position).await;
+                        total_refs += refs.len();
+                        refs_per_sym.push(refs);
                     }
 
-                    let mut groups: Vec<BTreeMap<String, Vec<(u32, bool)>>> =
-                        vec![BTreeMap::new(); symbols.len()];
-                    let mut fallback: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+                    let def_locations: Vec<(String, u32)> = symbols
+                        .iter()
+                        .map(|s| {
+                            (
+                                s.location.uri.path().to_string(),
+                                s.location.range.start.line,
+                            )
+                        })
+                        .collect();
 
-                    for loc in &unique_refs {
-                        let ref_file = loc.uri.path().to_string();
-                        let ref_line = loc.range.start.line + 1;
-                        let is_def = def_locations
-                            .iter()
-                            .any(|(f, l)| f == &ref_file && *l == loc.range.start.line);
-
-                        let ref_path = PathBuf::from(loc.uri.path().as_str());
-                        let def_result = self.fetch_definition(&ref_path, loc.range.start).await;
-
-                        let mut matched = false;
-                        if let Some(def_loc) = def_result {
-                            let resolved_file = def_loc.uri.path().to_string();
-                            let resolved_line = def_loc.range.start.line;
-
-                            for (i, (known_file, known_line)) in def_locations.iter().enumerate() {
-                                if resolved_file == *known_file && resolved_line == *known_line {
-                                    groups[i]
-                                        .entry(ref_file.clone())
-                                        .or_default()
-                                        .push((ref_line, is_def));
-                                    matched = true;
-                                    break;
+                    if total_refs > DISAMBIGUATION_REF_LIMIT {
+                        let mut ref_by_file: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+                        for (sym_idx, refs) in refs_per_sym.iter().enumerate() {
+                            let def_file = &def_locations[sym_idx].0;
+                            let def_line = def_locations[sym_idx].1 + 1;
+                            for loc in refs {
+                                let file = loc.uri.path().to_string();
+                                let line = loc.range.start.line + 1;
+                                let is_def = file == *def_file && line == def_line;
+                                ref_by_file.entry(file).or_default().push((line, is_def));
+                            }
+                        }
+                        format_clustered_references(&ref_by_file, &roots)
+                    } else {
+                        let mut unique_refs: Vec<Location> = Vec::new();
+                        let mut seen: HashSet<(String, u32)> = HashSet::new();
+                        for refs in &refs_per_sym {
+                            for loc in refs {
+                                let key = (loc.uri.path().to_string(), loc.range.start.line);
+                                if seen.insert(key) {
+                                    unique_refs.push(loc.clone());
                                 }
                             }
                         }
 
-                        if !matched {
-                            fallback
-                                .entry(ref_file)
-                                .or_default()
-                                .push((ref_line, is_def));
+                        let mut groups: Vec<BTreeMap<String, Vec<(u32, bool)>>> =
+                            vec![BTreeMap::new(); symbols.len()];
+                        let mut fallback: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+
+                        for loc in &unique_refs {
+                            let ref_file = loc.uri.path().to_string();
+                            let ref_line = loc.range.start.line + 1;
+                            let is_def = def_locations
+                                .iter()
+                                .any(|(f, l)| f == &ref_file && *l == loc.range.start.line);
+
+                            let ref_path = PathBuf::from(loc.uri.path().as_str());
+                            let def_result =
+                                self.fetch_definition(&ref_path, loc.range.start).await;
+
+                            let mut matched = false;
+                            if let Some(def_loc) = def_result {
+                                let resolved_file = def_loc.uri.path().to_string();
+                                let resolved_line = def_loc.range.start.line;
+
+                                for (i, (known_file, known_line)) in
+                                    def_locations.iter().enumerate()
+                                {
+                                    if resolved_file == *known_file && resolved_line == *known_line
+                                    {
+                                        groups[i]
+                                            .entry(ref_file.clone())
+                                            .or_default()
+                                            .push((ref_line, is_def));
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !matched {
+                                fallback
+                                    .entry(ref_file)
+                                    .or_default()
+                                    .push((ref_line, is_def));
+                            }
                         }
+
+                        format_disambiguated_references(&symbols, &groups, &fallback, &roots)
                     }
-
-                    format_disambiguated_references(&symbols, &groups, &fallback, &roots)
                 }
-            }
-        });
+            })
+        } else {
+            String::new()
+        };
 
-        // 4. Ripgrep text matches with reference deduplication
-        let mut search_dirs = roots;
-        for path in extra_paths {
-            if !search_dirs.contains(path) {
-                search_dirs.push(path.clone());
-            }
-        }
-        let rg_lines = Self::ripgrep_lines(query, &search_dirs);
-        let file_matches = format_clustered_file_matches(&rg_lines, &all_ref_lines, &search_dirs);
+        // 5. File matches tier (with reference dedup when enriched)
+        let file_matches = format_clustered_file_matches(&rg.file_lines, &all_ref_lines, &roots);
 
-        // 5. Combine tiers
+        // 6. Combine tiers
         let has_symbols = !symbol_sections.is_empty();
         let has_references = !references_formatted.is_empty();
         let has_file_matches = !file_matches.is_empty();
 
         if !has_symbols && !has_references && !has_file_matches {
-            return "No results found".to_string();
+            return Ok(CallToolResult::text("No results found".to_string()));
         }
 
         let mut output = String::new();
@@ -531,7 +520,7 @@ impl LspBridgeHandler {
             output.push_str(&file_matches);
         }
 
-        output
+        Ok(CallToolResult::text(output))
     }
 
     /// Fetches references for a symbol position, returning empty vec on failure.
@@ -853,33 +842,42 @@ impl LspBridgeHandler {
         }
     }
 
-    /// Runs ripgrep and returns per-file line numbers.
-    fn ripgrep_lines(query: &str, roots: &[PathBuf]) -> BTreeMap<String, Vec<u32>> {
+    /// Runs ripgrep with `--only-matching` and returns both matched strings
+    /// and per-file line numbers.
+    fn ripgrep_matches(pattern: &str, roots: &[PathBuf]) -> RipgrepMatches {
         use std::process::Command;
 
         let mut cmd = Command::new("rg");
-        cmd.args(["--line-number", "--no-heading", "--ignore-case", query]);
+        cmd.args([
+            "--line-number",
+            "--no-heading",
+            "--ignore-case",
+            "--only-matching",
+            pattern,
+        ]);
 
         for root in roots {
             cmd.arg(root);
         }
 
         let Ok(rg_output) = cmd.output() else {
-            return BTreeMap::new();
+            return RipgrepMatches::default();
         };
 
         if !rg_output.status.success() && rg_output.stdout.is_empty() {
-            return BTreeMap::new();
+            return RipgrepMatches::default();
         }
 
         let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        let mut matched_set: HashSet<String> = HashSet::new();
         let stdout = String::from_utf8_lossy(&rg_output.stdout);
 
+        // --only-matching output format: file:line:matched_text
         for line in stdout.lines() {
             let Some((file, rest)) = line.split_once(':') else {
                 continue;
             };
-            let Some((line_str, _content)) = rest.split_once(':') else {
+            let Some((line_str, matched_text)) = rest.split_once(':') else {
                 continue;
             };
             let Ok(line_num) = line_str.parse::<u32>() else {
@@ -890,9 +888,13 @@ impl LspBridgeHandler {
                 .entry(file.to_string())
                 .or_default()
                 .push(line_num);
+            matched_set.insert(matched_text.to_string());
         }
 
-        file_lines
+        RipgrepMatches {
+            matched_strings: matched_set.into_iter().collect(),
+            file_lines,
+        }
     }
 }
 
@@ -900,23 +902,17 @@ impl ToolHandler for LspBridgeHandler {
     fn list_tools(&self) -> Vec<Tool> {
         vec![
             Tool {
-                name: "search".to_string(),
-                description: Some("Search for a symbol or pattern across the workspace. Returns LSP workspace symbols (semantic) plus a file heatmap showing which files contain the query and where (match count + line range).".to_string()),
+                name: "grep".to_string(),
+                description: Some("Grep for a pattern across the workspace. Runs ripgrep first, then enriches matched strings with LSP workspace symbols. Use `|` for alternation (e.g., `foo|bar`). Returns symbols (with full enrichment for ≤5 unique symbols, name+kind+location for more) plus a file heatmap.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "queries": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Symbol names or text patterns to search for"
-                        },
-                        "paths": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Additional directories to include in the text search (heatmap only — no LSP symbol resolution). Workspace roots are always searched."
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search for (supports | for alternation)"
                         }
                     },
-                    "required": ["queries"]
+                    "required": ["pattern"]
                 }),
             },
             Tool {
@@ -1000,7 +996,7 @@ impl ToolHandler for LspBridgeHandler {
 
         // Dispatch tool
         let mut result = match name {
-            "search" => self.handle_search(arguments),
+            "grep" => self.handle_grep(arguments),
             "glob" => self.handle_glob(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
@@ -1042,6 +1038,15 @@ struct SymbolEnrichment {
     supertypes: Vec<TypeHierarchyItem>,
     /// Subtypes in the type hierarchy.
     subtypes: Vec<TypeHierarchyItem>,
+}
+
+/// Result of a ripgrep `--only-matching` search.
+#[derive(Default)]
+struct RipgrepMatches {
+    /// Unique matched strings (for LSP queries).
+    matched_strings: Vec<String>,
+    /// Per-file line numbers (for heatmap tier).
+    file_lines: BTreeMap<String, Vec<u32>>,
 }
 
 /// Collects `SymbolInformation` from a `WorkspaceSymbolResponse`.
@@ -1208,6 +1213,15 @@ fn format_enriched_symbol(
     }
 
     out
+}
+
+/// Formats a symbol with name, kind, and location only (no enrichment).
+/// Used when the number of symbols exceeds `GREP_ENRICHMENT_THRESHOLD`.
+fn format_symbol_name_only(sym: &SymbolInformation, roots: &[PathBuf]) -> String {
+    let kind = format!("{:?}", sym.kind);
+    let path = display_path(sym.location.uri.path().as_str(), roots);
+    let line = sym.location.range.start.line + 1;
+    format!("{} [{kind}] {path}:{line}", sym.name)
 }
 
 /// Gap-based clustering: groups sorted line numbers into clusters.
