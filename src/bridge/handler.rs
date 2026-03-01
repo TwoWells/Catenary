@@ -4,15 +4,14 @@
 //! Bridge handler that maps MCP tool calls to LSP requests.
 
 use anyhow::{Result, anyhow};
-use ignore::WalkBuilder;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCall,
     CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, Diagnostic, DiagnosticSeverity,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, Location, Position, ReferenceContext, ReferenceParams,
-    SymbolInformation, SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, HoverParams, Location, Position,
+    ReferenceContext, ReferenceParams, SymbolInformation, SymbolKind, TextDocumentIdentifier,
+    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -26,10 +25,6 @@ use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
-/// Tools that do not require LSP server readiness.
-/// Everything else waits by default — new tools are safe automatically.
-const METHODS_SKIP_WAIT: &[&str] = &["list_directory"];
-
 /// Maximum total references before disambiguation falls back to flat rendering.
 const DISAMBIGUATION_REF_LIMIT: usize = 200;
 
@@ -41,23 +36,6 @@ struct ServerHealth {
     dead: Vec<String>,
     /// One-time batched notification for state transitions (offline/recovery).
     notification: Option<String>,
-}
-
-/// Controls how much symbol detail to include in output.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum DetailLevel {
-    /// Only structural symbols: modules, classes, structs, interfaces, enums.
-    #[default]
-    Outline,
-    /// Outline + functions, methods, constructors.
-    Signatures,
-    /// Everything including variables, constants, fields.
-    Full,
-}
-
-const fn default_detail_level() -> DetailLevel {
-    DetailLevel::Outline
 }
 
 /// Input for tools that need only a file path.
@@ -76,33 +54,6 @@ pub struct SearchInput {
     /// Workspace roots are always searched; these paths are searched in addition.
     #[serde(default)]
     pub paths: Vec<String>,
-}
-
-/// Input for codebase map.
-#[derive(Debug, Deserialize)]
-pub struct CodebaseMapInput {
-    /// Subdirectory to start from (default: root)
-    pub path: Option<String>,
-    /// Max depth for traversal (default: 5)
-    #[serde(default = "default_depth")]
-    pub max_depth: usize,
-    /// Whether to ask LSP for symbols (default: false)
-    #[serde(default)]
-    pub include_symbols: bool,
-    /// Max lines of output before truncation (default: 2000)
-    #[serde(default = "default_budget")]
-    pub budget: usize,
-    /// Symbol detail level: outline, signatures, or full (default: outline)
-    #[serde(default = "default_detail_level")]
-    pub detail_level: DetailLevel,
-}
-
-const fn default_depth() -> usize {
-    5
-}
-
-const fn default_budget() -> usize {
-    2000
 }
 
 /// Bridge handler that implements MCP `ToolHandler` trait.
@@ -252,7 +203,7 @@ impl LspBridgeHandler {
             parts.push(format!(
                 "Language server{} unavailable: {langs} \u{2014} \
                  diagnostics unavailable for {langs} files. \
-                 search and list_directory still work but without \
+                 grep and glob still work but without \
                  language server enrichment.",
                 if newly_dead.len() == 1 { "" } else { "s" },
             ));
@@ -292,7 +243,7 @@ impl LspBridgeHandler {
     }
 
     /// Ensures a document is open and synced with the LSP server.
-    async fn ensure_document_open(
+    pub(super) async fn ensure_document_open(
         &self,
         path: &Path,
     ) -> Result<(lsp_types::Uri, Arc<Mutex<LspClient>>)> {
@@ -340,39 +291,6 @@ impl LspBridgeHandler {
                 .map_err(|e| anyhow!("Failed to get current working directory: {e}"))?;
             Ok(cwd.join(path))
         }
-    }
-
-    fn handle_document_symbols(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
-        let input: FileInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let path = Self::resolve_path(&input.file)?;
-
-        debug!("Document symbols request: {}", input.file);
-
-        let result = self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(&path).await?;
-
-            if !client_mutex.lock().await.wait_ready().await {
-                return Err(anyhow!("LSP server stopped responding during analysis"));
-            }
-
-            let params = DocumentSymbolParams {
-                text_document: TextDocumentIdentifier { uri },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-            client_mutex.lock().await.document_symbols(params).await
-        })?;
-
-        result.map_or_else(
-            || Ok(CallToolResult::text("No symbols found")),
-            |response| Ok(CallToolResult::text(format_document_symbols(&response))),
-        )
     }
 
     /// Unified search: LSP workspace symbols with enrichment + ripgrep text matches.
@@ -1043,219 +961,6 @@ impl LspBridgeHandler {
             Ok(CallToolResult::text(format_diagnostics(&diagnostics)))
         }
     }
-
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Complexity of codebase map generation requires many lines"
-    )]
-    fn handle_codebase_map(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
-        use std::fmt::Write;
-        struct MapEntry {
-            path: PathBuf,
-            depth: usize,
-            is_dir: bool,
-            symbols: Option<String>,
-            display_name: Option<String>,
-        }
-        let input: CodebaseMapInput =
-            serde_json::from_value(arguments.unwrap_or_else(|| serde_json::json!({})))
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        let root_paths: Vec<PathBuf> = if let Some(p) = &input.path {
-            vec![Self::resolve_path(p)?]
-        } else {
-            let roots = self.runtime.block_on(self.client_manager.roots());
-            if roots.is_empty() {
-                vec![std::env::current_dir()?]
-            } else {
-                roots
-            }
-        };
-        let multi_root = root_paths.len() > 1;
-
-        debug!(
-            "Codebase map request: paths={:?} depth={} symbols={}",
-            root_paths, input.max_depth, input.include_symbols
-        );
-
-        // 1. Walk Directory and collect entries
-        let mut entries = Vec::new();
-
-        for root_path in &root_paths {
-            // For multi-root, add the root itself as a top-level directory entry
-            let root_prefix = if multi_root {
-                root_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            } else {
-                None
-            };
-
-            let walker = WalkBuilder::new(root_path)
-                .max_depth(Some(input.max_depth))
-                .git_ignore(true)
-                .hidden(true)
-                .build();
-
-            // Add a virtual root entry for multi-root display
-            if let Some(ref name) = root_prefix {
-                entries.push(MapEntry {
-                    path: root_path.clone(),
-                    depth: 1,
-                    is_dir: true,
-                    symbols: None,
-                    display_name: Some(format!("{name}/")),
-                });
-            }
-
-            for result in walker {
-                match result {
-                    Ok(entry) => {
-                        let path = entry.path();
-                        if path == root_path {
-                            continue;
-                        } // Skip root itself
-
-                        let rel_path = path.strip_prefix(root_path).unwrap_or(path);
-                        let depth = rel_path.components().count();
-                        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-
-                        // In multi-root mode, add 1 to depth for nesting under root name
-                        let adjusted_depth = if multi_root { depth + 1 } else { depth };
-
-                        entries.push(MapEntry {
-                            path: path.to_path_buf(),
-                            depth: adjusted_depth,
-                            is_dir,
-                            symbols: None,
-                            display_name: None,
-                        });
-                    }
-                    Err(err) => warn!("Error walking directory: {}", err),
-                }
-            }
-        }
-
-        // Pick the first root for relative path display in single-root mode
-        let primary_root = root_paths.first().cloned().unwrap_or_default();
-
-        // 2. Fetch Symbols (Async Phase)
-        let unavailable_langs = if input.include_symbols {
-            let entries_len = entries.len();
-            let detail_level = input.detail_level;
-            debug!("Fetching symbols for {} files", entries_len);
-
-            self.runtime.block_on(async {
-                let mut unavailable: Vec<String> = Vec::new();
-
-                for entry in &mut entries {
-                    if entry.is_dir {
-                        continue;
-                    }
-
-                    // Simple extension check to avoid wasted LSP calls
-                    let lang_id = {
-                        let doc_manager = self.doc_manager.lock().await;
-                        doc_manager.language_id_for_path(&entry.path).to_string()
-                    };
-
-                    if let Ok(client_mutex) = self
-                        .client_manager
-                        .get_client_for_path(&entry.path, &lang_id)
-                        .await
-                    {
-                        if let Ok((uri, _)) = self.ensure_document_open(&entry.path).await {
-                            let params = DocumentSymbolParams {
-                                text_document: TextDocumentIdentifier { uri },
-                                work_done_progress_params:
-                                    lsp_types::WorkDoneProgressParams::default(),
-                                partial_result_params: lsp_types::PartialResultParams::default(),
-                            };
-
-                            let client = client_mutex.lock().await;
-                            let result = client.document_symbols(params).await;
-                            drop(client);
-
-                            if let Ok(Some(response)) = result {
-                                entry.symbols =
-                                    Some(format_compact_symbols(&response, detail_level));
-                            }
-                        }
-                    } else if !unavailable.contains(&lang_id) {
-                        warn!("[{lang_id}] unavailable during codebase map symbol fetch");
-                        unavailable.push(lang_id);
-                    }
-                }
-
-                unavailable
-            })
-        } else {
-            Vec::new()
-        };
-
-        // 3. Render Output
-        let mut output = String::new();
-        let mut line_count = 0;
-        let budget = input.budget;
-
-        for entry in entries {
-            if line_count >= budget {
-                output.push_str("... (truncated)\n");
-                break;
-            }
-
-            // Indentation
-            let indent = "  ".repeat(entry.depth - 1);
-
-            let display = if let Some(ref name) = entry.display_name {
-                name.clone()
-            } else {
-                // Find the matching root for this entry to compute relative path
-                let matching_root = root_paths
-                    .iter()
-                    .find(|r| entry.path.starts_with(r))
-                    .unwrap_or(&primary_root);
-                let rel_path = entry
-                    .path
-                    .strip_prefix(matching_root)
-                    .unwrap_or(&entry.path);
-                let name = rel_path.file_name().unwrap_or_default().to_string_lossy();
-                let marker = if entry.is_dir { "/" } else { "" };
-                format!("{name}{marker}")
-            };
-
-            let _ = writeln!(output, "{indent}{display}");
-            line_count += 1;
-
-            if let Some(symbols) = &entry.symbols {
-                let sym_indent = "  ".repeat(entry.depth);
-                for line in symbols.lines() {
-                    if line_count >= budget {
-                        break;
-                    }
-                    // Truncate long symbol lines
-                    let max_width = 120;
-                    let display_line = if line.len() > max_width {
-                        format!("{}...", &line[..max_width])
-                    } else {
-                        line.to_string()
-                    };
-
-                    let _ = writeln!(output, "{sym_indent}{display_line}");
-                    line_count += 1;
-                }
-            }
-        }
-
-        for lang in &unavailable_langs {
-            let _ = writeln!(
-                output,
-                "\nWarning: [{lang}] unavailable, symbols may be incomplete"
-            );
-        }
-
-        Ok(CallToolResult::text(output))
-    }
 }
 
 impl ToolHandler for LspBridgeHandler {
@@ -1282,43 +987,22 @@ impl ToolHandler for LspBridgeHandler {
                 }),
             },
             Tool {
-                name: "document_symbols".to_string(),
-                description: Some("Get the symbol outline of a file (functions, classes, variables, etc.).".to_string()),
-                input_schema: file_schema(),
-            },
-            Tool {
                 name: "diagnostics".to_string(),
                 description: Some("Get diagnostics (errors, warnings, hints) for a file.".to_string()),
                 input_schema: file_schema(),
             },
             Tool {
-                name: "codebase_map".to_string(),
-                description: Some("Generate a high-level file tree of the project, optionally including symbols from LSP.".to_string()),
+                name: "glob".to_string(),
+                description: Some("Browse the workspace. Auto-detects intent: file path → symbol outline, directory path → listing with symbols, glob pattern → matching files with symbols. Always shows outline-level symbols (structs, classes, enums, interfaces, modules, constants).".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Subdirectory to map (default: project root)" },
-                        "max_depth": { "type": "integer", "description": "Max depth for traversal (default: 5)" },
-                        "include_symbols": { "type": "boolean", "description": "Ask LSP for symbols in files (default: false)" },
-                        "budget": { "type": "integer", "description": "Max lines of output (default: 2000)" },
-                        "detail_level": {
+                        "pattern": {
                             "type": "string",
-                            "enum": ["outline", "signatures", "full"],
-                            "description": "Symbol detail: outline (classes/structs only), signatures (+functions/methods), full (everything). Default: outline"
+                            "description": "A file path, directory path, or glob pattern (e.g., 'src/', 'src/main.rs', '**/*.rs')"
                         }
                     },
-                    "required": []
-                }),
-            },
-            Tool {
-                name: "list_directory".to_string(),
-                description: Some("List the contents of a directory. Shows directories, files with sizes, and symlinks with targets. Symlinks are not followed. Path must be within workspace roots.".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Absolute or relative path to the directory" }
-                    },
-                    "required": ["path"]
+                    "required": ["pattern"]
                 }),
             },
         ]
@@ -1330,7 +1014,11 @@ impl ToolHandler for LspBridgeHandler {
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let start = std::time::Instant::now();
-        let file_path = Self::extract_file_path(arguments.as_ref());
+        let file_path = if name == "glob" {
+            Self::extract_glob_file_path(arguments.as_ref())
+        } else {
+            Self::extract_file_path(arguments.as_ref())
+        };
         let file = file_path.as_ref().map(|p| p.to_string_lossy().to_string());
 
         // Broadcast tool call
@@ -1350,34 +1038,32 @@ impl ToolHandler for LspBridgeHandler {
 
         // Wait for LSP readiness, then check server health.
         // Dead servers are non-fatal — tools degrade gracefully.
-        let health = if METHODS_SKIP_WAIT.contains(&name) {
-            ServerHealth {
-                dead: vec![],
-                notification: None,
-            }
-        } else if let Some(ref path) = file_path {
-            // File-scoped: wait for the specific server
-            self.runtime.block_on(self.wait_for_server_ready(path));
-            let touched: Vec<String> = self
-                .runtime
-                .block_on(self.language_for_path(path))
-                .into_iter()
-                .collect();
-            self.check_server_health(&touched)
-        } else {
-            // Symbol-only: wait for all servers
-            self.runtime.block_on(self.wait_for_all_servers_ready());
-            let touched: Vec<String> = self
-                .runtime
-                .block_on(self.client_manager.active_clients())
-                .keys()
-                .cloned()
-                .collect();
-            self.check_server_health(&touched)
-        };
+        let health = file_path.as_ref().map_or_else(
+            || {
+                // Symbol-only: wait for all servers
+                self.runtime.block_on(self.wait_for_all_servers_ready());
+                let touched: Vec<String> = self
+                    .runtime
+                    .block_on(self.client_manager.active_clients())
+                    .keys()
+                    .cloned()
+                    .collect();
+                self.check_server_health(&touched)
+            },
+            |path| {
+                // File-scoped: wait for the specific server
+                self.runtime.block_on(self.wait_for_server_ready(path));
+                let touched: Vec<String> = self
+                    .runtime
+                    .block_on(self.language_for_path(path))
+                    .into_iter()
+                    .collect();
+                self.check_server_health(&touched)
+            },
+        );
 
         // File-scoped tool with dead server: skip dispatch, return notification
-        if !health.dead.is_empty() && file_path.is_some() {
+        if !health.dead.is_empty() && file_path.is_some() && name != "glob" {
             broadcast_result(true);
             return Ok(CallToolResult::text(
                 health.notification.unwrap_or_default(),
@@ -1387,10 +1073,8 @@ impl ToolHandler for LspBridgeHandler {
         // Dispatch tool
         let mut result = match name {
             "search" => self.handle_search(arguments),
-            "document_symbols" => self.handle_document_symbols(arguments),
             "diagnostics" => self.handle_diagnostics(arguments),
-            "codebase_map" => self.handle_codebase_map(arguments),
-            "list_directory" => self.handle_list_directory(arguments),
+            "glob" => self.handle_glob(arguments),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
 
@@ -1410,64 +1094,6 @@ impl ToolHandler for LspBridgeHandler {
     }
 }
 
-// ... (existing schema helpers)
-
-fn format_compact_symbols(response: &DocumentSymbolResponse, level: DetailLevel) -> String {
-    let mut result = Vec::new();
-    match response {
-        DocumentSymbolResponse::Flat(symbols) => {
-            for sym in symbols {
-                if matches_detail_level(sym.kind, level) {
-                    result.push(format!("{} {:?}", sym.name, sym.kind));
-                }
-            }
-        }
-        DocumentSymbolResponse::Nested(symbols) => {
-            for sym in symbols {
-                if matches_detail_level(sym.kind, level) {
-                    result.push(format!("{} {:?}", sym.name, sym.kind));
-                }
-            }
-        }
-    }
-    result.join("\n")
-}
-
-const fn matches_detail_level(kind: lsp_types::SymbolKind, level: DetailLevel) -> bool {
-    use lsp_types::SymbolKind;
-
-    // Outline: structural types + document structure (STRING for markdown headings, KEY for YAML/JSON)
-    let is_outline = matches!(
-        kind,
-        SymbolKind::FILE
-            | SymbolKind::MODULE
-            | SymbolKind::NAMESPACE
-            | SymbolKind::PACKAGE
-            | SymbolKind::CLASS
-            | SymbolKind::INTERFACE
-            | SymbolKind::ENUM
-            | SymbolKind::STRUCT
-            | SymbolKind::STRING
-            | SymbolKind::KEY
-    );
-
-    // Signatures: outline + callable members
-    let is_signature = matches!(
-        kind,
-        SymbolKind::FUNCTION
-            | SymbolKind::METHOD
-            | SymbolKind::CONSTRUCTOR
-            | SymbolKind::PROPERTY
-            | SymbolKind::EVENT
-    );
-
-    match level {
-        DetailLevel::Outline => is_outline,
-        DetailLevel::Signatures => is_outline || is_signature,
-        DetailLevel::Full => true,
-    }
-}
-
 fn file_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -1476,44 +1102,6 @@ fn file_schema() -> serde_json::Value {
         },
         "required": ["file"]
     })
-}
-
-fn format_location(location: &Location) -> String {
-    let path = location.uri.path();
-    let line = location.range.start.line + 1;
-    let col = location.range.start.character + 1;
-    format!("{path}:{line}:{col}")
-}
-
-fn format_document_symbols(response: &DocumentSymbolResponse) -> String {
-    match response {
-        DocumentSymbolResponse::Flat(symbols) => symbols
-            .iter()
-            .map(format_symbol_info)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        DocumentSymbolResponse::Nested(symbols) => format_nested_symbols(symbols, 0),
-    }
-}
-
-fn format_symbol_info(sym: &SymbolInformation) -> String {
-    let kind = format!("{:?}", sym.kind);
-    let loc = format_location(&sym.location);
-    format!("{} [{}] {}", sym.name, kind, loc)
-}
-
-fn format_nested_symbols(symbols: &[DocumentSymbol], indent: usize) -> String {
-    let mut result = Vec::new();
-    for sym in symbols {
-        let kind = format!("{:?}", sym.kind);
-        let prefix = "  ".repeat(indent);
-        let line = sym.range.start.line + 1;
-        result.push(format!("{}{} [{}] line {}", prefix, sym.name, kind, line));
-        if let Some(children) = &sym.children {
-            result.push(format_nested_symbols(children, indent + 1));
-        }
-    }
-    result.join("\n")
 }
 
 fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {

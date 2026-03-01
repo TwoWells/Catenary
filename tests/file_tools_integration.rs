@@ -6,7 +6,7 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for file I/O tools: `list_directory`.
+//! Integration tests for the `glob` tool.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+
+const MOCK_LANG_A: &str = "yX4Za";
 
 /// Helper to spawn the bridge and communicate with it.
 struct BridgeProcess {
@@ -27,6 +29,31 @@ impl BridgeProcess {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("--root").arg(root);
         // Isolate from user-level config
+        cmd.env("XDG_CONFIG_HOME", root);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
+        let stdin = child.stdin.take().context("Failed to get stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+        })
+    }
+
+    fn spawn_with_lsp(root: &str) -> Result<Self> {
+        let bin = env!("CARGO_BIN_EXE_mockls");
+        let lsp = format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}");
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        cmd.arg("--lsp").arg(lsp);
+        cmd.arg("--root").arg(root);
         cmd.env("XDG_CONFIG_HOME", root);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -132,7 +159,7 @@ impl Drop for BridgeProcess {
 }
 
 #[test]
-fn test_list_directory_basic() -> Result<()> {
+fn test_glob_directory_basic() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::create_dir_all(dir.path().join("src"))?;
     std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
@@ -142,8 +169,8 @@ fn test_list_directory_basic() -> Result<()> {
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
-        "list_directory",
-        &json!({ "path": dir.path().to_string_lossy().to_string() }),
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
     )?;
 
     assert!(text.contains("src/"), "Should list src directory: {text}");
@@ -155,7 +182,7 @@ fn test_list_directory_basic() -> Result<()> {
 }
 
 #[test]
-fn test_list_directory_outside_root_succeeds() -> Result<()> {
+fn test_glob_outside_root() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let outside = tempfile::tempdir()?;
     std::fs::write(outside.path().join("hello.txt"), "hi")?;
@@ -164,8 +191,8 @@ fn test_list_directory_outside_root_succeeds() -> Result<()> {
     bridge.initialize()?;
 
     let result = bridge.call_tool(
-        "list_directory",
-        &json!({ "path": outside.path().to_string_lossy().as_ref() }),
+        "glob",
+        &json!({ "pattern": outside.path().to_string_lossy().as_ref() }),
     )?;
 
     let is_error = result.get("isError").and_then(serde_json::Value::as_bool);
@@ -186,7 +213,7 @@ fn test_list_directory_outside_root_succeeds() -> Result<()> {
 }
 
 #[test]
-fn test_tools_list_includes_list_directory() -> Result<()> {
+fn test_tools_list_includes_glob() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
@@ -211,28 +238,27 @@ fn test_tools_list_includes_list_directory() -> Result<()> {
         .collect();
 
     assert!(
-        tool_names.contains(&"list_directory"),
-        "Should include list_directory: {tool_names:?}"
-    );
-    // File tools are now handled by native Claude Code tools + notify hook
-    assert!(
-        !tool_names.contains(&"read_file"),
-        "Should not include read_file: {tool_names:?}"
+        tool_names.contains(&"glob"),
+        "Should include glob: {tool_names:?}"
     );
     assert!(
-        !tool_names.contains(&"write_file"),
-        "Should not include write_file: {tool_names:?}"
+        !tool_names.contains(&"list_directory"),
+        "Should not include list_directory: {tool_names:?}"
     );
     assert!(
-        !tool_names.contains(&"edit_file"),
-        "Should not include edit_file: {tool_names:?}"
+        !tool_names.contains(&"document_symbols"),
+        "Should not include document_symbols: {tool_names:?}"
+    );
+    assert!(
+        !tool_names.contains(&"codebase_map"),
+        "Should not include codebase_map: {tool_names:?}"
     );
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn test_list_directory_symlink_shown_not_followed() -> Result<()> {
+fn test_glob_directory_symlink() -> Result<()> {
     use std::os::unix::fs as unix_fs;
 
     let dir = tempfile::tempdir()?;
@@ -250,14 +276,216 @@ fn test_list_directory_symlink_shown_not_followed() -> Result<()> {
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
-        "list_directory",
-        &json!({ "path": dir.path().to_string_lossy().to_string() }),
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
     )?;
 
     // Symlink should be shown with its target
     assert!(
         text.contains("link.txt ->"),
         "Symlink should be shown with arrow: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_file_outline() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let script = dir.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(
+        &script,
+        "struct Config\nenum Mode\nconst MAX_SIZE\nfn helper\n",
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": script.to_str().context("file path")? }),
+    )?;
+
+    // Outline kinds present
+    assert!(text.contains("Config"), "Should contain Config: {text}");
+    assert!(text.contains("Struct"), "Config should be Struct: {text}");
+    assert!(text.contains("Mode"), "Should contain Mode: {text}");
+    assert!(text.contains("MAX_SIZE"), "Should contain MAX_SIZE: {text}");
+
+    // Function excluded from outline
+    assert!(
+        !text.contains("helper"),
+        "Function should be excluded from outline: {text}"
+    );
+
+    // Line numbers
+    assert!(text.contains("L1"), "Should have L1: {text}");
+    assert!(text.contains("L2"), "Should have L2: {text}");
+    assert!(text.contains("L3"), "Should have L3: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_glob_pattern_matching() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
+    std::fs::write(dir.path().join("lib.rs"), "pub mod lib;")?;
+    std::fs::write(dir.path().join("readme.md"), "# Readme")?;
+
+    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.rs" }))?;
+
+    assert!(text.contains("main.rs"), "Should match main.rs: {text}");
+    assert!(text.contains("lib.rs"), "Should match lib.rs: {text}");
+    assert!(
+        !text.contains("readme.md"),
+        "Should not match readme.md: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_alternation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
+    std::fs::write(dir.path().join("readme.md"), "# Readme")?;
+
+    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.{rs,toml}" }))?;
+
+    assert!(text.contains("main.rs"), "Should match main.rs: {text}");
+    assert!(
+        text.contains("Cargo.toml"),
+        "Should match Cargo.toml: {text}"
+    );
+    assert!(
+        !text.contains("readme.md"),
+        "Should not match readme.md: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_line_counts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("three.txt"), "line1\nline2\nline3\n")?;
+    std::fs::write(dir.path().join("one.txt"), "single\n")?;
+
+    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    assert!(
+        text.contains("(3 lines)"),
+        "Should show 3 lines for three.txt: {text}"
+    );
+    assert!(
+        text.contains("(1 lines)"),
+        "Should show 1 lines for one.txt: {text}"
+    );
+    // Should NOT show bytes
+    assert!(!text.contains("bytes"), "Should not show bytes: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_glob_gitignored_section() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Initialize a git repo so gitignore is recognized
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .context("Failed to run git init")?;
+
+    std::fs::write(dir.path().join(".gitignore"), "*.log\nbuild/\n")?;
+    std::fs::write(dir.path().join("app.txt"), "content")?;
+    std::fs::write(dir.path().join("debug.log"), "log data")?;
+    std::fs::create_dir(dir.path().join("build"))?;
+    std::fs::write(dir.path().join("build/output.bin"), "binary")?;
+
+    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Non-ignored files should be listed normally
+    assert!(text.contains("app.txt"), "Should list app.txt: {text}");
+
+    // Gitignored section should exist
+    assert!(
+        text.contains("gitignored:"),
+        "Should have gitignored section: {text}"
+    );
+
+    // Gitignored entries should be in the section
+    assert!(
+        text.contains("debug.log"),
+        "Should list debug.log in gitignored: {text}"
+    );
+    assert!(
+        text.contains("build/"),
+        "Should list build/ in gitignored: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_pattern_detection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let script = dir.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(&script, "struct Config\nenum Mode\n")?;
+    std::fs::create_dir(dir.path().join("subdir"))?;
+
+    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // File path → outline format (shows line count + symbols)
+    let file_text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": script.to_str().context("file path")? }),
+    )?;
+    assert!(
+        file_text.contains("(2 lines)"),
+        "File mode should show line count: {file_text}"
+    );
+    assert!(
+        file_text.contains("Config"),
+        "File mode should show symbols: {file_text}"
+    );
+
+    // Directory path → listing format (shows entries)
+    let dir_text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+    assert!(
+        dir_text.contains("subdir/"),
+        "Dir mode should show subdirectories: {dir_text}"
+    );
+    assert!(
+        dir_text.contains(&format!("types.{MOCK_LANG_A}")),
+        "Dir mode should list files: {dir_text}"
+    );
+
+    // Glob pattern → match format (shows full paths)
+    let glob_text =
+        bridge.call_tool_text("glob", &json!({ "pattern": format!("*.{MOCK_LANG_A}") }))?;
+    assert!(
+        glob_text.contains(&format!("types.{MOCK_LANG_A}")),
+        "Pattern mode should match files: {glob_text}"
     );
     Ok(())
 }

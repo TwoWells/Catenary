@@ -172,6 +172,7 @@ dependencies = [
  "config",
  "crossterm 0.28.1",
  "dirs",
+ "globset",
  "ignore",
  "libc",
  "lsp-types",
