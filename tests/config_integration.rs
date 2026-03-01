@@ -91,9 +91,9 @@ fn test_config_loading() -> Result<()> {
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "search",
+            "name": "grep",
             "arguments": {
-                "queries": ["echo"]
+                "pattern": "echo"
             }
         }
     })
@@ -177,9 +177,9 @@ fn test_config_override() -> Result<()> {
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "search",
+            "name": "grep",
             "arguments": {
-                "queries": ["echo"]
+                "pattern": "echo"
             }
         }
     })
