@@ -16,7 +16,10 @@
 //! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
 use anyhow::{Result, anyhow};
-use lsp_types::Diagnostic;
+use lsp_types::{
+    CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic,
+    PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -289,13 +292,23 @@ impl NotifyServer {
         }
 
         let diagnostics = client.get_diagnostics(&uri).await;
+
+        // Collect quick-fix code actions for each diagnostic
+        let fixes =
+            if !diagnostics.is_empty() && client.capabilities().code_action_provider.is_some() {
+                let text_document = TextDocumentIdentifier::new(uri.clone());
+                collect_quick_fixes(&client, &text_document, &diagnostics).await
+            } else {
+                Vec::new()
+            };
+
         drop(client);
 
         let count = diagnostics.len();
         let compact = if diagnostics.is_empty() {
             String::new()
         } else {
-            format_diagnostics_compact(&diagnostics)
+            format_diagnostics_compact(&diagnostics, &fixes)
         };
 
         // Broadcast diagnostics event for monitor visibility
@@ -470,11 +483,70 @@ fn resolve_path(file: &str) -> Result<PathBuf> {
     }
 }
 
-/// Formats diagnostics with line/column and severity.
-pub(crate) fn format_diagnostics_compact(diagnostics: &[Diagnostic]) -> String {
+/// Collects quick-fix titles for each diagnostic from the LSP server.
+///
+/// Returns a `Vec` parallel to `diagnostics` — each entry contains the
+/// titles of quick-fix code actions for that diagnostic. Diagnostics
+/// without fixes get an empty vec.
+///
+/// Requests are dispatched concurrently via `futures::future::join_all`
+/// to avoid sequential per-diagnostic latency (25-30 diagnostics is
+/// common in real-world files).
+async fn collect_quick_fixes(
+    client: &LspClient,
+    text_document: &TextDocumentIdentifier,
+    diagnostics: &[Diagnostic],
+) -> Vec<Vec<String>> {
+    let futures: Vec<_> = diagnostics
+        .iter()
+        .map(|diag| {
+            let params = CodeActionParams {
+                text_document: text_document.clone(),
+                range: diag.range,
+                context: CodeActionContext {
+                    diagnostics: vec![diag.clone()],
+                    only: Some(vec![CodeActionKind::QUICKFIX]),
+                    ..Default::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+
+            async move {
+                match client.code_action(params).await {
+                    Ok(Some(actions)) => actions
+                        .into_iter()
+                        .filter_map(|action| match action {
+                            CodeActionOrCommand::CodeAction(ca)
+                                if ca.kind.as_ref() == Some(&CodeActionKind::QUICKFIX) =>
+                            {
+                                Some(ca.title)
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    Ok(None) | Err(_) => Vec::new(),
+                }
+            }
+        })
+        .collect();
+
+    futures::future::join_all(futures).await
+}
+
+/// Formats diagnostics with line/column, severity, and optional quick-fix titles.
+///
+/// `fixes` is parallel to `diagnostics` — each entry contains the titles of
+/// quick-fix code actions for that diagnostic. Pass an empty slice when no
+/// fixes were collected.
+pub(crate) fn format_diagnostics_compact(
+    diagnostics: &[Diagnostic],
+    fixes: &[Vec<String>],
+) -> String {
     diagnostics
         .iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(i, d)| {
             let severity = match d.severity {
                 Some(lsp_types::DiagnosticSeverity::ERROR) => "error",
                 Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
@@ -494,14 +566,24 @@ pub(crate) fn format_diagnostics_compact(diagnostics: &[Diagnostic]) -> String {
                 })
                 .unwrap_or_default();
 
-            if code.is_empty() {
+            let mut result = if code.is_empty() {
                 format!("  {line}:{col} [{severity}] {source}: {}", d.message)
             } else {
                 format!(
                     "  {line}:{col} [{severity}] {source}({code}): {}",
                     d.message
                 )
+            };
+
+            // Append indented fix lines
+            if let Some(fix_titles) = fixes.get(i) {
+                for title in fix_titles {
+                    use std::fmt::Write;
+                    let _ = write!(result, "\n    fix: {title}");
+                }
             }
+
+            result
         })
         .collect::<Vec<_>>()
         .join("\n")

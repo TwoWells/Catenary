@@ -39,6 +39,17 @@ Flags are composable behavioral axes, not named presets.
 | `--publish-version` | off | Include `version` field in `publishDiagnostics` notifications |
 | `--progress-on-change` | off | Send `$/progress` tokens around diagnostic computation on `didChange` |
 | `--cpu-busy <ms>` | none | Burn CPU for N milliseconds after `didChange` without sending notifications |
+| `--flycheck-command <cmd>` | none | Spawn subprocess on `didSave` under a `$/progress` bracket (simulates cargo check) |
+| `--flycheck-ticks <n>` | none | Override `--ticks` passed to the flycheck subprocess |
+| `--advertise-save` | off | Include `textDocumentSync.save` in capabilities (required for `didSave`) |
+| `--notification-log <path>` | none | Write every received notification to a JSONL file for test verification |
+| `--content-modified-once` | off | Return `ContentModified` (-32801) on first `textDocument/definition`, then succeed |
+| `--cpu-on-workspace-change <ms>` | none | Burn CPU on `workspace/didChangeWorkspaceFolders` |
+| `--cpu-on-initialized <ms>` | none | Burn CPU on `initialized` before indexing simulation |
+| `--log-init-params <path>` | none | Write the `initialize` request params JSON to a file |
+| `--scan-roots` | off | Scan workspace roots on initialize and folder changes, index files by extension |
+| `--no-code-actions` | off | Omit `codeActionProvider` capability; return empty code action arrays |
+| `--multi-fix` | off | Return two quickfix actions per diagnostic (primary + alternative) |
 
 ### Example profiles
 
@@ -73,9 +84,18 @@ The flags document exactly what behavior each test targets.
 | `initialize` | Returns capabilities based on flags |
 | `shutdown` | Returns null |
 | `textDocument/hover` | Extracts word at position, returns as markdown code block |
-| `textDocument/definition` | Scans for definition pattern (`fn`, `function`, `def`, `let`, `const`, `var`); falls back to first occurrence |
-| `textDocument/references` | Returns all positions where the word appears in the document |
+| `textDocument/definition` | Scans for definition pattern (`fn`, `function`, `def`, `let`, `const`, `var`, `struct`, `class`, `enum`, `interface`, `trait`, `mod`, `module`, `type`, `method`, `field`); import-scoped resolution; cross-file fallback |
+| `textDocument/typeDefinition` | Resolves type via `: TypeName` annotation, searches for type declaration pattern |
+| `textDocument/references` | Returns all positions where the word appears across all documents |
+| `textDocument/implementation` | Same as references |
 | `textDocument/documentSymbol` | Scans for lines matching keyword patterns, returns `DocumentSymbol` array |
+| `textDocument/codeAction` | Returns quickfix actions for diagnostics with source "mockls"; always includes a `refactor` action (to exercise kind filtering). Controlled by `--no-code-actions` and `--multi-fix` |
+| `textDocument/prepareCallHierarchy` | Returns call hierarchy item for symbol at position |
+| `callHierarchy/incomingCalls` | Searches for call sites by scanning for the symbol name in enclosing functions |
+| `callHierarchy/outgoingCalls` | Returns empty array |
+| `textDocument/prepareTypeHierarchy` | Returns type hierarchy item for symbol at position |
+| `typeHierarchy/subtypes` | Returns all struct/class declarations across documents |
+| `typeHierarchy/supertypes` | Returns empty array |
 | `workspace/symbol` | Searches across all stored documents |
 
 ### Notifications (no response)

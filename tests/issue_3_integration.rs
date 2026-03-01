@@ -16,10 +16,12 @@
 //! (LSP sleeping while subprocess burns CPU), replacing the original
 //! rust-analyzer test that was flaky under load.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const MOCK_LANG_A: &str = "yX4Za";
 
@@ -28,6 +30,7 @@ struct BridgeProcess {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     stdout: Option<BufReader<std::process::ChildStdout>>,
+    state_home: String,
 }
 
 impl BridgeProcess {
@@ -38,6 +41,7 @@ impl BridgeProcess {
             .arg("--root")
             .arg(root)
             .env("XDG_CONFIG_HOME", root)
+            .env("XDG_STATE_HOME", root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -50,6 +54,7 @@ impl BridgeProcess {
             child,
             stdin: Some(stdin),
             stdout: Some(stdout),
+            state_home: root.to_string(),
         })
     }
 
@@ -86,8 +91,36 @@ impl BridgeProcess {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         }))?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
         Ok(())
+    }
+
+    /// Sends a file-change notification via the notify socket and returns
+    /// the diagnostics text.
+    fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
+        let sessions_dir = PathBuf::from(&self.state_home)
+            .join("catenary")
+            .join("sessions");
+        let socket_path = find_notify_socket(&sessions_dir)?;
+
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+            .context("connect to notify socket")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .context("set read timeout")?;
+
+        let request = json!({"file": file});
+        writeln!(stream, "{request}").context("write to notify socket")?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .context("shutdown write")?;
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .context("read from notify socket")?;
+
+        Ok(response.trim().to_string())
     }
 }
 
@@ -95,6 +128,28 @@ impl Drop for BridgeProcess {
     fn drop(&mut self) {
         self.stdin.take();
         let _ = self.child.wait();
+    }
+}
+
+/// Scans the sessions directory for a `notify.sock` file.
+fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+            for entry in entries.flatten() {
+                let sock = entry.path().join("notify.sock");
+                if sock.exists() {
+                    return Ok(sock);
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            bail!(
+                "No notify.sock found in {} within 5s",
+                sessions_dir.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -126,21 +181,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     bridge.initialize()?;
 
     // First diagnostics call — opens the file, triggers didOpen diagnostics
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "diagnostics",
-            "arguments": {
-                "file": file_path.to_str().context("file path")?
-            }
-        }
-    }))?;
-    let response = bridge.recv()?;
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file_path.to_str().context("file path")?)?;
     assert!(
         text.contains("mock diagnostic"),
         "Initial diagnostics should contain mock diagnostic, got: {text}"
@@ -153,26 +194,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     // This triggers didChange + didSave. The flycheck subprocess (mockc)
     // runs under a progress bracket. Catenary should wait for the full
     // Active→Idle cycle before returning diagnostics.
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "diagnostics",
-            "arguments": {
-                "file": file_path.to_str().context("file path")?
-            }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Diagnostics should not error: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or("");
+    let text = bridge.call_diagnostics_via_notify(file_path.to_str().context("file path")?)?;
     assert!(
         text.contains("mock diagnostic"),
         "Post-change diagnostics should contain mock diagnostic (after flycheck), got: {text}"

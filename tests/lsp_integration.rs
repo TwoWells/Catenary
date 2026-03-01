@@ -193,8 +193,8 @@ async fn test_client_capabilities() -> Result<()> {
         "hover capability should not be advertised"
     );
     assert!(
-        text_doc.get("codeAction").is_none(),
-        "codeAction capability should not be advertised"
+        text_doc.get("codeAction").is_some(),
+        "codeAction capability SHOULD be advertised"
     );
     assert!(
         text_doc.get("rename").is_none(),

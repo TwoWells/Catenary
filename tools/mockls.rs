@@ -6,6 +6,11 @@
 //! Speaks the LSP protocol over stdin/stdout using Content-Length framed
 //! JSON-RPC. CLI flags control capabilities, timing, and failure modes.
 //! No tokio — uses `std::thread` for deferred notifications.
+//!
+//! Code actions: by default, returns one quickfix action per diagnostic
+//! (source "mockls") plus a `refactor` action (to exercise kind filtering).
+//! `--no-code-actions` omits the `codeActionProvider` capability entirely.
+//! `--multi-fix` returns two quickfix actions per diagnostic.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -131,6 +136,14 @@ struct Args {
     /// `workspace/symbol` without a prior `didOpen`.
     #[arg(long)]
     scan_roots: bool,
+
+    /// Never return code actions (omit `codeActionProvider` capability).
+    #[arg(long)]
+    no_code_actions: bool,
+
+    /// Return multiple quickfix actions per diagnostic.
+    #[arg(long)]
+    multi_fix: bool,
 }
 
 /// A JSON-RPC request.
@@ -414,6 +427,7 @@ impl MockServer {
                 self.handle_type_hierarchy_prepare(&request.params)
             }
             "typeHierarchy/subtypes" => self.handle_type_hierarchy_subtypes(&request.params),
+            "textDocument/codeAction" => Some(self.handle_code_action(&request.params)),
             "callHierarchy/outgoingCalls" | "typeHierarchy/supertypes" => {
                 Some(Value::Array(Vec::new()))
             }
@@ -637,6 +651,10 @@ impl MockServer {
             "callHierarchyProvider": true,
             "textDocumentSync": text_doc_sync
         });
+
+        if !self.args.no_code_actions {
+            capabilities["codeActionProvider"] = serde_json::json!(true);
+        }
 
         if self.args.workspace_folders {
             capabilities["workspace"] = serde_json::json!({
@@ -973,6 +991,52 @@ impl MockServer {
         }
 
         Some(Value::Array(subtypes))
+    }
+
+    fn handle_code_action(&self, params: &Value) -> Value {
+        if self.args.no_code_actions {
+            return Value::Array(Vec::new());
+        }
+
+        let context = params.get("context");
+        let diagnostics = context
+            .and_then(|c| c.get("diagnostics"))
+            .and_then(Value::as_array);
+
+        let mut actions = Vec::new();
+
+        if let Some(diags) = diagnostics {
+            for diag in diags {
+                let source = diag.get("source").and_then(Value::as_str).unwrap_or("");
+                if source == "mockls" {
+                    let message = diag
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    actions.push(serde_json::json!({
+                        "title": format!("fix: {message}"),
+                        "kind": "quickfix",
+                        "diagnostics": [diag]
+                    }));
+
+                    if self.args.multi_fix {
+                        actions.push(serde_json::json!({
+                            "title": format!("fix: alternative for {message}"),
+                            "kind": "quickfix",
+                            "diagnostics": [diag]
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Always include a refactor action to verify Catenary filters it out
+        actions.push(serde_json::json!({
+            "title": "refactor: extract variable",
+            "kind": "refactor"
+        }));
+
+        Value::Array(actions)
     }
 
     fn handle_document_symbols(&self, params: &Value) -> Option<Value> {
@@ -1653,6 +1717,8 @@ mod tests {
             log_init_params: None,
             flycheck_ticks: None,
             scan_roots: false,
+            no_code_actions: false,
+            multi_fix: false,
         }
     }
 

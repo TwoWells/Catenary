@@ -138,11 +138,8 @@ don't fix this — they just let you waste more before hitting the wall.
 | Tool | Description |
 |------|-------------|
 | `search` | Symbols, semantic references, and text matches |
-| `definition` | Go to definition |
-| `diagnostics` | Errors and warnings |
-| `list_directory` | List directory contents |
-| `catenary release` | PostToolUse hook — returns LSP diagnostics and releases file lock |
-| ... | [See all tools](https://github.com/MarkWells-Dev/Catenary/wiki/Overview#available-tools) |
+| `glob` | Browse the workspace — file outlines, directory listings, glob matches |
+| `catenary release` | PostToolUse hook — returns LSP diagnostics (with quick-fix suggestions) and releases file lock |
 
 ## Known Limitations
 
