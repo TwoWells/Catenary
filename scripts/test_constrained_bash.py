@@ -260,6 +260,34 @@ class TestAdversarial(unittest.TestCase):
         self.assertIsNotNone(check("git diff <(cat file1) <(cat file2)"))
 
 
+class TestQuotedOperators(unittest.TestCase):
+    """Operators inside quoted strings must not be treated as shell operators."""
+
+    def test_awk_with_and_in_pattern(self):
+        self.assertIsNone(check("make test | awk '/a/ && /b/' | sort"))
+
+    def test_pipe_inside_single_quotes(self):
+        self.assertIsNone(check("make test | awk '/a|b/ {print}'"))
+
+    def test_semicolon_inside_single_quotes(self):
+        self.assertIsNone(check("make ARGS='a;b;c' test"))
+
+    def test_and_inside_double_quotes(self):
+        self.assertIsNone(check('git commit -m "foo && bar"'))
+
+    def test_pipe_inside_double_quotes(self):
+        self.assertIsNone(check('git commit -m "a | b"'))
+
+    def test_semicolon_inside_double_quotes(self):
+        self.assertIsNone(check('git commit -m "a; b"'))
+
+    def test_unquoted_operators_still_split(self):
+        # Ensure real operators outside quotes are still enforced
+        self.assertIsNotNone(check("make build && cat file"))
+        self.assertIsNotNone(check("make build; ls ."))
+        self.assertIsNotNone(check("cat file | grep foo"))
+
+
 class TestDenyResponse(unittest.TestCase):
     def test_claude_system_message_contains_command(self):
         response = deny_response("claude", "cargo build 2>&1", "Use a make target instead.")
