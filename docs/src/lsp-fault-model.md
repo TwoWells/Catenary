@@ -56,17 +56,17 @@ This document catalogs the failure modes, current handling, and required invaria
 
 ### 4. Workspace Edit Failures
 
-LSP servers propose workspace edits (via rename, code actions, formatting). These edits contain URIs, byte ranges, and replacement text — all untrusted.
+LSP servers propose workspace edits (via code actions, formatting). These edits contain URIs, byte ranges, and replacement text — all untrusted.
 
-**Design decision:** Catenary does not apply workspace edits to the filesystem. LSP tools (`rename`, `apply_quickfix`, `formatting`) return proposed edits as structured text. The MCP client reviews and applies them using its own editing tools, or via Catenary's `edit_file` tool which validates paths against workspace roots.
+**Design decision:** Catenary does not apply workspace edits to the filesystem. Code actions are delivered via the post-edit diagnostics hook as structured text. The agent reviews them and applies fixes using the host's native editing tools.
 
 This eliminates an entire class of failures:
 
 | Failure | Trigger | Resolution |
 |---------|---------|------------|
-| Edit targets file outside workspace | Path traversal in URI | MCP client controls file writes, not the LSP |
-| Overlapping edit ranges | Server bug | MCP client applies edits individually with full file context |
-| Edit with wrong encoding offsets | Encoding mismatch | MCP client works with text, not byte offsets |
+| Edit targets file outside workspace | Path traversal in URI | Host tool controls file writes, not the LSP |
+| Overlapping edit ranges | Server bug | Host tool applies edits individually with full file context |
+| Edit with wrong encoding offsets | Encoding mismatch | Host tool works with text, not byte offsets |
 | ResourceOp (create/rename/delete) | Code action side effects | Surfaced as proposed operations; MCP client decides |
 
 **Rationale:** The MCP clients calling Catenary (Claude Code, Gemini CLI, etc.) already have file editing tools with their own safety checks. Having Catenary also write files creates a redundant, less-validated write path that trusts LSP-provided URIs and byte offsets. Removing it enforces a clean trust boundary: LSP servers propose, the MCP client disposes.
@@ -155,7 +155,7 @@ These properties must hold regardless of LSP server behavior:
 
 1. **Catenary never crashes** due to LSP server output. All deserialization is fallible. All `unwrap()` on LSP data is forbidden.
 
-2. **Catenary never modifies the filesystem based on LSP data.** LSP-proposed edits (rename, code actions, formatting) are returned as structured text. Catenary's `edit_file` and `write_file` tools validate all paths against workspace roots independently of LSP data — the LSP never gets direct write access.
+2. **Catenary never modifies the filesystem based on LSP data.** LSP-proposed edits (code actions, formatting) are returned as structured text via hooks. The host tool controls all file writes — the LSP never gets direct write access.
 
 3. **Catenary never hangs indefinitely.** All LSP requests have bounded timeouts. Diagnostics waits use activity-based tracking with nudge-and-retry (bounded by attempt count). Reader task failures don't block the MCP server.
 

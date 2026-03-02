@@ -20,7 +20,7 @@ Claude Code — symlink into ~/.claude/hooks/ then add to ~/.claude/settings.jso
       "PreToolUse": [
         {
           "matcher": "Bash",
-          "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/constrained_bash.py"}]
+          "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/constrained_bash.py --format=claude"}]
         }
       ]
     }
@@ -142,19 +142,19 @@ PIPELINE_SAFE = {"grep", "egrep", "fgrep", "head", "tail", "wc", "jq", "awk", "s
 
 # Specific guidance for common denied commands
 GUIDANCE = {
-    "rg":      "Use Catenary's search tool instead.",
-    "ag":      "Use Catenary's search tool instead.",
-    "ack":     "Use Catenary's search tool instead.",
-    "fd":      "Use Catenary's search tool instead.",
-    "grep":    "Use Catenary's search tool instead.",
-    "egrep":   "Use Catenary's search tool instead.",
-    "fgrep":   "Use Catenary's search tool instead.",
-    "rgrep":   "Use Catenary's search tool instead.",
-    "zgrep":   "Use Catenary's search tool instead.",
-    "ls":      "Use Catenary's list_directory tool instead.",
-    "dir":     "Use Catenary's list_directory tool instead.",
-    "tree":    "Use Catenary's list_directory tool instead.",
-    "find":    "Use Catenary's list_directory tool instead.",
+    "rg":      "Use Catenary's grep tool instead.",
+    "ag":      "Use Catenary's grep tool instead.",
+    "ack":     "Use Catenary's grep tool instead.",
+    "fd":      "Use Catenary's grep tool instead.",
+    "grep":    "Use Catenary's grep tool instead.",
+    "egrep":   "Use Catenary's grep tool instead.",
+    "fgrep":   "Use Catenary's grep tool instead.",
+    "rgrep":   "Use Catenary's grep tool instead.",
+    "zgrep":   "Use Catenary's grep tool instead.",
+    "ls":      "Use Catenary's glob tool instead.",
+    "dir":     "Use Catenary's glob tool instead.",
+    "tree":    "Use Catenary's glob tool instead.",
+    "find":    "Use Catenary's glob tool instead.",
     "cat":     "Use the Read tool instead.",
     "head":    "Use the Read tool instead.",
     "tail":    "Use the Read tool instead.",
@@ -226,7 +226,7 @@ def check(cmd_string):
                 return GUIDANCE.get(name, DEFAULT_DENY)
 
             if name == "git" and len(rest) > 1 and rest[1] in DENIED_GIT:
-                return "Use Catenary's search or list_directory tools instead."
+                return "Use Catenary's grep or glob tools instead."
 
     return None
 
@@ -263,7 +263,7 @@ def deny_response(fmt, command, reason):
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--format", choices=["claude", "gemini"], default="claude")
+    parser.add_argument("--format", choices=["claude", "gemini"], required=True)
     args = parser.parse_args()
 
     try:

@@ -12,7 +12,7 @@ from wasting tokens discovering the deny list through trial and error:
 
 ```
 Text-scanning shell commands (grep, find, ls, cat, etc.) are denied.
-Use Catenary's LSP tools for navigation and list_directory for browsing.
+Use Catenary's grep tool for search and glob tool for browsing.
 Workarounds will be added to the deny list.
 ```
 
@@ -27,19 +27,14 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 
 | Task | Use | Instead of |
 |------|-----|------------|
-| Find where something is defined | `definition` | grep/ripgrep |
-| Find all usages of a symbol | `search` | grep/ripgrep |
-| Find a class/function by name | `search` | grep/glob patterns |
-| Understand a file's structure | `document_symbols` | Reading entire files |
-| Find implementations of interface | `implementation` | grep for impl blocks |
-| Rename a symbol safely | `rename` | Find/replace with grep |
-| Check for errors after edits | `diagnostics` | Running compiler |
-| Explore unfamiliar codebase | `codebase_map` | Multiple grep/read cycles |
+| Find symbols, references, text matches | `grep` | grep/ripgrep |
+| Browse files and directories | `glob` | ls/find/tree |
+| Check for errors after edits | hooks | Running compiler |
 
 ### Why This Matters
 
 - A single 500-line file read costs ~2000-4000 tokens
-- A `search` call costs ~200-500 tokens and returns symbols + references + text matches
+- A `grep` call costs ~200-500 tokens and returns symbols + references + text matches
 - One file read ≈ 10-20 targeted LSP queries
 - Reducing unnecessary reads prevents context compression and re-reads
 
@@ -72,21 +67,22 @@ language server directly.
 
 ## When to Use LSP vs Native File Tools
 
-Catenary provides LSP tools and `list_directory`. File reading and editing is
-handled by the host tool's native file operations (e.g. Claude Code's `Read`,
-`Edit`, `Write`). The `catenary release` hook provides post-edit LSP diagnostics
-so you immediately see any errors introduced by changes.
+Catenary provides two MCP tools (`grep` and `glob`) plus post-edit diagnostics
+via hooks. File reading and editing is handled by the host tool's native file
+operations (e.g. Claude Code's `Read`, `Edit`, `Write`). The `catenary release`
+hook provides post-edit LSP diagnostics so you immediately see any errors
+introduced by changes.
 
-**Use LSP tools** for:
+**Use Catenary tools** for:
 
-- Finding definitions, references, and symbols
-- Understanding file structure (document_symbols)
-- Checking errors after changes (diagnostics)
+- Finding symbols, references, and text matches (`grep`)
+- Browsing files and directory structure (`glob`)
+- Post-edit diagnostics (automatic via hooks)
 
 **Use native file tools** for:
 
 - Reading implementation logic (not just signatures)
-- Searching comments or string literals (`search` includes a file heatmap)
+- Searching comments or string literals (`grep` includes a file heatmap)
 - Config files or non-code content
 - Writing and editing code (diagnostics returned via notify hook)
 
@@ -104,8 +100,8 @@ so you immediately see any errors introduced by changes.
 
 **Efficient approach:**
 
-1. `search` for "auth" — returns symbols, semantic references, and text matches
-2. `definition` to jump to the specific handler
+1. `grep` for "auth" — returns symbols, semantic references, and text matches
+2. `grep` for the specific handler — definition and type info included in results
 3. Read the specific function you need to modify
 4. Edit to make the change — diagnostics returned via notify hook
 
@@ -115,11 +111,10 @@ When first exploring an unfamiliar codebase:
 
 ```
 # Get project structure with function/class names
-codebase_map with include_symbols: true
+glob with pattern: "**" and include_symbols: true
 
 # Then drill down with targeted queries
-search for specific components
-document_symbols for file structure
+grep for specific components
 
 # Read implementation when needed
 Read the specific code you need to understand
@@ -134,10 +129,9 @@ Typical token costs (approximate):
 | Operation                             | Tokens     |
 | ------------------------------------- | ---------- |
 | Read a 500-line file                  | ~2000-4000 |
-| `search` (symbols + references + heatmap) | ~200-500 |
-| `definition` response             | ~30-100    |
-| `document_symbols`                | ~200-800   |
-| `codebase_map` (budget: 200) | ~800-1000  |
+| `grep` (symbols + references + heatmap) | ~200-500 |
+| `glob` (file listing)                | ~200-800   |
+| `glob` with symbols (budget: 200)    | ~800-1000  |
 
 A single file read can cost as much as 10-20 targeted LSP queries.
 
@@ -146,14 +140,14 @@ A single file read can cost as much as 10-20 targeted LSP queries.
 1. **Ask, don't scan.** If you have a specific question ("where is X defined?"),
    use a targeted LSP query.
 
-2. **Structure before content.** Use `document_symbols` or `codebase_map` to
-   understand organization before reading implementation.
+2. **Structure before content.** Use `glob` with symbols to understand
+   organization before reading implementation.
 
-3. **Search before read.** Use `search` to find symbols, references, and
+3. **Search before read.** Use `grep` to find symbols, references, and
    matches before reading source files.
 
-4. **References are precise.** `find_references` finds actual usages,
-   not text matches. No false positives from comments or strings.
+4. **References are precise.** `grep` enriches results with semantic
+   references — actual usages, not text matches.
 
 5. **Save reads for logic.** Only read files when you need to understand
    _how_ something works, not _what_ it is or _where_ it lives.

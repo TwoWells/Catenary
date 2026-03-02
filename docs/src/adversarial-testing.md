@@ -205,21 +205,6 @@ A file designed to trigger code actions with specific titles (e.g., through cust
 - Code action titles are returned as data
 - No code action text is executed as a command
 
-### 4.2 Workspace edit preview content
-
-```rust
-// A rename from `old` to a crafted new name
-fn old() {}
-```
-
-**Trigger:** AI agent calls `rename` with `new_name` set to `"; rm -rf / #`.
-
-**Expected:** The rename response shows the proposed text replacement. The replacement text is returned as a string, never executed.
-
-**What to verify:**
-- Shell metacharacters in rename targets are not interpreted
-- The edit preview is data, not a command
-
 ---
 
 ## 5. Resource Exhaustion

@@ -97,10 +97,10 @@ catenary doctor
 
 ```
 rust         rust-analyzer       ✓ ready
-             hover definition references document_symbols search code_actions rename call_hierarchy
+             hover definition references document_symbols search code_actions call_hierarchy
 
 python       pyright-langserver  ✓ ready
-             hover definition references document_symbols search rename
+             hover definition references document_symbols search
 
 toml         taplo               - skipped (no matching files)
 

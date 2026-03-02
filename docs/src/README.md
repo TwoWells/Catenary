@@ -17,8 +17,7 @@ intelligence to AI coding assistants.
 Catenary bridges [MCP](https://modelcontextprotocol.io/) (Model Context
 Protocol) and [LSP](https://microsoft.github.io/language-server-protocol/)
 (Language Server Protocol), giving AI assistants like Claude access to real IDE
-features: hover docs, go-to-definition, find references, diagnostics,
-completions, rename, and more.
+features: hover docs, go-to-definition, find references, diagnostics, and more.
 
 ## Getting Started
 
