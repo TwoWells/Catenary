@@ -76,6 +76,9 @@ pub enum EventKind {
         tool: String,
         /// The optional file path involved.
         file: Option<String>,
+        /// MCP request arguments (gated by `capture_tool_output`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<serde_json::Value>,
     },
     /// Tool call completed.
     ToolResult {
@@ -88,6 +91,9 @@ pub enum EventKind {
         /// Full tool output text (for TUI detail expansion).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// MCP request arguments echoed back (for TUI detail header).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<serde_json::Value>,
     },
     /// Diagnostics returned from notify hook.
     Diagnostics {

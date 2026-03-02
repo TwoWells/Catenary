@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: build-release check deny test test-scripts release release-patch release-minor release-major tag-current
+.PHONY: build-release check deny test test-ignored test-scripts release release-patch release-minor release-major tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -18,7 +18,7 @@ build-release:
 	@cargo build --release
 
 check:
-	@cargo fmt
+	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
 	@cargo clippy --tests --features mockls --quiet -- -D warnings
 	@cargo deny --log-level error check >/dev/null 2>&1
 	@cargo nextest run --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
@@ -33,7 +33,11 @@ test-scripts:
 
 # Run tests. Pass T= to filter, N= to repeat, e.g.: make test T=json_diagnostics N=5
 # Prefix with ! to exclude: make test T=\!flaky_test
+# Run ignored tests (e.g. requiring real LSP): make test-ignored T=ra_symbol_universe
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
+test-ignored:
+	@cargo nextest run --features mockls --run-ignored ignored-only --status-level all --final-status-level all --no-capture $(if $(T),-E 'test($(CLEAN_T))',)
+
 test:
 	@cargo nextest run --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 

@@ -56,6 +56,8 @@ pub enum IconPreset {
     Unicode,
     /// Nerd Font glyphs (requires a patched font).
     Nerd,
+    /// Emoji icons (Unicode 17.0, requires emoji-capable font).
+    Emoji,
 }
 
 /// Icon theme configuration.
@@ -99,6 +101,14 @@ pub struct IconConfig {
     pub tool_glob: Option<String>,
     /// Default tool icon (fallback).
     pub tool_default: Option<String>,
+    /// Workspace expanded icon.
+    pub workspace_open: Option<String>,
+    /// Workspace collapsed icon.
+    pub workspace_closed: Option<String>,
+    /// Pinned panel icon.
+    pub pinned: Option<String>,
+    /// Progress spinner frames (animated).
+    pub progress: Option<String>,
 }
 
 /// TUI configuration options.
@@ -129,7 +139,7 @@ impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             auto_add_sessions: true,
-            sessions_width: 0.4,
+            sessions_width: 0.25,
             focus_follows_mouse: false,
             capture_tool_output: false,
         }
@@ -141,7 +151,7 @@ const fn default_true() -> bool {
 }
 
 const fn default_sessions_width() -> f64 {
-    0.4
+    0.25
 }
 
 const fn default_idle_timeout() -> u64 {

@@ -55,8 +55,10 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
     };
     let degrade = compute_degradation(area.width, area.height, app.grid.panels.len(), &config);
 
-    // Override visibility from degradation.
-    app.sessions_visible = degrade.sessions_visible;
+    // Degradation can hide sessions, but not force-show them (user `s` toggle wins).
+    if !degrade.sessions_visible {
+        app.sessions_visible = false;
+    }
 
     // Split into sessions area + grid area.
     let sessions_width = if app.sessions_visible && app.grid.panels.is_empty() {
@@ -88,6 +90,7 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
             app.theme,
             app.icons,
             app.focus == FocusedPane::Sessions,
+            !app.grid.panels.is_empty(),
         );
     }
 
@@ -101,6 +104,9 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
             if panel_rect.index >= app.grid.panels.len() {
                 continue;
             }
+            // Record real viewport height so snap_viewport uses it between frames.
+            app.grid.panels[panel_rect.index].viewport_height =
+                panel_rect.rect.height.saturating_sub(1) as usize;
             let is_focused =
                 app.focus == FocusedPane::Events && app.grid.focused == Some(panel_rect.index);
             render_panel(
@@ -213,11 +219,21 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                 FocusedPane::Sessions => {
                     if !app.grid.panels.is_empty() {
                         app.focus = FocusedPane::Events;
+                        // Focus first panel when entering Events from Sessions.
+                        app.grid.focus_panel(0);
                     }
                 }
                 FocusedPane::Events => {
-                    if app.sessions_visible {
+                    // Cycle through panels. When wrapping past the last panel,
+                    // jump to Sessions (if visible) instead.
+                    let at_last = app
+                        .grid
+                        .focused
+                        .is_some_and(|f| f + 1 >= app.grid.panels.len());
+                    if at_last && app.sessions_visible {
                         app.focus = FocusedPane::Sessions;
+                    } else {
+                        app.grid.focus_next();
                     }
                 }
             }
@@ -229,11 +245,16 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                 FocusedPane::Sessions => {
                     if !app.grid.panels.is_empty() {
                         app.focus = FocusedPane::Events;
+                        // Focus last panel when entering Events from Sessions in reverse.
+                        app.grid.focus_panel(app.grid.panels.len() - 1);
                     }
                 }
                 FocusedPane::Events => {
-                    if app.sessions_visible {
+                    let at_first = app.grid.focused.is_some_and(|f| f == 0);
+                    if at_first && app.sessions_visible {
                         app.focus = FocusedPane::Sessions;
+                    } else {
+                        app.grid.focus_prev();
                     }
                 }
             }
@@ -364,7 +385,21 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
             }
             true
         }
+        KeyCode::Char('s') => {
+            app.sessions_visible = !app.sessions_visible;
+            if !app.sessions_visible
+                && app.focus == FocusedPane::Sessions
+                && !app.grid.panels.is_empty()
+            {
+                app.focus = FocusedPane::Events;
+            }
+            true
+        }
         KeyCode::Char('?') => {
+            // If Sessions is hidden, show it first, then toggle cheatsheet.
+            if !app.sessions_visible {
+                app.sessions_visible = true;
+            }
             app.tree.show_cheatsheet = !app.tree.show_cheatsheet;
             true
         }
@@ -573,6 +608,7 @@ mod tests {
                 make_event(EventKind::ToolCall {
                     tool: "hover".to_string(),
                     file: Some("/src/main.rs".to_string()),
+                    params: None,
                 }),
             ],
         );
@@ -583,10 +619,12 @@ mod tests {
                 make_event(EventKind::ToolCall {
                     tool: "search".to_string(),
                     file: None,
+                    params: None,
                 }),
                 make_event(EventKind::ToolCall {
                     tool: "definition".to_string(),
                     file: Some("/src/lib.rs".to_string()),
+                    params: None,
                 }),
             ],
         );

@@ -2135,3 +2135,99 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
 
     Ok(())
 }
+
+/// Diagnostic test: does `workspace/symbol("")` from rust-analyzer return
+/// impl methods, or are they truncated by the result cap?
+///
+/// Creates a small Rust workspace with a struct + method, spawns the bridge
+/// with real rust-analyzer, and greps for the method name. If the symbol
+/// universe includes methods, the output will have `## [Function]` with
+/// hover enrichment. If not, only rg text hits appear.
+///
+/// Run with: `make test T=ra_symbol_universe`
+/// Requires: rust-analyzer on PATH.
+#[test]
+#[ignore = "requires rust-analyzer; diagnostic test for symbol universe coverage"]
+fn test_ra_symbol_universe_includes_methods() -> Result<()> {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir()?;
+
+    // Minimal Cargo.toml so rust-analyzer treats this as a real project
+    let cargo_toml = dir.path().join("Cargo.toml");
+    std::fs::write(
+        &cargo_toml,
+        "[package]\nname = \"ra-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir(&src_dir)?;
+    let lib_rs = src_dir.join("lib.rs");
+    std::fs::write(
+        &lib_rs,
+        "pub struct ZzTestWidget {\n    value: u32,\n}\n\n\
+         impl ZzTestWidget {\n    \
+             pub fn zz_widget_method(&self) -> u32 {\n        \
+                 self.value\n    \
+             }\n\
+         }\n",
+    )?;
+
+    let lsp_arg = format!("rust:rust-analyzer");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp_arg], root)?;
+    bridge.initialize()?;
+
+    // rust-analyzer needs time to index; poll with short sleeps
+    let mut text = String::new();
+    for attempt in 0..30 {
+        std::thread::sleep(Duration::from_secs(2));
+
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 5000 + attempt,
+            "method": "tools/call",
+            "params": {
+                "name": "grep",
+                "arguments": { "pattern": "zz_widget_method" }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        let result = &response["result"];
+        if let Some(t) = result["content"][0]["text"].as_str() {
+            if t.contains("## [") {
+                // Got enriched symbol output — universe includes methods
+                text = t.to_string();
+                break;
+            }
+            if t.contains("zz_widget_method") {
+                // Got rg hits but no symbol enrichment — keep trying
+                // (RA may still be indexing)
+                text = t.to_string();
+            }
+        }
+    }
+
+    // Flush stderr so we can see the output in test logs
+    let _ = writeln!(
+        std::io::stderr(),
+        "\n=== ra_symbol_universe output ===\n{text}\n=== end ==="
+    );
+
+    assert!(
+        text.contains("# zz_widget_method"),
+        "Expected '# zz_widget_method' heading, got:\n{text}"
+    );
+
+    // This is the key assertion: if the symbol universe includes methods,
+    // we get a ## [Function] or ## [Method] heading with hover enrichment.
+    // If this fails, workspace/symbol("") is truncating methods.
+    assert!(
+        text.contains("## ["),
+        "Expected ## [Function] or ## [Method] heading — \
+         symbol universe may be truncating methods. Got:\n{text}"
+    );
+
+    Ok(())
+}

@@ -420,85 +420,121 @@ pub struct IconSet {
     pub tool_glob: String,
     /// Default (fallback) tool icon.
     pub tool_default: String,
+    /// Workspace expanded icon.
+    pub workspace_open: String,
+    /// Workspace collapsed icon.
+    pub workspace_closed: String,
+    /// Pinned panel icon.
+    pub pinned: String,
+    /// Progress spinner icon (static fallback; animation is per-preset).
+    pub progress: String,
 }
+
+/// Static preset defaults for a single icon preset.
+struct PresetDefaults {
+    diag_error: &'static str,
+    diag_warn: &'static str,
+    diag_info: &'static str,
+    diag_ok: &'static str,
+    lock: &'static str,
+    unlock: &'static str,
+    tool_search: &'static str,
+    tool_glob: &'static str,
+    tool_default: &'static str,
+    workspace_open: &'static str,
+    workspace_closed: &'static str,
+    pinned: &'static str,
+    progress: &'static str,
+}
+
+const PRESET_UNICODE: PresetDefaults = PresetDefaults {
+    diag_error: "\u{2717} ",       // ✗
+    diag_warn: "\u{26A0} ",        // ⚠
+    diag_info: "\u{2139} ",        // ℹ
+    diag_ok: "\u{2713} ",          // ✓
+    lock: "\u{2B9E} ",             // ⮞
+    unlock: "\u{2B9C} ",           // ⮜
+    tool_search: "\u{2B9E} ",      // ⮞
+    tool_glob: "\u{2B9E} ",        // ⮞
+    tool_default: "\u{2B9E} ",     // ⮞
+    workspace_open: "\u{25BE} ",   // ▾
+    workspace_closed: "\u{25B8} ", // ▸
+    pinned: "\u{2020}",            // †
+    progress: "\u{2726} ",         // ✦
+};
+
+const PRESET_NERD: PresetDefaults = PresetDefaults {
+    diag_error: " ",           // nf-cod-error
+    diag_warn: " ",            // nf-cod-warning
+    diag_info: " ",            // nf-cod-info
+    diag_ok: " ",              // nf-cod-check
+    lock: " ",                 // nf-cod-lock
+    unlock: " ",               // nf-cod-unlock
+    tool_search: " ",          // nf-cod-search
+    tool_glob: " ",            // nf-cod-file_directory
+    tool_default: "\u{2192} ", // →
+    workspace_open: " ",       // nf-cod-chevron_down
+    workspace_closed: " ",     // nf-cod-chevron_right
+    pinned: " ",               // nf-cod-pinned
+    progress: " ",             // nf-cod-loading
+};
+
+const PRESET_EMOJI: PresetDefaults = PresetDefaults {
+    diag_error: "\u{274C}\u{FE0F}", // ❌️
+    diag_warn: "\u{26A0}\u{FE0F} ", // ⚠️
+    diag_info: "\u{2139}\u{FE0F} ", // ℹ️
+    diag_ok: "\u{2705}\u{FE0F}",    // ✅️
+    lock: "\u{2B9E} ",              // ⮞
+    unlock: "\u{2B9C} ",            // ⮜
+    tool_search: "\u{1F50D}",       // 🔍
+    tool_glob: "\u{1F50D}",         // 🔍
+    tool_default: "\u{2B9E} ",      // ⮞
+    workspace_open: "\u{1F4C2}",    // 📂
+    workspace_closed: "\u{1F4C1}",  // 📁
+    pinned: "\u{1F4CC}",            // 📌
+    progress: "\u{2726} ",          // ✦ (static fallback; snake spinner is animated)
+};
 
 impl IconSet {
     /// Resolve an [`IconConfig`] into a fully populated [`IconSet`].
     #[must_use]
     pub fn from_config(config: IconConfig) -> Self {
-        let (unicode, nerd) = Self::preset_defaults();
         let base = match config.preset {
-            IconPreset::Unicode => &unicode,
-            IconPreset::Nerd => &nerd,
+            IconPreset::Unicode => &PRESET_UNICODE,
+            IconPreset::Nerd => &PRESET_NERD,
+            IconPreset::Emoji => &PRESET_EMOJI,
         };
         Self {
-            diag_error: config.diag_error.unwrap_or_else(|| base.0.to_string()),
-            diag_warn: config.diag_warn.unwrap_or_else(|| base.1.to_string()),
-            diag_info: config.diag_info.unwrap_or_else(|| base.2.to_string()),
-            diag_ok: config.diag_ok.unwrap_or_else(|| base.3.to_string()),
-            lock: config.lock.unwrap_or_else(|| base.4.to_string()),
-            unlock: config.unlock.unwrap_or_else(|| base.5.to_string()),
-            tool_search: config.tool_search.unwrap_or_else(|| base.6.to_string()),
-            tool_glob: config.tool_glob.unwrap_or_else(|| base.7.to_string()),
-            tool_default: config.tool_default.unwrap_or_else(|| base.8.to_string()),
+            diag_error: config
+                .diag_error
+                .unwrap_or_else(|| base.diag_error.to_string()),
+            diag_warn: config
+                .diag_warn
+                .unwrap_or_else(|| base.diag_warn.to_string()),
+            diag_info: config
+                .diag_info
+                .unwrap_or_else(|| base.diag_info.to_string()),
+            diag_ok: config.diag_ok.unwrap_or_else(|| base.diag_ok.to_string()),
+            lock: config.lock.unwrap_or_else(|| base.lock.to_string()),
+            unlock: config.unlock.unwrap_or_else(|| base.unlock.to_string()),
+            tool_search: config
+                .tool_search
+                .unwrap_or_else(|| base.tool_search.to_string()),
+            tool_glob: config
+                .tool_glob
+                .unwrap_or_else(|| base.tool_glob.to_string()),
+            tool_default: config
+                .tool_default
+                .unwrap_or_else(|| base.tool_default.to_string()),
+            workspace_open: config
+                .workspace_open
+                .unwrap_or_else(|| base.workspace_open.to_string()),
+            workspace_closed: config
+                .workspace_closed
+                .unwrap_or_else(|| base.workspace_closed.to_string()),
+            pinned: config.pinned.unwrap_or_else(|| base.pinned.to_string()),
+            progress: config.progress.unwrap_or_else(|| base.progress.to_string()),
         }
-    }
-
-    /// Returns `(unicode_defaults, nerd_defaults)` tuples.
-    ///
-    /// Order: `diag_error`, `diag_warn`, `diag_info`, `diag_ok`, `lock`, `unlock`,
-    ///        `tool_search`, `tool_glob`, `tool_default`.
-    #[allow(
-        clippy::type_complexity,
-        reason = "private helper returning preset tuples"
-    )]
-    const fn preset_defaults() -> (
-        (
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-        ),
-        (
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-        ),
-    ) {
-        let unicode = (
-            "\u{2717} ", // ✗
-            "\u{26A0} ", // ⚠
-            "\u{2139} ", // ℹ
-            "\u{2713} ", // ✓
-            "\u{25B6} ", // ▶
-            "\u{25C0} ", // ◀
-            "\u{2192} ", // → (search)
-            "\u{2192} ", // → (glob)
-            "\u{2192} ", // → (default)
-        );
-        let nerd = (
-            " ",         // nf-cod-error
-            " ",         // nf-cod-warning
-            " ",         // nf-cod-info
-            " ",         // nf-cod-check
-            " ",         // nf-cod-lock
-            " ",         // nf-cod-unlock
-            " ",         // nf-cod-search
-            " ",         // nf-cod-file_directory
-            "\u{2192} ", // → (no nerd equivalent)
-        );
-        (unicode, nerd)
     }
 }
 
@@ -559,7 +595,7 @@ pub fn format_event_plain(ev: &SessionEvent) -> String {
             language, title, ..
         } => format!("{ts} {language} {title}"),
         EventKind::ProgressEnd { language } => format!("{ts} {language} complete"),
-        EventKind::ToolCall { tool, file } => {
+        EventKind::ToolCall { tool, file, .. } => {
             format!("{ts} {tool} {}", file.as_deref().unwrap_or(""))
         }
         EventKind::ToolResult {
@@ -575,7 +611,7 @@ pub fn format_event_plain(ev: &SessionEvent) -> String {
             count,
             preview,
         } => format!("{ts} {file} {count} {preview}"),
-        EventKind::McpMessage { direction, .. } => format!("{ts} mcp {direction}"),
+        EventKind::McpMessage { .. } => String::new(),
         EventKind::LockAcquired { file, owner, .. } => format!("{ts} lock {file} {owner}"),
         EventKind::LockReleased { file, owner, .. } => format!("{ts} unlock {file} {owner}"),
         EventKind::LockDenied {
@@ -662,18 +698,18 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
             let msg = message.as_ref().map_or(String::new(), |m| format!(": {m}"));
             Line::from(vec![
                 ts_span,
-                Span::styled("⟳ ", theme.text),
+                Span::styled(icons.progress.clone(), theme.text),
                 Span::styled(format!("[{language}] "), theme.accent),
                 Span::styled(format!("{title}{msg}{pct}"), theme.text),
             ])
         }
         EventKind::ProgressEnd { language } => Line::from(vec![
             ts_span,
-            Span::styled("⟳ ", theme.text),
+            Span::styled(icons.progress.clone(), theme.text),
             Span::styled(format!("[{language}] "), theme.accent),
             Span::styled("complete", theme.text),
         ]),
-        EventKind::ToolCall { tool, file } => {
+        EventKind::ToolCall { tool, file, .. } => {
             let icon = tool_icon(tool, icons);
             let file_str = file
                 .as_ref()
@@ -689,7 +725,7 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
             tool,
             success,
             duration_ms,
-            output: _,
+            ..
         } => {
             let (status_text, status_style) = if *success {
                 ("ok", theme.success)
@@ -698,8 +734,8 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
             };
             Line::from(vec![
                 ts_span,
-                Span::styled("← ", theme.info),
-                Span::styled(format!("{tool} → "), theme.text),
+                Span::styled("\u{2B9C} ", theme.info),
+                Span::styled(format!("{tool} \u{276F} "), theme.text),
                 Span::styled(status_text.to_string(), status_style),
                 Span::styled(format!(" ({duration_ms}ms)"), theme.text),
             ])
@@ -727,13 +763,7 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
                 ])
             }
         }
-        EventKind::McpMessage { direction, .. } => {
-            let arrow = if direction == "in" { "→" } else { "←" };
-            Line::from(vec![
-                ts_span,
-                Span::styled(format!("◇ mcp {arrow}"), theme.muted),
-            ])
-        }
+        EventKind::McpMessage { .. } => Line::default(),
         EventKind::LockAcquired { file, owner, tool } => {
             let base = basename(file);
             let tool_label = tool.as_ref().map_or(String::new(), |t| format!(" ({t})"));
@@ -830,6 +860,7 @@ mod tests {
         let ev = make_event(EventKind::ToolCall {
             tool: "grep".to_string(),
             file: Some("/src/main.rs".to_string()),
+            params: None,
         });
         let plain = format_event_plain(&ev);
         assert!(plain.contains("grep"));

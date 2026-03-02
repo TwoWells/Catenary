@@ -643,10 +643,12 @@ mod tests {
             make_event(EventKind::ToolCall {
                 tool: "Hover".to_string(),
                 file: None,
+                params: None,
             }),
             make_event(EventKind::ToolCall {
                 tool: "hover".to_string(),
                 file: None,
+                params: None,
             }),
         ];
 

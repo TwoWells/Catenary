@@ -300,7 +300,8 @@ fn format_age(started: chrono::DateTime<chrono::Utc>) -> String {
 ///   items, separated by `─── Keys ───`.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
+    clippy::too_many_lines,
+    reason = "terminal coordinates are always small; match arms for tree items"
 )]
 pub fn render_tree(
     tree: &SessionTree,
@@ -309,9 +310,8 @@ pub fn render_tree(
     theme: &Theme,
     icons: &IconSet,
     focused: bool,
+    has_grid: bool,
 ) {
-    let _ = icons; // Reserved for future icon usage.
-
     if area.width < 4 || area.height < 1 {
         return;
     }
@@ -322,11 +322,30 @@ pub fn render_tree(
         theme.border_unfocused
     };
 
-    // Draw a simple border.
+    let border_set = if focused {
+        ratatui::symbols::border::THICK
+    } else {
+        ratatui::symbols::border::PLAIN
+    };
+
+    let title_style = if focused {
+        theme.title
+    } else {
+        theme.border_unfocused
+    };
+
+    // Sessions has no left border per PLAN.md L44-45.
+    // When there's no Events grid, Sessions needs its own right border.
+    let borders = if has_grid {
+        ratatui::widgets::Borders::TOP
+    } else {
+        ratatui::widgets::Borders::TOP | ratatui::widgets::Borders::RIGHT
+    };
     let block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
+        .borders(borders)
+        .border_set(border_set)
         .border_style(border_style)
-        .title(Span::styled(" Sessions ", theme.title));
+        .title(Span::styled(" Sessions ", title_style));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -344,17 +363,31 @@ pub fn render_tree(
         if y >= y_max {
             break;
         }
+        let is_cursor = i == tree.cursor;
         let line = match item {
             TreeItem::Workspace { node, .. } => {
-                let icon = if node.has_active { "● " } else { "○ " };
+                let collapse_icon = if node.collapsed {
+                    &icons.workspace_closed
+                } else {
+                    &icons.workspace_open
+                };
+                let status_icon = if node.has_active { "● " } else { "○ " };
                 let icon_style = if node.has_active {
                     theme.session_active
                 } else {
                     theme.session_dead
                 };
-                let path = format_workspace_path(&node.path, max_width.saturating_sub(2));
+                let path = format_workspace_path(&node.path, max_width.saturating_sub(4));
                 Line::from(vec![
-                    Span::styled(icon, icon_style),
+                    Span::styled(
+                        collapse_icon,
+                        if is_cursor {
+                            theme.selection
+                        } else {
+                            theme.text
+                        },
+                    ),
+                    Span::styled(status_icon, icon_style),
                     Span::styled(path.to_string(), theme.text),
                 ])
             }
@@ -386,6 +419,11 @@ pub fn render_tree(
             }
         };
         buf.set_line(inner.x, y, &line, inner.width);
+        if is_cursor {
+            for x in inner.x..inner.x + inner.width {
+                buf[(x, y)].set_style(theme.selection);
+            }
+        }
         y += 1;
     }
 
@@ -629,7 +667,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true, false);
             })
             .expect("draw");
 
@@ -657,7 +695,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true, false);
             })
             .expect("draw");
 
