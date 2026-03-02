@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1c6df230.js";
+            window.path_to_searchindex_js = "searchindex-383e25f5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -265,13 +265,13 @@ grepping — and the efficiency gains are lost.</p>
 <tr><td><strong>Eager Startup</strong></td><td>Servers for detected languages start at launch; others start on first file access</td></tr>
 <tr><td><strong>Smart Routing</strong></td><td>Requests automatically route to the correct server based on file type</td></tr>
 <tr><td><strong>Universal Support</strong></td><td>Works with any LSP-compliant language server</td></tr>
-<tr><td><strong>Full LSP Coverage</strong></td><td>Definitions, references, diagnostics, rename, code actions, and more</td></tr>
+<tr><td><strong>Full LSP Coverage</strong></td><td>Search, diagnostics with quick fixes, workspace browsing, and more</td></tr>
 <tr><td><strong>File I/O</strong></td><td>Read, write, and edit files with automatic LSP diagnostics</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="available-tools"><a class="header" href="#available-tools">Available Tools</a></h2>
-<h3 id="lsp-tools"><a class="header" href="#lsp-tools">LSP Tools</a></h3>
+<h3 id="mcp-tools"><a class="header" href="#mcp-tools">MCP Tools</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -279,53 +279,31 @@ grepping — and the efficiency gains are lost.</p>
 </thead>
 <tbody>
 <tr><td><code>search</code></td><td>Search for symbols, semantic references, and text matches (LSP workspace symbols + references + file heatmap)</td></tr>
-<tr><td><code>definition</code></td><td>Jump to where a symbol is defined</td></tr>
-<tr><td><code>type_definition</code></td><td>Jump to the type’s definition</td></tr>
-<tr><td><code>implementation</code></td><td>Find implementations of interfaces/traits</td></tr>
-<tr><td><code>document_symbols</code></td><td>Get the outline of a file</td></tr>
-<tr><td><code>code_actions</code></td><td>Get quick fixes and refactorings</td></tr>
-<tr><td><code>rename</code></td><td>Compute rename edits (does not modify files)</td></tr>
-<tr><td><code>diagnostics</code></td><td>Get errors and warnings</td></tr>
-<tr><td><code>call_hierarchy</code></td><td>See who calls a function / what it calls</td></tr>
-<tr><td><code>type_hierarchy</code></td><td>See type inheritance</td></tr>
-<tr><td><code>codebase_map</code></td><td>Generate a high-level file tree with symbols</td></tr>
+<tr><td><code>glob</code></td><td>Browse the workspace — file outlines, directory listings, or glob pattern matches with symbols</td></tr>
 </tbody>
 </table>
 </div>
-<p><strong>Deprecated (being merged into <code>search</code>):</strong></p>
+<h3 id="hook-driven-features"><a class="header" href="#hook-driven-features">Hook-Driven Features</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Tool</th><th>Description</th><th>Replacement</th></tr>
+<tr><th>Feature</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>hover</code></td><td>Get documentation and type info for a symbol</td><td><code>search</code> (symbols tier with hover enrichment)</td></tr>
-<tr><td><code>find_references</code></td><td>Find all references to a symbol</td><td><code>search</code> (references tier)</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="file-io-tools"><a class="header" href="#file-io-tools">File I/O Tools</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Tool</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>list_directory</code></td><td>List directory contents (files, dirs, symlinks)</td></tr>
+<tr><td><strong>Diagnostics</strong></td><td>Errors, warnings, and quick-fix suggestions delivered inline after every edit via the <code>catenary release</code> PostToolUse hook</td></tr>
 </tbody>
 </table>
 </div>
 <p>File reading and editing is handled by the host tool’s native file operations
 (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). Catenary provides <strong>post-edit
-LSP diagnostics</strong> via the <code>catenary release</code> hook — diagnostics appear in the
-model’s context after every edit. See <a href="cli-integration.html">CLI Integration</a>
-for hook configuration.</p>
-<p><code>list_directory</code> and <code>search</code> (with the optional <code>paths</code> parameter) can
-operate outside workspace roots — access control is delegated to the host
-CLI’s permission layer. LSP-backed operations (diagnostics, hover,
-definition, etc.) are gated to workspace roots because the language server
-has no knowledge of files outside them. Catenary config files are always
-protected from modification.</p>
+LSP diagnostics</strong> (including quick-fix code actions) via the <code>catenary release</code>
+hook — diagnostics and fix suggestions appear in the model’s context after
+every edit. See <a href="cli-integration.html">CLI Integration</a> for hook configuration.</p>
+<p><code>search</code> (with the optional <code>paths</code> parameter) and <code>glob</code> can operate outside
+workspace roots — access control is delegated to the host CLI’s permission
+layer. LSP-backed operations (diagnostics, hover, definition, etc.) are gated
+to workspace roots because the language server has no knowledge of files
+outside them. Catenary config files are always protected from modification.</p>
 
                     </main>
 

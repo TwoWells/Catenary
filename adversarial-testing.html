@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1c6df230.js";
+            window.path_to_searchindex_js = "searchindex-383e25f5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -195,10 +195,9 @@
 <hr>
 <h2 id="1-prompt-injection-via-lsp-content"><a class="header" href="#1-prompt-injection-via-lsp-content">1. Prompt Injection via LSP Content</a></h2>
 <blockquote>
-<p><strong>Note:</strong> <code>hover</code> is being merged into <code>search</code> (symbols tier with
-hover enrichment). These concerns apply to any tool that surfaces LSP
-content — workspace symbols in <code>search</code>, <code>document_symbols</code>,
-<code>code_actions</code>, etc.</p>
+<p><strong>Note:</strong> These concerns apply to any tool or hook that surfaces LSP
+content — workspace symbols in <code>search</code>, <code>glob</code> outlines, and
+quick-fix titles in the diagnostics hook output.</p>
 </blockquote>
 <p>LSP responses include docstrings, comments, and type annotations from source files. These reach the AI agent as tool output.</p>
 <h3 id="11-docstring-injection"><a class="header" href="#11-docstring-injection">1.1 Docstring injection</a></h3>

@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1c6df230.js";
+            window.path_to_searchindex_js = "searchindex-383e25f5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -220,6 +220,17 @@
 <tr><td><code>--publish-version</code></td><td>off</td><td>Include <code>version</code> field in <code>publishDiagnostics</code> notifications</td></tr>
 <tr><td><code>--progress-on-change</code></td><td>off</td><td>Send <code>$/progress</code> tokens around diagnostic computation on <code>didChange</code></td></tr>
 <tr><td><code>--cpu-busy &lt;ms&gt;</code></td><td>none</td><td>Burn CPU for N milliseconds after <code>didChange</code> without sending notifications</td></tr>
+<tr><td><code>--flycheck-command &lt;cmd&gt;</code></td><td>none</td><td>Spawn subprocess on <code>didSave</code> under a <code>$/progress</code> bracket (simulates cargo check)</td></tr>
+<tr><td><code>--flycheck-ticks &lt;n&gt;</code></td><td>none</td><td>Override <code>--ticks</code> passed to the flycheck subprocess</td></tr>
+<tr><td><code>--advertise-save</code></td><td>off</td><td>Include <code>textDocumentSync.save</code> in capabilities (required for <code>didSave</code>)</td></tr>
+<tr><td><code>--notification-log &lt;path&gt;</code></td><td>none</td><td>Write every received notification to a JSONL file for test verification</td></tr>
+<tr><td><code>--content-modified-once</code></td><td>off</td><td>Return <code>ContentModified</code> (-32801) on first <code>textDocument/definition</code>, then succeed</td></tr>
+<tr><td><code>--cpu-on-workspace-change &lt;ms&gt;</code></td><td>none</td><td>Burn CPU on <code>workspace/didChangeWorkspaceFolders</code></td></tr>
+<tr><td><code>--cpu-on-initialized &lt;ms&gt;</code></td><td>none</td><td>Burn CPU on <code>initialized</code> before indexing simulation</td></tr>
+<tr><td><code>--log-init-params &lt;path&gt;</code></td><td>none</td><td>Write the <code>initialize</code> request params JSON to a file</td></tr>
+<tr><td><code>--scan-roots</code></td><td>off</td><td>Scan workspace roots on initialize and folder changes, index files by extension</td></tr>
+<tr><td><code>--no-code-actions</code></td><td>off</td><td>Omit <code>codeActionProvider</code> capability; return empty code action arrays</td></tr>
+<tr><td><code>--multi-fix</code></td><td>off</td><td>Return two quickfix actions per diagnostic (primary + alternative)</td></tr>
 </tbody>
 </table>
 </div>
@@ -248,9 +259,18 @@
 <tr><td><code>initialize</code></td><td>Returns capabilities based on flags</td></tr>
 <tr><td><code>shutdown</code></td><td>Returns null</td></tr>
 <tr><td><code>textDocument/hover</code></td><td>Extracts word at position, returns as markdown code block</td></tr>
-<tr><td><code>textDocument/definition</code></td><td>Scans for definition pattern (<code>fn</code>, <code>function</code>, <code>def</code>, <code>let</code>, <code>const</code>, <code>var</code>); falls back to first occurrence</td></tr>
-<tr><td><code>textDocument/references</code></td><td>Returns all positions where the word appears in the document</td></tr>
+<tr><td><code>textDocument/definition</code></td><td>Scans for definition pattern (<code>fn</code>, <code>function</code>, <code>def</code>, <code>let</code>, <code>const</code>, <code>var</code>, <code>struct</code>, <code>class</code>, <code>enum</code>, <code>interface</code>, <code>trait</code>, <code>mod</code>, <code>module</code>, <code>type</code>, <code>method</code>, <code>field</code>); import-scoped resolution; cross-file fallback</td></tr>
+<tr><td><code>textDocument/typeDefinition</code></td><td>Resolves type via <code>: TypeName</code> annotation, searches for type declaration pattern</td></tr>
+<tr><td><code>textDocument/references</code></td><td>Returns all positions where the word appears across all documents</td></tr>
+<tr><td><code>textDocument/implementation</code></td><td>Same as references</td></tr>
 <tr><td><code>textDocument/documentSymbol</code></td><td>Scans for lines matching keyword patterns, returns <code>DocumentSymbol</code> array</td></tr>
+<tr><td><code>textDocument/codeAction</code></td><td>Returns quickfix actions for diagnostics with source “mockls”; always includes a <code>refactor</code> action (to exercise kind filtering). Controlled by <code>--no-code-actions</code> and <code>--multi-fix</code></td></tr>
+<tr><td><code>textDocument/prepareCallHierarchy</code></td><td>Returns call hierarchy item for symbol at position</td></tr>
+<tr><td><code>callHierarchy/incomingCalls</code></td><td>Searches for call sites by scanning for the symbol name in enclosing functions</td></tr>
+<tr><td><code>callHierarchy/outgoingCalls</code></td><td>Returns empty array</td></tr>
+<tr><td><code>textDocument/prepareTypeHierarchy</code></td><td>Returns type hierarchy item for symbol at position</td></tr>
+<tr><td><code>typeHierarchy/subtypes</code></td><td>Returns all struct/class declarations across documents</td></tr>
+<tr><td><code>typeHierarchy/supertypes</code></td><td>Returns empty array</td></tr>
 <tr><td><code>workspace/symbol</code></td><td>Searches across all stored documents</td></tr>
 </tbody>
 </table>
