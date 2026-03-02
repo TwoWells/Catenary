@@ -4,6 +4,10 @@
 //! Bridge handler that maps MCP tool calls to LSP requests.
 
 use anyhow::{Result, anyhow};
+use grep_matcher::Matcher;
+use grep_regex::RegexMatcherBuilder;
+use grep_searcher::{Searcher, Sink, SinkMatch};
+use ignore::WalkBuilder;
 use lsp_types::{
     CallHierarchyIncomingCallsParams, CallHierarchyPrepareParams, GotoDefinitionParams,
     GotoDefinitionResponse, HoverParams, ReferenceContext, ReferenceParams, SymbolInformation,
@@ -303,7 +307,7 @@ impl LspBridgeHandler {
         let roots = self.runtime.block_on(self.client_manager.roots());
 
         // 1. Ripgrep: get matched strings + file/line heatmap in one pass
-        let rg = Self::ripgrep_matches(&input.pattern, &roots);
+        let rg = Self::ripgrep_matches(&input.pattern, &roots)?;
 
         // 2. Symbol universe: workspace/symbol("") + regex filter, with rg fallback
         let symbols = self.runtime.block_on(async {
@@ -776,67 +780,144 @@ impl LspBridgeHandler {
         })
     }
 
-    /// Runs ripgrep with `--only-matching` and returns both matched strings
-    /// and per-file line numbers.
-    fn ripgrep_matches(pattern: &str, roots: &[PathBuf]) -> RipgrepMatches {
-        use std::process::Command;
+    /// Searches workspace roots for pattern matches using the `grep-*` crates
+    /// (ripgrep's internals). Walks files in parallel and returns matched
+    /// strings and per-file line numbers in a single pass per file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pattern is not a valid regex.
+    fn ripgrep_matches(pattern: &str, roots: &[PathBuf]) -> Result<RipgrepMatches> {
+        use ignore::WalkState;
+        use std::sync::Mutex as StdMutex;
 
-        let mut cmd = Command::new("rg");
-        cmd.args([
-            "--line-number",
-            "--no-heading",
-            "--ignore-case",
-            "--only-matching",
-            pattern,
-        ]);
+        let matcher = RegexMatcherBuilder::new()
+            .case_insensitive(true)
+            .build(pattern)
+            .map_err(|e| anyhow!("Invalid regex pattern: {e}"))?;
+
+        let collected = Arc::new(StdMutex::new(Vec::<ThreadMatches>::new()));
 
         for root in roots {
-            cmd.arg(root);
+            let walker = WalkBuilder::new(root)
+                .git_ignore(true)
+                .hidden(false)
+                .build_parallel();
+
+            walker.run(|| {
+                let matcher = matcher.clone();
+                let mut state = CollectOnDrop {
+                    local: ThreadMatches::default(),
+                    collected: Arc::clone(&collected),
+                };
+
+                Box::new(move |entry| {
+                    let Ok(entry) = entry else {
+                        return WalkState::Continue;
+                    };
+                    let path = entry.path();
+                    if !path.is_file() {
+                        return WalkState::Continue;
+                    }
+
+                    let path_str = path.to_string_lossy().to_string();
+                    let mut sink = MatchSink {
+                        matcher: &matcher,
+                        path: &path_str,
+                        local: &mut state.local,
+                    };
+
+                    if let Err(e) = Searcher::new().search_path(&matcher, path, &mut sink) {
+                        warn!("grep: skipping {path_str}: {e}");
+                    }
+
+                    WalkState::Continue
+                })
+            });
         }
 
-        let Ok(rg_output) = cmd.output() else {
-            return RipgrepMatches::default();
+        let parts = Arc::into_inner(collected)
+            .ok_or_else(|| anyhow!("walker threads still hold references"))?
+            .into_inner()
+            .map_err(|e| anyhow!("lock poisoned: {e}"))?;
+
+        Ok(RipgrepMatches::merge(parts))
+    }
+}
+
+/// Wrapper that pushes per-thread match data into a shared collector on drop.
+/// Each parallel walker thread owns one of these; when `run()` returns and the
+/// closures are dropped, each thread's accumulated matches are flushed.
+struct CollectOnDrop {
+    local: ThreadMatches,
+    collected: Arc<std::sync::Mutex<Vec<ThreadMatches>>>,
+}
+
+impl Drop for CollectOnDrop {
+    fn drop(&mut self) {
+        let local = std::mem::take(&mut self.local);
+        if local.file_lines.is_empty() && local.matched_set.is_empty() {
+            return;
+        }
+        if let Ok(mut vec) = self.collected.lock() {
+            vec.push(local);
+        }
+    }
+}
+
+/// Collects per-file match data for the ripgrep library search.
+struct MatchSink<'a> {
+    matcher: &'a grep_regex::RegexMatcher,
+    path: &'a str,
+    local: &'a mut ThreadMatches,
+}
+
+impl Sink for MatchSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let Some(line_num) = mat
+            .line_number()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0)
+        else {
+            return Ok(true);
         };
 
-        if !rg_output.status.success() && rg_output.stdout.is_empty() {
-            return RipgrepMatches::default();
+        let line_bytes = mat.bytes();
+
+        // Extract each individual match from the line (--only-matching equivalent)
+        let mut at = 0;
+        while at < line_bytes.len() {
+            let Ok(Some(m)) = self.matcher.find_at(line_bytes, at) else {
+                break;
+            };
+            if m.start() == m.end() {
+                // Zero-width match — advance to avoid infinite loop
+                at = m.end() + 1;
+                continue;
+            }
+            if let Ok(text) = std::str::from_utf8(&line_bytes[m]) {
+                let text = text.to_string();
+                self.local.matched_set.insert(text.clone());
+                self.local
+                    .file_line_texts
+                    .entry(self.path.to_string())
+                    .or_default()
+                    .entry(line_num)
+                    .or_default()
+                    .push(text);
+            }
+            at = m.end();
         }
 
-        let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-        let mut matched_set: HashSet<String> = HashSet::new();
-        let mut file_line_texts: HashMap<String, HashMap<u32, Vec<String>>> = HashMap::new();
-        let stdout = String::from_utf8_lossy(&rg_output.stdout);
+        self.local
+            .file_lines
+            .entry(self.path.to_string())
+            .or_default()
+            .push(line_num);
 
-        // --only-matching output format: file:line:matched_text
-        for line in stdout.lines() {
-            let Some((file, rest)) = line.split_once(':') else {
-                continue;
-            };
-            let Some((line_str, matched_text)) = rest.split_once(':') else {
-                continue;
-            };
-            let Ok(line_num) = line_str.parse::<u32>() else {
-                continue;
-            };
-
-            file_lines
-                .entry(file.to_string())
-                .or_default()
-                .push(line_num);
-            matched_set.insert(matched_text.to_string());
-            file_line_texts
-                .entry(file.to_string())
-                .or_default()
-                .entry(line_num)
-                .or_default()
-                .push(matched_text.to_string());
-        }
-
-        RipgrepMatches {
-            matched_strings: matched_set.into_iter().collect(),
-            file_lines,
-            file_line_texts,
-        }
+        Ok(true)
     }
 }
 
@@ -984,6 +1065,45 @@ struct RipgrepMatches {
     /// Per-file line numbers (for heatmap tier).
     file_lines: BTreeMap<String, Vec<u32>>,
     /// Per-file, per-line matched texts (for routing unclaimed lines to headings).
+    file_line_texts: HashMap<String, HashMap<u32, Vec<String>>>,
+}
+
+impl RipgrepMatches {
+    /// Merges per-thread match accumulators into a single result.
+    fn merge(parts: Vec<ThreadMatches>) -> Self {
+        let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        let mut matched_set: HashSet<String> = HashSet::new();
+        let mut file_line_texts: HashMap<String, HashMap<u32, Vec<String>>> = HashMap::new();
+
+        for part in parts {
+            for (file, lines) in part.file_lines {
+                file_lines.entry(file).or_default().extend(lines);
+            }
+            matched_set.extend(part.matched_set);
+            for (file, line_map) in part.file_line_texts {
+                let entry = file_line_texts.entry(file).or_default();
+                for (line, texts) in line_map {
+                    entry.entry(line).or_default().extend(texts);
+                }
+            }
+        }
+
+        Self {
+            matched_strings: matched_set.into_iter().collect(),
+            file_lines,
+            file_line_texts,
+        }
+    }
+}
+
+/// Per-thread match accumulator used during parallel file walking.
+#[derive(Default)]
+struct ThreadMatches {
+    /// Per-file line numbers.
+    file_lines: BTreeMap<String, Vec<u32>>,
+    /// Unique matched strings (`HashSet` for efficient per-thread dedup).
+    matched_set: HashSet<String>,
+    /// Per-file, per-line matched texts.
     file_line_texts: HashMap<String, HashMap<u32, Vec<String>>>,
 }
 
