@@ -14,7 +14,7 @@ use lsp_types::{
     PublishDiagnosticsParams, ReferenceParams, ServerCapabilities, TextDocumentIdentifier,
     TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
     TypeHierarchySupertypesParams, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -826,6 +826,12 @@ impl LspClient {
                     ..Default::default()
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
+                    symbol: Some(lsp_types::WorkspaceSymbolClientCapabilities {
+                        resolve_support: Some(lsp_types::WorkspaceSymbolResolveSupportCapability {
+                            properties: vec!["location.range".to_string()],
+                        }),
+                        ..Default::default()
+                    }),
                     workspace_folders: Some(true),
                     configuration: Some(true),
                     ..Default::default()
@@ -1086,6 +1092,26 @@ impl LspClient {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
         self.request("workspace/symbol", params).await
+    }
+
+    /// Resolves additional properties (e.g. `location.range`) for a workspace symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
+    pub async fn workspace_symbol_resolve(
+        &self,
+        params: WorkspaceSymbol,
+    ) -> Result<Option<WorkspaceSymbol>> {
+        self.request("workspaceSymbol/resolve", params).await
+    }
+
+    /// Returns whether the server advertises `workspaceSymbol/resolve` support.
+    pub fn supports_workspace_symbol_resolve(&self) -> bool {
+        matches!(
+            &self.server_capabilities.workspace_symbol_provider,
+            Some(lsp_types::OneOf::Right(opts)) if opts.resolve_provider == Some(true)
+        )
     }
 
     /// Prepares call hierarchy for a position.
