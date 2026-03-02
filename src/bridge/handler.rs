@@ -5,9 +5,10 @@
 
 use anyhow::{Result, anyhow};
 use lsp_types::{
-    HoverParams, ReferenceContext, ReferenceParams, SymbolInformation, SymbolKind,
-    TextDocumentIdentifier, TextDocumentPositionParams, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    CallHierarchyIncomingCallsParams, CallHierarchyPrepareParams, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, ReferenceContext, ReferenceParams, SymbolInformation,
+    SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -22,9 +23,10 @@ use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
-/// Maximum unique LSP symbols for full enrichment (hover + references).
+/// Maximum unique LSP symbols for full enrichment (hover + references +
+/// labeled incoming calls / implementations / subtypes).
 /// Above this threshold, symbols are rendered with name + kind + location only.
-const GREP_ENRICHMENT_THRESHOLD: usize = 5;
+const GREP_ENRICHMENT_THRESHOLD: usize = 10;
 
 use super::{DocumentManager, DocumentNotification};
 
@@ -418,12 +420,43 @@ impl LspBridgeHandler {
                                 let _ = writeln!(output, "\n{hover}");
                             }
 
-                            // References (excluding definition line)
+                            // Labeled sections + collect labeled lines for dedup
+                            let mut labeled_lines: HashSet<(String, u32)> = HashSet::new();
+
+                            if !enrichment.incoming_calls.is_empty() {
+                                let _ = writeln!(output, "\nCalled by:");
+                                for (name, file, line) in &enrichment.incoming_calls {
+                                    let path = display_path(file, &roots);
+                                    let _ = writeln!(output, "  {name}  {path}:{line}");
+                                    labeled_lines.insert((file.clone(), *line));
+                                }
+                            }
+
+                            if !enrichment.implementations.is_empty() {
+                                let _ = writeln!(output, "\nImplementations:");
+                                for (file, line) in &enrichment.implementations {
+                                    let path = display_path(file, &roots);
+                                    let _ = writeln!(output, "  {path}:{line}");
+                                    labeled_lines.insert((file.clone(), *line));
+                                }
+                            }
+
+                            if !enrichment.subtypes.is_empty() {
+                                let _ = writeln!(output, "\nSubtypes:");
+                                for (name, file, line) in &enrichment.subtypes {
+                                    let path = display_path(file, &roots);
+                                    let _ = writeln!(output, "  {name}  {path}:{line}");
+                                    labeled_lines.insert((file.clone(), *line));
+                                }
+                            }
+
+                            // References (excluding definition line and labeled lines)
                             let ref_output = format_symbol_references(
                                 enrichment,
                                 sym.location.uri.path().as_str(),
                                 sym.location.range.start.line,
                                 &roots,
+                                &labeled_lines,
                             );
                             if !ref_output.is_empty() {
                                 let _ = writeln!(output, "\n{ref_output}");
@@ -590,10 +623,12 @@ impl LspBridgeHandler {
         all_symbols
     }
 
-    /// Enriches a symbol with hover and references.
+    /// Enriches a symbol with hover, references, and kind-specific labels.
+    #[allow(clippy::too_many_lines, reason = "Sequential LSP calls by kind")]
     fn enrich_symbol(&self, sym: &SymbolInformation) -> SymbolEnrichment {
         let path = PathBuf::from(sym.location.uri.path().as_str());
         let position = sym.location.range.start;
+        let kind = sym.kind;
 
         self.runtime.block_on(async {
             let mut enrichment = SymbolEnrichment::default();
@@ -623,7 +658,7 @@ impl LspBridgeHandler {
             if caps.references_provider.is_some() {
                 let params = ReferenceParams {
                     text_document_position: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri },
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
                         position,
                     },
                     work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
@@ -641,6 +676,100 @@ impl LspBridgeHandler {
                             .insert(loc.range.start.line + 1);
                     }
                 }
+            }
+
+            // Kind-specific enrichment
+            match kind {
+                // Functions/methods/constructors → incoming calls
+                SymbolKind::FUNCTION | SymbolKind::METHOD | SymbolKind::CONSTRUCTOR => {
+                    if caps.call_hierarchy_provider.is_some() {
+                        let prepare_params = CallHierarchyPrepareParams {
+                            text_document_position_params: TextDocumentPositionParams {
+                                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                position,
+                            },
+                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                        };
+                        if let Ok(Some(items)) = client.prepare_call_hierarchy(prepare_params).await
+                        {
+                            for item in items {
+                                let params = CallHierarchyIncomingCallsParams {
+                                    item,
+                                    work_done_progress_params:
+                                        lsp_types::WorkDoneProgressParams::default(),
+                                    partial_result_params: lsp_types::PartialResultParams::default(
+                                    ),
+                                };
+                                if let Ok(Some(calls)) = client.incoming_calls(params).await {
+                                    for call in calls {
+                                        enrichment.incoming_calls.push((
+                                            call.from.name,
+                                            call.from.uri.path().to_string(),
+                                            call.from.range.start.line + 1,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Structs/classes/enums → implementations
+                SymbolKind::STRUCT | SymbolKind::CLASS | SymbolKind::ENUM => {
+                    if caps.implementation_provider.is_some() {
+                        let params = GotoDefinitionParams {
+                            text_document_position_params: TextDocumentPositionParams {
+                                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                position,
+                            },
+                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                            partial_result_params: lsp_types::PartialResultParams::default(),
+                        };
+                        if let Ok(Some(response)) = client.implementation(params).await {
+                            for loc in goto_definition_locations(&response) {
+                                enrichment
+                                    .implementations
+                                    .push((loc.uri.path().to_string(), loc.range.start.line + 1));
+                            }
+                        }
+                    }
+                }
+
+                // Interfaces/traits → subtypes
+                SymbolKind::INTERFACE => {
+                    if client.supports_type_hierarchy() {
+                        let prepare_params = TypeHierarchyPrepareParams {
+                            text_document_position_params: TextDocumentPositionParams {
+                                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                                position,
+                            },
+                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                        };
+                        if let Ok(Some(items)) = client.prepare_type_hierarchy(prepare_params).await
+                        {
+                            for item in items {
+                                let params = TypeHierarchySubtypesParams {
+                                    item,
+                                    work_done_progress_params:
+                                        lsp_types::WorkDoneProgressParams::default(),
+                                    partial_result_params: lsp_types::PartialResultParams::default(
+                                    ),
+                                };
+                                if let Ok(Some(sub_items)) = client.subtypes(params).await {
+                                    for sub in sub_items {
+                                        enrichment.subtypes.push((
+                                            sub.name,
+                                            sub.uri.path().to_string(),
+                                            sub.range.start.line + 1,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                _ => {}
             }
 
             enrichment
@@ -716,7 +845,7 @@ impl ToolHandler for LspBridgeHandler {
         vec![
             Tool {
                 name: "grep".to_string(),
-                description: Some("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Returns per-symbol sections with definitions, hover docs, and references (≤5 symbols) or name+kind+location (>5).".to_string()),
+                description: Some("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Returns per-symbol sections with definitions, hover docs, and references (≤10 symbols) or name+kind+location (>10).".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -839,6 +968,12 @@ struct SymbolEnrichment {
     hover: Option<String>,
     /// Reference line numbers per file (for deduplication).
     ref_lines: HashMap<String, HashSet<u32>>,
+    /// Incoming calls: `(caller_name, file_path, line_1based)`.
+    incoming_calls: Vec<(String, String, u32)>,
+    /// Implementation locations: `(file_path, line_1based)`.
+    implementations: Vec<(String, u32)>,
+    /// Subtypes: `(type_name, file_path, line_1based)`.
+    subtypes: Vec<(String, String, u32)>,
 }
 
 /// Result of a ripgrep `--only-matching` search.
@@ -932,12 +1067,14 @@ fn format_single_range(start: u32, end: u32) -> String {
     }
 }
 
-/// Formats references from enrichment, excluding the definition line.
+/// Formats references from enrichment, excluding the definition line
+/// and any lines already shown in labeled sections.
 fn format_symbol_references(
     enrichment: &SymbolEnrichment,
     def_file: &str,
     def_line_0: u32,
     roots: &[PathBuf],
+    labeled_lines: &HashSet<(String, u32)>,
 ) -> String {
     use std::fmt::Write;
 
@@ -950,11 +1087,17 @@ fn format_symbol_references(
 
     for file in files {
         let lines = &enrichment.ref_lines[file];
-        // Filter out the definition line
+        // Filter out the definition line and labeled lines
+        let is_def_file = file.as_str() == def_file;
         let mut filtered: Vec<u32> = lines
             .iter()
             .copied()
-            .filter(|&l| !(file.as_str() == def_file && l == def_line_1))
+            .filter(|&l| {
+                if is_def_file && l == def_line_1 {
+                    return false;
+                }
+                !labeled_lines.contains(&(file.clone(), l))
+            })
             .collect();
         if filtered.is_empty() {
             continue;
@@ -967,6 +1110,21 @@ fn format_symbol_references(
     let trimmed_len = output.trim_end().len();
     output.truncate(trimmed_len);
     output
+}
+
+/// Extracts locations from a `GotoDefinitionResponse`.
+fn goto_definition_locations(response: &GotoDefinitionResponse) -> Vec<lsp_types::Location> {
+    match response {
+        GotoDefinitionResponse::Scalar(loc) => vec![loc.clone()],
+        GotoDefinitionResponse::Array(locs) => locs.clone(),
+        GotoDefinitionResponse::Link(links) => links
+            .iter()
+            .map(|link| lsp_types::Location {
+                uri: link.target_uri.clone(),
+                range: link.target_range,
+            })
+            .collect(),
+    }
 }
 
 /// Assigns rg file/line hits to symbol names based on LSP reference data
@@ -1143,11 +1301,13 @@ mod tests {
         let enrichment = SymbolEnrichment {
             hover: None,
             ref_lines,
+            ..SymbolEnrichment::default()
         };
         let roots = vec![PathBuf::from("/")];
+        let labeled = HashSet::new();
 
         // Definition is at line 0 (0-indexed) = line 1 (1-indexed)
-        let result = format_symbol_references(&enrichment, "/src/lib.rs", 0, &roots);
+        let result = format_symbol_references(&enrichment, "/src/lib.rs", 0, &roots, &labeled);
         assert!(result.contains("L10"));
         assert!(result.contains("L20"));
         assert!(

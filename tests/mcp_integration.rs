@@ -1599,20 +1599,24 @@ fn test_grep_alternation() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that >5 unique symbols skips enrichment: no References section,
+/// Verifies that >10 unique symbols skips enrichment: no References section,
 /// no hover content, but Symbols with name + kind + location are present.
 #[test]
 fn test_grep_enrichment_threshold_broad() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // Create 6 unique functions to exceed GREP_ENRICHMENT_THRESHOLD (5)
+    // Create 11 unique functions to exceed GREP_ENRICHMENT_THRESHOLD (10)
     let test_file = dir.path().join(format!("many.{MOCK_LANG_A}"));
     std::fs::write(
         &test_file,
         "fn zz_broad_one()\nfn zz_broad_two()\nfn zz_broad_three()\n\
          fn zz_broad_four()\nfn zz_broad_five()\nfn zz_broad_six()\n\
+         fn zz_broad_seven()\nfn zz_broad_eight()\nfn zz_broad_nine()\n\
+         fn zz_broad_ten()\nfn zz_broad_eleven()\n\
          zz_broad_one\nzz_broad_two\nzz_broad_three\n\
-         zz_broad_four\nzz_broad_five\nzz_broad_six\n",
+         zz_broad_four\nzz_broad_five\nzz_broad_six\n\
+         zz_broad_seven\nzz_broad_eight\nzz_broad_nine\n\
+         zz_broad_ten\nzz_broad_eleven\n",
     )?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -1626,7 +1630,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         "method": "tools/call",
         "params": {
             "name": "grep",
-            "arguments": { "pattern": "zz_broad_one|zz_broad_two|zz_broad_three|zz_broad_four|zz_broad_five|zz_broad_six" }
+            "arguments": { "pattern": "zz_broad_one|zz_broad_two|zz_broad_three|zz_broad_four|zz_broad_five|zz_broad_six|zz_broad_seven|zz_broad_eight|zz_broad_nine|zz_broad_ten|zz_broad_eleven" }
         }
     }))?;
 
@@ -1650,7 +1654,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         "Expected [Function] kind in broad search, got: {text}"
     );
 
-    // Hover content should NOT be present when >5 symbols (no code blocks)
+    // Hover content should NOT be present when >10 symbols (no code blocks)
     assert!(
         !text.contains("```"),
         "Non-enriched output should not have hover code blocks, got: {text}"
@@ -1989,6 +1993,144 @@ fn test_grep_cross_server_same_symbol() -> Result<()> {
     assert!(
         text.contains(&format!("shared.{MOCK_LANG_B}")),
         "Expected shared.{MOCK_LANG_B} in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that enriched output for functions includes a "Called by:" section
+/// listing the enclosing caller name.
+#[test]
+fn test_grep_enrichment_incoming_calls() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let test_file = dir.path().join(format!("calls.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn callee_fn()\nfn caller_fn()\n  callee_fn\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 950,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "callee_fn" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep incoming calls should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text for incoming calls")?;
+
+    assert!(
+        text.contains("Called by:"),
+        "Expected 'Called by:' section, got:\n{text}"
+    );
+    assert!(
+        text.contains("caller_fn"),
+        "Expected caller_fn in 'Called by:' section, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that enriched output for structs includes an "Implementations:" section.
+#[test]
+fn test_grep_enrichment_implementations() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // mockls routes textDocument/implementation to handle_references,
+    // so any reference location will appear as an implementation entry.
+    let test_file = dir.path().join(format!("impls.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "struct MyStruct\nMyStruct\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 960,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "MyStruct" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep implementations should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text for implementations")?;
+
+    assert!(
+        text.contains("Implementations:"),
+        "Expected 'Implementations:' section, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that enriched output for interfaces includes a "Subtypes:" section.
+#[test]
+fn test_grep_enrichment_subtypes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let test_file = dir.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "interface Animal\nstruct Dog\nclass Cat\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 970,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "Animal" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep subtypes should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text for subtypes")?;
+
+    assert!(
+        text.contains("Subtypes:"),
+        "Expected 'Subtypes:' section, got:\n{text}"
+    );
+    assert!(
+        text.contains("Dog"),
+        "Expected Dog in 'Subtypes:' section, got:\n{text}"
+    );
+    assert!(
+        text.contains("Cat"),
+        "Expected Cat in 'Subtypes:' section, got:\n{text}"
     );
 
     Ok(())

@@ -1808,7 +1808,8 @@ async fn run_doctor(args: Args, nocolor: bool, show_diff: bool) -> Result<()> {
             .await
         {
             Ok(result) => {
-                let tools = extract_capabilities(&result.capabilities);
+                let tools =
+                    extract_capabilities(&result.capabilities, client.supports_type_hierarchy());
                 println!(
                     "{}  {}  {}",
                     lang_display,
@@ -1866,7 +1867,10 @@ fn binary_exists(command: &str) -> bool {
 }
 
 /// Extracts Catenary tool names from LSP `ServerCapabilities`.
-fn extract_capabilities(caps: &lsp_types::ServerCapabilities) -> Vec<&'static str> {
+fn extract_capabilities(
+    caps: &lsp_types::ServerCapabilities,
+    type_hierarchy: bool,
+) -> Vec<&'static str> {
     let mut tools = Vec::new();
 
     if caps.hover_provider.is_some() {
@@ -1899,8 +1903,9 @@ fn extract_capabilities(caps: &lsp_types::ServerCapabilities) -> Vec<&'static st
     if caps.call_hierarchy_provider.is_some() {
         tools.push("call_hierarchy");
     }
-    // type_hierarchy_provider is not exposed as a direct field in lsp_types 0.97;
-    // type hierarchy support is probed at call time, so we omit it here.
+    if type_hierarchy {
+        tools.push("type_hierarchy");
+    }
 
     tools
 }

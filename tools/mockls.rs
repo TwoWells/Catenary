@@ -667,6 +667,7 @@ impl MockServer {
             "documentSymbolProvider": true,
             "workspaceSymbolProvider": workspace_symbol_value,
             "callHierarchyProvider": true,
+            "typeHierarchyProvider": true,
             "textDocumentSync": text_doc_sync
         });
 
