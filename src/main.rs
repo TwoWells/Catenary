@@ -1898,9 +1898,6 @@ fn extract_capabilities(
     if caps.code_action_provider.is_some() {
         tools.push("code_actions");
     }
-    if caps.rename_provider.is_some() {
-        tools.push("rename");
-    }
     if caps.call_hierarchy_provider.is_some() {
         tools.push("call_hierarchy");
     }

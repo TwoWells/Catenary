@@ -44,7 +44,7 @@ Preserved from the original CLI design:
 
 ### Gemini CLI
 
-Location: `~/.gemini/policies/` (user) or `.gemini/settings.json` (workspace)
+Location: `~/.gemini/settings.json` (user) or `.gemini/settings.json` (workspace)
 
 **Recommended: Extension + Constrained Mode.**
 
@@ -57,139 +57,9 @@ Location: `~/.gemini/policies/` (user) or `.gemini/settings.json` (workspace)
     gemini extensions install https://github.com/MarkWells-Dev/Catenary
     ```
 
-2.  **Constrained mode.** Use the Policy Engine to deny text-scanning commands while
-    keeping Gemini's native file I/O and shell tools available. Create the file
-    `~/.gemini/policies/catenary-constrained.toml`:
-
-```toml
-# Catenary constrained mode — forces LSP-first navigation
-# Place in ~/.gemini/policies/catenary-constrained.toml
-
-# --- 1. Search (Grep Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "rg", "ag", "ack", "fd",
-  "grep", "egrep", "fgrep", "rgrep", "zgrep",
-  "git grep",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's search tool instead."
-
-# --- 2. Navigation (Listing Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "ls", "dir", "vdir", "tree", "find",
-  "locate", "mlocate", "whereis", "which",
-  "git ls-files", "git ls-tree",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-
-# --- 3. Peeking (Reading Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "cat", "head", "tail", "more", "less", "nl",
-  "od", "hexdump", "xxd", "strings", "dd", "tee",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use the native read_file tool instead."
-
-# --- 4. Text Processing (Scripting Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "awk", "sed", "perl",
-  "cut", "paste", "sort", "uniq", "join",
-]
-decision = "deny"
-priority = 900
-deny_message = "Text processing commands are not allowed in constrained mode."
-
-# --- 5. Reconnaissance (Metadata Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = ["file", "stat", "du", "df"]
-decision = "deny"
-priority = 900
-deny_message = "Metadata commands are not allowed in constrained mode."
-
-# --- 6. Executors & Shells (The Wrapper Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "bash", "sh", "zsh", "dash", "fish",
-  "ash", "csh", "ksh", "tcsh",
-]
-decision = "deny"
-priority = 900
-deny_message = "Shell wrappers are not allowed in constrained mode."
-
-# --- 7. The Command Runners (Prevents Masquerading) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "env", "sudo", "su", "nohup", "timeout", "watch", "time",
-  "eval", "exec", "command", "builtin", "type", "hash",
-]
-decision = "deny"
-priority = 900
-deny_message = "Command runners are not allowed in constrained mode."
-
-# --- 8. The Multiplexers ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = ["xargs", "parallel"]
-decision = "deny"
-priority = 900
-deny_message = "Multiplexers are not allowed in constrained mode."
-
-# --- 9. Framework Tool Blocks ---
-[[rule]]
-toolName = "grep_search"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's search tool instead."
-
-[[rule]]
-toolName = "glob"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-
-[[rule]]
-toolName = "read_many_files"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's LSP tools for code navigation."
-
-[[rule]]
-toolName = "list_directory"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-```
-
-Then add the MCP server to `.gemini/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "catenary": {
-      "command": "catenary"
-    }
-  }
-}
-```
-
-**Alternative: constrained-bash hook.** Instead of the policy engine, you can
-use the same `scripts/constrained_bash.py` script from the repo with Gemini's
-`BeforeTool` hook system.
+2.  **Constrained mode.** Use the `constrained_bash.py` hook to deny
+    text-scanning commands while keeping Gemini's native file I/O and
+    shell tools available.
 
 **Install:**
 
@@ -214,6 +84,11 @@ chmod +x ~/.gemini/hooks/constrained_bash.py
         ]
       }
     ]
+  },
+  "mcpServers": {
+    "catenary": {
+      "command": "catenary"
+    }
   }
 }
 ```
@@ -324,7 +199,7 @@ chmod +x /path/to/catenary/scripts/constrained_bash.py
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/hooks/constrained_bash.py"
+            "command": "$HOME/.claude/hooks/constrained_bash.py --format=claude"
           }
         ]
       }
@@ -333,7 +208,7 @@ chmod +x /path/to/catenary/scripts/constrained_bash.py
 }
 ```
 
-The script provides specific guidance per command (`Use Catenary's search tool
+The script provides specific guidance per command (`Use Catenary's grep tool
 instead.`, `Use the Read tool instead.`, etc.) so the model corrects course
 immediately rather than attempting workarounds.
 
@@ -363,32 +238,43 @@ immediately rather than attempting workarounds.
 This keeps `Bash` available for build/test/git commands while blocking every
 path that would let the model fall back to text scanning. The model uses:
 
-- **Catenary LSP tools** for navigation (`search`, `hover`, `definition`, etc.)
-- **Catenary `list_directory`** for directory browsing (replaces `ls`, `tree`, `find`)
+- **Catenary `grep`** for content discovery (symbols, references, text matches)
+- **Catenary `glob`** for directory browsing (replaces `ls`, `tree`, `find`)
 - **Claude Code `Read`/`Edit`/`Write`** for file I/O (with `catenary release` hook for diagnostics)
 - **Claude Code `Bash`** for build, test, and git commands only
 
 ## Experiment Results
 
-### Current: Policy Engine (Gemini) + Deny List (Claude)
+### Current: `constrained_bash.py` hook (both hosts)
 
 Validated 2026-02-17.
 
 | Test                     | Gemini CLI                | Claude Code                                 |
 | ------------------------ | ------------------------- | ------------------------------------------- |
-| Restriction method       | Policy Engine (`deny`)    | `permissions.deny` list + block `Grep/Glob/Task` |
+| Restriction method       | `BeforeTool` hook         | `PreToolUse` hook                           |
 | MCP tools discovered     | ✓                         | ✓                                           |
 | Text scanning blocked    | ✓                         | ✓                                           |
 | Model adapts gracefully  | ✓ (immediately)           | ✓ (immediately)                             |
 | Sub-agent escape blocked | N/A                       | ✓ (requires denying `Task`)                 |
 
-The policy engine approach gives models clear feedback on *why* a tool is
-blocked and *what to use instead* (via `deny_message`). This eliminates the
-thrashing seen with earlier approaches — models go straight to Catenary tools
-on the first turn without attempting workarounds.
+Both hosts use the same `constrained_bash.py` script (with `--format=claude`
+or `--format=gemini`). The hook approach was chosen over the hosts' native
+permission systems (Gemini's Policy Engine, Claude Code's `permissions.deny`
+list) because the Python script can make context-sensitive decisions — for
+example, allowing pipeline-safe commands like `head`, `tail`, `sed`, and `awk`
+mid-pipeline (reading from stdin) while blocking them at the start of a command
+(reading from files). Static deny lists cannot distinguish these cases.
 
 Tested with `gemini-3-flash-preview` and `claude-opus-4-6`. Both adapted
 on the first prompt with zero fallback attempts.
+
+### Historical: Policy Engine (Gemini) + Deny List (Claude)
+
+Validated 2026-02-17, superseded by the hook approach above.
+
+Used Gemini's Policy Engine (`deny` rules in TOML) and Claude Code's
+`permissions.deny` list. Both gave clear feedback but lacked the flexibility
+to allow context-dependent exceptions (e.g. pipeline-safe commands).
 
 ### Historical: `tools.core` Allowlist (Gemini, deprecated)
 
@@ -403,16 +289,13 @@ by giving explicit deny messages instead of silently removing tools.
 
 ## Catenary Tool Coverage
 
-Catenary provides LSP intelligence and directory browsing:
+Catenary exposes two MCP tools plus post-edit diagnostics via hooks:
 
-| Tool                | Category  | Notes                                    |
-| ------------------- | --------- | ---------------------------------------- |
-| `list_directory`    | File I/O  | Files, dirs, symlinks                    |
-| `search`            | LSP       | Symbols + semantic references + text matches |
-| `codebase_map`      | LSP       | File tree with symbols                   |
-| `document_symbols`  | LSP       | File structure                           |
-| `diagnostics`       | LSP       | Errors, warnings                         |
-| ...                 | LSP       | [Full list](overview.md#available-tools) |
+| Tool   | Category  | Notes                                              |
+| ------ | --------- | -------------------------------------------------- |
+| `grep` | LSP+text  | Symbols, references, hover, implementations, text heatmap |
+| `glob` | File I/O  | Files, dirs, symlinks, symbol outlines             |
+| hooks  | LSP       | Post-edit diagnostics and code actions              |
 
 File I/O is handled by the host tool's native file operations. Catenary
 provides post-edit diagnostics via the `catenary release` hook.
@@ -421,14 +304,10 @@ provides post-edit diagnostics via the `catenary release` hook.
 
 ### LSP Dependency
 
-Some operations require LSP:
-
-- Find references (no grep fallback currently)
-- Rename symbol
-- Code actions
-
-If LSP is unavailable for a language, these tools return errors. `search` has
-a grep fallback for basic text matching when no LSP server covers the file.
+Semantic enrichment in `grep` (references, implementations, type cross-refs)
+requires a running LSP server. When no LSP server covers a file, `grep` falls
+back to text-only matching. Code actions are delivered via hooks and also
+require LSP.
 
 ## See Also
 
