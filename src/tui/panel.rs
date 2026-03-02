@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -85,6 +86,8 @@ pub struct PanelState<'a> {
     pub expanded: HashSet<usize>,
     /// Active visual selection, if any.
     pub visual_selection: Option<VisualSelection>,
+    /// Last known viewport height (updated each render frame).
+    pub viewport_height: usize,
     /// Semantic color theme (borrowed from the application).
     pub theme: &'a Theme,
     /// Resolved icon set (borrowed from the application).
@@ -111,6 +114,7 @@ impl<'a> PanelState<'a> {
             language_servers: Vec::new(),
             expanded: HashSet::new(),
             visual_selection: None,
+            viewport_height: 0,
             theme,
             icons,
         }
@@ -177,6 +181,45 @@ impl<'a> PanelState<'a> {
         }
 
         self.snap_viewport(0);
+    }
+
+    /// Scroll viewport by `delta` lines without moving the cursor.
+    ///
+    /// Used for mouse wheel: moves `scroll_offset` only, detaches tail on
+    /// scroll-up, reattaches when scrolled to the very bottom.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "terminal item counts never overflow isize"
+    )]
+    pub fn scroll_viewport(&mut self, delta: isize) {
+        let total = self.total_lines();
+        if total == 0 {
+            return;
+        }
+
+        if delta < 0 {
+            self.tail_attached = false;
+        }
+
+        let new_offset = (self.scroll_offset as isize + delta)
+            .max(0)
+            .min(total.saturating_sub(1) as isize);
+
+        #[allow(clippy::cast_sign_loss, reason = "clamped to >= 0")]
+        {
+            self.scroll_offset = new_offset as usize;
+        }
+
+        // Reattach tail if scrolled to the very bottom.
+        let vh = if self.viewport_height > 0 {
+            self.viewport_height
+        } else {
+            20
+        };
+        if self.scroll_offset + vh >= total {
+            self.tail_attached = true;
+        }
     }
 
     /// Jump to first event — `g` key.
@@ -263,11 +306,16 @@ impl<'a> PanelState<'a> {
 
     /// Snap viewport so cursor is centered (`scrolloff=999` behavior).
     ///
-    /// `height` of 0 means use the last known height (stored in `scroll_offset`
-    /// context). The caller can pass a concrete height for rendering.
+    /// `height` of 0 means use the last known viewport height from the
+    /// previous render frame. Falls back to 20 if never rendered.
     fn snap_viewport(&mut self, height: usize) {
-        // Use a reasonable default if height is 0 (pre-render snapping).
-        let h = if height > 0 { height } else { 20 };
+        let h = if height > 0 {
+            height
+        } else if self.viewport_height > 0 {
+            self.viewport_height
+        } else {
+            20
+        };
         let total = self.total_lines();
         if total <= h {
             self.scroll_offset = 0;
@@ -308,7 +356,7 @@ impl<'a> PanelState<'a> {
             .is_some_and(|ev| match &ev.kind {
                 EventKind::Diagnostics { count, .. } => *count > 0,
                 EventKind::ToolResult { .. } | EventKind::LockDenied { .. } => true,
-                EventKind::ToolCall { file, .. } => file.is_some(),
+                EventKind::ToolCall { params, file, .. } => params.is_some() || file.is_some(),
                 _ => false,
             })
     }
@@ -356,6 +404,9 @@ impl<'a> PanelState<'a> {
 fn collapse_progress_indexed(events: &[SessionEvent]) -> Vec<(usize, &SessionEvent)> {
     let mut result: Vec<(usize, &SessionEvent)> = Vec::with_capacity(events.len());
     for (idx, ev) in events.iter().enumerate() {
+        if matches!(ev.kind, EventKind::McpMessage { .. }) {
+            continue;
+        }
         if let EventKind::Progress {
             language, title, ..
         } = &ev.kind
@@ -379,40 +430,56 @@ fn collapse_progress_indexed(events: &[SessionEvent]) -> Vec<(usize, &SessionEve
 ///
 /// Returns an empty vec for events with no expandable detail.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "each match arm is simple; splitting would obscure the mapping"
+)]
 pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec<Line<'static>> {
     // Indent to align past the timestamp column ("HH:MM:SS  " = 10 chars).
     let indent = "          ";
     match &event.kind {
-        EventKind::Diagnostics { count, preview, .. } => {
+        EventKind::Diagnostics {
+            file,
+            count,
+            preview,
+        } => {
             if *count == 0 {
                 return Vec::new();
             }
-            preview
-                .lines()
-                .filter(|s| !s.trim().is_empty())
-                .map(|line| {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("fix:") {
-                        Line::from(vec![
-                            Span::raw(format!("{indent}    ")),
-                            Span::styled(trimmed.to_string(), theme.info),
-                        ])
-                    } else {
-                        let (icon, style) = diag_style(1, trimmed, icons, theme);
-                        Line::from(vec![
-                            Span::raw(indent.to_string()),
-                            Span::styled(icon.to_string(), style),
-                            Span::styled(trimmed.to_string(), style),
-                        ])
-                    }
-                })
-                .collect()
+            let mut lines = Vec::new();
+            let header = format!("{{\"file\": \"{file}\", \"count\": {count}}}");
+            lines.push(Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(header, theme.muted),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled("───────────────────────", theme.muted),
+            ]));
+            for line in preview.lines().filter(|s| !s.trim().is_empty()) {
+                let trimmed = line.trim();
+                if trimmed.starts_with("fix:") {
+                    lines.push(Line::from(vec![
+                        Span::raw(format!("{indent}    ")),
+                        Span::styled(trimmed.to_string(), theme.info),
+                    ]));
+                } else {
+                    let (icon, style) = diag_style(1, trimmed, icons, theme);
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(icon.to_string(), style),
+                        Span::styled(trimmed.to_string(), style),
+                    ]));
+                }
+            }
+            lines
         }
         EventKind::ToolResult {
             tool,
             success,
             duration_ms,
             output,
+            params,
         } => {
             let (status, style) = if *success {
                 ("ok", theme.success)
@@ -423,23 +490,49 @@ pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec
                 Span::raw(indent.to_string()),
                 Span::styled(format!("{tool}: {status} ({duration_ms}ms)"), style),
             ])];
+            if let Some(p) = params {
+                let json = serde_json::to_string(p).unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(format!("request: {json}"), theme.muted),
+                ]));
+            }
+            if params.is_some() && output.is_some() {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled("───────────────────────", theme.muted),
+                ]));
+            }
             if let Some(text) = output {
                 for line in text.lines() {
-                    lines.push(Line::from(vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(line.to_string(), theme.muted),
-                    ]));
+                    if line.trim().is_empty() {
+                        lines.push(Line::default());
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent.to_string()),
+                            Span::styled(line.to_string(), theme.muted),
+                        ]));
+                    }
                 }
             }
             lines
         }
-        EventKind::ToolCall {
-            file: Some(path), ..
-        } => {
-            vec![Line::from(vec![
-                Span::raw(indent.to_string()),
-                Span::styled(path.clone(), theme.muted),
-            ])]
+        EventKind::ToolCall { params, file, .. } => {
+            let mut lines = Vec::new();
+            if let Some(p) = params {
+                let json = serde_json::to_string(p).unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(json, theme.muted),
+                ]));
+            }
+            if let Some(path) = file {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(path.clone(), theme.muted),
+                ]));
+            }
+            lines
         }
         EventKind::LockDenied {
             file,
@@ -642,11 +735,25 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
         state.theme.border_unfocused
     };
 
+    let title_style = if focused {
+        state.theme.title
+    } else {
+        state.theme.border_unfocused
+    };
+
+    let border_set = if focused {
+        symbols::border::THICK
+    } else {
+        symbols::border::PLAIN
+    };
+
     let title = build_title(state);
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::RIGHT)
+        .border_set(border_set)
         .border_style(border_style)
-        .title(title);
+        .title(title)
+        .title_style(title_style);
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -954,10 +1061,12 @@ mod tests {
             make_event(EventKind::ToolCall {
                 tool: "grep".to_string(),
                 file: None,
+                params: None,
             }),
             make_event(EventKind::ToolCall {
                 tool: "glob".to_string(),
                 file: Some("/src/lib.rs".to_string()),
+                params: None,
             }),
         ];
 
@@ -1011,6 +1120,7 @@ mod tests {
                 make_event(EventKind::ToolCall {
                     tool: "grep".to_string(),
                     file: None,
+                    params: None,
                 })
             })
             .collect();
@@ -1120,7 +1230,8 @@ mod tests {
         panel.expanded.insert(1);
 
         let flat = panel.flat_lines();
-        assert_eq!(flat.len(), 6);
+        // 3 headers + 5 detail lines (2 header/separator + 3 diag entries)
+        assert_eq!(flat.len(), 8);
         assert_eq!(flat[0], FlatLine::EventHeader { event_index: 0 });
         assert_eq!(flat[1], FlatLine::EventHeader { event_index: 1 });
         assert_eq!(
@@ -1144,7 +1255,21 @@ mod tests {
                 detail_index: 2
             }
         );
-        assert_eq!(flat[5], FlatLine::EventHeader { event_index: 2 });
+        assert_eq!(
+            flat[5],
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 3
+            }
+        );
+        assert_eq!(
+            flat[6],
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 4
+            }
+        );
+        assert_eq!(flat[7], FlatLine::EventHeader { event_index: 2 });
     }
 
     #[test]
@@ -1170,32 +1295,29 @@ mod tests {
         panel.expanded.insert(2);
 
         let flat = panel.flat_lines();
-        // H0, D0.0, D0.1, H1, H2, D2.0
-        assert_eq!(flat.len(), 6);
+        // H0, D0.0..D0.3 (hdr+sep+2 diags), H1, H2, D2.0..D2.2 (hdr+sep+1 diag)
+        assert_eq!(flat.len(), 10);
         assert_eq!(flat[0], FlatLine::EventHeader { event_index: 0 });
-        assert_eq!(
-            flat[1],
-            FlatLine::Detail {
-                event_index: 0,
-                detail_index: 0
-            }
-        );
-        assert_eq!(
-            flat[2],
-            FlatLine::Detail {
-                event_index: 0,
-                detail_index: 1
-            }
-        );
-        assert_eq!(flat[3], FlatLine::EventHeader { event_index: 1 });
-        assert_eq!(flat[4], FlatLine::EventHeader { event_index: 2 });
-        assert_eq!(
-            flat[5],
-            FlatLine::Detail {
-                event_index: 2,
-                detail_index: 0
-            }
-        );
+        for i in 0..4 {
+            assert_eq!(
+                flat[1 + i],
+                FlatLine::Detail {
+                    event_index: 0,
+                    detail_index: i
+                }
+            );
+        }
+        assert_eq!(flat[5], FlatLine::EventHeader { event_index: 1 });
+        assert_eq!(flat[6], FlatLine::EventHeader { event_index: 2 });
+        for i in 0..3 {
+            assert_eq!(
+                flat[7 + i],
+                FlatLine::Detail {
+                    event_index: 2,
+                    detail_index: i
+                }
+            );
+        }
     }
 
     #[test]
@@ -1238,8 +1360,8 @@ mod tests {
         ];
         panel.load_events(events);
         panel.expanded.insert(1);
-        // flat: [H0, H1, D1.0, D1.1, H2] → cursor at 3 (D1.1)
-        panel.cursor = 3;
+        // flat: [H0, H1, D1.0, D1.1, D1.2, D1.3, H2] → cursor at 5 (D1.3)
+        panel.cursor = 5;
 
         panel.toggle_expansion();
         assert!(!panel.expanded.contains(&1));
@@ -1282,7 +1404,7 @@ mod tests {
         panel.load_events(events);
         panel.expanded.insert(1);
 
-        // flat: [H0, H1, D1.0, D1.1, D1.2, H2]
+        // flat: [H0, H1, D1.0..D1.4 (hdr+sep+3 diags), H2]
         panel.cursor = 0;
         panel.tail_attached = false;
 
@@ -1300,6 +1422,14 @@ mod tests {
             FlatLine::Detail {
                 event_index: 1,
                 detail_index: 2,
+            },
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 3,
+            },
+            FlatLine::Detail {
+                event_index: 1,
+                detail_index: 4,
             },
             FlatLine::EventHeader { event_index: 2 },
         ];
@@ -1324,13 +1454,22 @@ mod tests {
         let icons = test_icons();
 
         let lines = detail_lines(&ev, &theme, &icons);
-        assert_eq!(lines.len(), 2);
-        let text0: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        // JSON header + separator + 2 diagnostic lines
+        assert_eq!(lines.len(), 4);
+        let hdr: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            hdr.contains("/src/lib.rs"),
+            "header should contain file path"
+        );
+        assert!(hdr.contains("\"count\": 2"), "header should contain count");
+        let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(sep.contains("───"), "second line should be separator");
+        let text0: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text0.contains("rustc: something"),
             "first detail should contain diagnostic message"
         );
-        let text1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let text1: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text1.contains("rustc: other"),
             "second detail should contain diagnostic message"
@@ -1354,29 +1493,35 @@ mod tests {
         let icons = test_icons();
 
         let lines = detail_lines(&ev, &theme, &icons);
-        assert_eq!(lines.len(), 3);
+        // JSON header + separator + 3 preview lines
+        assert_eq!(lines.len(), 5);
 
-        // Line 0: normal diagnostic — has severity icon, error style
-        let text0: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        // Lines 0-1: JSON header + separator
+        assert!(lines[0].spans.iter().any(|s| s.style == theme.muted));
+        let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(sep.contains("───"));
+
+        // Line 2: normal diagnostic — has severity icon, error style
+        let text0: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text0.contains("[error]"));
-        assert!(lines[0].spans.iter().any(|s| s.style == theme.error));
+        assert!(lines[2].spans.iter().any(|s| s.style == theme.error));
 
-        // Line 1: fix line — info style, deeper indentation, no severity icon
-        let text1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        // Line 3: fix line — info style, deeper indentation, no severity icon
+        let text1: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text1.contains("fix: Remove unused import"));
-        assert!(lines[1].spans.iter().any(|s| s.style == theme.info));
+        assert!(lines[3].spans.iter().any(|s| s.style == theme.info));
         // Should have 14 chars of indentation (10 + 4)
-        let leading = &lines[1].spans[0];
+        let leading = &lines[3].spans[0];
         assert_eq!(
             leading.content.len(),
             14,
             "fix line should have 14-char indent"
         );
 
-        // Line 2: normal diagnostic — warning style
-        let text2: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        // Line 4: normal diagnostic — warning style
+        let text2: String = lines[4].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text2.contains("[warning]"));
-        assert!(lines[2].spans.iter().any(|s| s.style == theme.warning));
+        assert!(lines[4].spans.iter().any(|s| s.style == theme.warning));
     }
 
     #[test]
@@ -1386,6 +1531,7 @@ mod tests {
             success: true,
             duration_ms: 42,
             output: Some("line1\nline2".to_string()),
+            params: None,
         });
         let theme = test_theme();
         let icons = test_icons();
@@ -1414,6 +1560,7 @@ mod tests {
             success: false,
             duration_ms: 100,
             output: None,
+            params: None,
         });
         let theme = test_theme();
         let icons = test_icons();
@@ -1463,9 +1610,9 @@ mod tests {
         panel.load_events(events);
         panel.expanded.insert(5);
 
-        // Total flat lines: 10 headers + 4 details = 14.
+        // Total flat lines: 10 headers + 6 details (hdr+sep+4 diags) = 16.
         let flat = panel.flat_lines();
-        assert_eq!(flat.len(), 14);
+        assert_eq!(flat.len(), 16);
 
         // Set cursor to 0, snap viewport.
         panel.cursor = 0;
@@ -1517,5 +1664,86 @@ mod tests {
             content.contains("might be bad"),
             "expected second diagnostic detail"
         );
+    }
+
+    #[test]
+    fn test_detail_lines_tool_call_with_params() {
+        let ev = make_event(EventKind::ToolCall {
+            tool: "grep".to_string(),
+            file: Some("/src/main.rs".to_string()),
+            params: Some(serde_json::json!({"pattern": "main"})),
+        });
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        // JSON params line + file path line
+        assert_eq!(lines.len(), 2);
+
+        let json: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(json.contains("\"pattern\""), "should contain param key");
+        assert!(json.contains("\"main\""), "should contain param value");
+        assert!(lines[0].spans.iter().any(|s| s.style == theme.muted));
+
+        let path: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(path.contains("/src/main.rs"), "should contain file path");
+    }
+
+    #[test]
+    fn test_detail_lines_tool_result_with_params_and_output() {
+        let ev = make_event(EventKind::ToolResult {
+            tool: "grep".to_string(),
+            success: true,
+            duration_ms: 42,
+            output: Some("## Symbol results\nsrc/main.rs L42-L50".to_string()),
+            params: Some(serde_json::json!({"pattern": "main"})),
+        });
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        // Status + request header + separator + 2 output lines = 5
+        assert_eq!(lines.len(), 5);
+
+        let status: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(status.contains("grep: ok (42ms)"));
+
+        let req: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(req.contains("request:"), "should have request prefix");
+        assert!(req.contains("\"pattern\""), "should contain param key");
+
+        let sep: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(sep.contains("───"), "should have separator");
+
+        let out0: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(out0.contains("Symbol results"));
+        let out1: String = lines[4].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(out1.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_detail_lines_diagnostics_with_header() {
+        let ev = make_event(EventKind::Diagnostics {
+            file: "/src/lib.rs".to_string(),
+            count: 1,
+            preview: diag_preview(&[("error", 5, "unused variable")]),
+        });
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        // JSON header + separator + 1 diagnostic line = 3
+        assert_eq!(lines.len(), 3);
+
+        let hdr: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(hdr.contains("/src/lib.rs"), "header should contain file");
+        assert!(hdr.contains("\"count\": 1"), "header should contain count");
+        assert!(lines[0].spans.iter().any(|s| s.style == theme.muted));
+
+        let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(sep.contains("───"), "should have separator");
+
+        let diag: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(diag.contains("unused variable"));
     }
 }

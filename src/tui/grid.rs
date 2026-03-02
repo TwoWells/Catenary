@@ -496,10 +496,12 @@ mod tests {
         grid.panels[0].load_events(vec![make_event(EventKind::ToolCall {
             tool: "hover".to_string(),
             file: Some("/src/main.rs".to_string()),
+            params: None,
         })]);
         grid.panels[1].load_events(vec![make_event(EventKind::ToolCall {
             tool: "definition".to_string(),
             file: Some("/src/lib.rs".to_string()),
+            params: None,
         })]);
 
         let backend = TestBackend::new(80, 24);

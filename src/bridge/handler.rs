@@ -972,13 +972,15 @@ impl ToolHandler for LspBridgeHandler {
         };
         let file = file_path.as_ref().map(|p| p.to_string_lossy().to_string());
 
+        let capture = self.capture_tool_output;
+        let params_snapshot = if capture { arguments.clone() } else { None };
+
         // Broadcast tool call
         self.broadcaster.send(EventKind::ToolCall {
             tool: name.to_string(),
             file,
+            params: params_snapshot.clone(),
         });
-
-        let capture = self.capture_tool_output;
 
         // Wait for LSP readiness, then check server health.
         // Dead servers are non-fatal — tools degrade gracefully.
@@ -1019,6 +1021,7 @@ impl ToolHandler for LspBridgeHandler {
                 success: true,
                 duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                 output,
+                params: params_snapshot,
             });
             return Ok(CallToolResult::text(notification));
         }
@@ -1063,6 +1066,7 @@ impl ToolHandler for LspBridgeHandler {
             success,
             duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             output,
+            params: params_snapshot,
         });
 
         result

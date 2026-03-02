@@ -267,8 +267,9 @@ fn dispatch_mouse_action(app: &mut App<'_>, action: &MouseAction) {
             app.grid.toggle_pin();
         }
         MouseAction::ScrollPanel { panel, delta } => {
+            // Mouse scroll moves the viewport only, not the cursor or focus.
             if let Some(p) = app.grid.panels.get_mut(panel) {
-                p.navigate(delta);
+                p.scroll_viewport(delta);
             }
         }
         MouseAction::ScrollTree(delta) => {

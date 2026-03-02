@@ -297,6 +297,7 @@ mod tests {
                 make_event(EventKind::ToolCall {
                     tool: "hover".to_string(),
                     file: Some("/src/main.rs".to_string()),
+                    params: None,
                 })
             })
             .collect();

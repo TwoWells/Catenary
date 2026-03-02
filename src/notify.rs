@@ -566,13 +566,12 @@ pub(crate) fn format_diagnostics_compact(
                 })
                 .unwrap_or_default();
 
+            let message = strip_diagnostic_noise(&d.message);
+
             let mut result = if code.is_empty() {
-                format!("  {line}:{col} [{severity}] {source}: {}", d.message)
+                format!("  {line}:{col} [{severity}] {source}: {message}")
             } else {
-                format!(
-                    "  {line}:{col} [{severity}] {source}({code}): {}",
-                    d.message
-                )
+                format!("  {line}:{col} [{severity}] {source}({code}): {message}")
             };
 
             // Append indented fix lines
@@ -587,4 +586,38 @@ pub(crate) fn format_diagnostics_compact(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Strip well-known noise suffixes from diagnostic messages.
+///
+/// Removes trailing lines that are redundant boilerplate from specific
+/// linters. Currently handles:
+/// - Clippy/rustc: `"for further information visit https://..."` URLs
+/// - Clippy/rustc: `` "`#[warn(...)]` on by default" `` and similar
+///   `#[deny]`/`#[allow]`/`#[forbid]` attribution lines
+///
+/// Other LSP servers' multi-line messages are left intact.
+fn strip_diagnostic_noise(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Clippy "for further information visit ..." URL lines.
+            if trimmed.starts_with("for further information visit") {
+                return false;
+            }
+            // Rustc/clippy lint attribution: "`#[warn(...)]` on by default" etc.
+            if trimmed.starts_with("`#[")
+                && (trimmed.contains("on by default")
+                    || trimmed.contains("implied by")
+                    || trimmed.contains("to override"))
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
 }

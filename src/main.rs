@@ -2004,7 +2004,7 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
             let lang = colors.cyan(language);
             println!("{time_str} {lang}: Ready");
         }
-        EventKind::ToolCall { tool, file } => {
+        EventKind::ToolCall { tool, file, .. } => {
             let arrow = colors.green("→");
             let file_str = file
                 .as_ref()
@@ -2016,7 +2016,7 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
             tool,
             success,
             duration_ms,
-            output: _,
+            ..
         } => {
             let arrow = colors.blue("←");
             let status = if *success {
