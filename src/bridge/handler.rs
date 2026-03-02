@@ -1032,7 +1032,9 @@ fn format_symbol_kind(kind: SymbolKind) -> String {
 }
 
 /// Formats sorted line numbers as compact ranges: `L45`, `L15-L20`.
-/// Consecutive lines are collapsed into ranges.
+/// Nearby lines are clustered using sqrt-based merge distance (DBSCAN-style):
+/// `merge_distance = ceil(sqrt(max_line))`. This scales with file size —
+/// small files cluster tightly, large files tolerate wider gaps.
 fn format_line_ranges(lines: &[u32]) -> String {
     if lines.is_empty() {
         return String::new();
@@ -1042,12 +1044,22 @@ fn format_line_ranges(lines: &[u32]) -> String {
     sorted.sort_unstable();
     sorted.dedup();
 
+    let max_line = sorted[sorted.len() - 1];
+    // Integer ceiling of sqrt: isqrt rounds down, so add 1 unless it's a perfect square.
+    let isqrt = u32::isqrt(max_line);
+    let merge_distance = if isqrt * isqrt == max_line {
+        isqrt
+    } else {
+        isqrt + 1
+    }
+    .max(1);
+
     let mut ranges: Vec<String> = Vec::new();
     let mut start = sorted[0];
     let mut end = sorted[0];
 
     for &line in &sorted[1..] {
-        if line != end + 1 {
+        if line - end > merge_distance {
             ranges.push(format_single_range(start, end));
             start = line;
         }
@@ -1275,20 +1287,41 @@ mod tests {
 
     #[test]
     fn test_format_line_ranges_disjoint() {
-        assert_eq!(format_line_ranges(&[5, 10, 20]), "L5 L10 L20");
+        // max=20, merge_distance=ceil(sqrt(20))=5
+        // gap 5→10 = 5 ≤ 5 → merge; gap 10→20 = 10 > 5 → split
+        assert_eq!(format_line_ranges(&[5, 10, 20]), "L5-L10 L20");
     }
 
     #[test]
     fn test_format_line_ranges_mixed() {
-        assert_eq!(
-            format_line_ranges(&[1, 2, 3, 10, 11, 50]),
-            "L1-L3 L10-L11 L50"
-        );
+        // max=50, merge_distance=ceil(sqrt(50))=8
+        // gaps: 3→10=7 ≤ 8, 11→50=39 > 8
+        assert_eq!(format_line_ranges(&[1, 2, 3, 10, 11, 50]), "L1-L11 L50");
     }
 
     #[test]
     fn test_format_line_ranges_unsorted() {
+        // max=20, merge_distance=5; sorted [10,11,20]; gap 11→20=9 > 5
         assert_eq!(format_line_ranges(&[20, 10, 11]), "L10-L11 L20");
+    }
+
+    #[test]
+    fn test_format_line_ranges_dbscan_nearby() {
+        // max=30, merge_distance=ceil(sqrt(30))=6; gap 25→30=5 ≤ 6
+        assert_eq!(format_line_ranges(&[25, 30]), "L25-L30");
+    }
+
+    #[test]
+    fn test_format_line_ranges_dbscan_far_apart() {
+        // max=1000, merge_distance=ceil(sqrt(1000))=32; gap=999 > 32
+        assert_eq!(format_line_ranges(&[1, 1000]), "L1 L1000");
+    }
+
+    #[test]
+    fn test_format_line_ranges_dbscan_mixed() {
+        // max=14, merge_distance=ceil(sqrt(14))=4
+        // gap 5→10=5 > 4 → split; gap 10→14=4 ≤ 4 → merge
+        assert_eq!(format_line_ranges(&[5, 10, 14]), "L5 L10-L14");
     }
 
     // ─── format_symbol_references tests ──────────────────────────────────
