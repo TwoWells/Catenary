@@ -135,6 +135,7 @@ The `[server.<language-id>]` key must match the LSP language identifier. Catenar
 |--------|---------|-------------|
 | `idle_timeout` | `300` | Seconds before auto-closing idle documents. Set to `0` to disable. |
 | `log_retention_days` | `7` | Days to keep dead session logs. `0` = remove all dead sessions on startup. `-1` = retain forever. |
+| `tui.capture_tool_output` | `false` | Store full tool output in events for TUI detail expansion. Increases `events.jsonl` size. |
 
 ## Icons
 
@@ -179,11 +180,7 @@ alignment).
 | `lock` | `\u25B6 ` (▶) | ` ` | Lock acquired |
 | `unlock` | `\u25C0 ` (◀) | ` ` | Lock released |
 | `tool_search` | `\u2192 ` (→) | ` ` | Search tool |
-| `tool_map` | `\u2192 ` (→) | ` ` | Codebase map tool |
-| `tool_hover` | `\u2192 ` (→) | ` ` | Hover tool |
-| `tool_goto` | `\u2192 ` (→) | ` ` | Go-to-definition tool |
-| `tool_refs` | `\u2192 ` (→) | ` ` | Find references tool |
-| `tool_diagnostics` | `\u2192 ` (→) | ` ` | Diagnostics tool |
+| `tool_glob` | `\u2192 ` (→) | ` ` | Glob tool |
 | `tool_default` | `\u2192 ` (→) | `\u2192 ` (→) | Fallback for other tools |
 
 ## CLI Override

@@ -327,6 +327,7 @@ async fn run_server(args: Args) -> Result<()> {
         doc_manager,
         runtime,
         broadcaster.clone(),
+        config.tui.capture_tool_output,
     );
 
     // Run MCP server (blocking - reads from stdin)
@@ -2018,6 +2019,7 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
             tool,
             success,
             duration_ms,
+            output: _,
         } => {
             let arrow = colors.blue("←");
             let status = if *success {

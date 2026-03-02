@@ -85,6 +85,9 @@ pub enum EventKind {
         success: bool,
         /// How long the tool call took in milliseconds.
         duration_ms: u64,
+        /// Full tool output text (for TUI detail expansion).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// Diagnostics returned from notify hook.
     Diagnostics {
@@ -92,7 +95,7 @@ pub enum EventKind {
         file: String,
         /// Number of diagnostics found.
         count: usize,
-        /// Short preview of the first diagnostic.
+        /// Compact diagnostics text with optional fix lines.
         preview: String,
     },
     /// Session started.

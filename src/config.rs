@@ -95,16 +95,8 @@ pub struct IconConfig {
     pub unlock: Option<String>,
     /// Search tool icon.
     pub tool_search: Option<String>,
-    /// Codebase map tool icon.
-    pub tool_map: Option<String>,
-    /// Hover tool icon.
-    pub tool_hover: Option<String>,
-    /// Go-to-definition tool icon.
-    pub tool_goto: Option<String>,
-    /// Find references tool icon.
-    pub tool_refs: Option<String>,
-    /// Diagnostics tool icon.
-    pub tool_diagnostics: Option<String>,
+    /// Glob tool icon.
+    pub tool_glob: Option<String>,
     /// Default tool icon (fallback).
     pub tool_default: Option<String>,
 }
@@ -126,6 +118,11 @@ pub struct TuiConfig {
     /// Whether mouse hover changes focus (default: false).
     #[serde(default)]
     pub focus_follows_mouse: bool,
+
+    /// Capture full tool output in `ToolResult` events for TUI detail
+    /// expansion (default: false). Increases events.jsonl size.
+    #[serde(default)]
+    pub capture_tool_output: bool,
 }
 
 impl Default for TuiConfig {
@@ -134,6 +131,7 @@ impl Default for TuiConfig {
             auto_add_sessions: true,
             sessions_width: 0.4,
             focus_follows_mouse: false,
+            capture_tool_output: false,
         }
     }
 }

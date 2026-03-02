@@ -392,12 +392,19 @@ pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec
                 .filter(|s| !s.trim().is_empty())
                 .map(|line| {
                     let trimmed = line.trim();
-                    let (icon, style) = diag_style(1, trimmed, icons, theme);
-                    Line::from(vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(icon.to_string(), style),
-                        Span::styled(trimmed.to_string(), style),
-                    ])
+                    if trimmed.starts_with("fix:") {
+                        Line::from(vec![
+                            Span::raw(format!("{indent}    ")),
+                            Span::styled(trimmed.to_string(), theme.info),
+                        ])
+                    } else {
+                        let (icon, style) = diag_style(1, trimmed, icons, theme);
+                        Line::from(vec![
+                            Span::raw(indent.to_string()),
+                            Span::styled(icon.to_string(), style),
+                            Span::styled(trimmed.to_string(), style),
+                        ])
+                    }
                 })
                 .collect()
         }
@@ -405,16 +412,26 @@ pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec
             tool,
             success,
             duration_ms,
+            output,
         } => {
             let (status, style) = if *success {
                 ("ok", theme.success)
             } else {
                 ("error", theme.error)
             };
-            vec![Line::from(vec![
+            let mut lines = vec![Line::from(vec![
                 Span::raw(indent.to_string()),
                 Span::styled(format!("{tool}: {status} ({duration_ms}ms)"), style),
-            ])]
+            ])];
+            if let Some(text) = output {
+                for line in text.lines() {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(line.to_string(), theme.muted),
+                    ]));
+                }
+            }
+            lines
         }
         EventKind::ToolCall {
             file: Some(path), ..
@@ -935,16 +952,12 @@ mod tests {
         let icons = test_icons();
         let events: Vec<SessionEvent> = vec![
             make_event(EventKind::ToolCall {
-                tool: "hover".to_string(),
-                file: Some("/src/main.rs".to_string()),
-            }),
-            make_event(EventKind::ToolCall {
-                tool: "definition".to_string(),
-                file: Some("/src/lib.rs".to_string()),
-            }),
-            make_event(EventKind::ToolCall {
-                tool: "search".to_string(),
+                tool: "grep".to_string(),
                 file: None,
+            }),
+            make_event(EventKind::ToolCall {
+                tool: "glob".to_string(),
+                file: Some("/src/lib.rs".to_string()),
             }),
         ];
 
@@ -963,12 +976,8 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let content = buffer_to_string(&buf);
 
-        assert!(content.contains("hover"), "expected hover tool name");
-        assert!(
-            content.contains("definition"),
-            "expected definition tool name"
-        );
-        assert!(content.contains("search"), "expected search tool name");
+        assert!(content.contains("grep"), "expected grep tool name");
+        assert!(content.contains("glob"), "expected glob tool name");
     }
 
     #[test]
@@ -1000,7 +1009,7 @@ mod tests {
         let events: Vec<SessionEvent> = (0..5)
             .map(|_| {
                 make_event(EventKind::ToolCall {
-                    tool: "hover".to_string(),
+                    tool: "grep".to_string(),
                     file: None,
                 })
             })
@@ -1326,6 +1335,96 @@ mod tests {
             text1.contains("rustc: other"),
             "second detail should contain diagnostic message"
         );
+    }
+
+    #[test]
+    fn test_detail_lines_with_fix_lines() {
+        let preview = [
+            "  12:1 [error] rustc: unused import",
+            "  fix: Remove unused import",
+            "  34:1 [warning] rustc: something",
+        ]
+        .join("\n");
+        let ev = make_event(EventKind::Diagnostics {
+            file: "/src/lib.rs".to_string(),
+            count: 2,
+            preview,
+        });
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        assert_eq!(lines.len(), 3);
+
+        // Line 0: normal diagnostic — has severity icon, error style
+        let text0: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text0.contains("[error]"));
+        assert!(lines[0].spans.iter().any(|s| s.style == theme.error));
+
+        // Line 1: fix line — info style, deeper indentation, no severity icon
+        let text1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text1.contains("fix: Remove unused import"));
+        assert!(lines[1].spans.iter().any(|s| s.style == theme.info));
+        // Should have 14 chars of indentation (10 + 4)
+        let leading = &lines[1].spans[0];
+        assert_eq!(
+            leading.content.len(),
+            14,
+            "fix line should have 14-char indent"
+        );
+
+        // Line 2: normal diagnostic — warning style
+        let text2: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text2.contains("[warning]"));
+        assert!(lines[2].spans.iter().any(|s| s.style == theme.warning));
+    }
+
+    #[test]
+    fn test_detail_lines_tool_result_with_output() {
+        let ev = make_event(EventKind::ToolResult {
+            tool: "grep".to_string(),
+            success: true,
+            duration_ms: 42,
+            output: Some("line1\nline2".to_string()),
+        });
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        // Status line + two output lines
+        assert_eq!(lines.len(), 3);
+
+        let status: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(status.contains("grep: ok (42ms)"));
+        assert!(lines[0].spans.iter().any(|s| s.style == theme.success));
+
+        let out1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(out1.contains("line1"));
+        assert!(lines[1].spans.iter().any(|s| s.style == theme.muted));
+
+        let out2: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(out2.contains("line2"));
+        assert!(lines[2].spans.iter().any(|s| s.style == theme.muted));
+    }
+
+    #[test]
+    fn test_detail_lines_tool_result_without_output() {
+        let ev = make_event(EventKind::ToolResult {
+            tool: "glob".to_string(),
+            success: false,
+            duration_ms: 100,
+            output: None,
+        });
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let lines = detail_lines(&ev, &theme, &icons);
+        // Status line only, no output lines
+        assert_eq!(lines.len(), 1);
+
+        let status: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(status.contains("glob: error (100ms)"));
+        assert!(lines[0].spans.iter().any(|s| s.style == theme.error));
     }
 
     #[test]
