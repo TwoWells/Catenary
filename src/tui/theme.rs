@@ -416,16 +416,8 @@ pub struct IconSet {
     pub unlock: String,
     /// Search tool icon.
     pub tool_search: String,
-    /// Codebase map tool icon.
-    pub tool_map: String,
-    /// Hover tool icon.
-    pub tool_hover: String,
-    /// Go-to-definition tool icon.
-    pub tool_goto: String,
-    /// Find references tool icon.
-    pub tool_refs: String,
-    /// Diagnostics tool icon.
-    pub tool_diagnostics: String,
+    /// Glob tool icon.
+    pub tool_glob: String,
     /// Default (fallback) tool icon.
     pub tool_default: String,
 }
@@ -447,22 +439,15 @@ impl IconSet {
             lock: config.lock.unwrap_or_else(|| base.4.to_string()),
             unlock: config.unlock.unwrap_or_else(|| base.5.to_string()),
             tool_search: config.tool_search.unwrap_or_else(|| base.6.to_string()),
-            tool_map: config.tool_map.unwrap_or_else(|| base.7.to_string()),
-            tool_hover: config.tool_hover.unwrap_or_else(|| base.8.to_string()),
-            tool_goto: config.tool_goto.unwrap_or_else(|| base.9.to_string()),
-            tool_refs: config.tool_refs.unwrap_or_else(|| base.10.to_string()),
-            tool_diagnostics: config
-                .tool_diagnostics
-                .unwrap_or_else(|| base.11.to_string()),
-            tool_default: config.tool_default.unwrap_or_else(|| base.12.to_string()),
+            tool_glob: config.tool_glob.unwrap_or_else(|| base.7.to_string()),
+            tool_default: config.tool_default.unwrap_or_else(|| base.8.to_string()),
         }
     }
 
     /// Returns `(unicode_defaults, nerd_defaults)` tuples.
     ///
     /// Order: `diag_error`, `diag_warn`, `diag_info`, `diag_ok`, `lock`, `unlock`,
-    ///        `tool_search`, `tool_map`, `tool_hover`, `tool_goto`, `tool_refs`,
-    ///        `tool_diagnostics`, `tool_default`.
+    ///        `tool_search`, `tool_glob`, `tool_default`.
     #[allow(
         clippy::type_complexity,
         reason = "private helper returning preset tuples"
@@ -478,16 +463,8 @@ impl IconSet {
             &'static str,
             &'static str,
             &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
         ),
         (
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
             &'static str,
             &'static str,
             &'static str,
@@ -506,13 +483,9 @@ impl IconSet {
             "\u{2713} ", // ✓
             "\u{25B6} ", // ▶
             "\u{25C0} ", // ◀
-            "\u{2192} ", // →
-            "\u{2192} ", // →
-            "\u{2192} ", // →
-            "\u{2192} ", // →
-            "\u{2192} ", // →
-            "\u{2192} ", // →
-            "\u{2192} ", // →
+            "\u{2192} ", // → (search)
+            "\u{2192} ", // → (glob)
+            "\u{2192} ", // → (default)
         );
         let nerd = (
             " ",         // nf-cod-error
@@ -522,11 +495,7 @@ impl IconSet {
             " ",         // nf-cod-lock
             " ",         // nf-cod-unlock
             " ",         // nf-cod-search
-            " ",         // nf-cod-map
-            " ",         // nf-cod-comment_discussion
-            " ",         // nf-cod-symbol_method
-            " ",         // nf-cod-references
-            " ",         // nf-fa-stethoscope
+            " ",         // nf-cod-file_directory
             "\u{2192} ", // → (no nerd equivalent)
         );
         (unicode, nerd)
@@ -593,7 +562,12 @@ pub fn format_event_plain(ev: &SessionEvent) -> String {
         EventKind::ToolCall { tool, file } => {
             format!("{ts} {tool} {}", file.as_deref().unwrap_or(""))
         }
-        EventKind::ToolResult { tool, success, .. } => {
+        EventKind::ToolResult {
+            tool,
+            success,
+            output: _,
+            ..
+        } => {
             format!("{ts} {tool} {}", if *success { "ok" } else { "error" })
         }
         EventKind::Diagnostics {
@@ -616,12 +590,8 @@ pub fn format_event_plain(ev: &SessionEvent) -> String {
 #[must_use]
 pub fn tool_icon<'a>(name: &str, icons: &'a IconSet) -> &'a str {
     match name {
-        "search" => &icons.tool_search,
-        "codebase_map" => &icons.tool_map,
-        "hover" => &icons.tool_hover,
-        "definition" | "type_definition" => &icons.tool_goto,
-        "find_references" | "call_hierarchy" | "type_hierarchy" => &icons.tool_refs,
-        "diagnostics" => &icons.tool_diagnostics,
+        "grep" => &icons.tool_search,
+        "glob" => &icons.tool_glob,
         _ => &icons.tool_default,
     }
 }
@@ -719,6 +689,7 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
             tool,
             success,
             duration_ms,
+            output: _,
         } => {
             let (status_text, status_style) = if *success {
                 ("ok", theme.success)
@@ -857,11 +828,11 @@ mod tests {
     #[test]
     fn test_format_event_plain_tool_call() {
         let ev = make_event(EventKind::ToolCall {
-            tool: "hover".to_string(),
+            tool: "grep".to_string(),
             file: Some("/src/main.rs".to_string()),
         });
         let plain = format_event_plain(&ev);
-        assert!(plain.contains("hover"));
+        assert!(plain.contains("grep"));
     }
 
     #[test]

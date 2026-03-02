@@ -59,6 +59,8 @@ pub struct LspBridgeHandler {
     /// Languages whose servers have been reported offline to the agent.
     /// Used for one-time notification: offline is reported once, recovery once.
     notified_offline: std::sync::Mutex<HashSet<String>>,
+    /// Whether to capture full tool output in `ToolResult` events.
+    capture_tool_output: bool,
 }
 
 impl LspBridgeHandler {
@@ -68,6 +70,7 @@ impl LspBridgeHandler {
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
         broadcaster: EventBroadcaster,
+        capture_tool_output: bool,
     ) -> Self {
         Self {
             client_manager,
@@ -75,6 +78,7 @@ impl LspBridgeHandler {
             runtime,
             broadcaster,
             notified_offline: std::sync::Mutex::new(HashSet::new()),
+            capture_tool_output,
         }
     }
     /// Gets the appropriate LSP client for the given file path.
@@ -926,7 +930,7 @@ impl ToolHandler for LspBridgeHandler {
         vec![
             Tool {
                 name: "grep".to_string(),
-                description: Some("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Returns per-symbol sections with definitions, hover docs, and references (≤10 symbols) or name+kind+location (>10).".to_string()),
+                description: Some(format!("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Returns per-symbol sections with definitions, hover docs, and references (\u{2264}{GREP_ENRICHMENT_THRESHOLD} symbols) or name+kind+location (>{GREP_ENRICHMENT_THRESHOLD}).")),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -974,14 +978,7 @@ impl ToolHandler for LspBridgeHandler {
             file,
         });
 
-        // Helper to broadcast result
-        let broadcast_result = |success: bool| {
-            self.broadcaster.send(EventKind::ToolResult {
-                tool: name.to_string(),
-                success,
-                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            });
-        };
+        let capture = self.capture_tool_output;
 
         // Wait for LSP readiness, then check server health.
         // Dead servers are non-fatal — tools degrade gracefully.
@@ -1011,10 +1008,19 @@ impl ToolHandler for LspBridgeHandler {
 
         // File-scoped tool with dead server: skip dispatch, return notification
         if !health.dead.is_empty() && file_path.is_some() && name != "glob" {
-            broadcast_result(true);
-            return Ok(CallToolResult::text(
-                health.notification.unwrap_or_default(),
-            ));
+            let notification = health.notification.unwrap_or_default();
+            let output = if capture {
+                Some(notification.clone())
+            } else {
+                None
+            };
+            self.broadcaster.send(EventKind::ToolResult {
+                tool: name.to_string(),
+                success: true,
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output,
+            });
+            return Ok(CallToolResult::text(notification));
         }
 
         // Dispatch tool
@@ -1031,10 +1037,33 @@ impl ToolHandler for LspBridgeHandler {
             res.content.insert(0, ToolContent::Text { text: note });
         }
 
-        match &result {
-            Ok(res) => broadcast_result(res.is_error.is_none()),
-            Err(_) => broadcast_result(false),
-        }
+        let (success, output) = match &result {
+            Ok(res) => {
+                let output = if capture {
+                    let text: String = res
+                        .content
+                        .iter()
+                        .map(|c| {
+                            let ToolContent::Text { text } = c;
+                            text.as_str()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() { None } else { Some(text) }
+                } else {
+                    None
+                };
+                (res.is_error.is_none(), output)
+            }
+            Err(e) => (false, if capture { Some(e.to_string()) } else { None }),
+        };
+
+        self.broadcaster.send(EventKind::ToolResult {
+            tool: name.to_string(),
+            success,
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            output,
+        });
 
         result
     }
