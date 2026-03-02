@@ -144,6 +144,17 @@ struct Args {
     /// Return multiple quickfix actions per diagnostic.
     #[arg(long)]
     multi_fix: bool,
+
+    /// Advertise `workspaceSymbol/resolve` support. When set, `workspace/symbol`
+    /// returns URI-only locations (no range) and `workspaceSymbol/resolve`
+    /// returns full locations.
+    #[arg(long)]
+    resolve_provider: bool,
+
+    /// Return empty results for `workspace/symbol` with empty query.
+    /// Forces the fallback to per-query lookup.
+    #[arg(long)]
+    no_empty_query: bool,
 }
 
 /// A JSON-RPC request.
@@ -419,6 +430,7 @@ impl MockServer {
             }
             "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
+            "workspaceSymbol/resolve" => self.handle_workspace_symbol_resolve(&request.params),
             "textDocument/prepareCallHierarchy" => {
                 self.handle_call_hierarchy_prepare(&request.params)
             }
@@ -640,6 +652,12 @@ impl MockServer {
             text_doc_sync["save"] = serde_json::json!({ "includeText": false });
         }
 
+        let workspace_symbol_value = if self.args.resolve_provider {
+            serde_json::json!({ "resolveProvider": true })
+        } else {
+            serde_json::json!(true)
+        };
+
         let mut capabilities = serde_json::json!({
             "hoverProvider": true,
             "definitionProvider": true,
@@ -647,7 +665,7 @@ impl MockServer {
             "referencesProvider": true,
             "implementationProvider": true,
             "documentSymbolProvider": true,
-            "workspaceSymbolProvider": true,
+            "workspaceSymbolProvider": workspace_symbol_value,
             "callHierarchyProvider": true,
             "textDocumentSync": text_doc_sync
         });
@@ -1052,6 +1070,10 @@ impl MockServer {
     fn handle_workspace_symbols(&self, params: &Value) -> Value {
         let query = params.get("query").and_then(Value::as_str).unwrap_or("");
 
+        if query.is_empty() && self.args.no_empty_query {
+            return Value::Array(Vec::new());
+        }
+
         let mut all_symbols = Vec::new();
         for (uri, content) in &self.documents {
             for mut sym in extract_symbols(content) {
@@ -1062,10 +1084,15 @@ impl MockServer {
 
                 if matches && let Some(range) = sym.get("range").cloned() {
                     if let Some(obj) = sym.as_object_mut() {
-                        obj.insert(
-                            "location".to_string(),
-                            serde_json::json!({ "uri": uri, "range": range }),
-                        );
+                        if self.args.resolve_provider {
+                            // URI-only location (no range) — client must resolve
+                            obj.insert("location".to_string(), serde_json::json!({ "uri": uri }));
+                        } else {
+                            obj.insert(
+                                "location".to_string(),
+                                serde_json::json!({ "uri": uri, "range": range }),
+                            );
+                        }
                         obj.remove("range");
                         obj.remove("selectionRange");
                     }
@@ -1075,6 +1102,34 @@ impl MockServer {
         }
 
         Value::Array(all_symbols)
+    }
+
+    fn handle_workspace_symbol_resolve(&self, params: &Value) -> Option<Value> {
+        let name = params.get("name").and_then(Value::as_str)?;
+        let uri = params
+            .get("location")
+            .and_then(|loc| loc.get("uri"))
+            .and_then(Value::as_str)?;
+
+        let content = self.documents.get(uri)?;
+
+        // Find the symbol by name in the document to get its range
+        for sym in extract_symbols(content) {
+            if sym.get("name").and_then(Value::as_str) == Some(name) {
+                let range = sym.get("range")?;
+                let mut resolved = params.clone();
+                if let Some(obj) = resolved.as_object_mut() {
+                    obj.insert(
+                        "location".to_string(),
+                        serde_json::json!({ "uri": uri, "range": range }),
+                    );
+                }
+                return Some(resolved);
+            }
+        }
+
+        // Symbol not found — return as-is
+        Some(params.clone())
     }
 
     fn publish_diagnostics(&self, uri: &str) {
@@ -1719,6 +1774,8 @@ mod tests {
             scan_roots: false,
             no_code_actions: false,
             multi_fix: false,
+            resolve_provider: false,
+            no_empty_query: false,
         }
     }
 

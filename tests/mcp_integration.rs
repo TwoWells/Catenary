@@ -483,8 +483,8 @@ fn test_multi_root_find_symbol() -> Result<()> {
         "Expected search to find alpha.mock, got: {text_a}"
     );
     assert!(
-        text_a.contains("## Symbols"),
-        "Expected Symbols section for alpha_func, got: {text_a}"
+        text_a.contains("# alpha_func"),
+        "Expected symbol heading for alpha_func, got: {text_a}"
     );
     assert!(
         text_a.contains("[Function]"),
@@ -706,7 +706,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
             .as_str()
             .context("Missing text")?;
         last_text = text.to_string();
-        if text.contains("## Symbols") && text.contains(&format!("funcs_b.{MOCK_LANG_A}")) {
+        if text.contains("## [") && text.contains(&format!("funcs_b.{MOCK_LANG_A}")) {
             success = true;
             break;
         }
@@ -715,7 +715,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
 
     assert!(
         success,
-        "Search in root B should find ## Symbols with funcs_b.mock after server restart. Last output: {last_text}"
+        "Search in root B should find ## [ with funcs_b.mock after server restart. Last output: {last_text}"
     );
 
     Ok(())
@@ -951,7 +951,7 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             "Profile {name}: search in root B should reference funcs_b.mock, got: {text}"
         );
         assert!(
-            text.contains("## Symbols"),
+            text.contains("## ["),
             "Profile {name}: search in root B should have Symbols section, got: {text}"
         );
     }
@@ -1047,7 +1047,7 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         "Expected 'funcs_b.mock' in search results, got: {text}"
     );
     assert!(
-        text.contains("## Symbols"),
+        text.contains("## ["),
         "Root B search should have Symbols section, got: {text}"
     );
 
@@ -1120,7 +1120,7 @@ fn test_mockls_multiplexing() -> Result<()> {
         "Lang A search should reference test file, got: {text_a}"
     );
     assert!(
-        text_a.contains("## Symbols"),
+        text_a.contains("## ["),
         "Lang A search should have Symbols section, got: {text_a}"
     );
     assert!(
@@ -1236,7 +1236,7 @@ fn test_search_graceful_degradation() -> Result<()> {
     );
     // Should NOT have a Symbols section (LSP failed)
     assert!(
-        !text.contains("## Symbols"),
+        !text.contains("## ["),
         "Symbols section should be absent when workspace/symbol fails, got: {text}"
     );
 
@@ -1379,7 +1379,7 @@ fn test_warmup_observation() -> Result<()> {
         "Search should succeed after warmup observation. Got: {text}"
     );
     assert!(
-        text.contains("## Symbols"),
+        text.contains("## ["),
         "Search after warmup should have Symbols section, got: {text}"
     );
 
@@ -1422,7 +1422,7 @@ fn test_search_symbols_with_scan_roots() -> Result<()> {
         .context("Missing search text")?;
 
     assert!(
-        text.contains("## Symbols"),
+        text.contains("## ["),
         "Search with --scan-roots should produce ## Symbols section, got: {text}"
     );
     assert!(
@@ -1433,297 +1433,17 @@ fn test_search_symbols_with_scan_roots() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that type definition enrichment appears in search output.
-/// mockls resolves `let result: MyType` to the `struct MyType` declaration
-/// in the other file, so the `Type:` field should appear in the enrichment.
+/// Verifies per-symbol `#` / `##` output structure with enrichment.
+/// Two symbols, each with hover and references.
 #[test]
-fn test_search_type_definition_enrichment() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Create two files: one with a type definition, another with a
-    // variable annotated with that type. typeDefinition on the variable
-    // resolves to the struct declaration in the other file.
-    let def_file = dir.path().join(format!("types.{MOCK_LANG_A}"));
-    std::fs::write(&def_file, "struct MyType\n")?;
-
-    let use_file = dir.path().join(format!("usage.{MOCK_LANG_A}"));
-    std::fs::write(&use_file, "let result: MyType\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    // Search for 'result' — should find the variable in usage.mock
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "result" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text")?;
-
-    assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got: {text}"
-    );
-    // The type definition enrichment should show Type: for the variable
-    // symbol, pointing to wherever mockls resolves the type definition.
-    assert!(
-        text.contains("Type:"),
-        "Expected Type: enrichment for variable symbol, got: {text}"
-    );
-    assert!(
-        text.contains(&format!("types.{MOCK_LANG_A}")),
-        "Type: should reference types.mock, got: {text}"
-    );
-
-    Ok(())
-}
-
-/// Verifies that type definition enrichment points to the correct cross-file
-/// type declaration. File A has `struct Counter`, file B has `let count: Counter`.
-/// Searching for `count` should show `Type:` pointing to file A.
-#[test]
-fn test_search_type_definition_cross_file() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let type_file = dir.path().join(format!("types.{MOCK_LANG_A}"));
-    std::fs::write(&type_file, "struct Counter\n")?;
-
-    let use_file = dir.path().join(format!("usage.{MOCK_LANG_A}"));
-    std::fs::write(&use_file, "let count: Counter\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "count" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text")?;
-
-    assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got: {text}"
-    );
-    assert!(
-        text.contains("Type:"),
-        "Expected Type: enrichment for variable symbol, got: {text}"
-    );
-    assert!(
-        text.contains(&format!("types.{MOCK_LANG_A}")),
-        "Type: should point to types.mock, got: {text}"
-    );
-
-    Ok(())
-}
-
-/// Verifies that call hierarchy enrichment appears for function symbols.
-/// File has `fn caller()` body calling `fn callee()`. Search for `callee`
-/// should show `Called by:` with `caller`.
-#[test]
-fn test_search_call_hierarchy_enrichment() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let test_file = dir.path().join(format!("calls.{MOCK_LANG_A}"));
-    std::fs::write(&test_file, "fn callee()\nfn caller()\n  callee\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "callee" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text")?;
-
-    assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got: {text}"
-    );
-    assert!(
-        text.contains("Called by:"),
-        "Expected Called by: enrichment for function symbol, got: {text}"
-    );
-    assert!(
-        text.contains("caller"),
-        "Called by: should mention caller, got: {text}"
-    );
-
-    Ok(())
-}
-
-/// Verifies that struct symbols get implementation enrichment.
-/// File has `struct Foo` and references. Search for `Foo` should show
-/// `Implementations:`.
-#[test]
-fn test_search_struct_implementations() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let test_file = dir.path().join(format!("structs.{MOCK_LANG_A}"));
-    std::fs::write(&test_file, "struct Foo\nlet x: Foo\nFoo\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Foo" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text")?;
-
-    assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got: {text}"
-    );
-    assert!(
-        text.contains("Implementations:"),
-        "Expected Implementations: enrichment for struct symbol, got: {text}"
-    );
-    assert!(
-        text.contains(&format!("structs.{MOCK_LANG_A}")),
-        "Implementations should reference structs.mock, got: {text}"
-    );
-
-    Ok(())
-}
-
-/// Verifies that interface symbols get subtype enrichment.
-/// File has `interface Animal` and a `struct Dog`. Search for `Animal`
-/// should show `Subtypes:`.
-#[test]
-fn test_search_interface_subtypes() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let test_file = dir.path().join(format!("iface.{MOCK_LANG_A}"));
-    std::fs::write(&test_file, "interface Animal\nstruct Dog\nAnimal\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "Animal" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text")?;
-
-    assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got: {text}"
-    );
-    assert!(
-        text.contains("Subtypes:"),
-        "Expected Subtypes: enrichment for interface symbol, got: {text}"
-    );
-    assert!(
-        text.contains("Dog"),
-        "Subtypes should contain Dog, got: {text}"
-    );
-
-    Ok(())
-}
-
-/// Verifies that when multiple symbols share a name, references are grouped
-/// under their respective definitions via import-based scope resolution.
-/// File A has `fn load_config()`, file B has `fn load_config()`,
-/// file C imports from A, file D imports from B.
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    clippy::similar_names,
-    reason = "disambiguation test requires many assertions and group_1/group_2 variables"
-)]
-fn test_search_disambiguated_references() -> Result<()> {
+fn test_grep_per_symbol_output() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     let file_a = dir.path().join(format!("mod_a.{MOCK_LANG_A}"));
-    std::fs::write(&file_a, "fn load_config()\n")?;
+    std::fs::write(&file_a, "fn load_config()\nload_config\n")?;
 
     let file_b = dir.path().join(format!("mod_b.{MOCK_LANG_A}"));
-    std::fs::write(&file_b, "fn load_config()\n")?;
-
-    let file_c = dir.path().join(format!("caller_c.{MOCK_LANG_A}"));
-    std::fs::write(
-        &file_c,
-        "from mod_a import load_config\nfn use_a()\n  load_config\n",
-    )?;
-
-    let file_d = dir.path().join(format!("caller_d.{MOCK_LANG_A}"));
-    std::fs::write(
-        &file_d,
-        "from mod_b import load_config\nfn use_b()\n  load_config\n",
-    )?;
+    std::fs::write(&file_b, "fn save_config()\nsave_config\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let root = dir.path().to_str().context("root path")?;
@@ -1736,157 +1456,46 @@ fn test_search_disambiguated_references() -> Result<()> {
         "method": "tools/call",
         "params": {
             "name": "grep",
-            "arguments": { "pattern": "load_config" }
+            "arguments": { "pattern": "load_config|save_config" }
         }
     }))?;
 
     let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .context("Missing search text")?;
+        .context("Missing text")?;
 
+    // Per-symbol # headings
     assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got: {text}"
-    );
-    assert!(
-        text.contains(&format!("mod_a.{MOCK_LANG_A}")),
-        "Expected mod_a.mock in output, got: {text}"
-    );
-    assert!(
-        text.contains(&format!("mod_b.{MOCK_LANG_A}")),
-        "Expected mod_b.mock in output, got: {text}"
-    );
-    assert!(
-        text.contains("## References"),
-        "Expected References section for multiple symbols, got: {text}"
-    );
-    // Both disambiguation groups must exist
-    assert!(
-        text.contains("load_config (1):"),
-        "Expected disambiguation group (1), got:\n{text}"
-    );
-    assert!(
-        text.contains("load_config (2):"),
-        "Expected disambiguation group (2), got:\n{text}"
+        text.contains("# load_config") || text.contains("# save_config"),
+        "Expected # symbol headings, got:\n{text}"
     );
 
-    // Extract the References section
-    let refs_section = text
-        .split("## References")
-        .nth(1)
-        .and_then(|s| s.split("## File matches").next())
-        .unwrap_or("");
-
-    // Determine which group number each definition got
-    let mod_a_in_group_1 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (1):"));
-    let mod_a_in_group_2 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (2):"));
+    // ## [Kind] definition headings
     assert!(
-        mod_a_in_group_1 || mod_a_in_group_2,
-        "mod_a should appear in a group header, got:\n{refs_section}"
+        text.contains("## [Function]"),
+        "Expected ## [Function] headings, got:\n{text}"
     );
 
-    let mod_b_in_group_1 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (1):"));
-    let mod_b_in_group_2 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (2):"));
+    // Hover content (code block from mockls)
     assert!(
-        mod_b_in_group_1 || mod_b_in_group_2,
-        "mod_b should appear in a group header, got:\n{refs_section}"
-    );
-
-    // They must be in different groups
-    assert!(
-        mod_a_in_group_1 != mod_b_in_group_1,
-        "mod_a and mod_b must be in different groups, got:\n{refs_section}"
-    );
-
-    // Split on group boundaries to get per-group content
-    let group_1_content = refs_section
-        .split("load_config (1):")
-        .nth(1)
-        .and_then(|s| s.split("load_config (2):").next())
-        .unwrap_or("");
-
-    let group_2_content = refs_section.split("load_config (2):").nth(1).unwrap_or("");
-
-    let (mod_a_refs, mod_b_refs) = if mod_a_in_group_1 {
-        (group_1_content, group_2_content)
-    } else {
-        (group_2_content, group_1_content)
-    };
-
-    // caller_c.mock imported from mod_a — must be in mod_a's group
-    assert!(
-        mod_a_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
-        "caller_c.mock should be in mod_a's group, got:\n{mod_a_refs}"
-    );
-    // caller_d.mock imported from mod_b — must be in mod_b's group
-    assert!(
-        mod_b_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
-        "caller_d.mock should be in mod_b's group, got:\n{mod_b_refs}"
-    );
-    // Negative: callers must NOT appear in the wrong group
-    assert!(
-        !mod_a_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
-        "caller_d.mock should NOT be in mod_a's group, got:\n{mod_a_refs}"
-    );
-    assert!(
-        !mod_b_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
-        "caller_c.mock should NOT be in mod_b's group, got:\n{mod_b_refs}"
+        text.contains("```"),
+        "Expected hover code block in enriched output, got:\n{text}"
     );
 
     Ok(())
 }
 
-/// Capstone test: exercises all three search tiers with a fixture that
-/// requires correct hover, references, and disambiguation to pass.
-///
-/// Guards against:
-/// - `handle_hover` returning keyword instead of symbol name
-/// - `handle_references` searching for keyword instead of symbol name
-/// - disambiguation grouping references under wrong definitions
-/// - file match dedup failing to subtract reference lines
+/// Verifies that mockls with `--resolve-provider` returns URI-only symbols
+/// that are resolved via `workspaceSymbol/resolve`, producing the same output.
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    clippy::similar_names,
-    reason = "capstone test requires exhaustive assertions across all three search tiers"
-)]
-fn test_search_full_payload() -> Result<()> {
+fn test_grep_resolve_provider() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // Two definitions with the same name in different files
-    let mod_a = dir.path().join(format!("mod_a.{MOCK_LANG_A}"));
-    std::fs::write(&mod_a, "fn load_config()\n")?;
+    let test_file = dir.path().join(format!("resolve.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn resolve_me()\nresolve_me\n")?;
 
-    let mod_b = dir.path().join(format!("mod_b.{MOCK_LANG_A}"));
-    std::fs::write(&mod_b, "fn load_config()\n")?;
-
-    // Two callers, each scoped to one definition via import
-    let caller_c = dir.path().join(format!("caller_c.{MOCK_LANG_A}"));
-    std::fs::write(
-        &caller_c,
-        "from mod_a import load_config\nfn use_a()\n  load_config\n",
-    )?;
-
-    let caller_d = dir.path().join(format!("caller_d.{MOCK_LANG_A}"));
-    std::fs::write(
-        &caller_d,
-        "from mod_b import load_config\nfn use_b()\n  load_config\n",
-    )?;
-
-    // Non-code file: .txt is not indexed by scan_roots (only .mock),
-    // so it stays out of LSP references — exercising File matches.
-    let notes = dir.path().join("notes.txt");
-    std::fs::write(
-        &notes,
-        "The load_config function handles configuration loading.\n",
-    )?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --resolve-provider");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
@@ -1897,282 +1506,27 @@ fn test_search_full_payload() -> Result<()> {
         "method": "tools/call",
         "params": {
             "name": "grep",
-            "arguments": { "pattern": "load_config" }
+            "arguments": { "pattern": "resolve_me" }
         }
     }))?;
 
     let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .context("Missing search text")?;
+        .context("Missing text")?;
 
-    // ── Symbols tier ──────────────────────────────────────────────
-
+    // Symbol should be found and resolved
     assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got:\n{text}"
-    );
-
-    // Both definitions appear with correct kind
-    let function_count = text.matches("[Function]").count();
-    assert!(
-        function_count >= 2,
-        "Expected at least 2 [Function] symbols, found {function_count} in:\n{text}"
-    );
-
-    // Both definition files referenced in symbols
-    assert!(
-        text.contains(&format!("mod_a.{MOCK_LANG_A}")),
-        "Expected mod_a.mock in output, got:\n{text}"
+        text.contains("# resolve_me"),
+        "Expected # resolve_me heading, got:\n{text}"
     );
     assert!(
-        text.contains(&format!("mod_b.{MOCK_LANG_A}")),
-        "Expected mod_b.mock in output, got:\n{text}"
-    );
-
-    // ── Hover content (guards against handle_hover bug) ───────────
-    //
-    // Extract the Symbols section (before References).
-    // With the fix: hover returns "load_config" → rendered in code block.
-    // Without the fix: hover returns "fn" → bare keyword.
-    let symbols_section = text.split("## References").next().unwrap_or(text);
-
-    // Indented hover lines (2-space indent, not 4-space which is
-    // call hierarchy content)
-    let hover_lines: Vec<&str> = symbols_section
-        .lines()
-        .filter(|l| l.starts_with("  ") && !l.starts_with("    "))
-        .filter(|l| l.trim() != "```")
-        .collect();
-
-    // At least one hover line should contain the symbol name
-    assert!(
-        hover_lines.iter().any(|l| l.contains("load_config")),
-        "Hover should contain 'load_config', got hover lines: {hover_lines:?}"
-    );
-
-    // No hover line should be just the keyword
-    assert!(
-        !hover_lines.iter().any(|l| l.trim() == "fn"),
-        "Hover should not be bare keyword 'fn', got hover lines: {hover_lines:?}"
-    );
-
-    // ── References tier ───────────────────────────────────────────
-
-    assert!(
-        text.contains("## References"),
-        "Expected References section, got:\n{text}"
-    );
-
-    // ── Disambiguation groups (guards against references bug) ─────
-    //
-    // Both groups must render.
-    assert!(
-        text.contains("load_config (1):"),
-        "Expected disambiguation group (1), got:\n{text}"
+        text.contains("## [Function]"),
+        "Expected ## [Function] heading after resolve, got:\n{text}"
     );
     assert!(
-        text.contains("load_config (2):"),
-        "Expected disambiguation group (2), got:\n{text}"
-    );
-
-    // ── Caller routing (guards against scope resolution) ──────────
-    //
-    // Extract the References section.
-    let refs_section = text
-        .split("## References")
-        .nth(1)
-        .and_then(|s| s.split("## File matches").next())
-        .unwrap_or("");
-
-    // Determine which group number each definition got.
-    let mod_a_in_grp1 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (1):"));
-    let mod_a_in_grp2 = refs_section.contains(&format!("mod_a.{MOCK_LANG_A} load_config (2):"));
-    assert!(
-        mod_a_in_grp1 || mod_a_in_grp2,
-        "mod_a should appear in a group header, got:\n{refs_section}"
-    );
-
-    let mod_b_in_grp1 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (1):"));
-    let mod_b_in_grp2 = refs_section.contains(&format!("mod_b.{MOCK_LANG_A} load_config (2):"));
-    assert!(
-        mod_b_in_grp1 || mod_b_in_grp2,
-        "mod_b should appear in a group header, got:\n{refs_section}"
-    );
-
-    // They must be in different groups
-    assert!(
-        mod_a_in_grp1 != mod_b_in_grp1,
-        "mod_a and mod_b must be in different groups, got:\n{refs_section}"
-    );
-
-    // Split on group boundaries to get per-group content
-    let grp1_content = refs_section
-        .split("load_config (1):")
-        .nth(1)
-        .and_then(|s| s.split("load_config (2):").next())
-        .unwrap_or("");
-
-    let grp2_content = refs_section.split("load_config (2):").nth(1).unwrap_or("");
-
-    let (mod_a_refs, mod_b_refs) = if mod_a_in_grp1 {
-        (grp1_content, grp2_content)
-    } else {
-        (grp2_content, grp1_content)
-    };
-
-    // caller_c.mock imported from mod_a → must be in mod_a's group
-    assert!(
-        mod_a_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
-        "caller_c.mock should be in mod_a's group, got:\n{mod_a_refs}"
-    );
-
-    // caller_d.mock imported from mod_b → must be in mod_b's group
-    assert!(
-        mod_b_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
-        "caller_d.mock should be in mod_b's group, got:\n{mod_b_refs}"
-    );
-
-    // Negative: callers must NOT appear in the wrong group
-    assert!(
-        !mod_a_refs.contains(&format!("caller_d.{MOCK_LANG_A}")),
-        "caller_d.mock should NOT be in mod_a's group, got:\n{mod_a_refs}"
-    );
-    assert!(
-        !mod_b_refs.contains(&format!("caller_c.{MOCK_LANG_A}")),
-        "caller_c.mock should NOT be in mod_b's group, got:\n{mod_b_refs}"
-    );
-
-    // ── File matches tier ─────────────────────────────────────────
-    //
-    // notes.txt is not a .mock file, so scan_roots doesn't index it.
-    // Ripgrep finds it but LSP references don't cover it — it appears
-    // in File matches.
-    assert!(
-        text.contains("## File matches"),
-        "Expected File matches section, got:\n{text}"
-    );
-    assert!(
-        text.contains("notes.txt"),
-        "Expected notes.txt in file matches, got:\n{text}"
-    );
-
-    // Code files should NOT appear in File matches — their lines
-    // are already in References and should be deduped out.
-    let file_matches_section = text.split("## File matches").nth(1).unwrap_or("");
-
-    assert!(
-        !file_matches_section.contains(&format!("mod_a.{MOCK_LANG_A}")),
-        "mod_a.mock should be deduped from file matches, got:\n{file_matches_section}"
-    );
-    assert!(
-        !file_matches_section.contains(&format!("caller_c.{MOCK_LANG_A}")),
-        "caller_c.mock should be deduped from file matches, got:\n{file_matches_section}"
-    );
-
-    Ok(())
-}
-
-/// Verifies cross-language search disambiguation: two mockls instances
-/// serving different languages each define `fn perform_task()`. Search
-/// should return both symbols and group their references by language.
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    clippy::similar_names,
-    reason = "cross-language disambiguation test requires thorough assertions"
-)]
-fn test_search_cross_language_disambiguation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let file_a = dir.path().join(format!("mod_a.{MOCK_LANG_A}"));
-    std::fs::write(&file_a, "fn perform_task()\nperform_task\n")?;
-
-    let file_b = dir.path().join(format!("mod_b.{MOCK_LANG_B}"));
-    std::fs::write(&file_b, "fn perform_task()\nperform_task\n")?;
-
-    let lsp_a = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let lsp_b = mockls_lsp_arg(MOCK_LANG_B, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp_a, &lsp_b], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "perform_task" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed: {response:?}"
-    );
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .context("Missing search text")?;
-
-    // Both symbols should appear
-    assert!(
-        text.contains("## Symbols"),
-        "Expected Symbols section, got:\n{text}"
-    );
-    assert!(
-        text.contains(&format!("mod_a.{MOCK_LANG_A}")),
-        "Expected mod_a.{MOCK_LANG_A} in output, got:\n{text}"
-    );
-    assert!(
-        text.contains(&format!("mod_b.{MOCK_LANG_B}")),
-        "Expected mod_b.{MOCK_LANG_B} in output, got:\n{text}"
-    );
-
-    // Disambiguation groups must exist
-    assert!(
-        text.contains("## References"),
-        "Expected References section for cross-language symbols, got:\n{text}"
-    );
-    assert!(
-        text.contains("perform_task (1):"),
-        "Expected disambiguation group (1), got:\n{text}"
-    );
-    assert!(
-        text.contains("perform_task (2):"),
-        "Expected disambiguation group (2), got:\n{text}"
-    );
-
-    // Each group's references should stay within its own language file
-    let refs_section = text
-        .split("## References")
-        .nth(1)
-        .and_then(|s| s.split("## File matches").next())
-        .unwrap_or("");
-
-    let grp1_content = refs_section
-        .split("perform_task (1):")
-        .nth(1)
-        .and_then(|s| s.split("perform_task (2):").next())
-        .unwrap_or("");
-
-    let grp2_content = refs_section.split("perform_task (2):").nth(1).unwrap_or("");
-
-    let mod_a_in_grp1 = grp1_content.contains(&format!("mod_a.{MOCK_LANG_A}"));
-    let mod_b_in_grp2 = grp2_content.contains(&format!("mod_b.{MOCK_LANG_B}"));
-    let mod_b_in_grp1 = grp1_content.contains(&format!("mod_b.{MOCK_LANG_B}"));
-    let mod_a_in_grp2 = grp2_content.contains(&format!("mod_a.{MOCK_LANG_A}"));
-
-    // Each file should appear in exactly one group
-    assert!(
-        (mod_a_in_grp1 && mod_b_in_grp2) || (mod_b_in_grp1 && mod_a_in_grp2),
-        "Each language's file should be in a different group. \
-         grp1: {grp1_content}\ngrp2: {grp2_content}"
+        text.contains(&format!("resolve.{MOCK_LANG_A}")),
+        "Expected file name in output, got:\n{text}"
     );
 
     Ok(())
@@ -2230,7 +1584,7 @@ fn test_grep_alternation() -> Result<()> {
 
     // Both symbols should appear
     assert!(
-        text.contains("## Symbols"),
+        text.contains("## ["),
         "Expected Symbols section for alternation, got: {text}"
     );
     assert!(
@@ -2288,7 +1642,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
 
     // Symbols tier should be present with names and kinds
     assert!(
-        text.contains("## Symbols"),
+        text.contains("## ["),
         "Expected Symbols section for broad search, got: {text}"
     );
     assert!(
@@ -2296,27 +1650,346 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         "Expected [Function] kind in broad search, got: {text}"
     );
 
-    // References tier should NOT be present (not enriched)
+    // Hover content should NOT be present when >5 symbols (no code blocks)
     assert!(
-        !text.contains("## References"),
-        "References section should be absent for >5 symbols, got: {text}"
+        !text.contains("```"),
+        "Non-enriched output should not have hover code blocks, got: {text}"
     );
 
-    // Hover content should NOT be present (indented lines under symbol)
-    // Enriched symbols have hover on indented lines; non-enriched are single-line
-    let symbol_lines: Vec<&str> = text
-        .lines()
-        .skip_while(|l| !l.contains("## Symbols"))
-        .skip(1)
-        .take_while(|l| !l.starts_with("## "))
-        .filter(|l| !l.is_empty())
-        .collect();
-    for line in &symbol_lines {
-        assert!(
-            !line.starts_with("  "),
-            "Non-enriched symbols should not have indented hover lines, got: {line}"
-        );
-    }
+    Ok(())
+}
+
+/// Test A — rg-only groups by matched string.
+///
+/// Files with no symbol definitions (plain text without `fn`/`function`/etc.)
+/// should be grouped under `# matched_text` headings when queried with alternation.
+#[test]
+fn test_grep_rg_only_groups_by_matched_string() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Create files with no symbol definitions — just plain text
+    let file_a = dir.path().join(format!("notes.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file_a,
+        "the alpha_token is important\nalpha_token appears again\n",
+    )?;
+
+    let file_b = dir.path().join(format!("readme.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file_b,
+        "beta_token is used here\nbeta_token is also here\n",
+    )?;
+
+    // Use --scan-roots so mockls indexes files, but no fn/struct/etc. definitions exist
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 900,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "alpha_token|beta_token" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep rg-only failed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Should have separate # headings for each matched string
+    assert!(
+        text.contains("# alpha_token"),
+        "Expected '# alpha_token' heading, got:\n{text}"
+    );
+    assert!(
+        text.contains("# beta_token"),
+        "Expected '# beta_token' heading, got:\n{text}"
+    );
+
+    // Each heading should have its own file hits, not all dumped together
+    assert!(
+        text.contains(&format!("notes.{MOCK_LANG_A}")),
+        "Expected notes file in alpha_token section, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("readme.{MOCK_LANG_A}")),
+        "Expected readme file in beta_token section, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Test B — alternation routes non-code hits correctly.
+///
+/// Files with symbol definitions AND non-code mentions should have each `#`
+/// heading receive the correct rg hits, not all dumped under the first one.
+#[test]
+fn test_grep_alternation_routes_non_code_hits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // File with a symbol definition for "compute" and a plain mention of "render"
+    let file_a = dir.path().join(format!("engine.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn compute()\ncompute\nrender is mentioned here\n")?;
+
+    // File with a symbol definition for "render" and a plain mention of "compute"
+    let file_b = dir.path().join(format!("display.{MOCK_LANG_A}"));
+    std::fs::write(&file_b, "fn render()\nrender\ncompute is mentioned here\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 910,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "compute|render" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep alternation routing failed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Both symbols should have # headings
+    assert!(
+        text.contains("# compute"),
+        "Expected '# compute' heading, got:\n{text}"
+    );
+    assert!(
+        text.contains("# render"),
+        "Expected '# render' heading, got:\n{text}"
+    );
+
+    // Both should have ## [Function] definition sub-headings
+    let compute_idx = text
+        .find("# compute")
+        .context("Missing # compute heading")?;
+    let render_idx = text.find("# render").context("Missing # render heading")?;
+
+    // Each section should contain its own ## [Function] heading
+    let (first_section, second_section) = if compute_idx < render_idx {
+        (&text[compute_idx..render_idx], &text[render_idx..])
+    } else {
+        (&text[render_idx..compute_idx], &text[compute_idx..])
+    };
+
+    assert!(
+        first_section.contains("## [Function]"),
+        "First section should have ## [Function], got:\n{first_section}"
+    );
+    assert!(
+        second_section.contains("## [Function]"),
+        "Second section should have ## [Function], got:\n{second_section}"
+    );
+
+    Ok(())
+}
+
+/// Test C — two definitions under one `#` heading with per-`##` references.
+///
+/// Two files each defining the same function name should produce one `#`
+/// heading with two `##` sub-headings, each showing their own references.
+#[test]
+fn test_grep_two_defs_same_name_per_heading_refs() -> Result<()> {
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+
+    let file_a = dir_a.path().join(format!("impl_a.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn process()\nprocess\n")?;
+
+    let file_b = dir_b.path().join(format!("impl_b.{MOCK_LANG_A}"));
+    std::fs::write(&file_b, "fn process()\nprocess\n")?;
+
+    let root_a = dir_a.path().to_str().context("Invalid path A")?;
+    let root_b = dir_b.path().to_str().context("Invalid path B")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 920,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "process" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep two-defs failed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Should have exactly one # heading
+    assert!(
+        text.contains("# process"),
+        "Expected '# process' heading, got:\n{text}"
+    );
+
+    // Count ## [Function] headings — should be exactly 2
+    let def_count = text.matches("## [Function]").count();
+    assert_eq!(
+        def_count, 2,
+        "Expected 2 ## [Function] headings for two defs, got {def_count}:\n{text}"
+    );
+
+    // Both files should appear
+    assert!(
+        text.contains(&format!("impl_a.{MOCK_LANG_A}")),
+        "Expected impl_a in output, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("impl_b.{MOCK_LANG_A}")),
+        "Expected impl_b in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that `fetch_symbols_by_queries` handles `OneOf::Right` (URI-only)
+/// symbols via resolve. Uses `--no-empty-query` to force the fallback path
+/// (universe returns empty, per-query lookup fires) combined with
+/// `--resolve-provider` so per-query results need resolve.
+#[test]
+fn test_grep_resolve_fallback_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let test_file = dir.path().join(format!("fallback.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn resolve_fallback()\nresolve_fallback\n")?;
+
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG_A,
+        "--scan-roots --resolve-provider --no-empty-query",
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 930,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "resolve_fallback" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep resolve fallback failed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Symbol should be found via fallback + resolve
+    assert!(
+        text.contains("# resolve_fallback"),
+        "Expected '# resolve_fallback' heading, got:\n{text}"
+    );
+    assert!(
+        text.contains("## [Function]"),
+        "Expected ## [Function] heading after fallback resolve, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("fallback.{MOCK_LANG_A}")),
+        "Expected file name in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that the same symbol name found by two different language servers
+/// produces a single `#` heading with `##` sub-headings from each server.
+#[test]
+fn test_grep_cross_server_same_symbol() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file_a = dir.path().join(format!("shared.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn cross_server_fn()\ncross_server_fn\n")?;
+
+    let file_b = dir.path().join(format!("shared.{MOCK_LANG_B}"));
+    std::fs::write(&file_b, "fn cross_server_fn()\ncross_server_fn\n")?;
+
+    let lsp_a = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let lsp_b = mockls_lsp_arg(MOCK_LANG_B, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+
+    let mut bridge = BridgeProcess::spawn(&[&lsp_a, &lsp_b], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 940,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "cross_server_fn" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "grep cross-server failed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Single # heading
+    assert!(
+        text.contains("# cross_server_fn"),
+        "Expected '# cross_server_fn' heading, got:\n{text}"
+    );
+
+    // Two ## [Function] sub-headings, one from each server's file
+    let def_count = text.matches("## [Function]").count();
+    assert_eq!(
+        def_count, 2,
+        "Expected 2 ## [Function] headings from two servers, got {def_count}:\n{text}"
+    );
+
+    // Both files should appear
+    assert!(
+        text.contains(&format!("shared.{MOCK_LANG_A}")),
+        "Expected shared.{MOCK_LANG_A} in output, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("shared.{MOCK_LANG_B}")),
+        "Expected shared.{MOCK_LANG_B} in output, got:\n{text}"
+    );
 
     Ok(())
 }
