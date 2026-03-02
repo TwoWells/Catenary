@@ -123,6 +123,10 @@ pub struct LspClient {
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
     /// Whether the server advertised `textDocumentSync.save` support.
     wants_did_save: bool,
+    /// Whether the server advertised `typeHierarchyProvider`.
+    /// Tracked separately because `lsp_types` 0.97 omits this field from
+    /// `ServerCapabilities` despite it being in the LSP 3.17 spec.
+    supports_type_hierarchy: bool,
     /// Server capabilities from the `initialize` response.
     /// Populated after `initialize()` completes.
     server_capabilities: ServerCapabilities,
@@ -259,6 +263,7 @@ impl LspClient {
             last_sent_version: Arc::new(Mutex::new(HashMap::new())),
             monitor: std::sync::Mutex::new(monitor),
             wants_did_save: false,
+            supports_type_hierarchy: false,
             server_capabilities: ServerCapabilities::default(),
             _reader_handle: reader_handle,
             child,
@@ -847,7 +852,17 @@ impl LspClient {
             ..Default::default()
         };
 
-        let result: InitializeResult = self.request("initialize", params).await?;
+        let raw: serde_json::Value = self.request("initialize", params).await?;
+
+        // Extract typeHierarchyProvider before lsp_types drops it
+        // (missing from ServerCapabilities in lsp_types 0.97)
+        self.supports_type_hierarchy = raw
+            .get("capabilities")
+            .and_then(|c| c.get("typeHierarchyProvider"))
+            .is_some_and(|v| !v.is_null());
+
+        let result: InitializeResult =
+            serde_json::from_value(raw).context("failed to parse InitializeResult")?;
 
         // Extract negotiated encoding
         if let Some(capabilities) = &result.capabilities.position_encoding {
@@ -1112,6 +1127,11 @@ impl LspClient {
             &self.server_capabilities.workspace_symbol_provider,
             Some(lsp_types::OneOf::Right(opts)) if opts.resolve_provider == Some(true)
         )
+    }
+
+    /// Returns whether the server advertises `typeHierarchyProvider`.
+    pub const fn supports_type_hierarchy(&self) -> bool {
+        self.supports_type_hierarchy
     }
 
     /// Prepares call hierarchy for a position.
