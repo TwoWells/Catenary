@@ -67,7 +67,7 @@ args = ["--stdio"]
 ```
 
 The plugin registers the MCP server and adds hooks for post-edit
-diagnostics, file locking, and workspace root sync.
+diagnostics and workspace root sync.
 
 **Gemini CLI**
 ```bash
@@ -75,7 +75,7 @@ gemini extensions install https://github.com/MarkWells-Dev/Catenary
 ```
 
 The extension registers the MCP server and adds hooks for post-edit
-diagnostics and file locking.
+diagnostics.
 
 Optionally, install the [policy file](https://markwells-dev.github.io/catenary/cli-integration.html#gemini-cli)
 to `~/.gemini/policies/catenary-constrained.toml` to block text-scanning
@@ -140,6 +140,16 @@ don't fix this — they just let you waste more before hitting the wall.
 | `search` | Symbols, semantic references, and text matches |
 | `glob` | Browse the workspace — file outlines, directory listings, glob matches |
 | `catenary notify` | PostToolUse hook — returns LSP diagnostics with quick-fix suggestions |
+
+## CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `catenary list` | List active and historical sessions |
+| `catenary monitor <id>` | Follow events from a session |
+| `catenary query` | Query session events (by session, time, kind, or raw SQL) |
+| `catenary gc` | Garbage-collect old session data |
+| `catenary doctor` | Verify language servers and hook installation |
 
 ## Known Limitations
 

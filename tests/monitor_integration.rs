@@ -18,7 +18,7 @@ use serde_json::json;
 
 #[test]
 fn test_monitor_raw_messages() -> Result<()> {
-    // Create a real session (writes events.jsonl to the state directory)
+    // Create a real session (writes events to the SQLite database)
     let session = Session::create("/tmp/monitor-test")?;
     let session_id = session.info.id.clone();
     let broadcaster = session.broadcaster();

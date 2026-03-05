@@ -130,6 +130,52 @@ it — their results come directly from the server response, not from the cache.
 
 See [Wait Model](wait-model.md) for full design details.
 
+## State Management
+
+All persistent state lives in a single SQLite database at
+`~/.local/state/catenary/catenary.db`. WAL mode is enabled for concurrent
+read access (the TUI and CLI commands can query while the MCP server writes).
+
+### Schema
+
+| Table | Purpose |
+|-------|---------|
+| `sessions` | Session metadata (ID, PID, display name, client info, timestamps, alive flag) |
+| `workspace_roots` | Workspace root paths per session |
+| `events` | Session events (tool calls, diagnostics, server state changes, etc.) |
+| `language_servers` | Per-session LSP server state |
+| `filter_history` | TUI filter patterns (per-workspace) |
+| `root_sync_state` | Transcript offset and discovered roots for `sync-roots` |
+| `meta` | Schema version tracking |
+
+### Connection owners
+
+| Process | Lifetime |
+|---------|----------|
+| MCP server | Process lifetime (shared via `Arc<Mutex<Connection>>`) |
+| CLI hooks (`notify`, `sync-roots`) | Single command invocation |
+| CLI commands (`list`, `monitor`, `query`, `gc`) | Single command invocation |
+| TUI dashboard | Dashboard lifetime |
+
+### CLI commands
+
+`catenary query` provides ad-hoc event querying for debugging and bug reports:
+
+```bash
+catenary query --session 029ba740 --since 1h
+catenary query --kind diagnostics --since today
+catenary query --search "hover" --format json
+catenary query --sql "SELECT * FROM events WHERE payload LIKE '%timeout%'"
+```
+
+`catenary gc` manages data retention:
+
+```bash
+catenary gc --older-than 7d
+catenary gc --dead
+catenary gc --session 029ba740
+```
+
 ## Root Synchronization
 
 When the MCP client sends a `notifications/roots/list_changed` notification,

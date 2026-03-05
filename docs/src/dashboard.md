@@ -59,8 +59,8 @@ rendering of each event line.
 
 ## Session Pruning
 
-On startup, the dashboard automatically removes dead session logs older than
-the configured retention period. See
+On startup, the dashboard automatically removes dead sessions older than
+the configured retention period from the database. See
 [`log_retention_days`](configuration.md#global-options) in the configuration
 reference.
 

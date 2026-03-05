@@ -38,8 +38,8 @@ claude plugin marketplace add MarkWells-Dev/Catenary
 claude plugin install catenary@catenary
 ```
 
-The plugin registers the MCP server and hooks for post-edit diagnostics,
-file locking, and root sync. It requires the `catenary` binary on PATH.
+The plugin registers the MCP server and hooks for post-edit diagnostics
+and root sync. It requires the `catenary` binary on PATH.
 
 **Option 2: Manual**
 
@@ -48,7 +48,7 @@ claude mcp add catenary -- catenary
 ```
 
 This registers the MCP server only. You will not get post-edit diagnostics
-or file locking unless you also configure hooks manually (see
+unless you also configure hooks manually (see
 [CLI Integration](cli-integration.md)).
 
 ### Claude Desktop
@@ -75,8 +75,8 @@ Add to your config file:
 gemini extensions install https://github.com/MarkWells-Dev/Catenary
 ```
 
-The extension registers the MCP server and hooks for post-edit diagnostics
-and file locking. It requires the `catenary` binary on PATH.
+The extension registers the MCP server and hooks for post-edit diagnostics.
+It requires the `catenary` binary on PATH.
 
 **Option 2: Manual**
 
@@ -93,8 +93,8 @@ Add to `~/.gemini/settings.json`:
 ```
 
 This registers the MCP server only. You will not get post-edit diagnostics
-or file locking unless you also install the extension or configure hooks
-manually (see [CLI Integration](cli-integration.md)).
+unless you also install the extension or configure hooks manually (see
+[CLI Integration](cli-integration.md)).
 
 ### Other MCP Clients
 

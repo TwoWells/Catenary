@@ -120,7 +120,7 @@ pub struct TuiConfig {
     pub focus_follows_mouse: bool,
 
     /// Capture full tool output in `ToolResult` events for TUI detail
-    /// expansion (default: false). Increases events.jsonl size.
+    /// expansion (default: false). Increases database size.
     #[serde(default)]
     pub capture_tool_output: bool,
 }
