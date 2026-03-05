@@ -155,6 +155,17 @@ struct Args {
     /// Forces the fallback to per-query lookup.
     #[arg(long)]
     no_empty_query: bool,
+
+    /// Cap `workspace/symbol("")` results to N (simulates truncation).
+    /// Non-empty queries and hover return full results.
+    #[arg(long)]
+    symbol_limit: Option<usize>,
+
+    /// Return the literal word under the cursor for hover, without resolving
+    /// keywords to the following symbol name. Simulates real LSP behavior where
+    /// hovering on `fn` returns keyword docs, not the function's signature.
+    #[arg(long)]
+    literal_keyword_hover: bool,
 }
 
 /// A JSON-RPC request.
@@ -440,6 +451,7 @@ impl MockServer {
             }
             "typeHierarchy/subtypes" => self.handle_type_hierarchy_subtypes(&request.params),
             "textDocument/codeAction" => Some(self.handle_code_action(&request.params)),
+            "textDocument/prepareRename" => self.handle_prepare_rename(&request.params),
             "callHierarchy/outgoingCalls" | "typeHierarchy/supertypes" => {
                 Some(Value::Array(Vec::new()))
             }
@@ -668,6 +680,7 @@ impl MockServer {
             "workspaceSymbolProvider": workspace_symbol_value,
             "callHierarchyProvider": true,
             "typeHierarchyProvider": true,
+            "renameProvider": { "prepareProvider": true },
             "textDocumentSync": text_doc_sync
         });
 
@@ -690,13 +703,63 @@ impl MockServer {
     fn handle_hover(&self, params: &Value) -> Option<Value> {
         let (uri, line, col) = extract_position(params)?;
         let content = self.documents.get(uri)?;
-        let word = extract_symbol_name(content, line, col)?;
+        let word = if self.args.literal_keyword_hover {
+            extract_word(content, line, col)?
+        } else {
+            extract_symbol_name(content, line, col)?
+        };
 
         Some(serde_json::json!({
             "contents": {
                 "kind": "markdown",
                 "value": format!("```\n{word}\n```")
             }
+        }))
+    }
+
+    fn handle_prepare_rename(&self, params: &Value) -> Option<Value> {
+        let (uri, line, col) = extract_position(params)?;
+        let content = self.documents.get(uri)?;
+        let word = extract_word(content, line, col)?;
+
+        let keywords = [
+            "fn",
+            "function",
+            "def",
+            "let",
+            "const",
+            "var",
+            "struct",
+            "class",
+            "enum",
+            "interface",
+            "trait",
+            "mod",
+            "module",
+            "type",
+            "method",
+            "field",
+        ];
+        if keywords.contains(&word.as_str()) {
+            return None;
+        }
+
+        let line_text = content.lines().nth(line)?;
+        let bytes = line_text.as_bytes();
+        let start = (0..=col)
+            .rev()
+            .find(|&i| !is_word_char(bytes[i]))
+            .map_or(0, |i| i + 1);
+        let end = (col..bytes.len())
+            .find(|&i| !is_word_char(bytes[i]))
+            .unwrap_or(bytes.len());
+
+        Some(serde_json::json!({
+            "range": {
+                "start": { "line": line, "character": start },
+                "end": { "line": line, "character": end }
+            },
+            "placeholder": word
         }))
     }
 
@@ -1100,6 +1163,13 @@ impl MockServer {
                     all_symbols.push(sym);
                 }
             }
+        }
+
+        // Simulate truncation: cap empty-query results to --symbol-limit N
+        if query.is_empty()
+            && let Some(limit) = self.args.symbol_limit
+        {
+            all_symbols.truncate(limit);
         }
 
         Value::Array(all_symbols)
@@ -1777,6 +1847,8 @@ mod tests {
             multi_fix: false,
             resolve_provider: false,
             no_empty_query: false,
+            symbol_limit: None,
+            literal_keyword_hover: false,
         }
     }
 

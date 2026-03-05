@@ -118,7 +118,7 @@ impl LspBridgeHandler {
 
         if let Ok(symbols) = self.fetch_outline_symbols(path) {
             for (name, kind, line) in &symbols {
-                let _ = writeln!(result, "  {name} [{kind:?}] L{line}");
+                let _ = writeln!(result, "  [{kind:?}] {name} L{line}");
             }
         }
 
@@ -276,7 +276,7 @@ impl LspBridgeHandler {
 
             if let Ok(symbols) = self.fetch_outline_symbols(path) {
                 for (name, kind, line) in &symbols {
-                    let _ = writeln!(result, "  {name} [{kind:?}] L{line}");
+                    let _ = writeln!(result, "  [{kind:?}] {name} L{line}");
                 }
             }
         }

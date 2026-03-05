@@ -18,6 +18,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
@@ -27,10 +28,11 @@ use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
 use crate::session::{EventBroadcaster, EventKind};
 
-/// Maximum unique LSP symbols for full enrichment (hover + references +
-/// labeled incoming calls / implementations / subtypes).
-/// Above this threshold, symbols are rendered with name + kind + location only.
-const GREP_ENRICHMENT_THRESHOLD: usize = 10;
+/// Maximum unique LSP symbols for hover display in output. Above this
+/// threshold, hover content is omitted but structural enrichment (references,
+/// callers, implementations, subtypes) is always included. Also caps the
+/// bootstrap discovery loop.
+const GREP_HOVER_THRESHOLD: usize = 10;
 
 use super::{DocumentManager, DocumentNotification};
 
@@ -344,7 +346,7 @@ impl LspBridgeHandler {
             all_symbols
         });
 
-        let enrich = symbols.len() <= GREP_ENRICHMENT_THRESHOLD;
+        let show_hover = symbols.len() <= GREP_HOVER_THRESHOLD;
 
         // 3. Group symbols by name (preserving order of first occurrence)
         let mut name_order: Vec<String> = Vec::new();
@@ -356,22 +358,36 @@ impl LspBridgeHandler {
             by_name.entry(sym.name.clone()).or_default().push(sym);
         }
 
-        // 4. Collect enrichment data and build per-symbol ref lines for rg dedup
+        // 4. Always enrich: references, callers, implementations, subtypes
         let mut enrichments: HashMap<(String, u32), SymbolEnrichment> = HashMap::new();
         let mut all_ref_lines: HashMap<String, HashSet<u32>> = HashMap::new();
 
-        if enrich {
-            for sym in &symbols {
-                let enrichment = self.enrich_symbol(sym);
-                for (file, lines) in &enrichment.ref_lines {
-                    all_ref_lines.entry(file.clone()).or_default().extend(lines);
-                }
-                let key = (
-                    sym.location.uri.path().to_string(),
-                    sym.location.range.start.line,
-                );
-                enrichments.insert(key, enrichment);
+        for sym in &symbols {
+            let enrichment = self.enrich_symbol(sym);
+            for (file, lines) in &enrichment.ref_lines {
+                all_ref_lines.entry(file.clone()).or_default().extend(lines);
             }
+            let key = (
+                sym.location.uri.path().to_string(),
+                sym.location.range.start.line,
+            );
+            enrichments.insert(key, enrichment);
+        }
+
+        // 4b. Rg-bootstrapped enrichment: enrich unaccounted rg hits via hover
+        let br = self.bootstrap_from_rg(&rg, &by_name, &all_ref_lines);
+        enrichments.extend(br.enrichments);
+        for (file, lines) in br.ref_lines {
+            all_ref_lines.entry(file).or_default().extend(lines);
+        }
+        for n in &br.name_order {
+            if !name_order.contains(n) {
+                name_order.push(n.clone());
+            }
+        }
+        let bootstrapped = br.symbols;
+        for sym in &bootstrapped {
+            by_name.entry(sym.name.clone()).or_default().push(sym);
         }
 
         // 5. Assign rg lines to symbol names; leftover lines are non-code hits
@@ -398,7 +414,7 @@ impl LspBridgeHandler {
             }
             let _ = writeln!(output, "# {name}");
 
-            // Non-code rg hits for this heading
+            // Non-code rg hits for this heading, with hover-resolved context
             if let Some(lines) = rg_by_name.get(name.as_str())
                 && !lines.is_empty()
             {
@@ -417,58 +433,59 @@ impl LspBridgeHandler {
                     let line = sym.location.range.start.line + 1;
                     let _ = writeln!(output, "\n## [{kind}] {path}:{line}");
 
-                    if enrich {
-                        let key = (
-                            sym.location.uri.path().to_string(),
+                    let key = (
+                        sym.location.uri.path().to_string(),
+                        sym.location.range.start.line,
+                    );
+                    if let Some(enrichment) = enrichments.get(&key) {
+                        // Hover only when symbol count is within threshold
+                        if show_hover && let Some(hover) = &enrichment.hover {
+                            output.push('\n');
+                            for line in hover.lines() {
+                                let _ = writeln!(output, "> {line}");
+                            }
+                        }
+
+                        // Structural enrichment always shown
+                        let mut labeled_lines: HashSet<(String, u32)> = HashSet::new();
+
+                        if !enrichment.incoming_calls.is_empty() {
+                            let _ = writeln!(output, "\n### Callers\n");
+                            for (name, file, line) in &enrichment.incoming_calls {
+                                let path = display_path(file, &roots);
+                                let _ = writeln!(output, "{name}  {path}:{line}");
+                                labeled_lines.insert((file.clone(), *line));
+                            }
+                        }
+
+                        if !enrichment.implementations.is_empty() {
+                            let _ = writeln!(output, "\n### Implementations\n");
+                            for (file, line) in &enrichment.implementations {
+                                let path = display_path(file, &roots);
+                                let _ = writeln!(output, "{path}:{line}");
+                                labeled_lines.insert((file.clone(), *line));
+                            }
+                        }
+
+                        if !enrichment.subtypes.is_empty() {
+                            let _ = writeln!(output, "\n### Subtypes\n");
+                            for (name, file, line) in &enrichment.subtypes {
+                                let path = display_path(file, &roots);
+                                let _ = writeln!(output, "{name}  {path}:{line}");
+                                labeled_lines.insert((file.clone(), *line));
+                            }
+                        }
+
+                        // References (excluding definition line and labeled lines)
+                        let ref_output = format_symbol_references(
+                            enrichment,
+                            sym.location.uri.path().as_str(),
                             sym.location.range.start.line,
+                            &roots,
+                            &labeled_lines,
                         );
-                        if let Some(enrichment) = enrichments.get(&key) {
-                            // Hover
-                            if let Some(hover) = &enrichment.hover {
-                                let _ = writeln!(output, "\n{hover}");
-                            }
-
-                            // Labeled sections + collect labeled lines for dedup
-                            let mut labeled_lines: HashSet<(String, u32)> = HashSet::new();
-
-                            if !enrichment.incoming_calls.is_empty() {
-                                let _ = writeln!(output, "\nCalled by:");
-                                for (name, file, line) in &enrichment.incoming_calls {
-                                    let path = display_path(file, &roots);
-                                    let _ = writeln!(output, "  {name}  {path}:{line}");
-                                    labeled_lines.insert((file.clone(), *line));
-                                }
-                            }
-
-                            if !enrichment.implementations.is_empty() {
-                                let _ = writeln!(output, "\nImplementations:");
-                                for (file, line) in &enrichment.implementations {
-                                    let path = display_path(file, &roots);
-                                    let _ = writeln!(output, "  {path}:{line}");
-                                    labeled_lines.insert((file.clone(), *line));
-                                }
-                            }
-
-                            if !enrichment.subtypes.is_empty() {
-                                let _ = writeln!(output, "\nSubtypes:");
-                                for (name, file, line) in &enrichment.subtypes {
-                                    let path = display_path(file, &roots);
-                                    let _ = writeln!(output, "  {name}  {path}:{line}");
-                                    labeled_lines.insert((file.clone(), *line));
-                                }
-                            }
-
-                            // References (excluding definition line and labeled lines)
-                            let ref_output = format_symbol_references(
-                                enrichment,
-                                sym.location.uri.path().as_str(),
-                                sym.location.range.start.line,
-                                &roots,
-                                &labeled_lines,
-                            );
-                            if !ref_output.is_empty() {
-                                let _ = writeln!(output, "\n{ref_output}");
-                            }
+                        if !ref_output.is_empty() {
+                            let _ = writeln!(output, "\n### References\n\n{ref_output}");
                         }
                     }
                 }
@@ -632,16 +649,27 @@ impl LspBridgeHandler {
     }
 
     /// Enriches a symbol with hover, references, and kind-specific labels.
-    #[allow(clippy::too_many_lines, reason = "Sequential LSP calls by kind")]
     fn enrich_symbol(&self, sym: &SymbolInformation) -> SymbolEnrichment {
         let path = PathBuf::from(sym.location.uri.path().as_str());
-        let position = sym.location.range.start;
-        let kind = sym.kind;
+        let pos = sym.location.range.start;
+        self.enrich_at_position(&path, pos.line, pos.character, sym.kind)
+    }
+
+    /// Enriches a position with hover, references, and kind-specific labels.
+    #[allow(clippy::too_many_lines, reason = "Sequential LSP calls by kind")]
+    fn enrich_at_position(
+        &self,
+        path: &Path,
+        line_0: u32,
+        col: u32,
+        kind: SymbolKind,
+    ) -> SymbolEnrichment {
+        let position = lsp_types::Position::new(line_0, col);
 
         self.runtime.block_on(async {
             let mut enrichment = SymbolEnrichment::default();
 
-            let Ok((uri, client_mutex)) = self.ensure_document_open(&path).await else {
+            let Ok((uri, client_mutex)) = self.ensure_document_open(path).await else {
                 return enrichment;
             };
 
@@ -784,6 +812,369 @@ impl LspBridgeHandler {
         })
     }
 
+    /// Enriches a position with kind inference — tries all kind-specific
+    /// enrichments and infers kind from what returns results. Used by the
+    /// rg-bootstrapped enrichment path where kind is unknown.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Sequential LSP calls for kind inference"
+    )]
+    fn enrich_at_position_infer_kind(
+        &self,
+        path: &Path,
+        line_0: u32,
+        col: u32,
+    ) -> (SymbolKind, Option<String>, SymbolEnrichment) {
+        let position = lsp_types::Position::new(line_0, col);
+
+        self.runtime.block_on(async {
+            let mut enrichment = SymbolEnrichment::default();
+            let mut inferred_kind = SymbolKind::VARIABLE;
+            let mut resolved_name: Option<String> = None;
+
+            let Ok((uri, client_mutex)) = self.ensure_document_open(path).await else {
+                return (inferred_kind, resolved_name, enrichment);
+            };
+
+            let client = client_mutex.lock().await;
+            let caps = client.capabilities();
+
+            // Hover — signature + docs
+            if caps.hover_provider.is_some() {
+                let params = HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                };
+                if let Ok(Some(hover)) = client.hover(params).await {
+                    enrichment.hover = extract_hover_text(&hover);
+                }
+            }
+
+            // References — collect line numbers for dedup
+            if caps.references_provider.is_some() {
+                let params = ReferenceParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                    partial_result_params: lsp_types::PartialResultParams::default(),
+                    context: ReferenceContext {
+                        include_declaration: true,
+                    },
+                };
+                if let Ok(Some(refs)) = client.references(params).await {
+                    for loc in &refs {
+                        enrichment
+                            .ref_lines
+                            .entry(loc.uri.path().to_string())
+                            .or_default()
+                            .insert(loc.range.start.line + 1);
+                    }
+                }
+            }
+
+            // Try all kind-specific enrichments — infer kind from results
+
+            // Call hierarchy → FUNCTION
+            if caps.call_hierarchy_provider.is_some() {
+                let prepare_params = CallHierarchyPrepareParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                };
+                if let Ok(Some(items)) = client.prepare_call_hierarchy(prepare_params).await
+                    && !items.is_empty()
+                {
+                    inferred_kind = SymbolKind::FUNCTION;
+                    // The first item's name is the LSP-canonical symbol name.
+                    // This resolves keywords (e.g., `fn` → `foobar`).
+                    resolved_name = items.first().map(|i| i.name.clone());
+                    for item in items {
+                        let params = CallHierarchyIncomingCallsParams {
+                            item,
+                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                            partial_result_params: lsp_types::PartialResultParams::default(),
+                        };
+                        if let Ok(Some(calls)) = client.incoming_calls(params).await {
+                            for call in calls {
+                                enrichment.incoming_calls.push((
+                                    call.from.name,
+                                    call.from.uri.path().to_string(),
+                                    call.from.range.start.line + 1,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Implementation → STRUCT (only if not already identified as function)
+            if inferred_kind == SymbolKind::VARIABLE && caps.implementation_provider.is_some() {
+                let params = GotoDefinitionParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                    partial_result_params: lsp_types::PartialResultParams::default(),
+                };
+                if let Ok(Some(response)) = client.implementation(params).await {
+                    let locs = goto_definition_locations(&response);
+                    if !locs.is_empty() {
+                        inferred_kind = SymbolKind::STRUCT;
+                        for loc in locs {
+                            enrichment
+                                .implementations
+                                .push((loc.uri.path().to_string(), loc.range.start.line + 1));
+                        }
+                    }
+                }
+            }
+
+            // Type hierarchy → INTERFACE (only if not already identified)
+            if inferred_kind == SymbolKind::VARIABLE && client.supports_type_hierarchy() {
+                let prepare_params = TypeHierarchyPrepareParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position,
+                    },
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                };
+                if let Ok(Some(items)) = client.prepare_type_hierarchy(prepare_params).await
+                    && !items.is_empty()
+                {
+                    inferred_kind = SymbolKind::INTERFACE;
+                    resolved_name = items.first().map(|i| i.name.clone());
+                    for item in items {
+                        let params = TypeHierarchySubtypesParams {
+                            item,
+                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                            partial_result_params: lsp_types::PartialResultParams::default(),
+                        };
+                        if let Ok(Some(sub_items)) = client.subtypes(params).await {
+                            for sub in sub_items {
+                                enrichment.subtypes.push((
+                                    sub.name,
+                                    sub.uri.path().to_string(),
+                                    sub.range.start.line + 1,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            (inferred_kind, resolved_name, enrichment)
+        })
+    }
+
+    /// Bootstraps LSP enrichment from unaccounted rg hit positions.
+    ///
+    /// After the symbol universe enrichment, some rg hits may not be explained
+    /// by any universe symbol (truncation, keyword prefixes). This method
+    /// uses `prepareRename` to distinguish symbols from keywords, then
+    /// enriches confirmed symbols with full LSP queries.
+    ///
+    /// Returns owned `SymbolInformation` values (plus enrichments and ref
+    /// lines). The caller merges these into `by_name` where both the universe
+    /// `symbols` vec and the returned vec are in scope — no `Box::leak`.
+    #[allow(clippy::too_many_lines, reason = "Iterative elimination loop")]
+    fn bootstrap_from_rg(
+        &self,
+        rg: &RipgrepMatches,
+        by_name: &BTreeMap<String, Vec<&SymbolInformation>>,
+        all_ref_lines: &HashMap<String, HashSet<u32>>,
+    ) -> BootstrapResult {
+        let mut result = BootstrapResult {
+            symbols: Vec::new(),
+            enrichments: HashMap::new(),
+            ref_lines: HashMap::new(),
+            name_order: Vec::new(),
+        };
+
+        // Build accounted set: definition lines + reference lines from universe
+        let mut accounted: HashMap<String, HashSet<u32>> = HashMap::new();
+        for defs in by_name.values() {
+            for sym in defs {
+                let file = sym.location.uri.path().to_string();
+                let line = sym.location.range.start.line + 1;
+                accounted.entry(file).or_default().insert(line);
+            }
+        }
+        for (file, ref_set) in all_ref_lines {
+            accounted.entry(file.clone()).or_default().extend(ref_set);
+        }
+
+        // Collect unaccounted rg hits: (file, line_1based, matched_text, col)
+        let mut unaccounted: Vec<(String, u32, String, u32)> = Vec::new();
+        for (file, line_map) in &rg.file_line_texts {
+            for (&line, texts) in line_map {
+                if accounted.get(file).is_some_and(|s| s.contains(&line)) {
+                    continue;
+                }
+                for (text, col) in texts {
+                    unaccounted.push((file.clone(), line, text.clone(), *col));
+                }
+            }
+        }
+
+        if unaccounted.is_empty() {
+            return result;
+        }
+
+        // Identifier token regex for extracting symbols from matched text
+        let Ok(ident_re) = Regex::new(r"[a-zA-Z_]\w*") else {
+            return result;
+        };
+
+        // Track names we've already bootstrapped to avoid duplicates
+        let mut bootstrapped_names: HashSet<String> = HashSet::new();
+
+        // Total distinct symbol count: universe + bootstrapped
+        let total_symbols = |result: &BootstrapResult| by_name.len() + result.symbols.len();
+
+        for (file, line_1, matched_text, match_col) in &unaccounted {
+            if total_symbols(&result) >= GREP_HOVER_THRESHOLD {
+                break;
+            }
+
+            // Check if this line is now accounted (by a prior bootstrap round)
+            if accounted.get(file).is_some_and(|s| s.contains(line_1)) {
+                continue;
+            }
+
+            let line_0 = line_1 - 1;
+            let path = PathBuf::from(file.as_str());
+
+            // Extract identifier tokens from the matched text
+            for m in ident_re.find_iter(matched_text) {
+                if total_symbols(&result) >= GREP_HOVER_THRESHOLD {
+                    break;
+                }
+
+                let token = m.as_str();
+
+                // Skip if already a known symbol name or already bootstrapped
+                if by_name.contains_key(token) || bootstrapped_names.contains(token) {
+                    continue;
+                }
+
+                // Column = match start on line + token offset within match text
+                let col = match_col + u32::try_from(m.start()).unwrap_or(0);
+
+                // prepareRename distinguishes symbols from keywords:
+                // symbol → range, keyword → null. Cheaper than full enrichment.
+                let is_symbol = self.runtime.block_on(async {
+                    let Ok((uri, client_mutex)) = self.ensure_document_open(&path).await else {
+                        return false;
+                    };
+                    let client = client_mutex.lock().await;
+                    if client.capabilities().rename_provider.is_none() {
+                        return true;
+                    }
+                    let params = TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        position: lsp_types::Position::new(line_0, col),
+                    };
+                    matches!(client.prepare_rename(params).await, Ok(Some(_)))
+                });
+                if !is_symbol {
+                    continue;
+                }
+
+                let (kind, resolved, enrichment) =
+                    self.enrich_at_position_infer_kind(&path, line_0, col);
+
+                // resolved_name comes from prepareCallHierarchy (functions)
+                // or prepareTypeHierarchy (types). If neither returned a name,
+                // this token isn't a structural symbol — skip it.
+                let Some(name) = resolved else { continue };
+                // If the resolved name doesn't contain the token, this is a
+                // keyword (`fn`, `struct`) that resolved to the adjacent symbol
+                // — skip and let the real token get enriched. Substring matches
+                // (e.g., token `test_glob` resolving to `test_glob_basic`) are
+                // legitimate and should proceed.
+                if !name.contains(token) {
+                    continue;
+                }
+
+                // Skip if this resolved name is already known
+                if by_name.contains_key(&name) || bootstrapped_names.contains(&name) {
+                    // Still update accounted set so remaining hits are explained
+                    for (ref_file, ref_lines) in &enrichment.ref_lines {
+                        accounted
+                            .entry(ref_file.clone())
+                            .or_default()
+                            .extend(ref_lines);
+                        result
+                            .ref_lines
+                            .entry(ref_file.clone())
+                            .or_default()
+                            .extend(ref_lines);
+                    }
+                    accounted.entry(file.clone()).or_default().insert(*line_1);
+                    continue;
+                }
+
+                // Update accounted set with new reference lines
+                for (ref_file, ref_lines) in &enrichment.ref_lines {
+                    accounted
+                        .entry(ref_file.clone())
+                        .or_default()
+                        .extend(ref_lines);
+                    result
+                        .ref_lines
+                        .entry(ref_file.clone())
+                        .or_default()
+                        .extend(ref_lines);
+                }
+
+                // Add definition line to accounted
+                accounted.entry(file.clone()).or_default().insert(*line_1);
+
+                // Store enrichment
+                result
+                    .enrichments
+                    .insert((file.clone(), line_0), enrichment);
+
+                // Build a URI for the SymbolInformation
+                let Ok(uri) = lsp_types::Uri::from_str(&format!("file://{file}")) else {
+                    continue;
+                };
+
+                #[allow(deprecated, reason = "LSP spec uses deprecated fields")]
+                let sym = SymbolInformation {
+                    name: name.clone(),
+                    kind,
+                    tags: None,
+                    deprecated: None,
+                    location: lsp_types::Location {
+                        uri,
+                        range: lsp_types::Range {
+                            start: lsp_types::Position::new(line_0, col),
+                            end: lsp_types::Position::new(line_0, col),
+                        },
+                    },
+                    container_name: None,
+                };
+
+                if !by_name.contains_key(&name) {
+                    result.name_order.push(name.clone());
+                }
+                result.symbols.push(sym);
+                bootstrapped_names.insert(name);
+            }
+        }
+
+        result
+    }
+
     /// Searches workspace roots for pattern matches using the `grep-*` crates
     /// (ripgrep's internals). Walks files in parallel and returns matched
     /// strings and per-file line numbers in a single pass per file.
@@ -903,6 +1294,7 @@ impl Sink for MatchSink<'_> {
             }
             if let Ok(text) = std::str::from_utf8(&line_bytes[m]) {
                 let text = text.to_string();
+                let col = u32::try_from(m.start()).unwrap_or(0);
                 self.local.matched_set.insert(text.clone());
                 self.local
                     .file_line_texts
@@ -910,7 +1302,7 @@ impl Sink for MatchSink<'_> {
                     .or_default()
                     .entry(line_num)
                     .or_default()
-                    .push(text);
+                    .push((text, col));
             }
             at = m.end();
         }
@@ -930,7 +1322,7 @@ impl ToolHandler for LspBridgeHandler {
         vec![
             Tool {
                 name: "grep".to_string(),
-                description: Some(format!("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Returns per-symbol sections with definitions, hover docs, and references (\u{2264}{GREP_ENRICHMENT_THRESHOLD} symbols) or name+kind+location (>{GREP_ENRICHMENT_THRESHOLD}).")),
+                description: Some(format!("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Returns per-symbol sections with definitions, hover docs, and references (\u{2264}{GREP_HOVER_THRESHOLD} symbols) or name+kind+location (>{GREP_HOVER_THRESHOLD}).")),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1090,6 +1482,18 @@ struct SymbolEnrichment {
     subtypes: Vec<(String, String, u32)>,
 }
 
+/// Symbols and enrichment discovered by rg-bootstrapped hover.
+struct BootstrapResult {
+    /// Newly-discovered `SymbolInformation` values (owned, not leaked).
+    symbols: Vec<SymbolInformation>,
+    /// Enrichment keyed by `(file_path, line_0based)`.
+    enrichments: HashMap<(String, u32), SymbolEnrichment>,
+    /// Reference lines discovered during bootstrap, keyed by file path.
+    ref_lines: HashMap<String, HashSet<u32>>,
+    /// Names of bootstrapped symbols in discovery order.
+    name_order: Vec<String>,
+}
+
 /// Result of a ripgrep `--only-matching` search.
 #[derive(Default)]
 struct RipgrepMatches {
@@ -1097,8 +1501,10 @@ struct RipgrepMatches {
     matched_strings: Vec<String>,
     /// Per-file line numbers (for heatmap tier).
     file_lines: BTreeMap<String, Vec<u32>>,
-    /// Per-file, per-line matched texts (for routing unclaimed lines to headings).
-    file_line_texts: HashMap<String, HashMap<u32, Vec<String>>>,
+    /// Per-file, per-line matched texts with column offsets
+    /// `(matched_text, column_byte_offset)` for routing unclaimed lines
+    /// to headings and for rg-bootstrapped hover positions.
+    file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
 }
 
 impl RipgrepMatches {
@@ -1106,7 +1512,7 @@ impl RipgrepMatches {
     fn merge(parts: Vec<ThreadMatches>) -> Self {
         let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut matched_set: HashSet<String> = HashSet::new();
-        let mut file_line_texts: HashMap<String, HashMap<u32, Vec<String>>> = HashMap::new();
+        let mut file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>> = HashMap::new();
 
         for part in parts {
             for (file, lines) in part.file_lines {
@@ -1136,8 +1542,8 @@ struct ThreadMatches {
     file_lines: BTreeMap<String, Vec<u32>>,
     /// Unique matched strings (`HashSet` for efficient per-thread dedup).
     matched_set: HashSet<String>,
-    /// Per-file, per-line matched texts.
-    file_line_texts: HashMap<String, HashMap<u32, Vec<String>>>,
+    /// Per-file, per-line matched texts with column offsets.
+    file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
 }
 
 /// Extracts plain text from an LSP `Hover` response.
@@ -1346,7 +1752,7 @@ fn assign_rg_lines_to_symbols(
             let mut routed = false;
 
             if let Some(texts) = texts {
-                for matched_text in texts {
+                for (matched_text, _col) in texts {
                     let mt_lower = matched_text.to_lowercase();
                     // Try to match to a known symbol name
                     for (name, nl) in &name_lower {

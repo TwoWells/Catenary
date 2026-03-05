@@ -10,11 +10,12 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind, ProgressParams,
-    PublishDiagnosticsParams, ReferenceParams, ServerCapabilities, TextDocumentIdentifier,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent,
-    WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind,
+    PrepareRenameResponse, ProgressParams, PublishDiagnosticsParams, ReferenceParams,
+    ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
+    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbol, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1035,6 +1036,22 @@ impl LspClient {
     /// Returns an error if the request fails or times out.
     pub async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         self.request("textDocument/hover", params).await
+    }
+
+    /// Tests whether a position is a renameable symbol.
+    ///
+    /// Returns `Some(range/placeholder)` for symbols, `None` for keywords
+    /// and non-symbol positions. Used as a cheap discriminator before full
+    /// enrichment in the rg-bootstrap path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
+    pub async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        self.request("textDocument/prepareRename", params).await
     }
 
     /// Gets the definition location for a symbol.
