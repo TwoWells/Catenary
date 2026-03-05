@@ -732,8 +732,8 @@ fn run_notify(format: HostFormat) {
 /// notify endpoint. The server diffs against its current state, handling both
 /// additions and removals.
 ///
-/// Uses a persistent state file (`known_roots.json`) to track the byte offset
-/// and the full discovered root set across invocations.
+/// Uses the `root_sync_state` table in the `SQLite` database to track the byte
+/// offset and the full discovered root set across invocations.
 ///
 /// Silently succeeds on any error to avoid breaking Claude Code's flow.
 #[allow(
@@ -772,21 +772,32 @@ fn run_sync_roots(format: HostFormat) {
         return;
     };
 
-    let session_dir = session::sessions_dir().join(&session.id);
+    // Open DB for root_sync_state persistence
+    let Ok(db) = catenary_mcp::db::open_and_migrate() else {
+        return;
+    };
 
     // Load persistent state: byte offset + known root set
-    let state_path = session_dir.join("known_roots.json");
-    let (start_offset, mut known_roots) = load_root_state(&state_path);
-
-    // Migrate from old transcript_offset file if known_roots.json doesn't exist
-    if start_offset == 0 && known_roots.is_empty() {
-        let legacy_path = session_dir.join("transcript_offset");
-        if legacy_path.exists() {
-            // Legacy file only stored offset; remove it and re-scan from
-            // beginning to build the full root set.
-            let _ = std::fs::remove_file(&legacy_path);
-        }
-    }
+    let (start_offset, mut known_roots) = db
+        .query_row(
+            "SELECT offset, roots FROM root_sync_state WHERE session_id = ?1",
+            [&session.id],
+            |row| {
+                let offset: i64 = row.get(0)?;
+                let roots_json: String = row.get(1)?;
+                Ok((offset, roots_json))
+            },
+        )
+        .map_or_else(
+            |_| (0u64, Vec::new()),
+            |(offset, roots_json)| {
+                let roots: Vec<String> = serde_json::from_str(&roots_json).unwrap_or_default();
+                (
+                    u64::try_from(offset).unwrap_or(0),
+                    roots.into_iter().map(PathBuf::from).collect(),
+                )
+            },
+        );
 
     // Open transcript and seek to offset
     let Ok(mut file) = std::fs::File::open(transcript_path) else {
@@ -854,7 +865,19 @@ fn run_sync_roots(format: HostFormat) {
 
     // Save updated state
     let new_offset = file.stream_position().unwrap_or(start_offset);
-    save_root_state(&state_path, new_offset, &known_roots);
+    let roots_strs: Vec<String> = known_roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let roots_json = serde_json::to_string(&roots_strs).unwrap_or_else(|_| "[]".to_string());
+    let _ = db.execute(
+        "INSERT OR REPLACE INTO root_sync_state (session_id, offset, roots) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            &session.id,
+            i64::try_from(new_offset).unwrap_or(0),
+            roots_json
+        ],
+    );
 
     if !changed {
         return;
@@ -902,41 +925,6 @@ fn resolve_transcript_path(path_str: &str, cwd: &Path) -> PathBuf {
         path
     } else {
         cwd.join(path)
-    }
-}
-
-/// Persistent state for root tracking across `sync-roots` invocations.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RootState {
-    /// Byte offset into the transcript file.
-    offset: u64,
-    /// Known workspace roots (absolute paths).
-    roots: Vec<String>,
-}
-
-/// Loads the root state from a JSON file. Returns `(0, vec![])` on any error.
-fn load_root_state(path: &Path) -> (u64, Vec<PathBuf>) {
-    let Ok(data) = std::fs::read_to_string(path) else {
-        return (0, Vec::new());
-    };
-    let Ok(state) = serde_json::from_str::<RootState>(&data) else {
-        return (0, Vec::new());
-    };
-    let roots = state.roots.into_iter().map(PathBuf::from).collect();
-    (state.offset, roots)
-}
-
-/// Saves the root state to a JSON file. Silently ignores errors.
-fn save_root_state(path: &Path, offset: u64, roots: &[PathBuf]) {
-    let state = RootState {
-        offset,
-        roots: roots
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-    };
-    if let Ok(json) = serde_json::to_string(&state) {
-        let _ = std::fs::write(path, json);
     }
 }
 
