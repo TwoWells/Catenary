@@ -6,9 +6,11 @@
 //! Contains the core [`App`] struct, [`FocusedPane`] and [`InputMode`] enums,
 //! and the constructor that initializes sessions, tree, grid, and focus.
 
+use std::collections::HashMap;
+
 use ratatui::layout::Rect;
 
-use super::data::DataSource;
+use super::data::{DataSource, EventTail};
 use super::filter::FilterState;
 use super::grid::EventsGrid;
 use super::layout::PanelLayout;
@@ -68,6 +70,8 @@ pub struct App<'a> {
     pub grid_area: Rect,
     /// Cached panel layout (updated each frame).
     pub grid_layout: Option<PanelLayout>,
+    /// Event tails keyed by session ID, for streaming new events into panels.
+    pub tails: HashMap<String, Box<dyn EventTail>>,
 }
 
 impl<'a> App<'a> {
@@ -133,6 +137,7 @@ impl<'a> App<'a> {
             tree_area: Rect::default(),
             grid_area: Rect::default(),
             grid_layout: None,
+            tails: HashMap::new(),
         })
     }
 }
