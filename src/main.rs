@@ -994,9 +994,28 @@ fn run_gc(older_than: Option<&str>, dead: bool, session_id: Option<&str>) -> Res
 
     // --dead: detect crashed sessions, then delete all dead sessions
     if dead {
-        // list_sessions() checks PID liveness and marks crashed sessions
-        // as dead in the DB, so we just call it before deleting.
-        let _ = session::list_sessions();
+        // Mark crashed sessions (alive in DB but PID gone)
+        let crashed: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id, pid FROM sessions WHERE alive = 1")?;
+            let mut rows = stmt.query([])?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let pid: u32 = row.get(1)?;
+                if !session::is_process_alive(pid) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+
+        let ended_at = Utc::now().to_rfc3339();
+        for id in &crashed {
+            let _ = conn.execute(
+                "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+                rusqlite::params![&ended_at, id],
+            );
+        }
 
         // Count events that will be cascade-deleted
         let dead_events: usize = conn
