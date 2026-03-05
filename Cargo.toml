@@ -52,6 +52,7 @@ ignore = "0.4.25"
 libc = "0.2"
 lsp-types = "0.97.0"
 regex = "1.10"
+rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 similar = "2.6"
