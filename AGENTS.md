@@ -21,6 +21,8 @@ find-references, rename, and search without shell-based text scanning.
 - **Session:** A running Catenary instance. Each session has a unique ID (opaque
   string), a PID, and one or more workspace roots. Sessions are discoverable via
   `catenary list` and monitorable via `catenary monitor <id>`. See `src/session.rs`.
+- **Database:** All session state (sessions, events, workspace roots) is stored in
+  `~/.local/state/catenary/catenary.db` (SQLite with WAL mode). See `src/db.rs`.
 - **MCP tools:** The tools exposed to agents (search, hover, definition,
   diagnostics, etc.) are defined in the MCP server. Each tool delegates to one or
   more LSP servers under the hood.
@@ -31,13 +33,15 @@ find-references, rename, and search without shell-based text scanning.
 - **Diagnostics:** The `catenary notify` command (`src/notify.rs` for the IPC
   server) runs in PostToolUse hooks after file edits. It connects to the
   running session's notify socket, sends the changed file path, and returns
-  LSP diagnostics so they appear in the model's context.
+  LSP diagnostics so they appear in the model's context. Diagnostic events are
+  stored in the SQLite database for later querying via `catenary query`.
 - **Root sync:** `catenary sync-roots` (PreToolUse, Claude Code only) scans the
   transcript for `/add-dir` workspace additions and forwards them to the session.
 
 ### Architecture references
 
 - `docs/src/plugin-architecture.md` — plugin layout, hook contracts, version management.
+- `src/db.rs` — SQLite connection management, schema creation, and migrations.
 - `src/session.rs` — session lifecycle and event broadcasting.
 - `docs/src/` — full documentation source.
 

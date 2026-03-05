@@ -32,7 +32,7 @@ cargo install catenary-mcp
 **3. Connect your AI assistant**
 
 Plugins and extensions register the MCP server *and* hooks for post-edit
-diagnostics, file locking, and root sync. The binary must be on your PATH.
+diagnostics and root sync. The binary must be on your PATH.
 
 *Claude Code:*
 ```

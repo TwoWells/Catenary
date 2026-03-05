@@ -135,7 +135,7 @@ The `[server.<language-id>]` key must match the LSP language identifier. Catenar
 |--------|---------|-------------|
 | `idle_timeout` | `300` | Seconds before auto-closing idle documents. Set to `0` to disable. |
 | `log_retention_days` | `7` | Days to keep dead session logs. `0` = remove all dead sessions on startup. `-1` = retain forever. |
-| `tui.capture_tool_output` | `false` | Store full tool output in events for TUI detail expansion. Increases `events.jsonl` size. |
+| `tui.capture_tool_output` | `false` | Store full tool output in events for TUI detail expansion. Increases database size. |
 
 ## Icons
 

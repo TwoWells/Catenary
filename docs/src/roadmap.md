@@ -1,6 +1,6 @@
 # Roadmap
 
-Current version: **v1.1.0**
+Current version: **v1.4.0**
 
 ## Completed
 
@@ -128,6 +128,20 @@ Full toolset to replace CLI built-in tools.
 - [x] **`denied` subcommands** — block specific command+subcommand pairs
       in the `run` tool (e.g., `"git grep"`), takes priority over allowlist
       including `["*"]`
+
+### SQLite Migration ✓
+
+Replaced filesystem-based session and event storage with SQLite.
+
+- [x] Removed filesystem advisory lock system (no longer needed with
+      single-agent-per-worktree workflow)
+- [x] `src/db.rs` — connection management, schema creation, migrations
+- [x] Sessions, events, workspace roots stored in
+      `~/.local/state/catenary/catenary.db`
+- [x] WAL mode for concurrent readers (TUI/CLI) with single writer (MCP server)
+- [x] `SqliteDataSource` for TUI dashboard
+- [x] `catenary query` — ad-hoc event querying (table, JSON, CSV output)
+- [x] `catenary gc` — data retention management
 
 ### CLI Integration Research ✓
 

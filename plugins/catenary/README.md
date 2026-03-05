@@ -21,8 +21,8 @@ missing, hooks will silently do nothing.
 /plugin install catenary@catenary
 ```
 
-The plugin registers the MCP server and adds hooks for post-edit diagnostics,
-file locking, and workspace root sync.
+The plugin registers the MCP server and adds hooks for post-edit diagnostics
+and workspace root sync.
 
 ## Configuration
 

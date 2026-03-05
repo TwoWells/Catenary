@@ -129,7 +129,7 @@ workspace root set to the running Catenary session. The server diffs against its
 current state, applying both additions and removals to LSP clients and the search
 index.
 
-State is persisted in `known_roots.json` (inside the session directory) to track
+State is persisted in the `root_sync_state` table in the SQLite database to track
 the transcript byte offset and the full discovered root set across invocations.
 
 **Fields consumed from hook JSON:**

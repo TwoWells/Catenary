@@ -272,6 +272,18 @@ Catenary exposes two MCP tools plus post-edit diagnostics via hooks:
 | `glob` | File I/O  | Files, dirs, symlinks, symbol outlines             |
 | hooks  | LSP       | Post-edit diagnostics and code actions              |
 
+### Standalone CLI Commands
+
+These commands are not MCP tools — they are run directly from the terminal.
+
+| Command | Description |
+| ------- | ----------- |
+| `catenary list` | List active and historical sessions |
+| `catenary monitor <id>` | Follow events from a session in real time |
+| `catenary query` | Query events from the database (filterable by session, time, kind, or raw SQL) |
+| `catenary gc` | Garbage-collect old session data (by age, dead sessions, or specific session) |
+| `catenary doctor` | Verify language servers and hook installation |
+
 File I/O is handled by the host tool's native file operations. Catenary
 provides post-edit diagnostics via the `catenary notify` hook.
 
