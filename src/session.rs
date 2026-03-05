@@ -759,7 +759,7 @@ pub fn delete_session_data(id: &str) -> Result<()> {
 // ── Private helpers ──────────────────────────────────────────────────
 
 /// Returns the serde tag for an event kind (used as the `kind` column value).
-pub(crate) const fn event_kind_tag(kind: &EventKind) -> &'static str {
+const fn event_kind_tag(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::ServerState { .. } => "server_state",
         EventKind::Progress { .. } => "progress",
