@@ -356,19 +356,11 @@ impl EventBroadcaster {
     }
 
     /// Create a no-op broadcaster (for when session is disabled).
-    ///
-    /// # Errors
-    ///
-    /// This function is infallible but retains the `Result` return type
-    /// for API compatibility. It will be simplified in a future release.
-    #[allow(
-        clippy::missing_const_for_fn,
-        reason = "Result wrapper for API compatibility"
-    )]
-    pub fn noop() -> Result<Self> {
-        Ok(Self {
+    #[must_use]
+    pub const fn noop() -> Self {
+        Self {
             inner: BroadcasterInner::Noop,
-        })
+        }
     }
 }
 
@@ -918,8 +910,8 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcaster_noop() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop()?;
+    fn test_broadcaster_noop() {
+        let broadcaster = EventBroadcaster::noop();
 
         // Should not panic or error
         broadcaster.send(EventKind::Started);
@@ -927,8 +919,6 @@ mod tests {
             language: "rust".to_string(),
             state: "Ready".to_string(),
         });
-
-        Ok(())
     }
 
     #[test]
