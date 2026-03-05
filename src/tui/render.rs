@@ -323,6 +323,12 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                         panel.load_events(events);
                         panel.update_language_servers();
                     }
+                    // Create a tail if one doesn't already exist.
+                    if !app.tails.contains_key(&session_id)
+                        && let Ok(tail) = app.data.create_tail(&session_id)
+                    {
+                        app.tails.insert(session_id, tail);
+                    }
                 }
             } else if app.focus == FocusedPane::Events
                 && let Some(panel) = app.grid.focused_panel_mut()
@@ -340,9 +346,13 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
             true
         }
         KeyCode::Char('x') if app.focus == FocusedPane::Events => {
-            // Close focused panel.
+            // Close focused panel and remove its tail.
             if let Some(idx) = app.grid.focused {
+                let session_id = app.grid.panels.get(idx).map(|p| p.session_id.clone());
                 app.grid.close_panel(idx);
+                if let Some(id) = session_id {
+                    app.tails.remove(&id);
+                }
                 if app.grid.panels.is_empty() {
                     app.focus = FocusedPane::Sessions;
                 }

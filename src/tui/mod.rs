@@ -42,6 +42,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::config::IconConfig;
+use crate::session::EventKind;
 
 use self::app::{FocusedPane, InputMode};
 use self::data::SqliteDataSource;
@@ -84,7 +85,7 @@ pub fn run_with_data(icon_config: IconConfig, data: Box<dyn DataSource>) -> Resu
 
     let mut app = App::new(&theme, &icons, data, tui_config.sessions_width)?;
 
-    // Load events for auto-opened panels.
+    // Load events for auto-opened panels and create tails.
     let panel_ids: Vec<String> = app
         .grid
         .panels
@@ -97,6 +98,9 @@ pub fn run_with_data(icon_config: IconConfig, data: Box<dyn DataSource>) -> Resu
         {
             panel.load_events(events);
             panel.update_language_servers();
+        }
+        if let Ok(tail) = app.data.create_tail(id) {
+            app.tails.insert(id.clone(), tail);
         }
     }
 
@@ -163,6 +167,9 @@ fn run_loop(
         if last_tick.elapsed() >= TICK_INTERVAL {
             last_tick = Instant::now();
             tick_count += 1;
+
+            // Poll tails for new events every tick.
+            poll_tails(app);
 
             // Refresh sessions periodically.
             if tick_count.is_multiple_of(SESSION_REFRESH_TICKS) {
@@ -359,6 +366,25 @@ fn scrollbar_click(app: &mut App<'_>, panel: usize, y: u16) {
     }
 }
 
+/// Poll all event tails and push new events into their panels.
+fn poll_tails(app: &mut App<'_>) {
+    let ids: Vec<String> = app.tails.keys().cloned().collect();
+    for id in ids {
+        let Some(tail) = app.tails.get_mut(&id) else {
+            continue;
+        };
+        while let Ok(Some(event)) = tail.try_next_event() {
+            let is_server_state = matches!(event.kind, EventKind::ServerState { .. });
+            if let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == id) {
+                panel.push_event(event);
+                if is_server_state {
+                    panel.update_language_servers();
+                }
+            }
+        }
+    }
+}
+
 /// Refresh the session list from the data source.
 fn refresh_sessions(app: &mut App<'_>) {
     if let Ok(rows) = app.data.list_sessions() {
@@ -395,7 +421,14 @@ fn refresh_sessions(app: &mut App<'_>) {
                     panel.load_events(events);
                     panel.update_language_servers();
                 }
+                if let Ok(tail) = app.data.create_tail(id) {
+                    app.tails.insert(id.clone(), tail);
+                }
             }
         }
+
+        // Remove tails for panels that are no longer open.
+        app.tails
+            .retain(|id, _| app.grid.panel_for_session(id).is_some());
     }
 }
