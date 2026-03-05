@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_returns_initial_roots() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
@@ -611,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_root_appends() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
@@ -631,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_empty_initial() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(test_config(), vec![], broadcaster);
 
         assert!(manager.roots().await.is_empty());
@@ -640,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_root() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
@@ -659,7 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_roots_adds_and_removes() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
@@ -683,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_roots_no_change() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
@@ -704,7 +704,7 @@ mod tests {
     async fn test_sync_roots_shuts_down_unsupported_client() -> Result<()> {
         // mockls without --workspace-folders does NOT advertise workspace folder support.
         // When roots change, the client should be shut down (and lazily respawned).
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(mockls_config(), vec![PathBuf::from("/tmp")], broadcaster);
 
         let client = manager.get_client(MOCK_LANG_A).await?;
@@ -733,7 +733,7 @@ mod tests {
     async fn test_sync_roots_notifies_supported_client() -> Result<()> {
         // mockls with --workspace-folders DOES advertise workspace folder support.
         // When roots change, it should receive a notification instead of being shut down.
-        let broadcaster = EventBroadcaster::noop()?;
+        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             mockls_workspace_folders_config(),
             vec![PathBuf::from("/tmp")],

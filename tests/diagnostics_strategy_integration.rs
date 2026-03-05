@@ -294,7 +294,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
 
     // Spawn LspClient directly with mockls --diagnostics-delay 5000
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let broadcaster = EventBroadcaster::noop()?;
+    let broadcaster = EventBroadcaster::noop();
     let mut client = LspClient::spawn(
         mockls_bin,
         &[

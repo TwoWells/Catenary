@@ -1530,7 +1530,7 @@ async fn run_doctor(args: Args, nocolor: bool, show_diff: bool) -> Result<()> {
         .unwrap_or(10);
 
     // Create a broadcaster for client spawning (no-op since we don't need events)
-    let broadcaster = catenary_mcp::session::EventBroadcaster::noop()?;
+    let broadcaster = catenary_mcp::session::EventBroadcaster::noop();
 
     for (lang, server_config) in &servers {
         let lang_display = format!("{lang:<max_lang_width$}");

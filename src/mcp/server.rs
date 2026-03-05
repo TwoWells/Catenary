@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_handle_initialize() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_list() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_success() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_error() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_handle_unknown_method() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_handle_ping() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_stored_when_present() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         assert!(!server.client_has_roots);
 
         initialize_server(&mut server, true)?;
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_absent_by_default() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
         Ok(())
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_after_initialized() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_on_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn test_no_fetch_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, false)?;
 
         let notification = Notification {
@@ -745,7 +745,7 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -796,7 +796,7 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -858,7 +858,7 @@ mod tests {
     fn test_fetch_roots_handles_error_response() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn test_list_changed_honored_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         // Initialize WITHOUT roots capability
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_without_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
 
         // Initialize with `roots: {}` (no listChanged field)
         let request = Request {
@@ -923,7 +923,7 @@ mod tests {
     fn test_fetching_roots_reset_on_error() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop()?);
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
