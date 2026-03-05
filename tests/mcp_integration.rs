@@ -183,7 +183,7 @@ impl BridgeProcess {
 
     /// Sends a file-change notification via the notify socket and returns
     /// the diagnostics text. This exercises the production hook path
-    /// (`catenary release`) rather than the (removed) MCP `diagnostics` tool.
+    /// (`catenary notify`) rather than the (removed) MCP `diagnostics` tool.
     fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
         let state_home = self.state_home.as_ref().context("state_home not set")?;
         let sessions_dir = PathBuf::from(state_home).join("catenary").join("sessions");

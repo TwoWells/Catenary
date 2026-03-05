@@ -124,7 +124,7 @@ blocked, starved, and progress-explained ticks are free waits.
 servers that advertise save support receive `textDocument/didSave`.
 
 This mechanism applies to the paths that return diagnostics after a change:
-the `catenary release` hook (for post-edit diagnostics) and the `diagnostics`
+the `catenary notify` hook (for post-edit diagnostics) and the `diagnostics`
 tool. Request/response tools (`definition`, `document_symbols`) do not need
 it — their results come directly from the server response, not from the cache.
 

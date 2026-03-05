@@ -48,10 +48,9 @@ Location: `~/.gemini/settings.json` (user) or `.gemini/settings.json` (workspace
 
 **Recommended: Extension + Constrained Mode.**
 
-1.  **Install the Extension:** The Catenary extension provides
-    `BeforeTool` / `AfterTool` hooks that run `catenary acquire` /
-    `catenary release` around file operations. This ensures file locking
-    and the model sees LSP diagnostics immediately.
+1.  **Install the Extension:** The Catenary extension provides an
+    `AfterTool` hook that runs `catenary notify` after file operations,
+    so the model sees LSP diagnostics immediately.
 
     ```bash
     gemini extensions install https://github.com/MarkWells-Dev/Catenary
@@ -119,41 +118,18 @@ Location: `.claude/settings.json` (workspace) or `~/.claude/settings.json`
 
 **Recommended: Hook-based integration.** Claude Code's native `Read`, `Edit`,
 and `Write` tools handle file I/O with inline diffs and syntax highlighting.
-Catenary provides file locking and LSP diagnostics via `PreToolUse` /
-`PostToolUse` hooks — the lock is held through the full edit→diagnostics cycle.
+Catenary provides LSP diagnostics via a `PostToolUse` hook.
 
 ```json
 {
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary acquire --format=claude"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary release --format=claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary release --grace 0"
+            "command": "catenary notify --format=claude"
           }
         ]
       }
@@ -167,10 +143,9 @@ Catenary provides file locking and LSP diagnostics via `PreToolUse` /
 }
 ```
 
-The `catenary release` command reads the hook's JSON from stdin, finds the
-running Catenary session for the workspace, returns any LSP diagnostics,
-records the file's mtime, and releases the lock. It exits silently on any
-error so it never blocks Claude Code's flow.
+The `catenary notify` command reads the hook's JSON from stdin, finds the
+running Catenary session for the workspace, and returns any LSP diagnostics.
+It exits silently on any error so it never blocks Claude Code's flow.
 
 **Alternative: Constrained mode.** Keep Claude Code's native `Read`, `Edit`,
 `Write`, and `Bash` tools but block text-scanning commands to force LSP-first
@@ -240,7 +215,7 @@ path that would let the model fall back to text scanning. The model uses:
 
 - **Catenary `grep`** for content discovery (symbols, references, text matches)
 - **Catenary `glob`** for directory browsing (replaces `ls`, `tree`, `find`)
-- **Claude Code `Read`/`Edit`/`Write`** for file I/O (with `catenary release` hook for diagnostics)
+- **Claude Code `Read`/`Edit`/`Write`** for file I/O (with `catenary notify` hook for diagnostics)
 - **Claude Code `Bash`** for build, test, and git commands only
 
 ## Experiment Results
@@ -298,7 +273,7 @@ Catenary exposes two MCP tools plus post-edit diagnostics via hooks:
 | hooks  | LSP       | Post-edit diagnostics and code actions              |
 
 File I/O is handled by the host tool's native file operations. Catenary
-provides post-edit diagnostics via the `catenary release` hook.
+provides post-edit diagnostics via the `catenary notify` hook.
 
 ## Limitations
 

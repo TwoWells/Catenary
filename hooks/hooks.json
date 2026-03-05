@@ -1,25 +1,13 @@
 {
   "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "read_file|write_file|replace",
-        "hooks": [
-          {
-            "name": "catenary-acquire",
-            "type": "command",
-            "command": "catenary acquire --format=gemini"
-          }
-        ]
-      }
-    ],
     "AfterTool": [
       {
         "matcher": "read_file|write_file|replace",
         "hooks": [
           {
-            "name": "catenary-release",
+            "name": "catenary-notify",
             "type": "command",
-            "command": "catenary release --format=gemini"
+            "command": "catenary notify --format=gemini"
           }
         ]
       }

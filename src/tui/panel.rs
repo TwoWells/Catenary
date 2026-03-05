@@ -355,7 +355,7 @@ impl<'a> PanelState<'a> {
             .get(event_index)
             .is_some_and(|ev| match &ev.kind {
                 EventKind::Diagnostics { count, .. } => *count > 0,
-                EventKind::ToolResult { .. } | EventKind::LockDenied { .. } => true,
+                EventKind::ToolResult { .. } => true,
                 EventKind::ToolCall { params, file, .. } => params.is_some() || file.is_some(),
                 _ => false,
             })
@@ -533,16 +533,6 @@ pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec
                 ]));
             }
             lines
-        }
-        EventKind::LockDenied {
-            file,
-            owner,
-            held_by,
-        } => {
-            vec![Line::from(vec![
-                Span::raw(indent.to_string()),
-                Span::styled(format!("{file}: {owner} blocked by {held_by}"), theme.error),
-            ])]
         }
         _ => Vec::new(),
     }

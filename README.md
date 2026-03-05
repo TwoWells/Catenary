@@ -139,7 +139,7 @@ don't fix this — they just let you waste more before hitting the wall.
 |------|-------------|
 | `search` | Symbols, semantic references, and text matches |
 | `glob` | Browse the workspace — file outlines, directory listings, glob matches |
-| `catenary release` | PostToolUse hook — returns LSP diagnostics (with quick-fix suggestions) and releases file lock |
+| `catenary notify` | PostToolUse hook — returns LSP diagnostics with quick-fix suggestions |
 
 ## Known Limitations
 

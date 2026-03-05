@@ -30,7 +30,7 @@ use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
 /// Output format for hook commands.
 ///
 /// Determines how hook output is structured for the host CLI.
-/// Required on all hook-facing subcommands (`acquire`, `release`, `sync-roots`).
+/// Required on all hook-facing subcommands (`notify`, `sync-roots`).
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum HostFormat {
     /// Claude Code hooks (`PostToolUse` / `PreToolUse`).
@@ -117,29 +117,12 @@ enum Command {
         format: HostFormat,
     },
 
-    /// Acquire a file lock before reading or editing.
+    /// Run diagnostics for a file after editing.
     /// Reads hook JSON from stdin.
-    Acquire {
-        /// Maximum time to wait for the lock (seconds).
-        #[arg(long, default_value = "180")]
-        timeout: u64,
-
+    Notify {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
-    },
-
-    /// Release a file lock after reading or editing.
-    /// Runs diagnostics notify and track-read before releasing.
-    /// Reads hook JSON from stdin.
-    Release {
-        /// Grace period before the lock expires (seconds).
-        #[arg(long, default_value = "30")]
-        grace: u64,
-
-        /// Output format. When set, runs diagnostics and track-read before releasing.
-        #[arg(long, value_enum)]
-        format: Option<HostFormat>,
     },
 }
 
@@ -173,12 +156,8 @@ async fn main() -> Result<()> {
             run_sync_roots(format);
             Ok(())
         }
-        Some(Command::Acquire { timeout, format }) => {
-            run_acquire(timeout, format);
-            Ok(())
-        }
-        Some(Command::Release { grace, format }) => {
-            run_release(grace, format);
+        Some(Command::Notify { format }) => {
+            run_notify(format);
             Ok(())
         }
     }
@@ -700,14 +679,13 @@ fn ipc_exchange(
     lines
 }
 
-/// Acquire a file lock before reading or editing (`PreToolUse` hook handler).
+/// Run diagnostics notify after reading or editing (`PostToolUse` hook handler).
 ///
-/// Reads hook JSON from stdin, extracts the owner and file path, and acquires
-/// the lock. Blocks until the lock is available or the timeout expires.
-/// Silently succeeds on any error to avoid breaking the host CLI's flow.
-fn run_acquire(timeout: u64, format: HostFormat) {
-    use catenary_mcp::lock::AcquireResult;
-
+/// Reads hook JSON from stdin, finds the session for the file's workspace,
+/// connects to the notify socket, and returns diagnostics for the model's
+/// context. Silently succeeds on any error to avoid breaking the host CLI's
+/// flow.
+fn run_notify(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -716,125 +694,35 @@ fn run_acquire(timeout: u64, format: HostFormat) {
         return;
     };
 
-    let owner = extract_owner(&hook_json);
-    let tool = extract_tool_name(&hook_json);
     let Some(file_path) = extract_file_path(&hook_json) else {
         return;
     };
 
-    let Ok(mgr) = catenary_mcp::lock::FileLockManager::new() else {
+    // Notify session for diagnostics
+    let abs_path = PathBuf::from(&file_path);
+    let sessions = session::list_sessions().unwrap_or_default();
+    let session = sessions
+        .iter()
+        .find(|(s, _)| abs_path.to_string_lossy().starts_with(&s.workspace));
+
+    let Some((session, _)) = session else {
         return;
     };
 
-    let result = mgr.acquire(&file_path, &owner, timeout);
-
-    match result {
-        AcquireResult::Acquired => {
-            broadcast_lock_event(
-                &hook_json,
-                EventKind::LockAcquired {
-                    file: file_path,
-                    owner,
-                    tool,
-                },
-            );
-        }
-        AcquireResult::AcquiredStaleRead { context } => {
-            broadcast_lock_event(
-                &hook_json,
-                EventKind::LockAcquired {
-                    file: file_path,
-                    owner,
-                    tool,
-                },
-            );
-            let output = format_lock_output(format, Some(&context), None);
-            print!("{output}");
-        }
-        AcquireResult::Denied { reason } => {
-            broadcast_lock_event(
-                &hook_json,
-                EventKind::LockDenied {
-                    file: file_path,
-                    owner,
-                    held_by: "unknown".to_string(),
-                },
-            );
-            let output = format_lock_output(format, None, Some(&reason));
-            print!("{output}");
-        }
-    }
-}
-
-/// Release a file lock after reading or editing (`PostToolUse` hook handler).
-///
-/// When `format` is `Some`, runs the full post-tool pipeline before releasing:
-/// 1. Notify the session (diagnostics)
-/// 2. Track the file read (mtime recording)
-/// 3. Release the lock
-///
-/// When `format` is `None` (failure path), just releases the lock immediately.
-/// Silently succeeds on any error to avoid breaking the host CLI's flow.
-#[allow(
-    clippy::too_many_lines,
-    reason = "Sequential post-tool pipeline with early returns"
-)]
-fn run_release(grace: u64, format: Option<HostFormat>) {
-    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+    let endpoint = notify_endpoint(&session.id);
+    let Some(stream) = notify_connect(&endpoint) else {
         return;
     };
 
-    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+    let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
+    let lines = ipc_exchange(stream, &request);
+
+    if lines.is_empty() {
         return;
-    };
-
-    let owner = extract_owner(&hook_json);
-    let tool = extract_tool_name(&hook_json);
-    let Some(file_path) = extract_file_path(&hook_json) else {
-        return;
-    };
-
-    let Ok(mgr) = catenary_mcp::lock::FileLockManager::new() else {
-        return;
-    };
-
-    // When format is provided, run diagnostics and track-read before releasing
-    if let Some(fmt) = format {
-        // Step 1: Notify session for diagnostics
-        let abs_path = PathBuf::from(&file_path);
-        let sessions = session::list_sessions().unwrap_or_default();
-        let session = sessions
-            .iter()
-            .find(|(s, _)| abs_path.to_string_lossy().starts_with(&s.workspace));
-
-        if let Some((session, _)) = session {
-            let endpoint = notify_endpoint(&session.id);
-            if let Some(stream) = notify_connect(&endpoint) {
-                let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
-                let lines = ipc_exchange(stream, &request);
-
-                if !lines.is_empty() {
-                    let output = format_diagnostics(&lines, fmt, "PostToolUse");
-                    print!("{output}");
-                }
-            }
-        }
-
-        // Step 2: Track read (record mtime)
-        let _ = mgr.track_read(&file_path, &owner);
     }
 
-    // Step 3: Release lock
-    if mgr.release(&file_path, &owner, grace).is_ok() {
-        broadcast_lock_event(
-            &hook_json,
-            EventKind::LockReleased {
-                file: file_path,
-                owner,
-                tool,
-            },
-        );
-    }
+    let output = format_diagnostics(&lines, format, "PostToolUse");
+    print!("{output}");
 }
 
 /// Sync workspace roots from Claude Code transcript to a running Catenary session.
@@ -1052,32 +940,6 @@ fn save_root_state(path: &Path, offset: u64, roots: &[PathBuf]) {
     }
 }
 
-/// Extracts the owner identity from hook JSON.
-///
-/// Uses `session_id` as the primary key. If `agent_id` is present,
-/// appends it as `session_id:agent_id`.
-fn extract_owner(hook_json: &serde_json::Value) -> String {
-    let session_id = hook_json
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    let agent_id = hook_json.get("agent_id").and_then(|v| v.as_str());
-
-    agent_id.map_or_else(
-        || session_id.to_string(),
-        |aid| format!("{session_id}:{aid}"),
-    )
-}
-
-/// Extracts the tool name from hook JSON (e.g. "Edit", "Read", "Write").
-fn extract_tool_name(hook_json: &serde_json::Value) -> Option<String> {
-    hook_json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-}
-
 /// Extracts the file path from hook JSON's `tool_input`.
 fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
     let file_path = hook_json
@@ -1097,92 +959,6 @@ fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
     };
 
     Some(abs_path.to_string_lossy().into_owned())
-}
-
-/// Formats lock output for the hook response.
-///
-/// - `additional_context`: injected when the lock was acquired but the file
-///   was modified since the owner's last read.
-/// - `deny_reason`: injected when the lock acquisition timed out.
-fn format_lock_output(
-    format: HostFormat,
-    additional_context: Option<&str>,
-    deny_reason: Option<&str>,
-) -> String {
-    let is_gemini = matches!(format, HostFormat::Gemini);
-
-    match (deny_reason, additional_context) {
-        // Gemini BeforeTool uses top-level decision/reason
-        (Some(reason), _) if is_gemini => serde_json::json!({
-            "decision": "deny",
-            "reason": reason
-        })
-        .to_string(),
-        // Claude Code PreToolUse uses hookSpecificOutput
-        (Some(reason), _) => serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason
-            }
-        })
-        .to_string(),
-        // Gemini: deny stale reads too — force re-read before editing
-        (None, Some(context)) if is_gemini => serde_json::json!({
-            "decision": "deny",
-            "reason": context
-        })
-        .to_string(),
-        // Claude Code: allow with advisory context
-        (None, Some(context)) => serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "additionalContext": context
-            }
-        })
-        .to_string(),
-        (None, None) => String::new(),
-    }
-}
-
-/// Broadcasts a lock event to the monitor (best-effort).
-///
-/// Finds the Catenary session matching the hook's `cwd` and sends the event
-/// via the session's event broadcaster. Silently does nothing if no session
-/// is found or the broadcast fails.
-fn broadcast_lock_event(hook_json: &serde_json::Value, event: EventKind) {
-    use std::io::Write;
-
-    let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-
-    let sessions = session::list_sessions().unwrap_or_default();
-    let Some((session_info, _)) = sessions.iter().find(|(s, _)| cwd.starts_with(&s.workspace))
-    else {
-        return;
-    };
-
-    // Write directly to the session's events file
-    let events_path = session::sessions_dir()
-        .join(&session_info.id)
-        .join("events.jsonl");
-
-    let event = SessionEvent {
-        timestamp: chrono::Utc::now(),
-        kind: event,
-    };
-
-    if let Ok(mut line) = serde_json::to_string(&event) {
-        line.push('\n');
-        // Append to events file (best-effort)
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&events_path)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
-    }
 }
 
 /// Format diagnostic lines for output.
@@ -2052,40 +1828,6 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 println!("{time_str} {basename}: {label}{detail}");
             }
         }
-        EventKind::LockAcquired { file, owner, tool } => {
-            let basename = std::path::Path::new(file.as_str())
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file);
-            let lock_icon = colors.green("acquired");
-            let tool_label = tool.as_ref().map(|t| format!(" ({t})")).unwrap_or_default();
-            let short_owner = cli::truncate(owner, 8);
-            println!("{time_str} {basename}: {lock_icon}{tool_label} by {short_owner}");
-        }
-        EventKind::LockReleased { file, owner, tool } => {
-            let basename = std::path::Path::new(file.as_str())
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file);
-            let unlock_icon = colors.dim("released");
-            let tool_label = tool.as_ref().map(|t| format!(" ({t})")).unwrap_or_default();
-            let short_owner = cli::truncate(owner, 8);
-            println!("{time_str} {basename}: {unlock_icon}{tool_label} by {short_owner}");
-        }
-        EventKind::LockDenied {
-            file,
-            owner,
-            held_by,
-        } => {
-            let basename = std::path::Path::new(file.as_str())
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file);
-            let denied = colors.red("acquire denied");
-            let short_owner = cli::truncate(owner, 8);
-            let short_held = cli::truncate(held_by, 8);
-            println!("{time_str} {basename}: {denied} for {short_owner} (held by {short_held})");
-        }
         EventKind::McpMessage { direction, message } => {
             let arrow_colored = if direction == "in" {
                 colors.green("→")
@@ -2270,81 +2012,5 @@ mod tests {
 
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         Ok(())
-    }
-
-    #[test]
-    fn test_format_lock_output_claude_stale_read() -> Result<()> {
-        let output = format_lock_output(
-            HostFormat::Claude,
-            Some("File was modified since your last read"),
-            None,
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-
-        let hook_output = &parsed["hookSpecificOutput"];
-        assert_eq!(hook_output["hookEventName"], "PreToolUse");
-        assert_eq!(hook_output["permissionDecision"], "allow");
-        assert_eq!(
-            hook_output["additionalContext"],
-            "File was modified since your last read"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_lock_output_claude_denied() -> Result<()> {
-        let output =
-            format_lock_output(HostFormat::Claude, None, Some("Lock held by another agent"));
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-
-        let hook_output = &parsed["hookSpecificOutput"];
-        assert_eq!(hook_output["hookEventName"], "PreToolUse");
-        assert_eq!(hook_output["permissionDecision"], "deny");
-        assert_eq!(
-            hook_output["permissionDecisionReason"],
-            "Lock held by another agent"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_lock_output_gemini_stale_read() -> Result<()> {
-        let output = format_lock_output(
-            HostFormat::Gemini,
-            Some("File was modified since your last read"),
-            None,
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-
-        assert_eq!(parsed["decision"], "deny");
-        assert_eq!(parsed["reason"], "File was modified since your last read");
-        // Gemini should not have hookSpecificOutput
-        assert!(parsed["hookSpecificOutput"].is_null());
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_lock_output_gemini_denied() -> Result<()> {
-        let output =
-            format_lock_output(HostFormat::Gemini, None, Some("Lock held by another agent"));
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-
-        assert_eq!(parsed["decision"], "deny");
-        assert_eq!(parsed["reason"], "Lock held by another agent");
-        assert!(parsed["hookSpecificOutput"].is_null());
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_lock_output_no_output() {
-        let output = format_lock_output(HostFormat::Claude, None, None);
-        assert!(output.is_empty());
-
-        let output = format_lock_output(HostFormat::Gemini, None, None);
-        assert!(output.is_empty());
     }
 }

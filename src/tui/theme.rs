@@ -58,10 +58,6 @@ pub struct Theme {
     pub info: Style,
     /// Style for muted/dimmed text.
     pub muted: Style,
-    /// Style for lock acquired events.
-    pub lock: Style,
-    /// Style for lock released events.
-    pub unlock: Style,
 }
 
 impl Default for Theme {
@@ -97,8 +93,6 @@ impl Theme {
             warning: Style::new().fg(Color::Yellow),
             info: Style::new().fg(Color::Blue),
             muted: Style::new().add_modifier(Modifier::DIM),
-            lock: Style::new().fg(Color::Yellow),
-            unlock: Style::new().fg(Color::Cyan),
         }
     }
 
@@ -410,10 +404,6 @@ pub struct IconSet {
     pub diag_info: String,
     /// Diagnostic ok (clean) icon.
     pub diag_ok: String,
-    /// Lock acquired icon.
-    pub lock: String,
-    /// Lock released icon.
-    pub unlock: String,
     /// Search tool icon.
     pub tool_search: String,
     /// Glob tool icon.
@@ -436,8 +426,6 @@ struct PresetDefaults {
     diag_warn: &'static str,
     diag_info: &'static str,
     diag_ok: &'static str,
-    lock: &'static str,
-    unlock: &'static str,
     tool_search: &'static str,
     tool_glob: &'static str,
     tool_default: &'static str,
@@ -452,8 +440,6 @@ const PRESET_UNICODE: PresetDefaults = PresetDefaults {
     diag_warn: "\u{26A0} ",        // ⚠
     diag_info: "\u{2139} ",        // ℹ
     diag_ok: "\u{2713} ",          // ✓
-    lock: "\u{2B9E} ",             // ⮞
-    unlock: "\u{2B9C} ",           // ⮜
     tool_search: "\u{2B9E} ",      // ⮞
     tool_glob: "\u{2B9E} ",        // ⮞
     tool_default: "\u{2B9E} ",     // ⮞
@@ -468,8 +454,6 @@ const PRESET_NERD: PresetDefaults = PresetDefaults {
     diag_warn: " ",            // nf-cod-warning
     diag_info: " ",            // nf-cod-info
     diag_ok: " ",              // nf-cod-check
-    lock: " ",                 // nf-cod-lock
-    unlock: " ",               // nf-cod-unlock
     tool_search: " ",          // nf-cod-search
     tool_glob: " ",            // nf-cod-file_directory
     tool_default: "\u{2192} ", // →
@@ -484,8 +468,6 @@ const PRESET_EMOJI: PresetDefaults = PresetDefaults {
     diag_warn: "\u{26A0}\u{FE0F} ", // ⚠️
     diag_info: "\u{2139}\u{FE0F} ", // ℹ️
     diag_ok: "\u{2705}\u{FE0F}",    // ✅️
-    lock: "\u{2B9E} ",              // ⮞
-    unlock: "\u{2B9C} ",            // ⮜
     tool_search: "\u{1F50D}",       // 🔍
     tool_glob: "\u{1F50D}",         // 🔍
     tool_default: "\u{2B9E} ",      // ⮞
@@ -515,8 +497,6 @@ impl IconSet {
                 .diag_info
                 .unwrap_or_else(|| base.diag_info.to_string()),
             diag_ok: config.diag_ok.unwrap_or_else(|| base.diag_ok.to_string()),
-            lock: config.lock.unwrap_or_else(|| base.lock.to_string()),
-            unlock: config.unlock.unwrap_or_else(|| base.unlock.to_string()),
             tool_search: config
                 .tool_search
                 .unwrap_or_else(|| base.tool_search.to_string()),
@@ -612,13 +592,6 @@ pub fn format_event_plain(ev: &SessionEvent) -> String {
             preview,
         } => format!("{ts} {file} {count} {preview}"),
         EventKind::McpMessage { .. } => String::new(),
-        EventKind::LockAcquired { file, owner, .. } => format!("{ts} lock {file} {owner}"),
-        EventKind::LockReleased { file, owner, .. } => format!("{ts} unlock {file} {owner}"),
-        EventKind::LockDenied {
-            file,
-            owner,
-            held_by,
-        } => format!("{ts} denied {file} {owner} {held_by}"),
     }
 }
 
@@ -764,40 +737,6 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
             }
         }
         EventKind::McpMessage { .. } => Line::default(),
-        EventKind::LockAcquired { file, owner, tool } => {
-            let base = basename(file);
-            let tool_label = tool.as_ref().map_or(String::new(), |t| format!(" ({t})"));
-            Line::from(vec![
-                ts_span,
-                Span::styled(icons.lock.clone(), theme.lock),
-                Span::styled(format!("{base}{tool_label} by {owner}"), theme.text),
-            ])
-        }
-        EventKind::LockReleased { file, owner, tool } => {
-            let base = basename(file);
-            let tool_label = tool.as_ref().map_or(String::new(), |t| format!(" ({t})"));
-            Line::from(vec![
-                ts_span,
-                Span::styled(icons.unlock.clone(), theme.unlock),
-                Span::styled(format!("{base}{tool_label} by {owner}"), theme.unlock),
-            ])
-        }
-        EventKind::LockDenied {
-            file,
-            owner,
-            held_by,
-        } => {
-            let base = basename(file);
-            let lock = &icons.lock;
-            Line::from(vec![
-                ts_span,
-                Span::styled(format!("{lock}denied "), theme.error),
-                Span::styled(
-                    format!("{base} for {owner} (held by {held_by})"),
-                    theme.text,
-                ),
-            ])
-        }
     }
 }
 
@@ -848,11 +787,11 @@ mod tests {
     #[test]
     fn test_icon_set_overrides() {
         let config = IconConfig {
-            lock: Some("\u{1F512} ".into()),
+            diag_error: Some("ERR ".into()),
             ..IconConfig::default()
         };
         let icons = IconSet::from_config(config);
-        assert_eq!(icons.lock, "\u{1F512} ");
+        assert_eq!(icons.diag_error, "ERR ");
     }
 
     #[test]

@@ -72,12 +72,6 @@ pub enum IconPreset {
 /// preset = "nerd"
 /// ```
 ///
-/// ```toml
-/// [icons]
-/// preset = "nerd"
-/// lock = "🔒 "
-/// unlock = "🔑 "
-/// ```
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct IconConfig {
     /// Base icon preset (default: `unicode`).
@@ -91,10 +85,6 @@ pub struct IconConfig {
     pub diag_info: Option<String>,
     /// Diagnostic ok (clean) icon.
     pub diag_ok: Option<String>,
-    /// Lock acquired icon.
-    pub lock: Option<String>,
-    /// Lock released icon.
-    pub unlock: Option<String>,
     /// Search tool icon.
     pub tool_search: Option<String>,
     /// Glob tool icon.

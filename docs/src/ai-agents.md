@@ -69,7 +69,7 @@ language server directly.
 
 Catenary provides two MCP tools (`grep` and `glob`) plus post-edit diagnostics
 via hooks. File reading and editing is handled by the host tool's native file
-operations (e.g. Claude Code's `Read`, `Edit`, `Write`). The `catenary release`
+operations (e.g. Claude Code's `Read`, `Edit`, `Write`). The `catenary notify`
 hook provides post-edit LSP diagnostics so you immediately see any errors
 introduced by changes.
 
@@ -152,51 +152,28 @@ A single file read can cost as much as 10-20 targeted LSP queries.
 5. **Save reads for logic.** Only read files when you need to understand
    _how_ something works, not _what_ it is or _where_ it lives.
 
-6. **Edit with feedback.** The `catenary release` hook returns LSP diagnostics
+6. **Edit with feedback.** The `catenary notify` hook returns LSP diagnostics
    after every edit, so you immediately see any errors introduced.
 
-## Release Hook
+## Notify Hook
 
-Catenary provides post-edit LSP diagnostics, mtime tracking, and lock release
-via the `catenary release` command, designed for use as a `PostToolUse` hook
-in Claude Code.
+Catenary provides post-edit LSP diagnostics via the `catenary notify` command,
+designed for use as a `PostToolUse` hook in Claude Code.
 
 The recommended setup uses the Catenary plugin (`catenary@catenary`), which
-registers `catenary acquire` / `catenary release` hooks automatically. For
-manual configuration, add to `.claude/settings.json`:
+registers the `catenary notify` hook automatically. For manual configuration,
+add to `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary acquire --format=claude"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary release --format=claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary release --grace 0"
+            "command": "catenary notify --format=claude"
           }
         ]
       }
@@ -205,7 +182,6 @@ manual configuration, add to `.claude/settings.json`:
 }
 ```
 
-The `release` hook reads the `PostToolUse` JSON from stdin, finds the running
-Catenary session for the workspace, runs LSP diagnostics, records the file's
-mtime, and releases the file lock. It exits silently on any error so it never
-blocks the host tool's flow.
+The `notify` hook reads the `PostToolUse` JSON from stdin, finds the running
+Catenary session for the workspace, and returns LSP diagnostics. It exits
+silently on any error so it never blocks the host tool's flow.
