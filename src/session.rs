@@ -5,23 +5,24 @@
 //!
 //! Each Catenary instance creates a session that can be discovered and
 //! monitored from other terminals via `catenary list` and `catenary monitor`.
+//!
+//! Sessions are stored in SQLite via the [`crate::db`] module.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// Session metadata stored in info.json.
+/// Session metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     /// Unique session ID.
     pub id: String,
     /// Process ID of the Catenary instance.
     pub pid: u32,
-    /// Path to the workspace root.
+    /// Display name (comma-joined workspace roots).
     pub workspace: String,
     /// When the session started.
     pub started_at: DateTime<Utc>,
@@ -117,7 +118,7 @@ pub enum EventKind {
     },
 }
 
-/// Returns the base directory for session data.
+/// Returns the base directory for session runtime artifacts (notify sockets).
 pub fn sessions_dir() -> PathBuf {
     let state_dir = dirs::state_dir()
         .or_else(dirs::data_local_dir)
@@ -130,9 +131,7 @@ pub struct Session {
     /// Metadata about the session.
     pub info: SessionInfo,
 
-    dir: PathBuf,
-
-    events_file: Arc<Mutex<File>>,
+    conn: Arc<Mutex<Connection>>,
 
     /// Path to the notify IPC endpoint (if started).
     socket_path: Option<PathBuf>,
@@ -141,63 +140,68 @@ pub struct Session {
 impl Session {
     /// Create a new session.
     ///
+    /// Opens a database connection internally. For explicit connection
+    /// management, use [`Session::create_with_conn`].
+    ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The session directory cannot be created.
-    /// - Metadata or event files cannot be created.
+    /// Returns an error if the database cannot be opened or the session
+    /// cannot be inserted.
     pub fn create(workspace: &str) -> Result<Self> {
+        let conn = Arc::new(Mutex::new(crate::db::open_and_migrate()?));
+        Self::create_with_conn(workspace, conn)
+    }
+
+    /// Create a new session with an existing database connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session cannot be inserted into the database
+    /// or the socket directory cannot be created.
+    pub fn create_with_conn(workspace: &str, conn: Arc<Mutex<Connection>>) -> Result<Self> {
         let id = Self::generate_id();
-
-        let sessions_base = sessions_dir();
-
-        let session_dir = sessions_base.join(&id);
-
-        fs::create_dir_all(&session_dir)
-            .with_context(|| format!("Failed to create session dir: {}", session_dir.display()))?;
+        let started_at = Utc::now();
 
         let info = SessionInfo {
             id,
-
             pid: std::process::id(),
-
             workspace: workspace.to_string(),
-
-            started_at: Utc::now(),
-
+            started_at,
             client_name: None,
-
             client_version: None,
         };
 
-        // Write info.json
+        {
+            let c = conn.lock().map_err(|_| anyhow::anyhow!("mutex poisoned"))?;
+            c.execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at, alive) \
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                rusqlite::params![&info.id, info.pid, workspace, started_at.to_rfc3339()],
+            )
+            .context("failed to insert session")?;
 
-        let info_path = session_dir.join("info.json");
+            for root in workspace
+                .split(',')
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+            {
+                c.execute(
+                    "INSERT INTO workspace_roots (session_id, root_path) VALUES (?1, ?2)",
+                    rusqlite::params![&info.id, root],
+                )?;
+            }
+        }
 
-        let info_file = File::create(&info_path)?;
-
-        serde_json::to_writer_pretty(info_file, &info)?;
-
-        // Create events.jsonl
-
-        let events_path = session_dir.join("events.jsonl");
-
-        let events_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&events_path)?;
+        // Create socket directory (for notify.sock)
+        let socket_dir = sessions_dir().join(&info.id);
+        std::fs::create_dir_all(&socket_dir)
+            .with_context(|| format!("failed to create socket dir: {}", socket_dir.display()))?;
 
         let session = Self {
             info,
-
-            dir: session_dir,
-
-            events_file: Arc::new(Mutex::new(events_file)),
-
+            conn,
             socket_path: None,
         };
-
-        // Broadcast started event
 
         session.broadcast(EventKind::Started);
 
@@ -230,7 +234,7 @@ impl Session {
     pub fn socket_path(&self) -> PathBuf {
         #[cfg(unix)]
         {
-            self.dir.join("notify.sock")
+            sessions_dir().join(&self.info.id).join("notify.sock")
         }
         #[cfg(windows)]
         {
@@ -247,32 +251,33 @@ impl Session {
     /// Update client info (called after MCP initialize).
     pub fn set_client_info(&mut self, name: &str, version: &str) {
         self.info.client_name = Some(name.to_string());
-
         self.info.client_version = Some(version.to_string());
 
-        // Rewrite info.json
-
-        let info_path = self.dir.join("info.json");
-
-        if let Ok(file) = File::create(&info_path) {
-            let _ = serde_json::to_writer_pretty(file, &self.info);
+        if let Ok(c) = self.conn.lock() {
+            let _ = c.execute(
+                "UPDATE sessions SET client_name = ?1, client_version = ?2 WHERE id = ?3",
+                rusqlite::params![name, version, &self.info.id],
+            );
         }
     }
 
     /// Broadcast an event to listeners.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public API takes ownership by convention"
+    )]
     pub fn broadcast(&self, kind: EventKind) {
-        let event = SessionEvent {
-            timestamp: Utc::now(),
+        let timestamp = Utc::now();
+        let kind_tag = event_kind_tag(&kind);
 
-            kind,
-        };
-
-        if let Ok(mut file) = self.events_file.lock()
-            && let Ok(json) = serde_json::to_string(&event)
+        if let Ok(payload) = serde_json::to_string(&kind)
+            && let Ok(c) = self.conn.lock()
         {
-            let _ = writeln!(file, "{json}");
-
-            let _ = file.flush();
+            let _ = c.execute(
+                "INSERT INTO events (session_id, timestamp, kind, payload) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![&self.info.id, timestamp.to_rfc3339(), kind_tag, payload],
+            );
         }
     }
 
@@ -280,52 +285,73 @@ impl Session {
     #[must_use]
     pub fn broadcaster(&self) -> EventBroadcaster {
         EventBroadcaster {
-            events_file: self.events_file.clone(),
+            inner: BroadcasterInner::Live {
+                conn: self.conn.clone(),
+                session_id: self.info.id.clone(),
+            },
         }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Broadcast shutdown
-
         self.broadcast(EventKind::Shutdown);
 
-        // Write a dead marker so observers can tell the session ended cleanly
-        // even if the PID is later reused by another process.
-        let _ = File::create(self.dir.join("dead"));
+        if let Ok(c) = self.conn.lock() {
+            let _ = c.execute(
+                "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+                rusqlite::params![Utc::now().to_rfc3339(), &self.info.id],
+            );
+        }
 
         // Clean up notify socket (Unix only — named pipes are kernel
         // objects cleaned up automatically when all handles close)
         #[cfg(unix)]
         if let Some(ref sock) = self.socket_path {
-            let _ = fs::remove_file(sock);
+            let _ = std::fs::remove_file(sock);
         }
 
-        // Session directory is intentionally retained for post-mortem inspection.
-        // Pruning is handled separately based on log_retention_days.
+        // Remove socket directory (only succeeds if empty)
+        let socket_dir = sessions_dir().join(&self.info.id);
+        let _ = std::fs::remove_dir(&socket_dir);
     }
 }
 
 /// Cloneable broadcaster for sharing across components.
 #[derive(Clone)]
 pub struct EventBroadcaster {
-    events_file: Arc<Mutex<File>>,
+    inner: BroadcasterInner,
+}
+
+#[derive(Clone)]
+enum BroadcasterInner {
+    Live {
+        conn: Arc<Mutex<Connection>>,
+        session_id: String,
+    },
+    Noop,
 }
 
 impl EventBroadcaster {
     /// Broadcast an event.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public API takes ownership by convention"
+    )]
     pub fn send(&self, kind: EventKind) {
-        let event = SessionEvent {
-            timestamp: Utc::now(),
-            kind,
-        };
+        if let BroadcasterInner::Live { conn, session_id } = &self.inner {
+            let timestamp = Utc::now();
+            let kind_tag = event_kind_tag(&kind);
 
-        if let Ok(mut file) = self.events_file.lock()
-            && let Ok(json) = serde_json::to_string(&event)
-        {
-            let _ = writeln!(file, "{json}");
-            let _ = file.flush();
+            if let Ok(payload) = serde_json::to_string(&kind)
+                && let Ok(c) = conn.lock()
+            {
+                let _ = c.execute(
+                    "INSERT INTO events (session_id, timestamp, kind, payload) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![session_id, timestamp.to_rfc3339(), kind_tag, payload],
+                );
+            }
         }
     }
 
@@ -333,57 +359,152 @@ impl EventBroadcaster {
     ///
     /// # Errors
     ///
-    /// Returns an error if the null file cannot be opened or created.
+    /// This function is infallible but retains the `Result` return type
+    /// for API compatibility. It will be simplified in a future release.
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "Result wrapper for API compatibility"
+    )]
     pub fn noop() -> Result<Self> {
-        // Create a broadcaster that writes to /dev/null
-        let file = OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .or_else(|_| {
-                // Fallback for non-Unix systems
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(std::env::temp_dir().join(".catenary_null"))
-            })?;
         Ok(Self {
-            events_file: Arc::new(Mutex::new(file)),
+            inner: BroadcasterInner::Noop,
         })
     }
+}
+
+// ── Event tailing (SQLite-backed) ────────────────────────────────────
+
+/// Polls the events table for new events, replacing the file-based
+/// `TailReader` that was removed in the `SQLite` migration.
+pub struct SqliteEventTail {
+    conn: Connection,
+    session_id: String,
+    last_id: i64,
+}
+
+impl SqliteEventTail {
+    /// Read the next event if available. Returns `None` if no new event yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading from the database fails.
+    pub fn try_next_event(&mut self) -> Result<Option<SessionEvent>> {
+        let result = self.conn.query_row(
+            "SELECT id, timestamp, payload FROM events \
+             WHERE session_id = ?1 AND id > ?2 ORDER BY id LIMIT 1",
+            rusqlite::params![&self.session_id, self.last_id],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let ts: String = row.get(1)?;
+                let payload: String = row.get(2)?;
+                Ok((id, ts, payload))
+            },
+        );
+
+        match result {
+            Ok((id, ts, payload)) => {
+                self.last_id = id;
+                let timestamp = DateTime::parse_from_rfc3339(&ts)
+                    .with_context(|| format!("invalid event timestamp: {ts}"))?
+                    .with_timezone(&Utc);
+                let kind: EventKind =
+                    serde_json::from_str(&payload).context("invalid event payload")?;
+                Ok(Some(SessionEvent { timestamp, kind }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+// ── Free functions ───────────────────────────────────────────────────
+
+/// Raw row from the sessions table (avoids complex tuple types).
+struct SessionRow {
+    id: String,
+    pid: u32,
+    display_name: String,
+    client_name: Option<String>,
+    client_version: Option<String>,
+    started_at_str: String,
+    db_alive: bool,
 }
 
 /// List all sessions (active and inactive).
 ///
 /// Returns a list of sessions and their status (true = active, false = dead).
+/// Crashed sessions (PID gone but `alive` flag set) are marked dead in the DB.
 ///
 /// # Errors
 ///
-/// Returns an error if the sessions directory cannot be read.
+/// Returns an error if the database cannot be opened or queried.
 pub fn list_sessions() -> Result<Vec<(SessionInfo, bool)>> {
-    let sessions_base = sessions_dir();
+    let conn = crate::db::open_and_migrate()?;
 
-    if !sessions_base.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut sessions = Vec::new();
-
-    for entry in fs::read_dir(&sessions_base)? {
-        let entry = entry?;
-        let info_path = entry.path().join("info.json");
-
-        if info_path.exists()
-            && let Ok(file) = File::open(&info_path)
-            && let Ok(info) = serde_json::from_reader::<_, SessionInfo>(file)
-        {
-            let alive = session_is_alive(&entry.path(), info.pid);
-            sessions.push((info, alive));
+    // Collect raw rows first to release the statement borrow.
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, pid, display_name, client_name, client_version, started_at, alive \
+             FROM sessions ORDER BY started_at DESC",
+        )?;
+        let mut r = stmt.query([])?;
+        let mut rows = Vec::new();
+        while let Some(row) = r.next()? {
+            rows.push(SessionRow {
+                id: row.get(0)?,
+                pid: row.get(1)?,
+                display_name: row.get(2)?,
+                client_name: row.get(3)?,
+                client_version: row.get(4)?,
+                started_at_str: row.get(5)?,
+                db_alive: row.get(6)?,
+            });
         }
-    }
+        rows
+    };
 
-    // Sort by start time (most recent first)
-    sessions.sort_by(|(a, _), (b, _)| b.started_at.cmp(&a.started_at));
+    let mut sessions = Vec::with_capacity(rows.len());
+    for r in rows {
+        let SessionRow {
+            id,
+            pid,
+            display_name,
+            client_name,
+            client_version,
+            started_at_str,
+            db_alive,
+        } = r;
+        let started_at = DateTime::parse_from_rfc3339(&started_at_str)
+            .with_context(|| format!("invalid started_at: {started_at_str}"))?
+            .with_timezone(&Utc);
+
+        let alive = if db_alive {
+            if is_process_alive(pid) {
+                true
+            } else {
+                // Process crashed — mark dead in DB.
+                let _ = conn.execute(
+                    "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+                    rusqlite::params![Utc::now().to_rfc3339(), &id],
+                );
+                false
+            }
+        } else {
+            false
+        };
+
+        sessions.push((
+            SessionInfo {
+                id,
+                pid,
+                workspace: display_name,
+                started_at,
+                client_name,
+                client_version,
+            },
+            alive,
+        ));
+    }
 
     Ok(sessions)
 }
@@ -394,202 +515,167 @@ pub fn list_sessions() -> Result<Vec<(SessionInfo, bool)>> {
 ///
 /// # Errors
 ///
-/// Returns an error if the session info file exists but cannot be read or parsed.
+/// Returns an error if the database cannot be opened or queried.
 pub fn get_session(id: &str) -> Result<Option<(SessionInfo, bool)>> {
-    let sessions_base = sessions_dir();
-    let info_path = sessions_base.join(id).join("info.json");
+    let conn = crate::db::open_and_migrate()?;
 
-    if !info_path.exists() {
-        return Ok(None);
+    let result = conn.query_row(
+        "SELECT id, pid, display_name, client_name, client_version, started_at, alive \
+         FROM sessions WHERE id = ?1",
+        [id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, bool>(6)?,
+            ))
+        },
+    );
+
+    match result {
+        Ok((sid, pid, display_name, client_name, client_version, started_at_str, db_alive)) => {
+            let started_at = DateTime::parse_from_rfc3339(&started_at_str)
+                .with_context(|| format!("invalid started_at: {started_at_str}"))?
+                .with_timezone(&Utc);
+
+            let alive = if db_alive {
+                if is_process_alive(pid) {
+                    true
+                } else {
+                    let _ = conn.execute(
+                        "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+                        rusqlite::params![Utc::now().to_rfc3339(), &sid],
+                    );
+                    false
+                }
+            } else {
+                false
+            };
+
+            Ok(Some((
+                SessionInfo {
+                    id: sid,
+                    pid,
+                    workspace: display_name,
+                    started_at,
+                    client_name,
+                    client_version,
+                },
+                alive,
+            )))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
     }
-
-    let file = File::open(&info_path)?;
-    let info: SessionInfo = serde_json::from_reader(file)?;
-    let session_dir = sessions_base.join(id);
-    let alive = session_is_alive(&session_dir, info.pid);
-
-    Ok(Some((info, alive)))
 }
 
-/// Monitor events from a session (blocking iterator).
+/// Monitor events from a session (returns all historical events).
 ///
 /// # Errors
 ///
-/// Returns an error if the session does not exist or the events file cannot be opened.
+/// Returns an error if the database cannot be opened or queried.
 pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
-    let sessions_base = sessions_dir();
-    let events_path = sessions_base.join(id).join("events.jsonl");
+    let conn = crate::db::open_and_migrate()?;
 
-    if !events_path.exists() {
-        anyhow::bail!("Session not found: {id}");
+    let mut stmt =
+        conn.prepare("SELECT timestamp, payload FROM events WHERE session_id = ?1 ORDER BY id")?;
+    let mut rows = stmt.query([id])?;
+    let mut events = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let ts: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+
+        if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
+            && let Ok(kind) = serde_json::from_str::<EventKind>(&payload)
+        {
+            events.push(SessionEvent {
+                timestamp: timestamp.with_timezone(&Utc),
+                kind,
+            });
+        }
     }
 
-    let file = File::open(&events_path)?;
-    let reader = BufReader::new(file);
-
-    Ok(reader.lines().filter_map(|line| {
-        line.ok()
-            .and_then(|l| serde_json::from_str::<SessionEvent>(&l).ok())
-    }))
+    Ok(events.into_iter())
 }
 
 /// Tail events from a session (follows new events from the beginning).
 ///
 /// # Errors
 ///
-/// Returns an error if the session does not exist or the events file cannot be opened.
-pub fn tail_events(id: &str) -> Result<TailReader> {
-    let sessions_base = sessions_dir();
-    let events_path = sessions_base.join(id).join("events.jsonl");
+/// Returns an error if the session does not exist or the database cannot be opened.
+pub fn tail_events(id: &str) -> Result<SqliteEventTail> {
+    // Verify session exists
+    let conn = crate::db::open()?;
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sessions WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
 
-    if !events_path.exists() {
+    if !exists {
         anyhow::bail!("Session not found: {id}");
     }
 
-    TailReader::new(events_path)
+    Ok(SqliteEventTail {
+        conn,
+        session_id: id.to_string(),
+        last_id: 0,
+    })
 }
 
-/// Tail only *new* events from a session (seeks to end of file first).
+/// Tail only *new* events from a session (starts from current end).
 ///
 /// Use this when historical events have already been loaded separately
 /// and you only want events written after this call.
 ///
 /// # Errors
 ///
-/// Returns an error if the session does not exist or the events file cannot be opened.
-pub fn tail_events_new(id: &str) -> Result<TailReader> {
-    let sessions_base = sessions_dir();
-    let events_path = sessions_base.join(id).join("events.jsonl");
+/// Returns an error if the session does not exist or the database cannot be opened.
+pub fn tail_events_new(id: &str) -> Result<SqliteEventTail> {
+    let conn = crate::db::open()?;
 
-    if !events_path.exists() {
-        anyhow::bail!("Session not found: {id}");
-    }
+    let last_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
-    TailReader::new_from_end(events_path)
-}
-
-/// Reader that tails a file for new content.
-pub struct TailReader {
-    path: PathBuf,
-    reader: BufReader<File>,
-    last_size: u64,
-}
-
-impl TailReader {
-    fn new(path: PathBuf) -> Result<Self> {
-        let file = File::open(&path)?;
-        let metadata = file.metadata()?;
-        let reader = BufReader::new(file);
-
-        Ok(Self {
-            path,
-            reader,
-            last_size: metadata.len(),
-        })
-    }
-
-    /// Create a reader positioned at the end of the file, so it only
-    /// picks up events written after this call.
-    fn new_from_end(path: PathBuf) -> Result<Self> {
-        use std::io::{Seek, SeekFrom};
-
-        let file = File::open(&path)?;
-        let metadata = file.metadata()?;
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::End(0))?;
-
-        Ok(Self {
-            path,
-            reader,
-            last_size: metadata.len(),
-        })
-    }
-
-    /// Read the next event if available. Returns `None` if no new event is currently in the file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading from the file fails.
-    pub fn try_next_event(&mut self) -> Result<Option<SessionEvent>> {
-        use std::io::Seek;
-
-        let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
-
-        if bytes_read > 0 {
-            let line = line.trim();
-            if !line.is_empty() {
-                // If parse fails, we just skip it (log error?) or return None?
-                // Original code ignored parse errors implicitly by looping.
-                // Let's return None if parse fails to avoid breaking the loop in caller,
-                // but ideally we should log it. For now, let's match original behavior:
-                // if parse ok -> return Some.
-                if let Ok(event) = serde_json::from_str::<SessionEvent>(line) {
-                    return Ok(Some(event));
-                }
-            }
-            // Empty line or parse error: treat as "read something but no event"
-            // We can return None (so caller sleeps) or recurse?
-            // Let's return None. Caller will sleep 100ms and retry.
-            return Ok(None);
-        }
-
-        // Check if file was truncated or if we should wait
-        if let Ok(metadata) = fs::metadata(&self.path) {
-            if metadata.len() < self.last_size {
-                // File was truncated, reopen
-                let file = File::open(&self.path)?;
-                self.reader = BufReader::new(file);
-                self.last_size = 0;
-                // Retry reading immediately? Or just return None and let caller loop?
-                // Return None.
-                return Ok(None);
-            }
-
-            if metadata.len() > self.last_size {
-                // File grew — reset BufReader's EOF state so
-                // it reads new data on the next iteration.
-                self.reader.stream_position()?;
-            }
-
-            self.last_size = metadata.len();
-        } else {
-            // File was deleted
-            // We could return a special error or just let the caller handle it.
-            // But if file is deleted, `run_monitor` usually exits.
-            // Since we don't delete files anymore, this case is rare (manual deletion).
-            // Let's return error to signal "Stop".
-            anyhow::bail!("Events file deleted");
-        }
-
-        Ok(None)
-    }
+    Ok(SqliteEventTail {
+        conn,
+        session_id: id.to_string(),
+        last_id,
+    })
 }
 
 /// Get active languages for a session by reading its events.
 ///
 /// # Errors
 ///
-/// Returns an error if the events file exists but cannot be read.
+/// Returns an error if the database cannot be opened or queried.
 pub fn active_languages(id: &str) -> Result<Vec<String>> {
     use std::collections::HashMap;
 
-    let sessions_base = sessions_dir();
-    let events_path = sessions_base.join(id).join("events.jsonl");
+    let conn = crate::db::open_and_migrate()?;
 
-    if !events_path.exists() {
-        return Ok(vec![]);
-    }
-
-    let file = File::open(&events_path)?;
-    let reader = BufReader::new(file);
-
-    // Track server states: language -> state
+    let mut stmt = conn.prepare(
+        "SELECT payload FROM events WHERE session_id = ?1 AND kind = 'server_state' ORDER BY id",
+    )?;
+    let mut rows = stmt.query([id])?;
     let mut states: HashMap<String, String> = HashMap::new();
 
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(event) = serde_json::from_str::<SessionEvent>(&line)
-            && let EventKind::ServerState { language, state } = event.kind
+    while let Some(row) = rows.next()? {
+        let payload: String = row.get(0)?;
+        if let Ok(EventKind::ServerState { language, state }) =
+            serde_json::from_str::<EventKind>(&payload)
         {
             if state == "Dead" {
                 states.remove(&language);
@@ -604,82 +690,95 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
     Ok(languages)
 }
 
-/// Remove dead session directories older than the configured retention period.
+/// Remove dead sessions older than the configured retention period.
 ///
 /// - `retention_days == -1`: retain forever (no-op).
 /// - `retention_days == 0`: remove all dead sessions regardless of age.
 /// - `retention_days > 0`: remove dead sessions whose `started_at` is older
 ///   than `retention_days` days ago.
 ///
-/// Active sessions are never pruned.
+/// Active sessions are never pruned. Crashed sessions (PID gone) are
+/// detected and marked dead before pruning.
 ///
 /// # Errors
 ///
-/// Returns an error if the sessions directory cannot be read.  Individual
-/// session removal failures are logged and skipped.
+/// Returns an error if the database cannot be opened or queried.
 pub fn prune_sessions(retention_days: i64) -> Result<usize> {
     if retention_days < 0 {
         return Ok(0);
     }
 
-    let sessions_base = sessions_dir();
-    if !sessions_base.exists() {
-        return Ok(0);
+    let conn = crate::db::open_and_migrate()?;
+
+    // Detect crashed sessions (alive in DB but PID gone).
+    let crashed: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id, pid FROM sessions WHERE alive = 1")?;
+        let mut rows = stmt.query([])?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let pid: u32 = row.get(1)?;
+            if !is_process_alive(pid) {
+                ids.push(id);
+            }
+        }
+        ids
+    };
+
+    let ended_at = Utc::now().to_rfc3339();
+    for id in &crashed {
+        let _ = conn.execute(
+            "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+            rusqlite::params![&ended_at, id],
+        );
     }
 
     let cutoff = if retention_days == 0 {
-        // Remove all dead sessions — use a far-future cutoff so everything qualifies.
+        // Remove all dead sessions — use a far-future cutoff.
         Utc::now() + chrono::Duration::days(1)
     } else {
         Utc::now() - chrono::Duration::days(retention_days)
     };
 
-    let mut removed = 0usize;
-
-    for entry in fs::read_dir(&sessions_base)? {
-        let entry = entry?;
-        let dir = entry.path();
-
-        let info_path = dir.join("info.json");
-        if !info_path.exists() {
-            continue;
-        }
-
-        // Parse session info to get PID and age.
-        let Ok(file) = File::open(&info_path) else {
-            continue;
-        };
-        let Ok(info) = serde_json::from_reader::<_, SessionInfo>(file) else {
-            continue;
-        };
-
-        // Never prune active sessions.
-        if session_is_alive(&dir, info.pid) {
-            continue;
-        }
-
-        // Only prune if older than cutoff.
-        if info.started_at < cutoff {
-            if let Err(e) = fs::remove_dir_all(&dir) {
-                tracing::warn!("Failed to prune session {}: {e}", dir.display());
-            } else {
-                removed += 1;
-            }
-        }
-    }
+    let removed = conn.execute(
+        "DELETE FROM sessions WHERE alive = 0 AND started_at < ?1",
+        rusqlite::params![cutoff.to_rfc3339()],
+    )?;
 
     Ok(removed)
 }
 
-/// Determine whether a session is alive.
+/// Delete a session and all its associated data.
 ///
-/// A session is dead if it wrote a `dead` marker on shutdown, or if its
-/// recorded PID is no longer running (crash / SIGKILL recovery).
-fn session_is_alive(session_dir: &std::path::Path, pid: u32) -> bool {
-    if session_dir.join("dead").exists() {
-        return false;
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or the delete fails.
+pub fn delete_session_data(id: &str) -> Result<()> {
+    let conn = crate::db::open_and_migrate()?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+
+    // Clean up socket directory if it exists.
+    let socket_dir = sessions_dir().join(id);
+    let _ = std::fs::remove_dir_all(&socket_dir);
+
+    Ok(())
+}
+
+// ── Private helpers ──────────────────────────────────────────────────
+
+/// Returns the serde tag for an event kind (used as the `kind` column value).
+const fn event_kind_tag(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::ServerState { .. } => "server_state",
+        EventKind::Progress { .. } => "progress",
+        EventKind::ProgressEnd { .. } => "progress_end",
+        EventKind::ToolCall { .. } => "tool_call",
+        EventKind::ToolResult { .. } => "tool_result",
+        EventKind::Diagnostics { .. } => "diagnostics",
+        EventKind::Started => "started",
+        EventKind::Shutdown => "shutdown",
+        EventKind::McpMessage { .. } => "mcp_message",
     }
-    is_process_alive(pid)
 }
 
 /// Check if a process is still running.
@@ -738,14 +837,13 @@ mod tests {
         // Drop session
         drop(session);
 
-        // Should NOT be cleaned up immediately anymore (changed behavior)
-        // But get_session should still return it (as dead)
+        // get_session should still return it (as dead)
         let found = get_session(&id)?;
         let (_, alive) = found.expect("session should exist after drop");
         assert!(!alive, "Session should be dead after drop");
 
-        // Manual cleanup
-        let _ = fs::remove_dir_all(sessions_dir().join(id));
+        // Clean up
+        delete_session_data(&id)?;
 
         Ok(())
     }
@@ -767,10 +865,69 @@ mod tests {
             percentage: Some(50),
         });
 
-        // Read events back
-        assert!(monitor_events(&id)?.count() >= 2); // Started + our events
+        // Read events back (Started + 2 broadcast events = at least 3)
+        assert!(monitor_events(&id)?.count() >= 3);
 
         drop(session);
+        delete_session_data(&id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_broadcast_serialization() -> Result<()> {
+        let session = Session::create("/tmp/test-serialization")?;
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ToolCall {
+            tool: "grep".to_string(),
+            file: Some("/tmp/test.rs".to_string()),
+            params: None,
+        });
+
+        let events: Vec<_> = monitor_events(&id)?.collect();
+        let tool_call = events
+            .iter()
+            .find(|e| matches!(&e.kind, EventKind::ToolCall { .. }))
+            .expect("ToolCall event should be present");
+
+        if let EventKind::ToolCall { tool, file, .. } = &tool_call.kind {
+            assert_eq!(tool, "grep");
+            assert_eq!(file.as_deref(), Some("/tmp/test.rs"));
+        }
+
+        drop(session);
+        delete_session_data(&id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_set_client_info() -> Result<()> {
+        let mut session = Session::create("/tmp/test-client-info")?;
+        let id = session.info.id.clone();
+
+        session.set_client_info("claude-code", "1.0.0");
+
+        let found = get_session(&id)?;
+        let (info, _) = found.expect("session should exist");
+        assert_eq!(info.client_name.as_deref(), Some("claude-code"));
+        assert_eq!(info.client_version.as_deref(), Some("1.0.0"));
+
+        drop(session);
+        delete_session_data(&id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_broadcaster_noop() -> Result<()> {
+        let broadcaster = EventBroadcaster::noop()?;
+
+        // Should not panic or error
+        broadcaster.send(EventKind::Started);
+        broadcaster.send(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Ready".to_string(),
+        });
+
         Ok(())
     }
 
@@ -779,11 +936,11 @@ mod tests {
         let session = Session::create("/tmp/test-langs-empty")?;
         let id = session.info.id.clone();
 
-        // No server state events, should return empty
         let langs = active_languages(&id)?;
         assert!(langs.is_empty());
 
         drop(session);
+        delete_session_data(&id)?;
         Ok(())
     }
 
@@ -806,6 +963,7 @@ mod tests {
         assert_eq!(langs, vec!["rust"]);
 
         drop(session);
+        delete_session_data(&id)?;
         Ok(())
     }
 
@@ -828,6 +986,7 @@ mod tests {
         assert!(langs.is_empty());
 
         drop(session);
+        delete_session_data(&id)?;
         Ok(())
     }
 
@@ -855,57 +1014,63 @@ mod tests {
         assert_eq!(langs, vec!["python", "rust", "typescript"]);
 
         drop(session);
+        delete_session_data(&id)?;
         Ok(())
     }
 
     /// Helper: create a dead session, optionally backdated.
-    fn create_dead_session(workspace: &str, backdate_days: Option<i64>) -> Result<PathBuf> {
+    fn create_dead_session(workspace: &str, backdate_days: Option<i64>) -> Result<String> {
         let session = Session::create(workspace)?;
         let id = session.info.id.clone();
-        let dir = sessions_dir().join(&id);
         drop(session);
 
         if let Some(days) = backdate_days {
-            let info_path = dir.join("info.json");
-            let file = File::open(&info_path)?;
-            let mut info: SessionInfo = serde_json::from_reader(file)?;
-            info.started_at = Utc::now() - chrono::Duration::days(days);
-            let file = File::create(&info_path)?;
-            serde_json::to_writer_pretty(file, &info)?;
+            let new_start = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+            let conn = crate::db::open()?;
+            conn.execute(
+                "UPDATE sessions SET started_at = ?1 WHERE id = ?2",
+                rusqlite::params![new_start, &id],
+            )?;
         }
-        Ok(dir)
+        Ok(id)
     }
 
     /// Single sequential test covering all `prune_sessions` behaviours.
     ///
     /// These must run in sequence because `prune_sessions` operates on the
-    /// shared `sessions_dir()` and parallel execution causes interference.
+    /// shared database and parallel execution causes interference.
     #[test]
     fn test_prune_sessions() -> Result<()> {
         // -- retention=-1 retains forever --
-        let dir_forever = create_dead_session("/tmp/test-prune-forever", Some(365))?;
+        let id_forever = create_dead_session("/tmp/test-prune-forever", Some(365))?;
         let removed = prune_sessions(-1)?;
         assert_eq!(removed, 0, "retention=-1 should never prune");
-        assert!(dir_forever.exists());
-        let _ = fs::remove_dir_all(&dir_forever);
+        assert!(
+            get_session(&id_forever)?.is_some(),
+            "session should still exist"
+        );
+        delete_session_data(&id_forever)?;
 
         // -- retention=7 keeps recent, removes old --
-        let dir_recent = create_dead_session("/tmp/test-prune-recent", None)?;
-        let dir_old = create_dead_session("/tmp/test-prune-old", Some(10))?;
+        let id_recent = create_dead_session("/tmp/test-prune-recent", None)?;
+        let id_old = create_dead_session("/tmp/test-prune-old", Some(10))?;
 
         let _ = prune_sessions(7)?;
         assert!(
-            dir_recent.exists(),
+            get_session(&id_recent)?.is_some(),
             "recent dead session should survive prune"
         );
-        assert!(!dir_old.exists(), "old dead session should be pruned");
-        let _ = fs::remove_dir_all(&dir_recent);
+        assert!(
+            get_session(&id_old)?.is_none(),
+            "old dead session should be pruned"
+        );
+        delete_session_data(&id_recent)?;
 
         // -- retention=0 removes all dead --
-        let dir_zero = create_dead_session("/tmp/test-prune-zero", None)?;
+        let id_zero = create_dead_session("/tmp/test-prune-zero", None)?;
         let _ = prune_sessions(0)?;
         assert!(
-            !dir_zero.exists(),
+            get_session(&id_zero)?.is_none(),
             "dead session should be removed with retention=0"
         );
 

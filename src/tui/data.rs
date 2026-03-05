@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use anyhow::Result;
 
-use crate::session::{self, SessionEvent, SessionInfo, TailReader};
+use crate::session::{self, SessionEvent, SessionInfo, SqliteEventTail};
 
 /// Collected session row: info, liveness, and active language servers.
 pub struct SessionRow {
@@ -104,15 +104,13 @@ impl DataSource for LiveDataSource {
     }
 
     fn delete_session(&self, session_id: &str) -> Result<()> {
-        let dir = session::sessions_dir().join(session_id);
-        std::fs::remove_dir_all(&dir)?;
-        Ok(())
+        session::delete_session_data(session_id)
     }
 }
 
-/// Tail reader backed by a real [`TailReader`].
+/// Tail reader backed by `SQLite` polling.
 struct LiveEventTail {
-    reader: TailReader,
+    reader: SqliteEventTail,
 }
 
 impl EventTail for LiveEventTail {

@@ -124,15 +124,15 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
 /// Returns an error if any CREATE TABLE or INSERT statement fails.
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "BEGIN;
+        "BEGIN IMMEDIATE;
 
-         CREATE TABLE meta (
+         CREATE TABLE IF NOT EXISTS meta (
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
 
-         CREATE TABLE sessions (
+         CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
              pid            INTEGER NOT NULL,
              display_name   TEXT NOT NULL,
@@ -143,13 +143,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
              alive          INTEGER NOT NULL DEFAULT 1
          );
 
-         CREATE TABLE workspace_roots (
+         CREATE TABLE IF NOT EXISTS workspace_roots (
              session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
              root_path   TEXT NOT NULL,
              PRIMARY KEY (session_id, root_path)
          );
 
-         CREATE TABLE events (
+         CREATE TABLE IF NOT EXISTS events (
              id          INTEGER PRIMARY KEY AUTOINCREMENT,
              session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
              timestamp   TEXT NOT NULL,
@@ -158,26 +158,26 @@ fn create_schema(conn: &Connection) -> Result<()> {
              created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          );
 
-         CREATE INDEX idx_events_session_id ON events(session_id, id);
-         CREATE INDEX idx_events_timestamp ON events(timestamp);
+         CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id);
+         CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 
-         CREATE TABLE language_servers (
+         CREATE TABLE IF NOT EXISTS language_servers (
              session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
              name        TEXT NOT NULL,
              state       TEXT NOT NULL,
              PRIMARY KEY (session_id, name)
          );
 
-         CREATE TABLE filter_history (
+         CREATE TABLE IF NOT EXISTS filter_history (
              id          INTEGER PRIMARY KEY AUTOINCREMENT,
              workspace   TEXT NOT NULL,
              pattern     TEXT NOT NULL,
              created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          );
 
-         CREATE INDEX idx_filter_workspace ON filter_history(workspace, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_filter_workspace ON filter_history(workspace, created_at DESC);
 
-         CREATE TABLE root_sync_state (
+         CREATE TABLE IF NOT EXISTS root_sync_state (
              session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
              offset      INTEGER NOT NULL DEFAULT 0,
              roots       TEXT NOT NULL DEFAULT '[]'
