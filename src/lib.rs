@@ -12,6 +12,8 @@ pub mod bridge;
 pub mod cli;
 /// Configuration handling for language servers and session settings.
 pub mod config;
+/// SQLite database connection management, schema creation, and migrations.
+pub mod db;
 /// LSP client implementation and server management.
 pub mod lsp;
 /// MCP server implementation and type definitions.
