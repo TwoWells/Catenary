@@ -25,7 +25,7 @@ Catenary replaces brute-force file scanning with **graph navigation**.
 
 Instead of grepping across 20 files to find a definition, `definition` returns
 the exact location in one query. Instead of re-reading a file after editing it
-to check for errors, the `catenary release` hook returns diagnostics inline.
+to check for errors, the `catenary notify` hook returns diagnostics inline.
 Instead of fumbling with line numbers to find usages, `search` returns symbols,
 semantic references, and text matches in a single call.
 
@@ -58,7 +58,7 @@ lean across the entire session, regardless of how long the agent works.
 Catenary bridges [MCP](https://modelcontextprotocol.io/) and
 [LSP](https://microsoft.github.io/language-server-protocol/). It manages
 multiple language servers, routes requests by file type, and provides automatic
-post-edit diagnostics via the `catenary release` hook — all through a single MCP
+post-edit diagnostics via the `catenary notify` hook — all through a single MCP
 server. The agent never needs to know which server handles which language.
 
 ## Constrained Mode
@@ -68,7 +68,7 @@ supplement. In constrained mode, the host CLI's text-scanning commands (grep,
 cat, find, ls, etc.) are denied via permissions, forcing the agent to use LSP
 queries for navigation. The host's native file I/O tools remain available for
 reading and editing, with Catenary providing post-edit diagnostics via the
-`catenary release` hook.
+`catenary notify` hook.
 
 See [CLI Integration](cli-integration.md) for setup instructions.
 
@@ -100,11 +100,11 @@ See [CLI Integration](cli-integration.md) for setup instructions.
 
 | Feature          | Description                                         |
 | ---------------- | --------------------------------------------------- |
-| **Diagnostics**  | Errors, warnings, and quick-fix suggestions delivered inline after every edit via the `catenary release` PostToolUse hook |
+| **Diagnostics**  | Errors, warnings, and quick-fix suggestions delivered inline after every edit via the `catenary notify` PostToolUse hook |
 
 File reading and editing is handled by the host tool's native file operations
 (e.g. Claude Code's `Read`, `Edit`, `Write`). Catenary provides **post-edit
-LSP diagnostics** (including quick-fix code actions) via the `catenary release`
+LSP diagnostics** (including quick-fix code actions) via the `catenary notify`
 hook — diagnostics and fix suggestions appear in the model's context after
 every edit. See [CLI Integration](cli-integration.md) for hook configuration.
 

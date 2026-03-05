@@ -116,7 +116,7 @@ impl BridgeProcess {
 
     /// Sends a file-change notification via the notify socket and returns
     /// the diagnostics text. This exercises the production hook path
-    /// (`catenary release`) rather than the (removed) MCP `diagnostics` tool.
+    /// (`catenary notify`) rather than the (removed) MCP `diagnostics` tool.
     fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
         use std::io::Read as _;
 
@@ -381,7 +381,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
 
 /// Reproduces a cross-change stale diagnostics leak via concurrent notify socket.
 ///
-/// Exercises the production hook path (`catenary release`) with overlapping
+/// Exercises the production hook path (`catenary notify`) with overlapping
 /// connections to the notify socket. Task A opens v1, Task B edits to v2.
 /// v1's delayed diagnostics satisfy Task B's generation check, causing stale
 /// data to be returned for v2's content.

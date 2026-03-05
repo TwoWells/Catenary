@@ -1,5 +1,5 @@
 {
-  "description": "LSP diagnostics, root sync, and file locking via catenary hooks",
+  "description": "LSP diagnostics and root sync via catenary hooks",
   "hooks": {
     "PreToolUse": [
       {
@@ -10,15 +10,6 @@
             "command": "catenary sync-roots --format=claude"
           }
         ]
-      },
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary acquire --format=claude"
-          }
-        ]
       }
     ],
     "PostToolUse": [
@@ -27,18 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary release --format=claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary release --grace 0"
+            "command": "catenary notify --format=claude"
           }
         ]
       }
