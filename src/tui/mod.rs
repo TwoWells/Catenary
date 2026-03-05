@@ -44,7 +44,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::config::IconConfig;
 
 use self::app::{FocusedPane, InputMode};
-use self::data::LiveDataSource;
+use self::data::SqliteDataSource;
 use self::mouse::{DragState, MouseAction};
 use self::render::{draw, handle_key_filter, handle_key_normal, handle_key_visual};
 use self::theme::{IconSet, Theme};
@@ -61,7 +61,7 @@ const SESSION_REFRESH_TICKS: u64 = 25; // 25 * 200ms = 5s
 ///
 /// Returns an error if terminal setup fails or session data cannot be read.
 pub fn run(icon_config: IconConfig) -> Result<()> {
-    let data = Box::new(LiveDataSource);
+    let data = Box::new(SqliteDataSource::new()?);
     run_with_data(icon_config, data)
 }
 

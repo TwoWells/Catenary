@@ -3,15 +3,16 @@
 
 //! Data abstraction layer for the TUI.
 //!
-//! [`LiveDataSource`] reads from the filesystem (production).
+//! [`SqliteDataSource`] reads from the database (production).
 //! [`MockDataSource`] returns pre-configured data (testing).
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 
-use crate::session::{self, SessionEvent, SessionInfo, SqliteEventTail};
+use crate::session::{self, EventKind, SessionEvent, SessionInfo, SqliteEventTail};
 
 /// Collected session row: info, liveness, and active language servers.
 pub struct SessionRow {
@@ -25,7 +26,7 @@ pub struct SessionRow {
 
 /// Abstraction over session data access.
 ///
-/// [`LiveDataSource`] reads from the filesystem (production).
+/// [`SqliteDataSource`] reads from the database (production).
 /// [`MockDataSource`] returns pre-configured data (testing).
 pub trait DataSource {
     /// List all sessions with their liveness status and active languages.
@@ -53,7 +54,7 @@ pub trait DataSource {
     ///
     /// # Errors
     ///
-    /// Returns an error if the session directory cannot be removed.
+    /// Returns an error if the session data cannot be removed.
     fn delete_session(&self, session_id: &str) -> Result<()>;
 }
 
@@ -67,56 +68,186 @@ pub trait EventTail {
     fn try_next_event(&mut self) -> Result<Option<SessionEvent>>;
 }
 
-// ── Live (production) implementation ─────────────────────────────────
+impl EventTail for SqliteEventTail {
+    fn try_next_event(&mut self) -> Result<Option<SessionEvent>> {
+        self.try_next_event()
+    }
+}
 
-/// Data source backed by the real filesystem via [`session`] functions.
-pub struct LiveDataSource;
+// ── SQLite (production) implementation ───────────────────────────────
 
-impl DataSource for LiveDataSource {
+/// Data source backed by `SQLite` via the [`crate::db`] module.
+pub struct SqliteDataSource {
+    conn: rusqlite::Connection,
+}
+
+impl SqliteDataSource {
+    /// Open a new data source with a database connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or migrated.
+    pub fn new() -> Result<Self> {
+        let conn = crate::db::open_and_migrate()?;
+        Ok(Self { conn })
+    }
+}
+
+/// Raw row from the sessions table (avoids complex tuple types).
+struct RawSessionRow {
+    id: String,
+    pid: u32,
+    display_name: String,
+    client_name: Option<String>,
+    client_version: Option<String>,
+    started_at_str: String,
+    db_alive: bool,
+}
+
+impl DataSource for SqliteDataSource {
     fn list_sessions(&self) -> Result<Vec<SessionRow>> {
-        let raw = session::list_sessions()?;
-        let mut rows: Vec<SessionRow> = raw
-            .into_iter()
-            .map(|(info, alive)| {
-                let languages = session::active_languages(&info.id).unwrap_or_default();
-                SessionRow {
-                    info,
-                    alive,
-                    languages,
+        let raw = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, pid, display_name, client_name, client_version, started_at, alive \
+                 FROM sessions ORDER BY alive DESC, started_at DESC",
+            )?;
+            let mut r = stmt.query([])?;
+            let mut rows = Vec::new();
+            while let Some(row) = r.next()? {
+                rows.push(RawSessionRow {
+                    id: row.get(0)?,
+                    pid: row.get(1)?,
+                    display_name: row.get(2)?,
+                    client_name: row.get(3)?,
+                    client_version: row.get(4)?,
+                    started_at_str: row.get(5)?,
+                    db_alive: row.get(6)?,
+                });
+            }
+            rows
+        };
+
+        let mut sessions = Vec::with_capacity(raw.len());
+        for RawSessionRow {
+            id,
+            pid,
+            display_name,
+            client_name,
+            client_version,
+            started_at_str,
+            db_alive,
+        } in raw
+        {
+            let started_at = DateTime::parse_from_rfc3339(&started_at_str)
+                .with_context(|| format!("invalid started_at: {started_at_str}"))?
+                .with_timezone(&Utc);
+
+            let alive = if db_alive {
+                if session::is_process_alive(pid) {
+                    true
+                } else {
+                    let _ = self.conn.execute(
+                        "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+                        rusqlite::params![Utc::now().to_rfc3339(), &id],
+                    );
+                    false
                 }
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            b.alive
-                .cmp(&a.alive)
-                .then_with(|| b.info.started_at.cmp(&a.info.started_at))
-        });
-        Ok(rows)
+            } else {
+                false
+            };
+
+            let languages = active_languages_for(&self.conn, &id);
+
+            sessions.push(SessionRow {
+                info: SessionInfo {
+                    id,
+                    pid,
+                    workspace: display_name,
+                    started_at,
+                    client_name,
+                    client_version,
+                },
+                alive,
+                languages,
+            });
+        }
+
+        Ok(sessions)
     }
 
     fn monitor_events(&self, session_id: &str) -> Result<Vec<SessionEvent>> {
-        Ok(session::monitor_events(session_id)?.collect())
+        let mut stmt = self
+            .conn
+            .prepare("SELECT timestamp, payload FROM events WHERE session_id = ?1 ORDER BY id")?;
+        let mut rows = stmt.query([session_id])?;
+        let mut events = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let ts: String = row.get(0)?;
+            let payload: String = row.get(1)?;
+
+            if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
+                && let Ok(kind) = serde_json::from_str::<EventKind>(&payload)
+            {
+                events.push(SessionEvent {
+                    timestamp: timestamp.with_timezone(&Utc),
+                    kind,
+                });
+            }
+        }
+
+        Ok(events)
     }
 
     fn create_tail(&self, session_id: &str) -> Result<Box<dyn EventTail>> {
-        let reader = session::tail_events_new(session_id)?;
-        Ok(Box::new(LiveEventTail { reader }))
+        let tail = session::tail_events_new(session_id)?;
+        Ok(Box::new(tail))
     }
 
     fn delete_session(&self, session_id: &str) -> Result<()> {
-        session::delete_session_data(session_id)
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+
+        // Clean up socket directory if it exists.
+        let socket_dir = session::sessions_dir().join(session_id);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+
+        Ok(())
     }
 }
 
-/// Tail reader backed by `SQLite` polling.
-struct LiveEventTail {
-    reader: SqliteEventTail,
-}
+/// Query active languages for a session from its events.
+fn active_languages_for(conn: &rusqlite::Connection, session_id: &str) -> Vec<String> {
+    let mut languages = HashMap::new();
 
-impl EventTail for LiveEventTail {
-    fn try_next_event(&mut self) -> Result<Option<SessionEvent>> {
-        self.reader.try_next_event()
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT payload FROM events WHERE session_id = ?1 AND kind = 'server_state' ORDER BY id",
+    ) else {
+        return vec![];
+    };
+
+    let Ok(mut rows) = stmt.query([session_id]) else {
+        return vec![];
+    };
+
+    while let Ok(Some(row)) = rows.next() {
+        let Ok(payload) = row.get::<_, String>(0) else {
+            continue;
+        };
+        if let Ok(EventKind::ServerState { language, state }) =
+            serde_json::from_str::<EventKind>(&payload)
+        {
+            if state == "Dead" {
+                languages.remove(&language);
+            } else {
+                languages.insert(language, state);
+            }
+        }
     }
+
+    let mut result: Vec<String> = languages.into_keys().collect();
+    result.sort();
+    result
 }
 
 // ── Mock (testing) implementation ────────────────────────────────────
@@ -216,6 +347,8 @@ mod tests {
         }
     }
 
+    // ── Mock tests (unchanged) ───────────────────────────────────────
+
     #[test]
     fn test_mock_data_source_list_sessions() -> Result<()> {
         let ds = MockDataSource {
@@ -280,6 +413,97 @@ mod tests {
         assert!(tail.try_next_event()?.is_some());
         assert!(tail.try_next_event()?.is_some());
         assert!(tail.try_next_event()?.is_none());
+        Ok(())
+    }
+
+    // ── SQLite tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_sqlite_data_source_list_sessions() -> Result<()> {
+        let ds = SqliteDataSource::new()?;
+
+        // Create a session via the session module so it appears in the DB.
+        let session = crate::session::Session::create("/tmp/test-ds-list")?;
+        let id = session.info.id.clone();
+
+        let rows = ds.list_sessions()?;
+        assert!(rows.iter().any(|r| r.info.id == id));
+
+        drop(session);
+        ds.delete_session(&id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_data_source_monitor_events() -> Result<()> {
+        let ds = SqliteDataSource::new()?;
+
+        let session = crate::session::Session::create("/tmp/test-ds-events")?;
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Ready".to_string(),
+        });
+
+        let events = ds.monitor_events(&id)?;
+        // At least Started + ServerState
+        assert!(events.len() >= 2);
+
+        drop(session);
+        ds.delete_session(&id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_event_tail_streams() -> Result<()> {
+        let session = crate::session::Session::create("/tmp/test-ds-tail")?;
+        let id = session.info.id.clone();
+
+        let ds = SqliteDataSource::new()?;
+        let mut tail = ds.create_tail(&id)?;
+
+        // No new events since tail was created after the Started event
+        // (tail_events_new starts from the current end).
+        assert!(
+            tail.try_next_event()?.is_none(),
+            "should have no events initially"
+        );
+
+        // Broadcast a new event
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Ready".to_string(),
+        });
+
+        let event = tail.try_next_event()?;
+        assert!(event.is_some(), "should see newly broadcast event");
+
+        // No more events
+        assert!(tail.try_next_event()?.is_none());
+
+        drop(session);
+        ds.delete_session(&id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_data_source_delete_session() -> Result<()> {
+        let ds = SqliteDataSource::new()?;
+
+        let session = crate::session::Session::create("/tmp/test-ds-delete")?;
+        let id = session.info.id.clone();
+        drop(session);
+
+        // Should exist
+        assert!(ds.list_sessions()?.iter().any(|r| r.info.id == id));
+
+        // Delete
+        ds.delete_session(&id)?;
+
+        // Should be gone
+        assert!(!ds.list_sessions()?.iter().any(|r| r.info.id == id));
+
         Ok(())
     }
 }

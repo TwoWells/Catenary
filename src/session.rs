@@ -774,7 +774,7 @@ const fn event_kind_tag(kind: &EventKind) -> &'static str {
 }
 
 /// Check if a process is still running.
-fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
         // On Linux, checking /proc/<pid> is safe and doesn't require unsafe blocks.
