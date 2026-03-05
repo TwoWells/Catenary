@@ -124,6 +124,59 @@ enum Command {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
+
+    /// Query events from the database.
+    Query {
+        /// Filter by session ID or prefix.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Time filter (e.g., "1h", "today", "7d", "30m").
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter by event kind (e.g., `tool_call`, `diagnostics`).
+        #[arg(long)]
+        kind: Option<String>,
+
+        /// Free-text search in event payload.
+        #[arg(long)]
+        search: Option<String>,
+
+        /// Raw SQL query (power users).
+        #[arg(long)]
+        sql: Option<String>,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: QueryFormat,
+    },
+
+    /// Garbage-collect old session data.
+    Gc {
+        /// Delete events older than this duration (e.g., "7d", "30d").
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Delete all data for dead sessions.
+        #[arg(long)]
+        dead: bool,
+
+        /// Delete all data for a specific session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+/// Output format for the `query` command.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum QueryFormat {
+    /// Human-readable table.
+    Table,
+    /// JSON array.
+    Json,
+    /// Comma-separated values with headers.
+    Csv,
 }
 
 /// Entry point for the Catenary binary.
@@ -160,6 +213,26 @@ async fn main() -> Result<()> {
             run_notify(format);
             Ok(())
         }
+        Some(Command::Query {
+            session,
+            since,
+            kind,
+            search,
+            sql,
+            format,
+        }) => run_query(
+            session.as_deref(),
+            since.as_deref(),
+            kind.as_deref(),
+            search.as_deref(),
+            sql.as_deref(),
+            format,
+        ),
+        Some(Command::Gc {
+            older_than,
+            dead,
+            session,
+        }) => run_gc(older_than.as_deref(), dead, session.as_deref()),
     }
 }
 
@@ -608,6 +681,413 @@ fn run_status(id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse a human-friendly duration string into a UTC cutoff timestamp.
+///
+/// Accepted formats:
+/// - `Nm` — N minutes ago
+/// - `Nh` — N hours ago
+/// - `Nd` — N days ago
+/// - `today` — midnight local time today
+///
+/// # Errors
+///
+/// Returns an error if the string is not in a recognised format.
+fn parse_since(s: &str) -> Result<chrono::DateTime<Utc>> {
+    if s == "today" {
+        let today = Local::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow::anyhow!("failed to compute midnight"))?;
+        let local_midnight = today
+            .and_local_timezone(Local)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("ambiguous local midnight"))?;
+        return Ok(local_midnight.with_timezone(&Utc));
+    }
+
+    let (digits, unit) = s
+        .strip_suffix('m')
+        .map(|d| (d, "m"))
+        .or_else(|| s.strip_suffix('h').map(|d| (d, "h")))
+        .or_else(|| s.strip_suffix('d').map(|d| (d, "d")))
+        .ok_or_else(|| {
+            anyhow::anyhow!("unrecognised duration: {s} (expected Nm, Nh, Nd, or today)")
+        })?;
+
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number in duration: {s}"))?;
+
+    let duration = match unit {
+        "m" => chrono::Duration::minutes(n),
+        "h" => chrono::Duration::hours(n),
+        "d" => chrono::Duration::days(n),
+        _ => unreachable!(),
+    };
+
+    Ok(Utc::now() - duration)
+}
+
+/// Query events from the database.
+///
+/// Supports structured filters (`--session`, `--since`, `--kind`, `--search`)
+/// and raw SQL (`--sql`). Results are printed in the chosen format.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or the query fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Sequential query building and output formatting"
+)]
+fn run_query(
+    session_filter: Option<&str>,
+    since: Option<&str>,
+    kind: Option<&str>,
+    search: Option<&str>,
+    raw_sql: Option<&str>,
+    format: QueryFormat,
+) -> Result<()> {
+    let conn = catenary_mcp::db::open()?;
+
+    if let Some(sql) = raw_sql {
+        let mut stmt = conn.prepare(sql)?;
+        let col_count = stmt.column_count();
+        let col_names: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+            .collect();
+
+        let mut rows_out: Vec<Vec<String>> = Vec::new();
+        let mut db_rows = stmt.query([])?;
+        while let Some(row) = db_rows.next()? {
+            let mut vals = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let val: String = row
+                    .get::<_, rusqlite::types::Value>(i)
+                    .map(|v| format_sql_value(&v))
+                    .unwrap_or_default();
+                vals.push(val);
+            }
+            rows_out.push(vals);
+        }
+        drop(db_rows);
+
+        print_query_results(&col_names, &rows_out, format);
+        return Ok(());
+    }
+
+    // Build structured query
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(sid) = session_filter {
+        let resolved = resolve_session_id(sid)?;
+        conditions.push(format!("e.session_id = ?{}", params.len() + 1));
+        params.push(Box::new(resolved.id));
+    }
+
+    if let Some(since_str) = since {
+        let cutoff = parse_since(since_str)?;
+        conditions.push(format!("e.timestamp > ?{}", params.len() + 1));
+        params.push(Box::new(cutoff.to_rfc3339()));
+    }
+
+    if let Some(k) = kind {
+        conditions.push(format!("e.kind = ?{}", params.len() + 1));
+        params.push(Box::new(k.to_string()));
+    }
+
+    if let Some(s) = search {
+        conditions.push(format!("e.payload LIKE ?{}", params.len() + 1));
+        params.push(Box::new(format!("%{s}%")));
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT e.id, e.session_id, e.timestamp, e.kind, e.payload \
+         FROM events e{where_clause} ORDER BY e.id DESC LIMIT 100"
+    );
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let mut db_rows = stmt.query(param_refs.as_slice())?;
+
+    let col_names = vec![
+        "ID".to_string(),
+        "SESSION".to_string(),
+        "TIME".to_string(),
+        "KIND".to_string(),
+        "PAYLOAD".to_string(),
+    ];
+    let mut rows_out: Vec<Vec<String>> = Vec::new();
+    while let Some(row) = db_rows.next()? {
+        let id: i64 = row.get(0)?;
+        let sid: String = row.get(1)?;
+        let ts: String = row.get(2)?;
+        let k: String = row.get(3)?;
+        let payload: String = row.get(4)?;
+
+        // Shorten session ID and timestamp for table display
+        let short_sid = if sid.len() > 8 { &sid[..8] } else { &sid };
+        let short_ts = chrono::DateTime::parse_from_rfc3339(&ts)
+            .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
+            .unwrap_or(ts);
+
+        rows_out.push(vec![
+            id.to_string(),
+            short_sid.to_string(),
+            short_ts,
+            k,
+            payload,
+        ]);
+    }
+
+    print_query_results(&col_names, &rows_out, format);
+    Ok(())
+}
+
+/// Format a `rusqlite` value as a display string.
+fn format_sql_value(val: &rusqlite::types::Value) -> String {
+    match val {
+        rusqlite::types::Value::Null => "NULL".to_string(),
+        rusqlite::types::Value::Integer(i) => i.to_string(),
+        rusqlite::types::Value::Real(f) => f.to_string(),
+        rusqlite::types::Value::Text(s) => s.clone(),
+        rusqlite::types::Value::Blob(b) => format!("<blob {} bytes>", b.len()),
+    }
+}
+
+/// Print query results in the chosen format.
+fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: QueryFormat) {
+    if rows.is_empty() {
+        println!("No results");
+        return;
+    }
+
+    match format {
+        QueryFormat::Table => {
+            // Calculate column widths
+            let mut widths: Vec<usize> = col_names.iter().map(String::len).collect();
+            for row in rows {
+                for (i, val) in row.iter().enumerate() {
+                    if i < widths.len() {
+                        widths[i] = widths[i].max(val.len());
+                    }
+                }
+            }
+
+            // Cap payload column at 80 chars
+            if let Some(last) = widths.last_mut() {
+                *last = (*last).min(80);
+            }
+
+            // Header
+            let header: Vec<String> = col_names
+                .iter()
+                .zip(&widths)
+                .map(|(name, w)| format!("{name:<w$}"))
+                .collect();
+            println!("{}", header.join("  "));
+            println!(
+                "{}",
+                widths
+                    .iter()
+                    .map(|w| "-".repeat(*w))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+
+            // Rows
+            for row in rows {
+                let formatted: Vec<String> = row
+                    .iter()
+                    .zip(&widths)
+                    .map(|(val, w)| {
+                        if val.len() > *w {
+                            format!("{}...", &val[..w.saturating_sub(3)])
+                        } else {
+                            format!("{val:<w$}")
+                        }
+                    })
+                    .collect();
+                println!("{}", formatted.join("  "));
+            }
+        }
+        QueryFormat::Json => {
+            let arr: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    let mut obj = serde_json::Map::new();
+                    for (name, val) in col_names.iter().zip(row) {
+                        obj.insert(name.to_lowercase(), serde_json::Value::String(val.clone()));
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            let json = serde_json::to_string_pretty(&arr).unwrap_or_default();
+            println!("{json}");
+        }
+        QueryFormat::Csv => {
+            println!("{}", col_names.join(","));
+            for row in rows {
+                let escaped: Vec<String> = row
+                    .iter()
+                    .map(|v| {
+                        if v.contains(',') || v.contains('"') || v.contains('\n') {
+                            format!("\"{}\"", v.replace('"', "\"\""))
+                        } else {
+                            v.clone()
+                        }
+                    })
+                    .collect();
+                println!("{}", escaped.join(","));
+            }
+        }
+    }
+}
+
+/// Garbage-collect old session data.
+///
+/// Deletes events, dead sessions, or specific sessions based on the flags.
+/// Runs `VACUUM` when significant data is removed.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or a delete fails.
+fn run_gc(older_than: Option<&str>, dead: bool, session_id: Option<&str>) -> Result<()> {
+    let conn = catenary_mcp::db::open_and_migrate()?;
+    let mut total_events_deleted: usize = 0;
+    let mut sessions_deleted: usize = 0;
+
+    // --older-than: delete old events and filter history
+    if let Some(duration_str) = older_than {
+        let cutoff = parse_since(duration_str)?;
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let events_removed =
+            conn.execute("DELETE FROM events WHERE timestamp < ?1", [&cutoff_str])?;
+        total_events_deleted += events_removed;
+
+        let filters_removed = conn.execute(
+            "DELETE FROM filter_history WHERE created_at < ?1",
+            [&cutoff_str],
+        )?;
+
+        println!(
+            "Deleted {events_removed} event{} older than {duration_str}",
+            if events_removed == 1 { "" } else { "s" }
+        );
+        if filters_removed > 0 {
+            println!(
+                "Deleted {filters_removed} filter history entr{} older than {duration_str}",
+                if filters_removed == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+
+    // --dead: detect crashed sessions, then delete all dead sessions
+    if dead {
+        // list_sessions() checks PID liveness and marks crashed sessions
+        // as dead in the DB, so we just call it before deleting.
+        let _ = session::list_sessions();
+
+        // Count events that will be cascade-deleted
+        let dead_events: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id IN \
+                 (SELECT id FROM sessions WHERE alive = 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let removed = conn.execute("DELETE FROM sessions WHERE alive = 0", [])?;
+        sessions_deleted += removed;
+        total_events_deleted += dead_events;
+
+        println!(
+            "Deleted {removed} dead session{} ({dead_events} event{})",
+            if removed == 1 { "" } else { "s" },
+            if dead_events == 1 { "" } else { "s" },
+        );
+    }
+
+    // --session: delete a specific session
+    if let Some(sid) = session_id {
+        let resolved = resolve_session_id(sid)?;
+
+        let event_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+                [&resolved.id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        conn.execute("DELETE FROM sessions WHERE id = ?1", [&resolved.id])?;
+        sessions_deleted += 1;
+        total_events_deleted += event_count;
+
+        // Clean up socket directory
+        let socket_dir = session::sessions_dir().join(&resolved.id);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+
+        println!(
+            "Deleted session {} ({event_count} event{})",
+            &resolved.id[..8.min(resolved.id.len())],
+            if event_count == 1 { "" } else { "s" },
+        );
+    }
+
+    if older_than.is_none() && !dead && session_id.is_none() {
+        println!("Nothing to do. Use --older-than, --dead, or --session.");
+        return Ok(());
+    }
+
+    // VACUUM if significant data was deleted
+    if total_events_deleted > 1000 || sessions_deleted > 0 {
+        let size_before = db_file_size();
+        conn.execute_batch("VACUUM")?;
+        let size_after = db_file_size();
+
+        if let (Some(before), Some(after)) = (size_before, size_after) {
+            let saved = before.saturating_sub(after);
+            if saved > 0 {
+                println!("Database vacuumed (saved {})", format_bytes(saved));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get the database file size in bytes.
+fn db_file_size() -> Option<u64> {
+    std::fs::metadata(catenary_mcp::db::db_path())
+        .ok()
+        .map(|m| m.len())
+}
+
+/// Format a byte count as a human-readable string.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "byte counts are small enough for f64"
+)]
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Returns the IPC endpoint path for a session.
@@ -2000,5 +2480,198 @@ mod tests {
 
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         Ok(())
+    }
+
+    // ── parse_since tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_since_hours() -> Result<()> {
+        let cutoff = parse_since("1h")?;
+        let diff = Utc::now().signed_duration_since(cutoff);
+        // Should be approximately 1 hour (allow 5s tolerance)
+        assert!(
+            diff.num_seconds() >= 3595 && diff.num_seconds() <= 3605,
+            "expected ~3600s, got {}s",
+            diff.num_seconds()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_since_days() -> Result<()> {
+        let cutoff = parse_since("7d")?;
+        let diff = Utc::now().signed_duration_since(cutoff);
+        let expected = 7 * 86400;
+        assert!(
+            diff.num_seconds() >= expected - 5 && diff.num_seconds() <= expected + 5,
+            "expected ~{expected}s, got {}s",
+            diff.num_seconds()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_since_minutes() -> Result<()> {
+        let cutoff = parse_since("30m")?;
+        let diff = Utc::now().signed_duration_since(cutoff);
+        assert!(
+            diff.num_seconds() >= 1795 && diff.num_seconds() <= 1805,
+            "expected ~1800s, got {}s",
+            diff.num_seconds()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_since_today() -> Result<()> {
+        let cutoff = parse_since("today")?;
+        let now = Utc::now();
+        // Cutoff should be before now
+        assert!(cutoff <= now);
+        // And within the last 24 hours
+        assert!(now.signed_duration_since(cutoff).num_hours() < 24);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_since_invalid() {
+        assert!(parse_since("abc").is_err());
+        assert!(parse_since("").is_err());
+        assert!(parse_since("5x").is_err());
+    }
+
+    // ── query tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_query_with_kind_filter() -> Result<()> {
+        use catenary_mcp::session::{self, EventKind, Session};
+
+        let session = Session::create("/tmp/test-query-kind")?;
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ToolCall {
+            tool: "grep".to_string(),
+            file: Some("/tmp/a.rs".to_string()),
+            params: None,
+        });
+        session.broadcast(EventKind::ServerState {
+            language: "rust".to_string(),
+            state: "Ready".to_string(),
+        });
+
+        let conn = catenary_mcp::db::open()?;
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND kind = 'tool_call'",
+            [&id],
+            |row| row.get(0),
+        )?;
+        assert!(count >= 1, "should have at least one tool_call event");
+
+        let all_count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )?;
+        assert!(
+            all_count > count,
+            "should have more total events than tool_call events"
+        );
+
+        drop(session);
+        session::delete_session_data(&id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_with_search() -> Result<()> {
+        use catenary_mcp::session::{self, EventKind, Session};
+
+        let session = Session::create("/tmp/test-query-search")?;
+        let id = session.info.id.clone();
+
+        session.broadcast(EventKind::ToolCall {
+            tool: "hover".to_string(),
+            file: Some("/tmp/unique_marker_file.rs".to_string()),
+            params: None,
+        });
+
+        let conn = catenary_mcp::db::open()?;
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND payload LIKE '%unique_marker_file%'",
+            [&id],
+            |row| row.get(0),
+        )?;
+        assert!(count >= 1, "should find event by payload search");
+
+        drop(session);
+        session::delete_session_data(&id)?;
+        Ok(())
+    }
+
+    // ── gc tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_gc_dead_sessions() -> Result<()> {
+        use catenary_mcp::session::{self, Session};
+
+        let session = Session::create("/tmp/test-gc-dead")?;
+        let id = session.info.id.clone();
+        drop(session); // marks as dead
+
+        // Verify it exists as dead
+        let found = session::get_session(&id)?;
+        assert!(found.is_some(), "session should exist");
+        assert!(!found.expect("checked above").1, "session should be dead");
+
+        // Run gc --dead
+        run_gc(None, true, None)?;
+
+        // Should be gone
+        assert!(
+            session::get_session(&id)?.is_none(),
+            "dead session should be deleted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_specific_session() -> Result<()> {
+        use catenary_mcp::session::{self, Session};
+
+        let s1 = Session::create("/tmp/test-gc-specific-1")?;
+        let id1 = s1.info.id.clone();
+        let s2 = Session::create("/tmp/test-gc-specific-2")?;
+        let id2 = s2.info.id.clone();
+        drop(s1);
+        drop(s2);
+
+        // Delete only s1
+        run_gc(None, false, Some(&id1))?;
+
+        assert!(
+            session::get_session(&id1)?.is_none(),
+            "targeted session should be deleted"
+        );
+        assert!(
+            session::get_session(&id2)?.is_some(),
+            "other session should survive"
+        );
+
+        session::delete_session_data(&id2)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_no_flags_is_noop() -> Result<()> {
+        // Should not error
+        run_gc(None, false, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(2_621_440), "2.5 MB");
     }
 }
