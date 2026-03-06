@@ -22,14 +22,18 @@ struct ServerProcess {
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     stderr: BufReader<std::process::ChildStderr>,
+    state_dir: tempfile::TempDir,
 }
 
 impl ServerProcess {
     fn spawn() -> Result<Self> {
+        let state_dir = tempfile::tempdir().context("Failed to create state tempdir")?;
+
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("--root").arg(".");
-        // Isolate from user-level config
+        // Isolate from user-level config and state
         cmd.env("XDG_CONFIG_HOME", ".");
+        cmd.env("CATENARY_STATE_DIR", state_dir.path());
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -46,6 +50,7 @@ impl ServerProcess {
             stdin,
             stdout,
             stderr,
+            state_dir,
         })
     }
 
@@ -103,6 +108,7 @@ fn test_list_shows_row_numbers() -> Result<()> {
     // Run catenary list
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .arg("list")
+        .env("CATENARY_STATE_DIR", server.state_dir.path())
         .output()
         .context("Failed to run list command")?;
 
@@ -150,6 +156,7 @@ fn test_list_shows_language_servers_line() -> Result<()> {
     // Run catenary list
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .arg("list")
+        .env("CATENARY_STATE_DIR", server.state_dir.path())
         .output()
         .context("Failed to run list command")?;
 
@@ -182,6 +189,7 @@ fn test_monitor_by_row_number_starts() -> Result<()> {
     // monitoring some session (row number resolution works)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("monitor").arg("1");
+    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -223,9 +231,11 @@ fn test_monitor_invalid_row_number_fails() -> Result<()> {
     // Verify that an invalid row number (999) fails appropriately.
     // "999" is tried as row number (out of range), then as session ID prefix
     // (no match), so the row-number error is reported.
+    let state_dir = tempfile::tempdir().context("Failed to create state tempdir")?;
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .arg("monitor")
         .arg("999")
+        .env("CATENARY_STATE_DIR", state_dir.path())
         .output()
         .context("Failed to run monitor command")?;
 
@@ -251,6 +261,7 @@ fn test_monitor_numeric_session_id_resolves() -> Result<()> {
     // of whether the ID happens to be all digits.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("monitor").arg(&session_id);
+    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -297,6 +308,7 @@ fn test_monitor_raw_flag() -> Result<()> {
     // Start monitor with --raw flag
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("monitor").arg(&session_id).arg("--raw");
+    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -361,6 +373,7 @@ fn test_monitor_nocolor_flag() -> Result<()> {
     // Start monitor with --nocolor flag
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("monitor").arg(&session_id).arg("--nocolor");
+    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -432,6 +445,7 @@ fn test_monitor_filter_flag() -> Result<()> {
         .arg(&session_id)
         .arg("--filter")
         .arg("ping");
+    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
@@ -495,6 +509,7 @@ fn test_monitor_uses_arrows() -> Result<()> {
     // Start monitor (without --raw)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("monitor").arg(&session_id).arg("--nocolor");
+    cmd.env("CATENARY_STATE_DIR", server.state_dir.path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("Failed to spawn monitor")?;
     let stdout = child
