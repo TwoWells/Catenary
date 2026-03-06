@@ -91,6 +91,14 @@ impl SqliteDataSource {
         let conn = crate::db::open_and_migrate()?;
         Ok(Self { conn })
     }
+
+    /// Create a data source with an existing database connection.
+    ///
+    /// Useful for testing with isolated temporary databases.
+    #[must_use]
+    pub const fn with_conn(conn: rusqlite::Connection) -> Self {
+        Self { conn }
+    }
 }
 
 /// Raw row from the sessions table (avoids complex tuple types).
@@ -329,6 +337,16 @@ mod tests {
 
     use crate::session::{EventKind, SessionInfo};
 
+    /// Open an isolated test database in a tempdir.
+    /// Returns `(TempDir, PathBuf, Connection)` — the tempdir guard must
+    /// be held for the lifetime of the connection.
+    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
+        let dir = tempfile::tempdir().expect("failed to create tempdir for test DB");
+        let path = dir.path().join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&path).expect("failed to open test DB");
+        (dir, path, conn)
+    }
+
     fn make_session_info(id: &str) -> SessionInfo {
         SessionInfo {
             id: id.to_string(),
@@ -418,12 +436,24 @@ mod tests {
 
     // ── SQLite tests ─────────────────────────────────────────────────
 
+    /// Create a session backed by the database at `db_path`.
+    fn create_session(
+        db_path: &std::path::Path,
+        workspace: &str,
+    ) -> Result<crate::session::Session> {
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
+            db_path,
+        )?));
+        crate::session::Session::create_with_conn(workspace, arc)
+    }
+
     #[test]
     fn test_sqlite_data_source_list_sessions() -> Result<()> {
-        let ds = SqliteDataSource::new()?;
+        let (_dir, path, conn) = test_db();
+        let ds = SqliteDataSource::with_conn(conn);
 
-        // Create a session via the session module so it appears in the DB.
-        let session = crate::session::Session::create("/tmp/test-ds-list")?;
+        // Need a separate conn for creating the session (different handle).
+        let session = create_session(&path, "/tmp/test-ds-list")?;
         let id = session.info.id.clone();
 
         let rows = ds.list_sessions()?;
@@ -436,9 +466,10 @@ mod tests {
 
     #[test]
     fn test_sqlite_data_source_monitor_events() -> Result<()> {
-        let ds = SqliteDataSource::new()?;
+        let (_dir, path, conn) = test_db();
+        let ds = SqliteDataSource::with_conn(conn);
 
-        let session = crate::session::Session::create("/tmp/test-ds-events")?;
+        let session = create_session(&path, "/tmp/test-ds-events")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -457,11 +488,14 @@ mod tests {
 
     #[test]
     fn test_sqlite_event_tail_streams() -> Result<()> {
-        let session = crate::session::Session::create("/tmp/test-ds-tail")?;
+        let (_dir, path, conn) = test_db();
+
+        let session = create_session(&path, "/tmp/test-ds-tail")?;
         let id = session.info.id.clone();
 
-        let ds = SqliteDataSource::new()?;
-        let mut tail = ds.create_tail(&id)?;
+        // Open a fresh connection for the tail (it takes ownership).
+        let tail_conn = crate::db::open_at(&path)?;
+        let mut tail = crate::session::tail_events_new_with_conn(tail_conn, &id)?;
 
         // No new events since tail was created after the Started event
         // (tail_events_new starts from the current end).
@@ -483,15 +517,16 @@ mod tests {
         assert!(tail.try_next_event()?.is_none());
 
         drop(session);
-        ds.delete_session(&id)?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", [&id])?;
         Ok(())
     }
 
     #[test]
     fn test_sqlite_data_source_delete_session() -> Result<()> {
-        let ds = SqliteDataSource::new()?;
+        let (_dir, path, conn) = test_db();
+        let ds = SqliteDataSource::with_conn(conn);
 
-        let session = crate::session::Session::create("/tmp/test-ds-delete")?;
+        let session = create_session(&path, "/tmp/test-ds-delete")?;
         let id = session.info.id.clone();
         drop(session);
 

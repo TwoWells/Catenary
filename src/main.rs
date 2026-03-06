@@ -220,19 +220,26 @@ async fn main() -> Result<()> {
             search,
             sql,
             format,
-        }) => run_query(
-            session.as_deref(),
-            since.as_deref(),
-            kind.as_deref(),
-            search.as_deref(),
-            sql.as_deref(),
-            format,
-        ),
+        }) => {
+            let conn = catenary_mcp::db::open_and_migrate()?;
+            run_query(
+                &conn,
+                session.as_deref(),
+                since.as_deref(),
+                kind.as_deref(),
+                search.as_deref(),
+                sql.as_deref(),
+                format,
+            )
+        }
         Some(Command::Gc {
             older_than,
             dead,
             session,
-        }) => run_gc(older_than.as_deref(), dead, session.as_deref()),
+        }) => {
+            let conn = catenary_mcp::db::open_and_migrate()?;
+            run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
+        }
     }
 }
 
@@ -248,7 +255,8 @@ async fn main() -> Result<()> {
 fn run_dashboard(args: &Args) -> Result<()> {
     let config = catenary_mcp::config::Config::load(args.config.clone())?;
 
-    if let Err(e) = session::prune_sessions(config.log_retention_days) {
+    let conn = catenary_mcp::db::open_and_migrate()?;
+    if let Err(e) = session::prune_sessions_with_conn(&conn, config.log_retention_days) {
         warn!("session pruning failed: {e}");
     }
 
@@ -454,7 +462,8 @@ async fn run_server(args: Args) -> Result<()> {
 ///
 /// Returns an error if listing sessions fails.
 fn run_list() -> Result<()> {
-    let sessions = session::list_sessions()?;
+    let conn = catenary_mcp::db::open_and_migrate()?;
+    let sessions = session::list_sessions_with_conn(&conn)?;
 
     if sessions.is_empty() {
         println!("No active Catenary sessions");
@@ -516,7 +525,7 @@ fn run_list() -> Result<()> {
         if *alive {
             println!("{row_str}");
             // Get active languages for this session (shown on second line)
-            let languages = session::active_languages(&s.id).unwrap_or_default();
+            let languages = session::active_languages_with_conn(&conn, &s.id).unwrap_or_default();
             if !languages.is_empty() {
                 let lang_str = languages.join(", ");
                 println!(
@@ -532,27 +541,27 @@ fn run_list() -> Result<()> {
     Ok(())
 }
 
-/// Resolve a session ID from either a row number or ID prefix
-fn resolve_session_id(id: &str) -> Result<session::SessionInfo> {
+/// Resolve a session ID from either a row number or ID prefix.
+fn resolve_session_id(conn: &rusqlite::Connection, id: &str) -> Result<session::SessionInfo> {
     // Try parsing as a row number first (1-indexed)
     if let Ok(row_num) = id.parse::<usize>()
         && row_num > 0
     {
-        let sessions = session::list_sessions()?;
+        let sessions = session::list_sessions_with_conn(conn)?;
         if let Some((s, _)) = sessions.get(row_num - 1) {
             return Ok(s.clone());
         }
         // Row number out of range — try as session ID prefix before giving up.
         // Session IDs are hex strings that may be all digits (e.g., "025586387"),
         // so a purely numeric input could be either a row number or a session ID.
-        if let Ok(session) = find_session(id) {
+        if let Ok(session) = find_session(conn, id) {
             return Ok(session);
         }
         anyhow::bail!("Row number {} out of range (1-{})", row_num, sessions.len());
     }
 
     // Fall back to find_session (ID prefix matching)
-    find_session(id)
+    find_session(conn, id)
 }
 
 /// Monitor events from a session
@@ -562,8 +571,9 @@ fn resolve_session_id(id: &str) -> Result<session::SessionInfo> {
 ///
 /// Returns an error if the session cannot be found or monitoring fails.
 fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Result<()> {
+    let conn = catenary_mcp::db::open_and_migrate()?;
     // Resolve session ID (supports row numbers and prefix matching)
-    let session = resolve_session_id(id)?;
+    let session = resolve_session_id(&conn, id)?;
     let full_id = session.id;
 
     let colors = ColorConfig::new(nocolor);
@@ -622,7 +632,7 @@ fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Resu
                 // No new event — check liveness
                 std::thread::sleep(Duration::from_millis(100));
 
-                if let Ok(Some((_, alive))) = session::get_session(&full_id) {
+                if let Ok(Some((_, alive))) = session::get_session_with_conn(&conn, &full_id) {
                     if !alive {
                         println!("\nSession ended (process dead)");
                         break;
@@ -649,7 +659,8 @@ fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> Resu
 ///
 /// Returns an error if the session cannot be found.
 fn run_status(id: &str) -> Result<()> {
-    let session = find_session(id)?;
+    let conn = catenary_mcp::db::open_and_migrate()?;
+    let session = find_session(&conn, id)?;
 
     println!("Session: {}", session.id);
     println!("PID: {}", session.pid);
@@ -673,7 +684,7 @@ fn run_status(id: &str) -> Result<()> {
 
     // Show recent events
     println!("\nRecent events:");
-    let events: Vec<_> = session::monitor_events(&session.id)?.collect();
+    let events = session::monitor_events_with_conn(&conn, &session.id)?;
     let recent: Vec<_> = events.iter().rev().take(10).collect();
 
     for event in recent.iter().rev() {
@@ -743,6 +754,7 @@ fn parse_since(s: &str) -> Result<chrono::DateTime<Utc>> {
     reason = "Sequential query building and output formatting"
 )]
 fn run_query(
+    conn: &rusqlite::Connection,
     session_filter: Option<&str>,
     since: Option<&str>,
     kind: Option<&str>,
@@ -750,8 +762,6 @@ fn run_query(
     raw_sql: Option<&str>,
     format: QueryFormat,
 ) -> Result<()> {
-    let conn = catenary_mcp::db::open()?;
-
     if let Some(sql) = raw_sql {
         let mut stmt = conn.prepare(sql)?;
         let col_count = stmt.column_count();
@@ -783,7 +793,7 @@ fn run_query(
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if let Some(sid) = session_filter {
-        let resolved = resolve_session_id(sid)?;
+        let resolved = resolve_session_id(conn, sid)?;
         conditions.push(format!("e.session_id = ?{}", params.len() + 1));
         params.push(Box::new(resolved.id));
     }
@@ -961,8 +971,12 @@ fn print_query_results(col_names: &[String], rows: &[Vec<String>], format: Query
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or a delete fails.
-fn run_gc(older_than: Option<&str>, dead: bool, session_id: Option<&str>) -> Result<()> {
-    let conn = catenary_mcp::db::open_and_migrate()?;
+fn run_gc(
+    conn: &rusqlite::Connection,
+    older_than: Option<&str>,
+    dead: bool,
+    session_id: Option<&str>,
+) -> Result<()> {
     let mut total_events_deleted: usize = 0;
     let mut sessions_deleted: usize = 0;
 
@@ -1040,7 +1054,7 @@ fn run_gc(older_than: Option<&str>, dead: bool, session_id: Option<&str>) -> Res
 
     // --session: delete a specific session
     if let Some(sid) = session_id {
-        let resolved = resolve_session_id(sid)?;
+        let resolved = resolve_session_id(conn, sid)?;
 
         let event_count: usize = conn
             .query_row(
@@ -1199,7 +1213,10 @@ fn run_notify(format: HostFormat) {
 
     // Notify session for diagnostics
     let abs_path = PathBuf::from(&file_path);
-    let sessions = session::list_sessions().unwrap_or_default();
+    let Ok(conn) = catenary_mcp::db::open_and_migrate() else {
+        return;
+    };
+    let sessions = session::list_sessions_with_conn(&conn).unwrap_or_default();
     let session = sessions
         .iter()
         .find(|(s, _)| abs_path.to_string_lossy().starts_with(&s.workspace));
@@ -1260,19 +1277,19 @@ fn run_sync_roots(format: HostFormat) {
         PathBuf::from,
     );
 
+    // Open DB for root_sync_state persistence and session lookup
+    let Ok(db) = catenary_mcp::db::open_and_migrate() else {
+        return;
+    };
+
     // Find the session whose workspace matches cwd
-    let sessions = session::list_sessions().unwrap_or_default();
+    let sessions = session::list_sessions_with_conn(&db).unwrap_or_default();
     let cwd_str = cwd.to_string_lossy();
     let session = sessions
         .iter()
         .find(|(s, _)| cwd_str.starts_with(&s.workspace));
 
     let Some((session, _)) = session else {
-        return;
-    };
-
-    // Open DB for root_sync_state persistence
-    let Ok(db) = catenary_mcp::db::open_and_migrate() else {
         return;
     };
 
@@ -2171,15 +2188,15 @@ fn extract_capabilities(
     tools
 }
 
-/// Find session by ID or prefix
-fn find_session(id: &str) -> Result<session::SessionInfo> {
+/// Find session by ID or prefix.
+fn find_session(conn: &rusqlite::Connection, id: &str) -> Result<session::SessionInfo> {
     // Try exact match first
-    if let Some((s, _)) = session::get_session(id)? {
+    if let Some((s, _)) = session::get_session_with_conn(conn, id)? {
         return Ok(s);
     }
 
     // Try prefix match
-    let sessions = session::list_sessions()?;
+    let sessions = session::list_sessions_with_conn(conn)?;
     let matches: Vec<_> = sessions
         .iter()
         .filter(|(s, _)| s.id.starts_with(id))
@@ -2438,6 +2455,22 @@ mod tests {
     use super::*;
     use anyhow::Context;
 
+    /// Open an isolated test database in a tempdir.
+    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
+        let dir = tempfile::tempdir().expect("failed to create tempdir for test DB");
+        let path = dir.path().join("catenary").join("catenary.db");
+        let conn = catenary_mcp::db::open_and_migrate_at(&path).expect("failed to open test DB");
+        (dir, path, conn)
+    }
+
+    /// Create a session backed by the database at `db_path`.
+    fn create_session(db_path: &std::path::Path, workspace: &str) -> Result<session::Session> {
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(
+            catenary_mcp::db::open_and_migrate_at(db_path)?,
+        ));
+        session::Session::create_with_conn(workspace, arc)
+    }
+
     #[test]
     fn test_format_diagnostics_claude() -> Result<()> {
         let lines = vec![
@@ -2563,9 +2596,10 @@ mod tests {
 
     #[test]
     fn test_query_with_kind_filter() -> Result<()> {
-        use catenary_mcp::session::{self, EventKind, Session};
+        use catenary_mcp::session::EventKind;
+        let (_dir, path, conn) = test_db();
 
-        let session = Session::create("/tmp/test-query-kind")?;
+        let session = create_session(&path, "/tmp/test-query-kind")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ToolCall {
@@ -2578,7 +2612,6 @@ mod tests {
             state: "Ready".to_string(),
         });
 
-        let conn = catenary_mcp::db::open()?;
         let count: usize = conn.query_row(
             "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND kind = 'tool_call'",
             [&id],
@@ -2597,15 +2630,16 @@ mod tests {
         );
 
         drop(session);
-        session::delete_session_data(&id)?;
+        session::delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
     fn test_query_with_search() -> Result<()> {
-        use catenary_mcp::session::{self, EventKind, Session};
+        use catenary_mcp::session::EventKind;
+        let (_dir, path, conn) = test_db();
 
-        let session = Session::create("/tmp/test-query-search")?;
+        let session = create_session(&path, "/tmp/test-query-search")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ToolCall {
@@ -2614,7 +2648,6 @@ mod tests {
             params: None,
         });
 
-        let conn = catenary_mcp::db::open()?;
         let count: usize = conn.query_row(
             "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND payload LIKE '%unique_marker_file%'",
             [&id],
@@ -2623,7 +2656,7 @@ mod tests {
         assert!(count >= 1, "should find event by payload search");
 
         drop(session);
-        session::delete_session_data(&id)?;
+        session::delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
@@ -2631,23 +2664,23 @@ mod tests {
 
     #[test]
     fn test_gc_dead_sessions() -> Result<()> {
-        use catenary_mcp::session::{self, Session};
+        let (_dir, path, conn) = test_db();
 
-        let session = Session::create("/tmp/test-gc-dead")?;
+        let session = create_session(&path, "/tmp/test-gc-dead")?;
         let id = session.info.id.clone();
         drop(session); // marks as dead
 
         // Verify it exists as dead
-        let found = session::get_session(&id)?;
+        let found = session::get_session_with_conn(&conn, &id)?;
         assert!(found.is_some(), "session should exist");
         assert!(!found.expect("checked above").1, "session should be dead");
 
         // Run gc --dead
-        run_gc(None, true, None)?;
+        run_gc(&conn, None, true, None)?;
 
         // Should be gone
         assert!(
-            session::get_session(&id)?.is_none(),
+            session::get_session_with_conn(&conn, &id)?.is_none(),
             "dead session should be deleted"
         );
         Ok(())
@@ -2655,35 +2688,36 @@ mod tests {
 
     #[test]
     fn test_gc_specific_session() -> Result<()> {
-        use catenary_mcp::session::{self, Session};
+        let (_dir, path, conn) = test_db();
 
-        let s1 = Session::create("/tmp/test-gc-specific-1")?;
+        let s1 = create_session(&path, "/tmp/test-gc-specific-1")?;
         let id1 = s1.info.id.clone();
-        let s2 = Session::create("/tmp/test-gc-specific-2")?;
+        let s2 = create_session(&path, "/tmp/test-gc-specific-2")?;
         let id2 = s2.info.id.clone();
         drop(s1);
         drop(s2);
 
         // Delete only s1
-        run_gc(None, false, Some(&id1))?;
+        run_gc(&conn, None, false, Some(&id1))?;
 
         assert!(
-            session::get_session(&id1)?.is_none(),
+            session::get_session_with_conn(&conn, &id1)?.is_none(),
             "targeted session should be deleted"
         );
         assert!(
-            session::get_session(&id2)?.is_some(),
+            session::get_session_with_conn(&conn, &id2)?.is_some(),
             "other session should survive"
         );
 
-        session::delete_session_data(&id2)?;
+        session::delete_session_data_with_conn(&conn, &id2)?;
         Ok(())
     }
 
     #[test]
     fn test_gc_no_flags_is_noop() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
         // Should not error
-        run_gc(None, false, None)?;
+        run_gc(&conn, None, false, None)?;
         Ok(())
     }
 

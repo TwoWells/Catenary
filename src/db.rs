@@ -14,15 +14,28 @@ use rusqlite::Connection;
 /// Current schema version. Bump when adding migrations.
 const SCHEMA_VERSION: u32 = 1;
 
+/// Resolve the Catenary state directory.
+///
+/// Resolution order:
+/// 1. `CATENARY_STATE_DIR` environment variable (cross-platform override).
+/// 2. `dirs::state_dir()` (`XDG_STATE_HOME` on Linux).
+/// 3. `dirs::data_local_dir()` (macOS / Windows fallback).
+/// 4. `/tmp` as a last resort.
+#[must_use]
+pub fn state_dir() -> PathBuf {
+    std::env::var_os("CATENARY_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::state_dir)
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// Returns the path to the Catenary database file.
 ///
-/// Uses the same directory resolution as [`crate::session::sessions_dir`]:
-/// `dirs::state_dir()` with fallback to `dirs::data_local_dir()` or `/tmp`.
+/// Uses [`state_dir`] for the base directory.
+#[must_use]
 pub fn db_path() -> PathBuf {
-    let state_dir = dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    state_dir.join("catenary").join("catenary.db")
+    state_dir().join("catenary").join("catenary.db")
 }
 
 /// Opens a connection to the Catenary database with standard pragmas.
