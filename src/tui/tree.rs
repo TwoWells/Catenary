@@ -26,6 +26,9 @@ pub struct WorkspaceNode {
     pub collapsed: bool,
     /// True if any child session is alive.
     pub has_active: bool,
+    /// If this node is a group of merged single-session workspaces,
+    /// the number of original workspace paths. `None` for regular nodes.
+    pub grouped_count: Option<usize>,
 }
 
 /// A single visible item in the flattened tree.
@@ -80,8 +83,10 @@ impl SessionTree {
     /// way (active-first based on whether any child is active, then by most
     /// recent session).
     #[must_use]
+    #[allow(clippy::too_many_lines, reason = "grouping logic is sequential")]
     pub fn from_sessions(sessions: Vec<SessionRow>) -> Self {
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, HashMap};
+        use std::path::Path;
 
         // Group by workspace path, preserving insertion order via BTreeMap.
         let mut groups: BTreeMap<String, Vec<SessionRow>> = BTreeMap::new();
@@ -92,24 +97,100 @@ impl SessionTree {
                 .push(row);
         }
 
-        let mut workspaces: Vec<WorkspaceNode> = groups
-            .into_iter()
-            .map(|(path, mut sessions)| {
-                // Sort within workspace: active first, then reverse chronological.
+        // Partition into single-session and multi-session groups.
+        let mut multi_session: Vec<(String, Vec<SessionRow>)> = Vec::new();
+        let mut single_session: Vec<(String, SessionRow)> = Vec::new();
+        for (path, rows) in groups {
+            if rows.len() == 1 {
+                // Safe: we just checked len() == 1.
+                let row = rows.into_iter().next();
+                if let Some(r) = row {
+                    single_session.push((path, r));
+                }
+            } else {
+                multi_session.push((path, rows));
+            }
+        }
+
+        // Group single-session workspaces by parent directory.
+        let mut parent_groups: HashMap<String, Vec<(String, SessionRow)>> = HashMap::new();
+        let mut no_parent: Vec<(String, SessionRow)> = Vec::new();
+        for entry in single_session {
+            if let Some(parent) = Path::new(&entry.0).parent().and_then(|p| p.to_str()) {
+                parent_groups
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(entry);
+            } else {
+                no_parent.push(entry);
+            }
+        }
+
+        // Build workspace nodes.
+        let mut workspaces: Vec<WorkspaceNode> = Vec::new();
+
+        // Multi-session workspaces stay individual.
+        for (path, mut sessions) in multi_session {
+            sessions.sort_by(|a, b| {
+                b.alive
+                    .cmp(&a.alive)
+                    .then_with(|| b.info.started_at.cmp(&a.info.started_at))
+            });
+            let has_active = sessions.iter().any(|s| s.alive);
+            workspaces.push(WorkspaceNode {
+                path,
+                sessions,
+                collapsed: false,
+                has_active,
+                grouped_count: None,
+            });
+        }
+
+        // Merge single-session groups with > 2 siblings under same parent.
+        for (parent_path, children) in parent_groups {
+            if children.len() > 2 {
+                let count = children.len();
+                let mut sessions: Vec<SessionRow> =
+                    children.into_iter().map(|(_, row)| row).collect();
                 sessions.sort_by(|a, b| {
                     b.alive
                         .cmp(&a.alive)
                         .then_with(|| b.info.started_at.cmp(&a.info.started_at))
                 });
                 let has_active = sessions.iter().any(|s| s.alive);
-                WorkspaceNode {
-                    path,
+                workspaces.push(WorkspaceNode {
+                    path: parent_path,
                     sessions,
                     collapsed: false,
                     has_active,
+                    grouped_count: Some(count),
+                });
+            } else {
+                // <= 2 siblings: keep as individual nodes.
+                for (path, row) in children {
+                    let has_active = row.alive;
+                    workspaces.push(WorkspaceNode {
+                        path,
+                        sessions: vec![row],
+                        collapsed: false,
+                        has_active,
+                        grouped_count: None,
+                    });
                 }
-            })
-            .collect();
+            }
+        }
+
+        // Orphan single-session workspaces (no parent).
+        for (path, row) in no_parent {
+            let has_active = row.alive;
+            workspaces.push(WorkspaceNode {
+                path,
+                sessions: vec![row],
+                collapsed: false,
+                has_active,
+                grouped_count: None,
+            });
+        }
 
         // Sort workspaces: active-first, then by most recent session.
         workspaces.sort_by(|a, b| {
@@ -382,6 +463,9 @@ pub fn render_tree(
                     theme.session_dead
                 };
                 let path = format_workspace_path(&node.path, max_width.saturating_sub(4));
+                let label = node
+                    .grouped_count
+                    .map_or_else(|| path.to_string(), |n| format!("{path} ({n} sessions)"));
                 Line::from(vec![
                     Span::styled(
                         collapse_icon,
@@ -392,7 +476,7 @@ pub fn render_tree(
                         },
                     ),
                     Span::styled(status_icon, icon_style),
-                    Span::styled(path.to_string(), theme.text),
+                    Span::styled(label, theme.text),
                 ])
             }
             TreeItem::Session { row, .. } => {
@@ -708,6 +792,99 @@ mod tests {
 
         assert!(content.contains("Keys"), "expected cheatsheet separator");
         assert!(content.contains("navigate"), "expected cheatsheet content");
+    }
+
+    #[test]
+    fn test_tree_groups_sibling_single_session_workspaces() {
+        // 4 single-session workspaces under /tmp/parent → merged (> 2).
+        let sessions = vec![
+            make_session("aaa11111", "/tmp/parent/.tmpA", true, 1),
+            make_session("bbb22222", "/tmp/parent/.tmpB", false, 2),
+            make_session("ccc33333", "/tmp/parent/.tmpC", false, 3),
+            make_session("ddd44444", "/tmp/parent/.tmpD", false, 4),
+        ];
+        let tree = SessionTree::from_sessions(sessions);
+        assert_eq!(tree.workspaces.len(), 1, "should merge into one group node");
+        let ws = &tree.workspaces[0];
+        assert_eq!(ws.path, "/tmp/parent");
+        assert_eq!(ws.sessions.len(), 4);
+        assert_eq!(ws.grouped_count, Some(4));
+        assert!(ws.has_active, "group has one active session");
+    }
+
+    #[test]
+    fn test_tree_no_grouping_at_threshold() {
+        // 2 single-session workspaces under same parent → NOT merged (threshold > 2).
+        let sessions = vec![
+            make_session("aaa11111", "/tmp/parent/.tmpA", true, 1),
+            make_session("bbb22222", "/tmp/parent/.tmpB", false, 2),
+        ];
+        let tree = SessionTree::from_sessions(sessions);
+        assert_eq!(tree.workspaces.len(), 2, "should not merge with only 2");
+        assert!(
+            tree.workspaces.iter().all(|w| w.grouped_count.is_none()),
+            "neither should be a group"
+        );
+    }
+
+    #[test]
+    fn test_tree_grouping_preserves_multi_session_workspaces() {
+        // Multi-session workspace stays individual even if siblings group.
+        let sessions = vec![
+            make_session("aaa11111", "/tmp/parent/.tmpA", false, 1),
+            make_session("bbb22222", "/tmp/parent/.tmpB", false, 2),
+            make_session("ccc33333", "/tmp/parent/.tmpC", false, 3),
+            // Multi-session workspace under same parent.
+            make_session("ddd44444", "/tmp/parent/.tmpD", false, 4),
+            make_session("eee55555", "/tmp/parent/.tmpD", true, 5),
+        ];
+        let tree = SessionTree::from_sessions(sessions);
+        // .tmpD has 2 sessions → stays individual. A/B/C are single → merged.
+        assert_eq!(tree.workspaces.len(), 2);
+        let group = tree
+            .workspaces
+            .iter()
+            .find(|w| w.grouped_count.is_some())
+            .expect("should have a group node");
+        assert_eq!(group.path, "/tmp/parent");
+        assert_eq!(group.sessions.len(), 3);
+        assert_eq!(group.grouped_count, Some(3));
+        let individual = tree
+            .workspaces
+            .iter()
+            .find(|w| w.grouped_count.is_none())
+            .expect("should have an individual node");
+        assert_eq!(individual.path, "/tmp/parent/.tmpD");
+        assert_eq!(individual.sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_tree_render_grouped_node() {
+        let sessions = vec![
+            make_session("aaa11111", "/tmp/parent/.tmpA", true, 1),
+            make_session("bbb22222", "/tmp/parent/.tmpB", false, 2),
+            make_session("ccc33333", "/tmp/parent/.tmpC", false, 3),
+        ];
+        let tree = SessionTree::from_sessions(sessions);
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains("(3 sessions)"),
+            "expected group count in label, got:\n{content}"
+        );
     }
 
     /// Convert a ratatui buffer to a single string for assertion matching.
