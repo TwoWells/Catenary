@@ -293,6 +293,10 @@ impl NotifyServer {
 
         let diagnostics = client.get_diagnostics(&uri).await;
 
+        // Extract filter context before dropping the client lock
+        let server_command = client.server_command().to_string();
+        let server_version = client.server_version().map(str::to_string);
+
         // Collect quick-fix code actions for each diagnostic
         let fixes =
             if !diagnostics.is_empty() && client.capabilities().code_action_provider.is_some() {
@@ -304,11 +308,52 @@ impl NotifyServer {
 
         drop(client);
 
+        // Apply severity threshold from config
+        let min_severity = self
+            .client_manager
+            .config()
+            .server
+            .get(&lang_id)
+            .and_then(|sc| sc.min_severity.as_deref())
+            .and_then(crate::filter::parse_severity);
+
+        let (diagnostics, fixes) = if let Some(threshold) = min_severity {
+            let mut filtered_diags = Vec::new();
+            let mut filtered_fixes = Vec::new();
+            for (diag, fix) in diagnostics
+                .into_iter()
+                .zip(fixes.into_iter().chain(std::iter::repeat_with(Vec::new)))
+            {
+                if let Some(sev) = diag.severity {
+                    if crate::filter::severity_passes(sev, threshold) {
+                        filtered_diags.push(diag);
+                        filtered_fixes.push(fix);
+                    }
+                } else {
+                    // No severity = pass through
+                    filtered_diags.push(diag);
+                    filtered_fixes.push(fix);
+                }
+            }
+            (filtered_diags, filtered_fixes)
+        } else {
+            (diagnostics, fixes)
+        };
+
+        let filter = crate::filter::get_filter(&server_command);
+
         let count = diagnostics.len();
         let compact = if diagnostics.is_empty() {
             String::new()
         } else {
-            format_diagnostics_compact(&diagnostics, &fixes)
+            format_diagnostics_compact(
+                &diagnostics,
+                &fixes,
+                filter,
+                &server_command,
+                server_version.as_deref(),
+                &lang_id,
+            )
         };
 
         // Broadcast diagnostics event for monitor visibility
@@ -539,14 +584,21 @@ async fn collect_quick_fixes(
 /// `fixes` is parallel to `diagnostics` — each entry contains the titles of
 /// quick-fix code actions for that diagnostic. Pass an empty slice when no
 /// fixes were collected.
+///
+/// Messages are passed through the provided [`DiagnosticFilter`] for noise
+/// stripping. Diagnostics whose filtered message is empty are dropped.
 pub(crate) fn format_diagnostics_compact(
     diagnostics: &[Diagnostic],
     fixes: &[Vec<String>],
+    filter: &dyn crate::filter::DiagnosticFilter,
+    server_command: &str,
+    server_version: Option<&str>,
+    language_id: &str,
 ) -> String {
     diagnostics
         .iter()
         .enumerate()
-        .map(|(i, d)| {
+        .filter_map(|(i, d)| {
             let severity = match d.severity {
                 Some(lsp_types::DiagnosticSeverity::ERROR) => "error",
                 Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
@@ -566,7 +618,21 @@ pub(crate) fn format_diagnostics_compact(
                 })
                 .unwrap_or_default();
 
-            let message = strip_diagnostic_noise(&d.message);
+            let diag_code = d.code.as_ref().map(crate::filter::DiagnosticCode::from_lsp);
+            let message = filter.filter_message(
+                server_command,
+                server_version,
+                d.source.as_deref(),
+                diag_code.as_ref(),
+                d.severity.unwrap_or(lsp_types::DiagnosticSeverity::WARNING),
+                language_id,
+                &d.message,
+            );
+
+            // Empty message means the filter wants to drop this diagnostic
+            if message.is_empty() {
+                return None;
+            }
 
             let mut result = if code.is_empty() {
                 format!("  {line}:{col} [{severity}] {source}: {message}")
@@ -582,42 +648,8 @@ pub(crate) fn format_diagnostics_compact(
                 }
             }
 
-            result
+            Some(result)
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Strip well-known noise suffixes from diagnostic messages.
-///
-/// Removes trailing lines that are redundant boilerplate from specific
-/// linters. Currently handles:
-/// - Clippy/rustc: `"for further information visit https://..."` URLs
-/// - Clippy/rustc: `` "`#[warn(...)]` on by default" `` and similar
-///   `#[deny]`/`#[allow]`/`#[forbid]` attribution lines
-///
-/// Other LSP servers' multi-line messages are left intact.
-fn strip_diagnostic_noise(message: &str) -> String {
-    message
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            // Clippy "for further information visit ..." URL lines.
-            if trimmed.starts_with("for further information visit") {
-                return false;
-            }
-            // Rustc/clippy lint attribution: "`#[warn(...)]` on by default" etc.
-            if trimmed.starts_with("`#[")
-                && (trimmed.contains("on by default")
-                    || trimmed.contains("implied by")
-                    || trimmed.contains("to override"))
-            {
-                return false;
-            }
-            true
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_end()
-        .to_string()
 }

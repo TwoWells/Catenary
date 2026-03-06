@@ -34,6 +34,11 @@ impl ClientManager {
         }
     }
 
+    /// Returns a reference to the configuration.
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// Spawns LSP servers for languages detected in the workspace.
     ///
     /// Scans workspace roots for file types, matches against configured
@@ -562,6 +567,7 @@ mod tests {
                 command: bin.to_string_lossy().to_string(),
                 args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
+                min_severity: None,
             },
         );
         Config {
@@ -582,6 +588,7 @@ mod tests {
                 command: bin.to_string_lossy().to_string(),
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 initialization_options: None,
+                min_severity: None,
             },
         );
         Config {

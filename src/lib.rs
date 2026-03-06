@@ -14,6 +14,8 @@ pub mod cli;
 pub mod config;
 /// SQLite database connection management, schema creation, and migrations.
 pub mod db;
+/// Diagnostic noise filtering for LSP server output.
+pub mod filter;
 /// LSP client implementation and server management.
 pub mod lsp;
 /// MCP server implementation and type definitions.
