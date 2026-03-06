@@ -42,9 +42,10 @@ impl BridgeProcess {
             cmd.arg("--root").arg(root);
         }
 
-        // Isolate from user-level config
+        // Isolate from user-level config and state
         if let Some(first_root) = roots.first() {
             cmd.env("XDG_CONFIG_HOME", first_root);
+            cmd.env("XDG_STATE_HOME", first_root);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -40,10 +40,12 @@ fn test_config_loading() -> Result<()> {
 
     // Spawn catenary using ONLY the config file (no --lsp args)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    let state_dir = tempfile::tempdir()?;
     cmd.arg("--config").arg(config_path);
     cmd.arg("--root").arg(&root_dir);
-    // Isolate from user-level config
+    // Isolate from user-level config and state
     cmd.env("XDG_CONFIG_HOME", &root_dir);
+    cmd.env("CATENARY_STATE_DIR", state_dir.path());
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -130,12 +132,14 @@ fn test_config_override() -> Result<()> {
     // CLI also overrides idle_timeout to 10 (config has 60)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
+    let state_dir = tempfile::tempdir()?;
     cmd.arg("--lsp")
         .arg(format!("{MOCK_LANG_B}:{mockls_bin} {MOCK_LANG_B}"));
     cmd.arg("--idle-timeout").arg("10");
     cmd.arg("--root").arg(&root_dir);
-    // Isolate from user-level config
+    // Isolate from user-level config and state
     cmd.env("XDG_CONFIG_HOME", &root_dir);
+    cmd.env("CATENARY_STATE_DIR", state_dir.path());
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

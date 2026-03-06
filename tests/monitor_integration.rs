@@ -13,13 +13,19 @@
 //! broadcast by the server are readable as structured events.
 
 use anyhow::{Context, Result};
+use catenary_mcp::db;
 use catenary_mcp::session::{self, EventKind, Session};
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn test_monitor_raw_messages() -> Result<()> {
-    // Create a real session (writes events to the SQLite database)
-    let session = Session::create("/tmp/monitor-test")?;
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let db_path = dir.path().join("catenary").join("catenary.db");
+    let conn = db::open_and_migrate_at(&db_path)?;
+
+    let arc = Arc::new(Mutex::new(db::open_and_migrate_at(&db_path)?));
+    let session = Session::create_with_conn("/tmp/monitor-test", arc)?;
     let session_id = session.info.id.clone();
     let broadcaster = session.broadcaster();
 
@@ -43,8 +49,8 @@ fn test_monitor_raw_messages() -> Result<()> {
         }),
     });
 
-    // Read events back using the production monitor API
-    let events: Vec<_> = session::monitor_events(&session_id)?.collect();
+    // Read events back using the monitor API with the test connection
+    let events = session::monitor_events_with_conn(&conn, &session_id)?;
 
     // Find the incoming ping and outgoing result
     let found_in = events.iter().any(|e| {
