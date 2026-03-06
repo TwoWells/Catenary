@@ -66,6 +66,10 @@ pub struct SessionTree {
     pub workspaces: Vec<WorkspaceNode>,
     /// Cursor position in the flat visible list.
     pub cursor: usize,
+    /// Scroll offset (index of first visible item in the flat list).
+    pub scroll_offset: usize,
+    /// Last known viewport height (updated each render frame).
+    pub viewport_height: usize,
     /// Whether the cheatsheet is visible (toggled by `?`).
     pub show_cheatsheet: bool,
     /// Active visual selection, if any.
@@ -204,6 +208,8 @@ impl SessionTree {
         Self {
             workspaces,
             cursor: 0,
+            scroll_offset: 0,
+            viewport_height: 0,
             show_cheatsheet: false,
             visual_selection: None,
         }
@@ -245,6 +251,27 @@ impl SessionTree {
         let max = (count - 1) as isize;
         let new = (self.cursor as isize + delta).clamp(0, max);
         self.cursor = new as usize;
+        self.ensure_visible();
+    }
+
+    /// Adjust `scroll_offset` so the cursor is within the viewport.
+    pub fn ensure_visible(&mut self) {
+        let vh = if self.viewport_height > 0 {
+            self.viewport_height
+        } else {
+            return;
+        };
+        let count = self.visible_items().len();
+        // Clamp scroll_offset to valid range.
+        let max_offset = count.saturating_sub(vh);
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+        if self.cursor < self.scroll_offset {
+            self.scroll_offset = self.cursor;
+        } else if self.cursor >= self.scroll_offset + vh {
+            self.scroll_offset = self.cursor.saturating_sub(vh) + 1;
+        }
     }
 
     /// Identify the cursor target without borrowing `self` beyond the call.
@@ -306,6 +333,7 @@ impl SessionTree {
         for (i, _) in self.workspaces.iter().enumerate() {
             if i == wi {
                 self.cursor = flat_idx;
+                self.ensure_visible();
                 return;
             }
             flat_idx += 1;
@@ -323,6 +351,7 @@ impl SessionTree {
     pub fn expand_at_cursor(&mut self) {
         if let Some(CursorTarget::Workspace(wi)) = self.cursor_target() {
             self.workspaces[wi].collapsed = false;
+            self.ensure_visible();
         }
     }
 
@@ -383,6 +412,7 @@ fn format_age(started: chrono::DateTime<chrono::Utc>) -> String {
 /// - If focused, the border uses `theme.border_focused`; otherwise dim.
 /// - If `show_cheatsheet`, render the cheatsheet block below the tree
 ///   items, separated by `─── Keys ───`.
+/// - Right border column doubles as the scrollbar track.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
@@ -395,7 +425,6 @@ pub fn render_tree(
     theme: &Theme,
     icons: &IconSet,
     focused: bool,
-    has_grid: bool,
 ) {
     if area.width < 4 || area.height < 1 {
         return;
@@ -420,12 +449,8 @@ pub fn render_tree(
     };
 
     // Sessions has no left border per PLAN.md L44-45.
-    // When there's no Events grid, Sessions needs its own right border.
-    let borders = if has_grid {
-        ratatui::widgets::Borders::TOP
-    } else {
-        ratatui::widgets::Borders::TOP | ratatui::widgets::Borders::RIGHT
-    };
+    // Right border doubles as the scrollbar track.
+    let borders = ratatui::widgets::Borders::TOP | ratatui::widgets::Borders::RIGHT;
     let block = ratatui::widgets::Block::default()
         .borders(borders)
         .border_set(border_set)
@@ -440,11 +465,18 @@ pub fn render_tree(
 
     let items = tree.visible_items();
     let max_width = inner.width as usize;
+    let viewport = inner.height as usize;
     let mut y = inner.y;
     let y_max = inner.y + inner.height;
 
-    // Render tree items.
-    for (i, item) in items.iter().enumerate() {
+    // Render tree items respecting scroll offset.
+    let visible_end = (tree.scroll_offset + viewport).min(items.len());
+    for (i, item) in items
+        .iter()
+        .enumerate()
+        .take(visible_end)
+        .skip(tree.scroll_offset)
+    {
         if y >= y_max {
             break;
         }
@@ -480,7 +512,7 @@ pub fn render_tree(
                 ])
             }
             TreeItem::Session { row, .. } => {
-                let prefix = if i == tree.cursor { "  ▐ " } else { "    " };
+                let prefix = if is_cursor { "  ▐ " } else { "    " };
                 let id_short = if row.info.id.len() > 8 {
                     &row.info.id[..8]
                 } else {
@@ -493,7 +525,7 @@ pub fn render_tree(
                 } else {
                     theme.session_dead
                 };
-                let cursor_style = if i == tree.cursor {
+                let cursor_style = if is_cursor {
                     theme.selection
                 } else {
                     Style::default()
@@ -515,7 +547,7 @@ pub fn render_tree(
         y += 1;
     }
 
-    // Render cheatsheet if visible.
+    // Render cheatsheet if visible and there's space below the tree items.
     if tree.show_cheatsheet {
         if y >= y_max {
             return;
@@ -755,7 +787,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true, false);
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
             })
             .expect("draw");
 
@@ -783,7 +815,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true, false);
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
             })
             .expect("draw");
 
@@ -874,7 +906,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true, false);
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
             })
             .expect("draw");
 
@@ -884,6 +916,184 @@ mod tests {
         assert!(
             content.contains("(3 sessions)"),
             "expected group count in label, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_tree_scroll_on_navigate() {
+        // Create enough sessions to overflow a small viewport.
+        let sessions: Vec<SessionRow> = (0..20)
+            .map(|i| make_session(&format!("sess{i:04}"), &format!("/ws/proj{i}"), true, i + 1))
+            .collect();
+        let mut tree = SessionTree::from_sessions(sessions);
+        tree.viewport_height = 5;
+
+        // Cursor starts at 0, scroll_offset at 0.
+        assert_eq!(tree.cursor, 0);
+        assert_eq!(tree.scroll_offset, 0);
+
+        // Navigate down past viewport — scroll_offset should advance.
+        for _ in 0..6 {
+            tree.navigate(1);
+        }
+        assert_eq!(tree.cursor, 6);
+        assert!(
+            tree.scroll_offset > 0,
+            "scroll_offset should advance when cursor passes viewport"
+        );
+        assert!(
+            tree.cursor < tree.scroll_offset + tree.viewport_height,
+            "cursor should remain within visible window"
+        );
+
+        // Navigate back to top — scroll_offset should retreat.
+        for _ in 0..6 {
+            tree.navigate(-1);
+        }
+        assert_eq!(tree.cursor, 0);
+        assert_eq!(tree.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_tree_scroll_clamp_on_collapse() {
+        // Two workspaces with 5 sessions each = 12 visible items.
+        let mut sessions = Vec::new();
+        for i in 0..5 {
+            sessions.push(make_session(
+                &format!("aaa{i:05}"),
+                "/ws/alpha",
+                true,
+                i + 1,
+            ));
+        }
+        for i in 0..5 {
+            sessions.push(make_session(&format!("bbb{i:05}"), "/ws/beta", true, i + 1));
+        }
+        let mut tree = SessionTree::from_sessions(sessions);
+        tree.viewport_height = 5;
+
+        // Navigate to the end.
+        let count = tree.visible_items().len();
+        for _ in 0..count {
+            tree.navigate(1);
+        }
+        let old_offset = tree.scroll_offset;
+        assert!(old_offset > 0, "should have scrolled");
+
+        // Collapse the first workspace (cursor moves to it).
+        tree.cursor = 0;
+        tree.scroll_offset = 0;
+        #[allow(clippy::cast_possible_wrap, reason = "test value is small")]
+        tree.navigate((count - 1) as isize);
+        tree.collapse_at_cursor();
+
+        // After collapse, scroll_offset should be clamped to valid range.
+        let new_count = tree.visible_items().len();
+        let max_offset = new_count.saturating_sub(tree.viewport_height);
+        assert!(
+            tree.scroll_offset <= max_offset,
+            "scroll_offset {} should be <= max_offset {} after collapse",
+            tree.scroll_offset,
+            max_offset,
+        );
+    }
+
+    #[test]
+    fn test_tree_render_with_scroll_offset() {
+        // Create sessions that overflow a small viewport.
+        let sessions: Vec<SessionRow> = (0..10)
+            .map(|i| make_session(&format!("sess{i:04}"), &format!("/ws/proj{i}"), true, i + 1))
+            .collect();
+        let mut tree = SessionTree::from_sessions(sessions);
+        tree.viewport_height = 4;
+        tree.scroll_offset = 3;
+        tree.cursor = 3;
+
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+
+        // Height = 5 (1 title row + 4 content rows).
+        let backend = TestBackend::new(50, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        // Item at index 0 (sess0000) should NOT be visible.
+        assert!(
+            !content.contains("sess0000"),
+            "item at index 0 should be scrolled out of view, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_tree_render_scrollbar_when_overflow() {
+        use crate::tui::scrollbar::{ScrollMetrics, render_scrollbar};
+        use ratatui::layout::Rect;
+        use ratatui::style::Color;
+
+        // Create many sessions to ensure overflow.
+        let sessions: Vec<SessionRow> = (0..20)
+            .map(|i| make_session(&format!("sess{i:04}"), &format!("/ws/proj{i}"), true, i + 1))
+            .collect();
+        let mut tree = SessionTree::from_sessions(sessions);
+        let viewport_h = 5usize;
+        tree.viewport_height = viewport_h;
+
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+
+        // Height = 6 (1 title + 5 content).
+        let backend = TestBackend::new(50, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_tree(&tree, area, f.buffer_mut(), &theme, &icons, true);
+
+                // Render scrollbar on right border column (same as render.rs).
+                let visible_count = tree.visible_items().len();
+                let track_area = Rect::new(
+                    area.x + area.width.saturating_sub(1),
+                    area.y + 1,
+                    1,
+                    area.height.saturating_sub(1),
+                );
+                let metrics = ScrollMetrics {
+                    content_length: visible_count,
+                    viewport_length: viewport_h,
+                    position: tree.scroll_offset,
+                };
+                render_scrollbar(
+                    &metrics,
+                    track_area,
+                    f.buffer_mut(),
+                    Color::White,
+                    Color::DarkGray,
+                );
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+
+        // The right border column (x = 49) should contain scrollbar characters.
+        let right_col_x = 49u16;
+        let mut has_thumb = false;
+        for y in 1u16..6 {
+            let sym = buf[(right_col_x, y)].symbol();
+            if sym != " " && sym != "│" && sym != "┃" {
+                has_thumb = true;
+            }
+        }
+        assert!(
+            has_thumb,
+            "right border column should contain scrollbar thumb characters"
         );
     }
 

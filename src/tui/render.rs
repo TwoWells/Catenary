@@ -83,6 +83,10 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
 
     // Render sessions tree.
     if app.sessions_visible && tree_area.width > 0 && tree_area.height > 0 {
+        // Content area: inside top border (1 row) and right border (1 col).
+        let tree_content_height = tree_area.height.saturating_sub(1) as usize;
+        app.tree.viewport_height = tree_content_height;
+
         render_tree(
             &app.tree,
             tree_area,
@@ -90,12 +94,48 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
             app.theme,
             app.icons,
             app.focus == FocusedPane::Sessions,
-            !app.grid.panels.is_empty(),
         );
+
+        // Render scrollbar and overflow counts for the sessions tree.
+        let visible_count = app.tree.visible_items().len();
+        if visible_count > tree_content_height && tree_area.width > 0 {
+            let track_area = Rect::new(
+                tree_area.x + tree_area.width.saturating_sub(1),
+                tree_area.y + 1,
+                1,
+                tree_area.height.saturating_sub(1),
+            );
+            let metrics = ScrollMetrics {
+                content_length: visible_count,
+                viewport_length: tree_content_height,
+                position: app.tree.scroll_offset,
+            };
+            render_scrollbar(
+                &metrics,
+                track_area,
+                frame.buffer_mut(),
+                Color::White,
+                Color::DarkGray,
+            );
+
+            let content_area = Rect::new(
+                tree_area.x,
+                tree_area.y + 1,
+                tree_area.width.saturating_sub(1),
+                tree_area.height.saturating_sub(1),
+            );
+            let counts = compute_overflow(&metrics);
+            render_overflow_counts(
+                &counts,
+                content_area,
+                frame.buffer_mut(),
+                Style::default().fg(Color::DarkGray),
+            );
+        }
 
         // Render visual selection highlight on the sessions tree.
         if let Some(ref sel) = app.tree.visual_selection {
-            // Content area: inside the top border (1 row for title).
+            // Content area: inside the top border (1 row).
             let content_area = Rect::new(
                 tree_area.x,
                 tree_area.y + 1,
@@ -104,7 +144,7 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
             );
             render_selection_highlight(
                 sel,
-                0,
+                app.tree.scroll_offset,
                 frame.buffer_mut(),
                 content_area,
                 app.theme.selection,
