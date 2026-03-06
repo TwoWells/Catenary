@@ -411,6 +411,26 @@ fn refresh_sessions(app: &mut App<'_>) {
             }
         }
 
+        // Auto-close panels for dead sessions.
+        let dead_panel_indices: Vec<usize> = app
+            .grid
+            .panels
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !active_ids.contains(&p.session_id))
+            .map(|(i, _)| i)
+            .collect();
+        for idx in dead_panel_indices.into_iter().rev() {
+            let session_id = app.grid.panels.get(idx).map(|p| p.session_id.clone());
+            app.grid.close_panel(idx);
+            if let Some(id) = session_id {
+                app.tails.remove(&id);
+            }
+        }
+        if app.grid.panels.is_empty() && app.focus == FocusedPane::Events {
+            app.focus = FocusedPane::Sessions;
+        }
+
         // Auto-open panels for new active sessions.
         for id in &active_ids {
             if app.grid.panel_for_session(id).is_none() {
