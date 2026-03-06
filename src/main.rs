@@ -310,6 +310,7 @@ async fn run_server(args: Args) -> Result<()> {
                 command: program,
                 args: cmd_args,
                 initialization_options: None,
+                min_severity: None,
             },
         );
     }
@@ -1978,6 +1979,7 @@ async fn run_doctor(args: Args, nocolor: bool, show_diff: bool) -> Result<()> {
                 command: program,
                 args: cmd_args,
                 initialization_options: None,
+                min_severity: None,
             },
         );
     }

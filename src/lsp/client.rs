@@ -128,6 +128,12 @@ pub struct LspClient {
     /// Tracked separately because `lsp_types` 0.97 omits this field from
     /// `ServerCapabilities` despite it being in the LSP 3.17 spec.
     supports_type_hierarchy: bool,
+    /// The command used to spawn this server (e.g., "rust-analyzer").
+    server_command: String,
+    /// Server version from the `initialize` response (`ServerInfo.version`).
+    /// Populated after `initialize()` completes; `None` if the server
+    /// did not report a version.
+    server_version: Option<String>,
     /// Server capabilities from the `initialize` response.
     /// Populated after `initialize()` completes.
     server_capabilities: ServerCapabilities,
@@ -265,6 +271,8 @@ impl LspClient {
             monitor: std::sync::Mutex::new(monitor),
             wants_did_save: false,
             supports_type_hierarchy: false,
+            server_command: program.to_string(),
+            server_version: None,
             server_capabilities: ServerCapabilities::default(),
             _reader_handle: reader_handle,
             child,
@@ -919,7 +927,11 @@ impl LspClient {
             self.language, self.wants_did_save
         );
 
-        // Store server capabilities for capability gating
+        // Store server info and capabilities
+        self.server_version = result
+            .server_info
+            .as_ref()
+            .and_then(|si| si.version.clone());
         self.server_capabilities = result.capabilities.clone();
 
         // Send initialized notification
@@ -1564,6 +1576,16 @@ impl LspClient {
                 }
             }
         }
+    }
+
+    /// Returns the command used to spawn this server (e.g., "rust-analyzer").
+    pub fn server_command(&self) -> &str {
+        &self.server_command
+    }
+
+    /// Returns the server version from the LSP `initialize` response.
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
     }
 
     /// Returns the language identifier for this client (e.g., "rust", "python").

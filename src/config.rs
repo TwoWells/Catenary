@@ -45,6 +45,12 @@ pub struct ServerConfig {
     /// Initialization options to pass to the LSP server.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
+
+    /// Minimum diagnostic severity to deliver to agents.
+    /// Valid values: `"error"`, `"warning"`, `"information"`, `"hint"`.
+    /// When absent, all severities are delivered.
+    #[serde(default)]
+    pub min_severity: Option<String>,
 }
 
 /// Icon preset selecting a base set of icons.
