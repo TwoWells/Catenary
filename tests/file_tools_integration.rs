@@ -48,6 +48,29 @@ impl BridgeProcess {
         })
     }
 
+    fn spawn_with_real_lsp(lsp_arg: &str, root: &str) -> Result<Self> {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        cmd.arg("--lsp").arg(lsp_arg);
+        cmd.arg("--root").arg(root);
+        cmd.env("XDG_CONFIG_HOME", root);
+        cmd.env("XDG_STATE_HOME", root);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
+        let stdin = child.stdin.take().context("Failed to get stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+        })
+    }
+
     fn spawn_with_lsp(root: &str) -> Result<Self> {
         let bin = env!("CARGO_BIN_EXE_mockls");
         let lsp = format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}");
@@ -489,5 +512,188 @@ fn test_glob_pattern_detection() -> Result<()> {
         glob_text.contains(&format!("types.{MOCK_LANG_A}")),
         "Pattern mode should match files: {glob_text}"
     );
+    Ok(())
+}
+
+// ─── lua-language-server integration tests ──────────────────────────────
+
+/// Glob file outline with real lua-language-server.
+///
+/// Creates a `.lua` file with a module table and local functions,
+/// globs it as a file path, and checks that documentSymbol returns
+/// outline data without hanging.
+///
+/// Run with: `make test T=lua_glob_file_outline -- --ignored`
+/// Requires: lua-language-server on PATH.
+#[test]
+#[ignore = "requires lua-language-server"]
+fn test_lua_glob_file_outline() -> Result<()> {
+
+    let dir = tempfile::tempdir()?;
+    let lua_file = dir.path().join("helpers.lua");
+    std::fs::write(
+        &lua_file,
+        "local M = {}\n\n\
+         local MAX_RETRIES = 5\n\n\
+         function M.setup(opts)\n  \
+             M.opts = opts\n\
+         end\n\n\
+         function M.run()\n  \
+             return true\n\
+         end\n\n\
+         return M\n",
+    )?;
+
+    let mut bridge =
+        BridgeProcess::spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // lua-language-server needs a moment to start; poll until symbols appear
+    let mut text = String::new();
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_secs(1));
+
+        let result = bridge.call_tool_text(
+            "glob",
+            &json!({ "pattern": lua_file.to_str().context("file path")? }),
+        )?;
+
+        if result.contains('M') || result.contains("setup") || result.contains("MAX_RETRIES") {
+            text = result;
+            break;
+        }
+        text = result;
+    }
+
+    assert!(
+        text.contains("lines)"),
+        "Should show line count: {text}"
+    );
+
+    Ok(())
+}
+
+/// Glob pattern match across multiple lua files in subdirectories.
+///
+/// Mimics the chezmoi structure from `slow_glob.md` (`conky/lua/*.lua`).
+/// Tests that `**/*.lua` completes without stacking 30s timeouts.
+///
+/// Run with: `make test T=lua_glob_pattern -- --ignored`
+/// Requires: lua-language-server on PATH.
+#[test]
+#[ignore = "requires lua-language-server"]
+fn test_lua_glob_pattern() -> Result<()> {
+
+    let dir = tempfile::tempdir()?;
+
+    // Mimic the chezmoi conky structure
+    let lua_dir = dir.path().join("conky/lua");
+    std::fs::create_dir_all(&lua_dir)?;
+
+    std::fs::write(
+        lua_dir.join("main.lua"),
+        "local M = {}\nfunction M.init() end\nreturn M\n",
+    )?;
+    std::fs::write(
+        lua_dir.join("helpers.lua"),
+        "local H = {}\nfunction H.clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end\nreturn H\n",
+    )?;
+    std::fs::write(
+        lua_dir.join("draw.lua"),
+        "local D = {}\nfunction D.rect(x, y, w, h) end\nreturn D\n",
+    )?;
+    std::fs::write(
+        lua_dir.join("list.lua"),
+        "local L = {}\nfunction L.new() return {} end\nreturn L\n",
+    )?;
+
+    // Non-lua file that should not match
+    std::fs::write(dir.path().join("conky/conky.conf"), "-- config\n")?;
+
+    let mut bridge =
+        BridgeProcess::spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Give lua-language-server time to start
+    std::thread::sleep(Duration::from_secs(2));
+
+    let start = std::time::Instant::now();
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.lua" }))?;
+    let elapsed = start.elapsed();
+
+    assert!(text.contains("main.lua"), "Should match main.lua: {text}");
+    assert!(
+        text.contains("helpers.lua"),
+        "Should match helpers.lua: {text}"
+    );
+    assert!(text.contains("draw.lua"), "Should match draw.lua: {text}");
+    assert!(text.contains("list.lua"), "Should match list.lua: {text}");
+    assert!(
+        !text.contains("conky.conf"),
+        "Should not match conky.conf: {text}"
+    );
+
+    // If this takes >60s, something is seriously wrong (4 files should not
+    // take anywhere near the 120s seen in slow_glob.md)
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "Glob pattern took {elapsed:?} — possible stacked LSP timeouts"
+    );
+
+    Ok(())
+}
+
+/// Glob directory listing with mixed file types including lua.
+///
+/// Tests that lua files get outline symbols while non-lua files
+/// just get line counts.
+///
+/// Run with: `make test T=lua_glob_directory -- --ignored`
+/// Requires: lua-language-server on PATH.
+#[test]
+#[ignore = "requires lua-language-server"]
+fn test_lua_glob_directory() -> Result<()> {
+
+    let dir = tempfile::tempdir()?;
+
+    std::fs::write(
+        dir.path().join("init.lua"),
+        "local M = {}\nfunction M.setup() end\nreturn M\n",
+    )?;
+    std::fs::write(dir.path().join("config.json"), "{\"key\": \"value\"}\n")?;
+    std::fs::write(dir.path().join("notes.txt"), "some notes\n")?;
+
+    let mut bridge =
+        BridgeProcess::spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Give lua-language-server time to start
+    std::thread::sleep(Duration::from_secs(2));
+
+    let start = std::time::Instant::now();
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+    let elapsed = start.elapsed();
+
+    assert!(
+        text.contains("init.lua"),
+        "Should list init.lua: {text}"
+    );
+    assert!(
+        text.contains("config.json"),
+        "Should list config.json: {text}"
+    );
+    assert!(
+        text.contains("notes.txt"),
+        "Should list notes.txt: {text}"
+    );
+
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "Directory glob took {elapsed:?} — possible stacked LSP timeouts"
+    );
+
     Ok(())
 }
