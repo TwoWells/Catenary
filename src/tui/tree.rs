@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use super::data::SessionRow;
+use super::selection::VisualSelection;
 use super::theme::{IconSet, Theme};
 
 // ── Data types ──────────────────────────────────────────────────────────
@@ -64,6 +65,8 @@ pub struct SessionTree {
     pub cursor: usize,
     /// Whether the cheatsheet is visible (toggled by `?`).
     pub show_cheatsheet: bool,
+    /// Active visual selection, if any.
+    pub visual_selection: Option<VisualSelection>,
 }
 
 // ── Construction & navigation ───────────────────────────────────────────
@@ -121,6 +124,7 @@ impl SessionTree {
             workspaces,
             cursor: 0,
             show_cheatsheet: false,
+            visual_selection: None,
         }
     }
 

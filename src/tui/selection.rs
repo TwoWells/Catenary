@@ -16,7 +16,8 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use super::panel::{FlatLine, PanelState, detail_lines};
-use super::theme::format_event_plain;
+use super::theme::{format_ago, format_event_plain};
+use super::tree::{SessionTree, TreeItem};
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -127,6 +128,41 @@ pub fn yank_text(panel: &PanelState<'_>, selection: &VisualSelection) -> String 
     lines.join("\n")
 }
 
+/// Generate the clipboard text for a sessions tree selection.
+///
+/// For each visible item in the selection range:
+/// - `TreeItem::Workspace`: the workspace path.
+/// - `TreeItem::Session`: `"<id_short>  <client>  <status>  <age>"`.
+///
+/// Lines are separated by `\n`.
+#[must_use]
+pub fn yank_tree_text(tree: &SessionTree, selection: &VisualSelection) -> String {
+    let items = tree.visible_items();
+    let (start, end) = selection.range();
+    let mut lines: Vec<String> = Vec::with_capacity(end.saturating_sub(start) + 1);
+
+    for item in items.iter().skip(start).take(end - start + 1) {
+        match item {
+            TreeItem::Workspace { node, .. } => {
+                lines.push(node.path.clone());
+            }
+            TreeItem::Session { row, .. } => {
+                let id_short = if row.info.id.len() > 8 {
+                    &row.info.id[..8]
+                } else {
+                    &row.info.id
+                };
+                let client = row.info.client_name.as_deref().unwrap_or("unknown");
+                let status = if row.alive { "active" } else { "dead" };
+                let age = format_ago(row.info.started_at);
+                lines.push(format!("{id_short}  {client}  {status}  {age}"));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
 // ── Rendering ────────────────────────────────────────────────────────────
 
 /// Apply the highlight style to selected lines visible in the viewport.
@@ -221,10 +257,14 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
 
+    use chrono::{TimeDelta, Utc};
+
     use crate::config::IconConfig;
-    use crate::session::{EventKind, SessionEvent};
+    use crate::session::{EventKind, SessionEvent, SessionInfo};
+    use crate::tui::data::SessionRow;
     use crate::tui::panel::PanelState;
     use crate::tui::theme::{IconSet, Theme};
+    use crate::tui::tree::SessionTree;
 
     fn test_theme() -> Theme {
         Theme::new()
@@ -441,5 +481,70 @@ mod tests {
             result.is_ok(),
             "copy_to_clipboard should not error (even without clipboard tools)"
         );
+    }
+
+    fn make_session(id: &str, workspace: &str, alive: bool, mins_ago: i64) -> SessionRow {
+        SessionRow {
+            info: SessionInfo {
+                id: id.to_string(),
+                pid: 1234,
+                workspace: workspace.to_string(),
+                started_at: Utc::now() - TimeDelta::minutes(mins_ago),
+                client_name: Some("test-client".to_string()),
+                client_version: None,
+            },
+            alive,
+            languages: vec![],
+        }
+    }
+
+    #[test]
+    fn test_yank_tree_text_sessions() {
+        let sessions = vec![
+            make_session("aaa11111", "/ws/alpha", true, 5),
+            make_session("bbb22222", "/ws/alpha", false, 10),
+        ];
+        let tree = SessionTree::from_sessions(sessions);
+        // Visible items: [Workspace(/ws/alpha), Session(aaa11111), Session(bbb22222)]
+        // Select all three items (indices 0..=2).
+        let sel = {
+            let mut s = VisualSelection::new(0);
+            s.extend(2);
+            s
+        };
+        let text = yank_tree_text(&tree, &sel);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].contains("/ws/alpha"),
+            "first line should be workspace path"
+        );
+        assert!(
+            lines[1].contains("aaa11111"),
+            "second line should contain session ID"
+        );
+        assert!(
+            lines[1].contains("active"),
+            "active session should say 'active'"
+        );
+        assert!(
+            lines[2].contains("bbb22222"),
+            "third line should contain session ID"
+        );
+        assert!(lines[2].contains("dead"), "dead session should say 'dead'");
+        assert!(
+            lines[1].contains("test-client"),
+            "should include client name"
+        );
+    }
+
+    #[test]
+    fn test_yank_tree_text_workspace_only() {
+        let sessions = vec![make_session("aaa11111", "/ws/alpha", true, 5)];
+        let tree = SessionTree::from_sessions(sessions);
+        // Select only the workspace row (index 0).
+        let sel = VisualSelection::new(0);
+        let text = yank_tree_text(&tree, &sel);
+        assert_eq!(text, "/ws/alpha");
     }
 }
