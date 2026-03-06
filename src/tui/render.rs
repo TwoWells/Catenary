@@ -92,6 +92,24 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
             app.focus == FocusedPane::Sessions,
             !app.grid.panels.is_empty(),
         );
+
+        // Render visual selection highlight on the sessions tree.
+        if let Some(ref sel) = app.tree.visual_selection {
+            // Content area: inside the top border (1 row for title).
+            let content_area = Rect::new(
+                tree_area.x,
+                tree_area.y + 1,
+                tree_area.width,
+                tree_area.height.saturating_sub(1),
+            );
+            render_selection_highlight(
+                sel,
+                0,
+                frame.buffer_mut(),
+                content_area,
+                app.theme.selection,
+            );
+        }
     }
 
     // Compute grid layout.
@@ -280,11 +298,19 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
             app.input_mode = InputMode::FilterInput;
             true
         }
-        KeyCode::Char('v') if app.focus == FocusedPane::Events => {
+        KeyCode::Char('v') => {
             app.input_mode = InputMode::Visual;
-            // Start visual selection at the focused panel's cursor.
-            if let Some(panel) = app.grid.focused_panel_mut() {
-                panel.visual_selection = Some(super::selection::VisualSelection::new(panel.cursor));
+            match app.focus {
+                FocusedPane::Sessions => {
+                    app.tree.visual_selection =
+                        Some(super::selection::VisualSelection::new(app.tree.cursor));
+                }
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.visual_selection =
+                            Some(super::selection::VisualSelection::new(panel.cursor));
+                    }
+                }
             }
             true
         }
@@ -483,51 +509,80 @@ pub fn handle_key_visual(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
     use crossterm::event::KeyCode;
 
     match key.code {
-        KeyCode::Esc => {
-            // Cancel visual selection.
-            if let Some(panel) = app.grid.focused_panel_mut() {
-                panel.visual_selection = None;
-            }
-            app.input_mode = InputMode::Normal;
-            true
-        }
-        KeyCode::Char('v') => {
-            // Toggle off visual mode.
-            if let Some(panel) = app.grid.focused_panel_mut() {
-                panel.visual_selection = None;
+        KeyCode::Esc | KeyCode::Char('v') => {
+            // Cancel / toggle off visual selection.
+            match app.focus {
+                FocusedPane::Sessions => {
+                    app.tree.visual_selection = None;
+                }
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.visual_selection = None;
+                    }
+                }
             }
             app.input_mode = InputMode::Normal;
             true
         }
         KeyCode::Char('y') => {
             // Yank selection.
-            if let Some(panel) = app.grid.focused_panel()
-                && let Some(ref sel) = panel.visual_selection
-            {
-                let text = super::selection::yank_text(panel, sel);
-                let _ = super::selection::copy_to_clipboard(&text);
-            }
-            // Clear selection and exit visual mode.
-            if let Some(panel) = app.grid.focused_panel_mut() {
-                panel.visual_selection = None;
+            match app.focus {
+                FocusedPane::Sessions => {
+                    if let Some(ref sel) = app.tree.visual_selection {
+                        let text = super::selection::yank_tree_text(&app.tree, sel);
+                        let _ = super::selection::copy_to_clipboard(&text);
+                    }
+                    app.tree.visual_selection = None;
+                }
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel()
+                        && let Some(ref sel) = panel.visual_selection
+                    {
+                        let text = super::selection::yank_text(panel, sel);
+                        let _ = super::selection::copy_to_clipboard(&text);
+                    }
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.visual_selection = None;
+                    }
+                }
             }
             app.input_mode = InputMode::Normal;
             true
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if let Some(panel) = app.grid.focused_panel_mut() {
-                panel.navigate(1);
-                if let Some(ref mut sel) = panel.visual_selection {
-                    sel.extend(panel.cursor);
+            match app.focus {
+                FocusedPane::Sessions => {
+                    app.tree.navigate(1);
+                    if let Some(ref mut sel) = app.tree.visual_selection {
+                        sel.extend(app.tree.cursor);
+                    }
+                }
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.navigate(1);
+                        if let Some(ref mut sel) = panel.visual_selection {
+                            sel.extend(panel.cursor);
+                        }
+                    }
                 }
             }
             true
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if let Some(panel) = app.grid.focused_panel_mut() {
-                panel.navigate(-1);
-                if let Some(ref mut sel) = panel.visual_selection {
-                    sel.extend(panel.cursor);
+            match app.focus {
+                FocusedPane::Sessions => {
+                    app.tree.navigate(-1);
+                    if let Some(ref mut sel) = app.tree.visual_selection {
+                        sel.extend(app.tree.cursor);
+                    }
+                }
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.navigate(-1);
+                        if let Some(ref mut sel) = panel.visual_selection {
+                            sel.extend(panel.cursor);
+                        }
+                    }
                 }
             }
             true
