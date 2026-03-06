@@ -119,11 +119,9 @@ pub enum EventKind {
 }
 
 /// Returns the base directory for session runtime artifacts (notify sockets).
+#[must_use]
 pub fn sessions_dir() -> PathBuf {
-    let state_dir = dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    state_dir.join("catenary").join("sessions")
+    crate::db::state_dir().join("catenary").join("sessions")
 }
 
 /// An active session that broadcasts events.
@@ -132,6 +130,7 @@ pub struct Session {
     pub info: SessionInfo,
 
     conn: Arc<Mutex<Connection>>,
+    broadcaster: EventBroadcaster,
 
     /// Path to the notify IPC endpoint (if started).
     socket_path: Option<PathBuf>,
@@ -197,9 +196,17 @@ impl Session {
         std::fs::create_dir_all(&socket_dir)
             .with_context(|| format!("failed to create socket dir: {}", socket_dir.display()))?;
 
+        let broadcaster = EventBroadcaster {
+            inner: BroadcasterInner::Live {
+                conn: conn.clone(),
+                session_id: info.id.clone(),
+            },
+        };
+
         let session = Self {
             info,
             conn,
+            broadcaster,
             socket_path: None,
         };
 
@@ -267,29 +274,13 @@ impl Session {
         reason = "public API takes ownership by convention"
     )]
     pub fn broadcast(&self, kind: EventKind) {
-        let timestamp = Utc::now();
-        let kind_tag = event_kind_tag(&kind);
-
-        if let Ok(payload) = serde_json::to_string(&kind)
-            && let Ok(c) = self.conn.lock()
-        {
-            let _ = c.execute(
-                "INSERT INTO events (session_id, timestamp, kind, payload) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![&self.info.id, timestamp.to_rfc3339(), kind_tag, payload],
-            );
-        }
+        self.broadcaster.send(kind);
     }
 
     /// Get a broadcaster that can be cloned and shared.
     #[must_use]
     pub fn broadcaster(&self) -> EventBroadcaster {
-        EventBroadcaster {
-            inner: BroadcasterInner::Live {
-                conn: self.conn.clone(),
-                session_id: self.info.id.clone(),
-            },
-        }
+        self.broadcaster.clone()
     }
 }
 
@@ -424,15 +415,26 @@ struct SessionRow {
 
 /// List all sessions (active and inactive).
 ///
-/// Returns a list of sessions and their status (true = active, false = dead).
-/// Crashed sessions (PID gone but `alive` flag set) are marked dead in the DB.
+/// Opens a database connection internally. For explicit connection
+/// management, use [`list_sessions_with_conn`].
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queried.
 pub fn list_sessions() -> Result<Vec<(SessionInfo, bool)>> {
     let conn = crate::db::open_and_migrate()?;
+    list_sessions_with_conn(&conn)
+}
 
+/// List all sessions using an existing database connection.
+///
+/// Returns a list of sessions and their status (true = active, false = dead).
+/// Crashed sessions (PID gone but `alive` flag set) are marked dead in the DB.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<(SessionInfo, bool)>> {
     // Collect raw rows first to release the statement borrow.
     let rows = {
         let mut stmt = conn.prepare(
@@ -503,14 +505,25 @@ pub fn list_sessions() -> Result<Vec<(SessionInfo, bool)>> {
 
 /// Get a specific session by ID.
 ///
-/// Returns the session info and its status (true = active, false = dead).
+/// Opens a database connection internally. For explicit connection
+/// management, use [`get_session_with_conn`].
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queried.
 pub fn get_session(id: &str) -> Result<Option<(SessionInfo, bool)>> {
     let conn = crate::db::open_and_migrate()?;
+    get_session_with_conn(&conn, id)
+}
 
+/// Get a specific session by ID using an existing database connection.
+///
+/// Returns the session info and its status (true = active, false = dead).
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn get_session_with_conn(conn: &Connection, id: &str) -> Result<Option<(SessionInfo, bool)>> {
     let result = conn.query_row(
         "SELECT id, pid, display_name, client_name, client_version, started_at, alive \
          FROM sessions WHERE id = ?1",
@@ -567,12 +580,25 @@ pub fn get_session(id: &str) -> Result<Option<(SessionInfo, bool)>> {
 
 /// Monitor events from a session (returns all historical events).
 ///
+/// Opens a database connection internally. For explicit connection
+/// management, use [`monitor_events_with_conn`].
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queried.
-pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
+pub fn monitor_events(id: &str) -> Result<Vec<SessionEvent>> {
     let conn = crate::db::open_and_migrate()?;
+    monitor_events_with_conn(&conn, id)
+}
 
+/// Monitor events from a session using an existing database connection.
+///
+/// Returns all historical events for the given session.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn monitor_events_with_conn(conn: &Connection, id: &str) -> Result<Vec<SessionEvent>> {
     let mut stmt =
         conn.prepare("SELECT timestamp, payload FROM events WHERE session_id = ?1 ORDER BY id")?;
     let mut rows = stmt.query([id])?;
@@ -592,17 +618,30 @@ pub fn monitor_events(id: &str) -> Result<impl Iterator<Item = SessionEvent>> {
         }
     }
 
-    Ok(events.into_iter())
+    Ok(events)
 }
 
 /// Tail events from a session (follows new events from the beginning).
+///
+/// Opens a database connection internally. For explicit connection
+/// management, use [`tail_events_with_conn`].
 ///
 /// # Errors
 ///
 /// Returns an error if the session does not exist or the database cannot be opened.
 pub fn tail_events(id: &str) -> Result<SqliteEventTail> {
-    // Verify session exists
     let conn = crate::db::open()?;
+    tail_events_with_conn(conn, id)
+}
+
+/// Tail events from a session using an existing database connection.
+///
+/// The connection is moved into the returned [`SqliteEventTail`] for polling.
+///
+/// # Errors
+///
+/// Returns an error if the session does not exist.
+pub fn tail_events_with_conn(conn: Connection, id: &str) -> Result<SqliteEventTail> {
     let exists: bool = conn
         .query_row(
             "SELECT COUNT(*) > 0 FROM sessions WHERE id = ?1",
@@ -627,12 +666,25 @@ pub fn tail_events(id: &str) -> Result<SqliteEventTail> {
 /// Use this when historical events have already been loaded separately
 /// and you only want events written after this call.
 ///
+/// Opens a database connection internally. For explicit connection
+/// management, use [`tail_events_new_with_conn`].
+///
 /// # Errors
 ///
 /// Returns an error if the session does not exist or the database cannot be opened.
 pub fn tail_events_new(id: &str) -> Result<SqliteEventTail> {
     let conn = crate::db::open()?;
+    tail_events_new_with_conn(conn, id)
+}
 
+/// Tail only *new* events from a session using an existing database connection.
+///
+/// The connection is moved into the returned [`SqliteEventTail`] for polling.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn tail_events_new_with_conn(conn: Connection, id: &str) -> Result<SqliteEventTail> {
     let last_id: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?1",
@@ -650,13 +702,24 @@ pub fn tail_events_new(id: &str) -> Result<SqliteEventTail> {
 
 /// Get active languages for a session by reading its events.
 ///
+/// Opens a database connection internally. For explicit connection
+/// management, use [`active_languages_with_conn`].
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queried.
 pub fn active_languages(id: &str) -> Result<Vec<String>> {
-    use std::collections::HashMap;
-
     let conn = crate::db::open_and_migrate()?;
+    active_languages_with_conn(&conn, id)
+}
+
+/// Get active languages for a session using an existing database connection.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn active_languages_with_conn(conn: &Connection, id: &str) -> Result<Vec<String>> {
+    use std::collections::HashMap;
 
     let mut stmt = conn.prepare(
         "SELECT payload FROM events WHERE session_id = ?1 AND kind = 'server_state' ORDER BY id",
@@ -684,6 +747,23 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
 
 /// Remove dead sessions older than the configured retention period.
 ///
+/// Opens a database connection internally. For explicit connection
+/// management, use [`prune_sessions_with_conn`].
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or queried.
+pub fn prune_sessions(retention_days: i64) -> Result<usize> {
+    if retention_days < 0 {
+        return Ok(0);
+    }
+    let conn = crate::db::open_and_migrate()?;
+    prune_sessions_with_conn(&conn, retention_days)
+}
+
+/// Remove dead sessions older than the configured retention period
+/// using an existing database connection.
+///
 /// - `retention_days == -1`: retain forever (no-op).
 /// - `retention_days == 0`: remove all dead sessions regardless of age.
 /// - `retention_days > 0`: remove dead sessions whose `started_at` is older
@@ -694,13 +774,11 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened or queried.
-pub fn prune_sessions(retention_days: i64) -> Result<usize> {
+/// Returns an error if the database cannot be queried.
+pub fn prune_sessions_with_conn(conn: &Connection, retention_days: i64) -> Result<usize> {
     if retention_days < 0 {
         return Ok(0);
     }
-
-    let conn = crate::db::open_and_migrate()?;
 
     // Detect crashed sessions (alive in DB but PID gone).
     let crashed: Vec<String> = {
@@ -742,11 +820,24 @@ pub fn prune_sessions(retention_days: i64) -> Result<usize> {
 
 /// Delete a session and all its associated data.
 ///
+/// Opens a database connection internally. For explicit connection
+/// management, use [`delete_session_data_with_conn`].
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or the delete fails.
 pub fn delete_session_data(id: &str) -> Result<()> {
     let conn = crate::db::open_and_migrate()?;
+    delete_session_data_with_conn(&conn, id)
+}
+
+/// Delete a session and all its associated data using an existing database
+/// connection.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub fn delete_session_data_with_conn(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
 
     // Clean up socket directory if it exists.
@@ -812,18 +903,38 @@ pub fn is_process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use std::sync::Arc;
+
+    /// Open an isolated test database in a tempdir.
+    /// Returns `(TempDir, PathBuf, Connection)` — the tempdir guard must
+    /// be held for the lifetime of the connection.
+    fn test_db() -> (tempfile::TempDir, PathBuf, Connection) {
+        let dir = tempfile::tempdir().expect("failed to create tempdir for test DB");
+        let path = dir.path().join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&path).expect("failed to open test DB");
+        (dir, path, conn)
+    }
+
+    /// Create a session backed by the database at `db_path`.
+    fn create_session(db_path: &std::path::Path, workspace: &str) -> Result<Session> {
+        let arc = Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
+            db_path,
+        )?));
+        Session::create_with_conn(workspace, arc)
+    }
 
     #[test]
     fn test_session_create_and_list() -> Result<()> {
-        let session = Session::create("/tmp/test-workspace")?;
+        let (_dir, path, conn) = test_db();
+        let session = create_session(&path, "/tmp/test-workspace")?;
         let id = session.info.id.clone();
 
         // Should appear in list
-        let sessions = list_sessions()?;
+        let sessions = list_sessions_with_conn(&conn)?;
         assert!(sessions.iter().any(|(s, _)| s.id == id));
 
         // Should be retrievable
-        let found = get_session(&id)?;
+        let found = get_session_with_conn(&conn, &id)?;
         let (found_session, _) = found.expect("session should be retrievable");
         assert_eq!(found_session.workspace, "/tmp/test-workspace");
 
@@ -831,19 +942,20 @@ mod tests {
         drop(session);
 
         // get_session should still return it (as dead)
-        let found = get_session(&id)?;
+        let found = get_session_with_conn(&conn, &id)?;
         let (_, alive) = found.expect("session should exist after drop");
         assert!(!alive, "Session should be dead after drop");
 
         // Clean up
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
 
         Ok(())
     }
 
     #[test]
     fn test_event_broadcast() -> Result<()> {
-        let session = Session::create("/tmp/test-events")?;
+        let (_dir, path, conn) = test_db();
+        let session = create_session(&path, "/tmp/test-events")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -859,16 +971,17 @@ mod tests {
         });
 
         // Read events back (Started + 2 broadcast events = at least 3)
-        assert!(monitor_events(&id)?.count() >= 3);
+        assert!(monitor_events_with_conn(&conn, &id)?.len() >= 3);
 
         drop(session);
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
     fn test_event_broadcast_serialization() -> Result<()> {
-        let session = Session::create("/tmp/test-serialization")?;
+        let (_dir, path, conn) = test_db();
+        let session = create_session(&path, "/tmp/test-serialization")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ToolCall {
@@ -877,7 +990,7 @@ mod tests {
             params: None,
         });
 
-        let events: Vec<_> = monitor_events(&id)?.collect();
+        let events = monitor_events_with_conn(&conn, &id)?;
         let tool_call = events
             .iter()
             .find(|e| matches!(&e.kind, EventKind::ToolCall { .. }))
@@ -889,24 +1002,25 @@ mod tests {
         }
 
         drop(session);
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
     fn test_session_set_client_info() -> Result<()> {
-        let mut session = Session::create("/tmp/test-client-info")?;
+        let (_dir, path, conn) = test_db();
+        let mut session = create_session(&path, "/tmp/test-client-info")?;
         let id = session.info.id.clone();
 
         session.set_client_info("claude-code", "1.0.0");
 
-        let found = get_session(&id)?;
+        let found = get_session_with_conn(&conn, &id)?;
         let (info, _) = found.expect("session should exist");
         assert_eq!(info.client_name.as_deref(), Some("claude-code"));
         assert_eq!(info.client_version.as_deref(), Some("1.0.0"));
 
         drop(session);
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
@@ -924,20 +1038,22 @@ mod tests {
 
     #[test]
     fn test_active_languages_empty() -> Result<()> {
-        let session = Session::create("/tmp/test-langs-empty")?;
+        let (_dir, path, conn) = test_db();
+        let session = create_session(&path, "/tmp/test-langs-empty")?;
         let id = session.info.id.clone();
 
-        let langs = active_languages(&id)?;
+        let langs = active_languages_with_conn(&conn, &id)?;
         assert!(langs.is_empty());
 
         drop(session);
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
     fn test_active_languages_tracks_server_state() -> Result<()> {
-        let session = Session::create("/tmp/test-langs-state")?;
+        let (_dir, path, conn) = test_db();
+        let session = create_session(&path, "/tmp/test-langs-state")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -950,17 +1066,18 @@ mod tests {
             state: "Ready".to_string(),
         });
 
-        let langs = active_languages(&id)?;
+        let langs = active_languages_with_conn(&conn, &id)?;
         assert_eq!(langs, vec!["rust"]);
 
         drop(session);
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
     fn test_active_languages_removes_dead() -> Result<()> {
-        let session = Session::create("/tmp/test-langs-dead")?;
+        let (_dir, path, conn) = test_db();
+        let session = create_session(&path, "/tmp/test-langs-dead")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -973,17 +1090,18 @@ mod tests {
             state: "Dead".to_string(),
         });
 
-        let langs = active_languages(&id)?;
+        let langs = active_languages_with_conn(&conn, &id)?;
         assert!(langs.is_empty());
 
         drop(session);
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
     fn test_active_languages_multiple_languages() -> Result<()> {
-        let session = Session::create("/tmp/test-langs-multi")?;
+        let (_dir, path, conn) = test_db();
+        let session = create_session(&path, "/tmp/test-langs-multi")?;
         let id = session.info.id.clone();
 
         session.broadcast(EventKind::ServerState {
@@ -1001,23 +1119,27 @@ mod tests {
             state: "Initializing".to_string(),
         });
 
-        let langs = active_languages(&id)?;
+        let langs = active_languages_with_conn(&conn, &id)?;
         assert_eq!(langs, vec!["python", "rust", "typescript"]);
 
         drop(session);
-        delete_session_data(&id)?;
+        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     /// Helper: create a dead session, optionally backdated.
-    fn create_dead_session(workspace: &str, backdate_days: Option<i64>) -> Result<String> {
-        let session = Session::create(workspace)?;
+    fn create_dead_session(
+        db_path: &std::path::Path,
+        conn: &Connection,
+        workspace: &str,
+        backdate_days: Option<i64>,
+    ) -> Result<String> {
+        let session = create_session(db_path, workspace)?;
         let id = session.info.id.clone();
         drop(session);
 
         if let Some(days) = backdate_days {
             let new_start = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-            let conn = crate::db::open()?;
             conn.execute(
                 "UPDATE sessions SET started_at = ?1 WHERE id = ?2",
                 rusqlite::params![new_start, &id],
@@ -1032,36 +1154,37 @@ mod tests {
     /// shared database and parallel execution causes interference.
     #[test]
     fn test_prune_sessions() -> Result<()> {
+        let (_dir, path, conn) = test_db();
         // -- retention=-1 retains forever --
-        let id_forever = create_dead_session("/tmp/test-prune-forever", Some(365))?;
-        let removed = prune_sessions(-1)?;
+        let id_forever = create_dead_session(&path, &conn, "/tmp/test-prune-forever", Some(365))?;
+        let removed = prune_sessions_with_conn(&conn, -1)?;
         assert_eq!(removed, 0, "retention=-1 should never prune");
         assert!(
-            get_session(&id_forever)?.is_some(),
+            get_session_with_conn(&conn, &id_forever)?.is_some(),
             "session should still exist"
         );
-        delete_session_data(&id_forever)?;
+        delete_session_data_with_conn(&conn, &id_forever)?;
 
         // -- retention=7 keeps recent, removes old --
-        let id_recent = create_dead_session("/tmp/test-prune-recent", None)?;
-        let id_old = create_dead_session("/tmp/test-prune-old", Some(10))?;
+        let id_recent = create_dead_session(&path, &conn, "/tmp/test-prune-recent", None)?;
+        let id_old = create_dead_session(&path, &conn, "/tmp/test-prune-old", Some(10))?;
 
-        let _ = prune_sessions(7)?;
+        let _ = prune_sessions_with_conn(&conn, 7)?;
         assert!(
-            get_session(&id_recent)?.is_some(),
+            get_session_with_conn(&conn, &id_recent)?.is_some(),
             "recent dead session should survive prune"
         );
         assert!(
-            get_session(&id_old)?.is_none(),
+            get_session_with_conn(&conn, &id_old)?.is_none(),
             "old dead session should be pruned"
         );
-        delete_session_data(&id_recent)?;
+        delete_session_data_with_conn(&conn, &id_recent)?;
 
         // -- retention=0 removes all dead --
-        let id_zero = create_dead_session("/tmp/test-prune-zero", None)?;
-        let _ = prune_sessions(0)?;
+        let id_zero = create_dead_session(&path, &conn, "/tmp/test-prune-zero", None)?;
+        let _ = prune_sessions_with_conn(&conn, 0)?;
         assert!(
-            get_session(&id_zero)?.is_none(),
+            get_session_with_conn(&conn, &id_zero)?.is_none(),
             "dead session should be removed with retention=0"
         );
 
