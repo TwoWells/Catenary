@@ -753,7 +753,10 @@ impl LspClient {
         clippy::too_many_lines,
         reason = "Initialize handshake has many sequential steps"
     )]
-    #[allow(deprecated, reason = "root_uri is deprecated in LSP but servers like lua-language-server still require it")]
+    #[allow(
+        deprecated,
+        reason = "root_uri is deprecated in LSP but servers like lua-language-server still require it"
+    )]
     pub async fn initialize(
         &mut self,
         roots: &[PathBuf],

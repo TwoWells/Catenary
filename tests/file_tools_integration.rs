@@ -528,7 +528,6 @@ fn test_glob_pattern_detection() -> Result<()> {
 #[test]
 #[ignore = "requires lua-language-server"]
 fn test_lua_glob_file_outline() -> Result<()> {
-
     let dir = tempfile::tempdir()?;
     let lua_file = dir.path().join("helpers.lua");
     std::fs::write(
@@ -544,8 +543,10 @@ fn test_lua_glob_file_outline() -> Result<()> {
          return M\n",
     )?;
 
-    let mut bridge =
-        BridgeProcess::spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
+    let mut bridge = BridgeProcess::spawn_with_real_lsp(
+        "lua:lua-language-server",
+        &dir.path().to_string_lossy(),
+    )?;
     bridge.initialize()?;
 
     // lua-language-server needs a moment to start; poll until symbols appear
@@ -565,10 +566,7 @@ fn test_lua_glob_file_outline() -> Result<()> {
         text = result;
     }
 
-    assert!(
-        text.contains("lines)"),
-        "Should show line count: {text}"
-    );
+    assert!(text.contains("lines)"), "Should show line count: {text}");
 
     Ok(())
 }
@@ -583,7 +581,6 @@ fn test_lua_glob_file_outline() -> Result<()> {
 #[test]
 #[ignore = "requires lua-language-server"]
 fn test_lua_glob_pattern() -> Result<()> {
-
     let dir = tempfile::tempdir()?;
 
     // Mimic the chezmoi conky structure
@@ -610,8 +607,10 @@ fn test_lua_glob_pattern() -> Result<()> {
     // Non-lua file that should not match
     std::fs::write(dir.path().join("conky/conky.conf"), "-- config\n")?;
 
-    let mut bridge =
-        BridgeProcess::spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
+    let mut bridge = BridgeProcess::spawn_with_real_lsp(
+        "lua:lua-language-server",
+        &dir.path().to_string_lossy(),
+    )?;
     bridge.initialize()?;
 
     // Give lua-language-server time to start
@@ -653,7 +652,6 @@ fn test_lua_glob_pattern() -> Result<()> {
 #[test]
 #[ignore = "requires lua-language-server"]
 fn test_lua_glob_directory() -> Result<()> {
-
     let dir = tempfile::tempdir()?;
 
     std::fs::write(
@@ -663,8 +661,10 @@ fn test_lua_glob_directory() -> Result<()> {
     std::fs::write(dir.path().join("config.json"), "{\"key\": \"value\"}\n")?;
     std::fs::write(dir.path().join("notes.txt"), "some notes\n")?;
 
-    let mut bridge =
-        BridgeProcess::spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
+    let mut bridge = BridgeProcess::spawn_with_real_lsp(
+        "lua:lua-language-server",
+        &dir.path().to_string_lossy(),
+    )?;
     bridge.initialize()?;
 
     // Give lua-language-server time to start
@@ -677,18 +677,12 @@ fn test_lua_glob_directory() -> Result<()> {
     )?;
     let elapsed = start.elapsed();
 
-    assert!(
-        text.contains("init.lua"),
-        "Should list init.lua: {text}"
-    );
+    assert!(text.contains("init.lua"), "Should list init.lua: {text}");
     assert!(
         text.contains("config.json"),
         "Should list config.json: {text}"
     );
-    assert!(
-        text.contains("notes.txt"),
-        "Should list notes.txt: {text}"
-    );
+    assert!(text.contains("notes.txt"), "Should list notes.txt: {text}");
 
     assert!(
         elapsed < Duration::from_secs(60),
