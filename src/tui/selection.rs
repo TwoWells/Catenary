@@ -284,7 +284,7 @@ mod tests {
     fn diag_preview(entries: &[(&str, u32, &str)]) -> String {
         entries
             .iter()
-            .map(|(sev, line, msg)| format!("  {line}:1 [{sev}] rustc: {msg}"))
+            .map(|(sev, line, msg)| format!("\t:{line}:1 [{sev}] rustc: {msg}"))
             .collect::<Vec<_>>()
             .join("\n")
     }

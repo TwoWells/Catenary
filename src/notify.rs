@@ -54,6 +54,21 @@ enum NotifyRequest {
     },
 }
 
+/// IPC response from the notify server to the CLI.
+///
+/// Separates diagnostic content (for the model via `additionalContext`) from
+/// internal errors (for the user via `systemMessage`). The CLI deserializes
+/// this to decide where to route the output.
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyResult {
+    /// Diagnostic content for the model (may be `[clean]`, `[no language server]`,
+    /// `[diagnostics unavailable]`, or formatted diagnostic lines).
+    Content(String),
+    /// Internal error for the user (path resolution, LSP client failures, etc.).
+    Error(String),
+}
+
 /// Listens on an IPC endpoint (Unix socket or named pipe) for file-change
 /// notifications and returns LSP diagnostics.
 pub struct NotifyServer {
@@ -213,12 +228,17 @@ impl NotifyServer {
         Ok(())
     }
 
-    /// Processes a file change notification and returns diagnostics text.
+    /// Processes a file change notification and returns a [`NotifyResult`] as JSON.
     async fn process_file(&self, file_path: &str) -> String {
-        match self.process_file_inner(file_path).await {
-            Ok(diagnostics) => diagnostics,
-            Err(e) => format!("Notify error: {e}"),
-        }
+        let result = match self.process_file_inner(file_path).await {
+            Ok(content) => NotifyResult::Content(content),
+            Err(e) => {
+                warn!("Notify error for {file_path}: {e}");
+                NotifyResult::Error(e.to_string())
+            }
+        };
+        // Safe: NotifyResult serialization cannot fail (no non-string map keys, no floats).
+        serde_json::to_string(&result).unwrap_or_default()
     }
 
     /// Inner implementation that can return errors.
@@ -249,14 +269,14 @@ impl NotifyServer {
             .await
         {
             Ok(c) => c,
-            Err(_) => return Ok(String::new()), // No LSP server for this language
+            Err(_) => return Ok("[no language server]".into()),
         };
 
         let mut doc_manager = self.doc_manager.lock().await;
         let client = client_mutex.lock().await;
 
         if !client.is_alive() {
-            return Ok(String::new());
+            return Ok("[no language server]".into());
         }
 
         let uri = doc_manager.uri_for_path(&canonical)?;
@@ -285,7 +305,7 @@ impl NotifyServer {
             if client.wait_for_diagnostics_update(&uri, snapshot).await
                 == DiagnosticsWaitResult::Nothing
             {
-                return Ok(String::new());
+                return Ok("[diagnostics unavailable]".into());
             }
         } else {
             drop(doc_manager);
@@ -365,9 +385,9 @@ impl NotifyServer {
         });
 
         if diagnostics.is_empty() {
-            Ok(String::new())
+            Ok("[clean]".into())
         } else {
-            Ok(format!("Diagnostics ({count}):\n{compact}"))
+            Ok(compact)
         }
     }
 
@@ -635,16 +655,16 @@ pub(crate) fn format_diagnostics_compact(
             }
 
             let mut result = if code.is_empty() {
-                format!("  {line}:{col} [{severity}] {source}: {message}")
+                format!("\t:{line}:{col} [{severity}] {source}: {message}")
             } else {
-                format!("  {line}:{col} [{severity}] {source}({code}): {message}")
+                format!("\t:{line}:{col} [{severity}] {source}({code}): {message}")
             };
 
             // Append indented fix lines
             if let Some(fix_titles) = fixes.get(i) {
                 for title in fix_titles {
                     use std::fmt::Write;
-                    let _ = write!(result, "\n    fix: {title}");
+                    let _ = write!(result, "\n\t\tfix: {title}");
                 }
             }
 
@@ -652,4 +672,37 @@ pub(crate) fn format_diagnostics_compact(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_result_content_round_trip() {
+        let original = NotifyResult::Content("[clean]".into());
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: NotifyResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+
+        let raw: serde_json::Value = serde_json::from_str(&json).expect("parse as value");
+        assert_eq!(raw["content"], "[clean]");
+        assert!(raw.get("error").is_none());
+    }
+
+    #[test]
+    fn notify_result_error_round_trip() {
+        let original = NotifyResult::Error("path resolution failed".into());
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: NotifyResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+
+        let raw: serde_json::Value = serde_json::from_str(&json).expect("parse as value");
+        assert_eq!(raw["error"], "path resolution failed");
+        assert!(raw.get("content").is_none());
+    }
 }

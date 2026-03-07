@@ -1197,24 +1197,34 @@ fn ipc_exchange(
 ///
 /// Reads hook JSON from stdin, finds the session for the file's workspace,
 /// connects to the notify socket, and returns diagnostics for the model's
-/// context. Silently succeeds on any error to avoid breaking the host CLI's
-/// flow.
+/// context. Emits `systemMessage` JSON on infrastructure errors so the user
+/// sees failures in their terminal.
 fn run_notify(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        print!(
+            "{}",
+            format_error("Catenary: failed to read hook input", format)
+        );
         return;
     };
 
     let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        print!("{}", format_error("Catenary: invalid hook JSON", format));
         return;
     };
 
     let Some(file_path) = extract_file_path(&hook_json) else {
+        print!(
+            "{}",
+            format_error("Catenary: no file path in hook input", format)
+        );
         return;
     };
 
     // Notify session for diagnostics
     let abs_path = PathBuf::from(&file_path);
     let Ok(conn) = catenary_mcp::db::open_and_migrate() else {
+        print!("{}", format_error("Catenary: database unavailable", format));
         return;
     };
     let sessions = session::list_sessions_with_conn(&conn).unwrap_or_default();
@@ -1223,23 +1233,55 @@ fn run_notify(format: HostFormat) {
         .find(|(s, _)| abs_path.to_string_lossy().starts_with(&s.workspace));
 
     let Some((session, _)) = session else {
+        print!(
+            "{}",
+            format_error(
+                &format!("Catenary: no session for {}", abs_path.display()),
+                format,
+            )
+        );
         return;
     };
 
     let endpoint = notify_endpoint(&session.id);
     let Some(stream) = notify_connect(&endpoint) else {
+        print!(
+            "{}",
+            format_error(
+                &format!(
+                    "Catenary: notify socket unavailable for session {}",
+                    session.id
+                ),
+                format,
+            )
+        );
         return;
     };
 
     let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
     let lines = ipc_exchange(stream, &request);
 
-    if lines.is_empty() {
-        return;
-    }
+    // Deserialize NotifyResult from the first response line.
+    // Graceful degradation: if parsing fails (version skew), treat raw lines as content.
+    let result = lines
+        .first()
+        .and_then(|line| serde_json::from_str::<catenary_mcp::notify::NotifyResult>(line).ok())
+        .unwrap_or_else(|| catenary_mcp::notify::NotifyResult::Content(lines.join("\n")));
 
-    let output = format_diagnostics(&lines, format, "PostToolUse");
-    print!("{output}");
+    match result {
+        catenary_mcp::notify::NotifyResult::Content(content) => {
+            let filename = std::path::Path::new(&file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&file_path);
+            let full_content = format!("{filename}\n\t{content}");
+            let output = format_diagnostics(&full_content, format, "PostToolUse");
+            print!("{output}");
+        }
+        catenary_mcp::notify::NotifyResult::Error(msg) => {
+            print!("{}", format_error(&format!("Catenary: {msg}"), format));
+        }
+    }
 }
 
 /// Sync workspace roots from Claude Code transcript to a running Catenary session.
@@ -1424,7 +1466,8 @@ fn run_sync_roots(format: HostFormat) {
         return;
     }
 
-    let output = format_diagnostics(&lines, format, "PreToolUse");
+    let content = lines.join("\n");
+    let output = format_diagnostics(&content, format, "PreToolUse");
     print!("{output}");
 }
 
@@ -1466,29 +1509,48 @@ fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
     Some(abs_path.to_string_lossy().into_owned())
 }
 
-/// Format diagnostic lines for output.
+/// Format diagnostic content for the model via `additionalContext`.
 ///
-/// Both formats wrap diagnostics in a `hookSpecificOutput` JSON envelope
-/// so the host CLI can inject them into the model's context:
+/// Both formats wrap content in a `hookSpecificOutput` JSON envelope
+/// so the host CLI can inject it into the model's context:
 ///
-/// - Gemini: uses `additionalContext` for Gemini CLI `AfterTool` hooks.
-/// - Claude: includes `hookEventName` + `additionalContext` for Claude Code
-///   hooks (required by the Claude Code hook contract).
-fn format_diagnostics(lines: &[String], format: HostFormat, hook_event: &str) -> String {
-    let diagnostics = lines.join("\n");
-    // serde_json::to_string cannot fail on Value
+/// - Claude: includes `hookEventName` + `additionalContext` (required by
+///   the Claude Code hook contract).
+/// - Gemini: uses `additionalContext` only (no `hookEventName`).
+fn format_diagnostics(content: &str, format: HostFormat, hook_event: &str) -> String {
     match format {
         HostFormat::Gemini => serde_json::json!({
             "hookSpecificOutput": {
-                "additionalContext": format!("LSP Diagnostics:\n{diagnostics}")
+                "additionalContext": content
             }
         })
         .to_string(),
         HostFormat::Claude => serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": hook_event,
-                "additionalContext": diagnostics
+                "additionalContext": content
             }
+        })
+        .to_string(),
+    }
+}
+
+/// Format an internal error for the user via `systemMessage`.
+///
+/// The error is shown to the user in their terminal but not injected into
+/// the model's context — the model cannot act on internal Catenary failures.
+fn format_error(message: &str, format: HostFormat) -> String {
+    match format {
+        HostFormat::Claude => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+            },
+            "systemMessage": message
+        })
+        .to_string(),
+        HostFormat::Gemini => serde_json::json!({
+            "hookSpecificOutput": {},
+            "systemMessage": message
         })
         .to_string(),
     }
@@ -2453,6 +2515,10 @@ fn print_event(event: &SessionEvent) {
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
+#[allow(
+    clippy::similar_names,
+    reason = "content/context are distinct concepts in hook output tests"
+)]
 mod tests {
     use super::*;
     use anyhow::Context;
@@ -2475,11 +2541,8 @@ mod tests {
 
     #[test]
     fn test_format_diagnostics_claude() -> Result<()> {
-        let lines = vec![
-            "error[E0308]: mismatched types".into(),
-            "  --> src/main.rs:5:10".into(),
-        ];
-        let output = format_diagnostics(&lines, HostFormat::Claude, "PostToolUse");
+        let content = "error[E0308]: mismatched types\n  --> src/main.rs:5:10";
+        let output = format_diagnostics(content, HostFormat::Claude, "PostToolUse");
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("claude format should produce valid JSON")?;
 
@@ -2490,23 +2553,20 @@ mod tests {
             .expect("additionalContext should be a string");
         assert!(context.contains("error[E0308]: mismatched types"));
         assert!(context.contains("  --> src/main.rs:5:10"));
-        // Claude format should NOT have the "LSP Diagnostics:" prefix
-        assert!(!context.starts_with("LSP Diagnostics:"));
         Ok(())
     }
 
     #[test]
     fn test_format_diagnostics_gemini() -> Result<()> {
-        let lines = vec!["error[E0308]: mismatched types".into()];
-        let output = format_diagnostics(&lines, HostFormat::Gemini, "PostToolUse");
+        let content = "error[E0308]: mismatched types";
+        let output = format_diagnostics(content, HostFormat::Gemini, "PostToolUse");
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("gemini format should produce valid JSON")?;
 
         let context = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("additionalContext should be a string");
-        assert!(context.starts_with("LSP Diagnostics:\n"));
-        assert!(context.contains("error[E0308]: mismatched types"));
+        assert_eq!(context, content);
         // Gemini format should NOT have hookEventName
         assert!(parsed["hookSpecificOutput"]["hookEventName"].is_null());
         Ok(())
@@ -2514,8 +2574,8 @@ mod tests {
 
     #[test]
     fn test_format_diagnostics_gemini_multiline() -> Result<()> {
-        let lines = vec!["warning: unused variable".into(), "  --> lib.rs:3:9".into()];
-        let output = format_diagnostics(&lines, HostFormat::Gemini, "PostToolUse");
+        let content = "warning: unused variable\n  --> lib.rs:3:9";
+        let output = format_diagnostics(content, HostFormat::Gemini, "PostToolUse");
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
         let context = parsed["hookSpecificOutput"]["additionalContext"]
@@ -2527,12 +2587,36 @@ mod tests {
 
     #[test]
     fn test_format_diagnostics_claude_propagates_hook_event() -> Result<()> {
-        let lines = vec!["Added roots: /tmp/foo".into()];
-        let output = format_diagnostics(&lines, HostFormat::Claude, "PreToolUse");
+        let content = "Added roots: /tmp/foo";
+        let output = format_diagnostics(content, HostFormat::Claude, "PreToolUse");
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
 
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_error_claude() -> Result<()> {
+        let output = format_error("Catenary: database unavailable", HostFormat::Claude);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        assert_eq!(parsed["systemMessage"], "Catenary: database unavailable");
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert!(parsed["hookSpecificOutput"]["additionalContext"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_error_gemini() -> Result<()> {
+        let output = format_error("Catenary: database unavailable", HostFormat::Gemini);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+
+        assert_eq!(parsed["systemMessage"], "Catenary: database unavailable");
+        assert!(parsed["hookSpecificOutput"]["hookEventName"].is_null());
+        assert!(parsed["hookSpecificOutput"]["additionalContext"].is_null());
         Ok(())
     }
 

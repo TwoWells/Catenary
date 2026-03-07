@@ -206,7 +206,15 @@ impl BridgeProcess {
             .read_to_string(&mut response)
             .context("read from notify socket")?;
 
-        Ok(response.trim().to_string())
+        // Unwrap NotifyResult wire protocol — return the content string
+        let trimmed = response.trim();
+        serde_json::from_str::<catenary_mcp::notify::NotifyResult>(trimmed).map_or_else(
+            |_| Ok(trimmed.to_string()),
+            |result| match result {
+                catenary_mcp::notify::NotifyResult::Content(s) => Ok(s),
+                catenary_mcp::notify::NotifyResult::Error(e) => Ok(format!("Notify error: {e}")),
+            },
+        )
     }
 }
 
