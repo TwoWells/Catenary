@@ -105,6 +105,28 @@ pub struct IconConfig {
     pub pinned: Option<String>,
     /// Progress spinner frames (animated).
     pub progress: Option<String>,
+    /// Session started event icon.
+    pub session_started: Option<String>,
+    /// Session shutdown event icon.
+    pub session_shutdown: Option<String>,
+    /// Server state change event icon.
+    pub server_state: Option<String>,
+    /// Tool result arrow icon.
+    pub tool_result: Option<String>,
+    /// Tool result separator icon.
+    pub tool_result_sep: Option<String>,
+    /// Sed tool icon.
+    pub tool_sed: Option<String>,
+    /// Language server active icon.
+    pub ls_active: Option<String>,
+    /// Language server inactive icon.
+    pub ls_inactive: Option<String>,
+    /// Spinner grow phase frames (plays once at start).
+    pub spinner_grow: Option<Vec<String>>,
+    /// Spinner cycle phase frames (loops during progress).
+    pub spinner_cycle: Option<Vec<String>>,
+    /// Spinner done frame (shown on progress end).
+    pub spinner_done: Option<String>,
 }
 
 /// TUI configuration options.

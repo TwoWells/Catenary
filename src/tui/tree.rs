@@ -488,7 +488,11 @@ pub fn render_tree(
                 } else {
                     &icons.workspace_open
                 };
-                let status_icon = if node.has_active { "● " } else { "○ " };
+                let status_icon = if node.has_active {
+                    &icons.ls_active
+                } else {
+                    &icons.ls_inactive
+                };
                 let icon_style = if node.has_active {
                     theme.session_active
                 } else {
