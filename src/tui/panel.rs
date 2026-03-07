@@ -551,11 +551,11 @@ fn ls_status_style(state: &LsState) -> Style {
     }
 }
 
-/// Status icon character for a language server state.
-const fn ls_status_icon(state: &LsState) -> &'static str {
+/// Status icon for a language server state, resolved from the icon set.
+fn ls_status_icon<'a>(state: &LsState, icons: &'a IconSet) -> &'a str {
     match state {
-        LsState::NotLoaded => "\u{25CB} ", // ○
-        _ => "\u{25CF} ",                  // ●
+        LsState::NotLoaded => &icons.ls_inactive,
+        _ => &icons.ls_active,
     }
 }
 
@@ -578,7 +578,10 @@ fn build_title(state: &PanelState<'_>) -> Line<'static> {
                 spans.push(Span::raw(" \u{2571} ")); // ╱
             }
             let style = ls_status_style(&ls.state);
-            spans.push(Span::styled(ls_status_icon(&ls.state).to_string(), style));
+            spans.push(Span::styled(
+                ls_status_icon(&ls.state, state.icons).to_string(),
+                style,
+            ));
             spans.push(Span::styled(ls.name.clone(), style));
         }
     }
