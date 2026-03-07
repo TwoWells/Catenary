@@ -287,7 +287,10 @@ impl<H: ToolHandler> McpServer<H> {
                  Its search tools include all available LSP information \
                  and condense grep-equivalent results into a heatmap. \
                  Use list_directory for directory browsing. Post-edit LSP \
-                 diagnostics are provided automatically via the notify hook."
+                 diagnostics are provided automatically via the notify hook. \
+                 When multiple edits target the same file in one response, \
+                 only the final diagnostics per file are authoritative — \
+                 ignore intermediate results."
                     .to_string(),
             ),
         };
