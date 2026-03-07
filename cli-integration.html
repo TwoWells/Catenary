@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -216,147 +216,22 @@ maintaining a CLI.</p>
 </ul>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <h3 id="gemini-cli"><a class="header" href="#gemini-cli">Gemini CLI</a></h3>
-<p>Location: <code>~/.gemini/policies/</code> (user) or <code>.gemini/settings.json</code> (workspace)</p>
+<p>Location: <code>~/.gemini/settings.json</code> (user) or <code>.gemini/settings.json</code> (workspace)</p>
 <p><strong>Recommended: Extension + Constrained Mode.</strong></p>
 <ol>
 <li>
-<p><strong>Install the Extension:</strong> The Catenary extension provides
-<code>BeforeTool</code> / <code>AfterTool</code> hooks that run <code>catenary acquire</code> /
-<code>catenary release</code> around file operations. This ensures file locking
-and the model sees LSP diagnostics immediately.</p>
+<p><strong>Install the Extension:</strong> The Catenary extension provides an
+<code>AfterTool</code> hook that runs <code>catenary notify</code> after file operations,
+so the model sees LSP diagnostics immediately.</p>
 <pre><code class="language-bash">gemini extensions install https://github.com/MarkWells-Dev/Catenary
 </code></pre>
 </li>
 <li>
-<p><strong>Constrained mode.</strong> Use the Policy Engine to deny text-scanning commands while
-keeping Gemini’s native file I/O and shell tools available. Create the file
-<code>~/.gemini/policies/catenary-constrained.toml</code>:</p>
+<p><strong>Constrained mode.</strong> Use the <code>constrained_bash.py</code> hook to deny
+text-scanning commands while keeping Gemini’s native file I/O and
+shell tools available.</p>
 </li>
 </ol>
-<pre><code class="language-toml"># Catenary constrained mode — forces LSP-first navigation
-# Place in ~/.gemini/policies/catenary-constrained.toml
-
-# --- 1. Search (Grep Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "rg", "ag", "ack", "fd",
-  "grep", "egrep", "fgrep", "rgrep", "zgrep",
-  "git grep",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's search tool instead."
-
-# --- 2. Navigation (Listing Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "ls", "dir", "vdir", "tree", "find",
-  "locate", "mlocate", "whereis", "which",
-  "git ls-files", "git ls-tree",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-
-# --- 3. Peeking (Reading Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "cat", "head", "tail", "more", "less", "nl",
-  "od", "hexdump", "xxd", "strings", "dd", "tee",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use the native read_file tool instead."
-
-# --- 4. Text Processing (Scripting Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "awk", "sed", "perl",
-  "cut", "paste", "sort", "uniq", "join",
-]
-decision = "deny"
-priority = 900
-deny_message = "Text processing commands are not allowed in constrained mode."
-
-# --- 5. Reconnaissance (Metadata Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = ["file", "stat", "du", "df"]
-decision = "deny"
-priority = 900
-deny_message = "Metadata commands are not allowed in constrained mode."
-
-# --- 6. Executors &amp; Shells (The Wrapper Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "bash", "sh", "zsh", "dash", "fish",
-  "ash", "csh", "ksh", "tcsh",
-]
-decision = "deny"
-priority = 900
-deny_message = "Shell wrappers are not allowed in constrained mode."
-
-# --- 7. The Command Runners (Prevents Masquerading) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "env", "sudo", "su", "nohup", "timeout", "watch", "time",
-  "eval", "exec", "command", "builtin", "type", "hash",
-]
-decision = "deny"
-priority = 900
-deny_message = "Command runners are not allowed in constrained mode."
-
-# --- 8. The Multiplexers ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = ["xargs", "parallel"]
-decision = "deny"
-priority = 900
-deny_message = "Multiplexers are not allowed in constrained mode."
-
-# --- 9. Framework Tool Blocks ---
-[[rule]]
-toolName = "grep_search"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's search tool instead."
-
-[[rule]]
-toolName = "glob"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-
-[[rule]]
-toolName = "read_many_files"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's LSP tools for code navigation."
-
-[[rule]]
-toolName = "list_directory"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-</code></pre>
-<p>Then add the MCP server to <code>.gemini/settings.json</code>:</p>
-<pre><code class="language-json">{
-  "mcpServers": {
-    "catenary": {
-      "command": "catenary"
-    }
-  }
-}
-</code></pre>
-<p><strong>Alternative: constrained-bash hook.</strong> Instead of the policy engine, you can
-use the same <code>scripts/constrained_bash.py</code> script from the repo with Gemini’s
-<code>BeforeTool</code> hook system.</p>
 <p><strong>Install:</strong></p>
 <pre><code class="language-bash">cp /path/to/catenary/scripts/constrained_bash.py ~/.gemini/hooks/constrained_bash.py
 chmod +x ~/.gemini/hooks/constrained_bash.py
@@ -375,6 +250,11 @@ chmod +x ~/.gemini/hooks/constrained_bash.py
         ]
       }
     ]
+  },
+  "mcpServers": {
+    "catenary": {
+      "command": "catenary"
+    }
   }
 }
 </code></pre>
@@ -406,39 +286,16 @@ chmod +x ~/.gemini/hooks/constrained_bash.py
 (user)</p>
 <p><strong>Recommended: Hook-based integration.</strong> Claude Code’s native <code>Read</code>, <code>Edit</code>,
 and <code>Write</code> tools handle file I/O with inline diffs and syntax highlighting.
-Catenary provides file locking and LSP diagnostics via <code>PreToolUse</code> /
-<code>PostToolUse</code> hooks — the lock is held through the full edit→diagnostics cycle.</p>
+Catenary provides LSP diagnostics via a <code>PostToolUse</code> hook.</p>
 <pre><code class="language-json">{
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary acquire --format=claude"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary release --format=claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary release --grace 0"
+            "command": "catenary notify --format=claude"
           }
         ]
       }
@@ -451,10 +308,9 @@ Catenary provides file locking and LSP diagnostics via <code>PreToolUse</code> /
   }
 }
 </code></pre>
-<p>The <code>catenary release</code> command reads the hook’s JSON from stdin, finds the
-running Catenary session for the workspace, returns any LSP diagnostics,
-records the file’s mtime, and releases the lock. It exits silently on any
-error so it never blocks Claude Code’s flow.</p>
+<p>The <code>catenary notify</code> command reads the hook’s JSON from stdin, finds the
+running Catenary session for the workspace, and returns any LSP diagnostics.
+It exits silently on any error so it never blocks Claude Code’s flow.</p>
 <p><strong>Alternative: Constrained mode.</strong> Keep Claude Code’s native <code>Read</code>, <code>Edit</code>,
 <code>Write</code>, and <code>Bash</code> tools but block text-scanning commands to force LSP-first
 navigation. The repo includes a hook script that implements an allowlist:
@@ -476,7 +332,7 @@ chmod +x /path/to/catenary/scripts/constrained_bash.py
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/hooks/constrained_bash.py"
+            "command": "$HOME/.claude/hooks/constrained_bash.py --format=claude"
           }
         ]
       }
@@ -484,7 +340,7 @@ chmod +x /path/to/catenary/scripts/constrained_bash.py
   }
 }
 </code></pre>
-<p>The script provides specific guidance per command (<code>Use Catenary's search tool instead.</code>, <code>Use the Read tool instead.</code>, etc.) so the model corrects course
+<p>The script provides specific guidance per command (<code>Use Catenary's grep tool instead.</code>, <code>Use the Read tool instead.</code>, etc.) so the model corrects course
 immediately rather than attempting workarounds.</p>
 <p><strong>Troubleshooting:</strong></p>
 <ul>
@@ -514,13 +370,13 @@ correctly — the relabeling is cosmetic only.</p>
 <p>This keeps <code>Bash</code> available for build/test/git commands while blocking every
 path that would let the model fall back to text scanning. The model uses:</p>
 <ul>
-<li><strong>Catenary LSP tools</strong> for navigation (<code>search</code>, <code>hover</code>, <code>definition</code>, etc.)</li>
-<li><strong>Catenary <code>list_directory</code></strong> for directory browsing (replaces <code>ls</code>, <code>tree</code>, <code>find</code>)</li>
-<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary release</code> hook for diagnostics)</li>
+<li><strong>Catenary <code>grep</code></strong> for content discovery (symbols, references, text matches)</li>
+<li><strong>Catenary <code>glob</code></strong> for directory browsing (replaces <code>ls</code>, <code>tree</code>, <code>find</code>)</li>
+<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary notify</code> hook for diagnostics)</li>
 <li><strong>Claude Code <code>Bash</code></strong> for build, test, and git commands only</li>
 </ul>
 <h2 id="experiment-results"><a class="header" href="#experiment-results">Experiment Results</a></h2>
-<h3 id="current-policy-engine-gemini--deny-list-claude"><a class="header" href="#current-policy-engine-gemini--deny-list-claude">Current: Policy Engine (Gemini) + Deny List (Claude)</a></h3>
+<h3 id="current-constrained_bashpy-hook-both-hosts"><a class="header" href="#current-constrained_bashpy-hook-both-hosts">Current: <code>constrained_bash.py</code> hook (both hosts)</a></h3>
 <p>Validated 2026-02-17.</p>
 <div class="table-wrapper">
 <table>
@@ -528,7 +384,7 @@ path that would let the model fall back to text scanning. The model uses:</p>
 <tr><th>Test</th><th>Gemini CLI</th><th>Claude Code</th></tr>
 </thead>
 <tbody>
-<tr><td>Restriction method</td><td>Policy Engine (<code>deny</code>)</td><td><code>permissions.deny</code> list + block <code>Grep/Glob/Task</code></td></tr>
+<tr><td>Restriction method</td><td><code>BeforeTool</code> hook</td><td><code>PreToolUse</code> hook</td></tr>
 <tr><td>MCP tools discovered</td><td>✓</td><td>✓</td></tr>
 <tr><td>Text scanning blocked</td><td>✓</td><td>✓</td></tr>
 <tr><td>Model adapts gracefully</td><td>✓ (immediately)</td><td>✓ (immediately)</td></tr>
@@ -536,12 +392,20 @@ path that would let the model fall back to text scanning. The model uses:</p>
 </tbody>
 </table>
 </div>
-<p>The policy engine approach gives models clear feedback on <em>why</em> a tool is
-blocked and <em>what to use instead</em> (via <code>deny_message</code>). This eliminates the
-thrashing seen with earlier approaches — models go straight to Catenary tools
-on the first turn without attempting workarounds.</p>
+<p>Both hosts use the same <code>constrained_bash.py</code> script (with <code>--format=claude</code>
+or <code>--format=gemini</code>). The hook approach was chosen over the hosts’ native
+permission systems (Gemini’s Policy Engine, Claude Code’s <code>permissions.deny</code>
+list) because the Python script can make context-sensitive decisions — for
+example, allowing pipeline-safe commands like <code>head</code>, <code>tail</code>, <code>sed</code>, and <code>awk</code>
+mid-pipeline (reading from stdin) while blocking them at the start of a command
+(reading from files). Static deny lists cannot distinguish these cases.</p>
 <p>Tested with <code>gemini-3-flash-preview</code> and <code>claude-opus-4-6</code>. Both adapted
 on the first prompt with zero fallback attempts.</p>
+<h3 id="historical-policy-engine-gemini--deny-list-claude"><a class="header" href="#historical-policy-engine-gemini--deny-list-claude">Historical: Policy Engine (Gemini) + Deny List (Claude)</a></h3>
+<p>Validated 2026-02-17, superseded by the hook approach above.</p>
+<p>Used Gemini’s Policy Engine (<code>deny</code> rules in TOML) and Claude Code’s
+<code>permissions.deny</code> list. Both gave clear feedback but lacked the flexibility
+to allow context-dependent exceptions (e.g. pipeline-safe commands).</p>
 <h3 id="historical-toolscore-allowlist-gemini-deprecated"><a class="header" href="#historical-toolscore-allowlist-gemini-deprecated">Historical: <code>tools.core</code> Allowlist (Gemini, deprecated)</a></h3>
 <p>Validated 2026-02-06.</p>
 <p>The original Gemini approach used <code>tools.core</code> to allowlist only non-file
@@ -551,34 +415,43 @@ try several workarounds (WebFetch for local files, sub-agent delegation)
 before settling on Catenary tools. The policy engine approach replaced this
 by giving explicit deny messages instead of silently removing tools.</p>
 <h2 id="catenary-tool-coverage"><a class="header" href="#catenary-tool-coverage">Catenary Tool Coverage</a></h2>
-<p>Catenary provides LSP intelligence and directory browsing:</p>
+<p>Catenary exposes two MCP tools plus post-edit diagnostics via hooks:</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Tool</th><th>Category</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td><code>list_directory</code></td><td>File I/O</td><td>Files, dirs, symlinks</td></tr>
-<tr><td><code>search</code></td><td>LSP</td><td>Symbols + semantic references + text matches</td></tr>
-<tr><td><code>codebase_map</code></td><td>LSP</td><td>File tree with symbols</td></tr>
-<tr><td><code>document_symbols</code></td><td>LSP</td><td>File structure</td></tr>
-<tr><td><code>diagnostics</code></td><td>LSP</td><td>Errors, warnings</td></tr>
-<tr><td>…</td><td>LSP</td><td><a href="overview.html#available-tools">Full list</a></td></tr>
+<tr><td><code>grep</code></td><td>LSP+text</td><td>Symbols, references, hover, implementations, text heatmap</td></tr>
+<tr><td><code>glob</code></td><td>File I/O</td><td>Files, dirs, symlinks, symbol outlines</td></tr>
+<tr><td>hooks</td><td>LSP</td><td>Post-edit diagnostics and code actions</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="standalone-cli-commands"><a class="header" href="#standalone-cli-commands">Standalone CLI Commands</a></h3>
+<p>These commands are not MCP tools — they are run directly from the terminal.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>catenary list</code></td><td>List active and historical sessions</td></tr>
+<tr><td><code>catenary monitor &lt;id&gt;</code></td><td>Follow events from a session in real time</td></tr>
+<tr><td><code>catenary query</code></td><td>Query events from the database (filterable by session, time, kind, or raw SQL)</td></tr>
+<tr><td><code>catenary gc</code></td><td>Garbage-collect old session data (by age, dead sessions, or specific session)</td></tr>
+<tr><td><code>catenary doctor</code></td><td>Verify language servers and hook installation</td></tr>
 </tbody>
 </table>
 </div>
 <p>File I/O is handled by the host tool’s native file operations. Catenary
-provides post-edit diagnostics via the <code>catenary release</code> hook.</p>
+provides post-edit diagnostics via the <code>catenary notify</code> hook.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <h3 id="lsp-dependency"><a class="header" href="#lsp-dependency">LSP Dependency</a></h3>
-<p>Some operations require LSP:</p>
-<ul>
-<li>Find references (no grep fallback currently)</li>
-<li>Rename symbol</li>
-<li>Code actions</li>
-</ul>
-<p>If LSP is unavailable for a language, these tools return errors. <code>search</code> has
-a grep fallback for basic text matching when no LSP server covers the file.</p>
+<p>Semantic enrichment in <code>grep</code> (references, implementations, type cross-refs)
+requires a running LSP server. When no LSP server covers a file, <code>grep</code> falls
+back to text-only matching. Code actions are delivered via hooks and also
+require LSP.</p>
 <h2 id="see-also"><a class="header" href="#see-also">See Also</a></h2>
 <ul>
 <li><a href="archive/cli-design.html">Archive: CLI Design</a> — Original custom CLI design

@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -181,7 +181,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="roadmap"><a class="header" href="#roadmap">Roadmap</a></h1>
-<p>Current version: <strong>v1.1.0</strong></p>
+<p>Current version: <strong>v1.4.0</strong></p>
 <h2 id="completed"><a class="header" href="#completed">Completed</a></h2>
 <h3 id="catenary-mcp-v06x--mcp-bridge-"><a class="header" href="#catenary-mcp-v06x--mcp-bridge-">catenary-mcp (v0.6.x) — MCP Bridge ✓</a></h3>
 <p>LSP tools exposed via MCP. Feature complete.</p>
@@ -303,6 +303,19 @@ dead or unresponsive instead of silently returning empty results</li>
 <li><input disabled="" type="checkbox" checked=""> <strong><code>denied</code> subcommands</strong> — block specific command+subcommand pairs
 in the <code>run</code> tool (e.g., <code>"git grep"</code>), takes priority over allowlist
 including <code>["*"]</code></li>
+</ul>
+<h3 id="sqlite-migration-"><a class="header" href="#sqlite-migration-">SQLite Migration ✓</a></h3>
+<p>Replaced filesystem-based session and event storage with SQLite.</p>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> Removed filesystem advisory lock system (no longer needed with
+single-agent-per-worktree workflow)</li>
+<li><input disabled="" type="checkbox" checked=""> <code>src/db.rs</code> — connection management, schema creation, migrations</li>
+<li><input disabled="" type="checkbox" checked=""> Sessions, events, workspace roots stored in
+<code>~/.local/state/catenary/catenary.db</code></li>
+<li><input disabled="" type="checkbox" checked=""> WAL mode for concurrent readers (TUI/CLI) with single writer (MCP server)</li>
+<li><input disabled="" type="checkbox" checked=""> <code>SqliteDataSource</code> for TUI dashboard</li>
+<li><input disabled="" type="checkbox" checked=""> <code>catenary query</code> — ad-hoc event querying (table, JSON, CSV output)</li>
+<li><input disabled="" type="checkbox" checked=""> <code>catenary gc</code> — data retention management</li>
 </ul>
 <h3 id="cli-integration-research-"><a class="header" href="#cli-integration-research-">CLI Integration Research ✓</a></h3>
 <p>Validated approach: use existing CLI tools (Claude Code, Gemini CLI) with

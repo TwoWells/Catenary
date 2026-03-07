@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -196,8 +196,7 @@ intelligence to AI coding assistants.</p>
 <p>Catenary bridges <a href="https://modelcontextprotocol.io/">MCP</a> (Model Context
 Protocol) and <a href="https://microsoft.github.io/language-server-protocol/">LSP</a>
 (Language Server Protocol), giving AI assistants like Claude access to real IDE
-features: hover docs, go-to-definition, find references, diagnostics,
-completions, rename, and more.</p>
+features: hover docs, go-to-definition, find references, diagnostics, and more.</p>
 <h2 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h2>
 <p><strong>1. Install the binary</strong></p>
 <pre><code class="language-bash">cargo install catenary-mcp
@@ -205,7 +204,7 @@ completions, rename, and more.</p>
 <p><strong>2. Configure language servers</strong> — see <a href="configuration.html">Configuration</a></p>
 <p><strong>3. Connect your AI assistant</strong></p>
 <p>Plugins and extensions register the MCP server <em>and</em> hooks for post-edit
-diagnostics, file locking, and root sync. The binary must be on your PATH.</p>
+diagnostics and root sync. The binary must be on your PATH.</p>
 <p><em>Claude Code:</em></p>
 <pre><code>/plugin marketplace add MarkWells-Dev/Catenary
 /plugin install catenary@catenary

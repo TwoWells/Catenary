@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -238,18 +238,12 @@ session lifetime — protocol changes require a fresh session.</p>
 <p>Inside <code>plugins/catenary/</code>:</p>
 <ul>
 <li><strong><code>.mcp.json</code></strong> — declares the MCP server (<code>catenary</code> command).</li>
-<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics, root sync, and
-file locking:
+<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics and root sync:
 <ul>
 <li><code>PreToolUse</code> (all tools): runs <code>catenary sync-roots</code> to pick up <code>/add-dir</code>
 workspace additions and directory removals.</li>
-<li><code>PreToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary acquire</code> to
-serialize concurrent file access across agents.</li>
-<li><code>PostToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary release</code>
-which handles the full post-tool pipeline — diagnostics notify, mtime
-tracking, then lock release with grace period.</li>
-<li><code>PostToolUseFailure</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs
-<code>catenary release --grace 0</code> for immediate lock release on failure.</li>
+<li><code>PostToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary notify</code>
+to return LSP diagnostics after file operations.</li>
 </ul>
 </li>
 <li><strong><code>config.example.toml</code></strong> — example Catenary configuration.</li>
@@ -262,25 +256,21 @@ tracking, then lock release with grace period.</li>
 <ul>
 <li><strong><code>gemini-extension.json</code></strong> — manifest declaring the MCP server. Does <strong>not</strong>
 contain hooks (Gemini CLI ignores hooks defined in the manifest).</li>
-<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics and file locking:
+<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics:
 <ul>
-<li><code>BeforeTool</code> on <code>read_file|write_file|replace</code>: runs
-<code>catenary acquire --format=gemini</code> to serialize concurrent file access.</li>
 <li><code>AfterTool</code> on <code>read_file|write_file|replace</code>: runs
-<code>catenary release --format=gemini</code> which handles the full post-tool
-pipeline — diagnostics notify, mtime tracking, then lock release.</li>
+<code>catenary notify --format=gemini</code> to return LSP diagnostics after file
+operations.</li>
 </ul>
 </li>
 </ul>
 <h2 id="hook-contracts"><a class="header" href="#hook-contracts">Hook Contracts</a></h2>
-<p>All hook commands (<code>catenary acquire</code>, <code>catenary release</code>, <code>catenary sync-roots</code>)
-read hook JSON from stdin. They silently succeed on any error to avoid breaking
-the host CLI’s flow.</p>
-<h3 id="catenary-acquire"><a class="header" href="#catenary-acquire"><code>catenary acquire</code></a></h3>
-<p>Triggered before file reads or edits (Claude Code <code>PreToolUse</code>, Gemini
-<code>BeforeTool</code>). Acquires a file-level advisory lock, blocking until the lock is
-available or the timeout expires. This serializes concurrent access to the same
-file across multiple agents.</p>
+<p>All hook commands (<code>catenary notify</code>, <code>catenary sync-roots</code>) read hook JSON from
+stdin. They silently succeed on any error to avoid breaking the host CLI’s flow.</p>
+<h3 id="catenary-notify"><a class="header" href="#catenary-notify"><code>catenary notify</code></a></h3>
+<p>Triggered after file reads or edits (Claude Code <code>PostToolUse</code>, Gemini
+<code>AfterTool</code>). Connects to the session’s notify socket and returns LSP
+diagnostics to stdout.</p>
 <p><strong>Fields consumed from hook JSON:</strong></p>
 <div class="table-wrapper">
 <table>
@@ -288,10 +278,8 @@ file across multiple agents.</p>
 <tr><th>Field</th><th>Used for</th></tr>
 </thead>
 <tbody>
-<tr><td><code>session_id</code></td><td>Lock owner identity (primary key)</td></tr>
-<tr><td><code>agent_id</code></td><td>Lock owner identity (appended if present)</td></tr>
-<tr><td><code>tool_input.file_path</code> or <code>tool_input.file</code></td><td>File to lock</td></tr>
-<tr><td><code>cwd</code></td><td>Resolving relative file paths and finding the session for monitor events</td></tr>
+<tr><td><code>tool_input.file_path</code> or <code>tool_input.file</code></td><td>File to check for diagnostics</td></tr>
+<tr><td><code>cwd</code></td><td>Resolving relative file paths and finding the session</td></tr>
 </tbody>
 </table>
 </div>
@@ -302,60 +290,19 @@ file across multiple agents.</p>
 <tr><th>Flag</th><th>Required</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--timeout</code></td><td>no (default 180)</td><td>Seconds to wait before giving up</td></tr>
 <tr><td><code>--format</code></td><td>yes</td><td>Output format (<code>claude</code> or <code>gemini</code>)</td></tr>
 </tbody>
 </table>
 </div>
-<p><strong>Output:</strong> silent on success. On timeout, returns JSON with
-<code>permissionDecision: "deny"</code>. If the file was modified since the owner’s last
-read, returns JSON with <code>additionalContext</code> warning.</p>
-<h3 id="catenary-release"><a class="header" href="#catenary-release"><code>catenary release</code></a></h3>
-<p>Triggered after file reads or edits (Claude Code <code>PostToolUse</code>, Gemini
-<code>AfterTool</code>). Runs the full post-tool pipeline:</p>
-<ol>
-<li><strong>Diagnostics notify</strong> — connects to the session’s notify socket and returns
-LSP diagnostics to stdout (when <code>--format</code> is provided).</li>
-<li><strong>Track read</strong> — records the file’s mtime so future <code>acquire</code> calls can
-detect external modifications (when <code>--format</code> is provided).</li>
-<li><strong>Lock release</strong> — releases the lock with a grace period, allowing the same
-agent to re-acquire without contention during diagnostics→fix cycles.</li>
-</ol>
-<p>When <code>--format</code> is omitted (failure path, e.g. <code>--grace 0</code>), skips diagnostics
-and track-read, just releasing the lock immediately.</p>
-<p><strong>Fields consumed from hook JSON:</strong></p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Field</th><th>Used for</th></tr>
-</thead>
-<tbody>
-<tr><td><code>session_id</code></td><td>Lock owner identity</td></tr>
-<tr><td><code>agent_id</code></td><td>Lock owner identity (appended if present)</td></tr>
-<tr><td><code>tool_input.file_path</code> or <code>tool_input.file</code></td><td>File to unlock</td></tr>
-<tr><td><code>cwd</code></td><td>Resolving relative file paths and finding the session for diagnostics/monitor events</td></tr>
-</tbody>
-</table>
-</div>
-<p><strong>Flags:</strong></p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Flag</th><th>Required</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--grace</code></td><td>no (default 30)</td><td>Seconds before the lock expires</td></tr>
-<tr><td><code>--format</code></td><td>no</td><td>Output format (<code>claude</code> or <code>gemini</code>). When set, runs diagnostics and track-read before releasing</td></tr>
-</tbody>
-</table>
-</div>
+<p><strong>Output:</strong> silent when no diagnostics. Otherwise returns JSON with
+<code>additionalContext</code> containing the diagnostic text.</p>
 <h3 id="catenary-sync-roots"><a class="header" href="#catenary-sync-roots"><code>catenary sync-roots</code></a></h3>
 <p>Triggered before each tool use (Claude Code only). Scans the Claude Code
 transcript for <code>/add-dir</code> additions and directory removals, then sends the full
 workspace root set to the running Catenary session. The server diffs against its
 current state, applying both additions and removals to LSP clients and the search
 index.</p>
-<p>State is persisted in <code>known_roots.json</code> (inside the session directory) to track
+<p>State is persisted in the <code>root_sync_state</code> table in the SQLite database to track
 the transcript byte offset and the full discovered root set across invocations.</p>
 <p><strong>Fields consumed from hook JSON:</strong></p>
 <div class="table-wrapper">

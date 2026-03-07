@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -189,7 +189,7 @@ text-based file scanning.</p>
 the following to your system prompt or agent instructions to prevent the model
 from wasting tokens discovering the deny list through trial and error:</p>
 <pre><code>Text-scanning shell commands (grep, find, ls, cat, etc.) are denied.
-Use Catenary's LSP tools for navigation and list_directory for browsing.
+Use Catenary's grep tool for search and glob tool for browsing.
 Workarounds will be added to the deny list.
 </code></pre>
 <p>If Catenary is running <strong>alongside built-in tools</strong>, agents will default to
@@ -201,19 +201,14 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 
 | Task | Use | Instead of |
 |------|-----|------------|
-| Find where something is defined | `definition` | grep/ripgrep |
-| Find all usages of a symbol | `search` | grep/ripgrep |
-| Find a class/function by name | `search` | grep/glob patterns |
-| Understand a file's structure | `document_symbols` | Reading entire files |
-| Find implementations of interface | `implementation` | grep for impl blocks |
-| Rename a symbol safely | `rename` | Find/replace with grep |
-| Check for errors after edits | `diagnostics` | Running compiler |
-| Explore unfamiliar codebase | `codebase_map` | Multiple grep/read cycles |
+| Find symbols, references, text matches | `grep` | grep/ripgrep |
+| Browse files and directories | `glob` | ls/find/tree |
+| Check for errors after edits | hooks | Running compiler |
 
 ### Why This Matters
 
 - A single 500-line file read costs ~2000-4000 tokens
-- A `search` call costs ~200-500 tokens and returns symbols + references + text matches
+- A `grep` call costs ~200-500 tokens and returns symbols + references + text matches
 - One file read ≈ 10-20 targeted LSP queries
 - Reducing unnecessary reads prevents context compression and re-reads
 
@@ -239,20 +234,21 @@ re-read. Each cycle costs tokens and risks hitting rate limits mid-task.</p>
 Instead of reading a 500-line file to find a function’s type signature, ask the
 language server directly.</p>
 <h2 id="when-to-use-lsp-vs-native-file-tools"><a class="header" href="#when-to-use-lsp-vs-native-file-tools">When to Use LSP vs Native File Tools</a></h2>
-<p>Catenary provides LSP tools and <code>list_directory</code>. File reading and editing is
-handled by the host tool’s native file operations (e.g. Claude Code’s <code>Read</code>,
-<code>Edit</code>, <code>Write</code>). The <code>catenary release</code> hook provides post-edit LSP diagnostics
-so you immediately see any errors introduced by changes.</p>
-<p><strong>Use LSP tools</strong> for:</p>
+<p>Catenary provides two MCP tools (<code>grep</code> and <code>glob</code>) plus post-edit diagnostics
+via hooks. File reading and editing is handled by the host tool’s native file
+operations (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). The <code>catenary notify</code>
+hook provides post-edit LSP diagnostics so you immediately see any errors
+introduced by changes.</p>
+<p><strong>Use Catenary tools</strong> for:</p>
 <ul>
-<li>Finding definitions, references, and symbols</li>
-<li>Understanding file structure (document_symbols)</li>
-<li>Checking errors after changes (diagnostics)</li>
+<li>Finding symbols, references, and text matches (<code>grep</code>)</li>
+<li>Browsing files and directory structure (<code>glob</code>)</li>
+<li>Post-edit diagnostics (automatic via hooks)</li>
 </ul>
 <p><strong>Use native file tools</strong> for:</p>
 <ul>
 <li>Reading implementation logic (not just signatures)</li>
-<li>Searching comments or string literals (<code>search</code> includes a file heatmap)</li>
+<li>Searching comments or string literals (<code>grep</code> includes a file heatmap)</li>
 <li>Config files or non-code content</li>
 <li>Writing and editing code (diagnostics returned via notify hook)</li>
 </ul>
@@ -268,19 +264,18 @@ so you immediately see any errors introduced by changes.</p>
 </ol>
 <p><strong>Efficient approach:</strong></p>
 <ol>
-<li><code>search</code> for “auth” — returns symbols, semantic references, and text matches</li>
-<li><code>definition</code> to jump to the specific handler</li>
+<li><code>grep</code> for “auth” — returns symbols, semantic references, and text matches</li>
+<li><code>grep</code> for the specific handler — definition and type info included in results</li>
 <li>Read the specific function you need to modify</li>
 <li>Edit to make the change — diagnostics returned via notify hook</li>
 </ol>
 <h2 id="codebase-orientation"><a class="header" href="#codebase-orientation">Codebase Orientation</a></h2>
 <p>When first exploring an unfamiliar codebase:</p>
 <pre><code># Get project structure with function/class names
-codebase_map with include_symbols: true
+glob with pattern: "**" and include_symbols: true
 
 # Then drill down with targeted queries
-search for specific components
-document_symbols for file structure
+grep for specific components
 
 # Read implementation when needed
 Read the specific code you need to understand
@@ -295,10 +290,9 @@ Read the specific code you need to understand
 </thead>
 <tbody>
 <tr><td>Read a 500-line file</td><td>~2000-4000</td></tr>
-<tr><td><code>search</code> (symbols + references + heatmap)</td><td>~200-500</td></tr>
-<tr><td><code>definition</code> response</td><td>~30-100</td></tr>
-<tr><td><code>document_symbols</code></td><td>~200-800</td></tr>
-<tr><td><code>codebase_map</code> (budget: 200)</td><td>~800-1000</td></tr>
+<tr><td><code>grep</code> (symbols + references + heatmap)</td><td>~200-500</td></tr>
+<tr><td><code>glob</code> (file listing)</td><td>~200-800</td></tr>
+<tr><td><code>glob</code> with symbols (budget: 200)</td><td>~800-1000</td></tr>
 </tbody>
 </table>
 </div>
@@ -310,64 +304,41 @@ Read the specific code you need to understand
 use a targeted LSP query.</p>
 </li>
 <li>
-<p><strong>Structure before content.</strong> Use <code>document_symbols</code> or <code>codebase_map</code> to
-understand organization before reading implementation.</p>
+<p><strong>Structure before content.</strong> Use <code>glob</code> with symbols to understand
+organization before reading implementation.</p>
 </li>
 <li>
-<p><strong>Search before read.</strong> Use <code>search</code> to find symbols, references, and
+<p><strong>Search before read.</strong> Use <code>grep</code> to find symbols, references, and
 matches before reading source files.</p>
 </li>
 <li>
-<p><strong>References are precise.</strong> <code>find_references</code> finds actual usages,
-not text matches. No false positives from comments or strings.</p>
+<p><strong>References are precise.</strong> <code>grep</code> enriches results with semantic
+references — actual usages, not text matches.</p>
 </li>
 <li>
 <p><strong>Save reads for logic.</strong> Only read files when you need to understand
 <em>how</em> something works, not <em>what</em> it is or <em>where</em> it lives.</p>
 </li>
 <li>
-<p><strong>Edit with feedback.</strong> The <code>catenary release</code> hook returns LSP diagnostics
+<p><strong>Edit with feedback.</strong> The <code>catenary notify</code> hook returns LSP diagnostics
 after every edit, so you immediately see any errors introduced.</p>
 </li>
 </ol>
-<h2 id="release-hook"><a class="header" href="#release-hook">Release Hook</a></h2>
-<p>Catenary provides post-edit LSP diagnostics, mtime tracking, and lock release
-via the <code>catenary release</code> command, designed for use as a <code>PostToolUse</code> hook
-in Claude Code.</p>
+<h2 id="notify-hook"><a class="header" href="#notify-hook">Notify Hook</a></h2>
+<p>Catenary provides post-edit LSP diagnostics via the <code>catenary notify</code> command,
+designed for use as a <code>PostToolUse</code> hook in Claude Code.</p>
 <p>The recommended setup uses the Catenary plugin (<code>catenary@catenary</code>), which
-registers <code>catenary acquire</code> / <code>catenary release</code> hooks automatically. For
-manual configuration, add to <code>.claude/settings.json</code>:</p>
+registers the <code>catenary notify</code> hook automatically. For manual configuration,
+add to <code>.claude/settings.json</code>:</p>
 <pre><code class="language-json">{
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary acquire --format=claude"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary release --format=claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary release --grace 0"
+            "command": "catenary notify --format=claude"
           }
         ]
       }
@@ -375,10 +346,9 @@ manual configuration, add to <code>.claude/settings.json</code>:</p>
   }
 }
 </code></pre>
-<p>The <code>release</code> hook reads the <code>PostToolUse</code> JSON from stdin, finds the running
-Catenary session for the workspace, runs LSP diagnostics, records the file’s
-mtime, and releases the file lock. It exits silently on any error so it never
-blocks the host tool’s flow.</p>
+<p>The <code>notify</code> hook reads the <code>PostToolUse</code> JSON from stdin, finds the running
+Catenary session for the workspace, and returns LSP diagnostics. It exits
+silently on any error so it never blocks the host tool’s flow.</p>
 
                     </main>
 

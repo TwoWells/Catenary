@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -251,8 +251,8 @@
 </table>
 </div>
 <h3 id="4-workspace-edit-failures"><a class="header" href="#4-workspace-edit-failures">4. Workspace Edit Failures</a></h3>
-<p>LSP servers propose workspace edits (via rename, code actions, formatting). These edits contain URIs, byte ranges, and replacement text — all untrusted.</p>
-<p><strong>Design decision:</strong> Catenary does not apply workspace edits to the filesystem. LSP tools (<code>rename</code>, <code>apply_quickfix</code>, <code>formatting</code>) return proposed edits as structured text. The MCP client reviews and applies them using its own editing tools, or via Catenary’s <code>edit_file</code> tool which validates paths against workspace roots.</p>
+<p>LSP servers propose workspace edits (via code actions, formatting). These edits contain URIs, byte ranges, and replacement text — all untrusted.</p>
+<p><strong>Design decision:</strong> Catenary does not apply workspace edits to the filesystem. Code actions are delivered via the post-edit diagnostics hook as structured text. The agent reviews them and applies fixes using the host’s native editing tools.</p>
 <p>This eliminates an entire class of failures:</p>
 <div class="table-wrapper">
 <table>
@@ -260,9 +260,9 @@
 <tr><th>Failure</th><th>Trigger</th><th>Resolution</th></tr>
 </thead>
 <tbody>
-<tr><td>Edit targets file outside workspace</td><td>Path traversal in URI</td><td>MCP client controls file writes, not the LSP</td></tr>
-<tr><td>Overlapping edit ranges</td><td>Server bug</td><td>MCP client applies edits individually with full file context</td></tr>
-<tr><td>Edit with wrong encoding offsets</td><td>Encoding mismatch</td><td>MCP client works with text, not byte offsets</td></tr>
+<tr><td>Edit targets file outside workspace</td><td>Path traversal in URI</td><td>Host tool controls file writes, not the LSP</td></tr>
+<tr><td>Overlapping edit ranges</td><td>Server bug</td><td>Host tool applies edits individually with full file context</td></tr>
+<tr><td>Edit with wrong encoding offsets</td><td>Encoding mismatch</td><td>Host tool works with text, not byte offsets</td></tr>
 <tr><td>ResourceOp (create/rename/delete)</td><td>Code action side effects</td><td>Surfaced as proposed operations; MCP client decides</td></tr>
 </tbody>
 </table>
@@ -331,7 +331,7 @@
 <p><strong>Catenary never crashes</strong> due to LSP server output. All deserialization is fallible. All <code>unwrap()</code> on LSP data is forbidden.</p>
 </li>
 <li>
-<p><strong>Catenary never modifies the filesystem based on LSP data.</strong> LSP-proposed edits (rename, code actions, formatting) are returned as structured text. Catenary’s <code>edit_file</code> and <code>write_file</code> tools validate all paths against workspace roots independently of LSP data — the LSP never gets direct write access.</p>
+<p><strong>Catenary never modifies the filesystem based on LSP data.</strong> LSP-proposed edits (code actions, formatting) are returned as structured text via hooks. The host tool controls all file writes — the LSP never gets direct write access.</p>
 </li>
 <li>
 <p><strong>Catenary never hangs indefinitely.</strong> All LSP requests have bounded timeouts. Diagnostics waits use activity-based tracking with nudge-and-retry (bounded by attempt count). Reader task failures don’t block the MCP server.</p>

@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -289,10 +289,57 @@ blocked, starved, and progress-explained ticks are free waits.</p>
 <p><code>didSave</code> is gated on <code>textDocumentSync.save</code> from <code>ServerCapabilities</code>. Only
 servers that advertise save support receive <code>textDocument/didSave</code>.</p>
 <p>This mechanism applies to the paths that return diagnostics after a change:
-the <code>catenary release</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
+the <code>catenary notify</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
 tool. Request/response tools (<code>definition</code>, <code>document_symbols</code>) do not need
 it — their results come directly from the server response, not from the cache.</p>
 <p>See <a href="wait-model.html">Wait Model</a> for full design details.</p>
+<h2 id="state-management"><a class="header" href="#state-management">State Management</a></h2>
+<p>All persistent state lives in a single SQLite database at
+<code>~/.local/state/catenary/catenary.db</code>. WAL mode is enabled for concurrent
+read access (the TUI and CLI commands can query while the MCP server writes).</p>
+<h3 id="schema"><a class="header" href="#schema">Schema</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Table</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sessions</code></td><td>Session metadata (ID, PID, display name, client info, timestamps, alive flag)</td></tr>
+<tr><td><code>workspace_roots</code></td><td>Workspace root paths per session</td></tr>
+<tr><td><code>events</code></td><td>Session events (tool calls, diagnostics, server state changes, etc.)</td></tr>
+<tr><td><code>language_servers</code></td><td>Per-session LSP server state</td></tr>
+<tr><td><code>filter_history</code></td><td>TUI filter patterns (per-workspace)</td></tr>
+<tr><td><code>root_sync_state</code></td><td>Transcript offset and discovered roots for <code>sync-roots</code></td></tr>
+<tr><td><code>meta</code></td><td>Schema version tracking</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="connection-owners"><a class="header" href="#connection-owners">Connection owners</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Process</th><th>Lifetime</th></tr>
+</thead>
+<tbody>
+<tr><td>MCP server</td><td>Process lifetime (shared via <code>Arc&lt;Mutex&lt;Connection&gt;&gt;</code>)</td></tr>
+<tr><td>CLI hooks (<code>notify</code>, <code>sync-roots</code>)</td><td>Single command invocation</td></tr>
+<tr><td>CLI commands (<code>list</code>, <code>monitor</code>, <code>query</code>, <code>gc</code>)</td><td>Single command invocation</td></tr>
+<tr><td>TUI dashboard</td><td>Dashboard lifetime</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="cli-commands"><a class="header" href="#cli-commands">CLI commands</a></h3>
+<p><code>catenary query</code> provides ad-hoc event querying for debugging and bug reports:</p>
+<pre><code class="language-bash">catenary query --session 029ba740 --since 1h
+catenary query --kind diagnostics --since today
+catenary query --search "hover" --format json
+catenary query --sql "SELECT * FROM events WHERE payload LIKE '%timeout%'"
+</code></pre>
+<p><code>catenary gc</code> manages data retention:</p>
+<pre><code class="language-bash">catenary gc --older-than 7d
+catenary gc --dead
+catenary gc --session 029ba740
+</code></pre>
 <h2 id="root-synchronization"><a class="header" href="#root-synchronization">Root Synchronization</a></h2>
 <p>When the MCP client sends a <code>notifications/roots/list_changed</code> notification,
 Catenary:</p>

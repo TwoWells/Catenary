@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -331,19 +331,6 @@ version = "0.1.0"
 <ul>
 <li>Code action titles are returned as data</li>
 <li>No code action text is executed as a command</li>
-</ul>
-<h3 id="42-workspace-edit-preview-content"><a class="header" href="#42-workspace-edit-preview-content">4.2 Workspace edit preview content</a></h3>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>// A rename from `old` to a crafted new name
-fn old() {}
-<span class="boring">}</span></code></pre>
-<p><strong>Trigger:</strong> AI agent calls <code>rename</code> with <code>new_name</code> set to <code>"; rm -rf / #</code>.</p>
-<p><strong>Expected:</strong> The rename response shows the proposed text replacement. The replacement text is returned as a string, never executed.</p>
-<p><strong>What to verify:</strong></p>
-<ul>
-<li>Shell metacharacters in rename targets are not interpreted</li>
-<li>The edit preview is data, not a command</li>
 </ul>
 <hr>
 <h2 id="5-resource-exhaustion"><a class="header" href="#5-resource-exhaustion">5. Resource Exhaustion</a></h2>

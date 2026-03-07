@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -194,8 +194,7 @@ intelligence to AI coding assistants.</p>
 <p>Catenary bridges <a href="https://modelcontextprotocol.io/">MCP</a> (Model Context
 Protocol) and <a href="https://microsoft.github.io/language-server-protocol/">LSP</a>
 (Language Server Protocol), giving AI assistants like Claude access to real IDE
-features: hover docs, go-to-definition, find references, diagnostics,
-completions, rename, and more.</p>
+features: hover docs, go-to-definition, find references, diagnostics, and more.</p>
 <h2 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h2>
 <p><strong>1. Install the binary</strong></p>
 <pre><code class="language-bash">cargo install catenary-mcp
@@ -203,7 +202,7 @@ completions, rename, and more.</p>
 <p><strong>2. Configure language servers</strong> — see <a href="#configuration">Configuration</a></p>
 <p><strong>3. Connect your AI assistant</strong></p>
 <p>Plugins and extensions register the MCP server <em>and</em> hooks for post-edit
-diagnostics, file locking, and root sync. The binary must be on your PATH.</p>
+diagnostics and root sync. The binary must be on your PATH.</p>
 <p><em>Claude Code:</em></p>
 <pre><code>/plugin marketplace add MarkWells-Dev/Catenary
 /plugin install catenary@catenary
@@ -235,7 +234,7 @@ every turn. The problem scales with session length, not window size.</p>
 <p>Catenary replaces brute-force file scanning with <strong>graph navigation</strong>.</p>
 <p>Instead of grepping across 20 files to find a definition, <code>definition</code> returns
 the exact location in one query. Instead of re-reading a file after editing it
-to check for errors, the <code>catenary release</code> hook returns diagnostics inline.
+to check for errors, the <code>catenary notify</code> hook returns diagnostics inline.
 Instead of fumbling with line numbers to find usages, <code>search</code> returns symbols,
 semantic references, and text matches in a single call.</p>
 <p>Each LSP query is small and stateless. Nothing accumulates. The context stays
@@ -275,7 +274,7 @@ lean across the entire session, regardless of how long the agent works.</p>
 <p>Catenary bridges <a href="https://modelcontextprotocol.io/">MCP</a> and
 <a href="https://microsoft.github.io/language-server-protocol/">LSP</a>. It manages
 multiple language servers, routes requests by file type, and provides automatic
-post-edit diagnostics via the <code>catenary release</code> hook — all through a single MCP
+post-edit diagnostics via the <code>catenary notify</code> hook — all through a single MCP
 server. The agent never needs to know which server handles which language.</p>
 <h2 id="constrained-mode"><a class="header" href="#constrained-mode">Constrained Mode</a></h2>
 <p>Catenary is designed to be the agent’s <strong>primary navigation toolkit</strong>, not a
@@ -283,7 +282,7 @@ supplement. In constrained mode, the host CLI’s text-scanning commands (grep,
 cat, find, ls, etc.) are denied via permissions, forcing the agent to use LSP
 queries for navigation. The host’s native file I/O tools remain available for
 reading and editing, with Catenary providing post-edit diagnostics via the
-<code>catenary release</code> hook.</p>
+<code>catenary notify</code> hook.</p>
 <p>See <a href="#cli-integration">CLI Integration</a> for setup instructions.</p>
 <blockquote>
 <p>Catenary also works as a supplement alongside built-in tools. But without
@@ -326,13 +325,13 @@ grepping — and the efficiency gains are lost.</p>
 <tr><th>Feature</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><strong>Diagnostics</strong></td><td>Errors, warnings, and quick-fix suggestions delivered inline after every edit via the <code>catenary release</code> PostToolUse hook</td></tr>
+<tr><td><strong>Diagnostics</strong></td><td>Errors, warnings, and quick-fix suggestions delivered inline after every edit via the <code>catenary notify</code> PostToolUse hook</td></tr>
 </tbody>
 </table>
 </div>
 <p>File reading and editing is handled by the host tool’s native file operations
 (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). Catenary provides <strong>post-edit
-LSP diagnostics</strong> (including quick-fix code actions) via the <code>catenary release</code>
+LSP diagnostics</strong> (including quick-fix code actions) via the <code>catenary notify</code>
 hook — diagnostics and fix suggestions appear in the model’s context after
 every edit. See <a href="#cli-integration">CLI Integration</a> for hook configuration.</p>
 <p><code>search</code> (with the optional <code>paths</code> parameter) and <code>glob</code> can operate outside
@@ -369,13 +368,13 @@ missing, hooks will silently do nothing and you will get no diagnostics.</p>
 <pre><code class="language-bash">claude plugin marketplace add MarkWells-Dev/Catenary
 claude plugin install catenary@catenary
 </code></pre>
-<p>The plugin registers the MCP server and hooks for post-edit diagnostics,
-file locking, and root sync. It requires the <code>catenary</code> binary on PATH.</p>
+<p>The plugin registers the MCP server and hooks for post-edit diagnostics
+and root sync. It requires the <code>catenary</code> binary on PATH.</p>
 <p><strong>Option 2: Manual</strong></p>
 <pre><code class="language-bash">claude mcp add catenary -- catenary
 </code></pre>
 <p>This registers the MCP server only. You will not get post-edit diagnostics
-or file locking unless you also configure hooks manually (see
+unless you also configure hooks manually (see
 <a href="#cli-integration">CLI Integration</a>).</p>
 <h3 id="claude-desktop"><a class="header" href="#claude-desktop">Claude Desktop</a></h3>
 <p>Add to your config file:</p>
@@ -395,8 +394,8 @@ or file locking unless you also configure hooks manually (see
 <p><strong>Option 1: Extension (recommended)</strong></p>
 <pre><code class="language-bash">gemini extensions install https://github.com/MarkWells-Dev/Catenary
 </code></pre>
-<p>The extension registers the MCP server and hooks for post-edit diagnostics
-and file locking. It requires the <code>catenary</code> binary on PATH.</p>
+<p>The extension registers the MCP server and hooks for post-edit diagnostics.
+It requires the <code>catenary</code> binary on PATH.</p>
 <p><strong>Option 2: Manual</strong></p>
 <p>Add to <code>~/.gemini/settings.json</code>:</p>
 <pre><code class="language-json">{
@@ -408,8 +407,8 @@ and file locking. It requires the <code>catenary</code> binary on PATH.</p>
 }
 </code></pre>
 <p>This registers the MCP server only. You will not get post-edit diagnostics
-or file locking unless you also install the extension or configure hooks
-manually (see <a href="#cli-integration">CLI Integration</a>).</p>
+unless you also install the extension or configure hooks manually (see
+<a href="#cli-integration">CLI Integration</a>).</p>
 <h3 id="other-mcp-clients"><a class="header" href="#other-mcp-clients">Other MCP Clients</a></h3>
 <pre><code class="language-json">{
   "mcpServers": {
@@ -559,6 +558,7 @@ cargo.features = "all"
 <tbody>
 <tr><td><code>idle_timeout</code></td><td><code>300</code></td><td>Seconds before auto-closing idle documents. Set to <code>0</code> to disable.</td></tr>
 <tr><td><code>log_retention_days</code></td><td><code>7</code></td><td>Days to keep dead session logs. <code>0</code> = remove all dead sessions on startup. <code>-1</code> = retain forever.</td></tr>
+<tr><td><code>tui.capture_tool_output</code></td><td><code>false</code></td><td>Store full tool output in events for TUI detail expansion. Increases database size.</td></tr>
 </tbody>
 </table>
 </div>
@@ -605,11 +605,7 @@ alignment).</p>
 <tr><td><code>lock</code></td><td><code>\u25B6 </code> (▶)</td><td><code> </code></td><td>Lock acquired</td></tr>
 <tr><td><code>unlock</code></td><td><code>\u25C0 </code> (◀)</td><td><code> </code></td><td>Lock released</td></tr>
 <tr><td><code>tool_search</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Search tool</td></tr>
-<tr><td><code>tool_map</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Codebase map tool</td></tr>
-<tr><td><code>tool_hover</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Hover tool</td></tr>
-<tr><td><code>tool_goto</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Go-to-definition tool</td></tr>
-<tr><td><code>tool_refs</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Find references tool</td></tr>
-<tr><td><code>tool_diagnostics</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Diagnostics tool</td></tr>
+<tr><td><code>tool_glob</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Glob tool</td></tr>
 <tr><td><code>tool_default</code></td><td><code>\u2192 </code> (→)</td><td><code>\u2192 </code> (→)</td><td>Fallback for other tools</td></tr>
 </tbody>
 </table>
@@ -714,8 +710,8 @@ a text input:</p>
 <p>The filter performs a case-insensitive substring match on the plain-text
 rendering of each event line.</p>
 <h2 id="session-pruning"><a class="header" href="#session-pruning">Session Pruning</a></h2>
-<p>On startup, the dashboard automatically removes dead session logs older than
-the configured retention period. See
+<p>On startup, the dashboard automatically removes dead sessions older than
+the configured retention period from the database. See
 <a href="#global-options"><code>log_retention_days</code></a> in the configuration
 reference.</p>
 <h2 id="icons-1"><a class="header" href="#icons-1">Icons</a></h2>
@@ -760,147 +756,22 @@ maintaining a CLI.</p>
 </ul>
 <h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
 <h3 id="gemini-cli-1"><a class="header" href="#gemini-cli-1">Gemini CLI</a></h3>
-<p>Location: <code>~/.gemini/policies/</code> (user) or <code>.gemini/settings.json</code> (workspace)</p>
+<p>Location: <code>~/.gemini/settings.json</code> (user) or <code>.gemini/settings.json</code> (workspace)</p>
 <p><strong>Recommended: Extension + Constrained Mode.</strong></p>
 <ol>
 <li>
-<p><strong>Install the Extension:</strong> The Catenary extension provides
-<code>BeforeTool</code> / <code>AfterTool</code> hooks that run <code>catenary acquire</code> /
-<code>catenary release</code> around file operations. This ensures file locking
-and the model sees LSP diagnostics immediately.</p>
+<p><strong>Install the Extension:</strong> The Catenary extension provides an
+<code>AfterTool</code> hook that runs <code>catenary notify</code> after file operations,
+so the model sees LSP diagnostics immediately.</p>
 <pre><code class="language-bash">gemini extensions install https://github.com/MarkWells-Dev/Catenary
 </code></pre>
 </li>
 <li>
-<p><strong>Constrained mode.</strong> Use the Policy Engine to deny text-scanning commands while
-keeping Gemini’s native file I/O and shell tools available. Create the file
-<code>~/.gemini/policies/catenary-constrained.toml</code>:</p>
+<p><strong>Constrained mode.</strong> Use the <code>constrained_bash.py</code> hook to deny
+text-scanning commands while keeping Gemini’s native file I/O and
+shell tools available.</p>
 </li>
 </ol>
-<pre><code class="language-toml"># Catenary constrained mode — forces LSP-first navigation
-# Place in ~/.gemini/policies/catenary-constrained.toml
-
-# --- 1. Search (Grep Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "rg", "ag", "ack", "fd",
-  "grep", "egrep", "fgrep", "rgrep", "zgrep",
-  "git grep",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's search tool instead."
-
-# --- 2. Navigation (Listing Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "ls", "dir", "vdir", "tree", "find",
-  "locate", "mlocate", "whereis", "which",
-  "git ls-files", "git ls-tree",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-
-# --- 3. Peeking (Reading Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "cat", "head", "tail", "more", "less", "nl",
-  "od", "hexdump", "xxd", "strings", "dd", "tee",
-]
-decision = "deny"
-priority = 900
-deny_message = "Use the native read_file tool instead."
-
-# --- 4. Text Processing (Scripting Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "awk", "sed", "perl",
-  "cut", "paste", "sort", "uniq", "join",
-]
-decision = "deny"
-priority = 900
-deny_message = "Text processing commands are not allowed in constrained mode."
-
-# --- 5. Reconnaissance (Metadata Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = ["file", "stat", "du", "df"]
-decision = "deny"
-priority = 900
-deny_message = "Metadata commands are not allowed in constrained mode."
-
-# --- 6. Executors &amp; Shells (The Wrapper Family) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "bash", "sh", "zsh", "dash", "fish",
-  "ash", "csh", "ksh", "tcsh",
-]
-decision = "deny"
-priority = 900
-deny_message = "Shell wrappers are not allowed in constrained mode."
-
-# --- 7. The Command Runners (Prevents Masquerading) ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = [
-  "env", "sudo", "su", "nohup", "timeout", "watch", "time",
-  "eval", "exec", "command", "builtin", "type", "hash",
-]
-decision = "deny"
-priority = 900
-deny_message = "Command runners are not allowed in constrained mode."
-
-# --- 8. The Multiplexers ---
-[[rule]]
-toolName = "run_shell_command"
-commandPrefix = ["xargs", "parallel"]
-decision = "deny"
-priority = 900
-deny_message = "Multiplexers are not allowed in constrained mode."
-
-# --- 9. Framework Tool Blocks ---
-[[rule]]
-toolName = "grep_search"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's search tool instead."
-
-[[rule]]
-toolName = "glob"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-
-[[rule]]
-toolName = "read_many_files"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's LSP tools for code navigation."
-
-[[rule]]
-toolName = "list_directory"
-decision = "deny"
-priority = 900
-deny_message = "Use Catenary's list_directory tool instead."
-</code></pre>
-<p>Then add the MCP server to <code>.gemini/settings.json</code>:</p>
-<pre><code class="language-json">{
-  "mcpServers": {
-    "catenary": {
-      "command": "catenary"
-    }
-  }
-}
-</code></pre>
-<p><strong>Alternative: constrained-bash hook.</strong> Instead of the policy engine, you can
-use the same <code>scripts/constrained_bash.py</code> script from the repo with Gemini’s
-<code>BeforeTool</code> hook system.</p>
 <p><strong>Install:</strong></p>
 <pre><code class="language-bash">cp /path/to/catenary/scripts/constrained_bash.py ~/.gemini/hooks/constrained_bash.py
 chmod +x ~/.gemini/hooks/constrained_bash.py
@@ -919,6 +790,11 @@ chmod +x ~/.gemini/hooks/constrained_bash.py
         ]
       }
     ]
+  },
+  "mcpServers": {
+    "catenary": {
+      "command": "catenary"
+    }
   }
 }
 </code></pre>
@@ -950,39 +826,16 @@ chmod +x ~/.gemini/hooks/constrained_bash.py
 (user)</p>
 <p><strong>Recommended: Hook-based integration.</strong> Claude Code’s native <code>Read</code>, <code>Edit</code>,
 and <code>Write</code> tools handle file I/O with inline diffs and syntax highlighting.
-Catenary provides file locking and LSP diagnostics via <code>PreToolUse</code> /
-<code>PostToolUse</code> hooks — the lock is held through the full edit→diagnostics cycle.</p>
+Catenary provides LSP diagnostics via a <code>PostToolUse</code> hook.</p>
 <pre><code class="language-json">{
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary acquire --format=claude"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary release --format=claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary release --grace 0"
+            "command": "catenary notify --format=claude"
           }
         ]
       }
@@ -995,10 +848,9 @@ Catenary provides file locking and LSP diagnostics via <code>PreToolUse</code> /
   }
 }
 </code></pre>
-<p>The <code>catenary release</code> command reads the hook’s JSON from stdin, finds the
-running Catenary session for the workspace, returns any LSP diagnostics,
-records the file’s mtime, and releases the lock. It exits silently on any
-error so it never blocks Claude Code’s flow.</p>
+<p>The <code>catenary notify</code> command reads the hook’s JSON from stdin, finds the
+running Catenary session for the workspace, and returns any LSP diagnostics.
+It exits silently on any error so it never blocks Claude Code’s flow.</p>
 <p><strong>Alternative: Constrained mode.</strong> Keep Claude Code’s native <code>Read</code>, <code>Edit</code>,
 <code>Write</code>, and <code>Bash</code> tools but block text-scanning commands to force LSP-first
 navigation. The repo includes a hook script that implements an allowlist:
@@ -1020,7 +872,7 @@ chmod +x /path/to/catenary/scripts/constrained_bash.py
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/hooks/constrained_bash.py"
+            "command": "$HOME/.claude/hooks/constrained_bash.py --format=claude"
           }
         ]
       }
@@ -1028,7 +880,7 @@ chmod +x /path/to/catenary/scripts/constrained_bash.py
   }
 }
 </code></pre>
-<p>The script provides specific guidance per command (<code>Use Catenary's search tool instead.</code>, <code>Use the Read tool instead.</code>, etc.) so the model corrects course
+<p>The script provides specific guidance per command (<code>Use Catenary's grep tool instead.</code>, <code>Use the Read tool instead.</code>, etc.) so the model corrects course
 immediately rather than attempting workarounds.</p>
 <p><strong>Troubleshooting:</strong></p>
 <ul>
@@ -1058,13 +910,13 @@ correctly — the relabeling is cosmetic only.</p>
 <p>This keeps <code>Bash</code> available for build/test/git commands while blocking every
 path that would let the model fall back to text scanning. The model uses:</p>
 <ul>
-<li><strong>Catenary LSP tools</strong> for navigation (<code>search</code>, <code>hover</code>, <code>definition</code>, etc.)</li>
-<li><strong>Catenary <code>list_directory</code></strong> for directory browsing (replaces <code>ls</code>, <code>tree</code>, <code>find</code>)</li>
-<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary release</code> hook for diagnostics)</li>
+<li><strong>Catenary <code>grep</code></strong> for content discovery (symbols, references, text matches)</li>
+<li><strong>Catenary <code>glob</code></strong> for directory browsing (replaces <code>ls</code>, <code>tree</code>, <code>find</code>)</li>
+<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary notify</code> hook for diagnostics)</li>
 <li><strong>Claude Code <code>Bash</code></strong> for build, test, and git commands only</li>
 </ul>
 <h2 id="experiment-results"><a class="header" href="#experiment-results">Experiment Results</a></h2>
-<h3 id="current-policy-engine-gemini--deny-list-claude"><a class="header" href="#current-policy-engine-gemini--deny-list-claude">Current: Policy Engine (Gemini) + Deny List (Claude)</a></h3>
+<h3 id="current-constrained_bashpy-hook-both-hosts"><a class="header" href="#current-constrained_bashpy-hook-both-hosts">Current: <code>constrained_bash.py</code> hook (both hosts)</a></h3>
 <p>Validated 2026-02-17.</p>
 <div class="table-wrapper">
 <table>
@@ -1072,7 +924,7 @@ path that would let the model fall back to text scanning. The model uses:</p>
 <tr><th>Test</th><th>Gemini CLI</th><th>Claude Code</th></tr>
 </thead>
 <tbody>
-<tr><td>Restriction method</td><td>Policy Engine (<code>deny</code>)</td><td><code>permissions.deny</code> list + block <code>Grep/Glob/Task</code></td></tr>
+<tr><td>Restriction method</td><td><code>BeforeTool</code> hook</td><td><code>PreToolUse</code> hook</td></tr>
 <tr><td>MCP tools discovered</td><td>✓</td><td>✓</td></tr>
 <tr><td>Text scanning blocked</td><td>✓</td><td>✓</td></tr>
 <tr><td>Model adapts gracefully</td><td>✓ (immediately)</td><td>✓ (immediately)</td></tr>
@@ -1080,12 +932,20 @@ path that would let the model fall back to text scanning. The model uses:</p>
 </tbody>
 </table>
 </div>
-<p>The policy engine approach gives models clear feedback on <em>why</em> a tool is
-blocked and <em>what to use instead</em> (via <code>deny_message</code>). This eliminates the
-thrashing seen with earlier approaches — models go straight to Catenary tools
-on the first turn without attempting workarounds.</p>
+<p>Both hosts use the same <code>constrained_bash.py</code> script (with <code>--format=claude</code>
+or <code>--format=gemini</code>). The hook approach was chosen over the hosts’ native
+permission systems (Gemini’s Policy Engine, Claude Code’s <code>permissions.deny</code>
+list) because the Python script can make context-sensitive decisions — for
+example, allowing pipeline-safe commands like <code>head</code>, <code>tail</code>, <code>sed</code>, and <code>awk</code>
+mid-pipeline (reading from stdin) while blocking them at the start of a command
+(reading from files). Static deny lists cannot distinguish these cases.</p>
 <p>Tested with <code>gemini-3-flash-preview</code> and <code>claude-opus-4-6</code>. Both adapted
 on the first prompt with zero fallback attempts.</p>
+<h3 id="historical-policy-engine-gemini--deny-list-claude"><a class="header" href="#historical-policy-engine-gemini--deny-list-claude">Historical: Policy Engine (Gemini) + Deny List (Claude)</a></h3>
+<p>Validated 2026-02-17, superseded by the hook approach above.</p>
+<p>Used Gemini’s Policy Engine (<code>deny</code> rules in TOML) and Claude Code’s
+<code>permissions.deny</code> list. Both gave clear feedback but lacked the flexibility
+to allow context-dependent exceptions (e.g. pipeline-safe commands).</p>
 <h3 id="historical-toolscore-allowlist-gemini-deprecated"><a class="header" href="#historical-toolscore-allowlist-gemini-deprecated">Historical: <code>tools.core</code> Allowlist (Gemini, deprecated)</a></h3>
 <p>Validated 2026-02-06.</p>
 <p>The original Gemini approach used <code>tools.core</code> to allowlist only non-file
@@ -1095,34 +955,43 @@ try several workarounds (WebFetch for local files, sub-agent delegation)
 before settling on Catenary tools. The policy engine approach replaced this
 by giving explicit deny messages instead of silently removing tools.</p>
 <h2 id="catenary-tool-coverage"><a class="header" href="#catenary-tool-coverage">Catenary Tool Coverage</a></h2>
-<p>Catenary provides LSP intelligence and directory browsing:</p>
+<p>Catenary exposes two MCP tools plus post-edit diagnostics via hooks:</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Tool</th><th>Category</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td><code>list_directory</code></td><td>File I/O</td><td>Files, dirs, symlinks</td></tr>
-<tr><td><code>search</code></td><td>LSP</td><td>Symbols + semantic references + text matches</td></tr>
-<tr><td><code>codebase_map</code></td><td>LSP</td><td>File tree with symbols</td></tr>
-<tr><td><code>document_symbols</code></td><td>LSP</td><td>File structure</td></tr>
-<tr><td><code>diagnostics</code></td><td>LSP</td><td>Errors, warnings</td></tr>
-<tr><td>…</td><td>LSP</td><td><a href="#available-tools">Full list</a></td></tr>
+<tr><td><code>grep</code></td><td>LSP+text</td><td>Symbols, references, hover, implementations, text heatmap</td></tr>
+<tr><td><code>glob</code></td><td>File I/O</td><td>Files, dirs, symlinks, symbol outlines</td></tr>
+<tr><td>hooks</td><td>LSP</td><td>Post-edit diagnostics and code actions</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="standalone-cli-commands"><a class="header" href="#standalone-cli-commands">Standalone CLI Commands</a></h3>
+<p>These commands are not MCP tools — they are run directly from the terminal.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>catenary list</code></td><td>List active and historical sessions</td></tr>
+<tr><td><code>catenary monitor &lt;id&gt;</code></td><td>Follow events from a session in real time</td></tr>
+<tr><td><code>catenary query</code></td><td>Query events from the database (filterable by session, time, kind, or raw SQL)</td></tr>
+<tr><td><code>catenary gc</code></td><td>Garbage-collect old session data (by age, dead sessions, or specific session)</td></tr>
+<tr><td><code>catenary doctor</code></td><td>Verify language servers and hook installation</td></tr>
 </tbody>
 </table>
 </div>
 <p>File I/O is handled by the host tool’s native file operations. Catenary
-provides post-edit diagnostics via the <code>catenary release</code> hook.</p>
+provides post-edit diagnostics via the <code>catenary notify</code> hook.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <h3 id="lsp-dependency"><a class="header" href="#lsp-dependency">LSP Dependency</a></h3>
-<p>Some operations require LSP:</p>
-<ul>
-<li>Find references (no grep fallback currently)</li>
-<li>Rename symbol</li>
-<li>Code actions</li>
-</ul>
-<p>If LSP is unavailable for a language, these tools return errors. <code>search</code> has
-a grep fallback for basic text matching when no LSP server covers the file.</p>
+<p>Semantic enrichment in <code>grep</code> (references, implementations, type cross-refs)
+requires a running LSP server. When no LSP server covers a file, <code>grep</code> falls
+back to text-only matching. Code actions are delivered via hooks and also
+require LSP.</p>
 <h2 id="see-also"><a class="header" href="#see-also">See Also</a></h2>
 <ul>
 <li><a href="#archive-cli-design">Archive: CLI Design</a> — Original custom CLI design
@@ -1239,10 +1108,57 @@ blocked, starved, and progress-explained ticks are free waits.</p>
 <p><code>didSave</code> is gated on <code>textDocumentSync.save</code> from <code>ServerCapabilities</code>. Only
 servers that advertise save support receive <code>textDocument/didSave</code>.</p>
 <p>This mechanism applies to the paths that return diagnostics after a change:
-the <code>catenary release</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
+the <code>catenary notify</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
 tool. Request/response tools (<code>definition</code>, <code>document_symbols</code>) do not need
 it — their results come directly from the server response, not from the cache.</p>
 <p>See <a href="#wait-model">Wait Model</a> for full design details.</p>
+<h2 id="state-management"><a class="header" href="#state-management">State Management</a></h2>
+<p>All persistent state lives in a single SQLite database at
+<code>~/.local/state/catenary/catenary.db</code>. WAL mode is enabled for concurrent
+read access (the TUI and CLI commands can query while the MCP server writes).</p>
+<h3 id="schema"><a class="header" href="#schema">Schema</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Table</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sessions</code></td><td>Session metadata (ID, PID, display name, client info, timestamps, alive flag)</td></tr>
+<tr><td><code>workspace_roots</code></td><td>Workspace root paths per session</td></tr>
+<tr><td><code>events</code></td><td>Session events (tool calls, diagnostics, server state changes, etc.)</td></tr>
+<tr><td><code>language_servers</code></td><td>Per-session LSP server state</td></tr>
+<tr><td><code>filter_history</code></td><td>TUI filter patterns (per-workspace)</td></tr>
+<tr><td><code>root_sync_state</code></td><td>Transcript offset and discovered roots for <code>sync-roots</code></td></tr>
+<tr><td><code>meta</code></td><td>Schema version tracking</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="connection-owners"><a class="header" href="#connection-owners">Connection owners</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Process</th><th>Lifetime</th></tr>
+</thead>
+<tbody>
+<tr><td>MCP server</td><td>Process lifetime (shared via <code>Arc&lt;Mutex&lt;Connection&gt;&gt;</code>)</td></tr>
+<tr><td>CLI hooks (<code>notify</code>, <code>sync-roots</code>)</td><td>Single command invocation</td></tr>
+<tr><td>CLI commands (<code>list</code>, <code>monitor</code>, <code>query</code>, <code>gc</code>)</td><td>Single command invocation</td></tr>
+<tr><td>TUI dashboard</td><td>Dashboard lifetime</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="cli-commands"><a class="header" href="#cli-commands">CLI commands</a></h3>
+<p><code>catenary query</code> provides ad-hoc event querying for debugging and bug reports:</p>
+<pre><code class="language-bash">catenary query --session 029ba740 --since 1h
+catenary query --kind diagnostics --since today
+catenary query --search "hover" --format json
+catenary query --sql "SELECT * FROM events WHERE payload LIKE '%timeout%'"
+</code></pre>
+<p><code>catenary gc</code> manages data retention:</p>
+<pre><code class="language-bash">catenary gc --older-than 7d
+catenary gc --dead
+catenary gc --session 029ba740
+</code></pre>
 <h2 id="root-synchronization"><a class="header" href="#root-synchronization">Root Synchronization</a></h2>
 <p>When the MCP client sends a <code>notifications/roots/list_changed</code> notification,
 Catenary:</p>
@@ -1321,18 +1237,12 @@ session lifetime — protocol changes require a fresh session.</p>
 <p>Inside <code>plugins/catenary/</code>:</p>
 <ul>
 <li><strong><code>.mcp.json</code></strong> — declares the MCP server (<code>catenary</code> command).</li>
-<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics, root sync, and
-file locking:
+<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics and root sync:
 <ul>
 <li><code>PreToolUse</code> (all tools): runs <code>catenary sync-roots</code> to pick up <code>/add-dir</code>
 workspace additions and directory removals.</li>
-<li><code>PreToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary acquire</code> to
-serialize concurrent file access across agents.</li>
-<li><code>PostToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary release</code>
-which handles the full post-tool pipeline — diagnostics notify, mtime
-tracking, then lock release with grace period.</li>
-<li><code>PostToolUseFailure</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs
-<code>catenary release --grace 0</code> for immediate lock release on failure.</li>
+<li><code>PostToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary notify</code>
+to return LSP diagnostics after file operations.</li>
 </ul>
 </li>
 <li><strong><code>config.example.toml</code></strong> — example Catenary configuration.</li>
@@ -1345,25 +1255,21 @@ tracking, then lock release with grace period.</li>
 <ul>
 <li><strong><code>gemini-extension.json</code></strong> — manifest declaring the MCP server. Does <strong>not</strong>
 contain hooks (Gemini CLI ignores hooks defined in the manifest).</li>
-<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics and file locking:
+<li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics:
 <ul>
-<li><code>BeforeTool</code> on <code>read_file|write_file|replace</code>: runs
-<code>catenary acquire --format=gemini</code> to serialize concurrent file access.</li>
 <li><code>AfterTool</code> on <code>read_file|write_file|replace</code>: runs
-<code>catenary release --format=gemini</code> which handles the full post-tool
-pipeline — diagnostics notify, mtime tracking, then lock release.</li>
+<code>catenary notify --format=gemini</code> to return LSP diagnostics after file
+operations.</li>
 </ul>
 </li>
 </ul>
 <h2 id="hook-contracts"><a class="header" href="#hook-contracts">Hook Contracts</a></h2>
-<p>All hook commands (<code>catenary acquire</code>, <code>catenary release</code>, <code>catenary sync-roots</code>)
-read hook JSON from stdin. They silently succeed on any error to avoid breaking
-the host CLI’s flow.</p>
-<h3 id="catenary-acquire"><a class="header" href="#catenary-acquire"><code>catenary acquire</code></a></h3>
-<p>Triggered before file reads or edits (Claude Code <code>PreToolUse</code>, Gemini
-<code>BeforeTool</code>). Acquires a file-level advisory lock, blocking until the lock is
-available or the timeout expires. This serializes concurrent access to the same
-file across multiple agents.</p>
+<p>All hook commands (<code>catenary notify</code>, <code>catenary sync-roots</code>) read hook JSON from
+stdin. They silently succeed on any error to avoid breaking the host CLI’s flow.</p>
+<h3 id="catenary-notify"><a class="header" href="#catenary-notify"><code>catenary notify</code></a></h3>
+<p>Triggered after file reads or edits (Claude Code <code>PostToolUse</code>, Gemini
+<code>AfterTool</code>). Connects to the session’s notify socket and returns LSP
+diagnostics to stdout.</p>
 <p><strong>Fields consumed from hook JSON:</strong></p>
 <div class="table-wrapper">
 <table>
@@ -1371,10 +1277,8 @@ file across multiple agents.</p>
 <tr><th>Field</th><th>Used for</th></tr>
 </thead>
 <tbody>
-<tr><td><code>session_id</code></td><td>Lock owner identity (primary key)</td></tr>
-<tr><td><code>agent_id</code></td><td>Lock owner identity (appended if present)</td></tr>
-<tr><td><code>tool_input.file_path</code> or <code>tool_input.file</code></td><td>File to lock</td></tr>
-<tr><td><code>cwd</code></td><td>Resolving relative file paths and finding the session for monitor events</td></tr>
+<tr><td><code>tool_input.file_path</code> or <code>tool_input.file</code></td><td>File to check for diagnostics</td></tr>
+<tr><td><code>cwd</code></td><td>Resolving relative file paths and finding the session</td></tr>
 </tbody>
 </table>
 </div>
@@ -1385,60 +1289,19 @@ file across multiple agents.</p>
 <tr><th>Flag</th><th>Required</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--timeout</code></td><td>no (default 180)</td><td>Seconds to wait before giving up</td></tr>
 <tr><td><code>--format</code></td><td>yes</td><td>Output format (<code>claude</code> or <code>gemini</code>)</td></tr>
 </tbody>
 </table>
 </div>
-<p><strong>Output:</strong> silent on success. On timeout, returns JSON with
-<code>permissionDecision: "deny"</code>. If the file was modified since the owner’s last
-read, returns JSON with <code>additionalContext</code> warning.</p>
-<h3 id="catenary-release"><a class="header" href="#catenary-release"><code>catenary release</code></a></h3>
-<p>Triggered after file reads or edits (Claude Code <code>PostToolUse</code>, Gemini
-<code>AfterTool</code>). Runs the full post-tool pipeline:</p>
-<ol>
-<li><strong>Diagnostics notify</strong> — connects to the session’s notify socket and returns
-LSP diagnostics to stdout (when <code>--format</code> is provided).</li>
-<li><strong>Track read</strong> — records the file’s mtime so future <code>acquire</code> calls can
-detect external modifications (when <code>--format</code> is provided).</li>
-<li><strong>Lock release</strong> — releases the lock with a grace period, allowing the same
-agent to re-acquire without contention during diagnostics→fix cycles.</li>
-</ol>
-<p>When <code>--format</code> is omitted (failure path, e.g. <code>--grace 0</code>), skips diagnostics
-and track-read, just releasing the lock immediately.</p>
-<p><strong>Fields consumed from hook JSON:</strong></p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Field</th><th>Used for</th></tr>
-</thead>
-<tbody>
-<tr><td><code>session_id</code></td><td>Lock owner identity</td></tr>
-<tr><td><code>agent_id</code></td><td>Lock owner identity (appended if present)</td></tr>
-<tr><td><code>tool_input.file_path</code> or <code>tool_input.file</code></td><td>File to unlock</td></tr>
-<tr><td><code>cwd</code></td><td>Resolving relative file paths and finding the session for diagnostics/monitor events</td></tr>
-</tbody>
-</table>
-</div>
-<p><strong>Flags:</strong></p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Flag</th><th>Required</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--grace</code></td><td>no (default 30)</td><td>Seconds before the lock expires</td></tr>
-<tr><td><code>--format</code></td><td>no</td><td>Output format (<code>claude</code> or <code>gemini</code>). When set, runs diagnostics and track-read before releasing</td></tr>
-</tbody>
-</table>
-</div>
+<p><strong>Output:</strong> silent when no diagnostics. Otherwise returns JSON with
+<code>additionalContext</code> containing the diagnostic text.</p>
 <h3 id="catenary-sync-roots"><a class="header" href="#catenary-sync-roots"><code>catenary sync-roots</code></a></h3>
 <p>Triggered before each tool use (Claude Code only). Scans the Claude Code
 transcript for <code>/add-dir</code> additions and directory removals, then sends the full
 workspace root set to the running Catenary session. The server diffs against its
 current state, applying both additions and removals to LSP clients and the search
 index.</p>
-<p>State is persisted in <code>known_roots.json</code> (inside the session directory) to track
+<p>State is persisted in the <code>root_sync_state</code> table in the SQLite database to track
 the transcript byte offset and the full discovered root set across invocations.</p>
 <p><strong>Fields consumed from hook JSON:</strong></p>
 <div class="table-wrapper">
@@ -1929,7 +1792,7 @@ text-based file scanning.</p>
 the following to your system prompt or agent instructions to prevent the model
 from wasting tokens discovering the deny list through trial and error:</p>
 <pre><code>Text-scanning shell commands (grep, find, ls, cat, etc.) are denied.
-Use Catenary's LSP tools for navigation and list_directory for browsing.
+Use Catenary's grep tool for search and glob tool for browsing.
 Workarounds will be added to the deny list.
 </code></pre>
 <p>If Catenary is running <strong>alongside built-in tools</strong>, agents will default to
@@ -1941,19 +1804,14 @@ When exploring or navigating code, prefer Catenary's LSP tools over text search:
 
 | Task | Use | Instead of |
 |------|-----|------------|
-| Find where something is defined | `definition` | grep/ripgrep |
-| Find all usages of a symbol | `search` | grep/ripgrep |
-| Find a class/function by name | `search` | grep/glob patterns |
-| Understand a file's structure | `document_symbols` | Reading entire files |
-| Find implementations of interface | `implementation` | grep for impl blocks |
-| Rename a symbol safely | `rename` | Find/replace with grep |
-| Check for errors after edits | `diagnostics` | Running compiler |
-| Explore unfamiliar codebase | `codebase_map` | Multiple grep/read cycles |
+| Find symbols, references, text matches | `grep` | grep/ripgrep |
+| Browse files and directories | `glob` | ls/find/tree |
+| Check for errors after edits | hooks | Running compiler |
 
 ### Why This Matters
 
 - A single 500-line file read costs ~2000-4000 tokens
-- A `search` call costs ~200-500 tokens and returns symbols + references + text matches
+- A `grep` call costs ~200-500 tokens and returns symbols + references + text matches
 - One file read ≈ 10-20 targeted LSP queries
 - Reducing unnecessary reads prevents context compression and re-reads
 
@@ -1979,20 +1837,21 @@ re-read. Each cycle costs tokens and risks hitting rate limits mid-task.</p>
 Instead of reading a 500-line file to find a function’s type signature, ask the
 language server directly.</p>
 <h2 id="when-to-use-lsp-vs-native-file-tools"><a class="header" href="#when-to-use-lsp-vs-native-file-tools">When to Use LSP vs Native File Tools</a></h2>
-<p>Catenary provides LSP tools and <code>list_directory</code>. File reading and editing is
-handled by the host tool’s native file operations (e.g. Claude Code’s <code>Read</code>,
-<code>Edit</code>, <code>Write</code>). The <code>catenary release</code> hook provides post-edit LSP diagnostics
-so you immediately see any errors introduced by changes.</p>
-<p><strong>Use LSP tools</strong> for:</p>
+<p>Catenary provides two MCP tools (<code>grep</code> and <code>glob</code>) plus post-edit diagnostics
+via hooks. File reading and editing is handled by the host tool’s native file
+operations (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). The <code>catenary notify</code>
+hook provides post-edit LSP diagnostics so you immediately see any errors
+introduced by changes.</p>
+<p><strong>Use Catenary tools</strong> for:</p>
 <ul>
-<li>Finding definitions, references, and symbols</li>
-<li>Understanding file structure (document_symbols)</li>
-<li>Checking errors after changes (diagnostics)</li>
+<li>Finding symbols, references, and text matches (<code>grep</code>)</li>
+<li>Browsing files and directory structure (<code>glob</code>)</li>
+<li>Post-edit diagnostics (automatic via hooks)</li>
 </ul>
 <p><strong>Use native file tools</strong> for:</p>
 <ul>
 <li>Reading implementation logic (not just signatures)</li>
-<li>Searching comments or string literals (<code>search</code> includes a file heatmap)</li>
+<li>Searching comments or string literals (<code>grep</code> includes a file heatmap)</li>
 <li>Config files or non-code content</li>
 <li>Writing and editing code (diagnostics returned via notify hook)</li>
 </ul>
@@ -2008,19 +1867,18 @@ so you immediately see any errors introduced by changes.</p>
 </ol>
 <p><strong>Efficient approach:</strong></p>
 <ol>
-<li><code>search</code> for “auth” — returns symbols, semantic references, and text matches</li>
-<li><code>definition</code> to jump to the specific handler</li>
+<li><code>grep</code> for “auth” — returns symbols, semantic references, and text matches</li>
+<li><code>grep</code> for the specific handler — definition and type info included in results</li>
 <li>Read the specific function you need to modify</li>
 <li>Edit to make the change — diagnostics returned via notify hook</li>
 </ol>
 <h2 id="codebase-orientation"><a class="header" href="#codebase-orientation">Codebase Orientation</a></h2>
 <p>When first exploring an unfamiliar codebase:</p>
 <pre><code># Get project structure with function/class names
-codebase_map with include_symbols: true
+glob with pattern: "**" and include_symbols: true
 
 # Then drill down with targeted queries
-search for specific components
-document_symbols for file structure
+grep for specific components
 
 # Read implementation when needed
 Read the specific code you need to understand
@@ -2035,10 +1893,9 @@ Read the specific code you need to understand
 </thead>
 <tbody>
 <tr><td>Read a 500-line file</td><td>~2000-4000</td></tr>
-<tr><td><code>search</code> (symbols + references + heatmap)</td><td>~200-500</td></tr>
-<tr><td><code>definition</code> response</td><td>~30-100</td></tr>
-<tr><td><code>document_symbols</code></td><td>~200-800</td></tr>
-<tr><td><code>codebase_map</code> (budget: 200)</td><td>~800-1000</td></tr>
+<tr><td><code>grep</code> (symbols + references + heatmap)</td><td>~200-500</td></tr>
+<tr><td><code>glob</code> (file listing)</td><td>~200-800</td></tr>
+<tr><td><code>glob</code> with symbols (budget: 200)</td><td>~800-1000</td></tr>
 </tbody>
 </table>
 </div>
@@ -2050,64 +1907,41 @@ Read the specific code you need to understand
 use a targeted LSP query.</p>
 </li>
 <li>
-<p><strong>Structure before content.</strong> Use <code>document_symbols</code> or <code>codebase_map</code> to
-understand organization before reading implementation.</p>
+<p><strong>Structure before content.</strong> Use <code>glob</code> with symbols to understand
+organization before reading implementation.</p>
 </li>
 <li>
-<p><strong>Search before read.</strong> Use <code>search</code> to find symbols, references, and
+<p><strong>Search before read.</strong> Use <code>grep</code> to find symbols, references, and
 matches before reading source files.</p>
 </li>
 <li>
-<p><strong>References are precise.</strong> <code>find_references</code> finds actual usages,
-not text matches. No false positives from comments or strings.</p>
+<p><strong>References are precise.</strong> <code>grep</code> enriches results with semantic
+references — actual usages, not text matches.</p>
 </li>
 <li>
 <p><strong>Save reads for logic.</strong> Only read files when you need to understand
 <em>how</em> something works, not <em>what</em> it is or <em>where</em> it lives.</p>
 </li>
 <li>
-<p><strong>Edit with feedback.</strong> The <code>catenary release</code> hook returns LSP diagnostics
+<p><strong>Edit with feedback.</strong> The <code>catenary notify</code> hook returns LSP diagnostics
 after every edit, so you immediately see any errors introduced.</p>
 </li>
 </ol>
-<h2 id="release-hook"><a class="header" href="#release-hook">Release Hook</a></h2>
-<p>Catenary provides post-edit LSP diagnostics, mtime tracking, and lock release
-via the <code>catenary release</code> command, designed for use as a <code>PostToolUse</code> hook
-in Claude Code.</p>
+<h2 id="notify-hook"><a class="header" href="#notify-hook">Notify Hook</a></h2>
+<p>Catenary provides post-edit LSP diagnostics via the <code>catenary notify</code> command,
+designed for use as a <code>PostToolUse</code> hook in Claude Code.</p>
 <p>The recommended setup uses the Catenary plugin (<code>catenary@catenary</code>), which
-registers <code>catenary acquire</code> / <code>catenary release</code> hooks automatically. For
-manual configuration, add to <code>.claude/settings.json</code>:</p>
+registers the <code>catenary notify</code> hook automatically. For manual configuration,
+add to <code>.claude/settings.json</code>:</p>
 <pre><code class="language-json">{
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary acquire --format=claude"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "catenary release --format=claude"
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary release --grace 0"
+            "command": "catenary notify --format=claude"
           }
         ]
       }
@@ -2115,10 +1949,9 @@ manual configuration, add to <code>.claude/settings.json</code>:</p>
   }
 }
 </code></pre>
-<p>The <code>release</code> hook reads the <code>PostToolUse</code> JSON from stdin, finds the running
-Catenary session for the workspace, runs LSP diagnostics, records the file’s
-mtime, and releases the file lock. It exits silently on any error so it never
-blocks the host tool’s flow.</p>
+<p>The <code>notify</code> hook reads the <code>PostToolUse</code> JSON from stdin, finds the running
+Catenary session for the workspace, and returns LSP diagnostics. It exits
+silently on any error so it never blocks the host tool’s flow.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="wait-model"><a class="header" href="#wait-model">Wait Model</a></h1>
 <p>Catenary’s diagnostics contract: after an agent edits a file, Catenary delivers
@@ -2435,8 +2268,8 @@ servers, and LSP already provides the signals needed (version, progress).</p>
 </table>
 </div>
 <h3 id="4-workspace-edit-failures"><a class="header" href="#4-workspace-edit-failures">4. Workspace Edit Failures</a></h3>
-<p>LSP servers propose workspace edits (via rename, code actions, formatting). These edits contain URIs, byte ranges, and replacement text — all untrusted.</p>
-<p><strong>Design decision:</strong> Catenary does not apply workspace edits to the filesystem. LSP tools (<code>rename</code>, <code>apply_quickfix</code>, <code>formatting</code>) return proposed edits as structured text. The MCP client reviews and applies them using its own editing tools, or via Catenary’s <code>edit_file</code> tool which validates paths against workspace roots.</p>
+<p>LSP servers propose workspace edits (via code actions, formatting). These edits contain URIs, byte ranges, and replacement text — all untrusted.</p>
+<p><strong>Design decision:</strong> Catenary does not apply workspace edits to the filesystem. Code actions are delivered via the post-edit diagnostics hook as structured text. The agent reviews them and applies fixes using the host’s native editing tools.</p>
 <p>This eliminates an entire class of failures:</p>
 <div class="table-wrapper">
 <table>
@@ -2444,9 +2277,9 @@ servers, and LSP already provides the signals needed (version, progress).</p>
 <tr><th>Failure</th><th>Trigger</th><th>Resolution</th></tr>
 </thead>
 <tbody>
-<tr><td>Edit targets file outside workspace</td><td>Path traversal in URI</td><td>MCP client controls file writes, not the LSP</td></tr>
-<tr><td>Overlapping edit ranges</td><td>Server bug</td><td>MCP client applies edits individually with full file context</td></tr>
-<tr><td>Edit with wrong encoding offsets</td><td>Encoding mismatch</td><td>MCP client works with text, not byte offsets</td></tr>
+<tr><td>Edit targets file outside workspace</td><td>Path traversal in URI</td><td>Host tool controls file writes, not the LSP</td></tr>
+<tr><td>Overlapping edit ranges</td><td>Server bug</td><td>Host tool applies edits individually with full file context</td></tr>
+<tr><td>Edit with wrong encoding offsets</td><td>Encoding mismatch</td><td>Host tool works with text, not byte offsets</td></tr>
 <tr><td>ResourceOp (create/rename/delete)</td><td>Code action side effects</td><td>Surfaced as proposed operations; MCP client decides</td></tr>
 </tbody>
 </table>
@@ -2515,7 +2348,7 @@ servers, and LSP already provides the signals needed (version, progress).</p>
 <p><strong>Catenary never crashes</strong> due to LSP server output. All deserialization is fallible. All <code>unwrap()</code> on LSP data is forbidden.</p>
 </li>
 <li>
-<p><strong>Catenary never modifies the filesystem based on LSP data.</strong> LSP-proposed edits (rename, code actions, formatting) are returned as structured text. Catenary’s <code>edit_file</code> and <code>write_file</code> tools validate all paths against workspace roots independently of LSP data — the LSP never gets direct write access.</p>
+<p><strong>Catenary never modifies the filesystem based on LSP data.</strong> LSP-proposed edits (code actions, formatting) are returned as structured text via hooks. The host tool controls all file writes — the LSP never gets direct write access.</p>
 </li>
 <li>
 <p><strong>Catenary never hangs indefinitely.</strong> All LSP requests have bounded timeouts. Diagnostics waits use activity-based tracking with nudge-and-retry (bounded by attempt count). Reader task failures don’t block the MCP server.</p>
@@ -2682,19 +2515,6 @@ version = "0.1.0"
 <ul>
 <li>Code action titles are returned as data</li>
 <li>No code action text is executed as a command</li>
-</ul>
-<h3 id="42-workspace-edit-preview-content"><a class="header" href="#42-workspace-edit-preview-content">4.2 Workspace edit preview content</a></h3>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>// A rename from `old` to a crafted new name
-fn old() {}
-<span class="boring">}</span></code></pre>
-<p><strong>Trigger:</strong> AI agent calls <code>rename</code> with <code>new_name</code> set to <code>"; rm -rf / #</code>.</p>
-<p><strong>Expected:</strong> The rename response shows the proposed text replacement. The replacement text is returned as a string, never executed.</p>
-<p><strong>What to verify:</strong></p>
-<ul>
-<li>Shell metacharacters in rename targets are not interpreted</li>
-<li>The edit preview is data, not a command</li>
 </ul>
 <hr>
 <h2 id="5-resource-exhaustion"><a class="header" href="#5-resource-exhaustion">5. Resource Exhaustion</a></h2>
@@ -3335,7 +3155,7 @@ Options:
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="roadmap"><a class="header" href="#roadmap">Roadmap</a></h1>
-<p>Current version: <strong>v1.1.0</strong></p>
+<p>Current version: <strong>v1.4.0</strong></p>
 <h2 id="completed"><a class="header" href="#completed">Completed</a></h2>
 <h3 id="catenary-mcp-v06x--mcp-bridge-"><a class="header" href="#catenary-mcp-v06x--mcp-bridge-">catenary-mcp (v0.6.x) — MCP Bridge ✓</a></h3>
 <p>LSP tools exposed via MCP. Feature complete.</p>
@@ -3457,6 +3277,19 @@ dead or unresponsive instead of silently returning empty results</li>
 <li><input disabled="" type="checkbox" checked=""> <strong><code>denied</code> subcommands</strong> — block specific command+subcommand pairs
 in the <code>run</code> tool (e.g., <code>"git grep"</code>), takes priority over allowlist
 including <code>["*"]</code></li>
+</ul>
+<h3 id="sqlite-migration-"><a class="header" href="#sqlite-migration-">SQLite Migration ✓</a></h3>
+<p>Replaced filesystem-based session and event storage with SQLite.</p>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> Removed filesystem advisory lock system (no longer needed with
+single-agent-per-worktree workflow)</li>
+<li><input disabled="" type="checkbox" checked=""> <code>src/db.rs</code> — connection management, schema creation, migrations</li>
+<li><input disabled="" type="checkbox" checked=""> Sessions, events, workspace roots stored in
+<code>~/.local/state/catenary/catenary.db</code></li>
+<li><input disabled="" type="checkbox" checked=""> WAL mode for concurrent readers (TUI/CLI) with single writer (MCP server)</li>
+<li><input disabled="" type="checkbox" checked=""> <code>SqliteDataSource</code> for TUI dashboard</li>
+<li><input disabled="" type="checkbox" checked=""> <code>catenary query</code> — ad-hoc event querying (table, JSON, CSV output)</li>
+<li><input disabled="" type="checkbox" checked=""> <code>catenary gc</code> — data retention management</li>
 </ul>
 <h3 id="cli-integration-research-"><a class="header" href="#cli-integration-research-">CLI Integration Research ✓</a></h3>
 <p>Validated approach: use existing CLI tools (Claude Code, Gemini CLI) with

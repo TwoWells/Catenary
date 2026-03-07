@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -307,6 +307,7 @@ cargo.features = "all"
 <tbody>
 <tr><td><code>idle_timeout</code></td><td><code>300</code></td><td>Seconds before auto-closing idle documents. Set to <code>0</code> to disable.</td></tr>
 <tr><td><code>log_retention_days</code></td><td><code>7</code></td><td>Days to keep dead session logs. <code>0</code> = remove all dead sessions on startup. <code>-1</code> = retain forever.</td></tr>
+<tr><td><code>tui.capture_tool_output</code></td><td><code>false</code></td><td>Store full tool output in events for TUI detail expansion. Increases database size.</td></tr>
 </tbody>
 </table>
 </div>
@@ -353,11 +354,7 @@ alignment).</p>
 <tr><td><code>lock</code></td><td><code>\u25B6 </code> (▶)</td><td><code> </code></td><td>Lock acquired</td></tr>
 <tr><td><code>unlock</code></td><td><code>\u25C0 </code> (◀)</td><td><code> </code></td><td>Lock released</td></tr>
 <tr><td><code>tool_search</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Search tool</td></tr>
-<tr><td><code>tool_map</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Codebase map tool</td></tr>
-<tr><td><code>tool_hover</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Hover tool</td></tr>
-<tr><td><code>tool_goto</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Go-to-definition tool</td></tr>
-<tr><td><code>tool_refs</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Find references tool</td></tr>
-<tr><td><code>tool_diagnostics</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Diagnostics tool</td></tr>
+<tr><td><code>tool_glob</code></td><td><code>\u2192 </code> (→)</td><td><code> </code></td><td>Glob tool</td></tr>
 <tr><td><code>tool_default</code></td><td><code>\u2192 </code> (→)</td><td><code>\u2192 </code> (→)</td><td>Fallback for other tools</td></tr>
 </tbody>
 </table>

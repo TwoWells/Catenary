@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-383e25f5.js";
+            window.path_to_searchindex_js = "searchindex-990a00ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-cd5a037f.js"></script>
@@ -208,13 +208,13 @@ missing, hooks will silently do nothing and you will get no diagnostics.</p>
 <pre><code class="language-bash">claude plugin marketplace add MarkWells-Dev/Catenary
 claude plugin install catenary@catenary
 </code></pre>
-<p>The plugin registers the MCP server and hooks for post-edit diagnostics,
-file locking, and root sync. It requires the <code>catenary</code> binary on PATH.</p>
+<p>The plugin registers the MCP server and hooks for post-edit diagnostics
+and root sync. It requires the <code>catenary</code> binary on PATH.</p>
 <p><strong>Option 2: Manual</strong></p>
 <pre><code class="language-bash">claude mcp add catenary -- catenary
 </code></pre>
 <p>This registers the MCP server only. You will not get post-edit diagnostics
-or file locking unless you also configure hooks manually (see
+unless you also configure hooks manually (see
 <a href="cli-integration.html">CLI Integration</a>).</p>
 <h3 id="claude-desktop"><a class="header" href="#claude-desktop">Claude Desktop</a></h3>
 <p>Add to your config file:</p>
@@ -234,8 +234,8 @@ or file locking unless you also configure hooks manually (see
 <p><strong>Option 1: Extension (recommended)</strong></p>
 <pre><code class="language-bash">gemini extensions install https://github.com/MarkWells-Dev/Catenary
 </code></pre>
-<p>The extension registers the MCP server and hooks for post-edit diagnostics
-and file locking. It requires the <code>catenary</code> binary on PATH.</p>
+<p>The extension registers the MCP server and hooks for post-edit diagnostics.
+It requires the <code>catenary</code> binary on PATH.</p>
 <p><strong>Option 2: Manual</strong></p>
 <p>Add to <code>~/.gemini/settings.json</code>:</p>
 <pre><code class="language-json">{
@@ -247,8 +247,8 @@ and file locking. It requires the <code>catenary</code> binary on PATH.</p>
 }
 </code></pre>
 <p>This registers the MCP server only. You will not get post-edit diagnostics
-or file locking unless you also install the extension or configure hooks
-manually (see <a href="cli-integration.html">CLI Integration</a>).</p>
+unless you also install the extension or configure hooks manually (see
+<a href="cli-integration.html">CLI Integration</a>).</p>
 <h3 id="other-mcp-clients"><a class="header" href="#other-mcp-clients">Other MCP Clients</a></h3>
 <pre><code class="language-json">{
   "mcpServers": {
