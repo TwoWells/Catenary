@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/catenary-proc"]
+members = ["crates/catenary-proc", "crates/catenary-ts"]
 
 [package]
 name = "catenary-mcp"
@@ -35,8 +35,10 @@ mockls = []
 
 [dependencies]
 catenary-proc = { path = "crates/catenary-proc" }
+catenary-ts = { path = "crates/catenary-ts" }
 anyhow = "1.0.100"
 bytes = "1.10"
+cc = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
 config = "0.15.19"
@@ -58,6 +60,7 @@ serde_json = "1.0.149"
 similar = "2.6"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
+tree-sitter = "0.24"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 unicode-width = "0.2"
