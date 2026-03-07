@@ -54,6 +54,16 @@ impl DiagnosticFilter for RustAnalyzerFilter {
                 {
                     return false;
                 }
+                // Standalone `-W` flag attribution: "`-W clippy::...` implied by ..."
+                if trimmed.starts_with("`-W ") && trimmed.contains("implied by") {
+                    return false;
+                }
+                // Standalone override instruction: "to override `-W ...` add `#[allow(...)]`"
+                if trimmed.starts_with("to override")
+                    && (trimmed.contains("`#[allow(") || trimmed.contains("`#[warn("))
+                {
+                    return false;
+                }
                 true
             })
             .collect::<Vec<_>>()
@@ -138,6 +148,24 @@ mod tests {
     fn passthrough_for_no_version() {
         let msg = "unused variable `x`\nfor further information visit https://example.com";
         assert_eq!(filter(None, msg), msg);
+    }
+
+    #[test]
+    fn drops_standalone_w_flag_implied_by() {
+        let msg = "`-W clippy::doc-markdown` implied by `-W clippy::pedantic`";
+        assert_eq!(filter(KNOWN_VERSION, msg), "");
+    }
+
+    #[test]
+    fn drops_standalone_to_override_with_allow() {
+        let msg = "to override `-W clippy::pedantic` add `#[allow(clippy::doc_markdown)]`";
+        assert_eq!(filter(KNOWN_VERSION, msg), "");
+    }
+
+    #[test]
+    fn drops_standalone_to_override_with_warn() {
+        let msg = "to override `-D warnings` add `#[warn(clippy::doc_markdown)]`";
+        assert_eq!(filter(KNOWN_VERSION, msg), "");
     }
 
     #[test]
