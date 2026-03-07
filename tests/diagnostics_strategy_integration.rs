@@ -141,7 +141,15 @@ impl BridgeProcess {
             .read_to_string(&mut response)
             .context("read from notify socket")?;
 
-        Ok(response.trim().to_string())
+        // Unwrap NotifyResult wire protocol — return the content string
+        let trimmed = response.trim();
+        serde_json::from_str::<catenary_mcp::notify::NotifyResult>(trimmed).map_or_else(
+            |_| Ok(trimmed.to_string()),
+            |result| match result {
+                catenary_mcp::notify::NotifyResult::Content(s) => Ok(s),
+                catenary_mcp::notify::NotifyResult::Error(e) => Ok(format!("Notify error: {e}")),
+            },
+        )
     }
 }
 
@@ -167,9 +175,9 @@ fn test_diagnostics_degraded_mode() -> Result<()> {
 
     let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
-    assert!(
-        text.is_empty(),
-        "Degraded mode (no version/progress) should return no diagnostics. Got: {text}"
+    assert_eq!(
+        text, "[diagnostics unavailable]",
+        "Degraded mode (no version/progress) should return diagnostics unavailable. Got: {text}"
     );
 
     Ok(())
@@ -249,10 +257,13 @@ fn test_diagnostics_server_death() -> Result<()> {
         .call_diagnostics_via_notify(file.to_str().context("path")?)
         .unwrap_or_default();
 
-    // Should either get diagnostics (if server published before dying)
-    // or empty string. No server infrastructure messages to agent.
-    let is_acceptable =
-        text.contains("mock diagnostic") || text.is_empty() || text.contains("Notify error");
+    // Should either get diagnostics (if server published before dying),
+    // a status message, or a notify error. No raw infrastructure messages to agent.
+    let is_acceptable = text.contains("mock diagnostic")
+        || text == "[diagnostics unavailable]"
+        || text == "[no language server]"
+        || text == "[clean]"
+        || text.contains("Notify error");
 
     assert!(
         is_acceptable,
@@ -695,9 +706,11 @@ fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
 
     let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
-    assert!(
-        text.is_empty(),
-        "TokenMonitor with no diagnostics should return empty. Got: {text}"
+    // Token monitor sends didChange but server publishes nothing —
+    // wait times out, which is "checked, inconclusive".
+    assert_eq!(
+        text, "[diagnostics unavailable]",
+        "TokenMonitor with no diagnostics should return diagnostics unavailable. Got: {text}"
     );
 
     Ok(())

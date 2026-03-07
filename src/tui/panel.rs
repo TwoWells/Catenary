@@ -1176,12 +1176,12 @@ mod tests {
     // ── Expansion tests (ticket 04) ─────────────────────────────────────
 
     /// Build a diagnostic preview in the format produced by
-    /// `format_diagnostics_compact` (one `  line:col [severity] source: msg`
+    /// `format_diagnostics_compact` (one `\t:line:col [severity] source: msg`
     /// per diagnostic, joined by newlines).
     fn diag_preview(entries: &[(&str, u32, &str)]) -> String {
         entries
             .iter()
-            .map(|(sev, line, msg)| format!("  {line}:1 [{sev}] rustc: {msg}"))
+            .map(|(sev, line, msg)| format!("\t:{line}:1 [{sev}] rustc: {msg}"))
             .collect::<Vec<_>>()
             .join("\n")
     }
