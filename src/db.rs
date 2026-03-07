@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Resolve the Catenary state directory.
 ///
@@ -107,11 +107,16 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
 
     if table_exists(&conn, "meta") {
         let version = current_schema_version(&conn)?;
+        #[allow(
+            clippy::collapsible_if,
+            reason = "migration chain reads clearer with separate guards"
+        )]
         if version < SCHEMA_VERSION {
+            if version < 2 {
+                migrate_v1_to_v2(&conn)?;
+            }
             // Future migrations would go here, applied sequentially:
-            // if version < 2 { migrate_v1_to_v2(&conn)?; }
             // if version < 3 { migrate_v2_to_v3(&conn)?; }
-            let _ = version; // no migrations yet beyond v1
         }
     } else {
         create_schema(&conn)?;
@@ -143,7 +148,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '2');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -190,6 +195,49 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
          CREATE INDEX IF NOT EXISTS idx_filter_workspace ON filter_history(workspace, created_at DESC);
 
+         CREATE TABLE IF NOT EXISTS grammars (
+             scope       TEXT PRIMARY KEY,
+             file_types  TEXT NOT NULL,
+             lib_path    TEXT NOT NULL,
+             tags_path   TEXT NOT NULL,
+             repo_url    TEXT NOT NULL,
+             installed_at TEXT NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS symbols (
+             file_path   TEXT NOT NULL,
+             name        TEXT NOT NULL,
+             kind        TEXT NOT NULL,
+             line        INTEGER NOT NULL,
+             end_line    INTEGER NOT NULL,
+             scope       TEXT,
+             scope_kind  TEXT,
+             PRIMARY KEY (file_path, line)
+         );
+
+         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+
+         CREATE TABLE IF NOT EXISTS file_parse_state (
+             file_path   TEXT PRIMARY KEY,
+             mtime_ns    INTEGER NOT NULL,
+             grammar     TEXT NOT NULL REFERENCES grammars(scope)
+         );
+
+         CREATE TABLE IF NOT EXISTS snapshots (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             file_path   TEXT NOT NULL,
+             content     BLOB NOT NULL,
+             source      TEXT NOT NULL,
+             pattern     TEXT,
+             replacement TEXT,
+             count       INTEGER,
+             created_at  TEXT NOT NULL,
+             session_id  TEXT
+         );
+
+         CREATE INDEX IF NOT EXISTS idx_snapshots_file
+             ON snapshots(file_path, id DESC);
+
          CREATE TABLE IF NOT EXISTS root_sync_state (
              session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
              offset      INTEGER NOT NULL DEFAULT 0,
@@ -199,6 +247,70 @@ fn create_schema(conn: &Connection) -> Result<()> {
          COMMIT;",
     )
     .context("failed to create database schema")?;
+
+    Ok(())
+}
+
+/// Migrates the database from schema version 1 to 2.
+///
+/// Adds grammar registry, symbol index, file parse state, and snapshot tables
+/// for the `SEARCHv2` and sed features.
+///
+/// # Errors
+///
+/// Returns an error if any table creation or version update fails.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         CREATE TABLE grammars (
+             scope       TEXT PRIMARY KEY,
+             file_types  TEXT NOT NULL,
+             lib_path    TEXT NOT NULL,
+             tags_path   TEXT NOT NULL,
+             repo_url    TEXT NOT NULL,
+             installed_at TEXT NOT NULL
+         );
+
+         CREATE TABLE symbols (
+             file_path   TEXT NOT NULL,
+             name        TEXT NOT NULL,
+             kind        TEXT NOT NULL,
+             line        INTEGER NOT NULL,
+             end_line    INTEGER NOT NULL,
+             scope       TEXT,
+             scope_kind  TEXT,
+             PRIMARY KEY (file_path, line)
+         );
+
+         CREATE INDEX idx_symbols_name ON symbols(name);
+
+         CREATE TABLE file_parse_state (
+             file_path   TEXT PRIMARY KEY,
+             mtime_ns    INTEGER NOT NULL,
+             grammar     TEXT NOT NULL REFERENCES grammars(scope)
+         );
+
+         CREATE TABLE snapshots (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             file_path   TEXT NOT NULL,
+             content     BLOB NOT NULL,
+             source      TEXT NOT NULL,
+             pattern     TEXT,
+             replacement TEXT,
+             count       INTEGER,
+             created_at  TEXT NOT NULL,
+             session_id  TEXT
+         );
+
+         CREATE INDEX idx_snapshots_file
+             ON snapshots(file_path, id DESC);
+
+         UPDATE meta SET value = '2' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v1 to v2")?;
 
     Ok(())
 }
@@ -253,6 +365,10 @@ mod tests {
             "language_servers",
             "filter_history",
             "root_sync_state",
+            "grammars",
+            "symbols",
+            "file_parse_state",
+            "snapshots",
         ];
 
         for table in &expected_tables {
@@ -289,7 +405,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 1, "schema version should be 1");
+        assert_eq!(version, 2, "schema version should be 2");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -320,5 +436,249 @@ mod tests {
             .expect("failed to query foreign_keys");
 
         assert_eq!(fk, 1, "foreign keys should be enabled");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_grammar_tables_exist() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        for table in &["grammars", "symbols", "file_parse_state", "snapshots"] {
+            assert!(
+                table_exists(&conn, table),
+                "table '{table}' should exist after migration"
+            );
+        }
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_grammar_insert_and_query() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        conn.execute(
+            "INSERT INTO grammars (scope, file_types, lib_path, tags_path, repo_url, installed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "source.rust",
+                r#"["rs"]"#,
+                "/path/to/rust.so",
+                "/path/to/tags.scm",
+                "https://github.com/tree-sitter/tree-sitter-rust",
+                "2026-03-07T12:00:00Z",
+            ],
+        )
+        .expect("failed to insert grammar");
+
+        let (scope, file_types, lib_path): (String, String, String) = conn
+            .query_row(
+                "SELECT scope, file_types, lib_path FROM grammars WHERE scope = ?1",
+                ["source.rust"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("failed to query grammar");
+
+        assert_eq!(scope, "source.rust");
+        assert_eq!(file_types, r#"["rs"]"#);
+        assert_eq!(lib_path, "/path/to/rust.so");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_symbols_insert_and_query() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        conn.execute(
+            "INSERT INTO symbols (file_path, name, kind, line, end_line, scope, scope_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "src/main.rs",
+                "main",
+                "function",
+                1,
+                10,
+                None::<String>,
+                None::<String>
+            ],
+        )
+        .expect("failed to insert symbol");
+
+        conn.execute(
+            "INSERT INTO symbols (file_path, name, kind, line, end_line, scope, scope_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "src/main.rs",
+                "Config",
+                "struct",
+                12,
+                25,
+                None::<String>,
+                None::<String>
+            ],
+        )
+        .expect("failed to insert second symbol");
+
+        let mut stmt = conn
+            .prepare("SELECT file_path, name, kind, line, end_line FROM symbols WHERE name = ?1")
+            .expect("failed to prepare query");
+
+        let (file_path, name, kind, line, end_line): (String, String, String, i64, i64) = stmt
+            .query_row(["main"], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("failed to query symbol");
+
+        assert_eq!(file_path, "src/main.rs");
+        assert_eq!(name, "main");
+        assert_eq!(kind, "function");
+        assert_eq!(line, 1);
+        assert_eq!(end_line, 10);
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_file_parse_state_mtime() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        // Insert a grammar first (FK target).
+        conn.execute(
+            "INSERT INTO grammars (scope, file_types, lib_path, tags_path, repo_url, installed_at)
+             VALUES ('source.rust', '[\"rs\"]', '/lib.so', '/tags.scm', 'https://example.com', '2026-03-07T12:00:00Z')",
+            [],
+        )
+        .expect("failed to insert grammar");
+
+        conn.execute(
+            "INSERT INTO file_parse_state (file_path, mtime_ns, grammar)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params!["src/main.rs", 1_000_000_000_i64, "source.rust"],
+        )
+        .expect("failed to insert file_parse_state");
+
+        conn.execute(
+            "UPDATE file_parse_state SET mtime_ns = ?1 WHERE file_path = ?2",
+            rusqlite::params![2_000_000_000_i64, "src/main.rs"],
+        )
+        .expect("failed to update mtime");
+
+        let mtime: i64 = conn
+            .query_row(
+                "SELECT mtime_ns FROM file_parse_state WHERE file_path = ?1",
+                ["src/main.rs"],
+                |row| row.get(0),
+            )
+            .expect("failed to query mtime");
+
+        assert_eq!(mtime, 2_000_000_000);
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_file_parse_state_foreign_key() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        // Inserting file_parse_state with a non-existent grammar should fail.
+        let result = conn.execute(
+            "INSERT INTO file_parse_state (file_path, mtime_ns, grammar)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params!["src/main.rs", 1_000_000_000_i64, "source.nonexistent"],
+        );
+
+        assert!(
+            result.is_err(),
+            "inserting file_parse_state with invalid grammar should fail"
+        );
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_snapshots_insert_and_query() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        let content = b"fn main() {\n    println!(\"hello\");\n}\n";
+
+        conn.execute(
+            "INSERT INTO snapshots (file_path, content, source, pattern, replacement, count, created_at, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "src/main.rs",
+                content.as_slice(),
+                "sed",
+                "println!",
+                "eprintln!",
+                1,
+                "2026-03-07T12:00:00Z",
+                None::<String>,
+            ],
+        )
+        .expect("failed to insert snapshot");
+
+        let (id, file_path, stored_content, source): (i64, String, Vec<u8>, String) = conn
+            .query_row(
+                "SELECT id, file_path, content, source FROM snapshots WHERE file_path = ?1 ORDER BY id DESC LIMIT 1",
+                ["src/main.rs"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("failed to query snapshot");
+
+        assert!(id > 0, "snapshot id should be positive");
+        assert_eq!(file_path, "src/main.rs");
+        assert_eq!(stored_content, content);
+        assert_eq!(source, "sed");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_migration_v1_to_v2() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        // Create a v1 database manually.
+        let conn = open_at(&path).expect("open_at failed");
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+             COMMIT;",
+        )
+        .expect("failed to create v1 schema");
+        drop(conn);
+
+        // Open with migration — should upgrade to v2.
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        let version = current_schema_version(&conn).expect("failed to read schema version");
+        assert_eq!(version, 2, "schema version should be 2 after migration");
+
+        for table in &["grammars", "symbols", "file_parse_state", "snapshots"] {
+            assert!(
+                table_exists(&conn, table),
+                "table '{table}' should exist after v1→v2 migration"
+            );
+        }
     }
 }
