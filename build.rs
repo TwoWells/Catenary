@@ -23,6 +23,11 @@ fn main() {
 
     let version = git_describe().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=CATENARY_VERSION={version}");
+
+    // Expose the target triple for runtime use (e.g. cc crate in catenary install)
+    if let Ok(target) = std::env::var("TARGET") {
+        println!("cargo:rustc-env=TARGET={target}");
+    }
 }
 
 fn git_describe() -> Option<String> {
