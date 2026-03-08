@@ -128,7 +128,8 @@ the `catenary notify` hook (for post-edit diagnostics) and the `diagnostics`
 tool. Request/response tools (`definition`, `document_symbols`) do not need
 it — their results come directly from the server response, not from the cache.
 
-See [Wait Model](wait-model.md) for full design details.
+The wait model uses CPU-tick failure detection and LSP version matching
+to determine when the server has finished processing an edit.
 
 ## State Management
 
