@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// Resolve the Catenary state directory.
 ///
@@ -115,8 +115,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 2 {
                 migrate_v1_to_v2(&conn)?;
             }
-            // Future migrations would go here, applied sequentially:
-            // if version < 3 { migrate_v2_to_v3(&conn)?; }
+            if version < 3 {
+                migrate_v2_to_v3(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -148,7 +149,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '2');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '3');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -156,6 +157,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              display_name   TEXT NOT NULL,
              client_name    TEXT,
              client_version TEXT,
+             client_session_id TEXT,
              started_at     TEXT NOT NULL,
              ended_at       TEXT,
              alive          INTEGER NOT NULL DEFAULT 1
@@ -315,6 +317,29 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 2 to 3.
+///
+/// Adds `client_session_id` column to the `sessions` table for storing
+/// the host CLI's session ID (e.g., Claude Code or Gemini CLI UUID).
+///
+/// # Errors
+///
+/// Returns an error if the column addition or version update fails.
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         ALTER TABLE sessions ADD COLUMN client_session_id TEXT;
+
+         UPDATE meta SET value = '3' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v2 to v3")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -405,7 +430,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 2, "schema version should be 2");
+        assert_eq!(version, 3, "schema version should be 3");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -657,22 +682,32 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let path = dir.path().join("test.db");
 
-        // Create a v1 database manually.
+        // Create a v1 database manually (meta + sessions tables).
         let conn = open_at(&path).expect("open_at failed");
         conn.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+             CREATE TABLE sessions (
+                 id             TEXT PRIMARY KEY,
+                 pid            INTEGER NOT NULL,
+                 display_name   TEXT NOT NULL,
+                 client_name    TEXT,
+                 client_version TEXT,
+                 started_at     TEXT NOT NULL,
+                 ended_at       TEXT,
+                 alive          INTEGER NOT NULL DEFAULT 1
+             );
              COMMIT;",
         )
         .expect("failed to create v1 schema");
         drop(conn);
 
-        // Open with migration — should upgrade to v2.
+        // Open with migration — should upgrade through v2 to v3.
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 2, "schema version should be 2 after migration");
+        assert_eq!(version, 3, "schema version should be 3 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state", "snapshots"] {
             assert!(
@@ -680,5 +715,56 @@ mod tests {
                 "table '{table}' should exist after v1→v2 migration"
             );
         }
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_migration_v2_to_v3() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        // Create a v2 database manually.
+        let conn = open_at(&path).expect("open_at failed");
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+             CREATE TABLE sessions (
+                 id             TEXT PRIMARY KEY,
+                 pid            INTEGER NOT NULL,
+                 display_name   TEXT NOT NULL,
+                 client_name    TEXT,
+                 client_version TEXT,
+                 started_at     TEXT NOT NULL,
+                 ended_at       TEXT,
+                 alive          INTEGER NOT NULL DEFAULT 1
+             );
+             COMMIT;",
+        )
+        .expect("failed to create v2 schema");
+        drop(conn);
+
+        // Open with migration — should upgrade to v3.
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        let version = current_schema_version(&conn).expect("failed to read schema version");
+        assert_eq!(version, 3, "schema version should be 3 after migration");
+
+        // Verify client_session_id column exists by inserting a row that uses it.
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at, client_session_id) \
+             VALUES ('test', 1, 'test', '2026-01-01T00:00:00Z', 'client-uuid-123')",
+            [],
+        )
+        .expect("insert with client_session_id should succeed");
+
+        let csid: Option<String> = conn
+            .query_row(
+                "SELECT client_session_id FROM sessions WHERE id = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query client_session_id");
+        assert_eq!(csid.as_deref(), Some("client-uuid-123"));
     }
 }

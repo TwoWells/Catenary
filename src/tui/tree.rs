@@ -517,10 +517,15 @@ pub fn render_tree(
             }
             TreeItem::Session { row, .. } => {
                 let prefix = if is_cursor { "  ▐ " } else { "    " };
-                let id_short = if row.info.id.len() > 8 {
-                    &row.info.id[..8]
+                let display_id = row
+                    .info
+                    .client_session_id
+                    .as_deref()
+                    .unwrap_or(&row.info.id);
+                let id_short = if display_id.len() > 8 {
+                    &display_id[..8]
                 } else {
-                    &row.info.id
+                    display_id
                 };
                 let client = row.info.client_name.as_deref().unwrap_or("unknown");
                 let age = format_age(row.info.started_at);
@@ -604,6 +609,7 @@ mod tests {
                 started_at: Utc::now() - TimeDelta::minutes(mins_ago),
                 client_name: Some("test-client".to_string()),
                 client_version: None,
+                client_session_id: None,
             },
             alive,
             languages: vec![],

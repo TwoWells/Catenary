@@ -108,6 +108,7 @@ struct RawSessionRow {
     display_name: String,
     client_name: Option<String>,
     client_version: Option<String>,
+    client_session_id: Option<String>,
     started_at_str: String,
     db_alive: bool,
 }
@@ -116,7 +117,8 @@ impl DataSource for SqliteDataSource {
     fn list_sessions(&self) -> Result<Vec<SessionRow>> {
         let raw = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, pid, display_name, client_name, client_version, started_at, alive \
+                "SELECT id, pid, display_name, client_name, client_version, \
+                 client_session_id, started_at, alive \
                  FROM sessions ORDER BY alive DESC, started_at DESC",
             )?;
             let mut r = stmt.query([])?;
@@ -128,8 +130,9 @@ impl DataSource for SqliteDataSource {
                     display_name: row.get(2)?,
                     client_name: row.get(3)?,
                     client_version: row.get(4)?,
-                    started_at_str: row.get(5)?,
-                    db_alive: row.get(6)?,
+                    client_session_id: row.get(5)?,
+                    started_at_str: row.get(6)?,
+                    db_alive: row.get(7)?,
                 });
             }
             rows
@@ -142,6 +145,7 @@ impl DataSource for SqliteDataSource {
             display_name,
             client_name,
             client_version,
+            client_session_id,
             started_at_str,
             db_alive,
         } in raw
@@ -174,6 +178,7 @@ impl DataSource for SqliteDataSource {
                     started_at,
                     client_name,
                     client_version,
+                    client_session_id,
                 },
                 alive,
                 languages,
@@ -355,6 +360,7 @@ mod tests {
             started_at: Utc::now(),
             client_name: None,
             client_version: None,
+            client_session_id: None,
         }
     }
 

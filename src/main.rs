@@ -504,7 +504,8 @@ fn run_list() -> Result<()> {
         let ago = format_duration_ago(s.started_at);
 
         // Truncate fields to fit column widths
-        let id = cli::truncate(&s.id, widths.id);
+        let display_id = s.client_session_id.as_deref().unwrap_or(&s.id);
+        let id = cli::truncate(display_id, widths.id);
         let workspace = cli::truncate(&s.workspace, widths.workspace);
         let client = cli::truncate(&client, widths.client);
 
@@ -1243,6 +1244,15 @@ fn run_notify(format: HostFormat) {
         return;
     };
 
+    // Store the host CLI's session ID (first hook wins, subsequent calls are no-ops).
+    if let Some(client_sid) = hook_json.get("session_id").and_then(|v| v.as_str()) {
+        let _ = conn.execute(
+            "UPDATE sessions SET client_session_id = ?1 \
+             WHERE id = ?2 AND client_session_id IS NULL",
+            rusqlite::params![client_sid, &session.id],
+        );
+    }
+
     let endpoint = notify_endpoint(&session.id);
     let Some(stream) = notify_connect(&endpoint) else {
         print!(
@@ -1335,6 +1345,15 @@ fn run_sync_roots(format: HostFormat) {
     let Some((session, _)) = session else {
         return;
     };
+
+    // Store the host CLI's session ID (first hook wins, subsequent calls are no-ops).
+    if let Some(client_sid) = hook_json.get("session_id").and_then(|v| v.as_str()) {
+        let _ = db.execute(
+            "UPDATE sessions SET client_session_id = ?1 \
+             WHERE id = ?2 AND client_session_id IS NULL",
+            rusqlite::params![client_sid, &session.id],
+        );
+    }
 
     // Load persistent state: byte offset + known root set
     let (start_offset, mut known_roots) = db
