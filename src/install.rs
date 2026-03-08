@@ -30,8 +30,17 @@ fn data_dir() -> PathBuf {
 }
 
 /// Returns the base directory for installed grammars.
-fn grammar_dir() -> PathBuf {
+#[must_use]
+pub fn grammar_dir() -> PathBuf {
     data_dir().join("catenary").join("grammars")
+}
+
+/// Returns the C compiler name that would be used for grammar compilation.
+///
+/// Checks the `CC` environment variable first, falls back to `"cc"`.
+#[must_use]
+pub fn c_compiler_name() -> String {
+    std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
 }
 
 /// Resolves a grammar spec to a Git URL.
