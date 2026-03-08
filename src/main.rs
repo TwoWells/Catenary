@@ -1230,20 +1230,32 @@ fn run_notify(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         print!(
             "{}",
-            format_error("Catenary: failed to read hook input", format)
+            notify_error(
+                "hook input unavailable — try restarting your session",
+                format
+            )
         );
         return;
     };
 
     let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
-        print!("{}", format_error("Catenary: invalid hook JSON", format));
+        print!(
+            "{}",
+            notify_error(
+                "unexpected hook input — try restarting your session",
+                format
+            )
+        );
         return;
     };
 
     let Some(file_path) = extract_file_path(&hook_json) else {
         print!(
             "{}",
-            format_error("Catenary: no file path in hook input", format)
+            notify_error(
+                "missing file path in hook input — diagnostics skipped",
+                format
+            )
         );
         return;
     };
@@ -1251,7 +1263,13 @@ fn run_notify(format: HostFormat) {
     // Notify session for diagnostics
     let abs_path = PathBuf::from(&file_path);
     let Ok(conn) = catenary_mcp::db::open_and_migrate() else {
-        print!("{}", format_error("Catenary: database unavailable", format));
+        print!(
+            "{}",
+            notify_error(
+                "state database unavailable — try running: catenary list",
+                format
+            )
+        );
         return;
     };
     let sessions = session::list_sessions_with_conn(&conn).unwrap_or_default();
@@ -1278,9 +1296,9 @@ fn run_notify(format: HostFormat) {
     let Some(stream) = notify_connect(&endpoint) else {
         print!(
             "{}",
-            format_error(
+            notify_error(
                 &format!(
-                    "Catenary: notify socket unavailable for session {}",
+                    "session {} is not responding — it may have crashed",
                     session.id
                 ),
                 format,
@@ -1310,7 +1328,7 @@ fn run_notify(format: HostFormat) {
             print!("{output}");
         }
         catenary_mcp::notify::NotifyResult::Error(msg) => {
-            print!("{}", format_error(&format!("Catenary: {msg}"), format));
+            print!("{}", notify_error(&msg, format));
         }
     }
 }
@@ -1573,6 +1591,20 @@ fn format_diagnostics(content: &str, format: HostFormat, hook_event: &str) -> St
         })
         .to_string(),
     }
+}
+
+/// GitHub issues URL for user-facing bug report suggestions.
+const BUG_REPORT_URL: &str = "https://github.com/MarkWells-Dev/Catenary/issues";
+
+/// Format an internal error for the user via `systemMessage`, with a bug
+/// report link appended.
+///
+/// The error is shown to the user in their terminal but not injected into
+/// the model's context — the model cannot act on internal Catenary failures.
+fn notify_error(message: &str, format: HostFormat) -> String {
+    let full =
+        format!("Catenary: {message}. If this persists, please file a bug: {BUG_REPORT_URL}");
+    format_error(&full, format)
 }
 
 /// Format an internal error for the user via `systemMessage`.
