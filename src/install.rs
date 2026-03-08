@@ -90,25 +90,50 @@ fn compile_grammar(src_dir: &Path, output_path: &Path) -> Result<()> {
     }
 }
 
-/// Returns the C compiler command name.
+/// Returns a configured `cc::Build` for runtime use.
 ///
-/// Checks `CC` environment variable, then falls back to `cc`.
-fn c_compiler_name() -> String {
-    std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
+/// Sets `target`, `host`, and `opt_level` explicitly so the `cc` crate
+/// doesn't look for cargo build-script environment variables (`TARGET`,
+/// `HOST`, `OPT_LEVEL`) that aren't available at runtime.
+fn cc_builder(cpp: bool) -> cc::Build {
+    let target = env!("TARGET");
+    let mut build = cc::Build::new();
+    build
+        .target(target)
+        .host(target)
+        .opt_level(0)
+        .cpp(cpp)
+        .cargo_metadata(false);
+    build
 }
 
-/// Returns the C++ compiler command name.
+/// Returns the C compiler [`cc::Tool`] for the current platform.
 ///
-/// Checks `CXX` environment variable, then falls back to `c++`.
-fn cpp_compiler_name() -> String {
-    std::env::var("CXX").unwrap_or_else(|_| "c++".to_string())
+/// # Errors
+///
+/// Returns an error if no C compiler can be found.
+fn c_compiler() -> Result<cc::Tool> {
+    cc_builder(false)
+        .try_get_compiler()
+        .map_err(|e| anyhow::anyhow!("failed to find C compiler: {e}"))
+}
+
+/// Returns the C++ compiler [`cc::Tool`] for the current platform.
+///
+/// # Errors
+///
+/// Returns an error if no C++ compiler can be found.
+fn cpp_compiler() -> Result<cc::Tool> {
+    cc_builder(true)
+        .try_get_compiler()
+        .map_err(|e| anyhow::anyhow!("failed to find C++ compiler: {e}"))
 }
 
 /// Compile pure-C grammar sources in one shot.
 fn compile_c_only(src_dir: &Path, output_path: &Path) -> Result<()> {
-    let cc = c_compiler_name();
+    let compiler = c_compiler()?;
 
-    let mut cmd = std::process::Command::new(&cc);
+    let mut cmd = compiler.to_command();
     cmd.arg("-shared")
         .arg("-fPIC")
         .arg("-I")
@@ -121,9 +146,7 @@ fn compile_c_only(src_dir: &Path, output_path: &Path) -> Result<()> {
         cmd.arg(src_dir.join("scanner.c"));
     }
 
-    let output = cmd
-        .output()
-        .with_context(|| format!("failed to run C compiler '{cc}' — is a C compiler installed?"))?;
+    let output = cmd.output().context("failed to run C compiler")?;
     ensure!(
         output.status.success(),
         "grammar compilation failed:\n{}",
@@ -136,12 +159,13 @@ fn compile_c_only(src_dir: &Path, output_path: &Path) -> Result<()> {
 /// Compile mixed C/C++ grammar sources separately and link.
 fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Result<()> {
     let tmpdir = tempfile::tempdir().context("failed to create temp directory for compilation")?;
-    let cc = c_compiler_name();
-    let cxx = cpp_compiler_name();
+    let cc = c_compiler()?;
+    let cxx = cpp_compiler()?;
 
     // Compile parser.c
     let parser_o = tmpdir.path().join("parser.o");
-    let output = std::process::Command::new(&cc)
+    let output = cc
+        .to_command()
         .args(["-c", "-fPIC"])
         .arg("-I")
         .arg(src_dir)
@@ -149,7 +173,7 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
         .arg(&parser_o)
         .arg(src_dir.join("parser.c"))
         .output()
-        .with_context(|| format!("failed to run C compiler '{cc}'"))?;
+        .context("failed to compile parser.c")?;
     ensure!(
         output.status.success(),
         "parser.c compilation failed:\n{}",
@@ -162,7 +186,8 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
     let scanner_c = src_dir.join("scanner.c");
     if scanner_c.exists() {
         let scanner_c_o = tmpdir.path().join("scanner_c.o");
-        let output = std::process::Command::new(&cc)
+        let output = cc
+            .to_command()
             .args(["-c", "-fPIC"])
             .arg("-I")
             .arg(src_dir)
@@ -170,7 +195,7 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
             .arg(&scanner_c_o)
             .arg(&scanner_c)
             .output()
-            .with_context(|| format!("failed to run C compiler '{cc}'"))?;
+            .context("failed to compile scanner.c")?;
         ensure!(
             output.status.success(),
             "scanner.c compilation failed:\n{}",
@@ -181,7 +206,8 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
 
     // Compile scanner.cc
     let scanner_cc_o = tmpdir.path().join("scanner_cc.o");
-    let output = std::process::Command::new(&cxx)
+    let output = cxx
+        .to_command()
         .args(["-c", "-fPIC"])
         .arg("-I")
         .arg(src_dir)
@@ -189,7 +215,7 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
         .arg(&scanner_cc_o)
         .arg(scanner_cc)
         .output()
-        .with_context(|| format!("failed to run C++ compiler '{cxx}'"))?;
+        .context("failed to compile scanner.cc")?;
     ensure!(
         output.status.success(),
         "scanner.cc compilation failed:\n{}",
@@ -198,14 +224,12 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
     objects.push(scanner_cc_o);
 
     // Link with C++ linker (needed for C++ runtime)
-    let mut link_cmd = std::process::Command::new(&cxx);
+    let mut link_cmd = cxx.to_command();
     link_cmd.arg("-shared").arg("-o").arg(output_path);
     for obj in &objects {
         link_cmd.arg(obj);
     }
-    let output = link_cmd
-        .output()
-        .with_context(|| format!("failed to run C++ linker '{cxx}'"))?;
+    let output = link_cmd.output().context("failed to link grammar")?;
     ensure!(
         output.status.success(),
         "grammar linking failed:\n{}",
