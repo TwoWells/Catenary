@@ -1,0 +1,10 @@
+{
+  "grammars": [
+    {
+      "name": "mock",
+      "scope": "source.mock",
+      "file-types": ["mock"],
+      "injection-regex": "mock"
+    }
+  ]
+}

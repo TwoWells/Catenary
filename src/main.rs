@@ -109,6 +109,20 @@ enum Command {
         diff: bool,
     },
 
+    /// Install, list, or remove tree-sitter grammars.
+    Install {
+        /// Grammar spec: name, owner/repo, or full URL.
+        spec: Option<String>,
+
+        /// List installed grammars.
+        #[arg(long)]
+        list: bool,
+
+        /// Remove a grammar by scope.
+        #[arg(long)]
+        remove: Option<String>,
+    },
+
     /// Sync /add-dir roots from Claude Code transcript to a running session.
     /// Designed for `PreToolUse` hooks — reads hook JSON from stdin.
     SyncRoots {
@@ -205,6 +219,18 @@ async fn main() -> Result<()> {
         }) => run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => run_status(&id),
         Some(Command::Doctor { nocolor, diff }) => run_doctor(args, nocolor, diff).await,
+        Some(Command::Install { spec, list, remove }) => {
+            let conn = catenary_mcp::db::open_and_migrate()?;
+            if list {
+                catenary_mcp::install::list_grammars(&conn)
+            } else if let Some(scope) = remove {
+                catenary_mcp::install::remove_grammar(&scope, &conn)
+            } else if let Some(spec) = spec {
+                catenary_mcp::install::install_grammar(&spec, &conn)
+            } else {
+                catenary_mcp::install::list_grammars(&conn)
+            }
+        }
         Some(Command::SyncRoots { format }) => {
             run_sync_roots(format);
             Ok(())
@@ -1234,13 +1260,8 @@ fn run_notify(format: HostFormat) {
         .find(|(s, _)| abs_path.to_string_lossy().starts_with(&s.workspace));
 
     let Some((session, _)) = session else {
-        print!(
-            "{}",
-            format_error(
-                &format!("Catenary: no session for {}", abs_path.display()),
-                format,
-            )
-        );
+        // File is outside all session workspaces — nothing to do.
+        // No systemMessage: this isn't actionable for the user.
         return;
     };
 
