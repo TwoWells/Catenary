@@ -16,6 +16,8 @@ pub mod config;
 pub mod db;
 /// Diagnostic noise filtering for LSP server output.
 pub mod filter;
+/// Grammar installation, listing, and removal for tree-sitter integration.
+pub mod install;
 /// LSP client implementation and server management.
 pub mod lsp;
 /// MCP server implementation and type definitions.
