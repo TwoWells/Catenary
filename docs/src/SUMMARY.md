@@ -21,7 +21,6 @@
 - [🛠️ Language Servers](lsp/README.md)
   - [Landscape](lsp/landscape.md)
 - [🤖 AI Agents](ai-agents.md)
-- [⏱️ Wait Model](wait-model.md)
 - [🔇 Diagnostic Filters](diagnostic-filters.md)
 - [🛡️ LSP Fault Model](lsp-fault-model.md)
 - [🔴 Adversarial Testing](adversarial-testing.md)
