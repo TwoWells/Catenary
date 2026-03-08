@@ -480,11 +480,14 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
             true
         }
         KeyCode::Esc => {
-            // Clear pins, clear locked filter.
+            // Clear pins, clear locked filter, clear panel filters.
             app.grid.clear_pins();
             if let Some(ref mut filter) = app.filter {
                 filter.clear_locked();
                 app.filter = None;
+            }
+            for panel in &mut app.grid.panels {
+                panel.filter_pattern = None;
             }
             true
         }
@@ -511,6 +514,9 @@ pub fn handle_key_filter(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
         }
         KeyCode::Enter => {
             filter.submit();
+            let locked = filter.locked.clone();
+            let scope = filter.scope.clone();
+            apply_filter_to_panels(app, locked.as_ref(), &scope);
             app.input_mode = InputMode::Normal;
             true
         }
@@ -539,6 +545,31 @@ pub fn handle_key_filter(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
             true
         }
         _ => false,
+    }
+}
+
+/// Propagate a locked filter pattern to the relevant panels.
+fn apply_filter_to_panels(
+    app: &mut App<'_>,
+    pattern: Option<&String>,
+    scope: &super::filter::FilterScope,
+) {
+    let pat = pattern.cloned();
+    match scope {
+        super::filter::FilterScope::Local(idx) => {
+            if let Some(panel) = app.grid.panels.get_mut(*idx) {
+                panel.filter_pattern = pat;
+                panel.cursor = 0;
+                panel.scroll_offset = 0;
+            }
+        }
+        super::filter::FilterScope::Global => {
+            for panel in &mut app.grid.panels {
+                panel.filter_pattern.clone_from(&pat);
+                panel.cursor = 0;
+                panel.scroll_offset = 0;
+            }
+        }
     }
 }
 
@@ -659,6 +690,7 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 client_name: Some("test-client".to_string()),
                 client_version: None,
+                client_session_id: None,
             },
             alive,
             languages: vec!["rust".to_string()],

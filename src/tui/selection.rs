@@ -492,6 +492,7 @@ mod tests {
                 started_at: Utc::now() - TimeDelta::minutes(mins_ago),
                 client_name: Some("test-client".to_string()),
                 client_version: None,
+                client_session_id: None,
             },
             alive,
             languages: vec![],

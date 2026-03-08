@@ -32,6 +32,9 @@ pub struct SessionInfo {
     /// Version of the connected MCP client.
     #[serde(default)]
     pub client_version: Option<String>,
+    /// Session ID from the host CLI (Claude Code / Gemini CLI UUID).
+    #[serde(default)]
+    pub client_session_id: Option<String>,
 }
 
 /// An event that can be broadcast to listeners.
@@ -168,6 +171,7 @@ impl Session {
             started_at,
             client_name: None,
             client_version: None,
+            client_session_id: None,
         };
 
         {
@@ -409,6 +413,7 @@ struct SessionRow {
     display_name: String,
     client_name: Option<String>,
     client_version: Option<String>,
+    client_session_id: Option<String>,
     started_at_str: String,
     db_alive: bool,
 }
@@ -438,7 +443,8 @@ pub fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<(SessionInfo, bo
     // Collect raw rows first to release the statement borrow.
     let rows = {
         let mut stmt = conn.prepare(
-            "SELECT id, pid, display_name, client_name, client_version, started_at, alive \
+            "SELECT id, pid, display_name, client_name, client_version, \
+             client_session_id, started_at, alive \
              FROM sessions ORDER BY started_at DESC",
         )?;
         let mut r = stmt.query([])?;
@@ -450,8 +456,9 @@ pub fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<(SessionInfo, bo
                 display_name: row.get(2)?,
                 client_name: row.get(3)?,
                 client_version: row.get(4)?,
-                started_at_str: row.get(5)?,
-                db_alive: row.get(6)?,
+                client_session_id: row.get(5)?,
+                started_at_str: row.get(6)?,
+                db_alive: row.get(7)?,
             });
         }
         rows
@@ -465,6 +472,7 @@ pub fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<(SessionInfo, bo
             display_name,
             client_name,
             client_version,
+            client_session_id,
             started_at_str,
             db_alive,
         } = r;
@@ -495,6 +503,7 @@ pub fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<(SessionInfo, bo
                 started_at,
                 client_name,
                 client_version,
+                client_session_id,
             },
             alive,
         ));
@@ -525,7 +534,8 @@ pub fn get_session(id: &str) -> Result<Option<(SessionInfo, bool)>> {
 /// Returns an error if the database cannot be queried.
 pub fn get_session_with_conn(conn: &Connection, id: &str) -> Result<Option<(SessionInfo, bool)>> {
     let result = conn.query_row(
-        "SELECT id, pid, display_name, client_name, client_version, started_at, alive \
+        "SELECT id, pid, display_name, client_name, client_version, \
+         client_session_id, started_at, alive \
          FROM sessions WHERE id = ?1",
         [id],
         |row| {
@@ -535,14 +545,24 @@ pub fn get_session_with_conn(conn: &Connection, id: &str) -> Result<Option<(Sess
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, bool>(6)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         },
     );
 
     match result {
-        Ok((sid, pid, display_name, client_name, client_version, started_at_str, db_alive)) => {
+        Ok((
+            sid,
+            pid,
+            display_name,
+            client_name,
+            client_version,
+            client_session_id,
+            started_at_str,
+            db_alive,
+        )) => {
             let started_at = DateTime::parse_from_rfc3339(&started_at_str)
                 .with_context(|| format!("invalid started_at: {started_at_str}"))?
                 .with_timezone(&Utc);
@@ -569,6 +589,7 @@ pub fn get_session_with_conn(conn: &Connection, id: &str) -> Result<Option<(Sess
                     started_at,
                     client_name,
                     client_version,
+                    client_session_id,
                 },
                 alive,
             )))

@@ -88,6 +88,10 @@ pub struct PanelState<'a> {
     pub visual_selection: Option<VisualSelection>,
     /// Last known viewport height (updated each render frame).
     pub viewport_height: usize,
+    /// Display ID for the title bar (client session ID if available, else internal ID).
+    pub display_id: String,
+    /// Active filter pattern (case-insensitive substring match).
+    pub filter_pattern: Option<String>,
     /// Semantic color theme (borrowed from the application).
     pub theme: &'a Theme,
     /// Resolved icon set (borrowed from the application).
@@ -103,6 +107,7 @@ impl<'a> PanelState<'a> {
     /// scroll, not pinned.
     #[must_use]
     pub fn new(session_id: String, theme: &'a Theme, icons: &'a IconSet) -> Self {
+        let display_id = session_id.clone();
         Self {
             session_id,
             events: Vec::new(),
@@ -113,8 +118,10 @@ impl<'a> PanelState<'a> {
             pinned: false,
             language_servers: Vec::new(),
             expanded: HashSet::new(),
+            display_id,
             visual_selection: None,
             viewport_height: 0,
+            filter_pattern: None,
             theme,
             icons,
         }
@@ -332,8 +339,15 @@ impl<'a> PanelState<'a> {
     #[must_use]
     pub fn flat_lines(&self) -> Vec<FlatLine> {
         let collapsed = collapse_progress_indexed(&self.events);
+        let lower_pattern = self.filter_pattern.as_ref().map(|p| p.to_lowercase());
         let mut lines = Vec::new();
         for &(event_index, ev) in &collapsed {
+            if let Some(ref pat) = lower_pattern {
+                let plain = super::theme::format_event_plain(ev);
+                if !plain.to_lowercase().contains(pat) {
+                    continue;
+                }
+            }
             lines.push(FlatLine::EventHeader { event_index });
             if self.expanded.contains(&event_index) {
                 let count = detail_lines(ev, self.theme, self.icons).len();
@@ -561,10 +575,10 @@ fn ls_status_icon<'a>(state: &LsState, icons: &'a IconSet) -> &'a str {
 
 /// Build the title line for a panel.
 fn build_title(state: &PanelState<'_>) -> Line<'static> {
-    let id_short = if state.session_id.len() > 8 {
-        &state.session_id[..8]
+    let id_short = if state.display_id.len() > 8 {
+        &state.display_id[..8]
     } else {
-        &state.session_id
+        &state.display_id
     };
 
     let mut spans = vec![Span::raw(format!(" Events [{id_short}]"))];

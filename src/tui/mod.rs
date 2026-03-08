@@ -411,6 +411,18 @@ fn refresh_sessions(app: &mut App<'_>) {
             }
         }
 
+        // Update panel display IDs from refreshed session data.
+        for panel in &mut app.grid.panels {
+            for ws in &app.tree.workspaces {
+                if let Some(row) = ws.sessions.iter().find(|s| s.info.id == panel.session_id) {
+                    if let Some(ref csid) = row.info.client_session_id {
+                        panel.display_id.clone_from(csid);
+                    }
+                    break;
+                }
+            }
+        }
+
         // Auto-close panels for dead sessions.
         let dead_panel_indices: Vec<usize> = app
             .grid
