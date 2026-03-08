@@ -23,6 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler, PathValidator};
 use catenary_mcp::cli::{self, ColorConfig, ColumnWidths};
+use catenary_mcp::install;
 use catenary_mcp::lsp;
 use catenary_mcp::mcp::McpServer;
 use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
@@ -2077,6 +2078,89 @@ fn expand_home(path_str: &str, home: &Path) -> PathBuf {
         )
 }
 
+/// Check grammar toolchain and installed grammars.
+fn check_grammars(colors: &ColorConfig) {
+    check_grammars_compiler(colors);
+    check_grammars_dir(colors);
+
+    let Ok(db) = catenary_mcp::db::open_and_migrate() else {
+        println!("  {}", colors.red("✗ failed to open database"));
+        return;
+    };
+    check_grammars_installed(colors, &db);
+}
+
+/// Check whether a C compiler is available for grammar compilation.
+fn check_grammars_compiler(colors: &ColorConfig) {
+    let cc_name = install::c_compiler_name();
+    if binary_exists(&cc_name) {
+        println!("  {}", colors.green(&format!("✓ {cc_name} found")));
+    } else {
+        println!(
+            "  {}",
+            colors.red("✗ C compiler not found — catenary install requires a C compiler"),
+        );
+    }
+}
+
+/// Print the grammar data directory path and whether it exists.
+fn check_grammars_dir(colors: &ColorConfig) {
+    let gdir = install::grammar_dir();
+    if gdir.exists() {
+        println!("  {}", gdir.display());
+    } else {
+        println!(
+            "  {}",
+            colors.dim(&format!("{} (not yet created)", gdir.display())),
+        );
+    }
+}
+
+/// List installed grammars and verify their files exist on disk.
+fn check_grammars_installed(colors: &ColorConfig, db: &rusqlite::Connection) {
+    let Ok(mut stmt) = db.prepare("SELECT scope, lib_path, tags_path FROM grammars ORDER BY scope")
+    else {
+        println!("  {}", colors.red("✗ failed to query grammars"));
+        return;
+    };
+
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+
+    if rows.is_empty() {
+        println!("  {}", colors.dim("(none installed)"));
+        return;
+    }
+
+    for (scope, lib_path, tags_path) in &rows {
+        let lib_ok = Path::new(lib_path).exists();
+        let tags_ok = Path::new(tags_path).exists();
+
+        if lib_ok && tags_ok {
+            println!("  {}", colors.green(&format!("✓ {scope}")));
+        } else if !lib_ok {
+            let lib_name = Path::new(lib_path)
+                .file_name()
+                .map_or("parser.so", |n| n.to_str().unwrap_or("parser.so"));
+            println!(
+                "  {}",
+                colors.red(&format!("✗ {scope} — missing {lib_name}")),
+            );
+        } else {
+            println!("  {}", colors.red(&format!("✗ {scope} — missing tags.scm")),);
+        }
+    }
+}
+
 /// Run the doctor command: check language server health for the current workspace.
 ///
 /// # Errors
@@ -2267,6 +2351,11 @@ async fn run_doctor(args: Args, nocolor: bool, show_diff: bool) -> Result<()> {
     println!("{}:", colors.bold("Scripts"));
     check_constrained_bash_claude(&colors, show_diff);
     check_constrained_bash_gemini(&colors, show_diff);
+
+    // Grammars health section
+    println!();
+    println!("{}:", colors.bold("Grammars"));
+    check_grammars(&colors);
 
     Ok(())
 }
@@ -2884,5 +2973,40 @@ mod tests {
         assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(2_621_440), "2.5 MB");
+    }
+
+    // ── doctor grammar tests ──────────────────────────────────────
+
+    #[test]
+    fn test_doctor_grammar_section_no_grammars() {
+        let (_dir, _path, conn) = test_db();
+        let colors = ColorConfig::new(true);
+
+        // Should not panic on empty grammars table
+        check_grammars_installed(&colors, &conn);
+    }
+
+    #[test]
+    fn test_doctor_grammar_section_with_grammar() {
+        let (_dir, _path, conn) = test_db();
+        let colors = ColorConfig::new(true);
+
+        // Insert a grammar row with paths that don't exist on disk
+        conn.execute(
+            "INSERT INTO grammars (scope, file_types, lib_path, tags_path, repo_url, installed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "source.mock",
+                r#"["mock"]"#,
+                "/nonexistent/parser.so",
+                "/nonexistent/tags.scm",
+                "https://github.com/test/mock",
+                "2026-03-07T12:00:00Z",
+            ],
+        )
+        .expect("insert grammar row");
+
+        // Should not panic; will report missing files
+        check_grammars_installed(&colors, &conn);
     }
 }
