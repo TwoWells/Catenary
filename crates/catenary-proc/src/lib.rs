@@ -451,7 +451,7 @@ mod tests {
             sum = sum.wrapping_add(i);
         }
         // Prevent optimizing away the loop
-        assert!(sum > 0 || sum == 0);
+        std::hint::black_box(sum);
 
         // Second sample: delta may be > 0 (depends on granularity)
         let (delta1, state) = monitor.sample().expect("Second sample");

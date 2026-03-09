@@ -11,16 +11,26 @@ categories = ["development-tools"]
 
 [lints.rust]
 unsafe_code = "allow" # Grammar loading FFI — all unsafety confined to this crate.
+missing_docs = "warn"
 
 [lints.clippy]
-# Inherit most workspace lints but allow unsafe-related patterns
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+allow_attributes_without_reason = "deny"
+multiple_crate_versions = "allow"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 missing_safety_doc = "warn"
-multiple_crate_versions = "allow"
 
 [dependencies]
 tree-sitter = "0.24"
