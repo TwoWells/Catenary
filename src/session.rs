@@ -220,6 +220,10 @@ impl Session {
     }
 
     /// Generate a short unique session ID.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "intentional 32-bit wrap for compact hex ID"
+    )]
     fn generate_id() -> String {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -237,7 +241,7 @@ impl Session {
         // even when multiple sessions are created in the same millisecond.
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        format!("{:x}{:x}{:x}", u32::try_from(now).unwrap_or(0), pid, seq)
+        format!("{:x}{:x}{:x}", now as u32, pid, seq)
     }
 
     /// Returns the path to the notify IPC endpoint for this session.
