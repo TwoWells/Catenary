@@ -1276,10 +1276,10 @@ fn run_notify(format: HostFormat) {
     let sessions = session::list_sessions_with_conn(&conn).unwrap_or_default();
     let session = sessions
         .iter()
-        .find(|(s, _)| abs_path.to_string_lossy().starts_with(&s.workspace));
+        .find(|(s, alive)| *alive && abs_path.to_string_lossy().starts_with(&s.workspace));
 
     let Some((session, _)) = session else {
-        // File is outside all session workspaces — nothing to do.
+        // File is outside all session workspaces, or no alive session — nothing to do.
         // No systemMessage: this isn't actionable for the user.
         return;
     };
@@ -1380,7 +1380,7 @@ fn run_sync_roots(format: HostFormat) {
     let cwd_str = cwd.to_string_lossy();
     let session = sessions
         .iter()
-        .find(|(s, _)| cwd_str.starts_with(&s.workspace));
+        .find(|(s, alive)| *alive && cwd_str.starts_with(&s.workspace));
 
     let Some((session, _)) = session else {
         return;
