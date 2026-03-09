@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-990a00ff.js";
+            window.path_to_searchindex_js = "searchindex-c678b1b6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-cd5a037f.js"></script>
+        <script src="toc-a743189e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -210,7 +210,7 @@
 <tbody>
 <tr><td>Server won’t start</td><td>Bad command, missing binary, permission error</td><td><code>LspClient::spawn()</code> returns <code>Err</code>, propagated to <code>get_client()</code></td><td>OK</td></tr>
 <tr><td>Server crashes mid-session</td><td>Segfault, OOM, unhandled exception</td><td>Reader task detects stdout close, sets <code>alive=false</code>. Next request triggers restart via <code>get_client()</code></td><td>OK</td></tr>
-<tr><td>Server hangs (no response)</td><td>Deadlock, infinite loop</td><td>CPU-tick failure detection (1000-tick threshold, 30s wall-clock backstop). Diagnostics: load-aware failure detection via <code>ProcessMonitor</code> — see <a href="wait-model.html">Wait Model</a> and <a href="#timeout-ambiguity-resolved">Timeout Ambiguity</a></td><td>OK</td></tr>
+<tr><td>Server hangs (no response)</td><td>Deadlock, infinite loop</td><td>CPU-tick failure detection (1000-tick threshold, 30s wall-clock backstop). Diagnostics: load-aware failure detection via <code>ProcessMonitor</code> — see <a href="#timeout-ambiguity-resolved">Timeout Ambiguity</a></td><td>OK</td></tr>
 <tr><td>Server exits during initialize</td><td>Crash on startup</td><td><code>initialize()</code> request times out or gets channel-closed error</td><td>OK</td></tr>
 <tr><td>Server produces no stdout</td><td>Blocks on stderr, misconfigured pipes</td><td>Timeout on first request</td><td>OK</td></tr>
 </tbody>
@@ -351,7 +351,7 @@
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="wait-model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="diagnostic-filters.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -365,7 +365,7 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="wait-model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="diagnostic-filters.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

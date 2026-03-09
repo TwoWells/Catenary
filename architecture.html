@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-990a00ff.js";
+            window.path_to_searchindex_js = "searchindex-c678b1b6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-cd5a037f.js"></script>
+        <script src="toc-a743189e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -292,7 +292,8 @@ servers that advertise save support receive <code>textDocument/didSave</code>.</
 the <code>catenary notify</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
 tool. Request/response tools (<code>definition</code>, <code>document_symbols</code>) do not need
 it — their results come directly from the server response, not from the cache.</p>
-<p>See <a href="wait-model.html">Wait Model</a> for full design details.</p>
+<p>The wait model uses CPU-tick failure detection and LSP version matching
+to determine when the server has finished processing an edit.</p>
 <h2 id="state-management"><a class="header" href="#state-management">State Management</a></h2>
 <p>All persistent state lives in a single SQLite database at
 <code>~/.local/state/catenary/catenary.db</code>. WAL mode is enabled for concurrent
