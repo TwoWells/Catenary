@@ -290,8 +290,6 @@ fn test_diagnostics_server_death() -> Result<()> {
 async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     use catenary_mcp::lsp::{DiagnosticsWaitResult, LspClient};
     use catenary_mcp::session::EventBroadcaster;
-    use lsp_types::Uri;
-    use std::str::FromStr;
 
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
@@ -300,8 +298,8 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     let v1 = "echo v1\n";
     std::fs::write(&file, v1)?;
 
-    let uri_string = format!("file://{}", file.display());
-    let uri = Uri::from_str(&uri_string).context("parse URI")?;
+    let uri = format!("file://{}", file.display());
+    let lsp_uri: lsp_types::Uri = uri.parse().context("parse URI")?;
 
     // Spawn LspClient directly with mockls --diagnostics-delay 5000
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -329,14 +327,14 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     client
         .did_open(lsp_types::DidOpenTextDocumentParams {
             text_document: lsp_types::TextDocumentItem {
-                uri: uri.clone(),
+                uri: lsp_uri.clone(),
                 language_id: MOCK_LANG_A.to_string(),
                 version: 1,
                 text: v1.to_string(),
             },
         })
         .await?;
-    client.did_save(uri.clone()).await?;
+    client.did_save(lsp_uri.clone()).await?;
 
     // Sleep 4s — v1 diagnostics haven't arrived yet (5s delay > 4s)
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -353,7 +351,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     client
         .did_change(lsp_types::DidChangeTextDocumentParams {
             text_document: lsp_types::VersionedTextDocumentIdentifier {
-                uri: uri.clone(),
+                uri: lsp_uri.clone(),
                 version: 2,
             },
             content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
@@ -363,7 +361,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
             }],
         })
         .await?;
-    client.did_save(uri.clone()).await?;
+    client.did_save(lsp_uri.clone()).await?;
 
     // Wait for diagnostics with snapshot=0
     let result = client.wait_for_diagnostics_update(&uri, snapshot).await;
@@ -377,7 +375,10 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
         "Should have some diagnostics. Got none."
     );
 
-    let msg = &diagnostics[0].message;
+    let msg = diagnostics[0]
+        .get("message")
+        .and_then(Value::as_str)
+        .expect("diagnostic should have message");
 
     // BUG DEMONSTRATION: the diagnostics should reflect v2 (4 lines) but
     // due to the stale leak, they reflect v1 (1 line).

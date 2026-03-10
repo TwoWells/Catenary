@@ -5,16 +5,17 @@ use anyhow::{Context, Result, anyhow};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    ClientCapabilities, CodeActionParams, CodeActionResponse, Diagnostic,
-    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind,
-    PrepareRenameResponse, ReferenceParams, ServerCapabilities, TextDocumentIdentifier,
-    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceFolder,
-    WorkspaceFoldersChangeEvent, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    ClientCapabilities, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams,
+    PositionEncodingKind, PrepareRenameResponse, ReferenceParams, ServerCapabilities,
+    TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
+    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbol, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,7 +36,7 @@ use crate::session::{EventBroadcaster, EventKind};
 /// `version` is the document version from `publishDiagnostics`, if the
 /// server includes it. Used by [`DiagnosticsStrategy::Version`] to
 /// match diagnostics to a specific document change.
-pub type DiagnosticsCache = Arc<std::sync::Mutex<HashMap<Uri, (Option<i32>, Vec<Diagnostic>)>>>;
+pub type DiagnosticsCache = Arc<std::sync::Mutex<HashMap<String, (Option<i32>, Vec<Value>)>>>;
 
 /// Result of waiting for diagnostics to update after a file change.
 ///
@@ -86,7 +87,7 @@ pub struct LspClient {
     logged_no_diagnostics_support: AtomicBool,
     /// Last document version sent via `did_open`/`did_change` per URI.
     /// Used to detect stale diagnostics from prior document versions.
-    last_sent_version: Arc<Mutex<HashMap<Uri, i32>>>,
+    last_sent_version: Arc<Mutex<HashMap<String, i32>>>,
     /// Whether the server advertised `textDocumentSync.save` support.
     wants_did_save: bool,
     /// Whether the server advertised `typeHierarchyProvider`.
@@ -435,9 +436,9 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) -> Result<()> {
-        let uri = params.text_document.uri.clone();
+        let uri_str = params.text_document.uri.as_str().to_string();
         let version = params.text_document.version;
-        self.last_sent_version.lock().await.insert(uri, version);
+        self.last_sent_version.lock().await.insert(uri_str, version);
         self.notify("textDocument/didOpen", params).await
     }
 
@@ -447,9 +448,9 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<()> {
-        let uri = params.text_document.uri.clone();
+        let uri_str = params.text_document.uri.as_str().to_string();
         let version = params.text_document.version;
-        self.last_sent_version.lock().await.insert(uri, version);
+        self.last_sent_version.lock().await.insert(uri_str, version);
         self.notify("textDocument/didChange", params).await
     }
 
@@ -706,20 +707,43 @@ impl LspClient {
         self.request("typeHierarchy/subtypes", params).await
     }
 
-    /// Gets code actions (quick fixes, refactorings) for a range.
+    /// Gets code actions (quick fixes) for a range.
+    ///
+    /// Bakes in `only: ["quickfix"]` because the only caller (notify.rs)
+    /// always wants quickfixes.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
     pub async fn code_action(
         &self,
-        params: CodeActionParams,
-    ) -> Result<Option<CodeActionResponse>> {
-        self.request("textDocument/codeAction", params).await
+        uri: &str,
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+        diagnostics: &[Value],
+    ) -> Result<Value> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": start_char },
+                "end": { "line": end_line, "character": end_char }
+            },
+            "context": {
+                "diagnostics": diagnostics,
+                "only": ["quickfix"]
+            }
+        });
+        let result = self
+            .connection
+            .request("textDocument/codeAction", params)
+            .await?;
+        Ok(result)
     }
 
     /// Gets cached diagnostics for a specific URI.
-    pub fn get_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
+    pub fn get_diagnostics(&self, uri: &str) -> Vec<Value> {
         let cache = self
             .inbox
             .diagnostics
@@ -736,7 +760,7 @@ impl LspClient {
     /// Returns `None` if no diagnostics have been published for this URI
     /// or if the server doesn't include version in `publishDiagnostics`.
     #[allow(dead_code, reason = "Used by diagnostics strategy tests")]
-    pub(crate) fn cached_diagnostics_version(&self, uri: &Uri) -> Option<i32> {
+    pub(crate) fn cached_diagnostics_version(&self, uri: &str) -> Option<i32> {
         let cache = self
             .inbox
             .diagnostics
@@ -750,7 +774,7 @@ impl LspClient {
     /// Returns `true` (assume current) when the server doesn't publish version
     /// info or when no version has been tracked for this URI — we can't
     /// distinguish stale from fresh without version data.
-    async fn is_diagnostics_version_current(&self, uri: &Uri) -> bool {
+    async fn is_diagnostics_version_current(&self, uri: &str) -> bool {
         if !self.inbox.publishes_version.load(Ordering::SeqCst) {
             return true;
         }
@@ -768,7 +792,7 @@ impl LspClient {
     /// Callers should snapshot this *before* sending a change notification,
     /// then pass the snapshot to [`wait_for_diagnostics_update`] to ensure
     /// the returned diagnostics reflect that specific change.
-    pub fn diagnostics_generation(&self, uri: &Uri) -> u64 {
+    pub fn diagnostics_generation(&self, uri: &str) -> u64 {
         let generations = self
             .inbox
             .diagnostics_generation
@@ -864,7 +888,7 @@ impl LspClient {
     )]
     pub async fn wait_for_diagnostics_update(
         &self,
-        uri: &Uri,
+        uri: &str,
         snapshot: u64,
     ) -> DiagnosticsWaitResult {
         use super::diagnostics::{ActivityState, DiagnosticsStrategy, ProgressMonitor};

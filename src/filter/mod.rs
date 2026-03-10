@@ -32,13 +32,18 @@ pub enum DiagnosticCode {
 }
 
 impl DiagnosticCode {
-    /// Converts from the `lsp_types` representation.
+    /// Converts from a JSON diagnostic code value.
     #[must_use]
-    pub fn from_lsp(code: &lsp_types::NumberOrString) -> Self {
-        match code {
-            lsp_types::NumberOrString::Number(n) => Self::Number(i64::from(*n)),
-            lsp_types::NumberOrString::String(s) => Self::Text(s.clone()),
-        }
+    pub fn from_value(code: &serde_json::Value) -> Self {
+        code.as_i64().map_or_else(
+            || {
+                code.as_str().map_or_else(
+                    || Self::Text(code.to_string()),
+                    |s| Self::Text(s.to_string()),
+                )
+            },
+            Self::Number,
+        )
     }
 }
 
@@ -218,13 +223,15 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_code_from_lsp() {
-        let num = lsp_types::NumberOrString::Number(6133);
-        assert_eq!(DiagnosticCode::from_lsp(&num), DiagnosticCode::Number(6133));
+    fn diagnostic_code_from_value() {
+        use serde_json::json;
 
-        let s = lsp_types::NumberOrString::String("needless_return".to_string());
         assert_eq!(
-            DiagnosticCode::from_lsp(&s),
+            DiagnosticCode::from_value(&json!(6133)),
+            DiagnosticCode::Number(6133)
+        );
+        assert_eq!(
+            DiagnosticCode::from_value(&json!("needless_return")),
             DiagnosticCode::Text("needless_return".to_string())
         );
     }
