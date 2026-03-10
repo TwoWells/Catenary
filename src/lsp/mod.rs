@@ -5,6 +5,8 @@
 pub mod client;
 /// Diagnostics strategy selection and activity monitoring.
 pub(crate) mod diagnostics;
+/// Shared server state and notification dispatch.
+pub(crate) mod inbox;
 /// High-level manager for lazy-spawning and caching LSP clients.
 pub mod manager;
 /// LSP message protocol definitions.

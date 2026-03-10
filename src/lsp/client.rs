@@ -11,25 +11,25 @@ use lsp_types::{
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
     InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind,
-    PrepareRenameResponse, ProgressParams, PublishDiagnosticsParams, ReferenceParams,
-    ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
-    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbol, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    PrepareRenameResponse, ReferenceParams, ServerCapabilities, TextDocumentIdentifier,
+    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceFolder,
+    WorkspaceFoldersChangeEvent, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
+use super::inbox::ServerInbox;
 use super::protocol::{self, NotificationMessage, RequestId, RequestMessage, ResponseMessage};
-use super::state::{ProgressTracker, ServerState, ServerStatus};
+use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
 use crate::session::{EventBroadcaster, EventKind};
 
@@ -82,39 +82,22 @@ const SAFETY_CAP: Duration = Duration::from_secs(300);
 
 /// Manages communication with an LSP server process.
 pub struct LspClient {
+    // Connection plumbing (moves to Connection in 0c)
     next_id: AtomicI64,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
-    diagnostics: DiagnosticsCache,
-    /// Per-URI generation counter, incremented on each `publishDiagnostics`.
-    diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
-    /// Wakes waiters when any URI receives fresh diagnostics.
-    diagnostics_notify: Arc<Notify>,
-    /// Wakes waiters when capability flags (`publishes_version`, `has_sent_progress`) change.
-    capability_notify: Arc<Notify>,
-    /// Wakes waiters on `$/progress` state transitions.
-    progress_notify: Arc<Notify>,
-    /// Wakes waiters on `ServerState` changes.
-    state_notify: Arc<Notify>,
-    /// Whether this server has ever published diagnostics.
-    has_published_diagnostics: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+
+    // Grouped server state
+    inbox: Arc<ServerInbox>,
+
+    // Client-local state (not shared with reader)
     encoding: PositionEncodingKind,
-    /// Progress tracking for `$/progress` notifications.
-    progress: Arc<Mutex<ProgressTracker>>,
     /// Time when this client was spawned.
     spawn_time: Instant,
-    /// Current server state (0=Initializing, 1=Busy, 2=Ready, 3=Dead).
-    state: Arc<AtomicU8>,
-    /// The language identifier (e.g., "rust", "python") for error attribution.
-    language: String,
     /// Whether the server supports dynamic workspace folder changes
     /// (both `supported` and `change_notifications` are advertised).
     supports_workspace_folders: bool,
-    /// Whether the server has ever included `version` in `publishDiagnostics`.
-    publishes_version: Arc<AtomicBool>,
-    /// Whether the server has ever sent `$/progress` notifications.
-    has_sent_progress: Arc<AtomicBool>,
     /// Logged once when a server is detected as lacking diagnostics support.
     logged_no_diagnostics_support: AtomicBool,
     /// Last document version sent via `did_open`/`did_change` per URI.
@@ -206,22 +189,11 @@ impl LspClient {
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let diagnostics: DiagnosticsCache = Arc::new(Mutex::new(HashMap::new()));
-        let diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let diagnostics_notify = Arc::new(Notify::new());
-        let capability_notify = Arc::new(Notify::new());
-        let progress_notify = Arc::new(Notify::new());
-        let state_notify = Arc::new(Notify::new());
-        let has_published_diagnostics = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
-        let progress = Arc::new(Mutex::new(ProgressTracker::new()));
-        let state = Arc::new(AtomicU8::new(ServerState::Initializing.as_u8()));
-        let publishes_version = Arc::new(AtomicBool::new(false));
-        let has_sent_progress = Arc::new(AtomicBool::new(false));
+        let inbox = Arc::new(ServerInbox::new(language.to_string(), broadcaster));
 
         // Broadcast initial state
-        broadcaster.send(EventKind::ServerState {
+        inbox.broadcaster.send(EventKind::ServerState {
             language: language.to_string(),
             state: "Initializing".to_string(),
         });
@@ -230,42 +202,19 @@ impl LspClient {
             stdin.clone(),
             stdout,
             pending.clone(),
-            diagnostics.clone(),
-            diagnostics_generation.clone(),
-            diagnostics_notify.clone(),
-            capability_notify.clone(),
-            progress_notify.clone(),
-            state_notify.clone(),
-            has_published_diagnostics.clone(),
             alive.clone(),
-            progress.clone(),
-            state.clone(),
-            language.to_string(),
-            broadcaster,
-            publishes_version.clone(),
-            has_sent_progress.clone(),
+            inbox.clone(),
         ));
 
         Ok(Self {
             next_id: AtomicI64::new(1),
             stdin,
             pending,
-            diagnostics,
-            diagnostics_generation,
-            diagnostics_notify,
-            capability_notify,
-            progress_notify,
-            state_notify,
-            has_published_diagnostics,
             alive,
+            inbox,
             encoding: PositionEncodingKind::UTF16, // Default per spec
-            progress,
             spawn_time: Instant::now(),
-            state,
-            language: language.to_string(),
             supports_workspace_folders: false,
-            publishes_version,
-            has_sent_progress,
             logged_no_diagnostics_support: AtomicBool::new(false),
             last_sent_version: Arc::new(Mutex::new(HashMap::new())),
             monitor: std::sync::Mutex::new(monitor),
@@ -281,28 +230,15 @@ impl LspClient {
 
     /// Background task that reads LSP messages and routes responses to pending requests.
     #[allow(
-        clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "Internal task requires many handles to manage client state"
+        reason = "Internal task requires sequential message parsing and dispatch"
     )]
     async fn reader_task(
         stdin: Arc<Mutex<ChildStdin>>,
         stdout: ChildStdout,
         pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
-        diagnostics: DiagnosticsCache,
-        diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
-        diagnostics_notify: Arc<Notify>,
-        capability_notify: Arc<Notify>,
-        progress_notify: Arc<Notify>,
-        state_notify: Arc<Notify>,
-        has_published_diagnostics: Arc<AtomicBool>,
         alive: Arc<AtomicBool>,
-        progress: Arc<Mutex<ProgressTracker>>,
-        state: Arc<AtomicU8>,
-        language: String,
-        broadcaster: EventBroadcaster,
-        publishes_version: Arc<AtomicBool>,
-        has_sent_progress: Arc<AtomicBool>,
+        inbox: Arc<ServerInbox>,
     ) {
         let mut reader = BufReader::new(stdout);
         let mut buffer = BytesMut::with_capacity(8192);
@@ -393,23 +329,7 @@ impl LspClient {
                         if let Ok(notification) =
                             serde_json::from_value::<NotificationMessage>(value)
                         {
-                            Self::handle_notification(
-                                &notification,
-                                &diagnostics,
-                                &diagnostics_generation,
-                                &diagnostics_notify,
-                                &capability_notify,
-                                &progress_notify,
-                                &state_notify,
-                                &has_published_diagnostics,
-                                &progress,
-                                &state,
-                                &language,
-                                &broadcaster,
-                                &publishes_version,
-                                &has_sent_progress,
-                            )
-                            .await;
+                            inbox.on_notification(&notification).await;
                         }
                     }
                 } else if value.get("id").is_some() {
@@ -432,10 +352,12 @@ impl LspClient {
 
         // Mark server as dead and clean up orphaned progress tokens
         alive.store(false, Ordering::SeqCst);
-        state.store(ServerState::Dead.as_u8(), Ordering::SeqCst);
-        progress.lock().await.clear();
-        diagnostics_notify.notify_waiters();
-        state_notify.notify_waiters();
+        inbox
+            .state
+            .store(ServerState::Dead.as_u8(), Ordering::SeqCst);
+        inbox.progress.lock().await.clear();
+        inbox.diagnostics_notify.notify_waiters();
+        inbox.state_notify.notify_waiters();
         warn!("LSP reader task exiting - server connection lost");
     }
 
@@ -462,118 +384,6 @@ impl LspClient {
         }
     }
 
-    /// Handles incoming LSP notifications.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Internal notification handler requires many shared-state handles"
-    )]
-    async fn handle_notification(
-        notification: &NotificationMessage,
-        diagnostics: &DiagnosticsCache,
-        diagnostics_generation: &Arc<Mutex<HashMap<Uri, u64>>>,
-        diagnostics_notify: &Notify,
-        capability_notify: &Notify,
-        progress_notify: &Notify,
-        state_notify: &Notify,
-        has_published_diagnostics: &Arc<AtomicBool>,
-        progress: &Arc<Mutex<ProgressTracker>>,
-        state: &Arc<AtomicU8>,
-        language: &str,
-        broadcaster: &EventBroadcaster,
-        publishes_version: &Arc<AtomicBool>,
-        has_sent_progress: &Arc<AtomicBool>,
-    ) {
-        match notification.method.as_str() {
-            "textDocument/publishDiagnostics" => {
-                if let Ok(params) =
-                    serde_json::from_value::<PublishDiagnosticsParams>(notification.params.clone())
-                {
-                    debug!(
-                        "Received {} diagnostics for {:?} (version={:?})",
-                        params.diagnostics.len(),
-                        params.uri.as_str(),
-                        params.version,
-                    );
-                    has_published_diagnostics.store(true, Ordering::SeqCst);
-
-                    // Track whether server provides version in diagnostics
-                    if params.version.is_some() && !publishes_version.swap(true, Ordering::SeqCst) {
-                        capability_notify.notify_waiters();
-                    }
-
-                    let mut cache = diagnostics.lock().await;
-                    cache.insert(params.uri.clone(), (params.version, params.diagnostics));
-                    drop(cache);
-
-                    // Bump generation counter and wake waiters
-                    let mut generations = diagnostics_generation.lock().await;
-                    let counter = generations.entry(params.uri).or_insert(0);
-                    *counter += 1;
-                    drop(generations);
-                    diagnostics_notify.notify_waiters();
-                } else {
-                    warn!("Failed to parse publishDiagnostics params");
-                }
-            }
-            "$/progress" => {
-                if let Ok(params) =
-                    serde_json::from_value::<ProgressParams>(notification.params.clone())
-                {
-                    if !has_sent_progress.swap(true, Ordering::SeqCst) {
-                        capability_notify.notify_waiters();
-                    }
-
-                    let mut tracker = progress.lock().await;
-                    tracker.update(&params);
-
-                    // Update state based on progress.
-                    // The Dead guard is the only exclusion — Stuck servers
-                    // that send progress are naturally recovered here
-                    // (transitioned to Busy/Ready like any other state).
-                    let current_state = ServerState::from_u8(state.load(Ordering::SeqCst));
-                    if current_state != ServerState::Dead {
-                        if tracker.is_busy() {
-                            state.store(ServerState::Busy.as_u8(), Ordering::SeqCst);
-                            if tracker.broadcast_changed()
-                                && let Some(p) = tracker.primary_progress()
-                            {
-                                debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
-                                broadcaster.send(EventKind::Progress {
-                                    language: language.to_string(),
-                                    title: p.title.clone(),
-                                    message: p.message.clone(),
-                                    percentage: p.percentage,
-                                });
-                            }
-                        } else {
-                            state.store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-                            debug!("Server ready (progress completed)");
-                            broadcaster.send(EventKind::ProgressEnd {
-                                language: language.to_string(),
-                            });
-                        }
-                        // Fire notifies after state update
-                        progress_notify.notify_waiters();
-                        state_notify.notify_waiters();
-                    }
-                } else {
-                    warn!("Failed to parse $/progress params");
-                }
-            }
-            "window/logMessage" | "window/showMessage" => {
-                if let Some(message) = notification.params.get("message").and_then(|m| m.as_str()) {
-                    debug!("LSP server message: {}", message);
-                }
-            }
-            _ => {
-                trace!(
-                    "Ignoring notification: {} params={}",
-                    notification.method, notification.params
-                );
-            }
-        }
-    }
-
     /// Samples the server process via the persistent `ProcessMonitor`.
     ///
     /// Returns `(delta, state)` where delta is ticks since the last sample.
@@ -589,7 +399,8 @@ impl LspClient {
     /// `workspace/didChangeWorkspaceFolders`) without actual `$/progress`
     /// tokens, which would prevent the failure threshold from draining.
     fn progress_active(&self) -> bool {
-        self.progress
+        self.inbox
+            .progress
             .try_lock()
             .map_or(true, |tracker| tracker.is_busy())
     }
@@ -643,7 +454,7 @@ impl LspClient {
                             match result {
                                 Ok(resp) => break Ok(resp),
                                 Err(_) => break Err(anyhow!(
-                                    "[{}] server closed connection", self.language
+                                    "[{}] server closed connection", self.inbox.language
                                 )),
                             }
                         }
@@ -654,7 +465,7 @@ impl LspClient {
                                     self.pending.lock().await.remove(&id);
                                     break Err(anyhow!(
                                         "[{}] server died during '{method}'",
-                                        self.language
+                                        self.inbox.language
                                     ));
                                 }
                                 if state == catenary_proc::ProcessState::Running
@@ -668,7 +479,7 @@ impl LspClient {
                                 self.pending.lock().await.remove(&id);
                                 break Err(anyhow!(
                                     "[{}] server died during '{method}'",
-                                    self.language
+                                    self.inbox.language
                                 ));
                             }
 
@@ -677,14 +488,14 @@ impl LspClient {
                                 break Err(anyhow!(
                                     "[{}] request '{method}' failed \
                                      (server stuck)",
-                                    self.language
+                                    self.inbox.language
                                 ));
                             }
                             if tokio::time::Instant::now() >= wall_deadline {
                                 self.pending.lock().await.remove(&id);
                                 break Err(anyhow!(
                                     "[{}] request '{method}' timed out",
-                                    self.language
+                                    self.inbox.language
                                 ));
                             }
                         }
@@ -705,20 +516,21 @@ impl LspClient {
                 }
                 return Err(anyhow!(
                     "[{}] LSP error {}: {}",
-                    self.language,
+                    self.inbox.language,
                     error.code,
                     error.message
                 ));
             }
 
             let result = response.result.unwrap_or(serde_json::Value::Null);
-            return serde_json::from_value(result)
-                .with_context(|| format!("[{}] failed to parse LSP response", self.language));
+            return serde_json::from_value(result).with_context(|| {
+                format!("[{}] failed to parse LSP response", self.inbox.language)
+            });
         }
 
         Err(anyhow!(
             "[{}] request '{method}' failed after retries",
-            self.language
+            self.inbox.language
         ))
     }
 
@@ -924,7 +736,7 @@ impl LspClient {
         };
         debug!(
             "[{}] server wants didSave: {}",
-            self.language, self.wants_did_save
+            self.inbox.language, self.wants_did_save
         );
 
         // Store server info and capabilities
@@ -938,7 +750,8 @@ impl LspClient {
         self.notify("initialized", InitializedParams {}).await?;
 
         // Mark as ready (server may later report progress if indexing)
-        self.state
+        self.inbox
+            .state
             .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
 
         Ok(result)
@@ -1033,7 +846,8 @@ impl LspClient {
         removed: Vec<WorkspaceFolder>,
     ) -> Result<()> {
         if !added.is_empty() && self.server_state() == ServerState::Ready {
-            self.state
+            self.inbox
+                .state
                 .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
         }
 
@@ -1256,7 +1070,7 @@ impl LspClient {
 
     /// Gets cached diagnostics for a specific URI.
     pub async fn get_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
-        let cache = self.diagnostics.lock().await;
+        let cache = self.inbox.diagnostics.lock().await;
         cache
             .get(uri)
             .map(|(_, diags)| diags.clone())
@@ -1269,7 +1083,7 @@ impl LspClient {
     /// or if the server doesn't include version in `publishDiagnostics`.
     #[allow(dead_code, reason = "Used by diagnostics strategy tests")]
     pub(crate) async fn cached_diagnostics_version(&self, uri: &Uri) -> Option<i32> {
-        let cache = self.diagnostics.lock().await;
+        let cache = self.inbox.diagnostics.lock().await;
         cache.get(uri).and_then(|(version, _)| *version)
     }
 
@@ -1279,7 +1093,7 @@ impl LspClient {
     /// info or when no version has been tracked for this URI — we can't
     /// distinguish stale from fresh without version data.
     async fn is_diagnostics_version_current(&self, uri: &Uri) -> bool {
-        if !self.publishes_version.load(Ordering::SeqCst) {
+        if !self.inbox.publishes_version.load(Ordering::SeqCst) {
             return true;
         }
         let sent = self.last_sent_version.lock().await;
@@ -1297,7 +1111,7 @@ impl LspClient {
     /// then pass the snapshot to [`wait_for_diagnostics_update`] to ensure
     /// the returned diagnostics reflect that specific change.
     pub async fn diagnostics_generation(&self, uri: &Uri) -> u64 {
-        let generations = self.diagnostics_generation.lock().await;
+        let generations = self.inbox.diagnostics_generation.lock().await;
         generations.get(uri).copied().unwrap_or(0)
     }
 
@@ -1316,9 +1130,9 @@ impl LspClient {
     pub(crate) fn diagnostics_strategy(&self) -> Option<super::diagnostics::DiagnosticsStrategy> {
         use super::diagnostics::DiagnosticsStrategy;
 
-        if self.has_sent_progress.load(Ordering::SeqCst) {
+        if self.inbox.has_sent_progress.load(Ordering::SeqCst) {
             Some(DiagnosticsStrategy::TokenMonitor)
-        } else if self.publishes_version.load(Ordering::SeqCst) {
+        } else if self.inbox.publishes_version.load(Ordering::SeqCst) {
             Some(DiagnosticsStrategy::Version)
         } else {
             None
@@ -1335,8 +1149,8 @@ impl LspClient {
     /// intelligence but do not get `didSave` and are not waited on for
     /// diagnostics.
     pub fn supports_diagnostics_wait(&self) -> bool {
-        if self.publishes_version.load(Ordering::SeqCst)
-            || self.has_sent_progress.load(Ordering::SeqCst)
+        if self.inbox.publishes_version.load(Ordering::SeqCst)
+            || self.inbox.has_sent_progress.load(Ordering::SeqCst)
         {
             return true;
         }
@@ -1348,7 +1162,7 @@ impl LspClient {
         {
             info!(
                 "[{}] server lacks version/progress support \u{2014} diagnostics disabled",
-                self.language
+                self.inbox.language
             );
         }
         false
@@ -1396,12 +1210,12 @@ impl LspClient {
         // ── Grace period ─────────────────────────────────────────────
         // For servers that haven't published diagnostics yet, wait for
         // the first publishDiagnostics using load-aware failure detection.
-        if !self.has_published_diagnostics.load(Ordering::SeqCst) {
+        if !self.inbox.has_published_diagnostics.load(Ordering::SeqCst) {
             let grace_ok = load_aware_grace(
                 &mut || self.sample_monitor(),
                 PREAMBLE_THRESHOLD,
                 Some(Duration::from_secs(10)),
-                &self.diagnostics_notify,
+                &self.inbox.diagnostics_notify,
                 || self.progress_active(),
                 || async { self.diagnostics_generation(uri).await > snapshot },
             )
@@ -1430,7 +1244,7 @@ impl LspClient {
                     return DiagnosticsWaitResult::Nothing;
                 }
                 tokio::select! {
-                    () = self.capability_notify.notified() => {}
+                    () = self.inbox.capability_notify.notified() => {}
                     () = tokio::time::sleep(POLL_INTERVAL) => {}
                 }
             }
@@ -1438,8 +1252,8 @@ impl LspClient {
         debug!(
             "Diagnostics strategy: {:?} (has_progress={}, publishes_version={})",
             strategy,
-            self.has_sent_progress.load(Ordering::SeqCst),
-            self.publishes_version.load(Ordering::SeqCst),
+            self.inbox.has_sent_progress.load(Ordering::SeqCst),
+            self.inbox.publishes_version.load(Ordering::SeqCst),
         );
 
         let wall_deadline = tokio::time::Instant::now() + SAFETY_CAP;
@@ -1458,7 +1272,7 @@ impl LspClient {
 
                     // Event-driven wake + failure detection
                     tokio::select! {
-                        () = self.diagnostics_notify.notified() => {
+                        () = self.inbox.diagnostics_notify.notified() => {
                             // Check condition at top of loop
                             continue;
                         }
@@ -1491,8 +1305,10 @@ impl LspClient {
                 }
             }
             DiagnosticsStrategy::TokenMonitor => {
-                let mut monitor =
-                    super::diagnostics::TokenMonitor::new(self.state.clone(), self.alive.clone());
+                let mut monitor = super::diagnostics::TokenMonitor::new(
+                    self.inbox.state.clone(),
+                    self.alive.clone(),
+                );
                 let mut ever_active = false;
 
                 // Progress grace: if diagnostics arrive before progress tokens,
@@ -1514,7 +1330,7 @@ impl LspClient {
                             &mut || self.sample_monitor(),
                             PREAMBLE_THRESHOLD,
                             Some(Duration::from_secs(2)),
-                            &self.progress_notify,
+                            &self.inbox.progress_notify,
                             || self.progress_active(),
                             || async { self.progress_active() },
                         )
@@ -1547,8 +1363,8 @@ impl LspClient {
 
                     // Event-driven wake + failure detection
                     tokio::select! {
-                        () = self.diagnostics_notify.notified() => continue,
-                        () = self.progress_notify.notified() => continue,
+                        () = self.inbox.diagnostics_notify.notified() => continue,
+                        () = self.inbox.progress_notify.notified() => continue,
                         () = tokio::time::sleep(POLL_INTERVAL) => {}
                     }
 
@@ -1590,7 +1406,7 @@ impl LspClient {
 
     /// Returns the language identifier for this client (e.g., "rust", "python").
     pub fn language(&self) -> &str {
-        &self.language
+        &self.inbox.language
     }
 
     /// Returns whether the server supports dynamic workspace folder changes.
@@ -1605,7 +1421,7 @@ impl LspClient {
 
     /// Returns the current server state.
     pub fn server_state(&self) -> ServerState {
-        ServerState::from_u8(self.state.load(Ordering::SeqCst))
+        ServerState::from_u8(self.inbox.state.load(Ordering::SeqCst))
     }
 
     /// Returns time since server spawned.
@@ -1646,7 +1462,7 @@ impl LspClient {
     /// Returns detailed status for this server.
     pub async fn status(&self, language: String) -> ServerStatus {
         let (title, message, percentage) = {
-            let progress = self.progress.lock().await;
+            let progress = self.inbox.progress.lock().await;
             let primary = progress.primary_progress();
             let title = primary.map(|p| p.title.clone());
             let message = primary.and_then(|p| p.message.clone());
@@ -1696,7 +1512,7 @@ impl LspClient {
             &mut || self.sample_monitor(),
             READY_THRESHOLD,
             None, // Use default 5-minute safety cap
-            &self.state_notify,
+            &self.inbox.state_notify,
             || self.progress_active(),
             || async {
                 if self.is_ready() {
@@ -1715,9 +1531,10 @@ impl LspClient {
                                     "wait_ready: activity settle — non-progress server \
                                      idle for {count} samples, transitioning to Ready"
                                 );
-                                self.state
+                                self.inbox
+                                    .state
                                     .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-                                self.state_notify.notify_waiters();
+                                self.inbox.state_notify.notify_waiters();
                                 return true;
                             }
                         } else {
@@ -1737,9 +1554,10 @@ impl LspClient {
         // so future calls skip the full wait.
         if !ready && self.is_alive() {
             debug!("wait_ready: patience exhausted, server still alive — marking as Stuck");
-            self.state
+            self.inbox
+                .state
                 .store(ServerState::Stuck.as_u8(), Ordering::SeqCst);
-            self.state_notify.notify_waiters();
+            self.inbox.state_notify.notify_waiters();
         }
 
         ready
@@ -1760,9 +1578,10 @@ impl LspClient {
             && delta == 0
         {
             debug!("try_idle_recover: stuck server is idle — transitioning to Ready");
-            self.state
+            self.inbox
+                .state
                 .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-            self.state_notify.notify_waiters();
+            self.inbox.state_notify.notify_waiters();
             return true;
         }
 
