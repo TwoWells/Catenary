@@ -332,27 +332,6 @@ mod tests {
         assert!(!supports_workspace_folders(&json!({})));
     }
 
-    #[test]
-    fn supports_workspace_folders_comparison_with_lsp_types() {
-        use lsp_types::{
-            OneOf, ServerCapabilities, WorkspaceFoldersServerCapabilities,
-            WorkspaceServerCapabilities,
-        };
-
-        let lsp_caps = ServerCapabilities {
-            workspace: Some(WorkspaceServerCapabilities {
-                workspace_folders: Some(WorkspaceFoldersServerCapabilities {
-                    supported: Some(true),
-                    change_notifications: Some(OneOf::Left(true)),
-                }),
-                file_operations: None,
-            }),
-            ..Default::default()
-        };
-        let caps = serde_json::to_value(lsp_caps).expect("serialize");
-        assert!(supports_workspace_folders(&caps));
-    }
-
     // ── wants_did_save ──────────────────────────────────────────────
 
     #[test]
@@ -400,45 +379,6 @@ mod tests {
     #[test]
     fn wants_did_save_missing() {
         assert!(!wants_did_save(&json!({})));
-    }
-
-    #[test]
-    fn wants_did_save_comparison_with_lsp_types() {
-        use lsp_types::{
-            SaveOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-            TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
-        };
-
-        // Short-form Kind::Full
-        let lsp_caps = ServerCapabilities {
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
-            ..Default::default()
-        };
-        let caps = serde_json::to_value(&lsp_caps).expect("serialize");
-        assert!(wants_did_save(&caps));
-
-        // Long-form with save options
-        let lsp_caps = ServerCapabilities {
-            text_document_sync: Some(TextDocumentSyncCapability::Options(
-                TextDocumentSyncOptions {
-                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                        include_text: Some(false),
-                    })),
-                    ..Default::default()
-                },
-            )),
-            ..Default::default()
-        };
-        let caps = serde_json::to_value(&lsp_caps).expect("serialize");
-        assert!(wants_did_save(&caps));
-
-        // Short-form Kind::None
-        let lsp_caps = ServerCapabilities {
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::NONE)),
-            ..Default::default()
-        };
-        let caps = serde_json::to_value(&lsp_caps).expect("serialize");
-        assert!(!wants_did_save(&caps));
     }
 
     // ── text_document_sync_kind ─────────────────────────────────────
@@ -545,12 +485,11 @@ mod tests {
 
     #[test]
     fn publish_diagnostics_uri_present() {
-        let params = serde_json::to_value(lsp_types::PublishDiagnosticsParams {
-            uri: "file:///foo.rs".parse().expect("uri"),
-            version: Some(1),
-            diagnostics: vec![],
-        })
-        .expect("serialize");
+        let params = json!({
+            "uri": "file:///foo.rs",
+            "version": 1,
+            "diagnostics": []
+        });
         assert_eq!(publish_diagnostics_uri(&params), Some("file:///foo.rs"));
     }
 
@@ -561,23 +500,20 @@ mod tests {
 
     #[test]
     fn publish_diagnostics_version_present() {
-        let params = serde_json::to_value(lsp_types::PublishDiagnosticsParams {
-            uri: "file:///foo.rs".parse().expect("uri"),
-            version: Some(42),
-            diagnostics: vec![],
-        })
-        .expect("serialize");
+        let params = json!({
+            "uri": "file:///foo.rs",
+            "version": 42,
+            "diagnostics": []
+        });
         assert_eq!(publish_diagnostics_version(&params), Some(42));
     }
 
     #[test]
     fn publish_diagnostics_version_missing() {
-        let params = serde_json::to_value(lsp_types::PublishDiagnosticsParams {
-            uri: "file:///foo.rs".parse().expect("uri"),
-            version: None,
-            diagnostics: vec![],
-        })
-        .expect("serialize");
+        let params = json!({
+            "uri": "file:///foo.rs",
+            "diagnostics": []
+        });
         assert_eq!(publish_diagnostics_version(&params), None);
     }
 
@@ -591,15 +527,16 @@ mod tests {
 
     #[test]
     fn publish_diagnostics_diagnostics_present() {
-        let params = serde_json::to_value(lsp_types::PublishDiagnosticsParams {
-            uri: "file:///foo.rs".parse().expect("uri"),
-            version: None,
-            diagnostics: vec![lsp_types::Diagnostic {
-                message: "unused variable".to_string(),
-                ..Default::default()
-            }],
-        })
-        .expect("serialize");
+        let params = json!({
+            "uri": "file:///foo.rs",
+            "diagnostics": [{
+                "message": "unused variable",
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 }
+                }
+            }]
+        });
         let diags = publish_diagnostics_diagnostics(&params);
         assert_eq!(diags.len(), 1);
         assert_eq!(
@@ -623,18 +560,10 @@ mod tests {
 
     #[test]
     fn progress_token_string() {
-        let params = serde_json::to_value(lsp_types::ProgressParams {
-            token: lsp_types::NumberOrString::String("rustAnalyzer/flycheck".to_string()),
-            value: lsp_types::ProgressParamsValue::WorkDone(lsp_types::WorkDoneProgress::Begin(
-                lsp_types::WorkDoneProgressBegin {
-                    title: "Checking".to_string(),
-                    cancellable: None,
-                    message: None,
-                    percentage: None,
-                },
-            )),
-        })
-        .expect("serialize");
+        let params = json!({
+            "token": "rustAnalyzer/flycheck",
+            "value": { "kind": "begin", "title": "Checking" }
+        });
         assert_eq!(
             progress_token(&params).and_then(Value::as_str),
             Some("rustAnalyzer/flycheck")
@@ -643,13 +572,10 @@ mod tests {
 
     #[test]
     fn progress_token_number() {
-        let params = serde_json::to_value(lsp_types::ProgressParams {
-            token: lsp_types::NumberOrString::Number(42),
-            value: lsp_types::ProgressParamsValue::WorkDone(lsp_types::WorkDoneProgress::End(
-                lsp_types::WorkDoneProgressEnd { message: None },
-            )),
-        })
-        .expect("serialize");
+        let params = json!({
+            "token": 42,
+            "value": { "kind": "end" }
+        });
         assert_eq!(progress_token(&params).and_then(Value::as_i64), Some(42));
     }
 
@@ -660,46 +586,28 @@ mod tests {
 
     #[test]
     fn progress_kind_begin() {
-        let params = serde_json::to_value(lsp_types::ProgressParams {
-            token: lsp_types::NumberOrString::Number(1),
-            value: lsp_types::ProgressParamsValue::WorkDone(lsp_types::WorkDoneProgress::Begin(
-                lsp_types::WorkDoneProgressBegin {
-                    title: "Indexing".to_string(),
-                    cancellable: None,
-                    message: None,
-                    percentage: None,
-                },
-            )),
-        })
-        .expect("serialize");
+        let params = json!({
+            "token": 1,
+            "value": { "kind": "begin", "title": "Indexing" }
+        });
         assert_eq!(progress_kind(&params), Some("begin"));
     }
 
     #[test]
     fn progress_kind_report() {
-        let params = serde_json::to_value(lsp_types::ProgressParams {
-            token: lsp_types::NumberOrString::Number(1),
-            value: lsp_types::ProgressParamsValue::WorkDone(lsp_types::WorkDoneProgress::Report(
-                lsp_types::WorkDoneProgressReport {
-                    cancellable: None,
-                    message: Some("file.rs".to_string()),
-                    percentage: Some(50),
-                },
-            )),
-        })
-        .expect("serialize");
+        let params = json!({
+            "token": 1,
+            "value": { "kind": "report", "message": "file.rs", "percentage": 50 }
+        });
         assert_eq!(progress_kind(&params), Some("report"));
     }
 
     #[test]
     fn progress_kind_end() {
-        let params = serde_json::to_value(lsp_types::ProgressParams {
-            token: lsp_types::NumberOrString::Number(1),
-            value: lsp_types::ProgressParamsValue::WorkDone(lsp_types::WorkDoneProgress::End(
-                lsp_types::WorkDoneProgressEnd { message: None },
-            )),
-        })
-        .expect("serialize");
+        let params = json!({
+            "token": 1,
+            "value": { "kind": "end" }
+        });
         assert_eq!(progress_kind(&params), Some("end"));
     }
 
@@ -754,21 +662,19 @@ mod tests {
 
     #[test]
     fn diagnostic_severity_present() {
-        let diag = serde_json::to_value(lsp_types::Diagnostic {
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            ..Default::default()
-        })
-        .expect("serialize");
+        let diag = json!({ "severity": 1, "message": "err", "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 0 }
+        }});
         assert_eq!(diagnostic_severity(&diag), Some(1));
     }
 
     #[test]
     fn diagnostic_severity_warning() {
-        let diag = serde_json::to_value(lsp_types::Diagnostic {
-            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
-            ..Default::default()
-        })
-        .expect("serialize");
+        let diag = json!({ "severity": 2, "message": "warn", "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 0 }
+        }});
         assert_eq!(diagnostic_severity(&diag), Some(2));
     }
 
@@ -789,11 +695,10 @@ mod tests {
 
     #[test]
     fn diagnostic_message_present() {
-        let diag = serde_json::to_value(lsp_types::Diagnostic {
-            message: "unused variable".to_string(),
-            ..Default::default()
-        })
-        .expect("serialize");
+        let diag = json!({ "message": "unused variable", "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 0 }
+        }});
         assert_eq!(diagnostic_message(&diag), Some("unused variable"));
     }
 
@@ -804,20 +709,13 @@ mod tests {
 
     #[test]
     fn diagnostic_range_present() {
-        let diag = serde_json::to_value(lsp_types::Diagnostic {
-            range: lsp_types::Range {
-                start: lsp_types::Position {
-                    line: 1,
-                    character: 2,
-                },
-                end: lsp_types::Position {
-                    line: 1,
-                    character: 10,
-                },
-            },
-            ..Default::default()
-        })
-        .expect("serialize");
+        let diag = json!({
+            "message": "err",
+            "range": {
+                "start": { "line": 1, "character": 2 },
+                "end": { "line": 1, "character": 10 }
+            }
+        });
         assert_eq!(
             diagnostic_range(&diag),
             Some(Range {

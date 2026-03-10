@@ -344,7 +344,7 @@ impl NotifyServer {
                 .into_iter()
                 .zip(fixes.into_iter().chain(std::iter::repeat_with(Vec::new)))
             {
-                if let Some(sev) = diag.severity {
+                if let Some(sev) = diagnostic_severity_u8(&diag) {
                     if crate::filter::severity_passes(sev, threshold) {
                         filtered_diags.push(diag);
                         filtered_fixes.push(fix);
@@ -536,6 +536,12 @@ impl NotifyServer {
     }
 }
 
+/// Temporary bridge: extracts severity as `u8` from `lsp_types` `Diagnostic`.
+fn diagnostic_severity_u8(diag: &Diagnostic) -> Option<u8> {
+    let v = serde_json::to_value(diag.severity?).ok()?;
+    v.as_u64().and_then(|n| u8::try_from(n).ok())
+}
+
 /// Resolves a file path to an absolute path.
 fn resolve_path(file: &str) -> Result<PathBuf> {
     let path = PathBuf::from(file);
@@ -619,11 +625,11 @@ pub(crate) fn format_diagnostics_compact(
         .iter()
         .enumerate()
         .filter_map(|(i, d)| {
-            let severity = match d.severity {
-                Some(lsp_types::DiagnosticSeverity::ERROR) => "error",
-                Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
-                Some(lsp_types::DiagnosticSeverity::INFORMATION) => "info",
-                Some(lsp_types::DiagnosticSeverity::HINT) => "hint",
+            let severity = match diagnostic_severity_u8(d) {
+                Some(1) => "error",
+                Some(2) => "warning",
+                Some(3) => "info",
+                Some(4) => "hint",
                 _ => "unknown",
             };
             let line = d.range.start.line + 1;
@@ -644,7 +650,7 @@ pub(crate) fn format_diagnostics_compact(
                 server_version,
                 d.source.as_deref(),
                 diag_code.as_ref(),
-                d.severity.unwrap_or(lsp_types::DiagnosticSeverity::WARNING),
+                diagnostic_severity_u8(d).unwrap_or(crate::filter::SEVERITY_WARNING),
                 language_id,
                 &d.message,
             );

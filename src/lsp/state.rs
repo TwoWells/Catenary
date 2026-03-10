@@ -3,13 +3,14 @@
 
 //! Server state and progress tracking types.
 
-use lsp_types::{NumberOrString, ProgressParams, ProgressParamsValue, WorkDoneProgress};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Instant;
+use tracing::warn;
 
-/// Token type for progress tracking (string or number).
-pub type ProgressToken = NumberOrString;
+/// Token type for progress tracking.
+pub type ProgressToken = String;
 
 /// State of an active progress operation.
 #[derive(Debug, Clone)]
@@ -104,34 +105,52 @@ impl ProgressTracker {
     }
 
     /// Update state from a progress notification.
-    pub fn update(&mut self, params: &ProgressParams) {
-        match &params.value {
-            ProgressParamsValue::WorkDone(progress) => match progress {
-                WorkDoneProgress::Begin(begin) => {
-                    self.active_progress.insert(
-                        params.token.clone(),
-                        ProgressState {
-                            title: begin.title.clone(),
-                            message: begin.message.clone(),
-                            percentage: begin.percentage,
-                            started: Instant::now(),
-                        },
-                    );
-                }
-                WorkDoneProgress::Report(report) => {
-                    if let Some(state) = self.active_progress.get_mut(&params.token) {
-                        if report.message.is_some() {
-                            state.message.clone_from(&report.message);
-                        }
-                        if report.percentage.is_some() {
-                            state.percentage = report.percentage;
-                        }
+    ///
+    /// `token` is the canonicalized progress token (string form).
+    /// `value` is the raw `WorkDoneProgress` payload from `$/progress`.
+    pub fn update(&mut self, token: &str, value: &Value) {
+        match value.get("kind").and_then(Value::as_str) {
+            Some("begin") => {
+                self.active_progress.insert(
+                    token.to_string(),
+                    ProgressState {
+                        title: value
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        message: value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        percentage: value
+                            .get("percentage")
+                            .and_then(Value::as_u64)
+                            .and_then(|n| u32::try_from(n).ok()),
+                        started: Instant::now(),
+                    },
+                );
+            }
+            Some("report") => {
+                if let Some(state) = self.active_progress.get_mut(token) {
+                    if let Some(msg) = value.get("message").and_then(Value::as_str) {
+                        state.message = Some(msg.to_string());
+                    }
+                    if let Some(pct) = value
+                        .get("percentage")
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u32::try_from(n).ok())
+                    {
+                        state.percentage = Some(pct);
                     }
                 }
-                WorkDoneProgress::End(_) => {
-                    self.active_progress.remove(&params.token);
-                }
-            },
+            }
+            Some("end") => {
+                self.active_progress.remove(token);
+            }
+            other => {
+                warn!("Unknown progress kind: {:?}", other);
+            }
         }
     }
 
@@ -180,12 +199,7 @@ impl ProgressTracker {
 )]
 mod tests {
     use super::*;
-    fn make_progress_params(token: &str, progress: WorkDoneProgress) -> ProgressParams {
-        ProgressParams {
-            token: NumberOrString::String(token.to_string()),
-            value: ProgressParamsValue::WorkDone(progress),
-        }
-    }
+    use serde_json::json;
 
     #[test]
     fn test_progress_begin_end() {
@@ -193,16 +207,8 @@ mod tests {
         assert!(!tracker.is_busy());
 
         // Begin progress
-        let begin = make_progress_params(
-            "indexing",
-            WorkDoneProgress::Begin(lsp_types::WorkDoneProgressBegin {
-                title: "Indexing".to_string(),
-                cancellable: None,
-                message: Some("src/main.rs".to_string()),
-                percentage: Some(0),
-            }),
-        );
-        tracker.update(&begin);
+        let begin = json!({"kind": "begin", "title": "Indexing", "message": "src/main.rs", "percentage": 0});
+        tracker.update("indexing", &begin);
 
         assert!(tracker.is_busy());
         let primary = tracker.primary_progress().expect("active progress");
@@ -211,11 +217,8 @@ mod tests {
         assert_eq!(primary.percentage, Some(0));
 
         // End progress
-        let end = make_progress_params(
-            "indexing",
-            WorkDoneProgress::End(lsp_types::WorkDoneProgressEnd { message: None }),
-        );
-        tracker.update(&end);
+        let end = json!({"kind": "end"});
+        tracker.update("indexing", &end);
 
         assert!(!tracker.is_busy());
     }
@@ -225,27 +228,12 @@ mod tests {
         let mut tracker = ProgressTracker::new();
 
         // Begin
-        let begin = make_progress_params(
-            "indexing",
-            WorkDoneProgress::Begin(lsp_types::WorkDoneProgressBegin {
-                title: "Indexing".to_string(),
-                cancellable: None,
-                message: None,
-                percentage: Some(0),
-            }),
-        );
-        tracker.update(&begin);
+        let begin = json!({"kind": "begin", "title": "Indexing", "percentage": 0});
+        tracker.update("indexing", &begin);
 
         // Report progress
-        let report = make_progress_params(
-            "indexing",
-            WorkDoneProgress::Report(lsp_types::WorkDoneProgressReport {
-                cancellable: None,
-                message: Some("50% done".to_string()),
-                percentage: Some(50),
-            }),
-        );
-        tracker.update(&report);
+        let report = json!({"kind": "report", "message": "50% done", "percentage": 50});
+        tracker.update("indexing", &report);
 
         let primary = tracker.primary_progress().expect("active progress");
         assert_eq!(primary.percentage, Some(50));
@@ -257,26 +245,10 @@ mod tests {
         let mut tracker = ProgressTracker::new();
 
         // Begin two progress operations
-        let begin1 = make_progress_params(
-            "indexing",
-            WorkDoneProgress::Begin(lsp_types::WorkDoneProgressBegin {
-                title: "Indexing".to_string(),
-                cancellable: None,
-                message: None,
-                percentage: Some(50),
-            }),
-        );
-        let begin2 = make_progress_params(
-            "analyzing",
-            WorkDoneProgress::Begin(lsp_types::WorkDoneProgressBegin {
-                title: "Analyzing".to_string(),
-                cancellable: None,
-                message: None,
-                percentage: Some(10),
-            }),
-        );
-        tracker.update(&begin1);
-        tracker.update(&begin2);
+        let begin1 = json!({"kind": "begin", "title": "Indexing", "percentage": 50});
+        let begin2 = json!({"kind": "begin", "title": "Analyzing", "percentage": 10});
+        tracker.update("indexing", &begin1);
+        tracker.update("analyzing", &begin2);
 
         assert!(tracker.is_busy());
 
@@ -286,11 +258,8 @@ mod tests {
         assert_eq!(primary.percentage, Some(10));
 
         // End one
-        let end1 = make_progress_params(
-            "indexing",
-            WorkDoneProgress::End(lsp_types::WorkDoneProgressEnd { message: None }),
-        );
-        tracker.update(&end1);
+        let end1 = json!({"kind": "end"});
+        tracker.update("indexing", &end1);
 
         assert!(tracker.is_busy());
         let primary = tracker.primary_progress().expect("active progress");

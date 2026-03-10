@@ -13,7 +13,14 @@
 
 mod rust_analyzer;
 
-use lsp_types::DiagnosticSeverity;
+/// LSP severity constants (1=Error through 4=Hint).
+pub const SEVERITY_ERROR: u8 = 1;
+/// Warning severity.
+pub const SEVERITY_WARNING: u8 = 2;
+/// Information severity.
+pub const SEVERITY_INFORMATION: u8 = 3;
+/// Hint severity.
+pub const SEVERITY_HINT: u8 = 4;
 
 /// LSP diagnostic code, which can be a number or a string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +64,7 @@ pub trait DiagnosticFilter: Send + Sync {
         version: Option<&str>,
         source: Option<&str>,
         code: Option<&DiagnosticCode>,
-        severity: DiagnosticSeverity,
+        severity: u8,
         language_id: &str,
         message: &str,
     ) -> String;
@@ -73,7 +80,7 @@ impl DiagnosticFilter for DefaultFilter {
         _version: Option<&str>,
         _source: Option<&str>,
         _code: Option<&DiagnosticCode>,
-        _severity: DiagnosticSeverity,
+        _severity: u8,
         _language_id: &str,
         message: &str,
     ) -> String {
@@ -97,16 +104,16 @@ pub fn get_filter(server_command: &str) -> &'static dyn DiagnosticFilter {
     }
 }
 
-/// Parses a severity string from config into an `lsp_types::DiagnosticSeverity`.
+/// Parses a severity string from config into a `u8` (LSP severity encoding).
 ///
 /// Returns `None` for unrecognized values (caller should treat as "no threshold").
 #[must_use]
-pub fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
+pub fn parse_severity(s: &str) -> Option<u8> {
     match s.to_ascii_lowercase().as_str() {
-        "error" => Some(DiagnosticSeverity::ERROR),
-        "warning" => Some(DiagnosticSeverity::WARNING),
-        "information" | "info" => Some(DiagnosticSeverity::INFORMATION),
-        "hint" => Some(DiagnosticSeverity::HINT),
+        "error" => Some(SEVERITY_ERROR),
+        "warning" => Some(SEVERITY_WARNING),
+        "information" | "info" => Some(SEVERITY_INFORMATION),
+        "hint" => Some(SEVERITY_HINT),
         _ => None,
     }
 }
@@ -116,23 +123,16 @@ pub fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
 /// LSP severity is inverted: 1 = Error (most severe), 4 = Hint (least).
 /// A diagnostic passes if its severity value is ≤ the threshold value.
 #[must_use]
-pub fn severity_passes(severity: DiagnosticSeverity, threshold: DiagnosticSeverity) -> bool {
+pub const fn severity_passes(severity: u8, threshold: u8) -> bool {
     severity_rank(severity) <= severity_rank(threshold)
 }
 
-/// Maps `DiagnosticSeverity` to a numeric rank for comparison.
+/// Maps severity to a numeric rank for comparison.
 /// Lower rank = more severe (Error=1, Warning=2, Info=3, Hint=4, unknown=5).
-fn severity_rank(s: DiagnosticSeverity) -> u8 {
-    if s == DiagnosticSeverity::ERROR {
-        1
-    } else if s == DiagnosticSeverity::WARNING {
-        2
-    } else if s == DiagnosticSeverity::INFORMATION {
-        3
-    } else if s == DiagnosticSeverity::HINT {
-        4
-    } else {
-        5
+const fn severity_rank(s: u8) -> u8 {
+    match s {
+        1..=4 => s,
+        _ => 5,
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
             None,
             None,
             None,
-            DiagnosticSeverity::WARNING,
+            SEVERITY_WARNING,
             "rust",
             "unused variable `x`",
         );
@@ -167,7 +167,7 @@ mod tests {
             None,
             None,
             None,
-            DiagnosticSeverity::ERROR,
+            SEVERITY_ERROR,
             "python",
             "syntax error",
         );
@@ -184,7 +184,7 @@ mod tests {
             Some("1.92.0"),
             Some("clippy"),
             None,
-            DiagnosticSeverity::WARNING,
+            SEVERITY_WARNING,
             "rust",
             message,
         );
@@ -193,17 +193,11 @@ mod tests {
 
     #[test]
     fn parse_severity_valid() {
-        assert_eq!(parse_severity("error"), Some(DiagnosticSeverity::ERROR));
-        assert_eq!(parse_severity("Warning"), Some(DiagnosticSeverity::WARNING));
-        assert_eq!(
-            parse_severity("information"),
-            Some(DiagnosticSeverity::INFORMATION)
-        );
-        assert_eq!(
-            parse_severity("info"),
-            Some(DiagnosticSeverity::INFORMATION)
-        );
-        assert_eq!(parse_severity("hint"), Some(DiagnosticSeverity::HINT));
+        assert_eq!(parse_severity("error"), Some(SEVERITY_ERROR));
+        assert_eq!(parse_severity("Warning"), Some(SEVERITY_WARNING));
+        assert_eq!(parse_severity("information"), Some(SEVERITY_INFORMATION));
+        assert_eq!(parse_severity("info"), Some(SEVERITY_INFORMATION));
+        assert_eq!(parse_severity("hint"), Some(SEVERITY_HINT));
     }
 
     #[test]
@@ -214,25 +208,13 @@ mod tests {
     #[test]
     fn severity_passes_threshold() {
         // Error passes warning threshold
-        assert!(severity_passes(
-            DiagnosticSeverity::ERROR,
-            DiagnosticSeverity::WARNING
-        ));
+        assert!(severity_passes(SEVERITY_ERROR, SEVERITY_WARNING));
         // Warning passes warning threshold
-        assert!(severity_passes(
-            DiagnosticSeverity::WARNING,
-            DiagnosticSeverity::WARNING
-        ));
+        assert!(severity_passes(SEVERITY_WARNING, SEVERITY_WARNING));
         // Hint does not pass warning threshold
-        assert!(!severity_passes(
-            DiagnosticSeverity::HINT,
-            DiagnosticSeverity::WARNING
-        ));
+        assert!(!severity_passes(SEVERITY_HINT, SEVERITY_WARNING));
         // Info does not pass warning threshold
-        assert!(!severity_passes(
-            DiagnosticSeverity::INFORMATION,
-            DiagnosticSeverity::WARNING
-        ));
+        assert!(!severity_passes(SEVERITY_INFORMATION, SEVERITY_WARNING));
     }
 
     #[test]

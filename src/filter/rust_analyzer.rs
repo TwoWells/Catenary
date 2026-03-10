@@ -7,8 +7,6 @@
 //! - `"for further information visit https://..."` URL lines
 //! - Lint attribution lines (`` `#[warn(...)]` on by default ``, etc.)
 
-use lsp_types::DiagnosticSeverity;
-
 use super::{DiagnosticCode, DiagnosticFilter};
 
 /// Diagnostic filter for rust-analyzer.
@@ -29,7 +27,7 @@ impl DiagnosticFilter for RustAnalyzerFilter {
         version: Option<&str>,
         _source: Option<&str>,
         _code: Option<&DiagnosticCode>,
-        _severity: DiagnosticSeverity,
+        _severity: u8,
         _language_id: &str,
         message: &str,
     ) -> String {
@@ -89,7 +87,7 @@ mod tests {
             version,
             Some("clippy"),
             None,
-            DiagnosticSeverity::WARNING,
+            crate::filter::SEVERITY_WARNING,
             "rust",
             message,
         )
