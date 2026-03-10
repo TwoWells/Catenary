@@ -284,7 +284,7 @@ impl NotifyServer {
         // ensure_open detects disk changes and returns didOpen/didChange
         if let Some(notification) = doc_manager.ensure_open(&canonical).await? {
             // Snapshot generation *before* sending the change
-            let snapshot = client.diagnostics_generation(&uri).await;
+            let snapshot = client.diagnostics_generation(&uri);
 
             match notification {
                 DocumentNotification::Open(params) => {
@@ -311,7 +311,7 @@ impl NotifyServer {
             drop(doc_manager);
         }
 
-        let diagnostics = client.get_diagnostics(&uri).await;
+        let diagnostics = client.get_diagnostics(&uri);
 
         // Extract filter context before dropping the client lock
         let server_command = client.server_command().to_string();

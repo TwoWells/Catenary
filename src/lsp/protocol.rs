@@ -72,6 +72,19 @@ pub struct ResponseError {
     pub data: Option<serde_json::Value>,
 }
 
+/// Error returned by [`Inbox::on_request`](super::inbox::Inbox::on_request)
+/// for server requests the client cannot handle.
+///
+/// Connection translates this into a JSON-RPC error response.
+/// The inbox implementor never constructs the response envelope.
+#[derive(Debug)]
+pub struct RpcError {
+    /// JSON-RPC error code (e.g., -32601 for `MethodNotFound`).
+    pub code: i64,
+    /// Human-readable error message.
+    pub message: String,
+}
+
 impl From<i64> for RequestId {
     fn from(n: i64) -> Self {
         Self::Number(n)

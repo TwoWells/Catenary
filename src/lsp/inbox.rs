@@ -4,16 +4,39 @@
 //! Shared server state and notification dispatch.
 
 use lsp_types::{ProgressParams, PublishDiagnosticsParams, Uri};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use tokio::sync::{Mutex, Notify};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
 
 use super::client::DiagnosticsCache;
-use super::protocol::NotificationMessage;
+use super::protocol::RpcError;
 use super::state::{ProgressTracker, ServerState};
 use crate::session::{EventBroadcaster, EventKind};
+
+/// Receives server-initiated messages from the Connection reader loop.
+///
+/// All methods are synchronous. The async byte-reading lives in
+/// Connection; by the time these methods are called, the message
+/// is already parsed.
+pub trait Inbox: Send + Sync {
+    /// Handle a server notification (no response needed).
+    fn on_notification(&self, method: &str, params: &Value);
+
+    /// Handle a server request (response required).
+    ///
+    /// Returns `Ok(result)` for a success response or `Err(RpcError)`
+    /// for an error response. Connection builds the JSON-RPC envelope.
+    fn on_request(&self, method: &str, params: &Value) -> Result<Value, RpcError>;
+
+    /// Handle reader loop shutdown (server connection lost).
+    ///
+    /// Called after the `alive` flag is set to `false`. Updates internal
+    /// state and wakes any waiters blocked on diagnostics or state changes.
+    fn on_shutdown(&self);
+}
 
 /// Shared server state for notification dispatch.
 ///
@@ -65,13 +88,14 @@ impl ServerInbox {
             broadcaster,
         }
     }
+}
 
-    /// Handles an incoming LSP notification, updating shared state.
-    pub(crate) async fn on_notification(&self, notification: &NotificationMessage) {
-        match notification.method.as_str() {
+impl Inbox for ServerInbox {
+    fn on_notification(&self, method: &str, params: &Value) {
+        match method {
             "textDocument/publishDiagnostics" => {
                 if let Ok(params) =
-                    serde_json::from_value::<PublishDiagnosticsParams>(notification.params.clone())
+                    serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
                 {
                     debug!(
                         "Received {} diagnostics for {:?} (version={:?})",
@@ -88,12 +112,18 @@ impl ServerInbox {
                         self.capability_notify.notify_waiters();
                     }
 
-                    let mut cache = self.diagnostics.lock().await;
+                    let mut cache = self
+                        .diagnostics
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     cache.insert(params.uri.clone(), (params.version, params.diagnostics));
                     drop(cache);
 
                     // Bump generation counter and wake waiters
-                    let mut generations = self.diagnostics_generation.lock().await;
+                    let mut generations = self
+                        .diagnostics_generation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let counter = generations.entry(params.uri).or_insert(0);
                     *counter += 1;
                     drop(generations);
@@ -103,14 +133,15 @@ impl ServerInbox {
                 }
             }
             "$/progress" => {
-                if let Ok(params) =
-                    serde_json::from_value::<ProgressParams>(notification.params.clone())
-                {
+                if let Ok(params) = serde_json::from_value::<ProgressParams>(params.clone()) {
                     if !self.has_sent_progress.swap(true, Ordering::SeqCst) {
                         self.capability_notify.notify_waiters();
                     }
 
-                    let mut tracker = self.progress.lock().await;
+                    let mut tracker = self
+                        .progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     tracker.update(&params);
 
                     // Update state based on progress.
@@ -150,16 +181,43 @@ impl ServerInbox {
                 }
             }
             "window/logMessage" | "window/showMessage" => {
-                if let Some(message) = notification.params.get("message").and_then(|m| m.as_str()) {
+                if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
                     debug!("LSP server message: {}", message);
                 }
             }
             _ => {
-                trace!(
-                    "Ignoring notification: {} params={}",
-                    notification.method, notification.params
-                );
+                trace!("Ignoring notification: {} params={}", method, params);
             }
         }
+    }
+
+    fn on_request(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        match method {
+            "workspace/configuration" => {
+                let item_count = params
+                    .get("items")
+                    .and_then(|i| i.as_array())
+                    .map_or(1, Vec::len);
+                let results: Vec<Value> = (0..item_count)
+                    .map(|_| Value::Object(serde_json::Map::new()))
+                    .collect();
+                Ok(Value::Array(results))
+            }
+            "window/workDoneProgress/create" => Ok(Value::Null),
+            _ => Err(RpcError {
+                code: -32601,
+                message: format!("Method '{method}' not supported by client"),
+            }),
+        }
+    }
+
+    fn on_shutdown(&self) {
+        self.state
+            .store(ServerState::Dead.as_u8(), Ordering::SeqCst);
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.clear();
+        }
+        self.diagnostics_notify.notify_waiters();
+        self.state_notify.notify_waiters();
     }
 }

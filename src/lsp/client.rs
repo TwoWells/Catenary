@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 use anyhow::{Context, Result, anyhow};
-use bytes::BytesMut;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
@@ -20,15 +19,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, error, info, trace, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, info};
 
+use super::connection::Connection;
 use super::inbox::ServerInbox;
-use super::protocol::{self, NotificationMessage, RequestId, RequestMessage, ResponseMessage};
 use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
 use crate::session::{EventBroadcaster, EventKind};
@@ -38,7 +35,7 @@ use crate::session::{EventBroadcaster, EventKind};
 /// `version` is the document version from `publishDiagnostics`, if the
 /// server includes it. Used by [`DiagnosticsStrategy::Version`] to
 /// match diagnostics to a specific document change.
-pub type DiagnosticsCache = Arc<Mutex<HashMap<Uri, (Option<i32>, Vec<Diagnostic>)>>>;
+pub type DiagnosticsCache = Arc<std::sync::Mutex<HashMap<Uri, (Option<i32>, Vec<Diagnostic>)>>>;
 
 /// Result of waiting for diagnostics to update after a file change.
 ///
@@ -62,15 +59,6 @@ const DIAGNOSTICS_THRESHOLD: u64 = 1000;
 /// CPU tick threshold for preamble windows (grace, discovery, progress grace).
 const PREAMBLE_THRESHOLD: u64 = 500;
 
-/// CPU tick threshold for request timeout: 1000 ticks = 10 CPU-seconds.
-///
-/// The initialize request is the most expensive, taking several seconds of
-/// CPU time on complex servers. Normal requests (definition, references)
-/// are sub-second, so 10 CPU-seconds is generous. The threshold only
-/// counts unexplained work — if the server is sleeping (waiting on cargo,
-/// NFS, etc.), it doesn't drain.
-const REQUEST_THRESHOLD: u64 = 1000;
-
 /// CPU tick threshold for `wait_ready`: 1000 ticks = 10 CPU-seconds.
 const READY_THRESHOLD: u64 = 1000;
 
@@ -82,11 +70,7 @@ const SAFETY_CAP: Duration = Duration::from_secs(300);
 
 /// Manages communication with an LSP server process.
 pub struct LspClient {
-    // Connection plumbing (moves to Connection in 0c)
-    next_id: AtomicI64,
-    stdin: Arc<Mutex<ChildStdin>>,
-    pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
-    alive: Arc<AtomicBool>,
+    connection: Connection,
 
     // Grouped server state
     inbox: Arc<ServerInbox>,
@@ -103,8 +87,6 @@ pub struct LspClient {
     /// Last document version sent via `did_open`/`did_change` per URI.
     /// Used to detect stale diagnostics from prior document versions.
     last_sent_version: Arc<Mutex<HashMap<Uri, i32>>>,
-    /// Persistent process monitor for CPU-tick failure detection.
-    monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
     /// Whether the server advertised `textDocumentSync.save` support.
     wants_did_save: bool,
     /// Whether the server advertised `typeHierarchyProvider`.
@@ -120,8 +102,6 @@ pub struct LspClient {
     /// Server capabilities from the `initialize` response.
     /// Populated after `initialize()` completes.
     server_capabilities: ServerCapabilities,
-    _reader_handle: tokio::task::JoinHandle<()>,
-    child: Child,
 }
 
 impl LspClient {
@@ -155,10 +135,6 @@ impl LspClient {
         Self::spawn_inner(program, args, language, broadcaster, Stdio::null())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Spawn requires many sequential initialization steps"
-    )]
     fn spawn_inner(
         program: &str,
         args: &[&str],
@@ -166,30 +142,6 @@ impl LspClient {
         broadcaster: EventBroadcaster,
         stderr: Stdio,
     ) -> Result<Self> {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-            .with_context(|| format!("Failed to spawn LSP server: {program}"))?;
-
-        // Create ProcessMonitor from child PID (before taking stdin/stdout)
-        let monitor = child.id().and_then(catenary_proc::ProcessMonitor::new);
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("stdin not captured"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("stdout not captured"))?;
-
-        let stdin = Arc::new(Mutex::new(stdin));
-        let pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let alive = Arc::new(AtomicBool::new(true));
         let inbox = Arc::new(ServerInbox::new(language.to_string(), broadcaster));
 
         // Broadcast initial state
@@ -198,190 +150,23 @@ impl LspClient {
             state: "Initializing".to_string(),
         });
 
-        let reader_handle = tokio::spawn(Self::reader_task(
-            stdin.clone(),
-            stdout,
-            pending.clone(),
-            alive.clone(),
-            inbox.clone(),
-        ));
+        let connection =
+            Connection::new(program, args, stderr, inbox.clone(), language.to_string())?;
 
         Ok(Self {
-            next_id: AtomicI64::new(1),
-            stdin,
-            pending,
-            alive,
+            connection,
             inbox,
             encoding: PositionEncodingKind::UTF16, // Default per spec
             spawn_time: Instant::now(),
             supports_workspace_folders: false,
             logged_no_diagnostics_support: AtomicBool::new(false),
             last_sent_version: Arc::new(Mutex::new(HashMap::new())),
-            monitor: std::sync::Mutex::new(monitor),
             wants_did_save: false,
             supports_type_hierarchy: false,
             server_command: program.to_string(),
             server_version: None,
             server_capabilities: ServerCapabilities::default(),
-            _reader_handle: reader_handle,
-            child,
         })
-    }
-
-    /// Background task that reads LSP messages and routes responses to pending requests.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Internal task requires sequential message parsing and dispatch"
-    )]
-    async fn reader_task(
-        stdin: Arc<Mutex<ChildStdin>>,
-        stdout: ChildStdout,
-        pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
-        alive: Arc<AtomicBool>,
-        inbox: Arc<ServerInbox>,
-    ) {
-        let mut reader = BufReader::new(stdout);
-        let mut buffer = BytesMut::with_capacity(8192);
-
-        loop {
-            // Read more data into buffer
-            let mut temp = [0u8; 4096];
-            match reader.read(&mut temp).await {
-                Ok(0) => {
-                    debug!("LSP stdout closed");
-                    break;
-                }
-                Ok(n) => {
-                    buffer.extend_from_slice(&temp[..n]);
-                }
-                Err(e) => {
-                    error!("Error reading from LSP stdout: {}", e);
-                    break;
-                }
-            }
-
-            // Try to parse complete messages
-            while let Ok(Some(message_str)) = protocol::try_parse_message(&mut buffer) {
-                trace!("Received LSP message: {}", message_str);
-
-                let value: serde_json::Value = match serde_json::from_str(&message_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("Failed to parse JSON: {}", e);
-                        continue;
-                    }
-                };
-
-                // Check message type
-                if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-                    // Request or Notification
-                    if let Some(id) = value.get("id") {
-                        // Server Request
-                        debug!("Received server request: {} (id: {})", method, id);
-
-                        let request_id =
-                            serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0));
-
-                        let response = match method {
-                            "workspace/configuration" => {
-                                Self::handle_configuration_request(&value, request_id)
-                            }
-                            "window/workDoneProgress/create" => {
-                                // Accept progress token registration so the
-                                // server sends $/progress notifications.
-                                ResponseMessage {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: Some(request_id),
-                                    result: Some(serde_json::Value::Null),
-                                    error: None,
-                                }
-                            }
-                            _ => {
-                                // MethodNotFound for unsupported requests
-                                ResponseMessage {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: Some(request_id),
-                                    result: None,
-                                    error: Some(protocol::ResponseError {
-                                        code: -32601,
-                                        message: format!(
-                                            "Method '{method}' not supported by client"
-                                        ),
-                                        data: None,
-                                    }),
-                                }
-                            }
-                        };
-
-                        if let Ok(body) = serde_json::to_string(&response) {
-                            let header = format!("Content-Length: {}\r\n\r\n", body.len());
-                            let mut stdin_guard = stdin.lock().await;
-                            if let Err(e) = stdin_guard.write_all(header.as_bytes()).await {
-                                warn!("Failed to write response header: {}", e);
-                            } else if let Err(e) = stdin_guard.write_all(body.as_bytes()).await {
-                                warn!("Failed to write response body: {}", e);
-                            } else if let Err(e) = stdin_guard.flush().await {
-                                warn!("Failed to flush response: {}", e);
-                            }
-                        }
-                    } else {
-                        // Notification
-                        if let Ok(notification) =
-                            serde_json::from_value::<NotificationMessage>(value)
-                        {
-                            inbox.on_notification(&notification).await;
-                        }
-                    }
-                } else if value.get("id").is_some() {
-                    // Response
-                    if let Ok(response) = serde_json::from_value::<ResponseMessage>(value)
-                        && let Some(id) = &response.id
-                    {
-                        let mut pending = pending.lock().await;
-                        if let Some(sender) = pending.remove(id) {
-                            let _ = sender.send(response);
-                        } else {
-                            warn!("Received response for unknown request id: {:?}", id);
-                        }
-                    }
-                } else {
-                    warn!("Unknown message format: {}", message_str);
-                }
-            }
-        }
-
-        // Mark server as dead and clean up orphaned progress tokens
-        alive.store(false, Ordering::SeqCst);
-        inbox
-            .state
-            .store(ServerState::Dead.as_u8(), Ordering::SeqCst);
-        inbox.progress.lock().await.clear();
-        inbox.diagnostics_notify.notify_waiters();
-        inbox.state_notify.notify_waiters();
-        warn!("LSP reader task exiting - server connection lost");
-    }
-
-    /// Handles `workspace/configuration` requests from the server.
-    ///
-    /// Returns an empty object for each requested configuration item,
-    /// allowing the server to fall back to its built-in defaults.
-    fn handle_configuration_request(value: &serde_json::Value, id: RequestId) -> ResponseMessage {
-        let item_count = value
-            .get("params")
-            .and_then(|p| p.get("items"))
-            .and_then(|i| i.as_array())
-            .map_or(1, Vec::len);
-
-        let results: Vec<serde_json::Value> = (0..item_count)
-            .map(|_| serde_json::Value::Object(serde_json::Map::new()))
-            .collect();
-
-        ResponseMessage {
-            jsonrpc: "2.0".to_string(),
-            id: Some(id),
-            result: Some(serde_json::Value::Array(results)),
-            error: None,
-        }
     }
 
     /// Samples the server process via the persistent `ProcessMonitor`.
@@ -389,7 +174,7 @@ impl LspClient {
     /// Returns `(delta, state)` where delta is ticks since the last sample.
     /// Returns `None` if the process is gone or monitoring is unavailable.
     fn sample_monitor(&self) -> Option<(u64, catenary_proc::ProcessState)> {
-        self.monitor.lock().ok()?.as_mut()?.sample()
+        self.connection.sample_monitor()
     }
 
     /// Returns whether the server has active `$/progress` tokens.
@@ -405,160 +190,25 @@ impl LspClient {
             .map_or(true, |tracker| tracker.is_busy())
     }
 
-    /// Sends a request and waits for the response with failure detection.
+    /// Sends a request and waits for the response.
     ///
-    /// Uses CPU-tick failure detection instead of wall-clock timeout.
-    /// Falls back to a 30-second wall-clock timeout when the process
-    /// monitor is unavailable (e.g., mockls in tests).
-    /// Retries on `ContentModified` by waiting for the server to become
-    /// ready before retrying.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Request retry logic with failure detection"
-    )]
+    /// Delegates to [`Connection::request`] for transport and failure
+    /// detection, then deserializes the response into the expected type.
     async fn request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         params: P,
     ) -> Result<R> {
         let params_value = serde_json::to_value(params)?;
-
-        // Retry loop for ContentModified errors
-        for _attempt in 0..3 {
-            let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
-
-            let request = RequestMessage {
-                jsonrpc: "2.0".to_string(),
-                id: id.clone(),
-                method: method.to_string(),
-                params: params_value.clone(),
-            };
-
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut pending = self.pending.lock().await;
-                pending.insert(id.clone(), tx);
-            }
-
-            self.send_message(&request).await?;
-
-            // Wait for response: select on rx + failure detection timer
-            let response = {
-                let mut rx = rx;
-                let wall_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                let mut budget = i64::try_from(REQUEST_THRESHOLD).unwrap_or(1000);
-
-                loop {
-                    tokio::select! {
-                        result = &mut rx => {
-                            match result {
-                                Ok(resp) => break Ok(resp),
-                                Err(_) => break Err(anyhow!(
-                                    "[{}] server closed connection", self.inbox.language
-                                )),
-                            }
-                        }
-                        () = tokio::time::sleep(POLL_INTERVAL) => {
-                            // Failure detection
-                            if let Some((delta, state)) = self.sample_monitor() {
-                                if state == catenary_proc::ProcessState::Dead {
-                                    self.pending.lock().await.remove(&id);
-                                    break Err(anyhow!(
-                                        "[{}] server died during '{method}'",
-                                        self.inbox.language
-                                    ));
-                                }
-                                if state == catenary_proc::ProcessState::Running
-                                    && delta > 0
-                                    && !self.progress_active()
-                                {
-                                    budget -= i64::try_from(delta)
-                                        .unwrap_or(budget);
-                                }
-                            } else if !self.is_alive() {
-                                self.pending.lock().await.remove(&id);
-                                break Err(anyhow!(
-                                    "[{}] server died during '{method}'",
-                                    self.inbox.language
-                                ));
-                            }
-
-                            if budget <= 0 {
-                                self.pending.lock().await.remove(&id);
-                                break Err(anyhow!(
-                                    "[{}] request '{method}' failed \
-                                     (server stuck)",
-                                    self.inbox.language
-                                ));
-                            }
-                            if tokio::time::Instant::now() >= wall_deadline {
-                                self.pending.lock().await.remove(&id);
-                                break Err(anyhow!(
-                                    "[{}] request '{method}' timed out",
-                                    self.inbox.language
-                                ));
-                            }
-                        }
-                    }
-                }
-            }?;
-
-            if let Some(error) = response.error {
-                // Check for ContentModified (-32801) or RequestCancelled (-32800)
-                if error.code == -32801 || error.code == -32800 {
-                    debug!(
-                        "LSP request '{}' cancelled/modified, waiting for ready then retrying...",
-                        method,
-                    );
-                    // Wait for server to finish instead of fixed sleep
-                    self.wait_ready().await;
-                    continue;
-                }
-                return Err(anyhow!(
-                    "[{}] LSP error {}: {}",
-                    self.inbox.language,
-                    error.code,
-                    error.message
-                ));
-            }
-
-            let result = response.result.unwrap_or(serde_json::Value::Null);
-            return serde_json::from_value(result).with_context(|| {
-                format!("[{}] failed to parse LSP response", self.inbox.language)
-            });
-        }
-
-        Err(anyhow!(
-            "[{}] request '{method}' failed after retries",
-            self.inbox.language
-        ))
+        let result = self.connection.request(method, params_value).await?;
+        serde_json::from_value(result)
+            .with_context(|| format!("[{}] failed to parse LSP response", self.inbox.language))
     }
 
     /// Sends a notification (no response expected).
     async fn notify<P: serde::Serialize>(&self, method: &str, params: P) -> Result<()> {
-        let notification = NotificationMessage {
-            jsonrpc: "2.0".to_string(),
-            method: method.to_string(),
-            params: serde_json::to_value(params)?,
-        };
-
-        self.send_message(&notification).await
-    }
-
-    /// Sends a JSON-RPC message with Content-Length header.
-    async fn send_message<T: serde::Serialize + Sync>(&self, message: &T) -> Result<()> {
-        let body = serde_json::to_string(message)?;
-        let header = format!("Content-Length: {}\r\n\r\n", body.len());
-
-        trace!("Sending LSP message: {}", body);
-
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(header.as_bytes()).await?;
-        stdin.write_all(body.as_bytes()).await?;
-        stdin.flush().await?;
-        drop(stdin);
-
-        Ok(())
+        let params_value = serde_json::to_value(params)?;
+        self.connection.notify(method, params_value).await
     }
 
     /// Performs the LSP initialize handshake.
@@ -1069,8 +719,12 @@ impl LspClient {
     }
 
     /// Gets cached diagnostics for a specific URI.
-    pub async fn get_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
-        let cache = self.inbox.diagnostics.lock().await;
+    pub fn get_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
+        let cache = self
+            .inbox
+            .diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache
             .get(uri)
             .map(|(_, diags)| diags.clone())
@@ -1082,8 +736,12 @@ impl LspClient {
     /// Returns `None` if no diagnostics have been published for this URI
     /// or if the server doesn't include version in `publishDiagnostics`.
     #[allow(dead_code, reason = "Used by diagnostics strategy tests")]
-    pub(crate) async fn cached_diagnostics_version(&self, uri: &Uri) -> Option<i32> {
-        let cache = self.inbox.diagnostics.lock().await;
+    pub(crate) fn cached_diagnostics_version(&self, uri: &Uri) -> Option<i32> {
+        let cache = self
+            .inbox
+            .diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.get(uri).and_then(|(version, _)| *version)
     }
 
@@ -1101,7 +759,7 @@ impl LspClient {
             return true;
         };
         drop(sent);
-        let cached_v = self.cached_diagnostics_version(uri).await;
+        let cached_v = self.cached_diagnostics_version(uri);
         cached_v.is_some_and(|v| v >= sent_v)
     }
 
@@ -1110,8 +768,12 @@ impl LspClient {
     /// Callers should snapshot this *before* sending a change notification,
     /// then pass the snapshot to [`wait_for_diagnostics_update`] to ensure
     /// the returned diagnostics reflect that specific change.
-    pub async fn diagnostics_generation(&self, uri: &Uri) -> u64 {
-        let generations = self.inbox.diagnostics_generation.lock().await;
+    pub fn diagnostics_generation(&self, uri: &Uri) -> u64 {
+        let generations = self
+            .inbox
+            .diagnostics_generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         generations.get(uri).copied().unwrap_or(0)
     }
 
@@ -1179,7 +841,7 @@ impl LspClient {
     /// Returns the PID of the server process, if available.
     #[allow(dead_code, reason = "Used by diagnostics tests and session status")]
     pub(crate) fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.connection.pid()
     }
 
     /// Waits for fresh diagnostics after a file change, using the
@@ -1217,7 +879,7 @@ impl LspClient {
                 Some(Duration::from_secs(10)),
                 &self.inbox.diagnostics_notify,
                 || self.progress_active(),
-                || async { self.diagnostics_generation(uri).await > snapshot },
+                || async { self.diagnostics_generation(uri) > snapshot },
             )
             .await;
 
@@ -1264,7 +926,7 @@ impl LspClient {
             DiagnosticsStrategy::Version => {
                 // Wait for publishDiagnostics with version >= our change.
                 loop {
-                    if self.diagnostics_generation(uri).await > snapshot
+                    if self.diagnostics_generation(uri) > snapshot
                         && self.is_diagnostics_version_current(uri).await
                     {
                         return DiagnosticsWaitResult::Diagnostics;
@@ -1307,7 +969,7 @@ impl LspClient {
             DiagnosticsStrategy::TokenMonitor => {
                 let mut monitor = super::diagnostics::TokenMonitor::new(
                     self.inbox.state.clone(),
-                    self.alive.clone(),
+                    self.connection.alive_flag(),
                 );
                 let mut ever_active = false;
 
@@ -1316,7 +978,7 @@ impl LspClient {
                 let mut generation_advanced_at: Option<tokio::time::Instant> = None;
 
                 loop {
-                    let gen_advanced = self.diagnostics_generation(uri).await > snapshot
+                    let gen_advanced = self.diagnostics_generation(uri) > snapshot
                         && self.is_diagnostics_version_current(uri).await;
 
                     if gen_advanced && generation_advanced_at.is_none() {
@@ -1352,7 +1014,7 @@ impl LspClient {
                         ActivityState::Idle if ever_active => {
                             // Active → Idle: the full progress cycle completed.
                             // Check for diagnostics one more time.
-                            if self.diagnostics_generation(uri).await > snapshot {
+                            if self.diagnostics_generation(uri) > snapshot {
                                 return DiagnosticsWaitResult::Diagnostics;
                             }
                             debug!("TokenMonitor: Active \u{2192} Idle without new diagnostics");
@@ -1416,7 +1078,7 @@ impl LspClient {
 
     /// Returns whether the LSP server process is still running.
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::SeqCst)
+        self.connection.is_alive()
     }
 
     /// Returns the current server state.
@@ -1460,9 +1122,13 @@ impl LspClient {
     }
 
     /// Returns detailed status for this server.
-    pub async fn status(&self, language: String) -> ServerStatus {
+    pub fn status(&self, language: String) -> ServerStatus {
         let (title, message, percentage) = {
-            let progress = self.inbox.progress.lock().await;
+            let progress = self
+                .inbox
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let primary = progress.primary_progress();
             let title = primary.map(|p| p.title.clone());
             let message = primary.and_then(|p| p.message.clone());
@@ -1586,13 +1252,5 @@ impl LspClient {
         }
 
         false
-    }
-}
-
-impl Drop for LspClient {
-    fn drop(&mut self) {
-        // We can't await a graceful LSP shutdown here because drop is sync.
-        // But we MUST ensure the child process doesn't become a zombie.
-        let _ = self.child.start_kill();
     }
 }
