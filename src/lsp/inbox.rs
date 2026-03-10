@@ -3,7 +3,6 @@
 
 //! Shared server state and notification dispatch.
 
-use lsp_types::{ProgressParams, PublishDiagnosticsParams, Uri};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -12,6 +11,7 @@ use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
 
 use super::client::DiagnosticsCache;
+use super::extract;
 use super::protocol::RpcError;
 use super::state::{ProgressTracker, ServerState};
 use crate::session::{EventBroadcaster, EventKind};
@@ -45,7 +45,7 @@ pub trait Inbox: Send + Sync {
 pub struct ServerInbox {
     // Diagnostics
     pub(crate) diagnostics: DiagnosticsCache,
-    pub(crate) diagnostics_generation: Arc<Mutex<HashMap<Uri, u64>>>,
+    pub(crate) diagnostics_generation: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) diagnostics_notify: Arc<Notify>,
 
     // Capability discovery
@@ -94,97 +94,93 @@ impl Inbox for ServerInbox {
     fn on_notification(&self, method: &str, params: &Value) {
         match method {
             "textDocument/publishDiagnostics" => {
-                if let Ok(params) =
-                    serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
-                {
-                    debug!(
-                        "Received {} diagnostics for {:?} (version={:?})",
-                        params.diagnostics.len(),
-                        params.uri.as_str(),
-                        params.version,
-                    );
-                    self.has_published_diagnostics.store(true, Ordering::SeqCst);
+                let Some(uri) = extract::publish_diagnostics_uri(params) else {
+                    warn!("publishDiagnostics missing uri");
+                    return;
+                };
+                let version = extract::publish_diagnostics_version(params);
+                let diagnostics = extract::publish_diagnostics_diagnostics(params);
 
-                    // Track whether server provides version in diagnostics
-                    if params.version.is_some()
-                        && !self.publishes_version.swap(true, Ordering::SeqCst)
-                    {
-                        self.capability_notify.notify_waiters();
-                    }
+                debug!(
+                    "Received {} diagnostics for {:?} (version={:?})",
+                    diagnostics.len(),
+                    uri,
+                    version,
+                );
+                self.has_published_diagnostics.store(true, Ordering::SeqCst);
 
-                    let mut cache = self
-                        .diagnostics
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    cache.insert(params.uri.clone(), (params.version, params.diagnostics));
-                    drop(cache);
-
-                    // Bump generation counter and wake waiters
-                    let mut generations = self
-                        .diagnostics_generation
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let counter = generations.entry(params.uri).or_insert(0);
-                    *counter += 1;
-                    drop(generations);
-                    self.diagnostics_notify.notify_waiters();
-                } else {
-                    warn!("Failed to parse publishDiagnostics params");
+                // Track whether server provides version in diagnostics
+                if version.is_some() && !self.publishes_version.swap(true, Ordering::SeqCst) {
+                    self.capability_notify.notify_waiters();
                 }
+
+                let mut cache = self
+                    .diagnostics
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.insert(uri.to_string(), (version, diagnostics));
+                drop(cache);
+
+                // Bump generation counter and wake waiters
+                let mut generations = self
+                    .diagnostics_generation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let counter = generations.entry(uri.to_string()).or_insert(0);
+                *counter += 1;
+                drop(generations);
+                self.diagnostics_notify.notify_waiters();
             }
             "$/progress" => {
-                if let Ok(progress_params) =
-                    serde_json::from_value::<ProgressParams>(params.clone())
-                {
-                    if !self.has_sent_progress.swap(true, Ordering::SeqCst) {
-                        self.capability_notify.notify_waiters();
-                    }
+                let Some(token_value) = extract::progress_token(params) else {
+                    warn!("$/progress missing token");
+                    return;
+                };
+                let token_str = token_value
+                    .as_str()
+                    .map_or_else(|| token_value.to_string(), str::to_string);
 
-                    let token_str = match &progress_params.token {
-                        lsp_types::NumberOrString::String(s) => s.clone(),
-                        lsp_types::NumberOrString::Number(n) => n.to_string(),
-                    };
+                if !self.has_sent_progress.swap(true, Ordering::SeqCst) {
+                    self.capability_notify.notify_waiters();
+                }
 
-                    let mut tracker = self
-                        .progress
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    tracker.update(&token_str, &params["value"]);
+                let mut tracker = self
+                    .progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tracker.update(&token_str, &params["value"]);
 
-                    // Update state based on progress.
-                    // The Dead guard is the only exclusion — Stuck servers
-                    // that send progress are naturally recovered here
-                    // (transitioned to Busy/Ready like any other state).
-                    let current_state = ServerState::from_u8(self.state.load(Ordering::SeqCst));
-                    if current_state != ServerState::Dead {
-                        if tracker.is_busy() {
-                            self.state
-                                .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
-                            if tracker.broadcast_changed()
-                                && let Some(p) = tracker.primary_progress()
-                            {
-                                debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
-                                self.broadcaster.send(EventKind::Progress {
-                                    language: self.language.clone(),
-                                    title: p.title.clone(),
-                                    message: p.message.clone(),
-                                    percentage: p.percentage,
-                                });
-                            }
-                        } else {
-                            self.state
-                                .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-                            debug!("Server ready (progress completed)");
-                            self.broadcaster.send(EventKind::ProgressEnd {
+                // Update state based on progress.
+                // The Dead guard is the only exclusion — Stuck servers
+                // that send progress are naturally recovered here
+                // (transitioned to Busy/Ready like any other state).
+                let current_state = ServerState::from_u8(self.state.load(Ordering::SeqCst));
+                if current_state != ServerState::Dead {
+                    if tracker.is_busy() {
+                        self.state
+                            .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
+                        if tracker.broadcast_changed()
+                            && let Some(p) = tracker.primary_progress()
+                        {
+                            debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
+                            self.broadcaster.send(EventKind::Progress {
                                 language: self.language.clone(),
+                                title: p.title.clone(),
+                                message: p.message.clone(),
+                                percentage: p.percentage,
                             });
                         }
-                        // Fire notifies after state update
-                        self.progress_notify.notify_waiters();
-                        self.state_notify.notify_waiters();
+                    } else {
+                        self.state
+                            .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+                        debug!("Server ready (progress completed)");
+                        self.broadcaster.send(EventKind::ProgressEnd {
+                            language: self.language.clone(),
+                        });
                     }
-                } else {
-                    warn!("Failed to parse $/progress params");
+                    // Fire notifies after state update
+                    self.progress_notify.notify_waiters();
+                    self.state_notify.notify_waiters();
                 }
             }
             "window/logMessage" | "window/showMessage" => {

@@ -16,11 +16,8 @@
 //! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
 use anyhow::{Result, anyhow};
-use lsp_types::{
-    CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic,
-    PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
-};
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -284,7 +281,7 @@ impl NotifyServer {
         // ensure_open detects disk changes and returns didOpen/didChange
         if let Some(notification) = doc_manager.ensure_open(&canonical).await? {
             // Snapshot generation *before* sending the change
-            let snapshot = client.diagnostics_generation(&uri);
+            let snapshot = client.diagnostics_generation(uri.as_str());
 
             match notification {
                 DocumentNotification::Open(params) => {
@@ -302,7 +299,9 @@ impl NotifyServer {
 
             drop(doc_manager);
 
-            if client.wait_for_diagnostics_update(&uri, snapshot).await
+            if client
+                .wait_for_diagnostics_update(uri.as_str(), snapshot)
+                .await
                 == DiagnosticsWaitResult::Nothing
             {
                 return Ok("[diagnostics unavailable]".into());
@@ -311,7 +310,7 @@ impl NotifyServer {
             drop(doc_manager);
         }
 
-        let diagnostics = client.get_diagnostics(&uri);
+        let diagnostics = client.get_diagnostics(uri.as_str());
 
         // Extract filter context before dropping the client lock
         let server_command = client.server_command().to_string();
@@ -320,8 +319,7 @@ impl NotifyServer {
         // Collect quick-fix code actions for each diagnostic
         let fixes =
             if !diagnostics.is_empty() && client.capabilities().code_action_provider.is_some() {
-                let text_document = TextDocumentIdentifier::new(uri.clone());
-                collect_quick_fixes(&client, &text_document, &diagnostics).await
+                collect_quick_fixes(&client, uri.as_str(), &diagnostics).await
             } else {
                 Vec::new()
             };
@@ -344,7 +342,7 @@ impl NotifyServer {
                 .into_iter()
                 .zip(fixes.into_iter().chain(std::iter::repeat_with(Vec::new)))
             {
-                if let Some(sev) = diagnostic_severity_u8(&diag) {
+                if let Some(sev) = crate::lsp::extract::diagnostic_severity(&diag) {
                     if crate::filter::severity_passes(sev, threshold) {
                         filtered_diags.push(diag);
                         filtered_fixes.push(fix);
@@ -536,12 +534,6 @@ impl NotifyServer {
     }
 }
 
-/// Temporary bridge: extracts severity as `u8` from `lsp_types` `Diagnostic`.
-fn diagnostic_severity_u8(diag: &Diagnostic) -> Option<u8> {
-    let v = serde_json::to_value(diag.severity?).ok()?;
-    v.as_u64().and_then(|n| u8::try_from(n).ok())
-}
-
 /// Resolves a file path to an absolute path.
 fn resolve_path(file: &str) -> Result<PathBuf> {
     let path = PathBuf::from(file);
@@ -565,40 +557,49 @@ fn resolve_path(file: &str) -> Result<PathBuf> {
 /// common in real-world files).
 async fn collect_quick_fixes(
     client: &LspClient,
-    text_document: &TextDocumentIdentifier,
-    diagnostics: &[Diagnostic],
+    uri: &str,
+    diagnostics: &[Value],
 ) -> Vec<Vec<String>> {
     let futures: Vec<_> = diagnostics
         .iter()
-        .map(|diag| {
-            let params = CodeActionParams {
-                text_document: text_document.clone(),
-                range: diag.range,
-                context: CodeActionContext {
-                    diagnostics: vec![diag.clone()],
-                    only: Some(vec![CodeActionKind::QUICKFIX]),
-                    ..Default::default()
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
+        .map(|diag| async move {
+            let Some(range) = crate::lsp::extract::diagnostic_range(diag) else {
+                return Vec::new();
             };
-
-            async move {
-                match client.code_action(params).await {
-                    Ok(Some(actions)) => actions
-                        .into_iter()
-                        .filter_map(|action| match action {
-                            CodeActionOrCommand::CodeAction(ca)
-                                if ca.kind.as_ref() == Some(&CodeActionKind::QUICKFIX) =>
-                            {
-                                Some(ca.title)
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                    Ok(None) | Err(_) => Vec::new(),
-                }
-            }
+            let diag_slice = [diag.clone()];
+            client
+                .code_action(
+                    uri,
+                    range.start.line,
+                    range.start.character,
+                    range.end.line,
+                    range.end.character,
+                    &diag_slice,
+                )
+                .await
+                .map_or_else(
+                    |_| Vec::new(),
+                    |result| {
+                        result
+                            .as_array()
+                            .map(|actions| {
+                                actions
+                                    .iter()
+                                    .filter_map(|a| {
+                                        if a.get("kind").and_then(Value::as_str) == Some("quickfix")
+                                        {
+                                            a.get("title")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    },
+                )
         })
         .collect();
 
@@ -614,7 +615,7 @@ async fn collect_quick_fixes(
 /// Messages are passed through the provided [`DiagnosticFilter`] for noise
 /// stripping. Diagnostics whose filtered message is empty are dropped.
 pub(crate) fn format_diagnostics_compact(
-    diagnostics: &[Diagnostic],
+    diagnostics: &[Value],
     fixes: &[Vec<String>],
     filter: &dyn crate::filter::DiagnosticFilter,
     server_command: &str,
@@ -625,34 +626,37 @@ pub(crate) fn format_diagnostics_compact(
         .iter()
         .enumerate()
         .filter_map(|(i, d)| {
-            let severity = match diagnostic_severity_u8(d) {
+            let severity = match crate::lsp::extract::diagnostic_severity(d) {
                 Some(1) => "error",
                 Some(2) => "warning",
                 Some(3) => "info",
                 Some(4) => "hint",
                 _ => "unknown",
             };
-            let line = d.range.start.line + 1;
-            let col = d.range.start.character + 1;
-            let source = d.source.as_deref().unwrap_or("");
-            let code = d
-                .code
-                .as_ref()
-                .map(|c| match c {
-                    lsp_types::NumberOrString::Number(n) => n.to_string(),
-                    lsp_types::NumberOrString::String(s) => s.clone(),
+            let (line, col) = crate::lsp::extract::diagnostic_range(d)
+                .map_or((0, 0), |r| (r.start.line + 1, r.start.character + 1));
+            let source = d.get("source").and_then(Value::as_str);
+            let source_str = source.unwrap_or("");
+            let code_value = d.get("code");
+            let code = code_value
+                .map(|c| {
+                    c.as_i64().map_or_else(
+                        || c.as_str().map_or_else(|| c.to_string(), str::to_string),
+                        |n| n.to_string(),
+                    )
                 })
                 .unwrap_or_default();
 
-            let diag_code = d.code.as_ref().map(crate::filter::DiagnosticCode::from_lsp);
+            let diag_code = code_value.map(crate::filter::DiagnosticCode::from_value);
             let message = filter.filter_message(
                 server_command,
                 server_version,
-                d.source.as_deref(),
+                source,
                 diag_code.as_ref(),
-                diagnostic_severity_u8(d).unwrap_or(crate::filter::SEVERITY_WARNING),
+                crate::lsp::extract::diagnostic_severity(d)
+                    .unwrap_or(crate::filter::SEVERITY_WARNING),
                 language_id,
-                &d.message,
+                crate::lsp::extract::diagnostic_message(d).unwrap_or(""),
             );
 
             // Empty message means the filter wants to drop this diagnostic
@@ -661,9 +665,9 @@ pub(crate) fn format_diagnostics_compact(
             }
 
             let mut result = if code.is_empty() {
-                format!("\t:{line}:{col} [{severity}] {source}: {message}")
+                format!("\t:{line}:{col} [{severity}] {source_str}: {message}")
             } else {
-                format!("\t:{line}:{col} [{severity}] {source}({code}): {message}")
+                format!("\t:{line}:{col} [{severity}] {source_str}({code}): {message}")
             };
 
             // Append indented fix lines
