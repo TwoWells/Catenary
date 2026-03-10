@@ -301,669 +301,383 @@ pub fn subtypes(item: &Value) -> Value {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    clippy::default_trait_access,
-    reason = "tests use expect for readable assertions and Default::default() for lsp_types construction"
+    reason = "tests use expect for readable assertions"
 )]
 mod tests {
     use super::*;
-    use lsp_types::{
-        CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyOutgoingCallsParams,
-        CallHierarchyPrepareParams, ClientCapabilities, CodeActionContext, CodeActionParams,
-        DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
-        DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
-        GotoDefinitionParams, HoverParams, InitializeParams, PositionEncodingKind,
-        ReferenceContext, ReferenceParams, SymbolKind, TextDocumentContentChangeEvent,
-        TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
-        TypeHierarchyItem as LspTypeHierarchyItem,
-        TypeHierarchyPrepareParams as LspTypeHierarchyPrepareParams,
-        TypeHierarchySubtypesParams as LspTypeHierarchySubtypesParams,
-        TypeHierarchySupertypesParams as LspTypeHierarchySupertypesParams,
-        VersionedTextDocumentIdentifier, WorkspaceFolder as LspWorkspaceFolder,
-        WorkspaceFoldersChangeEvent, WorkspaceSymbolParams,
-    };
 
     // ── Initialize ──────────────────────────────────────────────────
 
     #[test]
-    #[allow(deprecated, reason = "root_uri is deprecated in LSP but still tested")]
-    fn initialize_matches_lsp_types() {
+    fn initialize_single_root() {
         let ours = initialize(42, &[("file:///workspace", "workspace")], None);
 
-        let theirs = serde_json::to_value(InitializeParams {
-            process_id: Some(42),
-            capabilities: ClientCapabilities {
-                general: Some(lsp_types::GeneralClientCapabilities {
-                    position_encodings: Some(vec![
-                        PositionEncodingKind::UTF8,
-                        PositionEncodingKind::UTF16,
-                    ]),
-                    ..Default::default()
-                }),
-                text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                    synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
-                        did_save: Some(true),
-                        dynamic_registration: Some(false),
-                        will_save: Some(false),
-                        will_save_wait_until: Some(false),
-                    }),
-                    publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
-                        version_support: Some(true),
-                        ..Default::default()
-                    }),
-                    definition: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    type_definition: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    implementation: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    declaration: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    references: Some(lsp_types::DynamicRegistrationClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
-                        dynamic_registration: Some(false),
-                        hierarchical_document_symbol_support: Some(true),
-                        ..Default::default()
-                    }),
-                    call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    code_action: Some(lsp_types::CodeActionClientCapabilities {
-                        dynamic_registration: Some(false),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                workspace: Some(lsp_types::WorkspaceClientCapabilities {
-                    symbol: Some(lsp_types::WorkspaceSymbolClientCapabilities {
-                        resolve_support: Some(lsp_types::WorkspaceSymbolResolveSupportCapability {
-                            properties: vec!["location.range".to_string()],
-                        }),
-                        ..Default::default()
-                    }),
-                    workspace_folders: Some(true),
-                    configuration: Some(true),
-                    ..Default::default()
-                }),
-                window: Some(lsp_types::WindowClientCapabilities {
-                    work_done_progress: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
+        let expected = json!({
+            "processId": 42,
+            "rootUri": "file:///workspace",
+            "capabilities": {
+                "general": {
+                    "positionEncodings": ["utf-8", "utf-16"]
+                },
+                "textDocument": {
+                    "synchronization": {
+                        "didSave": true,
+                        "dynamicRegistration": false,
+                        "willSave": false,
+                        "willSaveWaitUntil": false
+                    },
+                    "publishDiagnostics": {
+                        "versionSupport": true
+                    },
+                    "definition": {
+                        "dynamicRegistration": false,
+                        "linkSupport": true
+                    },
+                    "typeDefinition": {
+                        "dynamicRegistration": false,
+                        "linkSupport": true
+                    },
+                    "implementation": {
+                        "dynamicRegistration": false,
+                        "linkSupport": true
+                    },
+                    "declaration": {
+                        "dynamicRegistration": false,
+                        "linkSupport": true
+                    },
+                    "references": {
+                        "dynamicRegistration": false
+                    },
+                    "documentSymbol": {
+                        "dynamicRegistration": false,
+                        "hierarchicalDocumentSymbolSupport": true
+                    },
+                    "callHierarchy": {
+                        "dynamicRegistration": false
+                    },
+                    "typeHierarchy": {
+                        "dynamicRegistration": false
+                    },
+                    "codeAction": {
+                        "dynamicRegistration": false
+                    }
+                },
+                "workspace": {
+                    "symbol": {
+                        "resolveSupport": {
+                            "properties": ["location.range"]
+                        }
+                    },
+                    "workspaceFolders": true,
+                    "configuration": true
+                },
+                "window": {
+                    "workDoneProgress": true
+                }
             },
-            root_uri: Some("file:///workspace".parse().expect("valid uri")),
-            workspace_folders: Some(vec![LspWorkspaceFolder {
-                uri: "file:///workspace".parse().expect("valid uri"),
-                name: "workspace".to_string(),
-            }]),
-            ..Default::default()
-        })
-        .expect("serialize");
+            "workspaceFolders": [
+                { "uri": "file:///workspace", "name": "workspace" }
+            ]
+        });
 
-        assert_eq!(ours, theirs);
+        assert_eq!(ours, expected);
     }
 
     #[test]
-    #[allow(deprecated, reason = "root_uri is deprecated in LSP but still tested")]
     fn initialize_with_options() {
         let opts = json!({"key": "value"});
         let ours = initialize(1, &[("file:///ws", "ws")], Some(&opts));
 
-        let theirs = serde_json::to_value(InitializeParams {
-            process_id: Some(1),
-            capabilities: ClientCapabilities {
-                general: Some(lsp_types::GeneralClientCapabilities {
-                    position_encodings: Some(vec![
-                        PositionEncodingKind::UTF8,
-                        PositionEncodingKind::UTF16,
-                    ]),
-                    ..Default::default()
-                }),
-                text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                    synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
-                        did_save: Some(true),
-                        dynamic_registration: Some(false),
-                        will_save: Some(false),
-                        will_save_wait_until: Some(false),
-                    }),
-                    publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
-                        version_support: Some(true),
-                        ..Default::default()
-                    }),
-                    definition: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    type_definition: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    implementation: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    declaration: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    references: Some(lsp_types::DynamicRegistrationClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
-                        dynamic_registration: Some(false),
-                        hierarchical_document_symbol_support: Some(true),
-                        ..Default::default()
-                    }),
-                    call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    code_action: Some(lsp_types::CodeActionClientCapabilities {
-                        dynamic_registration: Some(false),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                workspace: Some(lsp_types::WorkspaceClientCapabilities {
-                    symbol: Some(lsp_types::WorkspaceSymbolClientCapabilities {
-                        resolve_support: Some(lsp_types::WorkspaceSymbolResolveSupportCapability {
-                            properties: vec!["location.range".to_string()],
-                        }),
-                        ..Default::default()
-                    }),
-                    workspace_folders: Some(true),
-                    configuration: Some(true),
-                    ..Default::default()
-                }),
-                window: Some(lsp_types::WindowClientCapabilities {
-                    work_done_progress: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            root_uri: Some("file:///ws".parse().expect("valid uri")),
-            workspace_folders: Some(vec![LspWorkspaceFolder {
-                uri: "file:///ws".parse().expect("valid uri"),
-                name: "ws".to_string(),
-            }]),
-            initialization_options: Some(opts),
-            ..Default::default()
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(ours["processId"], 1);
+        assert_eq!(ours["rootUri"], "file:///ws");
+        assert_eq!(ours["initializationOptions"], json!({"key": "value"}));
+        assert_eq!(
+            ours["workspaceFolders"],
+            json!([{"uri": "file:///ws", "name": "ws"}])
+        );
     }
 
     // ── Document synchronization ────────────────────────────────────
 
     #[test]
-    fn did_open_matches_lsp_types() {
+    fn did_open_golden() {
         let ours = did_open("file:///foo.rs", "rust", 1, "fn main() {}");
 
-        let theirs = serde_json::to_value(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: "file:///foo.rs".parse().expect("uri"),
-                language_id: "rust".to_string(),
-                version: 1,
-                text: "fn main() {}".to_string(),
-            },
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": {
+                    "uri": "file:///foo.rs",
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn main() {}"
+                }
+            })
+        );
     }
 
     #[test]
-    fn did_change_matches_lsp_types() {
+    fn did_change_golden() {
         let ours = did_change("file:///foo.rs", 2, "fn main() { println!() }");
 
-        let theirs = serde_json::to_value(DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier {
-                uri: "file:///foo.rs".parse().expect("uri"),
-                version: 2,
-            },
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: "fn main() { println!() }".to_string(),
-            }],
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs", "version": 2 },
+                "contentChanges": [{ "text": "fn main() { println!() }" }]
+            })
+        );
     }
 
     #[test]
-    fn did_close_matches_lsp_types() {
+    fn did_close_golden() {
         let ours = did_close("file:///foo.rs");
 
-        let theirs = serde_json::to_value(DidCloseTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: "file:///foo.rs".parse().expect("uri"),
-            },
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" }
+            })
+        );
     }
 
     #[test]
-    fn did_save_matches_lsp_types() {
+    fn did_save_golden() {
         let ours = did_save("file:///foo.rs");
 
-        let theirs = serde_json::to_value(DidSaveTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: "file:///foo.rs".parse().expect("uri"),
-            },
-            text: None,
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" }
+            })
+        );
     }
 
     // ── Workspace ───────────────────────────────────────────────────
 
     #[test]
-    fn did_change_workspace_folders_matches_lsp_types() {
+    fn did_change_workspace_folders_golden() {
         let ours =
             did_change_workspace_folders(&[("file:///new", "new")], &[("file:///old", "old")]);
 
-        let theirs = serde_json::to_value(DidChangeWorkspaceFoldersParams {
-            event: WorkspaceFoldersChangeEvent {
-                added: vec![LspWorkspaceFolder {
-                    uri: "file:///new".parse().expect("uri"),
-                    name: "new".to_string(),
-                }],
-                removed: vec![LspWorkspaceFolder {
-                    uri: "file:///old".parse().expect("uri"),
-                    name: "old".to_string(),
-                }],
-            },
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "event": {
+                    "added": [{ "uri": "file:///new", "name": "new" }],
+                    "removed": [{ "uri": "file:///old", "name": "old" }]
+                }
+            })
+        );
     }
 
     #[test]
-    fn workspace_symbols_matches_lsp_types() {
+    fn workspace_symbols_golden() {
         let ours = workspace_symbols("MyStruct");
 
-        let theirs = serde_json::to_value(WorkspaceSymbolParams {
-            query: "MyStruct".to_string(),
-            ..Default::default()
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(ours, json!({ "query": "MyStruct" }));
     }
 
     // ── Position-based requests ─────────────────────────────────────
 
     #[test]
-    fn hover_matches_lsp_types() {
+    fn hover_golden() {
         let ours = hover("file:///foo.rs", 10, 5);
 
-        let theirs = serde_json::to_value(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///foo.rs".parse().expect("uri"),
-                },
-                position: lsp_types::Position {
-                    line: 10,
-                    character: 5,
-                },
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 10, "character": 5 }
+            })
+        );
     }
 
     #[test]
-    fn definition_matches_lsp_types() {
+    fn definition_golden() {
         let ours = definition("file:///foo.rs", 10, 5);
 
-        let theirs = serde_json::to_value(GotoDefinitionParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///foo.rs".parse().expect("uri"),
-                },
-                position: lsp_types::Position {
-                    line: 10,
-                    character: 5,
-                },
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 10, "character": 5 }
+            })
+        );
     }
 
     #[test]
-    fn type_definition_matches_lsp_types() {
+    fn type_definition_golden() {
         let ours = type_definition("file:///foo.rs", 3, 8);
 
-        // GotoDefinitionParams is used for typeDefinition too
-        let theirs = serde_json::to_value(GotoDefinitionParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///foo.rs".parse().expect("uri"),
-                },
-                position: lsp_types::Position {
-                    line: 3,
-                    character: 8,
-                },
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 3, "character": 8 }
+            })
+        );
     }
 
     #[test]
-    fn implementation_matches_lsp_types() {
+    fn implementation_golden() {
         let ours = implementation("file:///foo.rs", 5, 12);
 
-        let theirs = serde_json::to_value(GotoDefinitionParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///foo.rs".parse().expect("uri"),
-                },
-                position: lsp_types::Position {
-                    line: 5,
-                    character: 12,
-                },
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 5, "character": 12 }
+            })
+        );
     }
 
     #[test]
-    fn prepare_rename_matches_lsp_types() {
+    fn prepare_rename_golden() {
         let ours = prepare_rename("file:///foo.rs", 7, 4);
 
-        let theirs = serde_json::to_value(TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: "file:///foo.rs".parse().expect("uri"),
-            },
-            position: lsp_types::Position {
-                line: 7,
-                character: 4,
-            },
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 7, "character": 4 }
+            })
+        );
     }
 
     #[test]
-    fn references_matches_lsp_types() {
+    fn references_golden() {
         let ours = references("file:///foo.rs", 10, 5, true);
 
-        let theirs = serde_json::to_value(ReferenceParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///foo.rs".parse().expect("uri"),
-                },
-                position: lsp_types::Position {
-                    line: 10,
-                    character: 5,
-                },
-            },
-            context: ReferenceContext {
-                include_declaration: true,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 10, "character": 5 },
+                "context": { "includeDeclaration": true }
+            })
+        );
     }
 
     #[test]
-    fn document_symbols_matches_lsp_types() {
+    fn document_symbols_golden() {
         let ours = document_symbols("file:///foo.rs");
 
-        let theirs = serde_json::to_value(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: "file:///foo.rs".parse().expect("uri"),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(ours, json!({ "textDocument": { "uri": "file:///foo.rs" } }));
     }
 
     // ── Code actions ────────────────────────────────────────────────
 
     #[test]
-    fn code_action_matches_lsp_types() {
+    fn code_action_golden() {
         let ours = code_action("file:///foo.rs", 1, 0, 1, 10, &[]);
 
-        let theirs = serde_json::to_value(CodeActionParams {
-            text_document: TextDocumentIdentifier {
-                uri: "file:///foo.rs".parse().expect("uri"),
-            },
-            range: lsp_types::Range {
-                start: lsp_types::Position {
-                    line: 1,
-                    character: 0,
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "range": {
+                    "start": { "line": 1, "character": 0 },
+                    "end": { "line": 1, "character": 10 }
                 },
-                end: lsp_types::Position {
-                    line: 1,
-                    character: 10,
-                },
-            },
-            context: CodeActionContext {
-                diagnostics: vec![],
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+                "context": {
+                    "diagnostics": []
+                }
+            })
+        );
     }
 
     // ── Call hierarchy ──────────────────────────────────────────────
 
-    fn sample_call_hierarchy_item() -> CallHierarchyItem {
-        CallHierarchyItem {
-            name: "foo".to_string(),
-            kind: SymbolKind::FUNCTION,
-            tags: None,
-            detail: None,
-            uri: "file:///foo.rs".parse().expect("uri"),
-            range: lsp_types::Range {
-                start: lsp_types::Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: lsp_types::Position {
-                    line: 1,
-                    character: 0,
-                },
+    fn sample_call_hierarchy_item() -> Value {
+        json!({
+            "name": "foo",
+            "kind": 12,
+            "uri": "file:///foo.rs",
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 0 }
             },
-            selection_range: lsp_types::Range {
-                start: lsp_types::Position {
-                    line: 0,
-                    character: 3,
-                },
-                end: lsp_types::Position {
-                    line: 0,
-                    character: 6,
-                },
-            },
-            data: None,
-        }
+            "selectionRange": {
+                "start": { "line": 0, "character": 3 },
+                "end": { "line": 0, "character": 6 }
+            }
+        })
     }
 
     #[test]
-    fn prepare_call_hierarchy_matches_lsp_types() {
+    fn prepare_call_hierarchy_golden() {
         let ours = prepare_call_hierarchy("file:///foo.rs", 5, 3);
 
-        let theirs = serde_json::to_value(CallHierarchyPrepareParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///foo.rs".parse().expect("uri"),
-                },
-                position: lsp_types::Position {
-                    line: 5,
-                    character: 3,
-                },
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 5, "character": 3 }
+            })
+        );
     }
 
     #[test]
-    fn incoming_calls_matches_lsp_types() {
+    fn incoming_calls_golden() {
         let item = sample_call_hierarchy_item();
-        let item_value = serde_json::to_value(&item).expect("serialize item");
-        let ours = incoming_calls(&item_value);
+        let ours = incoming_calls(&item);
 
-        let theirs = serde_json::to_value(CallHierarchyIncomingCallsParams {
-            item,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(ours, json!({ "item": item }));
     }
 
     #[test]
-    fn outgoing_calls_matches_lsp_types() {
+    fn outgoing_calls_golden() {
         let item = sample_call_hierarchy_item();
-        let item_value = serde_json::to_value(&item).expect("serialize item");
-        let ours = outgoing_calls(&item_value);
+        let ours = outgoing_calls(&item);
 
-        let theirs = serde_json::to_value(CallHierarchyOutgoingCallsParams {
-            item,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(ours, json!({ "item": item }));
     }
 
     // ── Type hierarchy ──────────────────────────────────────────────
 
-    fn sample_type_hierarchy_item() -> LspTypeHierarchyItem {
-        LspTypeHierarchyItem {
-            name: "MyTrait".to_string(),
-            kind: SymbolKind::INTERFACE,
-            tags: None,
-            detail: None,
-            uri: "file:///foo.rs".parse().expect("uri"),
-            range: lsp_types::Range {
-                start: lsp_types::Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: lsp_types::Position {
-                    line: 5,
-                    character: 0,
-                },
+    fn sample_type_hierarchy_item() -> Value {
+        json!({
+            "name": "MyTrait",
+            "kind": 11,
+            "uri": "file:///foo.rs",
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 5, "character": 0 }
             },
-            selection_range: lsp_types::Range {
-                start: lsp_types::Position {
-                    line: 0,
-                    character: 6,
-                },
-                end: lsp_types::Position {
-                    line: 0,
-                    character: 13,
-                },
-            },
-            data: None,
-        }
+            "selectionRange": {
+                "start": { "line": 0, "character": 6 },
+                "end": { "line": 0, "character": 13 }
+            }
+        })
     }
 
     #[test]
-    fn prepare_type_hierarchy_matches_lsp_types() {
+    fn prepare_type_hierarchy_golden() {
         let ours = prepare_type_hierarchy("file:///foo.rs", 2, 10);
 
-        let theirs = serde_json::to_value(LspTypeHierarchyPrepareParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///foo.rs".parse().expect("uri"),
-                },
-                position: lsp_types::Position {
-                    line: 2,
-                    character: 10,
-                },
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" },
+                "position": { "line": 2, "character": 10 }
+            })
+        );
     }
 
     #[test]
-    fn supertypes_matches_lsp_types() {
+    fn supertypes_golden() {
         let item = sample_type_hierarchy_item();
-        let item_value = serde_json::to_value(&item).expect("serialize item");
-        let ours = supertypes(&item_value);
+        let ours = supertypes(&item);
 
-        let theirs = serde_json::to_value(LspTypeHierarchySupertypesParams {
-            item,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(ours, json!({ "item": item }));
     }
 
     #[test]
-    fn subtypes_matches_lsp_types() {
+    fn subtypes_golden() {
         let item = sample_type_hierarchy_item();
-        let item_value = serde_json::to_value(&item).expect("serialize item");
-        let ours = subtypes(&item_value);
+        let ours = subtypes(&item);
 
-        let theirs = serde_json::to_value(LspTypeHierarchySubtypesParams {
-            item,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .expect("serialize");
-
-        assert_eq!(ours, theirs);
+        assert_eq!(ours, json!({ "item": item }));
     }
 }

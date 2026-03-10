@@ -133,16 +133,23 @@ impl Inbox for ServerInbox {
                 }
             }
             "$/progress" => {
-                if let Ok(params) = serde_json::from_value::<ProgressParams>(params.clone()) {
+                if let Ok(progress_params) =
+                    serde_json::from_value::<ProgressParams>(params.clone())
+                {
                     if !self.has_sent_progress.swap(true, Ordering::SeqCst) {
                         self.capability_notify.notify_waiters();
                     }
+
+                    let token_str = match &progress_params.token {
+                        lsp_types::NumberOrString::String(s) => s.clone(),
+                        lsp_types::NumberOrString::Number(n) => n.to_string(),
+                    };
 
                     let mut tracker = self
                         .progress
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    tracker.update(&params);
+                    tracker.update(&token_str, &params["value"]);
 
                     // Update state based on progress.
                     // The Dead guard is the only exclusion — Stuck servers
