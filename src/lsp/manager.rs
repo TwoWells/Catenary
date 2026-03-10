@@ -380,7 +380,7 @@ impl ClientManager {
         let mut statuses = Vec::new();
 
         for (lang, client_mutex) in clients {
-            let status = client_mutex.lock().await.status(lang).await;
+            let status = client_mutex.lock().await.status(lang);
             statuses.push(status);
         }
 

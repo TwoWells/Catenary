@@ -3,6 +3,8 @@
 
 /// Low-level LSP client for communicating with a server process.
 pub mod client;
+/// Transport layer: process lifecycle, reader loop, request/response correlation.
+pub(crate) mod connection;
 /// Diagnostics strategy selection and activity monitoring.
 pub(crate) mod diagnostics;
 #[allow(dead_code, reason = "Wired into production code in phase 0d")]

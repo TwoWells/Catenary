@@ -342,7 +342,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Snapshot generation before v2 change
-    let snapshot = client.diagnostics_generation(&uri).await;
+    let snapshot = client.diagnostics_generation(&uri);
     assert_eq!(snapshot, 0, "No diagnostics should have arrived yet");
 
     // Content v2: 4 lines
@@ -371,7 +371,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     assert_eq!(result, DiagnosticsWaitResult::Diagnostics);
 
     // Check what diagnostics we got
-    let diagnostics = client.get_diagnostics(&uri).await;
+    let diagnostics = client.get_diagnostics(&uri);
     assert!(
         !diagnostics.is_empty(),
         "Should have some diagnostics. Got none."
