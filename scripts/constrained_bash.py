@@ -131,7 +131,7 @@ def _strip_heredoc_bodies(cmd_string):
 
 
 # Commands agents are allowed to run
-ALLOWED = {"make", "git", "gh", "cp", "rm", "rmdir", "touch", "mkdir", "mv", "chmod", "sleep", "cd", "true", "false", "which"}
+ALLOWED = {"make", "git", "gh", "kubectl", "cp", "rm", "rmdir", "touch", "mkdir", "mv", "chmod", "sleep", "cd", "true", "false", "which"}
 
 # git subcommands that are denied even though git is allowed
 DENIED_GIT = {"grep", "ls-files", "ls-tree"}
