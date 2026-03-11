@@ -355,6 +355,29 @@ impl SessionTree {
         }
     }
 
+    /// Mark a session as dead by ID and recalculate the parent workspace's
+    /// `has_active` flag.
+    pub fn mark_session_dead(&mut self, session_id: &str) {
+        for ws in &mut self.workspaces {
+            if let Some(row) = ws.sessions.iter_mut().find(|s| s.info.id == session_id) {
+                row.alive = false;
+                ws.has_active = ws.sessions.iter().any(|s| s.alive);
+                return;
+            }
+        }
+    }
+
+    /// Return `(session_id, pid)` pairs for all sessions where `alive == true`.
+    #[must_use]
+    pub fn alive_session_pids(&self) -> Vec<(&str, u32)> {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| &ws.sessions)
+            .filter(|s| s.alive)
+            .map(|s| (s.info.id.as_str(), s.info.pid))
+            .collect()
+    }
+
     /// If cursor is on a session, return its ID.
     #[must_use]
     pub fn selected_session_id(&self) -> Option<&str> {
@@ -1105,6 +1128,52 @@ mod tests {
             has_thumb,
             "right border column should contain scrollbar thumb characters"
         );
+    }
+
+    #[test]
+    fn test_mark_session_dead() {
+        let sessions = vec![
+            make_session("live0001", "/ws/test", true, 5),
+            make_session("live0002", "/ws/test", true, 3),
+        ];
+        let mut tree = SessionTree::from_sessions(sessions);
+        let ws = &tree.workspaces[0];
+        assert!(ws.has_active);
+        assert!(ws.sessions.iter().all(|s| s.alive));
+
+        // Mark one dead — workspace still has_active.
+        tree.mark_session_dead("live0001");
+        let ws = &tree.workspaces[0];
+        assert!(ws.has_active);
+        assert!(
+            !ws.sessions
+                .iter()
+                .find(|s| s.info.id == "live0001")
+                .expect("session")
+                .alive
+        );
+
+        // Mark the other dead — workspace no longer has_active.
+        tree.mark_session_dead("live0002");
+        let ws = &tree.workspaces[0];
+        assert!(!ws.has_active);
+    }
+
+    #[test]
+    fn test_alive_session_pids() {
+        let mut s1 = make_session("live0001", "/ws/alpha", true, 5);
+        s1.info.pid = 100;
+        let mut s2 = make_session("dead0001", "/ws/alpha", false, 10);
+        s2.info.pid = 200;
+        let mut s3 = make_session("live0002", "/ws/beta", true, 3);
+        s3.info.pid = 300;
+
+        let tree = SessionTree::from_sessions(vec![s1, s2, s3]);
+        let alive = tree.alive_session_pids();
+        assert_eq!(alive.len(), 2);
+        assert!(alive.contains(&("live0001", 100)));
+        assert!(alive.contains(&("live0002", 300)));
+        assert!(!alive.iter().any(|(id, _)| *id == "dead0001"));
     }
 
     /// Convert a ratatui buffer to a single string for assertion matching.

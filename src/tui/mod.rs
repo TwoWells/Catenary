@@ -46,7 +46,7 @@ use ratatui::backend::CrosstermBackend;
 use tracing::warn;
 
 use crate::config::IconConfig;
-use crate::session::EventKind;
+use crate::session::{self, EventKind};
 
 use self::app::{FocusedPane, InputMode};
 use self::data::SqliteDataSource;
@@ -57,8 +57,8 @@ use self::theme::{IconSet, Theme};
 /// Tick interval for the event loop.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-/// How often to refresh the session list (in ticks).
-const SESSION_REFRESH_TICKS: u64 = 25; // 25 * 200ms = 5s
+/// How often to check PID liveness (in ticks).
+const LIVENESS_CHECK_TICKS: u64 = 150; // 150 * 200ms = 30s
 
 /// Start a file watcher on the WAL file's parent directory.
 ///
@@ -233,6 +233,7 @@ fn run_loop(
 
         if db_changed {
             poll_tails(app);
+            check_new_sessions(app);
         }
 
         // Tick.
@@ -245,9 +246,9 @@ fn run_loop(
                 poll_tails(app);
             }
 
-            // Refresh sessions periodically.
-            if tick_count.is_multiple_of(SESSION_REFRESH_TICKS) {
-                refresh_sessions(app);
+            // PID liveness check (catches crashes).
+            if tick_count.is_multiple_of(LIVENESS_CHECK_TICKS) {
+                check_session_liveness(app);
             }
         }
     }
@@ -441,13 +442,19 @@ fn scrollbar_click(app: &mut App<'_>, panel: usize, y: u16) {
 }
 
 /// Poll all event tails and push new events into their panels.
+///
+/// Tracks `Shutdown` events and handles them after draining: marks the
+/// session dead in the tree, closes its panel, and removes its tail.
 fn poll_tails(app: &mut App<'_>) {
     let ids: Vec<String> = app.tails.keys().cloned().collect();
+    let mut shutdown_ids: Vec<String> = Vec::new();
+
     for id in ids {
         let Some(tail) = app.tails.get_mut(&id) else {
             continue;
         };
         while let Ok(Some(event)) = tail.try_next_event() {
+            let is_shutdown = matches!(event.kind, EventKind::Shutdown);
             let is_server_state = matches!(event.kind, EventKind::ServerState { .. });
             if let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == id) {
                 panel.push_event(event);
@@ -455,86 +462,122 @@ fn poll_tails(app: &mut App<'_>) {
                     panel.update_language_servers();
                 }
             }
+            if is_shutdown {
+                shutdown_ids.push(id.clone());
+            }
+        }
+    }
+
+    // Handle shutdowns: mark dead, close panel, remove tail.
+    for id in &shutdown_ids {
+        app.tree.mark_session_dead(id);
+        if let Some(idx) = app.grid.panel_for_session(id) {
+            app.grid.close_panel(idx);
+        }
+        app.tails.remove(id);
+    }
+    if !shutdown_ids.is_empty() && app.grid.panels.is_empty() && app.focus == FocusedPane::Events {
+        app.focus = FocusedPane::Sessions;
+    }
+}
+
+/// Check for new sessions by comparing alive IDs against the tree.
+///
+/// Uses the lightweight `list_alive_session_ids` query. Only calls the
+/// expensive `list_sessions` when new IDs are detected.
+fn check_new_sessions(app: &mut App<'_>) {
+    let Ok(alive_ids) = app.data.list_alive_session_ids() else {
+        return;
+    };
+
+    // Collect known session IDs from the tree.
+    let known_ids: Vec<&str> = app
+        .tree
+        .workspaces
+        .iter()
+        .flat_map(|ws| &ws.sessions)
+        .map(|s| s.info.id.as_str())
+        .collect();
+
+    let has_new = alive_ids.iter().any(|id| !known_ids.contains(&id.as_str()));
+    if !has_new {
+        return;
+    }
+
+    // New sessions detected — full rebuild.
+    let Ok(rows) = app.data.list_sessions() else {
+        return;
+    };
+
+    // Preserve cursor position by session ID.
+    let cursor_session_id = app.tree.selected_session_id().map(String::from);
+
+    app.tree = tree::SessionTree::from_sessions(rows);
+
+    // Restore cursor position.
+    if let Some(ref id) = cursor_session_id {
+        for (i, item) in app.tree.visible_items().iter().enumerate() {
+            if let tree::TreeItem::Session { row, .. } = item
+                && row.info.id == *id
+            {
+                app.tree.cursor = i;
+                break;
+            }
+        }
+    }
+
+    // Update panel display IDs from refreshed session data.
+    for panel in &mut app.grid.panels {
+        for ws in &app.tree.workspaces {
+            if let Some(row) = ws.sessions.iter().find(|s| s.info.id == panel.session_id) {
+                if let Some(ref csid) = row.info.client_session_id {
+                    panel.display_id.clone_from(csid);
+                }
+                break;
+            }
+        }
+    }
+
+    // Auto-open panels for new alive sessions.
+    for id in &alive_ids {
+        if app.grid.panel_for_session(id).is_none() {
+            let idx = app.grid.open_panel(id.clone());
+            if let Ok(events) = app.data.monitor_events(id)
+                && let Some(panel) = app.grid.panels.get_mut(idx)
+            {
+                panel.load_events(events);
+                panel.update_language_servers();
+            }
+            if let Ok(tail) = app.data.create_tail(id) {
+                app.tails.insert(id.clone(), tail);
+            }
         }
     }
 }
 
-/// Refresh the session list from the data source.
-fn refresh_sessions(app: &mut App<'_>) {
-    if let Ok(rows) = app.data.list_sessions() {
-        let active_ids: Vec<String> = rows
-            .iter()
-            .filter(|r| r.alive)
-            .map(|r| r.info.id.clone())
-            .collect();
+/// Check PID liveness for all alive sessions in the tree.
+///
+/// No DB access — pure PID check via `session::is_process_alive`.
+fn check_session_liveness(app: &mut App<'_>) {
+    let alive: Vec<(String, u32)> = app
+        .tree
+        .alive_session_pids()
+        .into_iter()
+        .map(|(id, pid)| (id.to_string(), pid))
+        .collect();
 
-        // Preserve cursor position by session ID if possible.
-        let cursor_session_id = app.tree.selected_session_id().map(String::from);
-
-        app.tree = tree::SessionTree::from_sessions(rows);
-
-        // Restore cursor position.
-        if let Some(ref id) = cursor_session_id {
-            for (i, item) in app.tree.visible_items().iter().enumerate() {
-                if let tree::TreeItem::Session { row, .. } = item
-                    && row.info.id == *id
-                {
-                    app.tree.cursor = i;
-                    break;
-                }
+    let mut any_died = false;
+    for (id, pid) in &alive {
+        if !session::is_process_alive(*pid) {
+            app.tree.mark_session_dead(id);
+            if let Some(idx) = app.grid.panel_for_session(id) {
+                app.grid.close_panel(idx);
             }
+            app.tails.remove(id);
+            any_died = true;
         }
-
-        // Update panel display IDs from refreshed session data.
-        for panel in &mut app.grid.panels {
-            for ws in &app.tree.workspaces {
-                if let Some(row) = ws.sessions.iter().find(|s| s.info.id == panel.session_id) {
-                    if let Some(ref csid) = row.info.client_session_id {
-                        panel.display_id.clone_from(csid);
-                    }
-                    break;
-                }
-            }
-        }
-
-        // Auto-close panels for dead sessions.
-        let dead_panel_indices: Vec<usize> = app
-            .grid
-            .panels
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| !active_ids.contains(&p.session_id))
-            .map(|(i, _)| i)
-            .collect();
-        for idx in dead_panel_indices.into_iter().rev() {
-            let session_id = app.grid.panels.get(idx).map(|p| p.session_id.clone());
-            app.grid.close_panel(idx);
-            if let Some(id) = session_id {
-                app.tails.remove(&id);
-            }
-        }
-        if app.grid.panels.is_empty() && app.focus == FocusedPane::Events {
-            app.focus = FocusedPane::Sessions;
-        }
-
-        // Auto-open panels for new active sessions.
-        for id in &active_ids {
-            if app.grid.panel_for_session(id).is_none() {
-                let idx = app.grid.open_panel(id.clone());
-                if let Ok(events) = app.data.monitor_events(id)
-                    && let Some(panel) = app.grid.panels.get_mut(idx)
-                {
-                    panel.load_events(events);
-                    panel.update_language_servers();
-                }
-                if let Ok(tail) = app.data.create_tail(id) {
-                    app.tails.insert(id.clone(), tail);
-                }
-            }
-        }
-
-        // Remove tails for panels that are no longer open.
-        app.tails
-            .retain(|id, _| app.grid.panel_for_session(id).is_some());
+    }
+    if any_died && app.grid.panels.is_empty() && app.focus == FocusedPane::Events {
+        app.focus = FocusedPane::Sessions;
     }
 }
