@@ -12,7 +12,7 @@ use super::types::{
     ListToolsResult, METHOD_NOT_FOUND, Notification, Request, RequestId, Response, Root,
     RootsListResult, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
-use crate::session::{EventBroadcaster, EventKind};
+use crate::session::{Direction, EventBroadcaster, EventKind, Protocol};
 
 /// Trait for handling MCP tool calls.
 pub trait ToolHandler: Send + Sync {
@@ -123,8 +123,10 @@ impl<H: ToolHandler> McpServer<H> {
 
             // Broadcast incoming message
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                self.broadcaster.send(EventKind::McpMessage {
-                    direction: "in".to_string(),
+                self.broadcaster.send(EventKind::ProtocolMessage {
+                    protocol: Protocol::Mcp,
+                    language: None,
+                    direction: Direction::Recv,
                     message: json,
                 });
             }
@@ -171,8 +173,10 @@ impl<H: ToolHandler> McpServer<H> {
         trace!("Sending: {}", response_json);
 
         if let Ok(json) = serde_json::to_value(response) {
-            self.broadcaster.send(EventKind::McpMessage {
-                direction: "out".to_string(),
+            self.broadcaster.send(EventKind::ProtocolMessage {
+                protocol: Protocol::Mcp,
+                language: None,
+                direction: Direction::Send,
                 message: json,
             });
         }
@@ -373,8 +377,10 @@ impl<H: ToolHandler> McpServer<H> {
 
         // Broadcast outbound request
         if let Ok(json) = serde_json::to_value(&request) {
-            self.broadcaster.send(EventKind::McpMessage {
-                direction: "out".to_string(),
+            self.broadcaster.send(EventKind::ProtocolMessage {
+                protocol: Protocol::Mcp,
+                language: None,
+                direction: Direction::Send,
                 message: json,
             });
         }
@@ -410,8 +416,10 @@ impl<H: ToolHandler> McpServer<H> {
             let json: serde_json::Value = serde_json::from_str(trimmed)
                 .context("Failed to parse JSON during roots/list wait")?;
 
-            self.broadcaster.send(EventKind::McpMessage {
-                direction: "in".to_string(),
+            self.broadcaster.send(EventKind::ProtocolMessage {
+                protocol: Protocol::Mcp,
+                language: None,
+                direction: Direction::Recv,
                 message: json.clone(),
             });
 

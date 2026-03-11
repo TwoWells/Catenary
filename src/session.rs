@@ -47,6 +47,26 @@ pub struct SessionEvent {
     pub kind: EventKind,
 }
 
+/// Protocol that produced a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// Language Server Protocol message.
+    Lsp,
+    /// Model Context Protocol message.
+    Mcp,
+}
+
+/// Direction of a protocol message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    /// Sent by Catenary to the server/host.
+    Send,
+    /// Received by Catenary from the server/host.
+    Recv,
+}
+
 /// Types of session events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -112,10 +132,14 @@ pub enum EventKind {
     Started,
     /// Session ending.
     Shutdown,
-    /// Raw MCP message (incoming or outgoing).
-    McpMessage {
-        /// Direction of the message ("in" or "out").
-        direction: String,
+    /// Protocol message (LSP or MCP, inbound or outbound).
+    ProtocolMessage {
+        /// Which protocol produced this message.
+        protocol: Protocol,
+        /// Server language ID (e.g., "rust"). None for MCP.
+        language: Option<String>,
+        /// Whether the message was sent or received.
+        direction: Direction,
         /// The raw JSON-RPC message.
         message: serde_json::Value,
     },
@@ -885,7 +909,7 @@ const fn event_kind_tag(kind: &EventKind) -> &'static str {
         EventKind::Diagnostics { .. } => "diagnostics",
         EventKind::Started => "started",
         EventKind::Shutdown => "shutdown",
-        EventKind::McpMessage { .. } => "mcp_message",
+        EventKind::ProtocolMessage { .. } => "protocol_message",
     }
 }
 

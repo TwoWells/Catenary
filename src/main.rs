@@ -26,7 +26,7 @@ use catenary_mcp::cli::{self, ColorConfig, ColumnWidths};
 use catenary_mcp::install;
 use catenary_mcp::lsp;
 use catenary_mcp::mcp::McpServer;
-use catenary_mcp::session::{self, EventKind, Session, SessionEvent};
+use catenary_mcp::session::{self, Direction, EventKind, Protocol, Session, SessionEvent};
 
 /// Output format for hook commands.
 ///
@@ -2461,13 +2461,26 @@ fn format_duration_ago(timestamp: chrono::DateTime<Utc>) -> String {
 fn print_event_raw(event: &SessionEvent) {
     let time = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
 
-    if let EventKind::McpMessage { direction, message } = &event.kind {
-        let arrow = if direction == "in" { "→" } else { "←" };
-        println!("[{time}] {arrow}");
+    if let EventKind::ProtocolMessage {
+        protocol,
+        language,
+        direction,
+        message,
+    } = &event.kind
+    {
+        let tag = match protocol {
+            Protocol::Mcp => "[mcp]".to_string(),
+            Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
+        };
+        let arrow = match direction {
+            Direction::Recv => "\u{2192}",
+            Direction::Send => "\u{2190}",
+        };
+        println!("[{time}] {tag} {arrow}");
         let pretty = serde_json::to_string_pretty(message).unwrap_or_default();
         println!("{pretty}");
     } else {
-        // For non-MCP events, print as JSON
+        // For non-protocol events, print as JSON
         let json = serde_json::to_string_pretty(&event.kind).unwrap_or_default();
         println!("[{time}] {json}");
     }
@@ -2556,33 +2569,41 @@ fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width:
                 println!("{time_str} {basename}: {label}{detail}");
             }
         }
-        EventKind::McpMessage { direction, message } => {
-            let arrow_colored = if direction == "in" {
-                colors.green("→")
-            } else {
-                colors.blue("←")
+        EventKind::ProtocolMessage {
+            protocol,
+            language,
+            direction,
+            message,
+        } => {
+            let tag = match protocol {
+                Protocol::Mcp => "[mcp]".to_string(),
+                Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
+            };
+            let arrow_colored = match direction {
+                Direction::Recv => colors.green("\u{2192}"),
+                Direction::Send => colors.blue("\u{2190}"),
             };
 
-            // Extract meaningful info from MCP message
+            // Extract meaningful info from protocol message
             let summary = extract_mcp_summary(message, colors);
 
             // Calculate available width for message
-            // Format: [HH:MM:SS] → summary
-            let prefix_len = 10 + 2 + 2; // [time] + arrow + spaces
+            // Format: [HH:MM:SS] [tag] → summary
+            let prefix_len = 10 + tag.len() + 2 + 2; // [time] + tag + arrow + spaces
             let max_summary_len = term_width.saturating_sub(prefix_len);
 
             let summary = cli::truncate(&summary, max_summary_len);
-            println!("{time_str} {arrow_colored} {summary}");
+            println!("{time_str} {tag} {arrow_colored} {summary}");
 
             // Check for errors in response
-            if direction == "out"
+            if matches!(direction, Direction::Send)
                 && let Some(obj) = message.as_object()
                 && obj.contains_key("error")
                 && let Some(error) = obj.get("error")
             {
                 let err_msg = error
                     .get("message")
-                    .and_then(|m| m.as_str())
+                    .and_then(|m: &serde_json::Value| m.as_str())
                     .unwrap_or("Unknown error");
                 println!("    {}", colors.red(&format!("Error: {err_msg}")));
             }
