@@ -20,7 +20,7 @@ build-release:
 check:
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
 	@cargo clippy --tests --features mockls --quiet -- -D warnings
-	@cargo deny --log-level error check >/dev/null 2>&1
+	@cargo deny --log-level error check
 	@cargo nextest run --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 # Run cargo-deny license and advisory checks
