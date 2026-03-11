@@ -9,6 +9,8 @@ mod file_tools;
 mod handler;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
+/// Shared symbol types and helpers for handler and file_tools.
+mod symbols;
 
 pub use document_manager::{DocumentManager, DocumentNotification};
 pub use handler::LspBridgeHandler;

@@ -27,8 +27,9 @@ async fn test_mockls_initialize() -> Result<()> {
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
 
-    assert!(result.capabilities.hover_provider.is_some());
-    assert!(result.capabilities.definition_provider.is_some());
+    let caps = &result["capabilities"];
+    assert!(caps.get("hoverProvider").is_some_and(|v| !v.is_null()));
+    assert!(caps.get("definitionProvider").is_some_and(|v| !v.is_null()));
 
     client.shutdown().await?;
     Ok(())
@@ -48,7 +49,11 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
 
-    assert!(result.capabilities.hover_provider.is_some());
+    assert!(
+        result["capabilities"]
+            .get("hoverProvider")
+            .is_some_and(|v| !v.is_null())
+    );
     assert!(client.supports_workspace_folders());
 
     client.shutdown().await?;
