@@ -17,6 +17,7 @@ use super::inbox::{Inbox, ServerInbox};
 use super::params;
 use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
+use crate::logger::Logger;
 use crate::session::{EventBroadcaster, EventKind};
 
 /// Cached diagnostics for a file: `(version, diagnostics)`.
@@ -102,8 +103,16 @@ impl LspClient {
         args: &[&str],
         language: &str,
         broadcaster: EventBroadcaster,
+        logger: Arc<dyn Logger>,
     ) -> Result<Self> {
-        Self::spawn_inner(program, args, language, broadcaster, Stdio::inherit())
+        Self::spawn_inner(
+            program,
+            args,
+            language,
+            broadcaster,
+            logger,
+            Stdio::inherit(),
+        )
     }
 
     /// Spawns the LSP server with stderr suppressed (for `catenary doctor`).
@@ -116,8 +125,9 @@ impl LspClient {
         args: &[&str],
         language: &str,
         broadcaster: EventBroadcaster,
+        logger: Arc<dyn Logger>,
     ) -> Result<Self> {
-        Self::spawn_inner(program, args, language, broadcaster, Stdio::null())
+        Self::spawn_inner(program, args, language, broadcaster, logger, Stdio::null())
     }
 
     fn spawn_inner(
@@ -125,6 +135,7 @@ impl LspClient {
         args: &[&str],
         language: &str,
         broadcaster: EventBroadcaster,
+        logger: Arc<dyn Logger>,
         stderr: Stdio,
     ) -> Result<Self> {
         let inbox = Arc::new(ServerInbox::new(language.to_string(), broadcaster));
@@ -135,8 +146,14 @@ impl LspClient {
             state: "Initializing".to_string(),
         });
 
-        let connection =
-            Connection::new(program, args, stderr, inbox.clone(), language.to_string())?;
+        let connection = Connection::new(
+            program,
+            args,
+            stderr,
+            inbox.clone(),
+            language.to_string(),
+            logger,
+        )?;
 
         Ok(Self {
             connection,
