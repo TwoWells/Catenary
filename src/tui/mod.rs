@@ -31,6 +31,8 @@ pub use app::App;
 pub use data::{DataSource, MockDataSource};
 
 use std::io;
+use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -38,8 +40,10 @@ use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, Mou
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use notify::Watcher;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tracing::warn;
 
 use crate::config::IconConfig;
 use crate::session::EventKind;
@@ -56,6 +60,35 @@ const TICK_INTERVAL: Duration = Duration::from_millis(200);
 /// How often to refresh the session list (in ticks).
 const SESSION_REFRESH_TICKS: u64 = 25; // 25 * 200ms = 5s
 
+/// Start a file watcher on the WAL file's parent directory.
+///
+/// Watches the parent directory (non-recursive) because the WAL file may not
+/// exist yet (`SQLite` creates it on first write). Events are filtered to the
+/// WAL filename and coalesced into a single `()` signal.
+fn start_wal_watcher(db_path: &Path) -> Result<(notify::RecommendedWatcher, mpsc::Receiver<()>)> {
+    let wal_name = {
+        let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+        name.push("-wal");
+        name
+    };
+
+    let (tx, rx) = mpsc::channel();
+
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            let matches_wal = event.paths.iter().any(|p| p.file_name() == Some(&wal_name));
+            if matches_wal {
+                let _ = tx.send(());
+            }
+        }
+    })?;
+
+    let watch_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    watcher.watch(watch_dir, notify::RecursiveMode::NonRecursive)?;
+
+    Ok((watcher, rx))
+}
+
 /// Run the interactive TUI with the live data source.
 ///
 /// # Errors
@@ -63,17 +96,43 @@ const SESSION_REFRESH_TICKS: u64 = 25; // 25 * 200ms = 5s
 /// Returns an error if terminal setup fails or session data cannot be read.
 pub fn run(icon_config: IconConfig) -> Result<()> {
     let data = Box::new(SqliteDataSource::new()?);
-    run_with_data(icon_config, data)
+    let db_path = crate::db::db_path();
+
+    let wal_watcher = match start_wal_watcher(&db_path) {
+        Ok((watcher, rx)) => Some((watcher, rx)),
+        Err(e) => {
+            warn!("WAL watcher unavailable, falling back to polling: {e}");
+            None
+        }
+    };
+
+    // Hold _watcher to keep it alive; extract rx for the event loop.
+    let (_watcher, wal_rx) = match wal_watcher {
+        Some((w, rx)) => (Some(w), Some(rx)),
+        None => (None, None),
+    };
+
+    run_with_data_and_watcher(icon_config, data, wal_rx.as_ref())
 }
 
-/// Run the interactive TUI with a provided data source.
+/// Run the interactive TUI with a provided data source (test entry point).
 ///
-/// This is the testable entry point — tests can inject a [`MockDataSource`].
+/// Tests can inject a [`MockDataSource`]. No WAL watcher — falls back to
+/// tick-based polling.
 ///
 /// # Errors
 ///
 /// Returns an error if terminal setup fails or session data cannot be read.
 pub fn run_with_data(icon_config: IconConfig, data: Box<dyn DataSource>) -> Result<()> {
+    run_with_data_and_watcher(icon_config, data, None)
+}
+
+/// Run the interactive TUI with an optional WAL watcher.
+fn run_with_data_and_watcher(
+    icon_config: IconConfig,
+    data: Box<dyn DataSource>,
+    wal_rx: Option<&mpsc::Receiver<()>>,
+) -> Result<()> {
     // Theme and icons live on the stack.
     let theme = Theme::detect();
     let icons = IconSet::from_config(icon_config);
@@ -111,7 +170,7 @@ pub fn run_with_data(icon_config: IconConfig, data: Box<dyn DataSource>) -> Resu
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &mut app);
+    let result = run_loop(&mut terminal, &mut app, wal_rx);
 
     // Terminal teardown.
     disable_raw_mode()?;
@@ -129,6 +188,7 @@ pub fn run_with_data(icon_config: IconConfig, data: Box<dyn DataSource>) -> Resu
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<'_>,
+    wal_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     let mut tick_count = 0u64;
@@ -163,13 +223,27 @@ fn run_loop(
             }
         }
 
+        // Check for DB changes (non-blocking drain).
+        let mut db_changed = false;
+        if let Some(rx) = wal_rx {
+            while rx.try_recv().is_ok() {
+                db_changed = true;
+            }
+        }
+
+        if db_changed {
+            poll_tails(app);
+        }
+
         // Tick.
         if last_tick.elapsed() >= TICK_INTERVAL {
             last_tick = Instant::now();
             tick_count += 1;
 
-            // Poll tails for new events every tick.
-            poll_tails(app);
+            // Fallback: poll on tick if no watcher (test mode).
+            if wal_rx.is_none() {
+                poll_tails(app);
+            }
 
             // Refresh sessions periodically.
             if tick_count.is_multiple_of(SESSION_REFRESH_TICKS) {

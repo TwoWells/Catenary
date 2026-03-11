@@ -426,7 +426,26 @@ impl SqliteEventTail {
                     serde_json::from_str(&payload).context("invalid event payload")?;
                 Ok(Some(SessionEvent { timestamp, kind }))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Check if GC deleted rows past our high-water mark.
+                let max_id: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT MAX(id) FROM events WHERE session_id = ?1",
+                        [&self.session_id],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                    .flatten();
+
+                if let Some(max) = max_id
+                    && max < self.last_id
+                {
+                    self.last_id = 0;
+                }
+
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
