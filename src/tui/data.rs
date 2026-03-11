@@ -82,13 +82,28 @@ pub struct SqliteDataSource {
 }
 
 impl SqliteDataSource {
-    /// Open a new data source with a database connection.
+    /// Open a new read-only data source.
+    ///
+    /// The database must already exist (created by `catenary serve`).
+    /// The TUI never writes to the database.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database cannot be opened or migrated.
+    /// Returns an error if the database file does not exist or cannot be opened.
     pub fn new() -> Result<Self> {
-        let conn = crate::db::open_and_migrate()?;
+        let path = crate::db::db_path();
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "No database found at {}. Is a Catenary session running?",
+                path.display()
+            )
+        })?;
         Ok(Self { conn })
     }
 
