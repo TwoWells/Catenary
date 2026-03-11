@@ -13,10 +13,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 
 use super::inbox::Inbox;
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
+use crate::logger::Logger;
+use crate::session::{Direction, EventKind, Protocol};
 
 /// Poll interval for failure detection sampling.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -35,6 +37,7 @@ pub struct Connection {
     next_id: AtomicI64,
     inbox: Arc<dyn Inbox>,
     language: String,
+    logger: Arc<dyn Logger>,
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
     _reader_handle: tokio::task::JoinHandle<()>,
 }
@@ -53,6 +56,7 @@ impl Connection {
         stderr: Stdio,
         inbox: Arc<dyn Inbox>,
         language: String,
+        logger: Arc<dyn Logger>,
     ) -> Result<Self> {
         let mut child = Command::new(program)
             .args(args)
@@ -84,6 +88,8 @@ impl Connection {
             alive.clone(),
             inbox.clone(),
             stdout,
+            logger.clone(),
+            language.clone(),
         ));
 
         Ok(Self {
@@ -94,6 +100,7 @@ impl Connection {
             next_id: AtomicI64::new(1),
             inbox,
             language,
+            logger,
             monitor: std::sync::Mutex::new(monitor),
             _reader_handle: reader_handle,
         })
@@ -263,7 +270,15 @@ impl Connection {
         let body = serde_json::to_string(message)?;
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
-        trace!("Sending LSP message: {}", body);
+        // Tee: capture outgoing LSP message
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+            self.logger.log(EventKind::ProtocolMessage {
+                protocol: Protocol::Lsp,
+                language: Some(self.language.clone()),
+                direction: Direction::Send,
+                message: value,
+            });
+        }
 
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(header.as_bytes()).await?;
@@ -285,6 +300,8 @@ impl Connection {
         alive: Arc<AtomicBool>,
         inbox: Arc<dyn Inbox>,
         stdout: tokio::process::ChildStdout,
+        logger: Arc<dyn Logger>,
+        language: String,
     ) {
         let mut reader = BufReader::new(stdout);
         let mut buffer = BytesMut::with_capacity(8192);
@@ -308,8 +325,6 @@ impl Connection {
 
             // Try to parse complete messages
             while let Ok(Some(message_str)) = protocol::try_parse_message(&mut buffer) {
-                trace!("Received LSP message: {}", message_str);
-
                 let value: serde_json::Value = match serde_json::from_str(&message_str) {
                     Ok(v) => v,
                     Err(e) => {
@@ -317,6 +332,14 @@ impl Connection {
                         continue;
                     }
                 };
+
+                // Tee: capture incoming LSP message
+                logger.log(EventKind::ProtocolMessage {
+                    protocol: Protocol::Lsp,
+                    language: Some(language.clone()),
+                    direction: Direction::Recv,
+                    message: value.clone(),
+                });
 
                 // Check message type
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
