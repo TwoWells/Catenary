@@ -12,7 +12,7 @@ use lsp_types::{
     CallHierarchyIncomingCallsParams, CallHierarchyPrepareParams, GotoDefinitionParams,
     GotoDefinitionResponse, HoverParams, ReferenceContext, ReferenceParams, SymbolInformation,
     SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    TypeHierarchySubtypesParams, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -245,7 +245,7 @@ impl LspBridgeHandler {
     pub(super) async fn ensure_document_open(
         &self,
         path: &Path,
-    ) -> Result<(lsp_types::Uri, Arc<Mutex<LspClient>>)> {
+    ) -> Result<(String, Arc<Mutex<LspClient>>)> {
         let client_mutex = self.get_client_for_path(path).await?;
         let mut doc_manager = self.doc_manager.lock().await;
         let client = client_mutex.lock().await;
@@ -262,11 +262,16 @@ impl LspBridgeHandler {
 
         if let Some(notification) = doc_manager.ensure_open(path).await? {
             match notification {
-                DocumentNotification::Open(params) => {
-                    client.did_open(params).await?;
+                DocumentNotification::Open {
+                    language_id,
+                    version,
+                    text,
+                    ..
+                } => {
+                    client.did_open(&uri, &language_id, version, &text).await?;
                 }
-                DocumentNotification::Change(params) => {
-                    client.did_change(params).await?;
+                DocumentNotification::Change { version, text, .. } => {
+                    client.did_change(&uri, version, &text).await?;
                 }
             }
 
@@ -669,7 +674,10 @@ impl LspBridgeHandler {
         self.runtime.block_on(async {
             let mut enrichment = SymbolEnrichment::default();
 
-            let Ok((uri, client_mutex)) = self.ensure_document_open(path).await else {
+            let Ok((uri_str, client_mutex)) = self.ensure_document_open(path).await else {
+                return enrichment;
+            };
+            let Ok(uri) = Uri::from_str(&uri_str) else {
                 return enrichment;
             };
 
@@ -832,7 +840,10 @@ impl LspBridgeHandler {
             let mut inferred_kind = SymbolKind::VARIABLE;
             let mut resolved_name: Option<String> = None;
 
-            let Ok((uri, client_mutex)) = self.ensure_document_open(path).await else {
+            let Ok((uri_str, client_mutex)) = self.ensure_document_open(path).await else {
+                return (inferred_kind, resolved_name, enrichment);
+            };
+            let Ok(uri) = Uri::from_str(&uri_str) else {
                 return (inferred_kind, resolved_name, enrichment);
             };
 
@@ -1071,7 +1082,10 @@ impl LspBridgeHandler {
                 // prepareRename distinguishes symbols from keywords:
                 // symbol → range, keyword → null. Cheaper than full enrichment.
                 let is_symbol = self.runtime.block_on(async {
-                    let Ok((uri, client_mutex)) = self.ensure_document_open(&path).await else {
+                    let Ok((uri_str, client_mutex)) = self.ensure_document_open(&path).await else {
+                        return false;
+                    };
+                    let Ok(uri) = Uri::from_str(&uri_str) else {
                         return false;
                     };
                     let client = client_mutex.lock().await;

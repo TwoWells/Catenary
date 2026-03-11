@@ -299,7 +299,6 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     std::fs::write(&file, v1)?;
 
     let uri = format!("file://{}", file.display());
-    let lsp_uri: lsp_types::Uri = uri.parse().context("parse URI")?;
 
     // Spawn LspClient directly with mockls --diagnostics-delay 5000
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
@@ -324,17 +323,8 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     client.wait_ready().await;
 
     // didOpen(v1) + didSave at t=0
-    client
-        .did_open(lsp_types::DidOpenTextDocumentParams {
-            text_document: lsp_types::TextDocumentItem {
-                uri: lsp_uri.clone(),
-                language_id: MOCK_LANG_A.to_string(),
-                version: 1,
-                text: v1.to_string(),
-            },
-        })
-        .await?;
-    client.did_save(lsp_uri.clone()).await?;
+    client.did_open(&uri, MOCK_LANG_A, 1, v1).await?;
+    client.did_save(&uri).await?;
 
     // Sleep 4s — v1 diagnostics haven't arrived yet (5s delay > 4s)
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -348,20 +338,8 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     std::fs::write(&file, v2)?;
 
     // didChange(v2) + didSave at t≈4s
-    client
-        .did_change(lsp_types::DidChangeTextDocumentParams {
-            text_document: lsp_types::VersionedTextDocumentIdentifier {
-                uri: lsp_uri.clone(),
-                version: 2,
-            },
-            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: v2.to_string(),
-            }],
-        })
-        .await?;
-    client.did_save(lsp_uri.clone()).await?;
+    client.did_change(&uri, 2, v2).await?;
+    client.did_save(&uri).await?;
 
     // Wait for diagnostics with snapshot=0
     let result = client.wait_for_diagnostics_update(&uri, snapshot).await;

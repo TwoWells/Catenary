@@ -72,41 +72,18 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
 
-    let uri: lsp_types::Uri = format!("file://{}", script_path.display()).parse()?;
+    let uri = format!("file://{}", script_path.display());
 
     // Open
     client
-        .did_open(lsp_types::DidOpenTextDocumentParams {
-            text_document: lsp_types::TextDocumentItem {
-                uri: uri.clone(),
-                language_id: MOCK_LANG_A.to_string(),
-                version: 1,
-                text: "let MY_VAR\n".to_string(),
-            },
-        })
+        .did_open(&uri, MOCK_LANG_A, 1, "let MY_VAR\n")
         .await?;
 
     // Change
-    client
-        .did_change(lsp_types::DidChangeTextDocumentParams {
-            text_document: lsp_types::VersionedTextDocumentIdentifier {
-                uri: uri.clone(),
-                version: 2,
-            },
-            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: "let MY_VAR\nMY_VAR\n".to_string(),
-            }],
-        })
-        .await?;
+    client.did_change(&uri, 2, "let MY_VAR\nMY_VAR\n").await?;
 
     // Close
-    client
-        .did_close(lsp_types::DidCloseTextDocumentParams {
-            text_document: lsp_types::TextDocumentIdentifier { uri },
-        })
-        .await?;
+    client.did_close(&uri).await?;
 
     client.shutdown().await?;
     Ok(())

@@ -11,7 +11,9 @@
 use anyhow::{Result, anyhow};
 use globset::Glob;
 use ignore::WalkBuilder;
-use lsp_types::{DocumentSymbolParams, DocumentSymbolResponse, SymbolKind, TextDocumentIdentifier};
+use lsp_types::{
+    DocumentSymbolParams, DocumentSymbolResponse, SymbolKind, TextDocumentIdentifier, Uri,
+};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -290,7 +292,8 @@ impl LspBridgeHandler {
     /// returns an error (callers typically use `.unwrap_or_default()`).
     fn fetch_outline_symbols(&self, path: &Path) -> Result<OutlineSymbols> {
         self.runtime.block_on(async {
-            let (uri, client_mutex) = self.ensure_document_open(path).await?;
+            let (uri_str, client_mutex) = self.ensure_document_open(path).await?;
+            let uri: Uri = uri_str.parse().map_err(|e| anyhow!("Invalid URI: {e}"))?;
 
             let params = DocumentSymbolParams {
                 text_document: TextDocumentIdentifier { uri },

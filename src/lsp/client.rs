@@ -5,15 +5,12 @@ use anyhow::{Context, Result, anyhow};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    ClientCapabilities, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams,
-    PositionEncodingKind, PrepareRenameResponse, ReferenceParams, ServerCapabilities,
-    TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
-    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbol, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    ClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
+    InitializedParams, PositionEncodingKind, PrepareRenameResponse, ReferenceParams,
+    ServerCapabilities, TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceFolder,
+    WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -27,6 +24,7 @@ use tracing::{debug, info};
 
 use super::connection::Connection;
 use super::inbox::ServerInbox;
+use super::params;
 use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
 use crate::session::{EventBroadcaster, EventKind};
@@ -435,11 +433,22 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the notification fails.
-    pub async fn did_open(&self, params: DidOpenTextDocumentParams) -> Result<()> {
-        let uri_str = params.text_document.uri.as_str().to_string();
-        let version = params.text_document.version;
-        self.last_sent_version.lock().await.insert(uri_str, version);
-        self.notify("textDocument/didOpen", params).await
+    pub async fn did_open(
+        &self,
+        uri: &str,
+        language_id: &str,
+        version: i32,
+        text: &str,
+    ) -> Result<()> {
+        self.last_sent_version
+            .lock()
+            .await
+            .insert(uri.to_string(), version);
+        self.notify(
+            "textDocument/didOpen",
+            params::did_open(uri, language_id, version, text),
+        )
+        .await
     }
 
     /// Notifies the LSP server that a document changed.
@@ -447,11 +456,16 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the notification fails.
-    pub async fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<()> {
-        let uri_str = params.text_document.uri.as_str().to_string();
-        let version = params.text_document.version;
-        self.last_sent_version.lock().await.insert(uri_str, version);
-        self.notify("textDocument/didChange", params).await
+    pub async fn did_change(&self, uri: &str, version: i32, text: &str) -> Result<()> {
+        self.last_sent_version
+            .lock()
+            .await
+            .insert(uri.to_string(), version);
+        self.notify(
+            "textDocument/didChange",
+            params::did_change(uri, version, text),
+        )
+        .await
     }
 
     /// Notifies the LSP server that a document was saved.
@@ -462,15 +476,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the notification fails.
-    pub async fn did_save(&self, uri: Uri) -> Result<()> {
-        self.notify(
-            "textDocument/didSave",
-            DidSaveTextDocumentParams {
-                text_document: TextDocumentIdentifier { uri },
-                text: None,
-            },
-        )
-        .await
+    pub async fn did_save(&self, uri: &str) -> Result<()> {
+        self.notify("textDocument/didSave", params::did_save(uri))
+            .await
     }
 
     /// Notifies the LSP server that a document was closed.
@@ -478,8 +486,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the notification fails.
-    pub async fn did_close(&self, params: DidCloseTextDocumentParams) -> Result<()> {
-        self.notify("textDocument/didClose", params).await
+    pub async fn did_close(&self, uri: &str) -> Result<()> {
+        self.notify("textDocument/didClose", params::did_close(uri))
+            .await
     }
 
     /// Notifies the LSP server that workspace folders changed.
@@ -493,8 +502,8 @@ impl LspClient {
     /// Returns an error if the notification fails.
     pub async fn did_change_workspace_folders(
         &self,
-        added: Vec<WorkspaceFolder>,
-        removed: Vec<WorkspaceFolder>,
+        added: &[(&str, &str)],
+        removed: &[(&str, &str)],
     ) -> Result<()> {
         if !added.is_empty() && self.server_state() == ServerState::Ready {
             self.inbox
@@ -504,9 +513,7 @@ impl LspClient {
 
         self.notify(
             "workspace/didChangeWorkspaceFolders",
-            DidChangeWorkspaceFoldersParams {
-                event: WorkspaceFoldersChangeEvent { added, removed },
-            },
+            params::did_change_workspace_folders(added, removed),
         )
         .await
     }
