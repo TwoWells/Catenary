@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::config::{IconConfig, IconPreset};
-use crate::session::{EventKind, SessionEvent};
+use crate::session::{Direction, EventKind, Protocol, SessionEvent};
 
 // ── Theme ────────────────────────────────────────────────────────────────
 
@@ -729,7 +729,26 @@ pub fn format_event_plain(ev: &SessionEvent) -> String {
             count,
             preview,
         } => format!("{ts} {file} {count} {preview}"),
-        EventKind::McpMessage { .. } => String::new(),
+        EventKind::ProtocolMessage {
+            protocol,
+            language,
+            direction,
+            message,
+        } => {
+            let tag = match protocol {
+                Protocol::Mcp => "[mcp]".to_string(),
+                Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
+            };
+            let arrow = match direction {
+                Direction::Send => "\u{2192}",
+                Direction::Recv => "\u{2190}",
+            };
+            let method = message
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("response");
+            format!("{ts} {tag} {arrow} {method}")
+        }
     }
 }
 
@@ -875,7 +894,31 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
                 ])
             }
         }
-        EventKind::McpMessage { .. } => Line::default(),
+        EventKind::ProtocolMessage {
+            protocol,
+            language,
+            direction,
+            message,
+        } => {
+            let tag = match protocol {
+                Protocol::Mcp => "[mcp]".to_string(),
+                Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
+            };
+            let arrow = match direction {
+                Direction::Send => "\u{2192}",
+                Direction::Recv => "\u{2190}",
+            };
+            let method = message
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("response");
+            Line::from(vec![
+                ts_span,
+                Span::styled(format!("{tag} "), theme.text),
+                Span::styled(format!("{arrow} "), theme.text),
+                Span::styled(method.to_string(), theme.text),
+            ])
+        }
     }
 }
 

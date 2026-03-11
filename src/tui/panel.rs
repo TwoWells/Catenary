@@ -418,9 +418,6 @@ impl<'a> PanelState<'a> {
 fn collapse_progress_indexed(events: &[SessionEvent]) -> Vec<(usize, &SessionEvent)> {
     let mut result: Vec<(usize, &SessionEvent)> = Vec::with_capacity(events.len());
     for (idx, ev) in events.iter().enumerate() {
-        if matches!(ev.kind, EventKind::McpMessage { .. }) {
-            continue;
-        }
         if let EventKind::Progress {
             language, title, ..
         } = &ev.kind

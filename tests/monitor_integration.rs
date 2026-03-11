@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result};
 use catenary_mcp::db;
-use catenary_mcp::session::{self, EventKind, Session};
+use catenary_mcp::session::{self, Direction, EventKind, Protocol, Session};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -30,8 +30,10 @@ fn test_monitor_raw_messages() -> Result<()> {
     let broadcaster = session.broadcaster();
 
     // Broadcast an incoming MCP request
-    broadcaster.send(EventKind::McpMessage {
-        direction: "in".to_string(),
+    broadcaster.send(EventKind::ProtocolMessage {
+        protocol: Protocol::Mcp,
+        language: None,
+        direction: Direction::Recv,
         message: json!({
             "jsonrpc": "2.0",
             "id": 12345,
@@ -40,8 +42,10 @@ fn test_monitor_raw_messages() -> Result<()> {
     });
 
     // Broadcast an outgoing MCP response
-    broadcaster.send(EventKind::McpMessage {
-        direction: "out".to_string(),
+    broadcaster.send(EventKind::ProtocolMessage {
+        protocol: Protocol::Mcp,
+        language: None,
+        direction: Direction::Send,
         message: json!({
             "jsonrpc": "2.0",
             "id": 12345,
@@ -56,22 +60,22 @@ fn test_monitor_raw_messages() -> Result<()> {
     let found_in = events.iter().any(|e| {
         matches!(
             &e.kind,
-            EventKind::McpMessage {
-                direction,
+            EventKind::ProtocolMessage {
+                direction: Direction::Recv,
                 message,
-            } if direction == "in"
-                && message.get("method").and_then(|m| m.as_str()) == Some("ping")
+                ..
+            } if message.get("method").and_then(|m: &serde_json::Value| m.as_str()) == Some("ping")
         )
     });
 
     let found_out = events.iter().any(|e| {
         matches!(
             &e.kind,
-            EventKind::McpMessage {
-                direction,
+            EventKind::ProtocolMessage {
+                direction: Direction::Send,
                 message,
-            } if direction == "out"
-                && message.get("result").is_some()
+                ..
+            } if message.get("result").is_some()
         )
     });
 
@@ -80,20 +84,28 @@ fn test_monitor_raw_messages() -> Result<()> {
 
     assert!(
         found_in,
-        "Did not find incoming MCP message (direction=\"in\", method=\"ping\") in events"
+        "Did not find incoming protocol message (direction=Recv, method=\"ping\") in events"
     );
     assert!(
         found_out,
-        "Did not find outgoing MCP message (direction=\"out\", result) in events"
+        "Did not find outgoing protocol message (direction=Send, result) in events"
     );
 
     // Verify the messages round-tripped with correct content
     let in_event = events
         .iter()
-        .find(|e| matches!(&e.kind, EventKind::McpMessage { direction, .. } if direction == "in"))
+        .find(|e| {
+            matches!(
+                &e.kind,
+                EventKind::ProtocolMessage {
+                    direction: Direction::Recv,
+                    ..
+                }
+            )
+        })
         .context("incoming event missing")?;
 
-    if let EventKind::McpMessage { message, .. } = &in_event.kind {
+    if let EventKind::ProtocolMessage { message, .. } = &in_event.kind {
         assert_eq!(message["id"], 12345);
         assert_eq!(message["method"], "ping");
     }
