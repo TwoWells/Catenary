@@ -33,8 +33,6 @@ pub struct Connection {
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
     alive: Arc<AtomicBool>,
     next_id: AtomicI64,
-    /// Held to keep the inbox alive for the reader loop task.
-    #[allow(dead_code, reason = "Ownership reference — reader loop holds a clone")]
     inbox: Arc<dyn Inbox>,
     language: String,
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
@@ -163,6 +161,7 @@ impl Connection {
                                 }
                                 if state == catenary_proc::ProcessState::Running
                                     && delta > 0
+                                    && !self.inbox.is_progress_active()
                                 {
                                     budget -= i64::try_from(delta)
                                         .unwrap_or(budget);
@@ -199,7 +198,10 @@ impl Connection {
                 // Check for ContentModified (-32801) or RequestCancelled (-32800)
                 if error.code == -32801 || error.code == -32800 {
                     debug!("LSP request '{}' cancelled/modified, retrying...", method,);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::select! {
+                        () = self.inbox.state_notify().notified() => {}
+                        () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                     continue;
                 }
                 return Err(anyhow!(

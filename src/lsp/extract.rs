@@ -20,8 +20,9 @@ fn as_u32(v: &Value) -> Option<u32> {
 // ── Server capabilities (from InitializeResult.capabilities) ────────
 
 /// Returns whether the server advertises `diagnosticProvider` (pull model).
+// Wired up by Phase 1 (PullProvider detection)
 #[must_use]
-#[allow(dead_code, reason = "LSP primitives API — available for future use")]
+#[allow(dead_code, reason = "Phase 1 — PullProvider detection at init")]
 pub fn has_diagnostic_provider(caps: &Value) -> bool {
     caps.get("diagnosticProvider").is_some_and(|v| !v.is_null())
 }
@@ -73,8 +74,9 @@ pub fn wants_did_save(caps: &Value) -> bool {
 ///
 /// Handles both short-form (bare number) and long-form (`{ change: N }`).
 /// Returns 0 (None) when absent or unparseable.
+// Wired up by Phase 1 (pull timing reliability)
 #[must_use]
-#[allow(dead_code, reason = "LSP primitives API — available for future use")]
+#[allow(dead_code, reason = "Phase 1 — pull timing reliability")]
 pub fn text_document_sync_kind(caps: &Value) -> u8 {
     match caps.get("textDocumentSync") {
         Some(v) if v.is_number() => v.as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(0),
@@ -145,35 +147,6 @@ pub fn publish_diagnostics_diagnostics(params: &Value) -> Vec<Value> {
 #[must_use]
 pub fn progress_token(params: &Value) -> Option<&Value> {
     params.get("token")
-}
-
-/// Extracts the progress kind (`"begin"`, `"report"`, or `"end"`)
-/// from `$/progress` params.
-#[must_use]
-#[allow(dead_code, reason = "LSP primitives API — available for future use")]
-pub fn progress_kind(params: &Value) -> Option<&str> {
-    params.get("value")?.get("kind")?.as_str()
-}
-
-/// Extracts the progress title from a `begin` progress notification.
-#[must_use]
-#[allow(dead_code, reason = "LSP primitives API — available for future use")]
-pub fn progress_title(params: &Value) -> Option<&str> {
-    params.get("value")?.get("title")?.as_str()
-}
-
-/// Extracts the progress message from `begin` or `report` progress.
-#[must_use]
-#[allow(dead_code, reason = "LSP primitives API — available for future use")]
-pub fn progress_message(params: &Value) -> Option<&str> {
-    params.get("value")?.get("message")?.as_str()
-}
-
-/// Extracts the progress percentage (0-100) from `begin` or `report` progress.
-#[must_use]
-#[allow(dead_code, reason = "LSP primitives API — available for future use")]
-pub fn progress_percentage(params: &Value) -> Option<u32> {
-    as_u32(params.get("value")?.get("percentage")?)
 }
 
 // ── Individual diagnostic fields ────────────────────────────────────
@@ -588,80 +561,6 @@ mod tests {
     #[test]
     fn progress_token_missing() {
         assert!(progress_token(&json!({})).is_none());
-    }
-
-    #[test]
-    fn progress_kind_begin() {
-        let params = json!({
-            "token": 1,
-            "value": { "kind": "begin", "title": "Indexing" }
-        });
-        assert_eq!(progress_kind(&params), Some("begin"));
-    }
-
-    #[test]
-    fn progress_kind_report() {
-        let params = json!({
-            "token": 1,
-            "value": { "kind": "report", "message": "file.rs", "percentage": 50 }
-        });
-        assert_eq!(progress_kind(&params), Some("report"));
-    }
-
-    #[test]
-    fn progress_kind_end() {
-        let params = json!({
-            "token": 1,
-            "value": { "kind": "end" }
-        });
-        assert_eq!(progress_kind(&params), Some("end"));
-    }
-
-    #[test]
-    fn progress_kind_missing() {
-        assert_eq!(progress_kind(&json!({})), None);
-    }
-
-    #[test]
-    fn progress_title_present() {
-        let params = json!({ "value": { "kind": "begin", "title": "Indexing" } });
-        assert_eq!(progress_title(&params), Some("Indexing"));
-    }
-
-    #[test]
-    fn progress_title_missing() {
-        let params = json!({ "value": { "kind": "report" } });
-        assert_eq!(progress_title(&params), None);
-    }
-
-    #[test]
-    fn progress_message_present() {
-        let params = json!({ "value": { "kind": "begin", "title": "t", "message": "file.rs" } });
-        assert_eq!(progress_message(&params), Some("file.rs"));
-    }
-
-    #[test]
-    fn progress_message_missing() {
-        let params = json!({ "value": { "kind": "begin", "title": "t" } });
-        assert_eq!(progress_message(&params), None);
-    }
-
-    #[test]
-    fn progress_percentage_present() {
-        let params = json!({ "value": { "kind": "report", "percentage": 75 } });
-        assert_eq!(progress_percentage(&params), Some(75));
-    }
-
-    #[test]
-    fn progress_percentage_missing() {
-        let params = json!({ "value": { "kind": "report" } });
-        assert_eq!(progress_percentage(&params), None);
-    }
-
-    #[test]
-    fn progress_percentage_null() {
-        let params = json!({ "value": { "kind": "report", "percentage": null } });
-        assert_eq!(progress_percentage(&params), None);
     }
 
     // ── Diagnostic extractors ───────────────────────────────────────

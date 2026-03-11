@@ -224,36 +224,6 @@ pub fn document_symbols(uri: &str) -> Value {
     json!({ "textDocument": { "uri": uri } })
 }
 
-// ── Code actions ────────────────────────────────────────────────────
-
-/// Builds `CodeActionParams`.
-///
-/// `diagnostics` are raw `Value` arrays (diagnostics stored as JSON).
-#[must_use]
-#[allow(
-    dead_code,
-    reason = "LSP primitives API — client inlines with 'only' filter"
-)]
-pub fn code_action(
-    uri: &str,
-    start_line: u32,
-    start_character: u32,
-    end_line: u32,
-    end_character: u32,
-    diagnostics: &[Value],
-) -> Value {
-    json!({
-        "textDocument": { "uri": uri },
-        "range": {
-            "start": { "line": start_line, "character": start_character },
-            "end": { "line": end_line, "character": end_character }
-        },
-        "context": {
-            "diagnostics": diagnostics
-        }
-    })
-}
-
 // ── Call hierarchy ──────────────────────────────────────────────────
 
 /// Builds `CallHierarchyPrepareParams`.
@@ -568,27 +538,6 @@ mod tests {
         let ours = document_symbols("file:///foo.rs");
 
         assert_eq!(ours, json!({ "textDocument": { "uri": "file:///foo.rs" } }));
-    }
-
-    // ── Code actions ────────────────────────────────────────────────
-
-    #[test]
-    fn code_action_golden() {
-        let ours = code_action("file:///foo.rs", 1, 0, 1, 10, &[]);
-
-        assert_eq!(
-            ours,
-            json!({
-                "textDocument": { "uri": "file:///foo.rs" },
-                "range": {
-                    "start": { "line": 1, "character": 0 },
-                    "end": { "line": 1, "character": 10 }
-                },
-                "context": {
-                    "diagnostics": []
-                }
-            })
-        );
     }
 
     // ── Call hierarchy ──────────────────────────────────────────────
