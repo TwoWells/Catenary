@@ -56,6 +56,16 @@ pub trait DataSource {
     ///
     /// Returns an error if the session data cannot be removed.
     fn delete_session(&self, session_id: &str) -> Result<()>;
+
+    /// List IDs of sessions marked alive in the database.
+    ///
+    /// This is a lightweight query (no PID checks, no joins) suitable for
+    /// frequent calls on WAL change to detect new sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    fn list_alive_session_ids(&self) -> Result<Vec<String>>;
 }
 
 /// Tail reader abstraction for streaming new events.
@@ -242,6 +252,18 @@ impl DataSource for SqliteDataSource {
 
         Ok(())
     }
+
+    fn list_alive_session_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM sessions WHERE alive = 1")?;
+        let mut rows = stmt.query([])?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            ids.push(row.get(0)?);
+        }
+        Ok(ids)
+    }
 }
 
 /// Query active languages for a session from its events.
@@ -324,6 +346,15 @@ impl DataSource for MockDataSource {
 
     fn delete_session(&self, _session_id: &str) -> Result<()> {
         Ok(())
+    }
+
+    fn list_alive_session_ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .sessions
+            .iter()
+            .filter(|r| r.alive)
+            .map(|r| r.info.id.clone())
+            .collect())
     }
 }
 
@@ -560,6 +591,55 @@ mod tests {
         // Should be gone
         assert!(!ds.list_sessions()?.iter().any(|r| r.info.id == id));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_mock_list_alive_session_ids() -> Result<()> {
+        let ds = MockDataSource {
+            sessions: vec![
+                SessionRow {
+                    info: make_session_info("alive-1"),
+                    alive: true,
+                    languages: vec![],
+                },
+                SessionRow {
+                    info: make_session_info("dead-1"),
+                    alive: false,
+                    languages: vec![],
+                },
+                SessionRow {
+                    info: make_session_info("alive-2"),
+                    alive: true,
+                    languages: vec![],
+                },
+            ],
+            events: HashMap::new(),
+            tail_events: HashMap::new(),
+        };
+
+        let ids = ds.list_alive_session_ids()?;
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"alive-1".to_string()));
+        assert!(ids.contains(&"alive-2".to_string()));
+        assert!(!ids.contains(&"dead-1".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_list_alive_session_ids() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let ds = SqliteDataSource::with_conn(conn);
+
+        let session = create_session(&path, "/tmp/test-ds-alive-ids")?;
+        let id = session.info.id.clone();
+
+        // Session is alive (process is running).
+        let ids = ds.list_alive_session_ids()?;
+        assert!(ids.contains(&id), "alive session should appear");
+
+        drop(session);
+        ds.delete_session(&id)?;
         Ok(())
     }
 }
