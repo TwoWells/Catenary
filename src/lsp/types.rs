@@ -24,19 +24,9 @@ pub struct Range {
     pub end: Position,
 }
 
-/// A workspace folder with a URI and display name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "LSP primitives API — available for future use")]
-pub struct WorkspaceFolder {
-    /// The URI for this workspace folder.
-    pub uri: String,
-    /// The human-readable name for this workspace folder.
-    pub name: String,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Position, Range, WorkspaceFolder};
+    use super::{Position, Range};
 
     #[test]
     fn position_equality() {
@@ -112,29 +102,6 @@ mod tests {
             },
         };
         let b = a;
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn workspace_folder_equality() {
-        let a = WorkspaceFolder {
-            uri: "file:///foo".to_string(),
-            name: "foo".to_string(),
-        };
-        let b = WorkspaceFolder {
-            uri: "file:///foo".to_string(),
-            name: "foo".to_string(),
-        };
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn workspace_folder_clone() {
-        let a = WorkspaceFolder {
-            uri: "file:///bar".to_string(),
-            name: "bar".to_string(),
-        };
-        let b = a.clone();
         assert_eq!(a, b);
     }
 }

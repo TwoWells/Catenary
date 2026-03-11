@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::connection::Connection;
-use super::inbox::ServerInbox;
+use super::inbox::{Inbox, ServerInbox};
 use super::params;
 use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
@@ -168,10 +168,7 @@ impl LspClient {
     /// `workspace/didChangeWorkspaceFolders`) without actual `$/progress`
     /// tokens, which would prevent the failure threshold from draining.
     fn progress_active(&self) -> bool {
-        self.inbox
-            .progress
-            .try_lock()
-            .map_or(true, |tracker| tracker.is_busy())
+        self.inbox.is_progress_active()
     }
 
     /// Sends a request and waits for the response.

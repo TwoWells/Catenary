@@ -36,6 +36,18 @@ pub trait Inbox: Send + Sync {
     /// Called after the `alive` flag is set to `false`. Updates internal
     /// state and wakes any waiters blocked on diagnostics or state changes.
     fn on_shutdown(&self);
+
+    /// Whether the server is actively reporting progress.
+    ///
+    /// Used by `Connection::request` to pause failure detection budget
+    /// drain during explained work (e.g., indexing, flycheck).
+    fn is_progress_active(&self) -> bool;
+
+    /// Returns a reference to the state-change notifier.
+    ///
+    /// Used by `Connection::request` to wait for server settle after
+    /// `ContentModified` instead of a fixed sleep.
+    fn state_notify(&self) -> &Notify;
 }
 
 /// Shared server state for notification dispatch.
@@ -222,5 +234,55 @@ impl Inbox for ServerInbox {
         }
         self.diagnostics_notify.notify_waiters();
         self.state_notify.notify_waiters();
+    }
+
+    fn is_progress_active(&self) -> bool {
+        self.progress
+            .try_lock()
+            .map_or(true, |tracker| tracker.is_busy())
+    }
+
+    fn state_notify(&self) -> &Notify {
+        &self.state_notify
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_inbox() -> ServerInbox {
+        ServerInbox::new("test".to_string(), crate::session::EventBroadcaster::noop())
+    }
+
+    #[test]
+    fn is_progress_active_begin_end() {
+        let inbox = test_inbox();
+        assert!(!inbox.is_progress_active());
+
+        // Progress begin
+        inbox.on_notification(
+            "$/progress",
+            &json!({
+                "token": "test-token",
+                "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
+            }),
+        );
+        assert!(inbox.is_progress_active());
+
+        // Progress end
+        inbox.on_notification(
+            "$/progress",
+            &json!({
+                "token": "test-token",
+                "value": { "kind": "end" }
+            }),
+        );
+        assert!(!inbox.is_progress_active());
     }
 }

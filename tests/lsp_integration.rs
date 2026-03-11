@@ -198,3 +198,40 @@ async fn test_client_capabilities() -> Result<()> {
     client.shutdown().await?;
     Ok(())
 }
+
+/// Verifies that `Connection::request` retries on `ContentModified` (-32801).
+///
+/// mockls `--content-modified-once` returns `ContentModified` on the first
+/// `textDocument/definition` request, then succeeds on retry.
+#[tokio::test]
+async fn test_content_modified_retry() -> Result<()> {
+    let dir = tempdir()?;
+    let script_path = dir.path().join(format!("retry.{MOCK_LANG_A}"));
+    std::fs::write(&script_path, "fn hello\nhello\n")?;
+
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A, "--content-modified-once"],
+        MOCK_LANG_A,
+        catenary_mcp::session::EventBroadcaster::noop(),
+    )?;
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    let uri = format!("file://{}", script_path.display());
+    client
+        .did_open(&uri, MOCK_LANG_A, 1, "fn hello\nhello\n")
+        .await?;
+
+    // First internal attempt gets ContentModified, retry succeeds
+    let result = client.definition(&uri, 1, 0).await?;
+    assert!(
+        result.get("uri").is_some() || result.get(0).is_some(),
+        "definition should return a location after retry"
+    );
+
+    client.shutdown().await?;
+    Ok(())
+}
