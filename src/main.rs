@@ -2310,7 +2310,7 @@ async fn run_doctor(args: Args, nocolor: bool, show_diff: bool) -> Result<()> {
         {
             Ok(result) => {
                 let tools =
-                    extract_capabilities(&result.capabilities, client.supports_type_hierarchy());
+                    extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
                 println!(
                     "{}  {}  {}",
                     lang_display,
@@ -2372,38 +2372,37 @@ fn binary_exists(command: &str) -> bool {
     std::env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
 }
 
-/// Extracts Catenary tool names from LSP `ServerCapabilities`.
-fn extract_capabilities(
-    caps: &lsp_types::ServerCapabilities,
-    type_hierarchy: bool,
-) -> Vec<&'static str> {
+/// Extracts Catenary tool names from LSP server capabilities.
+fn extract_capabilities(caps: &serde_json::Value, type_hierarchy: bool) -> Vec<&'static str> {
+    let has = |key: &str| caps.get(key).is_some_and(|v| !v.is_null());
+
     let mut tools = Vec::new();
 
-    if caps.hover_provider.is_some() {
+    if has("hoverProvider") {
         tools.push("hover");
     }
-    if caps.definition_provider.is_some() {
+    if has("definitionProvider") {
         tools.push("definition");
     }
-    if caps.type_definition_provider.is_some() {
+    if has("typeDefinitionProvider") {
         tools.push("type_definition");
     }
-    if caps.implementation_provider.is_some() {
+    if has("implementationProvider") {
         tools.push("implementation");
     }
-    if caps.references_provider.is_some() {
+    if has("referencesProvider") {
         tools.push("references");
     }
-    if caps.document_symbol_provider.is_some() {
+    if has("documentSymbolProvider") {
         tools.push("document_symbols");
     }
-    if caps.workspace_symbol_provider.is_some() {
+    if has("workspaceSymbolProvider") {
         tools.push("search");
     }
-    if caps.code_action_provider.is_some() {
+    if has("codeActionProvider") {
         tools.push("code_actions");
     }
-    if caps.call_hierarchy_provider.is_some() {
+    if has("callHierarchyProvider") {
         tools.push("call_hierarchy");
     }
     if type_hierarchy {

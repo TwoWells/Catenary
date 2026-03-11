@@ -21,6 +21,7 @@ fn as_u32(v: &Value) -> Option<u32> {
 
 /// Returns whether the server advertises `diagnosticProvider` (pull model).
 #[must_use]
+#[allow(dead_code, reason = "LSP primitives API — available for future use")]
 pub fn has_diagnostic_provider(caps: &Value) -> bool {
     caps.get("diagnosticProvider").is_some_and(|v| !v.is_null())
 }
@@ -73,6 +74,7 @@ pub fn wants_did_save(caps: &Value) -> bool {
 /// Handles both short-form (bare number) and long-form (`{ change: N }`).
 /// Returns 0 (None) when absent or unparseable.
 #[must_use]
+#[allow(dead_code, reason = "LSP primitives API — available for future use")]
 pub fn text_document_sync_kind(caps: &Value) -> u8 {
     match caps.get("textDocumentSync") {
         Some(v) if v.is_number() => v.as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(0),
@@ -148,24 +150,28 @@ pub fn progress_token(params: &Value) -> Option<&Value> {
 /// Extracts the progress kind (`"begin"`, `"report"`, or `"end"`)
 /// from `$/progress` params.
 #[must_use]
+#[allow(dead_code, reason = "LSP primitives API — available for future use")]
 pub fn progress_kind(params: &Value) -> Option<&str> {
     params.get("value")?.get("kind")?.as_str()
 }
 
 /// Extracts the progress title from a `begin` progress notification.
 #[must_use]
+#[allow(dead_code, reason = "LSP primitives API — available for future use")]
 pub fn progress_title(params: &Value) -> Option<&str> {
     params.get("value")?.get("title")?.as_str()
 }
 
 /// Extracts the progress message from `begin` or `report` progress.
 #[must_use]
+#[allow(dead_code, reason = "LSP primitives API — available for future use")]
 pub fn progress_message(params: &Value) -> Option<&str> {
     params.get("value")?.get("message")?.as_str()
 }
 
 /// Extracts the progress percentage (0-100) from `begin` or `report` progress.
 #[must_use]
+#[allow(dead_code, reason = "LSP primitives API — available for future use")]
 pub fn progress_percentage(params: &Value) -> Option<u32> {
     as_u32(params.get("value")?.get("percentage")?)
 }

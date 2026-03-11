@@ -320,12 +320,16 @@ impl NotifyServer {
         let server_version = client.server_version().map(str::to_string);
 
         // Collect quick-fix code actions for each diagnostic
-        let fixes =
-            if !diagnostics.is_empty() && client.capabilities().code_action_provider.is_some() {
-                collect_quick_fixes(&client, &uri, &diagnostics).await
-            } else {
-                Vec::new()
-            };
+        let fixes = if !diagnostics.is_empty()
+            && client
+                .capabilities()
+                .get("codeActionProvider")
+                .is_some_and(|v| !v.is_null())
+        {
+            collect_quick_fixes(&client, &uri, &diagnostics).await
+        } else {
+            Vec::new()
+        };
 
         drop(client);
 

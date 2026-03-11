@@ -26,6 +26,7 @@ pub struct Range {
 
 /// A workspace folder with a URI and display name.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code, reason = "LSP primitives API — available for future use")]
 pub struct WorkspaceFolder {
     /// The URI for this workspace folder.
     pub uri: String,

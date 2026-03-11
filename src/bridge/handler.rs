@@ -8,21 +8,19 @@ use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{Searcher, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use lsp_types::{
-    CallHierarchyIncomingCallsParams, CallHierarchyPrepareParams, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, ReferenceContext, ReferenceParams, SymbolInformation,
-    SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
-};
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
+
+use super::symbols::{
+    self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
+};
 
 use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
@@ -325,8 +323,7 @@ impl LspBridgeHandler {
             let clients = self.client_manager.active_clients().await;
 
             // Try workspace/symbol("") first — returns the full symbol index
-            let mut all_symbols: Vec<SymbolInformation> =
-                self.fetch_symbol_universe(&clients).await;
+            let mut all_symbols: Vec<SymbolInfo> = self.fetch_symbol_universe(&clients).await;
 
             // Fallback: if symbol("") returned nothing, use rg matched strings
             if all_symbols.is_empty() && !rg.matched_strings.is_empty() {
@@ -338,15 +335,9 @@ impl LspBridgeHandler {
             // Regex filter against the user's pattern
             all_symbols.retain(|s| re.is_match(&s.name));
 
-            // Dedupe by (name, uri, line)
+            // Dedupe by (name, file_path, line)
             let mut seen: HashSet<(String, String, u32)> = HashSet::new();
-            all_symbols.retain(|s| {
-                seen.insert((
-                    s.name.clone(),
-                    s.location.uri.to_string(),
-                    s.location.range.start.line,
-                ))
-            });
+            all_symbols.retain(|s| seen.insert((s.name.clone(), s.file_path.clone(), s.line)));
 
             all_symbols
         });
@@ -355,7 +346,7 @@ impl LspBridgeHandler {
 
         // 3. Group symbols by name (preserving order of first occurrence)
         let mut name_order: Vec<String> = Vec::new();
-        let mut by_name: BTreeMap<String, Vec<&SymbolInformation>> = BTreeMap::new();
+        let mut by_name: BTreeMap<String, Vec<&SymbolInfo>> = BTreeMap::new();
         for sym in &symbols {
             if !by_name.contains_key(&sym.name) {
                 name_order.push(sym.name.clone());
@@ -372,10 +363,7 @@ impl LspBridgeHandler {
             for (file, lines) in &enrichment.ref_lines {
                 all_ref_lines.entry(file.clone()).or_default().extend(lines);
             }
-            let key = (
-                sym.location.uri.path().to_string(),
-                sym.location.range.start.line,
-            );
+            let key = (sym.file_path.clone(), sym.line);
             enrichments.insert(key, enrichment);
         }
 
@@ -434,14 +422,11 @@ impl LspBridgeHandler {
             if let Some(defs) = by_name.get(name) {
                 for sym in defs {
                     let kind = format_symbol_kind(sym.kind);
-                    let path = display_path(sym.location.uri.path().as_str(), &roots);
-                    let line = sym.location.range.start.line + 1;
+                    let path = display_path(&sym.file_path, &roots);
+                    let line = sym.line + 1;
                     let _ = writeln!(output, "\n## [{kind}] {path}:{line}");
 
-                    let key = (
-                        sym.location.uri.path().to_string(),
-                        sym.location.range.start.line,
-                    );
+                    let key = (sym.file_path.clone(), sym.line);
                     if let Some(enrichment) = enrichments.get(&key) {
                         // Hover only when symbol count is within threshold
                         if show_hover && let Some(hover) = &enrichment.hover {
@@ -484,8 +469,8 @@ impl LspBridgeHandler {
                         // References (excluding definition line and labeled lines)
                         let ref_output = format_symbol_references(
                             enrichment,
-                            sym.location.uri.path().as_str(),
-                            sym.location.range.start.line,
+                            &sym.file_path,
+                            sym.line,
                             &roots,
                             &labeled_lines,
                         );
@@ -513,63 +498,30 @@ impl LspBridgeHandler {
     async fn fetch_symbol_universe(
         &self,
         clients: &HashMap<String, Arc<Mutex<LspClient>>>,
-    ) -> Vec<SymbolInformation> {
-        let params = WorkspaceSymbolParams {
-            query: String::new(),
-            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-            partial_result_params: lsp_types::PartialResultParams::default(),
-        };
-
-        let mut all_symbols: Vec<SymbolInformation> = Vec::new();
+    ) -> Vec<SymbolInfo> {
+        let mut all_symbols: Vec<SymbolInfo> = Vec::new();
 
         for client_mutex in clients.values() {
             let client = client_mutex.lock().await;
             let supports_resolve = client.supports_workspace_symbol_resolve();
 
-            let Ok(Some(response)) = client.workspace_symbols(params.clone()).await else {
+            let Ok(response) = client.workspace_symbols("").await else {
                 continue;
             };
 
-            match response {
-                WorkspaceSymbolResponse::Flat(flat) => all_symbols.extend(flat),
-                WorkspaceSymbolResponse::Nested(nested) => {
-                    for ws in nested {
-                        match ws.location {
-                            lsp_types::OneOf::Left(ref location) => {
-                                #[allow(deprecated, reason = "LSP spec uses deprecated fields")]
-                                all_symbols.push(SymbolInformation {
-                                    name: ws.name.clone(),
-                                    kind: ws.kind,
-                                    tags: ws.tags.clone(),
-                                    deprecated: None,
-                                    location: location.clone(),
-                                    container_name: ws.container_name.clone(),
-                                });
-                            }
-                            lsp_types::OneOf::Right(_) if supports_resolve => {
-                                // URI-only: resolve to get full location
-                                if let Ok(Some(resolved)) =
-                                    client.workspace_symbol_resolve(ws.clone()).await
-                                    && let lsp_types::OneOf::Left(location) = resolved.location
-                                {
-                                    #[allow(
-                                        deprecated,
-                                        reason = "LSP spec uses deprecated fields"
-                                    )]
-                                    all_symbols.push(SymbolInformation {
-                                        name: resolved.name,
-                                        kind: resolved.kind,
-                                        tags: resolved.tags,
-                                        deprecated: None,
-                                        location,
-                                        container_name: resolved.container_name,
-                                    });
-                                }
-                            }
-                            lsp_types::OneOf::Right(_) => {
-                                // URI-only but no resolve support — skip
-                            }
-                        }
+            // Extract symbols that have full location info
+            all_symbols.extend(extract_symbol_infos(&response));
+
+            // Resolve URI-only symbols when server supports it
+            if supports_resolve && let Some(arr) = response.as_array() {
+                for item in arr {
+                    let has_uri = item.get("location").and_then(|l| l.get("uri")).is_some();
+                    let has_range = item.get("location").and_then(|l| l.get("range")).is_some();
+                    if has_uri
+                        && !has_range
+                        && let Ok(resolved) = client.workspace_symbol_resolve(item).await
+                    {
+                        all_symbols.extend(extract_symbol_infos(&Value::Array(vec![resolved])));
                     }
                 }
             }
@@ -579,71 +531,34 @@ impl LspBridgeHandler {
     }
 
     /// Fallback: queries workspace/symbol with each matched string (ticket 08 behavior).
-    /// Handles `OneOf::Right` (URI-only) symbols via resolve when supported.
+    /// Resolves URI-only symbols via resolve when supported.
     async fn fetch_symbols_by_queries(
         &self,
         queries: &[String],
         clients: &HashMap<String, Arc<Mutex<LspClient>>>,
-    ) -> Vec<SymbolInformation> {
-        let mut all_symbols: Vec<SymbolInformation> = Vec::new();
+    ) -> Vec<SymbolInfo> {
+        let mut all_symbols: Vec<SymbolInfo> = Vec::new();
 
         for query in queries {
-            let params = WorkspaceSymbolParams {
-                query: query.clone(),
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
-
             for client_mutex in clients.values() {
                 let client = client_mutex.lock().await;
                 let supports_resolve = client.supports_workspace_symbol_resolve();
 
-                let Ok(Some(response)) = client.workspace_symbols(params.clone()).await else {
+                let Ok(response) = client.workspace_symbols(query).await else {
                     continue;
                 };
 
-                match response {
-                    WorkspaceSymbolResponse::Flat(flat) => all_symbols.extend(flat),
-                    WorkspaceSymbolResponse::Nested(nested) => {
-                        for ws in nested {
-                            match ws.location {
-                                lsp_types::OneOf::Left(ref location) => {
-                                    #[allow(
-                                        deprecated,
-                                        reason = "LSP spec uses deprecated fields"
-                                    )]
-                                    all_symbols.push(SymbolInformation {
-                                        name: ws.name.clone(),
-                                        kind: ws.kind,
-                                        tags: ws.tags.clone(),
-                                        deprecated: None,
-                                        location: location.clone(),
-                                        container_name: ws.container_name.clone(),
-                                    });
-                                }
-                                lsp_types::OneOf::Right(_) if supports_resolve => {
-                                    if let Ok(Some(resolved)) =
-                                        client.workspace_symbol_resolve(ws.clone()).await
-                                        && let lsp_types::OneOf::Left(location) = resolved.location
-                                    {
-                                        #[allow(
-                                            deprecated,
-                                            reason = "LSP spec uses deprecated fields"
-                                        )]
-                                        all_symbols.push(SymbolInformation {
-                                            name: resolved.name,
-                                            kind: resolved.kind,
-                                            tags: resolved.tags,
-                                            deprecated: None,
-                                            location,
-                                            container_name: resolved.container_name,
-                                        });
-                                    }
-                                }
-                                lsp_types::OneOf::Right(_) => {
-                                    // URI-only but no resolve support — skip
-                                }
-                            }
+                all_symbols.extend(extract_symbol_infos(&response));
+
+                if supports_resolve && let Some(arr) = response.as_array() {
+                    for item in arr {
+                        let has_uri = item.get("location").and_then(|l| l.get("uri")).is_some();
+                        let has_range = item.get("location").and_then(|l| l.get("range")).is_some();
+                        if has_uri
+                            && !has_range
+                            && let Ok(resolved) = client.workspace_symbol_resolve(item).await
+                        {
+                            all_symbols.extend(extract_symbol_infos(&Value::Array(vec![resolved])));
                         }
                     }
                 }
@@ -654,10 +569,9 @@ impl LspBridgeHandler {
     }
 
     /// Enriches a symbol with hover, references, and kind-specific labels.
-    fn enrich_symbol(&self, sym: &SymbolInformation) -> SymbolEnrichment {
-        let path = PathBuf::from(sym.location.uri.path().as_str());
-        let pos = sym.location.range.start;
-        self.enrich_at_position(&path, pos.line, pos.character, sym.kind)
+    fn enrich_symbol(&self, sym: &SymbolInfo) -> SymbolEnrichment {
+        let path = PathBuf::from(&sym.file_path);
+        self.enrich_at_position(&path, sym.line, sym.character, sym.kind)
     }
 
     /// Enriches a position with hover, references, and kind-specific labels.
@@ -667,17 +581,12 @@ impl LspBridgeHandler {
         path: &Path,
         line_0: u32,
         col: u32,
-        kind: SymbolKind,
+        kind: u32,
     ) -> SymbolEnrichment {
-        let position = lsp_types::Position::new(line_0, col);
-
         self.runtime.block_on(async {
             let mut enrichment = SymbolEnrichment::default();
 
             let Ok((uri_str, client_mutex)) = self.ensure_document_open(path).await else {
-                return enrichment;
-            };
-            let Ok(uri) = Uri::from_str(&uri_str) else {
                 return enrichment;
             };
 
@@ -685,129 +594,63 @@ impl LspBridgeHandler {
             let caps = client.capabilities();
 
             // Hover — signature + docs
-            if caps.hover_provider.is_some() {
-                let params = HoverParams {
-                    text_document_position_params: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                };
-                if let Ok(Some(hover)) = client.hover(params).await {
-                    enrichment.hover = extract_hover_text(&hover);
-                }
+            if has_cap(caps, "hoverProvider")
+                && let Ok(hover) = client.hover(&uri_str, line_0, col).await
+            {
+                enrichment.hover = extract_hover_text_from_value(&hover);
             }
 
             // References — collect line numbers for dedup
-            if caps.references_provider.is_some() {
-                let params = ReferenceParams {
-                    text_document_position: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                    partial_result_params: lsp_types::PartialResultParams::default(),
-                    context: ReferenceContext {
-                        include_declaration: true,
-                    },
-                };
-                if let Ok(Some(refs)) = client.references(params).await {
-                    for loc in &refs {
-                        enrichment
-                            .ref_lines
-                            .entry(loc.uri.path().to_string())
-                            .or_default()
-                            .insert(loc.range.start.line + 1);
-                    }
+            if has_cap(caps, "referencesProvider")
+                && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
+            {
+                for (file, line, _char) in extract_locations(&refs) {
+                    enrichment
+                        .ref_lines
+                        .entry(file)
+                        .or_default()
+                        .insert(line + 1);
                 }
             }
 
             // Kind-specific enrichment
             match kind {
                 // Functions/methods/constructors → incoming calls
-                SymbolKind::FUNCTION | SymbolKind::METHOD | SymbolKind::CONSTRUCTOR => {
-                    if caps.call_hierarchy_provider.is_some() {
-                        let prepare_params = CallHierarchyPrepareParams {
-                            text_document_position_params: TextDocumentPositionParams {
-                                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                                position,
-                            },
-                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                        };
-                        if let Ok(Some(items)) = client.prepare_call_hierarchy(prepare_params).await
-                        {
-                            for item in items {
-                                let params = CallHierarchyIncomingCallsParams {
-                                    item,
-                                    work_done_progress_params:
-                                        lsp_types::WorkDoneProgressParams::default(),
-                                    partial_result_params: lsp_types::PartialResultParams::default(
-                                    ),
-                                };
-                                if let Ok(Some(calls)) = client.incoming_calls(params).await {
-                                    for call in calls {
-                                        enrichment.incoming_calls.push((
-                                            call.from.name,
-                                            call.from.uri.path().to_string(),
-                                            call.from.range.start.line + 1,
-                                        ));
-                                    }
-                                }
+                symbols::SK_FUNCTION | symbols::SK_METHOD | symbols::SK_CONSTRUCTOR => {
+                    if has_cap(caps, "callHierarchyProvider")
+                        && let Ok(response) =
+                            client.prepare_call_hierarchy(&uri_str, line_0, col).await
+                        && let Some(items) = response.as_array()
+                    {
+                        for item in items {
+                            if let Ok(calls) = client.incoming_calls(item).await {
+                                extract_incoming_calls(&calls, &mut enrichment);
                             }
                         }
                     }
                 }
 
                 // Structs/classes/enums → implementations
-                SymbolKind::STRUCT | SymbolKind::CLASS | SymbolKind::ENUM => {
-                    if caps.implementation_provider.is_some() {
-                        let params = GotoDefinitionParams {
-                            text_document_position_params: TextDocumentPositionParams {
-                                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                                position,
-                            },
-                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                            partial_result_params: lsp_types::PartialResultParams::default(),
-                        };
-                        if let Ok(Some(response)) = client.implementation(params).await {
-                            for loc in goto_definition_locations(&response) {
-                                enrichment
-                                    .implementations
-                                    .push((loc.uri.path().to_string(), loc.range.start.line + 1));
-                            }
+                symbols::SK_STRUCT | symbols::SK_CLASS | symbols::SK_ENUM => {
+                    if has_cap(caps, "implementationProvider")
+                        && let Ok(response) = client.implementation(&uri_str, line_0, col).await
+                    {
+                        for (file, line, _char) in extract_locations(&response) {
+                            enrichment.implementations.push((file, line + 1));
                         }
                     }
                 }
 
                 // Interfaces/traits → subtypes
-                SymbolKind::INTERFACE => {
-                    if client.supports_type_hierarchy() {
-                        let prepare_params = TypeHierarchyPrepareParams {
-                            text_document_position_params: TextDocumentPositionParams {
-                                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                                position,
-                            },
-                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                        };
-                        if let Ok(Some(items)) = client.prepare_type_hierarchy(prepare_params).await
-                        {
-                            for item in items {
-                                let params = TypeHierarchySubtypesParams {
-                                    item,
-                                    work_done_progress_params:
-                                        lsp_types::WorkDoneProgressParams::default(),
-                                    partial_result_params: lsp_types::PartialResultParams::default(
-                                    ),
-                                };
-                                if let Ok(Some(sub_items)) = client.subtypes(params).await {
-                                    for sub in sub_items {
-                                        enrichment.subtypes.push((
-                                            sub.name,
-                                            sub.uri.path().to_string(),
-                                            sub.range.start.line + 1,
-                                        ));
-                                    }
-                                }
+                symbols::SK_INTERFACE => {
+                    if client.supports_type_hierarchy()
+                        && let Ok(response) =
+                            client.prepare_type_hierarchy(&uri_str, line_0, col).await
+                        && let Some(items) = response.as_array()
+                    {
+                        for item in items {
+                            if let Ok(subs) = client.subtypes(item).await {
+                                extract_subtypes(&subs, &mut enrichment);
                             }
                         }
                     }
@@ -832,18 +675,13 @@ impl LspBridgeHandler {
         path: &Path,
         line_0: u32,
         col: u32,
-    ) -> (SymbolKind, Option<String>, SymbolEnrichment) {
-        let position = lsp_types::Position::new(line_0, col);
-
+    ) -> (u32, Option<String>, SymbolEnrichment) {
         self.runtime.block_on(async {
             let mut enrichment = SymbolEnrichment::default();
-            let mut inferred_kind = SymbolKind::VARIABLE;
+            let mut inferred_kind = symbols::SK_VARIABLE;
             let mut resolved_name: Option<String> = None;
 
             let Ok((uri_str, client_mutex)) = self.ensure_document_open(path).await else {
-                return (inferred_kind, resolved_name, enrichment);
-            };
-            let Ok(uri) = Uri::from_str(&uri_str) else {
                 return (inferred_kind, resolved_name, enrichment);
             };
 
@@ -851,132 +689,77 @@ impl LspBridgeHandler {
             let caps = client.capabilities();
 
             // Hover — signature + docs
-            if caps.hover_provider.is_some() {
-                let params = HoverParams {
-                    text_document_position_params: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                };
-                if let Ok(Some(hover)) = client.hover(params).await {
-                    enrichment.hover = extract_hover_text(&hover);
-                }
+            if has_cap(caps, "hoverProvider")
+                && let Ok(hover) = client.hover(&uri_str, line_0, col).await
+            {
+                enrichment.hover = extract_hover_text_from_value(&hover);
             }
 
             // References — collect line numbers for dedup
-            if caps.references_provider.is_some() {
-                let params = ReferenceParams {
-                    text_document_position: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                    partial_result_params: lsp_types::PartialResultParams::default(),
-                    context: ReferenceContext {
-                        include_declaration: true,
-                    },
-                };
-                if let Ok(Some(refs)) = client.references(params).await {
-                    for loc in &refs {
-                        enrichment
-                            .ref_lines
-                            .entry(loc.uri.path().to_string())
-                            .or_default()
-                            .insert(loc.range.start.line + 1);
-                    }
+            if has_cap(caps, "referencesProvider")
+                && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
+            {
+                for (file, line, _char) in extract_locations(&refs) {
+                    enrichment
+                        .ref_lines
+                        .entry(file)
+                        .or_default()
+                        .insert(line + 1);
                 }
             }
 
             // Try all kind-specific enrichments — infer kind from results
 
             // Call hierarchy → FUNCTION
-            if caps.call_hierarchy_provider.is_some() {
-                let prepare_params = CallHierarchyPrepareParams {
-                    text_document_position_params: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                };
-                if let Ok(Some(items)) = client.prepare_call_hierarchy(prepare_params).await
-                    && !items.is_empty()
-                {
-                    inferred_kind = SymbolKind::FUNCTION;
-                    // The first item's name is the LSP-canonical symbol name.
-                    // This resolves keywords (e.g., `fn` → `foobar`).
-                    resolved_name = items.first().map(|i| i.name.clone());
-                    for item in items {
-                        let params = CallHierarchyIncomingCallsParams {
-                            item,
-                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                            partial_result_params: lsp_types::PartialResultParams::default(),
-                        };
-                        if let Ok(Some(calls)) = client.incoming_calls(params).await {
-                            for call in calls {
-                                enrichment.incoming_calls.push((
-                                    call.from.name,
-                                    call.from.uri.path().to_string(),
-                                    call.from.range.start.line + 1,
-                                ));
-                            }
-                        }
+            if has_cap(caps, "callHierarchyProvider")
+                && let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
+                && let Some(items) = response.as_array()
+                && !items.is_empty()
+            {
+                inferred_kind = symbols::SK_FUNCTION;
+                // The first item's name is the LSP-canonical symbol name.
+                resolved_name = items
+                    .first()
+                    .and_then(|i| i.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                for item in items {
+                    if let Ok(calls) = client.incoming_calls(item).await {
+                        extract_incoming_calls(&calls, &mut enrichment);
                     }
                 }
             }
 
             // Implementation → STRUCT (only if not already identified as function)
-            if inferred_kind == SymbolKind::VARIABLE && caps.implementation_provider.is_some() {
-                let params = GotoDefinitionParams {
-                    text_document_position_params: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                    partial_result_params: lsp_types::PartialResultParams::default(),
-                };
-                if let Ok(Some(response)) = client.implementation(params).await {
-                    let locs = goto_definition_locations(&response);
-                    if !locs.is_empty() {
-                        inferred_kind = SymbolKind::STRUCT;
-                        for loc in locs {
-                            enrichment
-                                .implementations
-                                .push((loc.uri.path().to_string(), loc.range.start.line + 1));
-                        }
+            if inferred_kind == symbols::SK_VARIABLE
+                && has_cap(caps, "implementationProvider")
+                && let Ok(response) = client.implementation(&uri_str, line_0, col).await
+            {
+                let locs = extract_locations(&response);
+                if !locs.is_empty() {
+                    inferred_kind = symbols::SK_STRUCT;
+                    for (file, line, _char) in locs {
+                        enrichment.implementations.push((file, line + 1));
                     }
                 }
             }
 
             // Type hierarchy → INTERFACE (only if not already identified)
-            if inferred_kind == SymbolKind::VARIABLE && client.supports_type_hierarchy() {
-                let prepare_params = TypeHierarchyPrepareParams {
-                    text_document_position_params: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position,
-                    },
-                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                };
-                if let Ok(Some(items)) = client.prepare_type_hierarchy(prepare_params).await
-                    && !items.is_empty()
-                {
-                    inferred_kind = SymbolKind::INTERFACE;
-                    resolved_name = items.first().map(|i| i.name.clone());
-                    for item in items {
-                        let params = TypeHierarchySubtypesParams {
-                            item,
-                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                            partial_result_params: lsp_types::PartialResultParams::default(),
-                        };
-                        if let Ok(Some(sub_items)) = client.subtypes(params).await {
-                            for sub in sub_items {
-                                enrichment.subtypes.push((
-                                    sub.name,
-                                    sub.uri.path().to_string(),
-                                    sub.range.start.line + 1,
-                                ));
-                            }
-                        }
+            if inferred_kind == symbols::SK_VARIABLE
+                && client.supports_type_hierarchy()
+                && let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
+                && let Some(items) = response.as_array()
+                && !items.is_empty()
+            {
+                inferred_kind = symbols::SK_INTERFACE;
+                resolved_name = items
+                    .first()
+                    .and_then(|i| i.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                for item in items {
+                    if let Ok(subs) = client.subtypes(item).await {
+                        extract_subtypes(&subs, &mut enrichment);
                     }
                 }
             }
@@ -992,14 +775,14 @@ impl LspBridgeHandler {
     /// uses `prepareRename` to distinguish symbols from keywords, then
     /// enriches confirmed symbols with full LSP queries.
     ///
-    /// Returns owned `SymbolInformation` values (plus enrichments and ref
-    /// lines). The caller merges these into `by_name` where both the universe
-    /// `symbols` vec and the returned vec are in scope — no `Box::leak`.
+    /// Returns owned `SymbolInfo` values (plus enrichments and ref lines).
+    /// The caller merges these into `by_name` where both the universe
+    /// `symbols` vec and the returned vec are in scope.
     #[allow(clippy::too_many_lines, reason = "Iterative elimination loop")]
     fn bootstrap_from_rg(
         &self,
         rg: &RipgrepMatches,
-        by_name: &BTreeMap<String, Vec<&SymbolInformation>>,
+        by_name: &BTreeMap<String, Vec<&SymbolInfo>>,
         all_ref_lines: &HashMap<String, HashSet<u32>>,
     ) -> BootstrapResult {
         let mut result = BootstrapResult {
@@ -1013,9 +796,10 @@ impl LspBridgeHandler {
         let mut accounted: HashMap<String, HashSet<u32>> = HashMap::new();
         for defs in by_name.values() {
             for sym in defs {
-                let file = sym.location.uri.path().to_string();
-                let line = sym.location.range.start.line + 1;
-                accounted.entry(file).or_default().insert(line);
+                accounted
+                    .entry(sym.file_path.clone())
+                    .or_default()
+                    .insert(sym.line + 1);
             }
         }
         for (file, ref_set) in all_ref_lines {
@@ -1085,18 +869,13 @@ impl LspBridgeHandler {
                     let Ok((uri_str, client_mutex)) = self.ensure_document_open(&path).await else {
                         return false;
                     };
-                    let Ok(uri) = Uri::from_str(&uri_str) else {
-                        return false;
-                    };
                     let client = client_mutex.lock().await;
-                    if client.capabilities().rename_provider.is_none() {
+                    if !has_cap(client.capabilities(), "renameProvider") {
                         return true;
                     }
-                    let params = TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri },
-                        position: lsp_types::Position::new(line_0, col),
-                    };
-                    matches!(client.prepare_rename(params).await, Ok(Some(_)))
+                    let response = client.prepare_rename(&uri_str, line_0, col).await;
+                    drop(client);
+                    matches!(response, Ok(ref v) if !v.is_null())
                 });
                 if !is_symbol {
                     continue;
@@ -1157,25 +936,12 @@ impl LspBridgeHandler {
                     .enrichments
                     .insert((file.clone(), line_0), enrichment);
 
-                // Build a URI for the SymbolInformation
-                let Ok(uri) = lsp_types::Uri::from_str(&format!("file://{file}")) else {
-                    continue;
-                };
-
-                #[allow(deprecated, reason = "LSP spec uses deprecated fields")]
-                let sym = SymbolInformation {
+                let sym = SymbolInfo {
                     name: name.clone(),
                     kind,
-                    tags: None,
-                    deprecated: None,
-                    location: lsp_types::Location {
-                        uri,
-                        range: lsp_types::Range {
-                            start: lsp_types::Position::new(line_0, col),
-                            end: lsp_types::Position::new(line_0, col),
-                        },
-                    },
-                    container_name: None,
+                    file_path: file.clone(),
+                    line: line_0,
+                    character: col,
                 };
 
                 if !by_name.contains_key(&name) {
@@ -1498,8 +1264,8 @@ struct SymbolEnrichment {
 
 /// Symbols and enrichment discovered by rg-bootstrapped hover.
 struct BootstrapResult {
-    /// Newly-discovered `SymbolInformation` values (owned, not leaked).
-    symbols: Vec<SymbolInformation>,
+    /// Newly-discovered `SymbolInfo` values.
+    symbols: Vec<SymbolInfo>,
     /// Enrichment keyed by `(file_path, line_0based)`.
     enrichments: HashMap<(String, u32), SymbolEnrichment>,
     /// Reference lines discovered during bootstrap, keyed by file path.
@@ -1560,30 +1326,111 @@ struct ThreadMatches {
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
 }
 
-/// Extracts plain text from an LSP `Hover` response.
-fn extract_hover_text(hover: &lsp_types::Hover) -> Option<String> {
-    match &hover.contents {
-        lsp_types::HoverContents::Scalar(content) => Some(markup_content_to_string(content)),
-        lsp_types::HoverContents::Array(contents) => {
-            let texts: Vec<String> = contents.iter().map(markup_content_to_string).collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(texts.join("\n"))
+/// Returns `true` if a capability key is present and non-null.
+fn has_cap(caps: &Value, key: &str) -> bool {
+    caps.get(key).is_some_and(|v| !v.is_null())
+}
+
+/// Extracts plain text from a `Value`-based LSP hover response.
+fn extract_hover_text_from_value(hover: &Value) -> Option<String> {
+    let contents = hover.get("contents")?;
+
+    // String: plain MarkedString
+    if let Some(s) = contents.as_str() {
+        let s = s.trim();
+        return if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+    }
+
+    // Object with "value" field: MarkupContent or LanguageString MarkedString
+    if let Some(value) = contents.get("value").and_then(Value::as_str) {
+        let text = value.trim();
+        return if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
+    }
+
+    // Array of MarkedString
+    if let Some(arr) = contents.as_array() {
+        let texts: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                item.as_str().map_or_else(
+                    || {
+                        item.get("value")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    },
+                    |s| Some(s.to_string()),
+                )
+            })
+            .collect();
+        return if texts.is_empty() {
+            None
+        } else {
+            Some(texts.join("\n"))
+        };
+    }
+
+    None
+}
+
+/// Extracts the file path from a hierarchy item's `uri` field.
+fn value_file_path(item: &Value) -> String {
+    item.get("uri")
+        .and_then(Value::as_str)
+        .and_then(symbols::uri_to_path)
+        .unwrap_or_default()
+}
+
+/// Extracts `range.start.line` from a hierarchy item `Value`.
+fn value_start_line(item: &Value) -> u32 {
+    item.get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// Extracts incoming calls from a `callHierarchy/incomingCalls` response
+/// into the enrichment's `incoming_calls` list.
+fn extract_incoming_calls(response: &Value, enrichment: &mut SymbolEnrichment) {
+    if let Some(calls) = response.as_array() {
+        for call in calls {
+            if let Some(from) = call.get("from") {
+                enrichment.incoming_calls.push((
+                    from.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    value_file_path(from),
+                    value_start_line(from) + 1,
+                ));
             }
-        }
-        lsp_types::HoverContents::Markup(markup) => {
-            let text = markup.value.trim().to_string();
-            if text.is_empty() { None } else { Some(text) }
         }
     }
 }
 
-/// Converts a `MarkedString` to plain text.
-fn markup_content_to_string(content: &lsp_types::MarkedString) -> String {
-    match content {
-        lsp_types::MarkedString::String(s) => s.clone(),
-        lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+/// Extracts subtypes from a `typeHierarchy/subtypes` response
+/// into the enrichment's `subtypes` list.
+fn extract_subtypes(response: &Value, enrichment: &mut SymbolEnrichment) {
+    if let Some(subs) = response.as_array() {
+        for sub in subs {
+            enrichment.subtypes.push((
+                sub.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value_file_path(sub),
+                value_start_line(sub) + 1,
+            ));
+        }
     }
 }
 
@@ -1597,11 +1444,6 @@ fn display_path(file: &str, roots: &[PathBuf]) -> String {
                 .map(|rest| rest.strip_prefix('/').unwrap_or(rest).to_string())
         })
         .unwrap_or_else(|| file.to_string())
-}
-
-/// Formats a `SymbolKind` as a human-readable string.
-fn format_symbol_kind(kind: SymbolKind) -> String {
-    format!("{kind:?}")
 }
 
 /// Formats sorted line numbers as compact ranges: `L45`, `L15-L20`.
@@ -1697,28 +1539,13 @@ fn format_symbol_references(
     output
 }
 
-/// Extracts locations from a `GotoDefinitionResponse`.
-fn goto_definition_locations(response: &GotoDefinitionResponse) -> Vec<lsp_types::Location> {
-    match response {
-        GotoDefinitionResponse::Scalar(loc) => vec![loc.clone()],
-        GotoDefinitionResponse::Array(locs) => locs.clone(),
-        GotoDefinitionResponse::Link(links) => links
-            .iter()
-            .map(|link| lsp_types::Location {
-                uri: link.target_uri.clone(),
-                range: link.target_range,
-            })
-            .collect(),
-    }
-}
-
 /// Assigns rg file/line hits to symbol names based on LSP reference data
 /// and matched text routing.
 ///
 /// Returns a map from heading name to file hits. Each heading name is either
 /// an LSP symbol name or an rg-only matched string.
 fn assign_rg_lines_to_symbols(
-    by_name: &BTreeMap<String, Vec<&SymbolInformation>>,
+    by_name: &BTreeMap<String, Vec<&SymbolInfo>>,
     all_ref_lines: &HashMap<String, HashSet<u32>>,
     rg: &RipgrepMatches,
 ) -> BTreeMap<String, Vec<(String, Vec<u32>)>> {
@@ -1733,16 +1560,17 @@ fn assign_rg_lines_to_symbols(
     // Also claim definition lines
     for defs in by_name.values() {
         for sym in defs {
-            let file = sym.location.uri.path().to_string();
-            let line = sym.location.range.start.line + 1;
-            claimed.entry(file).or_default().insert(line);
+            claimed
+                .entry(sym.file_path.clone())
+                .or_default()
+                .insert(sym.line + 1);
         }
     }
 
     // Build a lowercase lookup for symbol names
     let name_lower: Vec<(String, String)> = by_name
         .keys()
-        .map(|n| (n.clone(), n.to_lowercase()))
+        .map(|n: &String| (n.clone(), n.to_lowercase()))
         .collect();
 
     // For each rg file, find unclaimed lines and route by matched text

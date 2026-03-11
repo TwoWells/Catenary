@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-use anyhow::{Context, Result, anyhow};
-use lsp_types::{
-    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
-    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    ClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
-    InitializedParams, PositionEncodingKind, PrepareRenameResponse, ReferenceParams,
-    ServerCapabilities, TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceFolder,
-    WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
-};
-use serde_json::Value;
+use anyhow::Result;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -75,7 +65,7 @@ pub struct LspClient {
     inbox: Arc<ServerInbox>,
 
     // Client-local state (not shared with reader)
-    encoding: PositionEncodingKind,
+    encoding: String,
     /// Time when this client was spawned.
     spawn_time: Instant,
     /// Whether the server supports dynamic workspace folder changes
@@ -88,10 +78,6 @@ pub struct LspClient {
     last_sent_version: Arc<Mutex<HashMap<String, i32>>>,
     /// Whether the server advertised `textDocumentSync.save` support.
     wants_did_save: bool,
-    /// Whether the server advertised `typeHierarchyProvider`.
-    /// Tracked separately because `lsp_types` 0.97 omits this field from
-    /// `ServerCapabilities` despite it being in the LSP 3.17 spec.
-    supports_type_hierarchy: bool,
     /// The command used to spawn this server (e.g., "rust-analyzer").
     server_command: String,
     /// Server version from the `initialize` response (`ServerInfo.version`).
@@ -100,7 +86,7 @@ pub struct LspClient {
     server_version: Option<String>,
     /// Server capabilities from the `initialize` response.
     /// Populated after `initialize()` completes.
-    server_capabilities: ServerCapabilities,
+    server_capabilities: Value,
 }
 
 impl LspClient {
@@ -155,16 +141,15 @@ impl LspClient {
         Ok(Self {
             connection,
             inbox,
-            encoding: PositionEncodingKind::UTF16, // Default per spec
+            encoding: "utf-16".to_string(), // Default per spec
             spawn_time: Instant::now(),
             supports_workspace_folders: false,
             logged_no_diagnostics_support: AtomicBool::new(false),
             last_sent_version: Arc::new(Mutex::new(HashMap::new())),
             wants_did_save: false,
-            supports_type_hierarchy: false,
             server_command: program.to_string(),
             server_version: None,
-            server_capabilities: ServerCapabilities::default(),
+            server_capabilities: Value::Object(serde_json::Map::default()),
         })
     }
 
@@ -192,22 +177,14 @@ impl LspClient {
     /// Sends a request and waits for the response.
     ///
     /// Delegates to [`Connection::request`] for transport and failure
-    /// detection, then deserializes the response into the expected type.
-    async fn request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        params: P,
-    ) -> Result<R> {
-        let params_value = serde_json::to_value(params)?;
-        let result = self.connection.request(method, params_value).await?;
-        serde_json::from_value(result)
-            .with_context(|| format!("[{}] failed to parse LSP response", self.inbox.language))
+    /// detection, returning the raw JSON response.
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.connection.request(method, params).await
     }
 
     /// Sends a notification (no response expected).
-    async fn notify<P: serde::Serialize>(&self, method: &str, params: P) -> Result<()> {
-        let params_value = serde_json::to_value(params)?;
-        self.connection.notify(method, params_value).await
+    async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        self.connection.notify(method, params).await
     }
 
     /// Performs the LSP initialize handshake.
@@ -218,201 +195,86 @@ impl LspClient {
     /// - A root path is invalid.
     /// - The initialize request fails.
     /// - The server fails to respond.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Initialize handshake has many sequential steps"
-    )]
-    #[allow(
-        deprecated,
-        reason = "root_uri is deprecated in LSP but servers like lua-language-server still require it"
-    )]
     pub async fn initialize(
         &mut self,
         roots: &[PathBuf],
         initialization_options: Option<serde_json::Value>,
-    ) -> Result<InitializeResult> {
-        let workspace_folders: Vec<WorkspaceFolder> = roots
+    ) -> Result<Value> {
+        let workspace_folders: Vec<(String, String)> = roots
             .iter()
             .map(|root| {
-                let uri: Uri = format!("file://{}", root.display())
-                    .parse()
-                    .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
-                Ok(WorkspaceFolder {
-                    uri,
-                    name: root.file_name().map_or_else(
-                        || "workspace".to_string(),
-                        |s| s.to_string_lossy().to_string(),
-                    ),
-                })
+                let uri = format!("file://{}", root.display());
+                let name = root.file_name().map_or_else(
+                    || "workspace".to_string(),
+                    |s| s.to_string_lossy().to_string(),
+                );
+                (uri, name)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
-        let params = InitializeParams {
-            process_id: Some(std::process::id()),
-            capabilities: ClientCapabilities {
-                general: Some(lsp_types::GeneralClientCapabilities {
-                    position_encodings: Some(vec![
-                        PositionEncodingKind::UTF8,
-                        PositionEncodingKind::UTF16,
-                    ]),
-                    ..Default::default()
-                }),
-                text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                    synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
-                        did_save: Some(true),
-                        dynamic_registration: Some(false),
-                        will_save: Some(false),
-                        will_save_wait_until: Some(false),
-                    }),
-                    publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
-                        version_support: Some(true),
-                        ..Default::default()
-                    }),
-                    definition: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    type_definition: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    implementation: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    declaration: Some(lsp_types::GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    references: Some(lsp_types::DynamicRegistrationClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
-                        dynamic_registration: Some(false),
-                        hierarchical_document_symbol_support: Some(true),
-                        ..Default::default()
-                    }),
-                    call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    code_action: Some(lsp_types::CodeActionClientCapabilities {
-                        dynamic_registration: Some(false),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                workspace: Some(lsp_types::WorkspaceClientCapabilities {
-                    symbol: Some(lsp_types::WorkspaceSymbolClientCapabilities {
-                        resolve_support: Some(lsp_types::WorkspaceSymbolResolveSupportCapability {
-                            properties: vec!["location.range".to_string()],
-                        }),
-                        ..Default::default()
-                    }),
-                    workspace_folders: Some(true),
-                    configuration: Some(true),
-                    ..Default::default()
-                }),
-                window: Some(lsp_types::WindowClientCapabilities {
-                    work_done_progress: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            root_uri: workspace_folders.first().map(|wf| wf.uri.clone()),
-            workspace_folders: Some(workspace_folders),
-            initialization_options,
-            ..Default::default()
-        };
+        let folder_refs: Vec<(&str, &str)> = workspace_folders
+            .iter()
+            .map(|(uri, name)| (uri.as_str(), name.as_str()))
+            .collect();
 
-        let raw: serde_json::Value = self.request("initialize", params).await?;
+        let init_params = params::initialize(
+            std::process::id(),
+            &folder_refs,
+            initialization_options.as_ref(),
+        );
 
-        // Extract typeHierarchyProvider before lsp_types drops it
-        // (missing from ServerCapabilities in lsp_types 0.97)
-        self.supports_type_hierarchy = raw
+        let raw = self.request("initialize", init_params).await?;
+
+        let caps = raw
             .get("capabilities")
-            .and_then(|c| c.get("typeHierarchyProvider"))
-            .is_some_and(|v| !v.is_null());
-
-        let result: InitializeResult =
-            serde_json::from_value(raw).context("failed to parse InitializeResult")?;
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
 
         // Extract negotiated encoding
-        if let Some(capabilities) = &result.capabilities.position_encoding {
-            self.encoding = capabilities.clone();
-            debug!("Negotiated position encoding: {:?}", self.encoding);
+        if let Some(enc) = super::extract::position_encoding(&caps) {
+            self.encoding = enc.to_string();
+            debug!("Negotiated position encoding: {}", self.encoding);
         } else {
             debug!("Server did not specify position encoding, defaulting to UTF-16");
-            self.encoding = PositionEncodingKind::UTF16;
+            self.encoding = "utf-16".to_string();
         }
 
         // Extract workspace folders capability
-        let wf = result
-            .capabilities
-            .workspace
-            .as_ref()
-            .and_then(|ws| ws.workspace_folders.as_ref());
-
-        let supported = wf.and_then(|wf| wf.supported).unwrap_or(false);
-        let accepts_changes = wf
-            .and_then(|wf| wf.change_notifications.as_ref())
-            .is_some_and(|cn| {
-                matches!(
-                    cn,
-                    lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_)
-                )
-            });
-
-        self.supports_workspace_folders = supported && accepts_changes;
+        self.supports_workspace_folders = super::extract::supports_workspace_folders(&caps);
         debug!(
-            "Server workspace folders support: {} (supported={}, change_notifications={})",
-            self.supports_workspace_folders, supported, accepts_changes
+            "Server workspace folders support: {}",
+            self.supports_workspace_folders
         );
 
-        // Extract textDocumentSync.save capability.
-        // When the server advertises Options with an explicit `save` field,
-        // trust it. When the server uses the short-form Kind (Full/Incremental),
-        // LSP spec says this is equivalent to Options with save=SaveOptions{},
-        // meaning the server accepts didSave.
-        self.wants_did_save = match &result.capabilities.text_document_sync {
-            Some(lsp_types::TextDocumentSyncCapability::Kind(kind)) => {
-                *kind != lsp_types::TextDocumentSyncKind::NONE
-            }
-            Some(lsp_types::TextDocumentSyncCapability::Options(opts)) => opts.save.is_some(),
-            None => false,
-        };
+        // Extract textDocumentSync.save capability
+        self.wants_did_save = super::extract::wants_did_save(&caps);
         debug!(
             "[{}] server wants didSave: {}",
             self.inbox.language, self.wants_did_save
         );
 
         // Store server info and capabilities
-        self.server_version = result
-            .server_info
-            .as_ref()
-            .and_then(|si| si.version.clone());
-        self.server_capabilities = result.capabilities.clone();
+        self.server_version = super::extract::server_version(&raw).map(str::to_string);
+        self.server_capabilities = caps;
 
         // Send initialized notification
-        self.notify("initialized", InitializedParams {}).await?;
+        self.notify("initialized", json!({})).await?;
 
         // Mark as ready (server may later report progress if indexing)
         self.inbox
             .state
             .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
 
-        Ok(result)
+        Ok(raw)
     }
 
     /// Returns the negotiated position encoding.
-    pub fn encoding(&self) -> PositionEncodingKind {
-        self.encoding.clone()
+    pub fn encoding(&self) -> &str {
+        &self.encoding
     }
 
     /// Returns the server capabilities from the `initialize` response.
-    pub const fn capabilities(&self) -> &ServerCapabilities {
+    pub const fn capabilities(&self) -> &Value {
         &self.server_capabilities
     }
 
@@ -523,24 +385,26 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        self.request("textDocument/hover", params).await
+    pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.request("textDocument/hover", params::hover(uri, line, character))
+            .await
     }
 
     /// Tests whether a position is a renameable symbol.
     ///
-    /// Returns `Some(range/placeholder)` for symbols, `None` for keywords
+    /// Returns a non-null `Value` for symbols, `Value::Null` for keywords
     /// and non-symbol positions. Used as a cheap discriminator before full
     /// enrichment in the rg-bootstrap path.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn prepare_rename(
-        &self,
-        params: TextDocumentPositionParams,
-    ) -> Result<Option<PrepareRenameResponse>> {
-        self.request("textDocument/prepareRename", params).await
+    pub async fn prepare_rename(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.request(
+            "textDocument/prepareRename",
+            params::prepare_rename(uri, line, character),
+        )
+        .await
     }
 
     /// Gets the definition location for a symbol.
@@ -548,11 +412,12 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn definition(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> Result<Option<GotoDefinitionResponse>> {
-        self.request("textDocument/definition", params).await
+    pub async fn definition(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.request(
+            "textDocument/definition",
+            params::definition(uri, line, character),
+        )
+        .await
     }
 
     /// Gets the type definition location for a symbol.
@@ -560,11 +425,12 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn type_definition(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> Result<Option<GotoDefinitionResponse>> {
-        self.request("textDocument/typeDefinition", params).await
+    pub async fn type_definition(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.request(
+            "textDocument/typeDefinition",
+            params::type_definition(uri, line, character),
+        )
+        .await
     }
 
     /// Gets implementation locations for a symbol.
@@ -572,11 +438,12 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn implementation(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> Result<Option<GotoDefinitionResponse>> {
-        self.request("textDocument/implementation", params).await
+    pub async fn implementation(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.request(
+            "textDocument/implementation",
+            params::implementation(uri, line, character),
+        )
+        .await
     }
 
     /// Gets all references to a symbol.
@@ -586,9 +453,16 @@ impl LspClient {
     /// Returns an error if the request fails or times out.
     pub async fn references(
         &self,
-        params: ReferenceParams,
-    ) -> Result<Option<Vec<lsp_types::Location>>> {
-        self.request("textDocument/references", params).await
+        uri: &str,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<Value> {
+        self.request(
+            "textDocument/references",
+            params::references(uri, line, character, include_declaration),
+        )
+        .await
     }
 
     /// Gets document symbols (outline) for a file.
@@ -596,11 +470,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn document_symbols(
-        &self,
-        params: DocumentSymbolParams,
-    ) -> Result<Option<DocumentSymbolResponse>> {
-        self.request("textDocument/documentSymbol", params).await
+    pub async fn document_symbols(&self, uri: &str) -> Result<Value> {
+        self.request("textDocument/documentSymbol", params::document_symbols(uri))
+            .await
     }
 
     /// Searches for symbols across the workspace.
@@ -608,11 +480,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn workspace_symbols(
-        &self,
-        params: WorkspaceSymbolParams,
-    ) -> Result<Option<WorkspaceSymbolResponse>> {
-        self.request("workspace/symbol", params).await
+    pub async fn workspace_symbols(&self, query: &str) -> Result<Value> {
+        self.request("workspace/symbol", params::workspace_symbols(query))
+            .await
     }
 
     /// Resolves additional properties (e.g. `location.range`) for a workspace symbol.
@@ -620,24 +490,19 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn workspace_symbol_resolve(
-        &self,
-        params: WorkspaceSymbol,
-    ) -> Result<Option<WorkspaceSymbol>> {
-        self.request("workspaceSymbol/resolve", params).await
+    pub async fn workspace_symbol_resolve(&self, symbol: &Value) -> Result<Value> {
+        self.request("workspaceSymbol/resolve", symbol.clone())
+            .await
     }
 
     /// Returns whether the server advertises `workspaceSymbol/resolve` support.
     pub fn supports_workspace_symbol_resolve(&self) -> bool {
-        matches!(
-            &self.server_capabilities.workspace_symbol_provider,
-            Some(lsp_types::OneOf::Right(opts)) if opts.resolve_provider == Some(true)
-        )
+        super::extract::workspace_symbol_resolve_provider(&self.server_capabilities)
     }
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
-    pub const fn supports_type_hierarchy(&self) -> bool {
-        self.supports_type_hierarchy
+    pub fn supports_type_hierarchy(&self) -> bool {
+        super::extract::has_type_hierarchy_provider(&self.server_capabilities)
     }
 
     /// Prepares call hierarchy for a position.
@@ -647,10 +512,15 @@ impl LspClient {
     /// Returns an error if the request fails or times out.
     pub async fn prepare_call_hierarchy(
         &self,
-        params: CallHierarchyPrepareParams,
-    ) -> Result<Option<Vec<CallHierarchyItem>>> {
-        self.request("textDocument/prepareCallHierarchy", params)
-            .await
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        self.request(
+            "textDocument/prepareCallHierarchy",
+            params::prepare_call_hierarchy(uri, line, character),
+        )
+        .await
     }
 
     /// Gets incoming calls to a call hierarchy item.
@@ -658,11 +528,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn incoming_calls(
-        &self,
-        params: CallHierarchyIncomingCallsParams,
-    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
-        self.request("callHierarchy/incomingCalls", params).await
+    pub async fn incoming_calls(&self, item: &Value) -> Result<Value> {
+        self.request("callHierarchy/incomingCalls", params::incoming_calls(item))
+            .await
     }
 
     /// Gets outgoing calls from a call hierarchy item.
@@ -670,11 +538,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn outgoing_calls(
-        &self,
-        params: CallHierarchyOutgoingCallsParams,
-    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
-        self.request("callHierarchy/outgoingCalls", params).await
+    pub async fn outgoing_calls(&self, item: &Value) -> Result<Value> {
+        self.request("callHierarchy/outgoingCalls", params::outgoing_calls(item))
+            .await
     }
 
     /// Prepares type hierarchy for a position.
@@ -684,10 +550,15 @@ impl LspClient {
     /// Returns an error if the request fails or times out.
     pub async fn prepare_type_hierarchy(
         &self,
-        params: TypeHierarchyPrepareParams,
-    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        self.request("textDocument/prepareTypeHierarchy", params)
-            .await
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        self.request(
+            "textDocument/prepareTypeHierarchy",
+            params::prepare_type_hierarchy(uri, line, character),
+        )
+        .await
     }
 
     /// Gets supertypes of a type hierarchy item.
@@ -695,11 +566,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn supertypes(
-        &self,
-        params: TypeHierarchySupertypesParams,
-    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        self.request("typeHierarchy/supertypes", params).await
+    pub async fn supertypes(&self, item: &Value) -> Result<Value> {
+        self.request("typeHierarchy/supertypes", params::supertypes(item))
+            .await
     }
 
     /// Gets subtypes of a type hierarchy item.
@@ -707,11 +576,9 @@ impl LspClient {
     /// # Errors
     ///
     /// Returns an error if the request fails or times out.
-    pub async fn subtypes(
-        &self,
-        params: TypeHierarchySubtypesParams,
-    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        self.request("typeHierarchy/subtypes", params).await
+    pub async fn subtypes(&self, item: &Value) -> Result<Value> {
+        self.request("typeHierarchy/subtypes", params::subtypes(item))
+            .await
     }
 
     /// Gets code actions (quick fixes) for a range.
@@ -731,7 +598,7 @@ impl LspClient {
         end_char: u32,
         diagnostics: &[Value],
     ) -> Result<Value> {
-        let params = serde_json::json!({
+        let params = json!({
             "textDocument": { "uri": uri },
             "range": {
                 "start": { "line": start_line, "character": start_char },
@@ -742,11 +609,7 @@ impl LspClient {
                 "only": ["quickfix"]
             }
         });
-        let result = self
-            .connection
-            .request("textDocument/codeAction", params)
-            .await?;
-        Ok(result)
+        self.request("textDocument/codeAction", params).await
     }
 
     /// Gets cached diagnostics for a specific URI.

@@ -230,6 +230,10 @@ pub fn document_symbols(uri: &str) -> Value {
 ///
 /// `diagnostics` are raw `Value` arrays (diagnostics stored as JSON).
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "LSP primitives API — client inlines with 'only' filter"
+)]
 pub fn code_action(
     uri: &str,
     start_line: u32,

@@ -11,10 +11,8 @@
 use anyhow::{Result, anyhow};
 use globset::Glob;
 use ignore::WalkBuilder;
-use lsp_types::{
-    DocumentSymbolParams, DocumentSymbolResponse, SymbolKind, TextDocumentIdentifier, Uri,
-};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs::File;
@@ -22,6 +20,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use super::handler::LspBridgeHandler;
+use super::symbols::{format_symbol_kind, is_outline_kind};
 use crate::mcp::CallToolResult;
 
 /// Input for the `glob` tool.
@@ -31,26 +30,8 @@ pub struct GlobInput {
     pub pattern: String,
 }
 
-/// Returns `true` for symbol kinds included in outline output.
-const fn is_outline_kind(kind: SymbolKind) -> bool {
-    matches!(
-        kind,
-        SymbolKind::STRUCT
-            | SymbolKind::CLASS
-            | SymbolKind::ENUM
-            | SymbolKind::INTERFACE
-            | SymbolKind::MODULE
-            | SymbolKind::NAMESPACE
-            | SymbolKind::PACKAGE
-            | SymbolKind::CONSTANT
-            | SymbolKind::OBJECT
-            | SymbolKind::STRING
-            | SymbolKind::KEY
-    )
-}
-
-/// Outline symbols for a single file: `(name, kind, 1-based line)`.
-type OutlineSymbols = Vec<(String, SymbolKind, u32)>;
+/// Outline symbols for a single file: `(name, kind_u32, 1-based line)`.
+type OutlineSymbols = Vec<(String, u32, u32)>;
 
 /// Counts lines in a file.
 fn count_lines(path: &Path) -> usize {
@@ -59,29 +40,52 @@ fn count_lines(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Extracts depth-0 outline symbols from a document symbol response.
-fn extract_outline_symbols(response: &DocumentSymbolResponse) -> OutlineSymbols {
+/// Extracts depth-0 outline symbols from a document symbol response (`Value`).
+///
+/// Handles both flat `SymbolInformation[]` and nested `DocumentSymbol[]`.
+fn extract_outline_symbols(response: &Value) -> OutlineSymbols {
+    let Some(arr) = response.as_array() else {
+        return Vec::new();
+    };
+
     let mut symbols = Vec::new();
 
-    match response {
-        DocumentSymbolResponse::Flat(flat) => {
-            for sym in flat {
-                if is_outline_kind(sym.kind) {
-                    symbols.push((
-                        sym.name.clone(),
-                        sym.kind,
-                        sym.location.range.start.line + 1,
-                    ));
-                }
-            }
+    for item in arr {
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0);
+
+        if !is_outline_kind(kind) {
+            continue;
         }
-        DocumentSymbolResponse::Nested(nested) => {
-            // Depth 0 only — don't recurse into children
-            for sym in nested {
-                if is_outline_kind(sym.kind) {
-                    symbols.push((sym.name.clone(), sym.kind, sym.range.start.line + 1));
-                }
-            }
+
+        // Flat SymbolInformation: location.range.start.line
+        if let Some(line) = item
+            .get("location")
+            .and_then(|l| l.get("range"))
+            .and_then(|r| r.get("start"))
+            .and_then(|s| s.get("line"))
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+        {
+            symbols.push((name.to_string(), kind, line + 1));
+            continue;
+        }
+
+        // Nested DocumentSymbol: range.start.line (depth 0 only)
+        if let Some(line) = item
+            .get("range")
+            .and_then(|r| r.get("start"))
+            .and_then(|s| s.get("line"))
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+        {
+            symbols.push((name.to_string(), kind, line + 1));
         }
     }
 
@@ -120,7 +124,8 @@ impl LspBridgeHandler {
 
         if let Ok(symbols) = self.fetch_outline_symbols(path) {
             for (name, kind, line) in &symbols {
-                let _ = writeln!(result, "  [{kind:?}] {name} L{line}");
+                let kind_str = format_symbol_kind(*kind);
+                let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
             }
         }
 
@@ -205,7 +210,8 @@ impl LspBridgeHandler {
         for (name, line_count, symbols) in &files {
             let _ = writeln!(result, "{name}  ({line_count} lines)");
             for (sym_name, kind, line) in symbols {
-                let _ = writeln!(result, "  {sym_name} [{kind:?}] L{line}");
+                let kind_str = format_symbol_kind(*kind);
+                let _ = writeln!(result, "  {sym_name} [{kind_str}] L{line}");
             }
         }
 
@@ -278,7 +284,8 @@ impl LspBridgeHandler {
 
             if let Ok(symbols) = self.fetch_outline_symbols(path) {
                 for (name, kind, line) in &symbols {
-                    let _ = writeln!(result, "  [{kind:?}] {name} L{line}");
+                    let kind_str = format_symbol_kind(*kind);
+                    let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
                 }
             }
         }
@@ -288,25 +295,17 @@ impl LspBridgeHandler {
 
     /// Fetches depth-0 outline symbols for a file from LSP.
     ///
-    /// Returns `(name, kind, 1-based line)` tuples. On LSP failure,
+    /// Returns `(name, kind_u32, 1-based line)` tuples. On LSP failure,
     /// returns an error (callers typically use `.unwrap_or_default()`).
     fn fetch_outline_symbols(&self, path: &Path) -> Result<OutlineSymbols> {
         self.runtime.block_on(async {
             let (uri_str, client_mutex) = self.ensure_document_open(path).await?;
-            let uri: Uri = uri_str.parse().map_err(|e| anyhow!("Invalid URI: {e}"))?;
 
-            let params = DocumentSymbolParams {
-                text_document: TextDocumentIdentifier { uri },
-                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            };
+            let response = client_mutex.lock().await.document_symbols(&uri_str).await?;
 
-            let response: Option<DocumentSymbolResponse> =
-                client_mutex.lock().await.document_symbols(params).await?;
-
-            let Some(response) = response else {
+            if response.is_null() {
                 return Ok(Vec::new());
-            };
+            }
 
             Ok(extract_outline_symbols(&response))
         })
