@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-use anyhow::{Result, anyhow};
-use lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Uri,
-    VersionedTextDocumentIdentifier,
-};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -72,19 +67,11 @@ impl DocumentManager {
 
                     debug!("Document changed on disk: {}", path.display());
 
-                    return Ok(Some(DocumentNotification::Change(
-                        DidChangeTextDocumentParams {
-                            text_document: VersionedTextDocumentIdentifier {
-                                uri: path_to_uri(&path)?,
-                                version: doc.version,
-                            },
-                            content_changes: vec![TextDocumentContentChangeEvent {
-                                range: None,
-                                range_length: None,
-                                text: content,
-                            }],
-                        },
-                    )));
+                    return Ok(Some(DocumentNotification::Change {
+                        uri: path_to_uri(&path),
+                        version: doc.version,
+                        text: content,
+                    }));
                 }
             }
 
@@ -94,7 +81,7 @@ impl DocumentManager {
 
         // Document not open - read and open it
         let content = fs::read_to_string(&path).await?;
-        let uri = path_to_uri(&path)?;
+        let uri = path_to_uri(&path);
 
         // Detect language ID from extension
         let language_id = detect_language_id(&path);
@@ -108,16 +95,12 @@ impl DocumentManager {
         self.documents.insert(path.clone(), doc);
         debug!("Opening document: {} ({})", path.display(), language_id);
 
-        Ok(Some(DocumentNotification::Open(
-            DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri,
-                    language_id: language_id.to_string(),
-                    version: 1,
-                    text: content,
-                },
-            },
-        )))
+        Ok(Some(DocumentNotification::Open {
+            uri,
+            language_id: language_id.to_string(),
+            version: 1,
+            text: content,
+        }))
     }
 
     /// Marks a document as closed and returns the notification to send.
@@ -125,16 +108,12 @@ impl DocumentManager {
     /// # Errors
     ///
     /// Returns an error if the path cannot be canonicalized or converted to a URI.
-    pub fn close(&mut self, path: &Path) -> Result<Option<DidCloseTextDocumentParams>> {
+    pub fn close(&mut self, path: &Path) -> Result<Option<String>> {
         let path = path.canonicalize()?;
 
         if self.documents.remove(&path).is_some() {
             debug!("Closing document: {}", path.display());
-            Ok(Some(DidCloseTextDocumentParams {
-                text_document: TextDocumentIdentifier {
-                    uri: path_to_uri(&path)?,
-                },
-            }))
+            Ok(Some(path_to_uri(&path)))
         } else {
             Ok(None)
         }
@@ -145,8 +124,8 @@ impl DocumentManager {
     /// # Errors
     ///
     /// Returns an error if the path cannot be canonicalized or converted to a URI.
-    pub fn uri_for_path(&self, path: &Path) -> Result<Uri> {
-        path_to_uri(&path.canonicalize()?)
+    pub fn uri_for_path(&self, path: &Path) -> Result<String> {
+        Ok(path_to_uri(&path.canonicalize()?))
     }
 
     /// Returns the language ID for a given path.
@@ -178,7 +157,7 @@ impl DocumentManager {
         mtime: SystemTime,
     ) -> Result<DocumentNotification> {
         let path = path.canonicalize()?;
-        let uri = path_to_uri(&path)?;
+        let uri = path_to_uri(&path);
 
         if let Some(doc) = self.documents.get_mut(&path) {
             // Already open — send didChange
@@ -187,17 +166,11 @@ impl DocumentManager {
             doc.mtime = mtime;
             debug!("External write (change): {}", path.display());
 
-            Ok(DocumentNotification::Change(DidChangeTextDocumentParams {
-                text_document: VersionedTextDocumentIdentifier {
-                    uri,
-                    version: doc.version,
-                },
-                content_changes: vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: content.to_string(),
-                }],
-            }))
+            Ok(DocumentNotification::Change {
+                uri,
+                version: doc.version,
+                text: content.to_string(),
+            })
         } else {
             // Not open — send didOpen
             let language_id = detect_language_id(&path);
@@ -215,14 +188,12 @@ impl DocumentManager {
                 language_id
             );
 
-            Ok(DocumentNotification::Open(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri,
-                    language_id: language_id.to_string(),
-                    version: 1,
-                    text: content.to_string(),
-                },
-            }))
+            Ok(DocumentNotification::Open {
+                uri,
+                language_id: language_id.to_string(),
+                version: 1,
+                text: content.to_string(),
+            })
         }
     }
 }
@@ -230,16 +201,29 @@ impl DocumentManager {
 /// Notification to send to the LSP server.
 pub enum DocumentNotification {
     /// A `textDocument/didOpen` notification.
-    Open(DidOpenTextDocumentParams),
+    Open {
+        /// Document URI (`file://` scheme).
+        uri: String,
+        /// Language identifier (e.g. `"rust"`, `"python"`).
+        language_id: String,
+        /// Document version.
+        version: i32,
+        /// Full document text.
+        text: String,
+    },
     /// A `textDocument/didChange` notification.
-    Change(DidChangeTextDocumentParams),
+    Change {
+        /// Document URI (`file://` scheme).
+        uri: String,
+        /// Document version.
+        version: i32,
+        /// Full document text.
+        text: String,
+    },
 }
 
-fn path_to_uri(path: &Path) -> Result<Uri> {
-    let uri_str = format!("file://{}", path.display());
-    uri_str
-        .parse()
-        .map_err(|e| anyhow!("Invalid path for URI: {}: {}", path.display(), e))
+fn path_to_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
 }
 
 fn detect_language_id(path: &Path) -> &'static str {
@@ -316,10 +300,16 @@ mod tests {
         let notification = manager.ensure_open(file.path()).await?;
 
         assert!(notification.is_some());
-        if let Some(DocumentNotification::Open(params)) = notification {
-            assert_eq!(params.text_document.language_id, "rust");
-            assert_eq!(params.text_document.version, 1);
-            assert!(params.text_document.text.contains("fn main()"));
+        if let Some(DocumentNotification::Open {
+            language_id,
+            version,
+            text,
+            ..
+        }) = notification
+        {
+            assert_eq!(language_id, "rust");
+            assert_eq!(version, 1);
+            assert!(text.contains("fn main()"));
         } else {
             anyhow::bail!("Expected Open notification");
         }
@@ -353,7 +343,10 @@ mod tests {
 
         // First open
         let notification1 = manager.ensure_open(&path).await?;
-        assert!(matches!(notification1, Some(DocumentNotification::Open(_))));
+        assert!(matches!(
+            notification1,
+            Some(DocumentNotification::Open { .. })
+        ));
 
         // Modify file (need delay for mtime to differ on some filesystems)
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -362,7 +355,7 @@ mod tests {
         // Re-access - should get Change notification since content differs
         let notification2 = manager.ensure_open(&path).await?;
         assert!(
-            matches!(notification2, Some(DocumentNotification::Change(_))),
+            matches!(notification2, Some(DocumentNotification::Change { .. })),
             "Expected Change notification after file modification"
         );
         Ok(())
@@ -418,9 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn test_path_to_uri() -> Result<()> {
-        let uri = path_to_uri(Path::new("/home/user/test.rs"))?;
-        assert!(uri.as_str().starts_with("file:///home/user/test.rs"));
-        Ok(())
+    fn test_path_to_uri() {
+        let uri = path_to_uri(Path::new("/home/user/test.rs"));
+        assert!(uri.starts_with("file:///home/user/test.rs"));
     }
 }

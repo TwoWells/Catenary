@@ -281,27 +281,30 @@ impl NotifyServer {
         // ensure_open detects disk changes and returns didOpen/didChange
         if let Some(notification) = doc_manager.ensure_open(&canonical).await? {
             // Snapshot generation *before* sending the change
-            let snapshot = client.diagnostics_generation(uri.as_str());
+            let snapshot = client.diagnostics_generation(&uri);
 
             match notification {
-                DocumentNotification::Open(params) => {
-                    client.did_open(params).await?;
+                DocumentNotification::Open {
+                    language_id,
+                    version,
+                    text,
+                    ..
+                } => {
+                    client.did_open(&uri, &language_id, version, &text).await?;
                 }
-                DocumentNotification::Change(params) => {
-                    client.did_change(params).await?;
+                DocumentNotification::Change { version, text, .. } => {
+                    client.did_change(&uri, version, &text).await?;
                 }
             }
 
             // Trigger flycheck on servers that only run diagnostics on save
             if client.wants_did_save() {
-                client.did_save(uri.clone()).await?;
+                client.did_save(&uri).await?;
             }
 
             drop(doc_manager);
 
-            if client
-                .wait_for_diagnostics_update(uri.as_str(), snapshot)
-                .await
+            if client.wait_for_diagnostics_update(&uri, snapshot).await
                 == DiagnosticsWaitResult::Nothing
             {
                 return Ok("[diagnostics unavailable]".into());
@@ -310,7 +313,7 @@ impl NotifyServer {
             drop(doc_manager);
         }
 
-        let diagnostics = client.get_diagnostics(uri.as_str());
+        let diagnostics = client.get_diagnostics(&uri);
 
         // Extract filter context before dropping the client lock
         let server_command = client.server_command().to_string();
@@ -319,7 +322,7 @@ impl NotifyServer {
         // Collect quick-fix code actions for each diagnostic
         let fixes =
             if !diagnostics.is_empty() && client.capabilities().code_action_provider.is_some() {
-                collect_quick_fixes(&client, uri.as_str(), &diagnostics).await
+                collect_quick_fixes(&client, &uri, &diagnostics).await
             } else {
                 Vec::new()
             };

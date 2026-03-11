@@ -78,17 +78,11 @@ impl ClientManager {
     ///
     /// Returns an error if the root path cannot be converted to a valid URI.
     pub async fn add_root(&self, root: PathBuf) -> Result<()> {
-        let uri: lsp_types::Uri = format!("file://{}", root.display())
-            .parse()
-            .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
-
-        let folder = lsp_types::WorkspaceFolder {
-            uri,
-            name: root.file_name().map_or_else(
-                || "workspace".to_string(),
-                |s| s.to_string_lossy().to_string(),
-            ),
-        };
+        let uri = format!("file://{}", root.display());
+        let name = root.file_name().map_or_else(
+            || "workspace".to_string(),
+            |s| s.to_string_lossy().to_string(),
+        );
 
         self.roots.lock().await.push(root);
 
@@ -103,7 +97,7 @@ impl ClientManager {
             }
             if client.supports_workspace_folders() {
                 if let Err(e) = client
-                    .did_change_workspace_folders(vec![folder.clone()], vec![])
+                    .did_change_workspace_folders(&[(&uri, &name)], &[])
                     .await
                 {
                     warn!(
@@ -133,17 +127,11 @@ impl ClientManager {
     ///
     /// Returns an error if the root path cannot be converted to a valid URI.
     pub async fn remove_root(&self, root: &Path) -> Result<()> {
-        let uri: lsp_types::Uri = format!("file://{}", root.display())
-            .parse()
-            .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
-
-        let folder = lsp_types::WorkspaceFolder {
-            uri,
-            name: root.file_name().map_or_else(
-                || "workspace".to_string(),
-                |s| s.to_string_lossy().to_string(),
-            ),
-        };
+        let uri = format!("file://{}", root.display());
+        let name = root.file_name().map_or_else(
+            || "workspace".to_string(),
+            |s| s.to_string_lossy().to_string(),
+        );
 
         self.roots.lock().await.retain(|r| r != root);
 
@@ -158,7 +146,7 @@ impl ClientManager {
             }
             if client.supports_workspace_folders() {
                 if let Err(e) = client
-                    .did_change_workspace_folders(vec![], vec![folder.clone()])
+                    .did_change_workspace_folders(&[], &[(&uri, &name)])
                     .await
                 {
                     warn!(
@@ -213,40 +201,43 @@ impl ClientManager {
             to_remove.len()
         );
 
-        let added_folders = to_add
+        let added_folders: Vec<(String, String)> = to_add
             .iter()
             .map(|root| {
-                let uri: lsp_types::Uri = format!("file://{}", root.display())
-                    .parse()
-                    .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
-                Ok(lsp_types::WorkspaceFolder {
-                    uri,
-                    name: root.file_name().map_or_else(
+                (
+                    format!("file://{}", root.display()),
+                    root.file_name().map_or_else(
                         || "workspace".to_string(),
                         |s| s.to_string_lossy().to_string(),
                     ),
-                })
+                )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
-        let removed_folders = to_remove
+        let removed_folders: Vec<(String, String)> = to_remove
             .iter()
             .map(|root| {
-                let uri: lsp_types::Uri = format!("file://{}", root.display())
-                    .parse()
-                    .map_err(|e| anyhow!("Invalid root path {}: {e}", root.display()))?;
-                Ok(lsp_types::WorkspaceFolder {
-                    uri,
-                    name: root.file_name().map_or_else(
+                (
+                    format!("file://{}", root.display()),
+                    root.file_name().map_or_else(
                         || "workspace".to_string(),
                         |s| s.to_string_lossy().to_string(),
                     ),
-                })
+                )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
         // Update internal state
         *self.roots.lock().await = new_roots;
+
+        let added_refs: Vec<(&str, &str)> = added_folders
+            .iter()
+            .map(|(u, n)| (u.as_str(), n.as_str()))
+            .collect();
+        let removed_refs: Vec<(&str, &str)> = removed_folders
+            .iter()
+            .map(|(u, n)| (u.as_str(), n.as_str()))
+            .collect();
 
         // Notify clients that support dynamic workspace folders,
         // restart those that don't.
@@ -259,7 +250,7 @@ impl ClientManager {
             }
             if client.supports_workspace_folders() {
                 if let Err(e) = client
-                    .did_change_workspace_folders(added_folders.clone(), removed_folders.clone())
+                    .did_change_workspace_folders(&added_refs, &removed_refs)
                     .await
                 {
                     warn!(
