@@ -71,9 +71,9 @@ Inside `plugins/catenary/`:
 
 - **`.mcp.json`** — declares the MCP server (`catenary` command).
 - **`hooks/hooks.json`** — registers hooks for diagnostics and root sync:
-  - `PreToolUse` (all tools): runs `catenary sync-roots` to pick up `/add-dir`
+  - `PreToolUse` (all tools): runs `catenary hook pre-tool` to pick up `/add-dir`
     workspace additions and directory removals.
-  - `PostToolUse` on `Edit|Write|NotebookEdit|Read`: runs `catenary notify`
+  - `PostToolUse` on `Edit|Write|NotebookEdit|Read`: runs `catenary hook post-tool`
     to return LSP diagnostics after file operations.
 - **`config.example.toml`** — example Catenary configuration.
 
@@ -91,19 +91,20 @@ The extension root is the repository root. Two files matter:
   contain hooks (Gemini CLI ignores hooks defined in the manifest).
 - **`hooks/hooks.json`** — registers hooks for diagnostics:
   - `AfterTool` on `read_file|write_file|replace`: runs
-    `catenary notify --format=gemini` to return LSP diagnostics after file
-    operations.
+    `catenary hook post-tool --format=gemini` to return LSP diagnostics after
+    file operations.
 
 ## Hook Contracts
 
-All hook commands (`catenary notify`, `catenary sync-roots`) read hook JSON from
-stdin. They silently succeed on any error to avoid breaking the host CLI's flow.
+All hook commands (`catenary hook post-tool`, `catenary hook pre-tool`) read
+hook JSON from stdin. They silently succeed on any error to avoid breaking the
+host CLI's flow.
 
-### `catenary notify`
+### `catenary hook post-tool`
 
 Triggered after file reads or edits (Claude Code `PostToolUse`, Gemini
-`AfterTool`). Connects to the session's notify socket and returns LSP
-diagnostics to stdout.
+`AfterTool`). Connects to the session's hook socket and returns LSP diagnostics
+to stdout.
 
 **Fields consumed from hook JSON:**
 
@@ -121,7 +122,7 @@ diagnostics to stdout.
 **Output:** silent when no diagnostics. Otherwise returns JSON with
 `additionalContext` containing the diagnostic text.
 
-### `catenary sync-roots`
+### `catenary hook pre-tool`
 
 Triggered before each tool use (Claude Code only). Scans the Claude Code
 transcript for `/add-dir` additions and directory removals, then sends the full

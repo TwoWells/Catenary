@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! IPC server for file-change notifications and root management.
+//! IPC server for host CLI hook integration.
 //!
-//! When Claude Code's native `Edit` or `Write` tools modify a file, a
-//! `PostToolUse` hook runs `catenary notify`, which connects to this server
-//! and sends the changed file path. The server notifies the LSP, waits for
-//! fresh diagnostics, and returns them so they appear in the model's context.
+//! When a host CLI's post-tool hook fires after a file edit, it runs
+//! `catenary hook post-tool`, which connects to this server and sends the
+//! changed file path. The server notifies the LSP, waits for fresh
+//! diagnostics, and returns them so they appear in the model's context.
 //!
-//! The server also accepts `sync_roots` requests from `catenary sync-roots`,
-//! which synchronize workspace roots discovered from `/add-dir` and removal
-//! commands in the Claude Code transcript. The older `add_roots` request type
-//! is still supported for backwards compatibility.
+//! The server also accepts `sync_roots` requests from `catenary hook
+//! pre-tool`, which synchronize workspace roots discovered from `/add-dir`
+//! and removal commands in the Claude Code transcript. The older `add_roots`
+//! request type is still supported for backwards compatibility.
 //!
 //! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
@@ -28,9 +28,9 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::{DocumentManager, DocumentNotification, PathValidator};
 use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient};
-use crate::session::{EventBroadcaster, EventKind};
+use crate::session::{EventBroadcaster, EventKind, MessageLog};
 
-/// Request from `catenary notify` (file change) or `catenary sync-roots` (root sync).
+/// Request from `catenary hook PostToolUse` (file change) or `catenary hook PreToolUse` (root sync).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum NotifyRequest {
@@ -38,6 +38,14 @@ enum NotifyRequest {
     File {
         /// Absolute path to the changed file.
         file: String,
+        /// Name of the host CLI tool that triggered the hook (e.g., "Write", "Edit").
+        /// Included in the logged payload for monitor visibility.
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "metadata field — logged in payload, not read in code"
+        )]
+        tool: Option<String>,
     },
     /// A request to synchronize workspace roots (full replacement).
     SyncRoots {
@@ -51,7 +59,7 @@ enum NotifyRequest {
     },
 }
 
-/// IPC response from the notify server to the CLI.
+/// IPC response from the hook server to the CLI.
 ///
 /// Separates diagnostic content (for the model via `additionalContext`) from
 /// internal errors (for the user via `systemMessage`). The CLI deserializes
@@ -66,29 +74,35 @@ pub enum NotifyResult {
     Error(String),
 }
 
-/// Listens on an IPC endpoint (Unix socket or named pipe) for file-change
-/// notifications and returns LSP diagnostics.
-pub struct NotifyServer {
+/// Listens on an IPC endpoint (Unix socket or named pipe) for hook requests
+/// from the host CLI and returns LSP diagnostics or root sync results.
+pub struct HookServer {
     client_manager: Arc<ClientManager>,
     doc_manager: Arc<Mutex<DocumentManager>>,
     path_validator: Arc<RwLock<PathValidator>>,
     broadcaster: EventBroadcaster,
+    message_log: Arc<MessageLog>,
+    client_name: String,
 }
 
-impl NotifyServer {
-    /// Creates a new `NotifyServer`.
+impl HookServer {
+    /// Creates a new `HookServer`.
     #[must_use]
     pub const fn new(
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         path_validator: Arc<RwLock<PathValidator>>,
         broadcaster: EventBroadcaster,
+        message_log: Arc<MessageLog>,
+        client_name: String,
     ) -> Self {
         Self {
             client_manager,
             doc_manager,
             path_validator,
             broadcaster,
+            message_log,
+            client_name,
         }
     }
 
@@ -203,20 +217,47 @@ impl NotifyServer {
         let request: NotifyRequest =
             serde_json::from_str(line.trim()).map_err(|e| anyhow!("Invalid request: {e}"))?;
 
+        let method = match &request {
+            NotifyRequest::File { .. } => "post-tool",
+            NotifyRequest::SyncRoots { .. } | NotifyRequest::AddRoots { .. } => "pre-tool",
+        };
+
+        // Log incoming hook request
+        let entry_id = self.message_log.log(
+            "hook",
+            method,
+            "catenary",
+            &self.client_name,
+            None,
+            None,
+            &serde_json::from_str::<Value>(line.trim()).unwrap_or_default(),
+        );
+
         let response = match request {
-            NotifyRequest::File { file } => {
-                debug!("Notify: processing file {file}");
-                self.process_file(&file).await
+            NotifyRequest::File { file, .. } => {
+                debug!("Hook: processing file {file}");
+                self.process_file(&file, entry_id).await
             }
             NotifyRequest::SyncRoots { sync_roots } => {
-                debug!("Notify: syncing {} root(s)", sync_roots.len());
+                debug!("Hook: syncing {} root(s)", sync_roots.len());
                 self.process_sync_roots(&sync_roots).await
             }
             NotifyRequest::AddRoots { add_roots } => {
-                debug!("Notify: adding {} root(s)", add_roots.len());
+                debug!("Hook: adding {} root(s)", add_roots.len());
                 self.process_add_roots(&add_roots).await
             }
         };
+
+        // Log outgoing hook response
+        self.message_log.log(
+            "hook",
+            method,
+            "catenary",
+            &self.client_name,
+            Some(entry_id),
+            None,
+            &serde_json::from_str::<Value>(&response).unwrap_or_default(),
+        );
 
         writer.write_all(response.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -226,8 +267,8 @@ impl NotifyServer {
     }
 
     /// Processes a file change notification and returns a [`NotifyResult`] as JSON.
-    async fn process_file(&self, file_path: &str) -> String {
-        let result = match self.process_file_inner(file_path).await {
+    async fn process_file(&self, file_path: &str, entry_id: i64) -> String {
+        let result = match self.process_file_inner(file_path, entry_id).await {
             Ok(content) => NotifyResult::Content(content),
             Err(e) => {
                 warn!("Notify error for {file_path}: {e}");
@@ -247,7 +288,7 @@ impl NotifyServer {
         clippy::too_many_lines,
         reason = "Diagnostics wait loop adds necessary branches"
     )]
-    async fn process_file_inner(&self, file_path: &str) -> Result<String> {
+    async fn process_file_inner(&self, file_path: &str, entry_id: i64) -> Result<String> {
         let path = resolve_path(file_path)?;
 
         // Gate on workspace roots: if the LSP server doesn't know about this
@@ -270,9 +311,13 @@ impl NotifyServer {
         };
 
         let mut doc_manager = self.doc_manager.lock().await;
-        let client = client_mutex.lock().await;
+        let mut client = client_mutex.lock().await;
+
+        // Thread parent_id so LSP requests are correlated with this hook
+        client.set_parent_id(Some(entry_id));
 
         if !client.is_alive() {
+            client.set_parent_id(None);
             return Ok("[no language server]".into());
         }
 
@@ -307,6 +352,7 @@ impl NotifyServer {
             if client.wait_for_diagnostics_update(&uri, snapshot).await
                 == DiagnosticsWaitResult::Nothing
             {
+                client.set_parent_id(None);
                 return Ok("[diagnostics unavailable]".into());
             }
         } else {
@@ -331,6 +377,7 @@ impl NotifyServer {
             Vec::new()
         };
 
+        client.set_parent_id(None);
         drop(client);
 
         // Apply severity threshold from config
@@ -721,5 +768,153 @@ mod tests {
         let raw: serde_json::Value = serde_json::from_str(&json).expect("parse as value");
         assert_eq!(raw["error"], "path resolution failed");
         assert!(raw.get("content").is_none());
+    }
+
+    #[test]
+    fn test_hook_request_tool_field() {
+        // With tool field
+        let json = r#"{"file": "/tmp/test.rs", "tool": "Write"}"#;
+        let req: NotifyRequest = serde_json::from_str(json).expect("deserialize with tool");
+        let NotifyRequest::File { file, tool } = req else {
+            unreachable!("expected File variant");
+        };
+        assert_eq!(file, "/tmp/test.rs");
+        assert_eq!(tool.as_deref(), Some("Write"));
+
+        // Without tool field (backward compatibility)
+        let json = r#"{"file": "/tmp/test.rs"}"#;
+        let req: NotifyRequest = serde_json::from_str(json).expect("deserialize without tool");
+        let NotifyRequest::File { tool, .. } = req else {
+            unreachable!("expected File variant");
+        };
+        assert!(tool.is_none());
+    }
+
+    #[test]
+    fn test_hook_log_file_request() {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        // Insert a session for the FK.
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
+
+        // Simulate what handle_connection does for a File request
+        let method = "post-tool";
+        let request_payload = serde_json::json!({"file": "/tmp/test.rs", "tool": "Write"});
+        let entry_id = log.log(
+            "hook",
+            method,
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &request_payload,
+        );
+        assert!(entry_id > 0);
+
+        let response_payload = serde_json::json!({"content": "[clean]"});
+        let resp_id = log.log(
+            "hook",
+            method,
+            "catenary",
+            "claude-code",
+            Some(entry_id),
+            None,
+            &response_payload,
+        );
+        assert!(resp_id > entry_id);
+
+        // Verify both messages in the database
+        let (r_type, r_method): (String, String) = conn
+            .lock()
+            .expect("lock")
+            .query_row(
+                "SELECT type, method FROM messages WHERE id = ?1",
+                [entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query request");
+        assert_eq!(r_type, "hook");
+        assert_eq!(r_method, "post-tool");
+
+        let stored_req_id: Option<i64> = conn
+            .lock()
+            .expect("lock")
+            .query_row(
+                "SELECT request_id FROM messages WHERE id = ?1",
+                [resp_id],
+                |row| row.get(0),
+            )
+            .expect("query response");
+        assert_eq!(stored_req_id, Some(entry_id));
+    }
+
+    #[test]
+    fn test_hook_log_sync_roots() {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
+
+        let method = "pre-tool";
+        let request_payload = serde_json::json!({"sync_roots": ["/tmp/root1"]});
+        let entry_id = log.log(
+            "hook",
+            method,
+            "catenary",
+            "host",
+            None,
+            None,
+            &request_payload,
+        );
+
+        let response_payload = serde_json::json!("Added roots: /tmp/root1");
+        log.log(
+            "hook",
+            method,
+            "catenary",
+            "host",
+            Some(entry_id),
+            None,
+            &response_payload,
+        );
+
+        // Verify method is pre-tool
+        let r_method: String = conn
+            .lock()
+            .expect("lock")
+            .query_row(
+                "SELECT method FROM messages WHERE id = ?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(r_method, "pre-tool");
+    }
+
+    /// Open an isolated test database in a tempdir.
+    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("catenary").join("catenary.db");
+        let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
+        (dir, path, conn)
     }
 }

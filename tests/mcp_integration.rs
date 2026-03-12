@@ -181,9 +181,9 @@ impl BridgeProcess {
         Ok(())
     }
 
-    /// Sends a file-change notification via the notify socket and returns
+    /// Sends a file-change notification via the hook socket and returns
     /// the diagnostics text. This exercises the production hook path
-    /// (`catenary notify`) rather than the (removed) MCP `diagnostics` tool.
+    /// (`catenary hook post-tool`) rather than the (removed) MCP `diagnostics` tool.
     fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
         let state_home = self.state_home.as_ref().context("state_home not set")?;
         let sessions_dir = PathBuf::from(state_home).join("catenary").join("sessions");
@@ -208,11 +208,11 @@ impl BridgeProcess {
 
         // Unwrap NotifyResult wire protocol — return the content string
         let trimmed = response.trim();
-        serde_json::from_str::<catenary_mcp::notify::NotifyResult>(trimmed).map_or_else(
+        serde_json::from_str::<catenary_mcp::hook::NotifyResult>(trimmed).map_or_else(
             |_| Ok(trimmed.to_string()),
             |result| match result {
-                catenary_mcp::notify::NotifyResult::Content(s) => Ok(s),
-                catenary_mcp::notify::NotifyResult::Error(e) => Ok(format!("Notify error: {e}")),
+                catenary_mcp::hook::NotifyResult::Content(s) => Ok(s),
+                catenary_mcp::hook::NotifyResult::Error(e) => Ok(format!("Notify error: {e}")),
             },
         )
     }

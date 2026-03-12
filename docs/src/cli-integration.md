@@ -49,7 +49,7 @@ Location: `~/.gemini/settings.json` (user) or `.gemini/settings.json` (workspace
 **Recommended: Extension + Constrained Mode.**
 
 1.  **Install the Extension:** The Catenary extension provides an
-    `AfterTool` hook that runs `catenary notify` after file operations,
+    `AfterTool` hook that runs `catenary hook post-tool` after file operations,
     so the model sees LSP diagnostics immediately.
 
     ```bash
@@ -129,7 +129,7 @@ Catenary provides LSP diagnostics via a `PostToolUse` hook.
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
+            "command": "catenary hook post-tool --format=claude"
           }
         ]
       }
@@ -143,8 +143,8 @@ Catenary provides LSP diagnostics via a `PostToolUse` hook.
 }
 ```
 
-The `catenary notify` command reads the hook's JSON from stdin, finds the
-running Catenary session for the workspace, and returns any LSP diagnostics.
+The `catenary hook post-tool` command reads the hook's JSON from stdin, finds
+the running Catenary session for the workspace, and returns any LSP diagnostics.
 It exits silently on any error so it never blocks Claude Code's flow.
 
 **Alternative: Constrained mode.** Keep Claude Code's native `Read`, `Edit`,
@@ -215,7 +215,7 @@ path that would let the model fall back to text scanning. The model uses:
 
 - **Catenary `grep`** for content discovery (symbols, references, text matches)
 - **Catenary `glob`** for directory browsing (replaces `ls`, `tree`, `find`)
-- **Claude Code `Read`/`Edit`/`Write`** for file I/O (with `catenary notify` hook for diagnostics)
+- **Claude Code `Read`/`Edit`/`Write`** for file I/O (with `catenary hook post-tool` for diagnostics)
 - **Claude Code `Bash`** for build, test, and git commands only
 
 ## Experiment Results
@@ -285,7 +285,7 @@ These commands are not MCP tools — they are run directly from the terminal.
 | `catenary doctor` | Verify language servers and hook installation |
 
 File I/O is handled by the host tool's native file operations. Catenary
-provides post-edit diagnostics via the `catenary notify` hook.
+provides post-edit diagnostics via the `catenary hook post-tool` hook.
 
 ## Limitations
 

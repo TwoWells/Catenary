@@ -124,8 +124,15 @@ enum Command {
         remove: Option<String>,
     },
 
+    /// Hook subcommands (invoked by host CLI hooks).
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+
     /// Sync /add-dir roots from Claude Code transcript to a running session.
     /// Designed for `PreToolUse` hooks — reads hook JSON from stdin.
+    #[command(hide = true)]
     SyncRoots {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
@@ -134,6 +141,7 @@ enum Command {
 
     /// Run diagnostics for a file after editing.
     /// Reads hook JSON from stdin.
+    #[command(hide = true)]
     Notify {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
@@ -180,6 +188,25 @@ enum Command {
         /// Delete all data for a specific session.
         #[arg(long)]
         session: Option<String>,
+    },
+}
+
+/// Hook subcommands invoked by host CLI hooks.
+#[derive(Subcommand, Debug)]
+enum HookCommand {
+    /// Post-tool: file-change notification with diagnostics.
+    #[command(name = "post-tool")]
+    PostTool {
+        /// Output format: "claude" or "gemini".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// Pre-tool: workspace root synchronization.
+    #[command(name = "pre-tool")]
+    PreTool {
+        /// Output format: "claude" or "gemini".
+        #[arg(long, value_enum)]
+        format: HostFormat,
     },
 }
 
@@ -231,6 +258,13 @@ async fn main() -> Result<()> {
             } else {
                 catenary_mcp::install::list_grammars(&conn)
             }
+        }
+        Some(Command::Hook { command }) => {
+            match command {
+                HookCommand::PostTool { format } => run_notify(format),
+                HookCommand::PreTool { format } => run_sync_roots(format),
+            }
+            Ok(())
         }
         Some(Command::SyncRoots { format }) => {
             run_sync_roots(format);
@@ -399,18 +433,20 @@ async fn run_server(args: Args) -> Result<()> {
         current_roots.clone(),
     )));
 
-    // Start the notify socket server for PostToolUse hook integration
-    let notify_server = catenary_mcp::notify::NotifyServer::new(
+    // Start the hook server for PostToolUse/PreToolUse hook integration
+    let hook_server = catenary_mcp::hook::HookServer::new(
         client_manager.clone(),
         doc_manager.clone(),
         path_validator.clone(),
         broadcaster.clone(),
+        message_log.clone(),
+        "host".to_string(),
     );
     let socket_path = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .socket_path();
-    let notify_handle = notify_server.start(&socket_path)?;
+    let notify_handle = hook_server.start(&socket_path)?;
     session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
@@ -1319,18 +1355,22 @@ fn run_notify(format: HostFormat) {
         return;
     };
 
-    let request = serde_json::json!({ "file": abs_path.to_string_lossy() });
+    let tool_name = hook_json.get("tool_name").and_then(|v| v.as_str());
+    let mut request = serde_json::json!({ "file": abs_path.to_string_lossy() });
+    if let Some(tool) = tool_name {
+        request["tool"] = serde_json::json!(tool);
+    }
     let lines = ipc_exchange(stream, &request);
 
     // Deserialize NotifyResult from the first response line.
     // Graceful degradation: if parsing fails (version skew), treat raw lines as content.
     let result = lines
         .first()
-        .and_then(|line| serde_json::from_str::<catenary_mcp::notify::NotifyResult>(line).ok())
-        .unwrap_or_else(|| catenary_mcp::notify::NotifyResult::Content(lines.join("\n")));
+        .and_then(|line| serde_json::from_str::<catenary_mcp::hook::NotifyResult>(line).ok())
+        .unwrap_or_else(|| catenary_mcp::hook::NotifyResult::Content(lines.join("\n")));
 
     match result {
-        catenary_mcp::notify::NotifyResult::Content(content) => {
+        catenary_mcp::hook::NotifyResult::Content(content) => {
             let filename = std::path::Path::new(&file_path)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1339,7 +1379,7 @@ fn run_notify(format: HostFormat) {
             let output = format_diagnostics(&full_content, format, "PostToolUse");
             print!("{output}");
         }
-        catenary_mcp::notify::NotifyResult::Error(msg) => {
+        catenary_mcp::hook::NotifyResult::Error(msg) => {
             print!("{}", notify_error(&msg, format));
         }
     }
@@ -3016,6 +3056,46 @@ mod tests {
 
         // Should not panic on empty grammars table
         check_grammars_installed(&colors, &conn);
+    }
+
+    // ── CLI hook subcommand tests ─────────────────────────────────
+
+    #[test]
+    fn test_cli_hook_post_tool() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "post-tool", "--format=claude"]);
+        let args = args.expect("hook post-tool should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::PostTool { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_pre_tool() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "pre-tool", "--format=gemini"]);
+        let args = args.expect("hook pre-tool should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::PreTool { .. }));
+    }
+
+    #[test]
+    fn test_cli_legacy_notify_still_parses() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "notify", "--format=claude"]);
+        let args = args.expect("legacy notify should still parse");
+        assert!(matches!(args.command, Some(Command::Notify { .. })));
+    }
+
+    #[test]
+    fn test_cli_legacy_sync_roots_still_parses() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "sync-roots", "--format=claude"]);
+        let args = args.expect("legacy sync-roots should still parse");
+        assert!(matches!(args.command, Some(Command::SyncRoots { .. })));
     }
 
     #[test]
