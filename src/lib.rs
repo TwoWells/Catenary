@@ -16,6 +16,8 @@ pub mod config;
 pub mod db;
 /// Diagnostic noise filtering for LSP server output.
 pub mod filter;
+/// IPC server for host CLI hook integration (diagnostics and root sync).
+pub mod hook;
 /// Grammar installation, listing, and removal for tree-sitter integration.
 pub mod install;
 /// Logger trait for capturing protocol events.
@@ -24,8 +26,6 @@ pub mod logger;
 pub mod lsp;
 /// MCP server implementation and type definitions.
 pub mod mcp;
-/// IPC server for file-change notifications from hooks.
-pub mod notify;
 /// Session management and event broadcasting.
 pub mod session;
 /// Interactive TUI for session browsing and event tailing.

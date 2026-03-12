@@ -30,13 +30,13 @@ find-references, rename, and search without shell-based text scanning.
   hooks that fire before/after tool use. Hook definitions live in
   `plugins/catenary/hooks/hooks.json` (Claude Code) and `hooks/hooks.json`
   (Gemini CLI). See `docs/src/plugin-architecture.md` for the full hook contract.
-- **Diagnostics:** The `catenary notify` command (`src/notify.rs` for the IPC
-  server) runs in PostToolUse hooks after file edits. It connects to the
-  running session's notify socket, sends the changed file path, and returns
+- **Diagnostics:** The `catenary hook post-tool` command (`src/hook.rs` for the
+  IPC server) runs in PostToolUse hooks after file edits. It connects to the
+  running session's hook socket, sends the changed file path, and returns
   LSP diagnostics so they appear in the model's context. Diagnostic events are
   stored in the SQLite database for later querying via `catenary query`.
-- **Root sync:** `catenary sync-roots` (PreToolUse, Claude Code only) scans the
-  transcript for `/add-dir` workspace additions and forwards them to the session.
+- **Root sync:** `catenary hook pre-tool` (PreToolUse, Claude Code only) scans
+  the transcript for `/add-dir` workspace additions and forwards them to the session.
 
 ### Architecture references
 

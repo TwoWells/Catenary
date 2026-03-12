@@ -7,7 +7,7 @@
           {
             "name": "catenary-notify",
             "type": "command",
-            "command": "catenary notify --format=gemini"
+            "command": "catenary hook post-tool --format=gemini"
           }
         ]
       }

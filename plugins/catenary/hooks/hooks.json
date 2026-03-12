@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary sync-roots --format=claude"
+            "command": "catenary hook pre-tool --format=claude"
           }
         ]
       }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
+            "command": "catenary hook post-tool --format=claude"
           }
         ]
       }

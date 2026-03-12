@@ -114,9 +114,9 @@ impl BridgeProcess {
         Ok(())
     }
 
-    /// Sends a file-change notification via the notify socket and returns
+    /// Sends a file-change notification via the hook socket and returns
     /// the diagnostics text. This exercises the production hook path
-    /// (`catenary notify`) rather than the (removed) MCP `diagnostics` tool.
+    /// (`catenary hook post-tool`) rather than the (removed) MCP `diagnostics` tool.
     fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
         use std::io::Read as _;
 
@@ -143,11 +143,11 @@ impl BridgeProcess {
 
         // Unwrap NotifyResult wire protocol — return the content string
         let trimmed = response.trim();
-        serde_json::from_str::<catenary_mcp::notify::NotifyResult>(trimmed).map_or_else(
+        serde_json::from_str::<catenary_mcp::hook::NotifyResult>(trimmed).map_or_else(
             |_| Ok(trimmed.to_string()),
             |result| match result {
-                catenary_mcp::notify::NotifyResult::Content(s) => Ok(s),
-                catenary_mcp::notify::NotifyResult::Error(e) => Ok(format!("Notify error: {e}")),
+                catenary_mcp::hook::NotifyResult::Content(s) => Ok(s),
+                catenary_mcp::hook::NotifyResult::Error(e) => Ok(format!("Notify error: {e}")),
             },
         )
     }
@@ -373,7 +373,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
 
 /// Reproduces a cross-change stale diagnostics leak via concurrent notify socket.
 ///
-/// Exercises the production hook path (`catenary notify`) with overlapping
+/// Exercises the production hook path (`catenary hook post-tool`) with overlapping
 /// connections to the notify socket. Task A opens v1, Task B edits to v2.
 /// v1's delayed diagnostics satisfy Task B's generation check, causing stale
 /// data to be returned for v2's content.

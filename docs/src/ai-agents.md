@@ -69,7 +69,7 @@ language server directly.
 
 Catenary provides two MCP tools (`grep` and `glob`) plus post-edit diagnostics
 via hooks. File reading and editing is handled by the host tool's native file
-operations (e.g. Claude Code's `Read`, `Edit`, `Write`). The `catenary notify`
+operations (e.g. Claude Code's `Read`, `Edit`, `Write`). The `catenary hook post-tool`
 hook provides post-edit LSP diagnostics so you immediately see any errors
 introduced by changes.
 
@@ -152,17 +152,17 @@ A single file read can cost as much as 10-20 targeted LSP queries.
 5. **Save reads for logic.** Only read files when you need to understand
    _how_ something works, not _what_ it is or _where_ it lives.
 
-6. **Edit with feedback.** The `catenary notify` hook returns LSP diagnostics
-   after every edit, so you immediately see any errors introduced.
+6. **Edit with feedback.** The `catenary hook post-tool` hook returns LSP
+   diagnostics after every edit, so you immediately see any errors introduced.
 
-## Notify Hook
+## Hook Integration
 
-Catenary provides post-edit LSP diagnostics via the `catenary notify` command,
-designed for use as a `PostToolUse` hook in Claude Code.
+Catenary provides post-edit LSP diagnostics via the `catenary hook post-tool`
+command, designed for use as a `PostToolUse` hook in Claude Code.
 
 The recommended setup uses the Catenary plugin (`catenary@catenary`), which
-registers the `catenary notify` hook automatically. For manual configuration,
-add to `.claude/settings.json`:
+registers the hook automatically. For manual configuration, add to
+`.claude/settings.json`:
 
 ```json
 {
@@ -173,7 +173,7 @@ add to `.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
+            "command": "catenary hook post-tool --format=claude"
           }
         ]
       }
