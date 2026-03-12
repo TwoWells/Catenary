@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use crate::session::{self, EventKind, SessionEvent, SessionInfo, SqliteEventTail};
+use crate::session::{self, SessionInfo, SessionMessage, SqliteMessageTail};
 
 /// Collected session row: info, liveness, and active language servers.
 pub struct SessionRow {
@@ -36,19 +36,19 @@ pub trait DataSource {
     /// Returns an error if session data cannot be read.
     fn list_sessions(&self) -> Result<Vec<SessionRow>>;
 
-    /// Load all historical events for a session.
+    /// Load all historical messages for a session.
     ///
     /// # Errors
     ///
-    /// Returns an error if the session does not exist or events cannot be read.
-    fn monitor_events(&self, session_id: &str) -> Result<Vec<SessionEvent>>;
+    /// Returns an error if the session does not exist or messages cannot be read.
+    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
 
-    /// Create a tail reader for new events (from current position onward).
+    /// Create a tail reader for new messages (from current position onward).
     ///
     /// # Errors
     ///
     /// Returns an error if the session does not exist or the tail cannot be created.
-    fn create_tail(&self, session_id: &str) -> Result<Box<dyn EventTail>>;
+    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>>;
 
     /// Delete a dead session's data.
     ///
@@ -68,19 +68,19 @@ pub trait DataSource {
     fn list_alive_session_ids(&self) -> Result<Vec<String>>;
 }
 
-/// Tail reader abstraction for streaming new events.
-pub trait EventTail {
-    /// Read the next event if available. Returns `None` if no new event yet.
+/// Tail reader abstraction for streaming new messages.
+pub trait MessageTail: Send {
+    /// Read the next message if available. Returns `None` if no new message yet.
     ///
     /// # Errors
     ///
     /// Returns an error if reading from the underlying source fails.
-    fn try_next_event(&mut self) -> Result<Option<SessionEvent>>;
+    fn try_next_message(&mut self) -> Result<Option<SessionMessage>>;
 }
 
-impl EventTail for SqliteEventTail {
-    fn try_next_event(&mut self) -> Result<Option<SessionEvent>> {
-        self.try_next_event()
+impl MessageTail for SqliteMessageTail {
+    fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
+        self.try_next_message()
     }
 }
 
@@ -213,32 +213,12 @@ impl DataSource for SqliteDataSource {
         Ok(sessions)
     }
 
-    fn monitor_events(&self, session_id: &str) -> Result<Vec<SessionEvent>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT timestamp, payload FROM events WHERE session_id = ?1 ORDER BY id")?;
-        let mut rows = stmt.query([session_id])?;
-        let mut events = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            let ts: String = row.get(0)?;
-            let payload: String = row.get(1)?;
-
-            if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
-                && let Ok(kind) = serde_json::from_str::<EventKind>(&payload)
-            {
-                events.push(SessionEvent {
-                    timestamp: timestamp.with_timezone(&Utc),
-                    kind,
-                });
-            }
-        }
-
-        Ok(events)
+    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
+        session::monitor_messages_with_conn(&self.conn, session_id)
     }
 
-    fn create_tail(&self, session_id: &str) -> Result<Box<dyn EventTail>> {
-        let tail = session::tail_events_new(session_id)?;
+    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
+        let tail = session::tail_messages_new(session_id)?;
         Ok(Box::new(tail))
     }
 
@@ -295,10 +275,10 @@ fn active_languages_for(conn: &rusqlite::Connection, session_id: &str) -> Vec<St
 pub struct MockDataSource {
     /// Sessions to return from [`DataSource::list_sessions`].
     pub sessions: Vec<SessionRow>,
-    /// Events keyed by session ID for [`DataSource::monitor_events`].
-    pub events: HashMap<String, Vec<SessionEvent>>,
-    /// Tail events keyed by session ID for [`DataSource::create_tail`].
-    pub tail_events: HashMap<String, VecDeque<SessionEvent>>,
+    /// Messages keyed by session ID for [`DataSource::monitor_messages`].
+    pub messages: HashMap<String, Vec<SessionMessage>>,
+    /// Tail messages keyed by session ID for [`DataSource::create_message_tail`].
+    pub tail_messages: HashMap<String, VecDeque<SessionMessage>>,
 }
 
 impl DataSource for MockDataSource {
@@ -317,20 +297,20 @@ impl DataSource for MockDataSource {
         Ok(rows)
     }
 
-    fn monitor_events(&self, session_id: &str) -> Result<Vec<SessionEvent>> {
-        self.events
+    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
+        self.messages
             .get(session_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))
     }
 
-    fn create_tail(&self, session_id: &str) -> Result<Box<dyn EventTail>> {
-        let events = self
-            .tail_events
+    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
+        let messages = self
+            .tail_messages
             .get(session_id)
             .cloned()
             .unwrap_or_default();
-        Ok(Box::new(MockEventTail { events }))
+        Ok(Box::new(MockMessageTail { messages }))
     }
 
     fn delete_session(&self, _session_id: &str) -> Result<()> {
@@ -348,21 +328,21 @@ impl DataSource for MockDataSource {
 }
 
 /// Tail reader backed by a [`VecDeque`] for testing.
-pub struct MockEventTail {
-    events: VecDeque<SessionEvent>,
+pub struct MockMessageTail {
+    messages: VecDeque<SessionMessage>,
 }
 
-impl MockEventTail {
-    /// Create a new mock tail with the given events.
+impl MockMessageTail {
+    /// Create a new mock tail with the given messages.
     #[must_use]
-    pub const fn new(events: VecDeque<SessionEvent>) -> Self {
-        Self { events }
+    pub const fn new(messages: VecDeque<SessionMessage>) -> Self {
+        Self { messages }
     }
 }
 
-impl EventTail for MockEventTail {
-    fn try_next_event(&mut self) -> Result<Option<SessionEvent>> {
-        Ok(self.events.pop_front())
+impl MessageTail for MockMessageTail {
+    fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
+        Ok(self.messages.pop_front())
     }
 }
 
@@ -375,7 +355,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    use crate::session::{EventKind, SessionInfo};
+    use crate::session::SessionInfo;
 
     /// Open an isolated test database in a tempdir.
     /// Returns `(TempDir, PathBuf, Connection)` — the tempdir guard must
@@ -399,14 +379,21 @@ mod tests {
         }
     }
 
-    fn make_event(kind: EventKind) -> SessionEvent {
-        SessionEvent {
+    fn make_message(method: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: "lsp".to_string(),
+            method: method.to_string(),
+            server: "rust-analyzer".to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
             timestamp: Utc::now(),
-            kind,
+            payload: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 
-    // ── Mock tests (unchanged) ───────────────────────────────────────
+    // ── Mock tests ──────────────────────────────────────────────────
 
     #[test]
     fn test_mock_data_source_list_sessions() -> Result<()> {
@@ -423,8 +410,8 @@ mod tests {
                     languages: vec![],
                 },
             ],
-            events: HashMap::new(),
-            tail_events: HashMap::new(),
+            messages: HashMap::new(),
+            tail_messages: HashMap::new(),
         };
 
         let rows = ds.list_sessions()?;
@@ -438,40 +425,40 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_data_source_monitor_events() -> Result<()> {
-        let events = vec![
-            make_event(EventKind::Started),
-            make_event(EventKind::Shutdown),
-            make_event(EventKind::Started),
+    fn test_mock_data_source_monitor_messages() -> Result<()> {
+        let messages = vec![
+            make_message("initialize"),
+            make_message("textDocument/hover"),
+            make_message("textDocument/definition"),
         ];
-        let mut event_map = HashMap::new();
-        event_map.insert("abc".to_string(), events);
+        let mut messages_map = HashMap::new();
+        messages_map.insert("abc".to_string(), messages);
 
         let ds = MockDataSource {
             sessions: vec![],
-            events: event_map,
-            tail_events: HashMap::new(),
+            messages: messages_map,
+            tail_messages: HashMap::new(),
         };
 
-        let result = ds.monitor_events("abc")?;
+        let result = ds.monitor_messages("abc")?;
         assert_eq!(result.len(), 3);
 
-        let err = ds.monitor_events("nonexistent");
+        let err = ds.monitor_messages("nonexistent");
         assert!(err.is_err());
         Ok(())
     }
 
     #[test]
-    fn test_mock_event_tail_drains() -> Result<()> {
-        let mut events = VecDeque::new();
-        events.push_back(make_event(EventKind::Started));
-        events.push_back(make_event(EventKind::Shutdown));
+    fn test_mock_message_tail_drains() -> Result<()> {
+        let mut messages = VecDeque::new();
+        messages.push_back(make_message("initialize"));
+        messages.push_back(make_message("shutdown"));
 
-        let mut tail = MockEventTail::new(events);
+        let mut tail = MockMessageTail::new(messages);
 
-        assert!(tail.try_next_event()?.is_some());
-        assert!(tail.try_next_event()?.is_some());
-        assert!(tail.try_next_event()?.is_none());
+        assert!(tail.try_next_message()?.is_some());
+        assert!(tail.try_next_message()?.is_some());
+        assert!(tail.try_next_message()?.is_none());
         Ok(())
     }
 
@@ -506,21 +493,25 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_data_source_monitor_events() -> Result<()> {
+    fn test_sqlite_data_source_monitor_messages() -> Result<()> {
         let (_dir, path, conn) = test_db();
         let ds = SqliteDataSource::with_conn(conn);
 
-        let session = create_session(&path, "/tmp/test-ds-events")?;
+        let session = create_session(&path, "/tmp/test-ds-messages")?;
         let id = session.info.id.clone();
 
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Ready".to_string(),
-        });
+        session.message_log().log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
 
-        let events = ds.monitor_events(&id)?;
-        // At least Started + ServerState
-        assert!(events.len() >= 2);
+        let messages = ds.monitor_messages(&id)?;
+        assert!(!messages.is_empty(), "should have at least one message");
 
         drop(session);
         ds.delete_session(&id)?;
@@ -528,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_event_tail_streams() -> Result<()> {
+    fn test_sqlite_message_tail_streams() -> Result<()> {
         let (_dir, path, conn) = test_db();
 
         let session = create_session(&path, "/tmp/test-ds-tail")?;
@@ -536,26 +527,31 @@ mod tests {
 
         // Open a fresh connection for the tail (it takes ownership).
         let tail_conn = crate::db::open_at(&path)?;
-        let mut tail = crate::session::tail_events_new_with_conn(tail_conn, &id)?;
+        let mut tail = crate::session::tail_messages_new_with_conn(tail_conn, &id)?;
 
-        // No new events since tail was created after the Started event
-        // (tail_events_new starts from the current end).
+        // No new messages since tail was created after any existing messages
+        // (tail_messages_new starts from the current end).
         assert!(
-            tail.try_next_event()?.is_none(),
-            "should have no events initially"
+            tail.try_next_message()?.is_none(),
+            "should have no messages initially"
         );
 
-        // Broadcast a new event
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Ready".to_string(),
-        });
+        // Log a new message.
+        session.message_log().log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
 
-        let event = tail.try_next_event()?;
-        assert!(event.is_some(), "should see newly broadcast event");
+        let msg = tail.try_next_message()?;
+        assert!(msg.is_some(), "should see newly logged message");
 
-        // No more events
-        assert!(tail.try_next_event()?.is_none());
+        // No more messages.
+        assert!(tail.try_next_message()?.is_none());
 
         drop(session);
         conn.execute("DELETE FROM sessions WHERE id = ?1", [&id])?;
@@ -603,8 +599,8 @@ mod tests {
                     languages: vec![],
                 },
             ],
-            events: HashMap::new(),
-            tail_events: HashMap::new(),
+            messages: HashMap::new(),
+            tail_messages: HashMap::new(),
         };
 
         let ids = ds.list_alive_session_ids()?;

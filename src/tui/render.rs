@@ -382,16 +382,16 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                     let idx = app.grid.open_panel(session_id.clone());
                     app.grid.focus_panel(idx);
                     app.focus = FocusedPane::Events;
-                    // Load events for the panel.
-                    if let Ok(events) = app.data.monitor_events(&session_id)
+                    // Load messages for the panel.
+                    if let Ok(messages) = app.data.monitor_messages(&session_id)
                         && let Some(panel) = app.grid.panels.get_mut(idx)
                     {
-                        panel.load_events(events);
+                        panel.load_messages(messages);
                         panel.update_language_servers();
                     }
                     // Create a tail if one doesn't already exist.
                     if !app.tails.contains_key(&session_id)
-                        && let Ok(tail) = app.data.create_tail(&session_id)
+                        && let Ok(tail) = app.data.create_message_tail(&session_id)
                     {
                         app.tails.insert(session_id, tail);
                     }
@@ -674,7 +674,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use crate::config::IconConfig;
-    use crate::session::{EventKind, SessionEvent, SessionInfo};
+    use crate::session::{SessionInfo, SessionMessage};
     use crate::tui::app::{App, FocusedPane, InputMode};
     use crate::tui::data::{MockDataSource, SessionRow};
     use crate::tui::render::{draw, handle_key_normal};
@@ -697,21 +697,28 @@ mod tests {
         }
     }
 
-    fn make_event(kind: EventKind) -> SessionEvent {
-        SessionEvent {
+    fn make_message(method: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: "lsp".to_string(),
+            method: method.to_string(),
+            server: "rust-analyzer".to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
             timestamp: chrono::Utc::now(),
-            kind,
+            payload: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 
     fn make_mock_data(
         sessions: Vec<SessionRow>,
-        events_map: HashMap<String, Vec<SessionEvent>>,
+        messages_map: HashMap<String, Vec<SessionMessage>>,
     ) -> MockDataSource {
         MockDataSource {
             sessions,
-            events: events_map,
-            tail_events: HashMap::new(),
+            messages: messages_map,
+            tail_messages: HashMap::new(),
         }
     }
 
@@ -737,36 +744,24 @@ mod tests {
             make_session("active01", "/ws/test", true),
             make_session("active02", "/ws/test", true),
         ];
-        let mut events_map = HashMap::new();
-        events_map.insert(
+        let mut messages_map = HashMap::new();
+        messages_map.insert(
             "active01".to_string(),
             vec![
-                make_event(EventKind::Started),
-                make_event(EventKind::ToolCall {
-                    tool: "hover".to_string(),
-                    file: Some("/src/main.rs".to_string()),
-                    params: None,
-                }),
+                make_message("initialize"),
+                make_message("textDocument/hover"),
             ],
         );
-        events_map.insert(
+        messages_map.insert(
             "active02".to_string(),
             vec![
-                make_event(EventKind::Started),
-                make_event(EventKind::ToolCall {
-                    tool: "search".to_string(),
-                    file: None,
-                    params: None,
-                }),
-                make_event(EventKind::ToolCall {
-                    tool: "definition".to_string(),
-                    file: Some("/src/lib.rs".to_string()),
-                    params: None,
-                }),
+                make_message("initialize"),
+                make_message("workspace/symbol"),
+                make_message("textDocument/definition"),
             ],
         );
 
-        let data = Box::new(make_mock_data(sessions, events_map));
+        let data = Box::new(make_mock_data(sessions, messages_map));
         let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
 
         // Load events into the open panels.
@@ -777,10 +772,10 @@ mod tests {
             .map(|p| p.session_id.clone())
             .collect();
         for id in &panel_ids {
-            if let Ok(events) = app.data.monitor_events(id)
+            if let Ok(messages) = app.data.monitor_messages(id)
                 && let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == *id)
             {
-                panel.load_events(events);
+                panel.load_messages(messages);
             }
         }
 
@@ -848,9 +843,9 @@ mod tests {
         let icons = IconSet::from_config(IconConfig::default());
 
         let sessions = vec![make_session("sess0001", "/ws/test", true)];
-        let mut events_map = HashMap::new();
-        events_map.insert("sess0001".to_string(), vec![make_event(EventKind::Started)]);
-        let data = Box::new(make_mock_data(sessions, events_map));
+        let mut messages_map = HashMap::new();
+        messages_map.insert("sess0001".to_string(), vec![make_message("initialize")]);
+        let data = Box::new(make_mock_data(sessions, messages_map));
         let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
 
         assert_eq!(app.focus, FocusedPane::Sessions);
@@ -873,9 +868,9 @@ mod tests {
         let icons = IconSet::from_config(IconConfig::default());
 
         let sessions = vec![make_session("sess0001", "/ws/test", true)];
-        let mut events_map = HashMap::new();
-        events_map.insert("sess0001".to_string(), vec![make_event(EventKind::Started)]);
-        let data = Box::new(make_mock_data(sessions, events_map));
+        let mut messages_map = HashMap::new();
+        messages_map.insert("sess0001".to_string(), vec![make_message("initialize")]);
+        let data = Box::new(make_mock_data(sessions, messages_map));
         let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
 
         // Move focus to Events.

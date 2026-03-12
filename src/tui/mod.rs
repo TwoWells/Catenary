@@ -46,7 +46,7 @@ use ratatui::backend::CrosstermBackend;
 use tracing::warn;
 
 use crate::config::IconConfig;
-use crate::session::{self, EventKind};
+use crate::session;
 
 use self::app::{FocusedPane, InputMode};
 use self::data::SqliteDataSource;
@@ -144,7 +144,7 @@ fn run_with_data_and_watcher(
 
     let mut app = App::new(&theme, &icons, data, tui_config.sessions_width)?;
 
-    // Load events for auto-opened panels and create tails.
+    // Load messages for auto-opened panels and create tails.
     let panel_ids: Vec<String> = app
         .grid
         .panels
@@ -152,13 +152,13 @@ fn run_with_data_and_watcher(
         .map(|p| p.session_id.clone())
         .collect();
     for id in &panel_ids {
-        if let Ok(events) = app.data.monitor_events(id)
+        if let Ok(messages) = app.data.monitor_messages(id)
             && let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == *id)
         {
-            panel.load_events(events);
+            panel.load_messages(messages);
             panel.update_language_servers();
         }
-        if let Ok(tail) = app.data.create_tail(id) {
+        if let Ok(tail) = app.data.create_message_tail(id) {
             app.tails.insert(id.clone(), tail);
         }
     }
@@ -441,43 +441,20 @@ fn scrollbar_click(app: &mut App<'_>, panel: usize, y: u16) {
     }
 }
 
-/// Poll all event tails and push new events into their panels.
-///
-/// Tracks `Shutdown` events and handles them after draining: marks the
-/// session dead in the tree, closes its panel, and removes its tail.
+/// Poll all message tails and push new messages into their panels.
 fn poll_tails(app: &mut App<'_>) {
     let ids: Vec<String> = app.tails.keys().cloned().collect();
-    let mut shutdown_ids: Vec<String> = Vec::new();
 
     for id in ids {
         let Some(tail) = app.tails.get_mut(&id) else {
             continue;
         };
-        while let Ok(Some(event)) = tail.try_next_event() {
-            let is_shutdown = matches!(event.kind, EventKind::Shutdown);
-            let is_server_state = matches!(event.kind, EventKind::ServerState { .. });
+        while let Ok(Some(msg)) = tail.try_next_message() {
             if let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == id) {
-                panel.push_event(event);
-                if is_server_state {
-                    panel.update_language_servers();
-                }
-            }
-            if is_shutdown {
-                shutdown_ids.push(id.clone());
+                panel.push_message(msg);
+                panel.update_language_servers();
             }
         }
-    }
-
-    // Handle shutdowns: mark dead, close panel, remove tail.
-    for id in &shutdown_ids {
-        app.tree.mark_session_dead(id);
-        if let Some(idx) = app.grid.panel_for_session(id) {
-            app.grid.close_panel(idx);
-        }
-        app.tails.remove(id);
-    }
-    if !shutdown_ids.is_empty() && app.grid.panels.is_empty() && app.focus == FocusedPane::Events {
-        app.focus = FocusedPane::Sessions;
     }
 }
 
@@ -542,13 +519,13 @@ fn check_new_sessions(app: &mut App<'_>) {
     for id in &alive_ids {
         if app.grid.panel_for_session(id).is_none() {
             let idx = app.grid.open_panel(id.clone());
-            if let Ok(events) = app.data.monitor_events(id)
+            if let Ok(messages) = app.data.monitor_messages(id)
                 && let Some(panel) = app.grid.panels.get_mut(idx)
             {
-                panel.load_events(events);
+                panel.load_messages(messages);
                 panel.update_language_servers();
             }
-            if let Ok(tail) = app.data.create_tail(id) {
+            if let Ok(tail) = app.data.create_message_tail(id) {
                 app.tails.insert(id.clone(), tail);
             }
         }

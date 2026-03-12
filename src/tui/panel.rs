@@ -403,7 +403,7 @@ const MAX_DETAIL_PAYLOAD_LINES: usize = 20;
 #[must_use]
 pub fn detail_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'static>> {
     let payload = &msg.payload;
-    if payload.as_object().is_none_or(|o| o.is_empty()) {
+    if payload.as_object().is_none_or(serde_json::Map::is_empty) {
         return Vec::new();
     }
 
@@ -688,9 +688,7 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
                 detail_index,
             } => detail_cache
                 .entry(*message_index)
-                .or_insert_with(|| {
-                    detail_lines(&state.messages[*message_index], state.theme)
-                })
+                .or_insert_with(|| detail_lines(&state.messages[*message_index], state.theme))
                 .get(*detail_index)
                 .cloned()
                 .unwrap_or_default(),
@@ -1134,17 +1132,18 @@ mod tests {
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
         panel.messages = vec![
             make_message("lsp", "textDocument/hover", "rust-analyzer"),
-            make_message("lsp", "textDocument/completion", "typescript-language-server"),
+            make_message(
+                "lsp",
+                "textDocument/completion",
+                "typescript-language-server",
+            ),
         ];
 
         panel.update_language_servers();
         assert_eq!(panel.language_servers.len(), 2);
         assert_eq!(panel.language_servers[0].name, "rust-analyzer");
         assert_eq!(panel.language_servers[0].state, LsState::Healthy);
-        assert_eq!(
-            panel.language_servers[1].name,
-            "typescript-language-server"
-        );
+        assert_eq!(panel.language_servers[1].name, "typescript-language-server");
         assert_eq!(panel.language_servers[1].state, LsState::Healthy);
     }
 
@@ -1238,7 +1237,15 @@ mod tests {
         let flat = panel.flat_lines();
         let detail_pos = flat
             .iter()
-            .position(|fl| matches!(fl, FlatLine::Detail { message_index: 1, .. }))
+            .position(|fl| {
+                matches!(
+                    fl,
+                    FlatLine::Detail {
+                        message_index: 1,
+                        ..
+                    }
+                )
+            })
             .expect("should have detail lines");
         panel.cursor = detail_pos;
 
@@ -1280,10 +1287,10 @@ mod tests {
         panel.tail_attached = false;
 
         // Walk through all lines one by one.
-        for i in 1..flat.len() {
+        for expected in flat.iter().skip(1) {
             panel.navigate(1);
             let current_flat = panel.flat_lines();
-            assert_eq!(current_flat[panel.cursor], flat[i]);
+            assert_eq!(current_flat[panel.cursor], *expected);
         }
     }
 
@@ -1311,7 +1318,10 @@ mod tests {
         let theme = test_theme();
 
         let lines = detail_lines(&msg, &theme);
-        assert!(lines.is_empty(), "empty payload should have no detail lines");
+        assert!(
+            lines.is_empty(),
+            "empty payload should have no detail lines"
+        );
     }
 
     #[test]
@@ -1367,10 +1377,7 @@ mod tests {
         // Header should show the diagnostics summary.
         assert!(content.contains("lib.rs"), "expected file name in header");
         // Detail lines should contain the payload.
-        assert!(
-            content.contains("post-tool"),
-            "expected method in detail"
-        );
+        assert!(content.contains("post-tool"), "expected method in detail");
     }
 
     #[test]
@@ -1383,9 +1390,6 @@ mod tests {
             make_message("lsp", "initialized", "rust-analyzer"),
         ];
         assert!(panel.has_detail(0), "non-empty payload should have detail");
-        assert!(
-            !panel.has_detail(1),
-            "empty payload should not have detail"
-        );
+        assert!(!panel.has_detail(1), "empty payload should not have detail");
     }
 }
