@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c678b1b6.js";
+            window.path_to_searchindex_js = "searchindex-5baba51a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a743189e.js"></script>
@@ -234,7 +234,7 @@ every turn. The problem scales with session length, not window size.</p>
 <p>Catenary replaces brute-force file scanning with <strong>graph navigation</strong>.</p>
 <p>Instead of grepping across 20 files to find a definition, <code>definition</code> returns
 the exact location in one query. Instead of re-reading a file after editing it
-to check for errors, the <code>catenary notify</code> hook returns diagnostics inline.
+to check for errors, the <code>catenary hook post-tool</code> hook returns diagnostics inline.
 Instead of fumbling with line numbers to find usages, <code>search</code> returns symbols,
 semantic references, and text matches in a single call.</p>
 <p>Each LSP query is small and stateless. Nothing accumulates. The context stays
@@ -274,7 +274,7 @@ lean across the entire session, regardless of how long the agent works.</p>
 <p>Catenary bridges <a href="https://modelcontextprotocol.io/">MCP</a> and
 <a href="https://microsoft.github.io/language-server-protocol/">LSP</a>. It manages
 multiple language servers, routes requests by file type, and provides automatic
-post-edit diagnostics via the <code>catenary notify</code> hook — all through a single MCP
+post-edit diagnostics via the <code>catenary hook post-tool</code> hook — all through a single MCP
 server. The agent never needs to know which server handles which language.</p>
 <h2 id="constrained-mode"><a class="header" href="#constrained-mode">Constrained Mode</a></h2>
 <p>Catenary is designed to be the agent’s <strong>primary navigation toolkit</strong>, not a
@@ -282,7 +282,7 @@ supplement. In constrained mode, the host CLI’s text-scanning commands (grep,
 cat, find, ls, etc.) are denied via permissions, forcing the agent to use LSP
 queries for navigation. The host’s native file I/O tools remain available for
 reading and editing, with Catenary providing post-edit diagnostics via the
-<code>catenary notify</code> hook.</p>
+<code>catenary hook post-tool</code> hook.</p>
 <p>See <a href="#cli-integration">CLI Integration</a> for setup instructions.</p>
 <blockquote>
 <p>Catenary also works as a supplement alongside built-in tools. But without
@@ -325,13 +325,13 @@ grepping — and the efficiency gains are lost.</p>
 <tr><th>Feature</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><strong>Diagnostics</strong></td><td>Errors, warnings, and quick-fix suggestions delivered inline after every edit via the <code>catenary notify</code> PostToolUse hook</td></tr>
+<tr><td><strong>Diagnostics</strong></td><td>Errors, warnings, and quick-fix suggestions delivered inline after every edit via the <code>catenary hook post-tool</code> PostToolUse hook</td></tr>
 </tbody>
 </table>
 </div>
 <p>File reading and editing is handled by the host tool’s native file operations
 (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). Catenary provides <strong>post-edit
-LSP diagnostics</strong> (including quick-fix code actions) via the <code>catenary notify</code>
+LSP diagnostics</strong> (including quick-fix code actions) via the <code>catenary hook post-tool</code>
 hook — diagnostics and fix suggestions appear in the model’s context after
 every edit. See <a href="#cli-integration">CLI Integration</a> for hook configuration.</p>
 <p><code>search</code> (with the optional <code>paths</code> parameter) and <code>glob</code> can operate outside
@@ -761,7 +761,7 @@ maintaining a CLI.</p>
 <ol>
 <li>
 <p><strong>Install the Extension:</strong> The Catenary extension provides an
-<code>AfterTool</code> hook that runs <code>catenary notify</code> after file operations,
+<code>AfterTool</code> hook that runs <code>catenary hook post-tool</code> after file operations,
 so the model sees LSP diagnostics immediately.</p>
 <pre><code class="language-bash">gemini extensions install https://github.com/MarkWells-Dev/Catenary
 </code></pre>
@@ -835,7 +835,7 @@ Catenary provides LSP diagnostics via a <code>PostToolUse</code> hook.</p>
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
+            "command": "catenary hook post-tool --format=claude"
           }
         ]
       }
@@ -848,8 +848,8 @@ Catenary provides LSP diagnostics via a <code>PostToolUse</code> hook.</p>
   }
 }
 </code></pre>
-<p>The <code>catenary notify</code> command reads the hook’s JSON from stdin, finds the
-running Catenary session for the workspace, and returns any LSP diagnostics.
+<p>The <code>catenary hook post-tool</code> command reads the hook’s JSON from stdin, finds
+the running Catenary session for the workspace, and returns any LSP diagnostics.
 It exits silently on any error so it never blocks Claude Code’s flow.</p>
 <p><strong>Alternative: Constrained mode.</strong> Keep Claude Code’s native <code>Read</code>, <code>Edit</code>,
 <code>Write</code>, and <code>Bash</code> tools but block text-scanning commands to force LSP-first
@@ -912,7 +912,7 @@ path that would let the model fall back to text scanning. The model uses:</p>
 <ul>
 <li><strong>Catenary <code>grep</code></strong> for content discovery (symbols, references, text matches)</li>
 <li><strong>Catenary <code>glob</code></strong> for directory browsing (replaces <code>ls</code>, <code>tree</code>, <code>find</code>)</li>
-<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary notify</code> hook for diagnostics)</li>
+<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary hook post-tool</code> for diagnostics)</li>
 <li><strong>Claude Code <code>Bash</code></strong> for build, test, and git commands only</li>
 </ul>
 <h2 id="experiment-results"><a class="header" href="#experiment-results">Experiment Results</a></h2>
@@ -985,7 +985,7 @@ by giving explicit deny messages instead of silently removing tools.</p>
 </table>
 </div>
 <p>File I/O is handled by the host tool’s native file operations. Catenary
-provides post-edit diagnostics via the <code>catenary notify</code> hook.</p>
+provides post-edit diagnostics via the <code>catenary hook post-tool</code> hook.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <h3 id="lsp-dependency"><a class="header" href="#lsp-dependency">LSP Dependency</a></h3>
 <p>Semantic enrichment in <code>grep</code> (references, implementations, type cross-refs)
@@ -1108,7 +1108,7 @@ blocked, starved, and progress-explained ticks are free waits.</p>
 <p><code>didSave</code> is gated on <code>textDocumentSync.save</code> from <code>ServerCapabilities</code>. Only
 servers that advertise save support receive <code>textDocument/didSave</code>.</p>
 <p>This mechanism applies to the paths that return diagnostics after a change:
-the <code>catenary notify</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
+the <code>catenary hook post-tool</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
 tool. Request/response tools (<code>definition</code>, <code>document_symbols</code>) do not need
 it — their results come directly from the server response, not from the cache.</p>
 <p>The wait model uses CPU-tick failure detection and LSP version matching
@@ -1240,9 +1240,9 @@ session lifetime — protocol changes require a fresh session.</p>
 <li><strong><code>.mcp.json</code></strong> — declares the MCP server (<code>catenary</code> command).</li>
 <li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics and root sync:
 <ul>
-<li><code>PreToolUse</code> (all tools): runs <code>catenary sync-roots</code> to pick up <code>/add-dir</code>
+<li><code>PreToolUse</code> (all tools): runs <code>catenary hook pre-tool</code> to pick up <code>/add-dir</code>
 workspace additions and directory removals.</li>
-<li><code>PostToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary notify</code>
+<li><code>PostToolUse</code> on <code>Edit|Write|NotebookEdit|Read</code>: runs <code>catenary hook post-tool</code>
 to return LSP diagnostics after file operations.</li>
 </ul>
 </li>
@@ -1259,18 +1259,19 @@ contain hooks (Gemini CLI ignores hooks defined in the manifest).</li>
 <li><strong><code>hooks/hooks.json</code></strong> — registers hooks for diagnostics:
 <ul>
 <li><code>AfterTool</code> on <code>read_file|write_file|replace</code>: runs
-<code>catenary notify --format=gemini</code> to return LSP diagnostics after file
-operations.</li>
+<code>catenary hook post-tool --format=gemini</code> to return LSP diagnostics after
+file operations.</li>
 </ul>
 </li>
 </ul>
 <h2 id="hook-contracts"><a class="header" href="#hook-contracts">Hook Contracts</a></h2>
-<p>All hook commands (<code>catenary notify</code>, <code>catenary sync-roots</code>) read hook JSON from
-stdin. They silently succeed on any error to avoid breaking the host CLI’s flow.</p>
-<h3 id="catenary-notify"><a class="header" href="#catenary-notify"><code>catenary notify</code></a></h3>
+<p>All hook commands (<code>catenary hook post-tool</code>, <code>catenary hook pre-tool</code>) read
+hook JSON from stdin. They silently succeed on any error to avoid breaking the
+host CLI’s flow.</p>
+<h3 id="catenary-hook-post-tool"><a class="header" href="#catenary-hook-post-tool"><code>catenary hook post-tool</code></a></h3>
 <p>Triggered after file reads or edits (Claude Code <code>PostToolUse</code>, Gemini
-<code>AfterTool</code>). Connects to the session’s notify socket and returns LSP
-diagnostics to stdout.</p>
+<code>AfterTool</code>). Connects to the session’s hook socket and returns LSP diagnostics
+to stdout.</p>
 <p><strong>Fields consumed from hook JSON:</strong></p>
 <div class="table-wrapper">
 <table>
@@ -1296,7 +1297,7 @@ diagnostics to stdout.</p>
 </div>
 <p><strong>Output:</strong> silent when no diagnostics. Otherwise returns JSON with
 <code>additionalContext</code> containing the diagnostic text.</p>
-<h3 id="catenary-sync-roots"><a class="header" href="#catenary-sync-roots"><code>catenary sync-roots</code></a></h3>
+<h3 id="catenary-hook-pre-tool"><a class="header" href="#catenary-hook-pre-tool"><code>catenary hook pre-tool</code></a></h3>
 <p>Triggered before each tool use (Claude Code only). Scans the Claude Code
 transcript for <code>/add-dir</code> additions and directory removals, then sends the full
 workspace root set to the running Catenary session. The server diffs against its
@@ -1840,7 +1841,7 @@ language server directly.</p>
 <h2 id="when-to-use-lsp-vs-native-file-tools"><a class="header" href="#when-to-use-lsp-vs-native-file-tools">When to Use LSP vs Native File Tools</a></h2>
 <p>Catenary provides two MCP tools (<code>grep</code> and <code>glob</code>) plus post-edit diagnostics
 via hooks. File reading and editing is handled by the host tool’s native file
-operations (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). The <code>catenary notify</code>
+operations (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). The <code>catenary hook post-tool</code>
 hook provides post-edit LSP diagnostics so you immediately see any errors
 introduced by changes.</p>
 <p><strong>Use Catenary tools</strong> for:</p>
@@ -1924,16 +1925,16 @@ references — actual usages, not text matches.</p>
 <em>how</em> something works, not <em>what</em> it is or <em>where</em> it lives.</p>
 </li>
 <li>
-<p><strong>Edit with feedback.</strong> The <code>catenary notify</code> hook returns LSP diagnostics
-after every edit, so you immediately see any errors introduced.</p>
+<p><strong>Edit with feedback.</strong> The <code>catenary hook post-tool</code> hook returns LSP
+diagnostics after every edit, so you immediately see any errors introduced.</p>
 </li>
 </ol>
-<h2 id="notify-hook"><a class="header" href="#notify-hook">Notify Hook</a></h2>
-<p>Catenary provides post-edit LSP diagnostics via the <code>catenary notify</code> command,
-designed for use as a <code>PostToolUse</code> hook in Claude Code.</p>
+<h2 id="hook-integration"><a class="header" href="#hook-integration">Hook Integration</a></h2>
+<p>Catenary provides post-edit LSP diagnostics via the <code>catenary hook post-tool</code>
+command, designed for use as a <code>PostToolUse</code> hook in Claude Code.</p>
 <p>The recommended setup uses the Catenary plugin (<code>catenary@catenary</code>), which
-registers the <code>catenary notify</code> hook automatically. For manual configuration,
-add to <code>.claude/settings.json</code>:</p>
+registers the hook automatically. For manual configuration, add to
+<code>.claude/settings.json</code>:</p>
 <pre><code class="language-json">{
   "hooks": {
     "PostToolUse": [
@@ -1942,7 +1943,7 @@ add to <code>.claude/settings.json</code>:</p>
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
+            "command": "catenary hook post-tool --format=claude"
           }
         ]
       }

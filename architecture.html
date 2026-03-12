@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c678b1b6.js";
+            window.path_to_searchindex_js = "searchindex-5baba51a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a743189e.js"></script>
@@ -289,7 +289,7 @@ blocked, starved, and progress-explained ticks are free waits.</p>
 <p><code>didSave</code> is gated on <code>textDocumentSync.save</code> from <code>ServerCapabilities</code>. Only
 servers that advertise save support receive <code>textDocument/didSave</code>.</p>
 <p>This mechanism applies to the paths that return diagnostics after a change:
-the <code>catenary notify</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
+the <code>catenary hook post-tool</code> hook (for post-edit diagnostics) and the <code>diagnostics</code>
 tool. Request/response tools (<code>definition</code>, <code>document_symbols</code>) do not need
 it — their results come directly from the server response, not from the cache.</p>
 <p>The wait model uses CPU-tick failure detection and LSP version matching

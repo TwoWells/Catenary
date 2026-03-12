@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c678b1b6.js";
+            window.path_to_searchindex_js = "searchindex-5baba51a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a743189e.js"></script>
@@ -221,7 +221,7 @@ maintaining a CLI.</p>
 <ol>
 <li>
 <p><strong>Install the Extension:</strong> The Catenary extension provides an
-<code>AfterTool</code> hook that runs <code>catenary notify</code> after file operations,
+<code>AfterTool</code> hook that runs <code>catenary hook post-tool</code> after file operations,
 so the model sees LSP diagnostics immediately.</p>
 <pre><code class="language-bash">gemini extensions install https://github.com/MarkWells-Dev/Catenary
 </code></pre>
@@ -295,7 +295,7 @@ Catenary provides LSP diagnostics via a <code>PostToolUse</code> hook.</p>
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
+            "command": "catenary hook post-tool --format=claude"
           }
         ]
       }
@@ -308,8 +308,8 @@ Catenary provides LSP diagnostics via a <code>PostToolUse</code> hook.</p>
   }
 }
 </code></pre>
-<p>The <code>catenary notify</code> command reads the hook’s JSON from stdin, finds the
-running Catenary session for the workspace, and returns any LSP diagnostics.
+<p>The <code>catenary hook post-tool</code> command reads the hook’s JSON from stdin, finds
+the running Catenary session for the workspace, and returns any LSP diagnostics.
 It exits silently on any error so it never blocks Claude Code’s flow.</p>
 <p><strong>Alternative: Constrained mode.</strong> Keep Claude Code’s native <code>Read</code>, <code>Edit</code>,
 <code>Write</code>, and <code>Bash</code> tools but block text-scanning commands to force LSP-first
@@ -372,7 +372,7 @@ path that would let the model fall back to text scanning. The model uses:</p>
 <ul>
 <li><strong>Catenary <code>grep</code></strong> for content discovery (symbols, references, text matches)</li>
 <li><strong>Catenary <code>glob</code></strong> for directory browsing (replaces <code>ls</code>, <code>tree</code>, <code>find</code>)</li>
-<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary notify</code> hook for diagnostics)</li>
+<li><strong>Claude Code <code>Read</code>/<code>Edit</code>/<code>Write</code></strong> for file I/O (with <code>catenary hook post-tool</code> for diagnostics)</li>
 <li><strong>Claude Code <code>Bash</code></strong> for build, test, and git commands only</li>
 </ul>
 <h2 id="experiment-results"><a class="header" href="#experiment-results">Experiment Results</a></h2>
@@ -445,7 +445,7 @@ by giving explicit deny messages instead of silently removing tools.</p>
 </table>
 </div>
 <p>File I/O is handled by the host tool’s native file operations. Catenary
-provides post-edit diagnostics via the <code>catenary notify</code> hook.</p>
+provides post-edit diagnostics via the <code>catenary hook post-tool</code> hook.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <h3 id="lsp-dependency"><a class="header" href="#lsp-dependency">LSP Dependency</a></h3>
 <p>Semantic enrichment in <code>grep</code> (references, implementations, type cross-refs)

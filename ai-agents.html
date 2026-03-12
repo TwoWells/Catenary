@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c678b1b6.js";
+            window.path_to_searchindex_js = "searchindex-5baba51a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a743189e.js"></script>
@@ -236,7 +236,7 @@ language server directly.</p>
 <h2 id="when-to-use-lsp-vs-native-file-tools"><a class="header" href="#when-to-use-lsp-vs-native-file-tools">When to Use LSP vs Native File Tools</a></h2>
 <p>Catenary provides two MCP tools (<code>grep</code> and <code>glob</code>) plus post-edit diagnostics
 via hooks. File reading and editing is handled by the host tool’s native file
-operations (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). The <code>catenary notify</code>
+operations (e.g. Claude Code’s <code>Read</code>, <code>Edit</code>, <code>Write</code>). The <code>catenary hook post-tool</code>
 hook provides post-edit LSP diagnostics so you immediately see any errors
 introduced by changes.</p>
 <p><strong>Use Catenary tools</strong> for:</p>
@@ -320,16 +320,16 @@ references — actual usages, not text matches.</p>
 <em>how</em> something works, not <em>what</em> it is or <em>where</em> it lives.</p>
 </li>
 <li>
-<p><strong>Edit with feedback.</strong> The <code>catenary notify</code> hook returns LSP diagnostics
-after every edit, so you immediately see any errors introduced.</p>
+<p><strong>Edit with feedback.</strong> The <code>catenary hook post-tool</code> hook returns LSP
+diagnostics after every edit, so you immediately see any errors introduced.</p>
 </li>
 </ol>
-<h2 id="notify-hook"><a class="header" href="#notify-hook">Notify Hook</a></h2>
-<p>Catenary provides post-edit LSP diagnostics via the <code>catenary notify</code> command,
-designed for use as a <code>PostToolUse</code> hook in Claude Code.</p>
+<h2 id="hook-integration"><a class="header" href="#hook-integration">Hook Integration</a></h2>
+<p>Catenary provides post-edit LSP diagnostics via the <code>catenary hook post-tool</code>
+command, designed for use as a <code>PostToolUse</code> hook in Claude Code.</p>
 <p>The recommended setup uses the Catenary plugin (<code>catenary@catenary</code>), which
-registers the <code>catenary notify</code> hook automatically. For manual configuration,
-add to <code>.claude/settings.json</code>:</p>
+registers the hook automatically. For manual configuration, add to
+<code>.claude/settings.json</code>:</p>
 <pre><code class="language-json">{
   "hooks": {
     "PostToolUse": [
@@ -338,7 +338,7 @@ add to <code>.claude/settings.json</code>:</p>
         "hooks": [
           {
             "type": "command",
-            "command": "catenary notify --format=claude"
+            "command": "catenary hook post-tool --format=claude"
           }
         ]
       }
