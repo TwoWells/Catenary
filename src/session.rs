@@ -616,6 +616,89 @@ impl SqliteEventTail {
     }
 }
 
+// ── Message tailing (SQLite-backed) ──────────────────────────────────
+
+/// Polls the messages table for new messages, parallel to
+/// [`SqliteEventTail`] for events.
+pub struct SqliteMessageTail {
+    conn: Connection,
+    session_id: String,
+    last_id: i64,
+}
+
+impl SqliteMessageTail {
+    /// Read the next message if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading from the database fails.
+    pub fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
+        let result = self.conn.query_row(
+            "SELECT id, timestamp, type, method, server, client, \
+             request_id, parent_id, payload FROM messages \
+             WHERE session_id = ?1 AND id > ?2 ORDER BY id LIMIT 1",
+            rusqlite::params![&self.session_id, self.last_id],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let ts: String = row.get(1)?;
+                let r#type: String = row.get(2)?;
+                let method: String = row.get(3)?;
+                let server: String = row.get(4)?;
+                let client: String = row.get(5)?;
+                let request_id: Option<i64> = row.get(6)?;
+                let parent_id: Option<i64> = row.get(7)?;
+                let payload: String = row.get(8)?;
+                Ok((
+                    id, ts, r#type, method, server, client, request_id, parent_id, payload,
+                ))
+            },
+        );
+
+        match result {
+            Ok((id, ts, r#type, method, server, client, request_id, parent_id, payload)) => {
+                self.last_id = id;
+                let timestamp = DateTime::parse_from_rfc3339(&ts)
+                    .with_context(|| format!("invalid message timestamp: {ts}"))?
+                    .with_timezone(&Utc);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&payload).context("invalid message payload")?;
+                Ok(Some(SessionMessage {
+                    id,
+                    r#type,
+                    method,
+                    server,
+                    client,
+                    request_id,
+                    parent_id,
+                    timestamp,
+                    payload,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Check if GC deleted rows past our high-water mark.
+                let max_id: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT MAX(id) FROM messages WHERE session_id = ?1",
+                        [&self.session_id],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                    .flatten();
+
+                if let Some(max) = max_id
+                    && max < self.last_id
+                {
+                    self.last_id = 0;
+                }
+
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 // ── Free functions ───────────────────────────────────────────────────
 
 /// Raw row from the sessions table (avoids complex tuple types).
@@ -854,6 +937,54 @@ pub fn monitor_events_with_conn(conn: &Connection, id: &str) -> Result<Vec<Sessi
     Ok(events)
 }
 
+/// Load all messages for a session, ordered by id.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn monitor_messages_with_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionMessage>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp, type, method, server, client, \
+         request_id, parent_id, payload FROM messages \
+         WHERE session_id = ?1 ORDER BY id",
+    )?;
+    let mut rows = stmt.query([session_id])?;
+    let mut messages = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let ts: String = row.get(1)?;
+        let r#type: String = row.get(2)?;
+        let method: String = row.get(3)?;
+        let server: String = row.get(4)?;
+        let client: String = row.get(5)?;
+        let request_id: Option<i64> = row.get(6)?;
+        let parent_id: Option<i64> = row.get(7)?;
+        let payload_str: String = row.get(8)?;
+
+        if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
+            && let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str)
+        {
+            messages.push(SessionMessage {
+                id,
+                r#type,
+                method,
+                server,
+                client,
+                request_id,
+                parent_id,
+                timestamp: timestamp.with_timezone(&Utc),
+                payload,
+            });
+        }
+    }
+
+    Ok(messages)
+}
+
 /// Tail events from a session (follows new events from the beginning).
 ///
 /// Opens a database connection internally. For explicit connection
@@ -933,6 +1064,42 @@ pub fn tail_events_new_with_conn(conn: Connection, id: &str) -> Result<SqliteEve
     })
 }
 
+/// Tail only *new* messages from a session (starts from current end).
+///
+/// Opens a database connection internally. For explicit connection
+/// management, use [`tail_messages_new_with_conn`].
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or queried.
+pub fn tail_messages_new(id: &str) -> Result<SqliteMessageTail> {
+    let conn = crate::db::open()?;
+    tail_messages_new_with_conn(conn, id)
+}
+
+/// Tail only *new* messages from a session using an existing database connection.
+///
+/// The connection is moved into the returned [`SqliteMessageTail`] for polling.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried.
+pub fn tail_messages_new_with_conn(conn: Connection, id: &str) -> Result<SqliteMessageTail> {
+    let last_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok(SqliteMessageTail {
+        conn,
+        session_id: id.to_string(),
+        last_id,
+    })
+}
+
 /// Get active languages for a session by reading its events.
 ///
 /// Opens a database connection internally. For explicit connection
@@ -948,33 +1115,25 @@ pub fn active_languages(id: &str) -> Result<Vec<String>> {
 
 /// Get active languages for a session using an existing database connection.
 ///
+/// Returns the set of LSP server names that have communicated during
+/// the session, derived from the `messages` table.
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be queried.
 pub fn active_languages_with_conn(conn: &Connection, id: &str) -> Result<Vec<String>> {
-    use std::collections::HashMap;
-
     let mut stmt = conn.prepare(
-        "SELECT payload FROM events WHERE session_id = ?1 AND kind = 'server_state' ORDER BY id",
+        "SELECT DISTINCT server FROM messages \
+         WHERE session_id = ?1 AND type = 'lsp' \
+         ORDER BY server",
     )?;
     let mut rows = stmt.query([id])?;
-    let mut states: HashMap<String, String> = HashMap::new();
+    let mut languages = Vec::new();
 
     while let Some(row) = rows.next()? {
-        let payload: String = row.get(0)?;
-        if let Ok(EventKind::ServerState { language, state }) =
-            serde_json::from_str::<EventKind>(&payload)
-        {
-            if state == "Dead" {
-                states.remove(&language);
-            } else {
-                states.insert(language, state);
-            }
-        }
+        languages.push(row.get(0)?);
     }
 
-    let mut languages: Vec<String> = states.keys().cloned().collect();
-    languages.sort();
     Ok(languages)
 }
 
@@ -1271,92 +1430,153 @@ mod tests {
 
     #[test]
     fn test_active_languages_empty() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let session = create_session(&path, "/tmp/test-langs-empty")?;
-        let id = session.info.id.clone();
+        let (_dir, _path, conn) = test_db();
 
-        let langs = active_languages_with_conn(&conn, &id)?;
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let langs = active_languages_with_conn(&conn, "s1")?;
         assert!(langs.is_empty());
 
-        drop(session);
-        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
-    fn test_active_languages_tracks_server_state() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let session = create_session(&path, "/tmp/test-langs-state")?;
-        let id = session.info.id.clone();
+    fn test_active_languages_single_server() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
 
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Initializing".to_string(),
-        });
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
 
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Ready".to_string(),
-        });
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+        log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
 
-        let langs = active_languages_with_conn(&conn, &id)?;
-        assert_eq!(langs, vec!["rust"]);
+        let langs = {
+            let c = conn.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            active_languages_with_conn(&c, "s1")?
+        };
+        assert_eq!(langs, vec!["rust-analyzer"]);
 
-        drop(session);
-        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
-    fn test_active_languages_removes_dead() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let session = create_session(&path, "/tmp/test-langs-dead")?;
-        let id = session.info.id.clone();
+    fn test_active_languages_excludes_non_lsp() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
 
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Ready".to_string(),
-        });
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
 
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Dead".to_string(),
-        });
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+        // MCP and hook messages should not appear.
+        log.log(
+            "mcp",
+            "tools/call",
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
+        log.log(
+            "hook",
+            "post-tool",
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
 
-        let langs = active_languages_with_conn(&conn, &id)?;
+        let langs = {
+            let c = conn.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            active_languages_with_conn(&c, "s1")?
+        };
         assert!(langs.is_empty());
 
-        drop(session);
-        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
     #[test]
-    fn test_active_languages_multiple_languages() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let session = create_session(&path, "/tmp/test-langs-multi")?;
-        let id = session.info.id.clone();
+    fn test_active_languages_multiple_servers() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
 
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Ready".to_string(),
-        });
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
 
-        session.broadcast(EventKind::ServerState {
-            language: "python".to_string(),
-            state: "Ready".to_string(),
-        });
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+        let payload = serde_json::json!({});
 
-        session.broadcast(EventKind::ServerState {
-            language: "typescript".to_string(),
-            state: "Initializing".to_string(),
-        });
+        log.log(
+            "lsp",
+            "initialize",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+        log.log(
+            "lsp",
+            "initialize",
+            "pyright",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+        log.log(
+            "lsp",
+            "initialize",
+            "typescript-language-server",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+        // Duplicate — should not produce a second entry.
+        log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
 
-        let langs = active_languages_with_conn(&conn, &id)?;
-        assert_eq!(langs, vec!["python", "rust", "typescript"]);
+        let langs = {
+            let c = conn.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            active_languages_with_conn(&c, "s1")?
+        };
+        assert_eq!(
+            langs,
+            vec!["pyright", "rust-analyzer", "typescript-language-server"]
+        );
 
-        drop(session);
-        delete_session_data_with_conn(&conn, &id)?;
         Ok(())
     }
 
@@ -1663,6 +1883,174 @@ mod tests {
 
         let received = rx.try_recv().expect("should receive broadcast");
         assert_eq!(received, id);
+
+        Ok(())
+    }
+
+    // ── Message query tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_monitor_messages_with_conn() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+        let payload = serde_json::json!({"method": "textDocument/hover"});
+
+        log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+        log.log(
+            "mcp",
+            "tools/call",
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &serde_json::json!({"name": "grep"}),
+        );
+        log.log(
+            "lsp",
+            "textDocument/definition",
+            "typescript-language-server",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+
+        let messages = {
+            let c = conn.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            monitor_messages_with_conn(&c, "s1")?
+        };
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].r#type, "lsp");
+        assert_eq!(messages[0].method, "textDocument/hover");
+        assert_eq!(messages[0].server, "rust-analyzer");
+        assert_eq!(messages[1].r#type, "mcp");
+        assert_eq!(messages[1].method, "tools/call");
+        assert_eq!(messages[2].server, "typescript-language-server");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_tail_streams() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn, "s1".to_string());
+
+        // Log one message before opening the tail.
+        log.log(
+            "lsp",
+            "initialize",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
+
+        // Open tail — should start from current end.
+        let tail_conn = crate::db::open_at(&path)?;
+        let mut tail = tail_messages_new_with_conn(tail_conn, "s1")?;
+
+        // Nothing new yet.
+        assert!(
+            tail.try_next_message()?.is_none(),
+            "should have no messages initially"
+        );
+
+        // Log a new message.
+        log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({"result": null}),
+        );
+
+        let msg = tail.try_next_message()?;
+        assert!(msg.is_some(), "should see newly logged message");
+        let msg = msg.expect("verified Some above");
+        assert_eq!(msg.method, "textDocument/hover");
+
+        // No more messages.
+        assert!(tail.try_next_message()?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_active_languages_from_messages() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+
+        log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
+        log.log(
+            "lsp",
+            "textDocument/definition",
+            "typescript-language-server",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
+        // MCP message should not appear in active languages.
+        log.log(
+            "mcp",
+            "tools/call",
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
+
+        let langs = {
+            let c = conn.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            active_languages_with_conn(&c, "s1")?
+        };
+
+        assert_eq!(langs, vec!["rust-analyzer", "typescript-language-server"]);
 
         Ok(())
     }

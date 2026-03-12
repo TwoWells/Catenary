@@ -266,12 +266,12 @@ impl DataSource for SqliteDataSource {
     }
 }
 
-/// Query active languages for a session from its events.
+/// Query active languages for a session from its messages.
 fn active_languages_for(conn: &rusqlite::Connection, session_id: &str) -> Vec<String> {
-    let mut languages = HashMap::new();
-
     let Ok(mut stmt) = conn.prepare(
-        "SELECT payload FROM events WHERE session_id = ?1 AND kind = 'server_state' ORDER BY id",
+        "SELECT DISTINCT server FROM messages \
+         WHERE session_id = ?1 AND type = 'lsp' \
+         ORDER BY server",
     ) else {
         return vec![];
     };
@@ -280,23 +280,12 @@ fn active_languages_for(conn: &rusqlite::Connection, session_id: &str) -> Vec<St
         return vec![];
     };
 
+    let mut result = Vec::new();
     while let Ok(Some(row)) = rows.next() {
-        let Ok(payload) = row.get::<_, String>(0) else {
-            continue;
-        };
-        if let Ok(EventKind::ServerState { language, state }) =
-            serde_json::from_str::<EventKind>(&payload)
-        {
-            if state == "Dead" {
-                languages.remove(&language);
-            } else {
-                languages.insert(language, state);
-            }
+        if let Ok(server) = row.get::<_, String>(0) {
+            result.push(server);
         }
     }
-
-    let mut result: Vec<String> = languages.into_keys().collect();
-    result.sort();
     result
 }
 
