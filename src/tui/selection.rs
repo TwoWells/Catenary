@@ -16,7 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use super::panel::{FlatLine, PanelState, detail_lines};
-use super::theme::{format_ago, format_event_plain};
+use super::theme::{format_ago, format_message_plain};
 use super::tree::{SessionTree, TreeItem};
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ impl VisualSelection {
 /// Generate the clipboard text for the selection.
 ///
 /// For each line in the selection range:
-/// - `FlatLine::EventHeader`: uses `format_event_plain()`.
+/// - `FlatLine::MessageHeader`: uses `format_message_plain()`.
 /// - `FlatLine::Detail`: uses the rendered detail text (plain, without styling).
 ///
 /// Lines are separated by `\n`.
@@ -105,17 +105,17 @@ pub fn yank_text(panel: &PanelState<'_>, selection: &VisualSelection) -> String 
 
     for fl in flat.iter().skip(start).take(end - start + 1) {
         match fl {
-            FlatLine::EventHeader { event_index } => {
-                if let Some(ev) = panel.events.get(*event_index) {
-                    lines.push(format_event_plain(ev));
+            FlatLine::MessageHeader { message_index } => {
+                if let Some(msg) = panel.messages.get(*message_index) {
+                    lines.push(format_message_plain(msg));
                 }
             }
             FlatLine::Detail {
-                event_index,
+                message_index,
                 detail_index,
             } => {
-                if let Some(ev) = panel.events.get(*event_index) {
-                    let details = detail_lines(ev, panel.theme, panel.icons);
+                if let Some(msg) = panel.messages.get(*message_index) {
+                    let details = detail_lines(msg, panel.theme);
                     if let Some(line) = details.get(*detail_index) {
                         let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                         lines.push(plain);
@@ -260,7 +260,7 @@ mod tests {
     use chrono::{TimeDelta, Utc};
 
     use crate::config::IconConfig;
-    use crate::session::{EventKind, SessionEvent, SessionInfo};
+    use crate::session::{SessionInfo, SessionMessage};
     use crate::tui::data::SessionRow;
     use crate::tui::panel::PanelState;
     use crate::tui::theme::{IconSet, Theme};
@@ -274,19 +274,37 @@ mod tests {
         IconSet::from_config(IconConfig::default())
     }
 
-    fn make_event(kind: EventKind) -> SessionEvent {
-        SessionEvent {
+    fn make_message(r#type: &str, method: &str, server: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
             timestamp: chrono::Utc::now(),
-            kind,
+            payload: serde_json::json!({}),
         }
     }
 
-    fn diag_preview(entries: &[(&str, u32, &str)]) -> String {
-        entries
-            .iter()
-            .map(|(sev, line, msg)| format!("\t:{line}:1 [{sev}] rustc: {msg}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+    fn make_message_with_payload(
+        r#type: &str,
+        method: &str,
+        server: &str,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload,
+        }
     }
 
     #[test]
@@ -332,16 +350,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..5)
-            .map(|_| {
-                make_event(EventKind::ToolCall {
-                    tool: "hover".to_string(),
-                    file: Some("/src/main.rs".to_string()),
-                    params: None,
-                })
-            })
+        let messages: Vec<SessionMessage> = (0..5)
+            .map(|_| make_message("lsp", "textDocument/hover", "rust-analyzer"))
             .collect();
-        panel.load_events(events);
+        panel.load_messages(messages);
 
         let sel = {
             let mut s = VisualSelection::new(1);
@@ -352,7 +364,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            assert!(line.contains("hover"), "each line should contain 'hover'");
+            assert!(
+                line.contains("textDocument/hover"),
+                "each line should contain method"
+            );
         }
     }
 
@@ -361,35 +376,36 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events = vec![
-            make_event(EventKind::Started),
-            make_event(EventKind::Diagnostics {
-                file: "/src/lib.rs".to_string(),
-                count: 2,
-                preview: diag_preview(&[("error", 12, "bad thing"), ("warning", 34, "meh")]),
-            }),
-            make_event(EventKind::Shutdown),
+        let messages = vec![
+            make_message("lsp", "initialized", "rust-analyzer"),
+            make_message_with_payload(
+                "hook",
+                "post-tool",
+                "catenary",
+                serde_json::json!({
+                    "file": "/src/lib.rs",
+                    "count": 2,
+                    "preview": "\t:12:1 [error] rustc: bad thing\n\t:34:1 [warning] rustc: meh"
+                }),
+            ),
+            make_message("mcp", "tools/list", "catenary"),
         ];
-        panel.load_events(events);
+        panel.load_messages(messages);
         panel.expanded.insert(1);
 
-        // flat: [H0, H1, D1.0, D1.1, H2]
-        // Select H1 + D1.0 + D1.1 (indices 1..=3).
+        // Select header + first two detail lines of message 1.
         let sel = {
             let mut s = VisualSelection::new(1);
             s.extend(3);
             s
         };
         let text = yank_text(&panel, &sel);
-        // The header's plain text includes the preview (which has newlines),
-        // so the total line count is header-lines + 2 detail lines.
         assert!(text.contains("lib.rs"), "header should mention file");
+        // Detail lines contain pretty-printed payload.
         assert!(
-            text.contains("bad thing"),
-            "should contain first diagnostic"
+            text.contains("post-tool"),
+            "detail should contain method"
         );
-        assert!(text.contains("meh"), "should contain second diagnostic");
-        // At minimum: 1 header line + 2 detail lines = 3+ lines.
         assert!(
             text.lines().count() >= 3,
             "should have at least 3 lines of output"
@@ -397,21 +413,23 @@ mod tests {
     }
 
     #[test]
-    fn test_selection_survives_push_event() {
+    fn test_selection_survives_push_message() {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..10).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..10)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
         panel.tail_attached = false;
 
         let mut sel = VisualSelection::new(3);
         sel.extend(7);
         assert_eq!(sel.range(), (3, 7));
 
-        // Push a new event (appends at end).
-        panel.push_event(make_event(EventKind::Shutdown));
-        assert_eq!(panel.events.len(), 11);
+        // Push a new message (appends at end).
+        panel.push_message(make_message("mcp", "tools/list", "catenary"));
+        assert_eq!(panel.messages.len(), 11);
 
         // Selection range is unchanged — indices are stable when appending.
         assert_eq!(sel.range(), (3, 7));

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Events panel: renders a list of session events with cursor, scroll offset,
-//! tail attach/detach behavior, and horizontal scroll indicators.
+//! Messages panel: renders a list of protocol messages with cursor, scroll
+//! offset, tail attach/detach behavior, and horizontal scroll indicators.
 //!
 //! This is the core building block — later tickets add expansion (04),
 //! multi-panel grid (05), scrollbar (06), and selection (07) on top of this.
@@ -18,8 +18,8 @@ use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::selection::VisualSelection;
-use super::theme::{IconSet, Theme, diag_style, format_event_styled};
-use crate::session::{EventKind, SessionEvent};
+use super::theme::{IconSet, Theme, format_message_plain, format_message_styled};
+use crate::session::SessionMessage;
 
 // ── Data types ──────────────────────────────────────────────────────────
 
@@ -47,42 +47,42 @@ pub struct LanguageServerStatus {
     pub state: LsState,
 }
 
-/// A line in the flattened view — either an event header or a detail line.
+/// A line in the flattened view — either a message header or a detail line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlatLine {
-    /// An event header (the one-line summary).
-    EventHeader {
-        /// Index into the events vec.
-        event_index: usize,
+    /// A message header (the one-line summary).
+    MessageHeader {
+        /// Index into the messages vec.
+        message_index: usize,
     },
-    /// A detail line within an expanded event.
+    /// A detail line within an expanded message.
     Detail {
-        /// Index into the events vec.
-        event_index: usize,
+        /// Index into the messages vec.
+        message_index: usize,
         /// Index of this detail line within the expansion.
         detail_index: usize,
     },
 }
 
-/// State for a single Events panel.
+/// State for a single messages panel.
 pub struct PanelState<'a> {
     /// Session ID this panel is tailing.
     pub session_id: String,
-    /// All events loaded for this session.
-    pub events: Vec<SessionEvent>,
-    /// Cursor position (index into events after collapse).
+    /// All messages loaded for this session.
+    pub messages: Vec<SessionMessage>,
+    /// Cursor position (index into flat lines).
     pub cursor: usize,
     /// Scroll offset from top of content.
     pub scroll_offset: usize,
     /// Whether the panel is attached to the tail (auto-scrolling).
     pub tail_attached: bool,
-    /// Horizontal scroll offset (for wide event lines).
+    /// Horizontal scroll offset (for wide lines).
     pub horizontal_scroll: usize,
     /// Whether this panel is pinned (enlarged).
     pub pinned: bool,
     /// Language server statuses for the title bar.
     pub language_servers: Vec<LanguageServerStatus>,
-    /// Indices of expanded events (in the events Vec).
+    /// Indices of expanded messages (in the messages Vec).
     pub expanded: HashSet<usize>,
     /// Active visual selection, if any.
     pub visual_selection: Option<VisualSelection>,
@@ -103,14 +103,14 @@ pub struct PanelState<'a> {
 impl<'a> PanelState<'a> {
     /// Create a new panel for the given session.
     ///
-    /// Starts with empty events, cursor at 0, tail attached, no horizontal
+    /// Starts with empty messages, cursor at 0, tail attached, no horizontal
     /// scroll, not pinned.
     #[must_use]
     pub fn new(session_id: String, theme: &'a Theme, icons: &'a IconSet) -> Self {
         let display_id = session_id.clone();
         Self {
             session_id,
-            events: Vec::new(),
+            messages: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             tail_attached: true,
@@ -132,9 +132,9 @@ impl<'a> PanelState<'a> {
         self.flat_lines().len()
     }
 
-    /// Load historical events. Sets cursor to the last event and attaches tail.
-    pub fn load_events(&mut self, events: Vec<SessionEvent>) {
-        self.events = events;
+    /// Load historical messages. Sets cursor to the last line and attaches tail.
+    pub fn load_messages(&mut self, messages: Vec<SessionMessage>) {
+        self.messages = messages;
         self.expanded.clear();
         let total = self.total_lines();
         self.cursor = total.saturating_sub(1);
@@ -142,12 +142,12 @@ impl<'a> PanelState<'a> {
         self.snap_viewport(0);
     }
 
-    /// Append a new event.
+    /// Append a new message.
     ///
-    /// If tail attached, advance cursor and scroll to keep the latest event
+    /// If tail attached, advance cursor and scroll to keep the latest message
     /// visible. If detached, just append (cursor stays put).
-    pub fn push_event(&mut self, event: SessionEvent) {
-        self.events.push(event);
+    pub fn push_message(&mut self, msg: SessionMessage) {
+        self.messages.push(msg);
         if self.tail_attached {
             let total = self.total_lines();
             self.cursor = total.saturating_sub(1);
@@ -229,14 +229,14 @@ impl<'a> PanelState<'a> {
         }
     }
 
-    /// Jump to first event — `g` key.
+    /// Jump to first line — `g` key.
     pub const fn scroll_to_top(&mut self) {
         self.cursor = 0;
         self.scroll_offset = 0;
         self.tail_attached = false;
     }
 
-    /// Jump to last event — `G` key.
+    /// Jump to last line — `G` key.
     pub fn scroll_to_bottom(&mut self) {
         let total = self.total_lines();
         self.cursor = total.saturating_sub(1);
@@ -264,7 +264,7 @@ impl<'a> PanelState<'a> {
         self.navigate(half as isize);
     }
 
-    /// Compute the `(start, end)` indices of events visible in the viewport.
+    /// Compute the `(start, end)` indices of lines visible in the viewport.
     ///
     /// `height` is the inner content height (excluding title bar and borders).
     #[must_use]
@@ -275,38 +275,25 @@ impl<'a> PanelState<'a> {
         (start, end)
     }
 
-    /// Scan events for `ServerState` events and update `language_servers`.
+    /// Derive language server statuses from messages.
     ///
-    /// Tracks the latest state per language.
+    /// Scans for LSP messages and tracks unique server names. Any server
+    /// with messages is considered healthy.
     pub fn update_language_servers(&mut self) {
-        let mut map: HashMap<String, LsState> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut order: Vec<String> = Vec::new();
 
-        for ev in &self.events {
-            if let EventKind::ServerState { language, state } = &ev.kind {
-                let ls_state = match state.as_str() {
-                    "ready" | "running" => LsState::Healthy,
-                    "initializing" | "starting" => LsState::Initializing,
-                    "exited" | "crashed" | "error" | "stuck" => LsState::Crashed,
-                    _ => LsState::NotLoaded,
-                };
-                if !map.contains_key(language) {
-                    order.push(language.clone());
-                }
-                map.insert(language.clone(), ls_state);
-            } else if let EventKind::Progress { language, .. } = &ev.kind {
-                if !map.contains_key(language) {
-                    order.push(language.clone());
-                }
-                map.insert(language.clone(), LsState::Progress);
+        for msg in &self.messages {
+            if msg.r#type == "lsp" && !msg.server.is_empty() && seen.insert(msg.server.clone()) {
+                order.push(msg.server.clone());
             }
         }
 
         self.language_servers = order
             .into_iter()
-            .filter_map(|name| {
-                map.remove(&name)
-                    .map(|state| LanguageServerStatus { name, state })
+            .map(|name| LanguageServerStatus {
+                name,
+                state: LsState::Healthy,
             })
             .collect();
     }
@@ -334,26 +321,25 @@ impl<'a> PanelState<'a> {
 
     // ── Expansion ───────────────────────────────────────────────────────
 
-    /// Build a flat list of lines: event headers interleaved with detail lines
-    /// for any expanded events.
+    /// Build a flat list of lines: message headers interleaved with detail
+    /// lines for any expanded messages.
     #[must_use]
     pub fn flat_lines(&self) -> Vec<FlatLine> {
-        let collapsed = collapse_progress_indexed(&self.events);
         let lower_pattern = self.filter_pattern.as_ref().map(|p| p.to_lowercase());
         let mut lines = Vec::new();
-        for &(event_index, ev) in &collapsed {
+        for (message_index, msg) in self.messages.iter().enumerate() {
             if let Some(ref pat) = lower_pattern {
-                let plain = super::theme::format_event_plain(ev);
+                let plain = format_message_plain(msg);
                 if !plain.to_lowercase().contains(pat) {
                     continue;
                 }
             }
-            lines.push(FlatLine::EventHeader { event_index });
-            if self.expanded.contains(&event_index) {
-                let count = detail_lines(ev, self.theme, self.icons).len();
+            lines.push(FlatLine::MessageHeader { message_index });
+            if self.expanded.contains(&message_index) {
+                let count = detail_lines(msg, self.theme).len();
                 for detail_index in 0..count {
                     lines.push(FlatLine::Detail {
-                        event_index,
+                        message_index,
                         detail_index,
                     });
                 }
@@ -362,46 +348,41 @@ impl<'a> PanelState<'a> {
         lines
     }
 
-    /// Quick check: does this event type have expandable detail?
+    /// Quick check: does this message have expandable detail?
     #[must_use]
-    pub fn has_detail(&self, event_index: usize) -> bool {
-        self.events
-            .get(event_index)
-            .is_some_and(|ev| match &ev.kind {
-                EventKind::Diagnostics { count, .. } => *count > 0,
-                EventKind::ToolResult { .. } => true,
-                EventKind::ToolCall { params, file, .. } => params.is_some() || file.is_some(),
-                _ => false,
-            })
+    pub fn has_detail(&self, message_index: usize) -> bool {
+        self.messages
+            .get(message_index)
+            .is_some_and(|msg| msg.payload.as_object().is_some_and(|o| !o.is_empty()))
     }
 
-    /// Toggle expansion of the event under the cursor.
+    /// Toggle expansion of the message under the cursor.
     ///
-    /// - On an `EventHeader`: toggle the event in/out of `expanded`.
-    /// - On a `Detail` line: collapse the parent event, move cursor to its header.
-    /// - On an event with no detail: no-op.
+    /// - On a `MessageHeader`: toggle the message in/out of `expanded`.
+    /// - On a `Detail` line: collapse the parent message, move cursor to its header.
+    /// - On a message with no detail: no-op.
     pub fn toggle_expansion(&mut self) {
         let flat = self.flat_lines();
         let Some(current) = flat.get(self.cursor) else {
             return;
         };
         match *current {
-            FlatLine::EventHeader { event_index } => {
-                if !self.has_detail(event_index) {
+            FlatLine::MessageHeader { message_index } => {
+                if !self.has_detail(message_index) {
                     return;
                 }
-                if self.expanded.contains(&event_index) {
-                    self.expanded.remove(&event_index);
+                if self.expanded.contains(&message_index) {
+                    self.expanded.remove(&message_index);
                 } else {
-                    self.expanded.insert(event_index);
+                    self.expanded.insert(message_index);
                 }
             }
-            FlatLine::Detail { event_index, .. } => {
-                self.expanded.remove(&event_index);
+            FlatLine::Detail { message_index, .. } => {
+                self.expanded.remove(&message_index);
                 // Move cursor to the parent header.
                 let new_flat = self.flat_lines();
                 if let Some(pos) = new_flat.iter().position(|fl| {
-                    matches!(fl, FlatLine::EventHeader { event_index: ei } if *ei == event_index)
+                    matches!(fl, FlatLine::MessageHeader { message_index: mi } if *mi == message_index)
                 }) {
                     self.cursor = pos;
                 }
@@ -413,140 +394,53 @@ impl<'a> PanelState<'a> {
 
 // ── Expansion helpers ───────────────────────────────────────────────────
 
-/// Collapse consecutive progress events, preserving original indices into
-/// the events vec.
-fn collapse_progress_indexed(events: &[SessionEvent]) -> Vec<(usize, &SessionEvent)> {
-    let mut result: Vec<(usize, &SessionEvent)> = Vec::with_capacity(events.len());
-    for (idx, ev) in events.iter().enumerate() {
-        if let EventKind::Progress {
-            language, title, ..
-        } = &ev.kind
-            && let Some((_, last)) = result.last()
-            && let EventKind::Progress {
-                language: prev_lang,
-                title: prev_title,
-                ..
-            } = &last.kind
-            && prev_lang == language
-            && prev_title == title
-        {
-            result.pop();
-        }
-        result.push((idx, ev));
-    }
-    result
-}
+/// Maximum number of payload lines to show in detail expansion.
+const MAX_DETAIL_PAYLOAD_LINES: usize = 20;
 
-/// Generate styled detail lines for an expanded event.
+/// Generate styled detail lines for an expanded message.
 ///
-/// Returns an empty vec for events with no expandable detail.
+/// Returns an empty vec for messages with empty payloads.
 #[must_use]
-#[allow(
-    clippy::too_many_lines,
-    reason = "each match arm is simple; splitting would obscure the mapping"
-)]
-pub fn detail_lines(event: &SessionEvent, theme: &Theme, icons: &IconSet) -> Vec<Line<'static>> {
+pub fn detail_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'static>> {
+    let payload = &msg.payload;
+    if payload.as_object().is_none_or(|o| o.is_empty()) {
+        return Vec::new();
+    }
+
     // Indent to align past the timestamp column ("HH:MM:SS  " = 10 chars).
     let indent = "          ";
-    match &event.kind {
-        EventKind::Diagnostics {
-            file,
-            count,
-            preview,
-        } => {
-            if *count == 0 {
-                return Vec::new();
+    let mut lines = Vec::new();
+
+    // Line 1: method [type]
+    lines.push(Line::from(vec![
+        Span::raw(indent.to_string()),
+        Span::styled(format!("{} [{}]", msg.method, msg.r#type), theme.muted),
+    ]));
+
+    // Line 2: separator
+    lines.push(Line::from(vec![
+        Span::raw(indent.to_string()),
+        Span::styled("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", theme.muted),
+    ]));
+
+    // Lines 3+: pretty-printed payload, capped
+    if let Ok(pretty) = serde_json::to_string_pretty(payload) {
+        for (i, line) in pretty.lines().enumerate() {
+            if i >= MAX_DETAIL_PAYLOAD_LINES {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled("...", theme.muted),
+                ]));
+                break;
             }
-            let mut lines = Vec::new();
-            let header = format!("{{\"file\": \"{file}\", \"count\": {count}}}");
             lines.push(Line::from(vec![
                 Span::raw(indent.to_string()),
-                Span::styled(header, theme.muted),
+                Span::styled(line.to_string(), theme.muted),
             ]));
-            lines.push(Line::from(vec![
-                Span::raw(indent.to_string()),
-                Span::styled("───────────────────────", theme.muted),
-            ]));
-            for line in preview.lines().filter(|s| !s.trim().is_empty()) {
-                let trimmed = line.trim();
-                if trimmed.starts_with("fix:") {
-                    lines.push(Line::from(vec![
-                        Span::raw(format!("{indent}    ")),
-                        Span::styled(trimmed.to_string(), theme.info),
-                    ]));
-                } else {
-                    let (icon, style) = diag_style(1, trimmed, icons, theme);
-                    lines.push(Line::from(vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(icon.to_string(), style),
-                        Span::styled(trimmed.to_string(), style),
-                    ]));
-                }
-            }
-            lines
         }
-        EventKind::ToolResult {
-            tool,
-            success,
-            duration_ms,
-            output,
-            params,
-        } => {
-            let (status, style) = if *success {
-                ("ok", theme.success)
-            } else {
-                ("error", theme.error)
-            };
-            let mut lines = vec![Line::from(vec![
-                Span::raw(indent.to_string()),
-                Span::styled(format!("{tool}: {status} ({duration_ms}ms)"), style),
-            ])];
-            if let Some(p) = params {
-                let json = serde_json::to_string(p).unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled(format!("request: {json}"), theme.muted),
-                ]));
-            }
-            if params.is_some() && output.is_some() {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled("───────────────────────", theme.muted),
-                ]));
-            }
-            if let Some(text) = output {
-                for line in text.lines() {
-                    if line.trim().is_empty() {
-                        lines.push(Line::default());
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::raw(indent.to_string()),
-                            Span::styled(line.to_string(), theme.muted),
-                        ]));
-                    }
-                }
-            }
-            lines
-        }
-        EventKind::ToolCall { params, file, .. } => {
-            let mut lines = Vec::new();
-            if let Some(p) = params {
-                let json = serde_json::to_string(p).unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled(json, theme.muted),
-                ]));
-            }
-            if let Some(path) = file {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled(path.clone(), theme.muted),
-                ]));
-            }
-            lines
-        }
-        _ => Vec::new(),
     }
+
+    lines
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────
@@ -719,7 +613,7 @@ fn clip_line_horizontal(line: &Line<'_>, h_scroll: usize, width: usize) -> Line<
     Line::from(result_spans)
 }
 
-/// Render a single events panel into the given buffer area.
+/// Render a single messages panel into the given buffer area.
 ///
 /// The panel owns its top row (title bar) and right column (scrollbar,
 /// rendered by ticket 06). Left and bottom edges are content. The caller
@@ -774,7 +668,7 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
     let start = state.scroll_offset.min(total);
     let end = (start + height).min(total);
 
-    // Cache detail lines per expanded event to avoid recomputation.
+    // Cache detail lines per expanded message to avoid recomputation.
     let mut detail_cache: HashMap<usize, Vec<Line<'static>>> = HashMap::new();
 
     // Render each visible line.
@@ -786,16 +680,16 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
         }
 
         let line = match fl {
-            FlatLine::EventHeader { event_index } => {
-                format_event_styled(&state.events[*event_index], state.icons, state.theme)
+            FlatLine::MessageHeader { message_index } => {
+                format_message_styled(&state.messages[*message_index], state.icons, state.theme)
             }
             FlatLine::Detail {
-                event_index,
+                message_index,
                 detail_index,
             } => detail_cache
-                .entry(*event_index)
+                .entry(*message_index)
                 .or_insert_with(|| {
-                    detail_lines(&state.events[*event_index], state.theme, state.icons)
+                    detail_lines(&state.messages[*message_index], state.theme)
                 })
                 .get(*detail_index)
                 .cloned()
@@ -847,7 +741,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use crate::config::IconConfig;
-    use crate::session::EventKind;
+    use crate::session::SessionMessage;
 
     fn test_theme() -> Theme {
         Theme::new()
@@ -857,11 +751,61 @@ mod tests {
         IconSet::from_config(IconConfig::default())
     }
 
-    fn make_event(kind: EventKind) -> SessionEvent {
-        SessionEvent {
+    fn make_message(r#type: &str, method: &str, server: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
             timestamp: chrono::Utc::now(),
-            kind,
+            payload: serde_json::json!({}),
         }
+    }
+
+    fn make_message_with_payload(
+        r#type: &str,
+        method: &str,
+        server: &str,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload,
+        }
+    }
+
+    /// An LSP message with a non-empty payload (expandable).
+    fn make_lsp_message() -> SessionMessage {
+        make_message_with_payload(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            serde_json::json!({"id": 1, "method": "textDocument/hover", "params": {}}),
+        )
+    }
+
+    /// A hook diagnostic message with preview (expandable).
+    fn make_hook_diag_message(file: &str, count: u64) -> SessionMessage {
+        make_message_with_payload(
+            "hook",
+            "post-tool",
+            "catenary",
+            serde_json::json!({
+                "file": file,
+                "count": count,
+                "preview": "\t:12:1 [error] rustc: something"
+            }),
+        )
     }
 
     /// Convert a ratatui buffer to a single string for assertion matching.
@@ -887,51 +831,57 @@ mod tests {
         assert_eq!(panel.scroll_offset, 0);
         assert_eq!(panel.horizontal_scroll, 0);
         assert!(!panel.pinned);
-        assert!(panel.events.is_empty());
+        assert!(panel.messages.is_empty());
     }
 
     #[test]
-    fn test_panel_load_events() {
+    fn test_panel_load_messages() {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..10).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
-        assert_eq!(panel.events.len(), 10);
+        let messages: Vec<SessionMessage> = (0..10)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
+        assert_eq!(panel.messages.len(), 10);
         assert_eq!(panel.cursor, 9);
         assert!(panel.tail_attached);
     }
 
     #[test]
-    fn test_panel_push_event_attached() {
+    fn test_panel_push_message_attached() {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..5)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
         assert_eq!(panel.cursor, 4);
 
-        panel.push_event(make_event(EventKind::Shutdown));
-        assert_eq!(panel.events.len(), 6);
+        panel.push_message(make_message("mcp", "tools/list", "catenary"));
+        assert_eq!(panel.messages.len(), 6);
         assert_eq!(panel.cursor, 5);
         assert!(panel.tail_attached);
     }
 
     #[test]
-    fn test_panel_push_event_detached() {
+    fn test_panel_push_message_detached() {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..5)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         // Navigate up to detach.
         panel.navigate(-1);
         assert!(!panel.tail_attached);
         let cursor_before = panel.cursor;
 
-        panel.push_event(make_event(EventKind::Shutdown));
-        assert_eq!(panel.events.len(), 6);
+        panel.push_message(make_message("mcp", "tools/list", "catenary"));
+        assert_eq!(panel.messages.len(), 6);
         assert_eq!(panel.cursor, cursor_before);
         assert!(!panel.tail_attached);
     }
@@ -941,8 +891,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..10).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..10)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
         assert_eq!(panel.cursor, 9);
         assert!(panel.tail_attached);
 
@@ -956,8 +908,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..5)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         // Navigate up to detach.
         panel.navigate(-2);
@@ -980,8 +934,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..20).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..20)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         panel.scroll_to_top();
         assert_eq!(panel.cursor, 0);
@@ -994,8 +950,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..20).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..20)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         panel.scroll_to_top();
         assert!(!panel.tail_attached);
@@ -1010,8 +968,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..100).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..100)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         // Move cursor to 50 and snap viewport.
         panel.cursor = 50;
@@ -1028,8 +988,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..100).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..100)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         // Cursor near top — can't center.
         panel.cursor = 3;
@@ -1045,8 +1007,10 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..100).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..100)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         // Cursor near bottom.
         panel.cursor = 97;
@@ -1058,24 +1022,26 @@ mod tests {
     }
 
     #[test]
-    fn test_panel_render_events() {
+    fn test_panel_render_messages() {
         let theme = test_theme();
         let icons = test_icons();
-        let events: Vec<SessionEvent> = vec![
-            make_event(EventKind::ToolCall {
-                tool: "grep".to_string(),
-                file: None,
-                params: None,
-            }),
-            make_event(EventKind::ToolCall {
-                tool: "glob".to_string(),
-                file: Some("/src/lib.rs".to_string()),
-                params: None,
-            }),
+        let messages: Vec<SessionMessage> = vec![
+            make_message_with_payload(
+                "mcp",
+                "tools/call",
+                "catenary",
+                serde_json::json!({"params": {"name": "grep"}}),
+            ),
+            make_message_with_payload(
+                "mcp",
+                "tools/call",
+                "catenary",
+                serde_json::json!({"params": {"name": "glob"}}),
+            ),
         ];
 
         let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
-        panel.load_events(events);
+        panel.load_messages(messages);
 
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
@@ -1119,19 +1085,20 @@ mod tests {
     fn test_panel_render_cursor_highlight() {
         let theme = test_theme();
         let icons = test_icons();
-        let events: Vec<SessionEvent> = (0..5)
+        let messages: Vec<SessionMessage> = (0..5)
             .map(|_| {
-                make_event(EventKind::ToolCall {
-                    tool: "grep".to_string(),
-                    file: None,
-                    params: None,
-                })
+                make_message_with_payload(
+                    "mcp",
+                    "tools/call",
+                    "catenary",
+                    serde_json::json!({"params": {"name": "grep"}}),
+                )
             })
             .collect();
 
         let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
-        panel.load_events(events);
-        // Set cursor to row 1 (second event in visible area).
+        panel.load_messages(messages);
+        // Set cursor to row 1 (second message in visible area).
         panel.cursor = 1;
         panel.snap_viewport(8);
 
@@ -1165,50 +1132,38 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        panel.events = vec![
-            make_event(EventKind::ServerState {
-                language: "rust".to_string(),
-                state: "ready".to_string(),
-            }),
-            make_event(EventKind::ServerState {
-                language: "ts".to_string(),
-                state: "initializing".to_string(),
-            }),
+        panel.messages = vec![
+            make_message("lsp", "textDocument/hover", "rust-analyzer"),
+            make_message("lsp", "textDocument/completion", "typescript-language-server"),
         ];
 
         panel.update_language_servers();
         assert_eq!(panel.language_servers.len(), 2);
-        assert_eq!(panel.language_servers[0].name, "rust");
+        assert_eq!(panel.language_servers[0].name, "rust-analyzer");
         assert_eq!(panel.language_servers[0].state, LsState::Healthy);
-        assert_eq!(panel.language_servers[1].name, "ts");
-        assert_eq!(panel.language_servers[1].state, LsState::Initializing);
+        assert_eq!(
+            panel.language_servers[1].name,
+            "typescript-language-server"
+        );
+        assert_eq!(panel.language_servers[1].state, LsState::Healthy);
     }
 
-    // ── Expansion tests (ticket 04) ─────────────────────────────────────
-
-    /// Build a diagnostic preview in the format produced by
-    /// `format_diagnostics_compact` (one `\t:line:col [severity] source: msg`
-    /// per diagnostic, joined by newlines).
-    fn diag_preview(entries: &[(&str, u32, &str)]) -> String {
-        entries
-            .iter()
-            .map(|(sev, line, msg)| format!("\t:{line}:1 [{sev}] rustc: {msg}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+    // ── Expansion tests ─────────────────────────────────────────────────
 
     #[test]
     fn test_flat_lines_no_expansion() {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events: Vec<SessionEvent> = (0..5).map(|_| make_event(EventKind::Started)).collect();
-        panel.load_events(events);
+        let messages: Vec<SessionMessage> = (0..5)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        panel.load_messages(messages);
 
         let flat = panel.flat_lines();
         assert_eq!(flat.len(), 5);
         for (i, fl) in flat.iter().enumerate() {
-            assert_eq!(*fl, FlatLine::EventHeader { event_index: i });
+            assert_eq!(*fl, FlatLine::MessageHeader { message_index: i });
         }
     }
 
@@ -1217,111 +1172,34 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events = vec![
-            make_event(EventKind::Started),
-            make_event(EventKind::Diagnostics {
-                file: "/src/lib.rs".to_string(),
-                count: 3,
-                preview: diag_preview(&[
-                    ("error", 12, "one"),
-                    ("warning", 34, "two"),
-                    ("error", 56, "three"),
-                ]),
-            }),
-            make_event(EventKind::Shutdown),
+        let messages = vec![
+            make_message("lsp", "initialized", "rust-analyzer"),
+            make_hook_diag_message("/src/lib.rs", 3),
+            make_message("mcp", "tools/list", "catenary"),
         ];
-        panel.load_events(events);
+        panel.load_messages(messages);
         panel.expanded.insert(1);
 
         let flat = panel.flat_lines();
-        // 3 headers + 5 detail lines (2 header/separator + 3 diag entries)
-        assert_eq!(flat.len(), 8);
-        assert_eq!(flat[0], FlatLine::EventHeader { event_index: 0 });
-        assert_eq!(flat[1], FlatLine::EventHeader { event_index: 1 });
-        assert_eq!(
-            flat[2],
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 0
-            }
-        );
-        assert_eq!(
-            flat[3],
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 1
-            }
-        );
-        assert_eq!(
-            flat[4],
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 2
-            }
-        );
-        assert_eq!(
-            flat[5],
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 3
-            }
-        );
-        assert_eq!(
-            flat[6],
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 4
-            }
-        );
-        assert_eq!(flat[7], FlatLine::EventHeader { event_index: 2 });
-    }
-
-    #[test]
-    fn test_flat_lines_multiple_expanded() {
-        let theme = test_theme();
-        let icons = test_icons();
-        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events = vec![
-            make_event(EventKind::Diagnostics {
-                file: "/a.rs".to_string(),
-                count: 2,
-                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b")]),
-            }),
-            make_event(EventKind::Started),
-            make_event(EventKind::Diagnostics {
-                file: "/b.rs".to_string(),
-                count: 1,
-                preview: diag_preview(&[("error", 5, "c")]),
-            }),
-        ];
-        panel.load_events(events);
-        panel.expanded.insert(0);
-        panel.expanded.insert(2);
-
-        let flat = panel.flat_lines();
-        // H0, D0.0..D0.3 (hdr+sep+2 diags), H1, H2, D2.0..D2.2 (hdr+sep+1 diag)
-        assert_eq!(flat.len(), 10);
-        assert_eq!(flat[0], FlatLine::EventHeader { event_index: 0 });
-        for i in 0..4 {
+        // 3 headers + detail lines for the expanded hook message
+        let detail_count = detail_lines(&panel.messages[1], &theme).len();
+        assert!(detail_count > 0, "hook diag message should have details");
+        assert_eq!(flat.len(), 3 + detail_count);
+        assert_eq!(flat[0], FlatLine::MessageHeader { message_index: 0 });
+        assert_eq!(flat[1], FlatLine::MessageHeader { message_index: 1 });
+        for i in 0..detail_count {
             assert_eq!(
-                flat[1 + i],
+                flat[2 + i],
                 FlatLine::Detail {
-                    event_index: 0,
+                    message_index: 1,
                     detail_index: i
                 }
             );
         }
-        assert_eq!(flat[5], FlatLine::EventHeader { event_index: 1 });
-        assert_eq!(flat[6], FlatLine::EventHeader { event_index: 2 });
-        for i in 0..3 {
-            assert_eq!(
-                flat[7 + i],
-                FlatLine::Detail {
-                    event_index: 2,
-                    detail_index: i
-                }
-            );
-        }
+        assert_eq!(
+            flat[2 + detail_count],
+            FlatLine::MessageHeader { message_index: 2 }
+        );
     }
 
     #[test]
@@ -1329,16 +1207,12 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events = vec![
-            make_event(EventKind::Started),
-            make_event(EventKind::Diagnostics {
-                file: "/a.rs".to_string(),
-                count: 2,
-                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b")]),
-            }),
+        let messages = vec![
+            make_message("lsp", "initialized", "rust-analyzer"),
+            make_lsp_message(),
         ];
-        panel.load_events(events);
-        // Cursor on event 1 (the Diagnostics header).
+        panel.load_messages(messages);
+        // Cursor on message 1 (the expandable LSP message).
         panel.cursor = 1;
 
         panel.toggle_expansion();
@@ -1353,23 +1227,24 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events = vec![
-            make_event(EventKind::Started),
-            make_event(EventKind::Diagnostics {
-                file: "/a.rs".to_string(),
-                count: 2,
-                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b")]),
-            }),
-            make_event(EventKind::Shutdown),
+        let messages = vec![
+            make_message("lsp", "initialized", "rust-analyzer"),
+            make_lsp_message(),
+            make_message("mcp", "tools/list", "catenary"),
         ];
-        panel.load_events(events);
+        panel.load_messages(messages);
         panel.expanded.insert(1);
-        // flat: [H0, H1, D1.0, D1.1, D1.2, D1.3, H2] → cursor at 5 (D1.3)
-        panel.cursor = 5;
+        // Find a detail line index.
+        let flat = panel.flat_lines();
+        let detail_pos = flat
+            .iter()
+            .position(|fl| matches!(fl, FlatLine::Detail { message_index: 1, .. }))
+            .expect("should have detail lines");
+        panel.cursor = detail_pos;
 
         panel.toggle_expansion();
         assert!(!panel.expanded.contains(&1));
-        // After collapse: [H0, H1, H2] → header of event 1 is at index 1.
+        // After collapse: cursor should be on message 1's header.
         assert_eq!(panel.cursor, 1);
     }
 
@@ -1378,13 +1253,9 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events = vec![make_event(EventKind::Progress {
-            language: "rust".to_string(),
-            title: "Indexing".to_string(),
-            message: None,
-            percentage: None,
-        })];
-        panel.load_events(events);
+        // Empty payload → no detail
+        let messages = vec![make_message("lsp", "initialized", "rust-analyzer")];
+        panel.load_messages(messages);
         panel.cursor = 0;
 
         panel.toggle_expansion();
@@ -1396,201 +1267,51 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let events = vec![
-            make_event(EventKind::Started),
-            make_event(EventKind::Diagnostics {
-                file: "/a.rs".to_string(),
-                count: 3,
-                preview: diag_preview(&[("error", 1, "a"), ("warning", 2, "b"), ("error", 3, "c")]),
-            }),
-            make_event(EventKind::Shutdown),
+        let messages = vec![
+            make_message("lsp", "initialized", "rust-analyzer"),
+            make_lsp_message(),
+            make_message("mcp", "tools/list", "catenary"),
         ];
-        panel.load_events(events);
+        panel.load_messages(messages);
         panel.expanded.insert(1);
 
-        // flat: [H0, H1, D1.0..D1.4 (hdr+sep+3 diags), H2]
+        let flat = panel.flat_lines();
         panel.cursor = 0;
         panel.tail_attached = false;
 
-        let expected = [
-            FlatLine::EventHeader { event_index: 0 },
-            FlatLine::EventHeader { event_index: 1 },
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 0,
-            },
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 1,
-            },
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 2,
-            },
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 3,
-            },
-            FlatLine::Detail {
-                event_index: 1,
-                detail_index: 4,
-            },
-            FlatLine::EventHeader { event_index: 2 },
-        ];
-
-        let flat = panel.flat_lines();
-        assert_eq!(flat[panel.cursor], expected[0]);
-        for exp in &expected[1..] {
+        // Walk through all lines one by one.
+        for i in 1..flat.len() {
             panel.navigate(1);
-            let flat = panel.flat_lines();
-            assert_eq!(flat[panel.cursor], *exp);
+            let current_flat = panel.flat_lines();
+            assert_eq!(current_flat[panel.cursor], flat[i]);
         }
     }
 
     #[test]
-    fn test_detail_lines_diagnostics() {
-        let ev = make_event(EventKind::Diagnostics {
-            file: "/src/lib.rs".to_string(),
-            count: 2,
-            preview: diag_preview(&[("error", 12, "something"), ("warning", 34, "other")]),
-        });
+    fn test_detail_lines_non_empty_payload() {
+        let msg = make_lsp_message();
         let theme = test_theme();
-        let icons = test_icons();
 
-        let lines = detail_lines(&ev, &theme, &icons);
-        // JSON header + separator + 2 diagnostic lines
-        assert_eq!(lines.len(), 4);
+        let lines = detail_lines(&msg, &theme);
+        // Should have: method [type] header + separator + payload lines
+        assert!(lines.len() >= 3, "should have header + sep + payload");
         let hdr: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            hdr.contains("/src/lib.rs"),
-            "header should contain file path"
+            hdr.contains("textDocument/hover"),
+            "header should contain method"
         );
-        assert!(hdr.contains("\"count\": 2"), "header should contain count");
+        assert!(hdr.contains("[lsp]"), "header should contain type");
         let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(sep.contains("───"), "second line should be separator");
-        let text0: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text0.contains("rustc: something"),
-            "first detail should contain diagnostic message"
-        );
-        let text1: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text1.contains("rustc: other"),
-            "second detail should contain diagnostic message"
-        );
+        assert!(sep.contains("\u{2500}"), "second line should be separator");
     }
 
     #[test]
-    fn test_detail_lines_with_fix_lines() {
-        let preview = [
-            "  12:1 [error] rustc: unused import",
-            "  fix: Remove unused import",
-            "  34:1 [warning] rustc: something",
-        ]
-        .join("\n");
-        let ev = make_event(EventKind::Diagnostics {
-            file: "/src/lib.rs".to_string(),
-            count: 2,
-            preview,
-        });
+    fn test_detail_lines_empty_payload() {
+        let msg = make_message("lsp", "initialized", "rust-analyzer");
         let theme = test_theme();
-        let icons = test_icons();
 
-        let lines = detail_lines(&ev, &theme, &icons);
-        // JSON header + separator + 3 preview lines
-        assert_eq!(lines.len(), 5);
-
-        // Lines 0-1: JSON header + separator
-        assert!(lines[0].spans.iter().any(|s| s.style == theme.muted));
-        let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(sep.contains("───"));
-
-        // Line 2: normal diagnostic — has severity icon, error style
-        let text0: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text0.contains("[error]"));
-        assert!(lines[2].spans.iter().any(|s| s.style == theme.error));
-
-        // Line 3: fix line — info style, deeper indentation, no severity icon
-        let text1: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text1.contains("fix: Remove unused import"));
-        assert!(lines[3].spans.iter().any(|s| s.style == theme.info));
-        // Should have 14 chars of indentation (10 + 4)
-        let leading = &lines[3].spans[0];
-        assert_eq!(
-            leading.content.len(),
-            14,
-            "fix line should have 14-char indent"
-        );
-
-        // Line 4: normal diagnostic — warning style
-        let text2: String = lines[4].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text2.contains("[warning]"));
-        assert!(lines[4].spans.iter().any(|s| s.style == theme.warning));
-    }
-
-    #[test]
-    fn test_detail_lines_tool_result_with_output() {
-        let ev = make_event(EventKind::ToolResult {
-            tool: "grep".to_string(),
-            success: true,
-            duration_ms: 42,
-            output: Some("line1\nline2".to_string()),
-            params: None,
-        });
-        let theme = test_theme();
-        let icons = test_icons();
-
-        let lines = detail_lines(&ev, &theme, &icons);
-        // Status line + two output lines
-        assert_eq!(lines.len(), 3);
-
-        let status: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(status.contains("grep: ok (42ms)"));
-        assert!(lines[0].spans.iter().any(|s| s.style == theme.success));
-
-        let out1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(out1.contains("line1"));
-        assert!(lines[1].spans.iter().any(|s| s.style == theme.muted));
-
-        let out2: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(out2.contains("line2"));
-        assert!(lines[2].spans.iter().any(|s| s.style == theme.muted));
-    }
-
-    #[test]
-    fn test_detail_lines_tool_result_without_output() {
-        let ev = make_event(EventKind::ToolResult {
-            tool: "glob".to_string(),
-            success: false,
-            duration_ms: 100,
-            output: None,
-            params: None,
-        });
-        let theme = test_theme();
-        let icons = test_icons();
-
-        let lines = detail_lines(&ev, &theme, &icons);
-        // Status line only, no output lines
-        assert_eq!(lines.len(), 1);
-
-        let status: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(status.contains("glob: error (100ms)"));
-        assert!(lines[0].spans.iter().any(|s| s.style == theme.error));
-    }
-
-    #[test]
-    fn test_detail_lines_empty_for_progress() {
-        let ev = make_event(EventKind::Progress {
-            language: "rust".to_string(),
-            title: "Indexing".to_string(),
-            message: None,
-            percentage: None,
-        });
-        let theme = test_theme();
-        let icons = test_icons();
-
-        let lines = detail_lines(&ev, &theme, &icons);
-        assert!(lines.is_empty());
+        let lines = detail_lines(&msg, &theme);
+        assert!(lines.is_empty(), "empty payload should have no detail lines");
     }
 
     #[test]
@@ -1598,25 +1319,18 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let mut events: Vec<SessionEvent> =
-            (0..10).map(|_| make_event(EventKind::Started)).collect();
-        // Replace event 5 with a Diagnostics that has 4 detail lines.
-        events[5] = make_event(EventKind::Diagnostics {
-            file: "/a.rs".to_string(),
-            count: 4,
-            preview: diag_preview(&[
-                ("error", 1, "a"),
-                ("error", 2, "b"),
-                ("warning", 3, "c"),
-                ("error", 4, "d"),
-            ]),
-        });
-        panel.load_events(events);
+        let mut messages: Vec<SessionMessage> = (0..10)
+            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
+            .collect();
+        // Replace message 5 with an expandable one.
+        messages[5] = make_lsp_message();
+        panel.load_messages(messages);
         panel.expanded.insert(5);
 
-        // Total flat lines: 10 headers + 6 details (hdr+sep+4 diags) = 16.
         let flat = panel.flat_lines();
-        assert_eq!(flat.len(), 16);
+        let detail_count = detail_lines(&panel.messages[5], &theme).len();
+        // 10 headers + detail lines for message 5
+        assert_eq!(flat.len(), 10 + detail_count);
 
         // Set cursor to 0, snap viewport.
         panel.cursor = 0;
@@ -1627,20 +1341,13 @@ mod tests {
     }
 
     #[test]
-    fn test_render_expanded_event() {
+    fn test_render_expanded_message() {
         let theme = test_theme();
         let icons = test_icons();
-        let events = vec![make_event(EventKind::Diagnostics {
-            file: "/src/lib.rs".to_string(),
-            count: 2,
-            preview: diag_preview(&[
-                ("error", 12, "something wrong"),
-                ("warning", 34, "might be bad"),
-            ]),
-        })];
+        let messages = vec![make_hook_diag_message("/src/lib.rs", 2)];
 
         let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
-        panel.load_events(events);
+        panel.load_messages(messages);
         panel.expanded.insert(0);
         panel.cursor = 0;
         panel.snap_viewport(8);
@@ -1659,95 +1366,26 @@ mod tests {
 
         // Header should show the diagnostics summary.
         assert!(content.contains("lib.rs"), "expected file name in header");
-        // Detail lines should contain the diagnostic messages.
+        // Detail lines should contain the payload.
         assert!(
-            content.contains("something wrong"),
-            "expected first diagnostic detail"
-        );
-        assert!(
-            content.contains("might be bad"),
-            "expected second diagnostic detail"
+            content.contains("post-tool"),
+            "expected method in detail"
         );
     }
 
     #[test]
-    fn test_detail_lines_tool_call_with_params() {
-        let ev = make_event(EventKind::ToolCall {
-            tool: "grep".to_string(),
-            file: Some("/src/main.rs".to_string()),
-            params: Some(serde_json::json!({"pattern": "main"})),
-        });
+    fn test_has_detail_non_empty_payload() {
         let theme = test_theme();
         let icons = test_icons();
-
-        let lines = detail_lines(&ev, &theme, &icons);
-        // JSON params line + file path line
-        assert_eq!(lines.len(), 2);
-
-        let json: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(json.contains("\"pattern\""), "should contain param key");
-        assert!(json.contains("\"main\""), "should contain param value");
-        assert!(lines[0].spans.iter().any(|s| s.style == theme.muted));
-
-        let path: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(path.contains("/src/main.rs"), "should contain file path");
-    }
-
-    #[test]
-    fn test_detail_lines_tool_result_with_params_and_output() {
-        let ev = make_event(EventKind::ToolResult {
-            tool: "grep".to_string(),
-            success: true,
-            duration_ms: 42,
-            output: Some("## Symbol results\nsrc/main.rs L42-L50".to_string()),
-            params: Some(serde_json::json!({"pattern": "main"})),
-        });
-        let theme = test_theme();
-        let icons = test_icons();
-
-        let lines = detail_lines(&ev, &theme, &icons);
-        // Status + request header + separator + 2 output lines = 5
-        assert_eq!(lines.len(), 5);
-
-        let status: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(status.contains("grep: ok (42ms)"));
-
-        let req: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(req.contains("request:"), "should have request prefix");
-        assert!(req.contains("\"pattern\""), "should contain param key");
-
-        let sep: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(sep.contains("───"), "should have separator");
-
-        let out0: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(out0.contains("Symbol results"));
-        let out1: String = lines[4].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(out1.contains("src/main.rs"));
-    }
-
-    #[test]
-    fn test_detail_lines_diagnostics_with_header() {
-        let ev = make_event(EventKind::Diagnostics {
-            file: "/src/lib.rs".to_string(),
-            count: 1,
-            preview: diag_preview(&[("error", 5, "unused variable")]),
-        });
-        let theme = test_theme();
-        let icons = test_icons();
-
-        let lines = detail_lines(&ev, &theme, &icons);
-        // JSON header + separator + 1 diagnostic line = 3
-        assert_eq!(lines.len(), 3);
-
-        let hdr: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(hdr.contains("/src/lib.rs"), "header should contain file");
-        assert!(hdr.contains("\"count\": 1"), "header should contain count");
-        assert!(lines[0].spans.iter().any(|s| s.style == theme.muted));
-
-        let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(sep.contains("───"), "should have separator");
-
-        let diag: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(diag.contains("unused variable"));
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.messages = vec![
+            make_lsp_message(),
+            make_message("lsp", "initialized", "rust-analyzer"),
+        ];
+        assert!(panel.has_detail(0), "non-empty payload should have detail");
+        assert!(
+            !panel.has_detail(1),
+            "empty payload should not have detail"
+        );
     }
 }
