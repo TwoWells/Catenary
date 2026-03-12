@@ -145,6 +145,161 @@ pub enum EventKind {
     },
 }
 
+/// A protocol message row from the `messages` table.
+///
+/// All envelope fields plus the raw protocol payload. This is the
+/// universal message type — replaces `SessionEvent` after the
+/// collapse migration.
+#[derive(Debug, Clone)]
+pub struct SessionMessage {
+    /// Unique message ID (autoincrement primary key).
+    pub id: i64,
+    /// Protocol boundary: `mcp`, `lsp`, or `hook`.
+    pub r#type: String,
+    /// Protocol method (e.g., `textDocument/hover`, `tools/call`).
+    pub method: String,
+    /// Server endpoint name.
+    pub server: String,
+    /// Client endpoint name.
+    pub client: String,
+    /// "I am the response to this message." Pair merge.
+    pub request_id: Option<i64>,
+    /// "I was caused by this message." Scope/causation.
+    pub parent_id: Option<i64>,
+    /// When the message was logged.
+    pub timestamp: DateTime<Utc>,
+    /// Raw protocol JSON, untouched.
+    pub payload: serde_json::Value,
+}
+
+/// Shared protocol message logger.
+///
+/// Replaces `EventBroadcaster` and the `Logger` trait. Each protocol
+/// boundary component holds `Arc<MessageLog>` and calls `log()` for
+/// every message that crosses the wire.
+pub struct MessageLog {
+    inner: MessageLogInner,
+}
+
+enum MessageLogInner {
+    Live {
+        conn: Arc<Mutex<Connection>>,
+        session_id: String,
+        tx: tokio::sync::broadcast::Sender<i64>,
+    },
+    Noop,
+}
+
+impl MessageLog {
+    /// Create a new message log for the given session.
+    #[must_use]
+    pub fn new(conn: Arc<Mutex<Connection>>, session_id: String) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(256);
+        Self {
+            inner: MessageLogInner::Live {
+                conn,
+                session_id,
+                tx,
+            },
+        }
+    }
+
+    /// Log a protocol message. Returns the inserted row `id`.
+    ///
+    /// `session_id` and `timestamp` are provided internally.
+    /// Callers supply only the envelope fields and payload.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per envelope field"
+    )]
+    pub fn log(
+        &self,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        client: &str,
+        request_id: Option<i64>,
+        parent_id: Option<i64>,
+        payload: &serde_json::Value,
+    ) -> i64 {
+        let MessageLogInner::Live {
+            conn,
+            session_id,
+            tx,
+        } = &self.inner
+        else {
+            return 0;
+        };
+
+        let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let payload_str = serde_json::to_string(payload).unwrap_or_default();
+
+        let id = conn
+            .lock()
+            .ok()
+            .and_then(|c| {
+                c.execute(
+                    "INSERT INTO messages \
+                     (session_id, timestamp, type, method, server, client, \
+                      request_id, parent_id, payload) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        session_id,
+                        timestamp,
+                        r#type,
+                        method,
+                        server,
+                        client,
+                        request_id,
+                        parent_id,
+                        payload_str,
+                    ],
+                )
+                .ok()?;
+                Some(c.last_insert_rowid())
+            })
+            .unwrap_or(0);
+
+        tracing::trace!(
+            r#type,
+            method,
+            server,
+            client,
+            id,
+            "protocol message logged"
+        );
+
+        let _ = tx.send(id);
+        id
+    }
+
+    /// Subscribe to new message notifications.
+    ///
+    /// Returns a broadcast receiver that yields the `id` of each
+    /// newly inserted message.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<i64> {
+        match &self.inner {
+            MessageLogInner::Live { tx, .. } => tx.subscribe(),
+            MessageLogInner::Noop => {
+                let (tx, rx) = tokio::sync::broadcast::channel(1);
+                drop(tx);
+                rx
+            }
+        }
+    }
+
+    /// Create a no-op message log (for when session is disabled).
+    ///
+    /// `log()` returns 0 and does not write to the database.
+    #[must_use]
+    pub const fn noop() -> Self {
+        Self {
+            inner: MessageLogInner::Noop,
+        }
+    }
+}
+
 /// Returns the base directory for session runtime artifacts (notify sockets).
 #[must_use]
 pub fn sessions_dir() -> PathBuf {
@@ -158,6 +313,7 @@ pub struct Session {
 
     conn: Arc<Mutex<Connection>>,
     broadcaster: EventBroadcaster,
+    message_log: Arc<MessageLog>,
 
     /// Path to the notify IPC endpoint (if started).
     socket_path: Option<PathBuf>,
@@ -231,10 +387,13 @@ impl Session {
             },
         };
 
+        let message_log = Arc::new(MessageLog::new(conn.clone(), info.id.clone()));
+
         let session = Self {
             info,
             conn,
             broadcaster,
+            message_log,
             socket_path: None,
         };
 
@@ -313,6 +472,12 @@ impl Session {
     #[must_use]
     pub fn broadcaster(&self) -> EventBroadcaster {
         self.broadcaster.clone()
+    }
+
+    /// Get the message log for this session.
+    #[must_use]
+    pub const fn message_log(&self) -> &Arc<MessageLog> {
+        &self.message_log
     }
 }
 
@@ -1255,6 +1420,249 @@ mod tests {
             get_session_with_conn(&conn, &id_zero)?.is_none(),
             "dead session should be removed with retention=0"
         );
+
+        Ok(())
+    }
+
+    // ── MessageLog tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_message_log_insert_and_query() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        // Insert a session for the FK.
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+        let payload = serde_json::json!({"method": "textDocument/hover"});
+        let id = log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+        assert!(id > 0, "log should return a positive id");
+
+        // Query back.
+        let (r_type, method, server, client, stored_payload): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .query_row(
+                "SELECT type, method, server, client, payload FROM messages WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+
+        assert_eq!(r_type, "lsp");
+        assert_eq!(method, "textDocument/hover");
+        assert_eq!(server, "rust-analyzer");
+        assert_eq!(client, "catenary");
+        let stored: serde_json::Value = serde_json::from_str(&stored_payload)?;
+        assert_eq!(stored, payload);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_log_returns_incrementing_ids() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn, "s1".to_string());
+        let payload = serde_json::json!({});
+        let id1 = log.log(
+            "lsp",
+            "initialize",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+        let id2 = log.log(
+            "lsp",
+            "initialized",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+
+        assert!(
+            id2 > id1,
+            "second id ({id2}) should be greater than first ({id1})"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_log_request_id_foreign_key() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+        let payload = serde_json::json!({});
+
+        let req_id = log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+        let resp_id = log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            Some(req_id),
+            None,
+            &payload,
+        );
+
+        let stored_req_id: Option<i64> = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .query_row(
+                "SELECT request_id FROM messages WHERE id = ?1",
+                [resp_id],
+                |row| row.get(0),
+            )?;
+
+        assert_eq!(stored_req_id, Some(req_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_log_parent_id_foreign_key() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn.clone(), "s1".to_string());
+        let payload = serde_json::json!({});
+
+        let parent = log.log(
+            "mcp",
+            "tools/call",
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &payload,
+        );
+        let child = log.log(
+            "lsp",
+            "workspace/symbol",
+            "rust-analyzer",
+            "catenary",
+            None,
+            Some(parent),
+            &payload,
+        );
+
+        let stored_parent_id: Option<i64> = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .query_row(
+                "SELECT parent_id FROM messages WHERE id = ?1",
+                [child],
+                |row| row.get(0),
+            )?;
+
+        assert_eq!(stored_parent_id, Some(parent));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_log_noop() {
+        let log = MessageLog::noop();
+        let payload = serde_json::json!({"test": true});
+        let id = log.log(
+            "lsp",
+            "initialize",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+
+        assert_eq!(id, 0, "noop log should return 0");
+    }
+
+    #[test]
+    fn test_message_log_broadcast() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+        let conn = Arc::new(Mutex::new(conn));
+
+        conn.lock().map_err(|_| anyhow::anyhow!("lock"))?.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = MessageLog::new(conn, "s1".to_string());
+        let mut rx = log.subscribe();
+
+        let payload = serde_json::json!({});
+        let id = log.log(
+            "lsp",
+            "initialize",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &payload,
+        );
+
+        let received = rx.try_recv().expect("should receive broadcast");
+        assert_eq!(received, id);
 
         Ok(())
     }

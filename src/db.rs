@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Resolve the Catenary state directory.
 ///
@@ -118,6 +118,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 3 {
                 migrate_v2_to_v3(&conn)?;
             }
+            if version < 4 {
+                migrate_v3_to_v4(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -141,6 +144,10 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error if any CREATE TABLE or INSERT statement fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single execute_batch with all DDL statements"
+)]
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "BEGIN IMMEDIATE;
@@ -149,7 +156,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '3');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -180,6 +187,25 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
          CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id);
          CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+
+         CREATE TABLE IF NOT EXISTS messages (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             timestamp   TEXT NOT NULL,
+             type        TEXT NOT NULL,
+             method      TEXT NOT NULL,
+             server      TEXT NOT NULL,
+             client      TEXT NOT NULL,
+             request_id  INTEGER REFERENCES messages(id),
+             parent_id   INTEGER REFERENCES messages(id),
+             payload     TEXT NOT NULL,
+             created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         );
+
+         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+         CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(type);
+         CREATE INDEX IF NOT EXISTS idx_messages_request_id ON messages(request_id);
+         CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id);
 
          CREATE TABLE IF NOT EXISTS language_servers (
              session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -340,6 +366,45 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 3 to 4.
+///
+/// Adds the `messages` table for protocol message logging (collapse workstream).
+///
+/// # Errors
+///
+/// Returns an error if the table creation or version update fails.
+fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         CREATE TABLE messages (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             timestamp   TEXT NOT NULL,
+             type        TEXT NOT NULL,
+             method      TEXT NOT NULL,
+             server      TEXT NOT NULL,
+             client      TEXT NOT NULL,
+             request_id  INTEGER REFERENCES messages(id),
+             parent_id   INTEGER REFERENCES messages(id),
+             payload     TEXT NOT NULL,
+             created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         );
+
+         CREATE INDEX idx_messages_session ON messages(session_id);
+         CREATE INDEX idx_messages_type ON messages(type);
+         CREATE INDEX idx_messages_request_id ON messages(request_id);
+         CREATE INDEX idx_messages_parent_id ON messages(parent_id);
+
+         UPDATE meta SET value = '4' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v3 to v4")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -387,6 +452,7 @@ mod tests {
             "sessions",
             "workspace_roots",
             "events",
+            "messages",
             "language_servers",
             "filter_history",
             "root_sync_state",
@@ -430,7 +496,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 3, "schema version should be 3");
+        assert_eq!(version, 4, "schema version should be 4");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -707,7 +773,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 3, "schema version should be 3 after migration");
+        assert_eq!(version, 4, "schema version should be 4 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state", "snapshots"] {
             assert!(
@@ -748,7 +814,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 3, "schema version should be 3 after migration");
+        assert_eq!(version, 4, "schema version should be 4 after migration");
 
         // Verify client_session_id column exists by inserting a row that uses it.
         conn.execute(
@@ -766,5 +832,62 @@ mod tests {
             )
             .expect("query client_session_id");
         assert_eq!(csid.as_deref(), Some("client-uuid-123"));
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_schema_migration_v3_to_v4() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        // Create a v3 database manually.
+        let conn = open_at(&path).expect("open_at failed");
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '3');
+             CREATE TABLE sessions (
+                 id             TEXT PRIMARY KEY,
+                 pid            INTEGER NOT NULL,
+                 display_name   TEXT NOT NULL,
+                 client_name    TEXT,
+                 client_version TEXT,
+                 client_session_id TEXT,
+                 started_at     TEXT NOT NULL,
+                 ended_at       TEXT,
+                 alive          INTEGER NOT NULL DEFAULT 1
+             );
+             COMMIT;",
+        )
+        .expect("failed to create v3 schema");
+        drop(conn);
+
+        // Open with migration — should upgrade to v4.
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        let version = current_schema_version(&conn).expect("failed to read schema version");
+        assert_eq!(version, 4, "schema version should be 4 after migration");
+
+        assert!(
+            table_exists(&conn, "messages"),
+            "messages table should exist after v3→v4 migration"
+        );
+
+        // Verify the table is usable by inserting a row.
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+             VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert session");
+
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, method, server, client, payload) \
+             VALUES ('test-session', '2026-01-01T00:00:00Z', 'lsp', \
+                     'textDocument/hover', 'rust-analyzer', 'catenary', '{}')",
+            [],
+        )
+        .expect("insert into messages should succeed after migration");
     }
 }
