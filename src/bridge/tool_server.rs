@@ -16,6 +16,7 @@
 /// — the boundary components on either side handle logging. A
 /// `ToolServer` is a black box: what went in and what came out are
 /// linked by `parent_id` at the protocol level.
+#[allow(async_fn_in_trait, reason = "no dyn dispatch — only concrete types")]
 pub trait ToolServer: Send + Sync {
     /// Execute the tool with the given parameters.
     ///
@@ -27,7 +28,7 @@ pub trait ToolServer: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the tool execution fails.
-    fn execute(
+    async fn execute(
         &self,
         params: &serde_json::Value,
         parent_id: Option<i64>,

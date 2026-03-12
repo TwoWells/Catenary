@@ -8,6 +8,7 @@
 //! filtering, quick-fix collection, and compact formatting.
 
 use super::path_security::PathValidator;
+use super::tool_server::ToolServer;
 use super::{DocumentManager, DocumentNotification};
 use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient};
 use anyhow::{Result, anyhow};
@@ -212,6 +213,27 @@ impl DiagnosticsServer {
         };
 
         Ok(DiagnosticsResult { content, count })
+    }
+}
+
+impl ToolServer for DiagnosticsServer {
+    async fn execute(
+        &self,
+        params: &serde_json::Value,
+        parent_id: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let file = params
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("missing \"file\" parameter"))?;
+
+        let entry_id = parent_id.unwrap_or(0);
+        let result = self.process_file(file, entry_id).await?;
+
+        Ok(serde_json::json!({
+            "content": result.content,
+            "count": result.count,
+        }))
     }
 }
 
