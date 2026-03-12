@@ -10,6 +10,16 @@
             "command": "catenary hook post-tool --format=gemini"
           }
         ]
+      },
+      {
+        "matcher": "run_shell_command(catenary restore *)",
+        "hooks": [
+          {
+            "name": "catenary-notify",
+            "type": "command",
+            "command": "catenary hook post-tool --format=gemini"
+          }
+        ]
       }
     ]
   }

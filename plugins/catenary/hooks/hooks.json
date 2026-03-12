@@ -21,6 +21,15 @@
             "command": "catenary hook post-tool --format=claude"
           }
         ]
+      },
+      {
+        "matcher": "Bash(catenary restore *)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook post-tool --format=claude"
+          }
+        ]
       }
     ]
   }

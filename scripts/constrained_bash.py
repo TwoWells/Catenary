@@ -160,6 +160,7 @@ GUIDANCE = {
     "tail":    "Use the Read tool instead.",
     "less":    "Use the Read tool instead.",
     "more":    "Use the Read tool instead.",
+    "sed":     "Use Catenary's replace tool instead.",
     "cargo":   "Use a make target instead. If no target exists, suggest one.",
     "rustc":   "Use a make target instead. If no target exists, suggest one.",
     "rustup":  "Use a make target instead. If no target exists, suggest one.",

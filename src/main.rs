@@ -189,6 +189,20 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+
+    /// Restore a file to a previous snapshot.
+    Restore {
+        /// File to restore (most recent snapshot).
+        file: Option<String>,
+
+        /// List snapshots instead of restoring.
+        #[arg(long)]
+        list: bool,
+
+        /// Restore to a specific snapshot ID.
+        #[arg(long)]
+        id: Option<i64>,
+    },
 }
 
 /// Hook subcommands invoked by host CLI hooks.
@@ -300,6 +314,22 @@ async fn main() -> Result<()> {
         }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
             run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
+        }
+        Some(Command::Restore { file, list, id }) => {
+            let conn = catenary_mcp::db::open_and_migrate()?;
+            let output = if list {
+                catenary_mcp::restore::list_snapshots(&conn, file.as_deref())?
+            } else if let Some(id) = id {
+                catenary_mcp::restore::restore_by_id(&conn, id)?
+            } else if let Some(ref file) = file {
+                catenary_mcp::restore::restore_most_recent(&conn, file)?
+            } else {
+                anyhow::bail!(
+                    "usage: catenary restore <file> | catenary restore --id=N | catenary restore --list"
+                );
+            };
+            println!("{output}");
+            Ok(())
         }
     }
 }
@@ -1169,7 +1199,10 @@ fn run_gc(
         );
     }
 
-    if older_than.is_none() && !dead && session_id.is_none() {
+    // Snapshot cleanup (fixed 7-day retention, always runs)
+    let snapshots_deleted = gc_expired_snapshots(conn)?;
+
+    if older_than.is_none() && !dead && session_id.is_none() && snapshots_deleted == 0 {
         println!("Nothing to do. Use --older-than, --dead, or --session.");
         return Ok(());
     }
@@ -1189,6 +1222,69 @@ fn run_gc(
     }
 
     Ok(())
+}
+
+/// Clean up expired snapshots (fixed 7-day retention).
+///
+/// Deletes all snapshot rows older than 7 days. For restore snapshots,
+/// also removes matching sidecar files from disk. Sidecars whose content
+/// differs from the snapshot are left in place with a warning.
+///
+/// Returns the number of snapshot rows deleted.
+///
+/// # Errors
+///
+/// Returns an error if the database query or delete fails.
+fn gc_expired_snapshots(conn: &rusqlite::Connection) -> Result<usize> {
+    // Process restore sidecars before deleting rows.
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, content FROM snapshots \
+         WHERE source = 'restore' AND created_at < datetime('now', '-7 days')",
+    )?;
+    let restore_rows: Vec<(i64, String, Vec<u8>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut sidecars_deleted: usize = 0;
+    for (id, file_path, content) in &restore_rows {
+        let sidecar = catenary_mcp::restore::sidecar_path(Path::new(file_path), *id);
+        if sidecar.exists() {
+            match std::fs::read(&sidecar) {
+                Ok(ref disk_content) if disk_content == content => {
+                    let _ = std::fs::remove_file(&sidecar);
+                    sidecars_deleted += 1;
+                }
+                Ok(_) => {
+                    println!(
+                        "sidecar {} differs from snapshot #{id} — not deleted.",
+                        sidecar.display(),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    let snapshots_deleted = conn.execute(
+        "DELETE FROM snapshots WHERE created_at < datetime('now', '-7 days')",
+        [],
+    )?;
+
+    if snapshots_deleted > 0 {
+        print!(
+            "Deleted {snapshots_deleted} expired snapshot{}",
+            if snapshots_deleted == 1 { "" } else { "s" },
+        );
+        if sidecars_deleted > 0 {
+            print!(
+                " ({sidecars_deleted} sidecar{})",
+                if sidecars_deleted == 1 { "" } else { "s" },
+            );
+        }
+        println!();
+    }
+
+    Ok(snapshots_deleted)
 }
 
 /// Get the database file size in bytes.
@@ -3051,6 +3147,130 @@ mod tests {
         let (_dir, _path, conn) = test_db();
         // Should not error
         run_gc(&conn, None, false, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_sidecar_identical() -> Result<()> {
+        let (_db_dir, _path, conn) = test_db();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("test.rs");
+        let file_str = file.to_string_lossy().to_string();
+
+        let content = b"original content";
+
+        // Insert an expired restore snapshot (older than 7 days).
+        conn.execute(
+            "INSERT INTO snapshots \
+                 (file_path, content, source, created_at) \
+             VALUES (?1, ?2, 'restore', datetime('now', '-8 days'))",
+            rusqlite::params![&file_str, content.as_slice()],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        // Create sidecar with identical content.
+        let sidecar = catenary_mcp::restore::sidecar_path(&file, id);
+        std::fs::write(&sidecar, content).expect("write sidecar");
+
+        gc_expired_snapshots(&conn)?;
+
+        // Sidecar should be deleted.
+        assert!(!sidecar.exists(), "sidecar should be deleted");
+
+        // Snapshot row should be deleted.
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0, "snapshot row should be deleted");
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_sidecar_modified() -> Result<()> {
+        let (_db_dir, _path, conn) = test_db();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("test.rs");
+        let file_str = file.to_string_lossy().to_string();
+
+        let content = b"original content";
+
+        conn.execute(
+            "INSERT INTO snapshots \
+                 (file_path, content, source, created_at) \
+             VALUES (?1, ?2, 'restore', datetime('now', '-8 days'))",
+            rusqlite::params![&file_str, content.as_slice()],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        // Create sidecar with different content.
+        let sidecar = catenary_mcp::restore::sidecar_path(&file, id);
+        std::fs::write(&sidecar, b"modified by user").expect("write sidecar");
+
+        gc_expired_snapshots(&conn)?;
+
+        // Sidecar should NOT be deleted.
+        assert!(sidecar.exists(), "modified sidecar should survive");
+
+        // Snapshot row should still be deleted.
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0, "snapshot row should be deleted regardless");
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_sidecar_missing() -> Result<()> {
+        let (_db_dir, _path, conn) = test_db();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("test.rs");
+        let file_str = file.to_string_lossy().to_string();
+
+        conn.execute(
+            "INSERT INTO snapshots \
+                 (file_path, content, source, created_at) \
+             VALUES (?1, ?2, 'restore', datetime('now', '-8 days'))",
+            rusqlite::params![&file_str, b"content".as_slice()],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        // No sidecar on disk — should not error.
+        gc_expired_snapshots(&conn)?;
+
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0, "snapshot row should be deleted");
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_non_restore_snapshot() -> Result<()> {
+        let (_db_dir, _path, conn) = test_db();
+
+        conn.execute(
+            "INSERT INTO snapshots \
+                 (file_path, content, source, pattern, count, created_at) \
+             VALUES ('src/test.rs', X'00', 'replace', '1 edits', 1, datetime('now', '-8 days'))",
+            [],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        gc_expired_snapshots(&conn)?;
+
+        // Row should be deleted (no sidecar check for non-restore).
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0, "replace snapshot row should be deleted");
         Ok(())
     }
 
