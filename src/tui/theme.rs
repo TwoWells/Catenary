@@ -979,10 +979,7 @@ pub fn format_message_styled(
                         reason = "diagnostic count is always small"
                     )]
                     let (icon, style) = diag_style(count as usize, preview, icons, theme);
-                    let label = format!(
-                        "{count} diagnostic{}",
-                        if count == 1 { "" } else { "s" }
-                    );
+                    let label = format!("{count} diagnostic{}", if count == 1 { "" } else { "s" });
                     Line::from(vec![
                         ts_span,
                         Span::styled(icon.to_string(), style),
@@ -1364,10 +1361,7 @@ mod tests {
             text.contains("[rust-analyzer]"),
             "should contain server name"
         );
-        assert!(
-            text.contains("textDocument/hover"),
-            "should contain method"
-        );
+        assert!(text.contains("textDocument/hover"), "should contain method");
         assert!(text.contains("\u{2192}"), "outbound request should show →");
     }
 
