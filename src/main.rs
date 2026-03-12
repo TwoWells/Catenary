@@ -426,7 +426,12 @@ async fn run_server(args: Args) -> Result<()> {
     let client_manager_for_roots = client_manager.clone();
     let path_validator_for_roots = path_validator.clone();
     let runtime_for_roots = tokio::runtime::Handle::current();
-    let mut mcp_server = McpServer::new(handler, broadcaster)
+    let message_log = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .message_log()
+        .clone();
+    let mut mcp_server = McpServer::new(handler, broadcaster, message_log)
         .on_client_info(Box::new(move |name: &str, version: &str| {
             if let Ok(mut session) = session_for_callback.lock() {
                 session.set_client_info(name, version);
