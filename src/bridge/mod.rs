@@ -11,6 +11,8 @@ mod file_tools;
 mod handler;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
+/// Replace tool core: input parsing, edit application, output rendering.
+pub mod replace;
 /// Shared symbol types and helpers for handler and file_tools.
 mod symbols;
 /// Workspace root synchronization for PreToolUse hook requests.
