@@ -255,7 +255,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use crate::config::IconConfig;
-    use crate::session::{EventKind, SessionEvent};
+    use crate::session::SessionMessage;
 
     fn test_theme() -> Theme {
         Theme::new()
@@ -265,10 +265,17 @@ mod tests {
         IconSet::from_config(IconConfig::default())
     }
 
-    fn make_event(kind: EventKind) -> SessionEvent {
-        SessionEvent {
+    fn make_message(method: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: "lsp".to_string(),
+            method: method.to_string(),
+            server: "rust-analyzer".to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
             timestamp: chrono::Utc::now(),
-            kind,
+            payload: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -492,17 +499,9 @@ mod tests {
         grid.open_panel("panel-a".to_string());
         grid.open_panel("panel-b".to_string());
 
-        // Load some events into each panel.
-        grid.panels[0].load_events(vec![make_event(EventKind::ToolCall {
-            tool: "hover".to_string(),
-            file: Some("/src/main.rs".to_string()),
-            params: None,
-        })]);
-        grid.panels[1].load_events(vec![make_event(EventKind::ToolCall {
-            tool: "definition".to_string(),
-            file: Some("/src/lib.rs".to_string()),
-            params: None,
-        })]);
+        // Load some messages into each panel.
+        grid.panels[0].load_messages(vec![make_message("hover")]);
+        grid.panels[1].load_messages(vec![make_message("definition")]);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal creation");
@@ -518,10 +517,13 @@ mod tests {
 
         assert!(content.contains("panel-a"), "expected panel-a session id");
         assert!(content.contains("panel-b"), "expected panel-b session id");
-        assert!(content.contains("hover"), "expected hover tool in panel-a");
+        assert!(
+            content.contains("hover"),
+            "expected hover method in panel-a"
+        );
         assert!(
             content.contains("definition"),
-            "expected definition tool in panel-b"
+            "expected definition method in panel-b"
         );
     }
 

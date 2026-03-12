@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use ratatui::layout::Rect;
 
-use super::data::{DataSource, EventTail};
+use super::data::{DataSource, MessageTail};
 use super::filter::FilterState;
 use super::grid::EventsGrid;
 use super::layout::PanelLayout;
@@ -71,7 +71,7 @@ pub struct App<'a> {
     /// Cached panel layout (updated each frame).
     pub grid_layout: Option<PanelLayout>,
     /// Event tails keyed by session ID, for streaming new events into panels.
-    pub tails: HashMap<String, Box<dyn EventTail>>,
+    pub tails: HashMap<String, Box<dyn MessageTail>>,
 }
 
 impl<'a> App<'a> {
