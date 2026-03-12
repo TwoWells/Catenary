@@ -402,10 +402,7 @@ mod tests {
         let text = yank_text(&panel, &sel);
         assert!(text.contains("lib.rs"), "header should mention file");
         // Detail lines contain pretty-printed payload.
-        assert!(
-            text.contains("post-tool"),
-            "detail should contain method"
-        );
+        assert!(text.contains("post-tool"), "detail should contain method");
         assert!(
             text.lines().count() >= 3,
             "should have at least 3 lines of output"
