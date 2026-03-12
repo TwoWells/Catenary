@@ -17,13 +17,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::bridge::diagnostics_server::DiagnosticsServer;
 use crate::bridge::sync_roots_server::SyncRootsServer;
-use crate::bridge::{DocumentManager, PathValidator};
-use crate::lsp::ClientManager;
 use crate::session::{EventBroadcaster, EventKind, MessageLog};
 
 /// Request from `catenary hook PostToolUse` (file change) or `catenary hook PreToolUse` (root sync).
@@ -83,18 +80,13 @@ pub struct HookServer {
 impl HookServer {
     /// Creates a new `HookServer`.
     #[must_use]
-    pub fn new(
-        client_manager: Arc<ClientManager>,
-        doc_manager: Arc<Mutex<DocumentManager>>,
-        path_validator: Arc<RwLock<PathValidator>>,
+    pub const fn new(
+        diagnostics: DiagnosticsServer,
+        sync_roots: SyncRootsServer,
         broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,
         client_name: String,
     ) -> Self {
-        let diagnostics =
-            DiagnosticsServer::new(client_manager.clone(), doc_manager, path_validator.clone());
-        let sync_roots = SyncRootsServer::new(client_manager, path_validator);
-
         Self {
             diagnostics,
             sync_roots,

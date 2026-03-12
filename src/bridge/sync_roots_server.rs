@@ -24,7 +24,7 @@ pub struct SyncRootsServer {
 
 impl SyncRootsServer {
     /// Creates a new `SyncRootsServer`.
-    pub(crate) const fn new(
+    pub const fn new(
         client_manager: Arc<ClientManager>,
         path_validator: Arc<RwLock<PathValidator>>,
     ) -> Self {
