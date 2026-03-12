@@ -214,6 +214,42 @@ impl DiagnosticsServer {
 
         Ok(DiagnosticsResult { content, count })
     }
+
+    /// Processes multiple file changes and returns a combined diagnostics string.
+    ///
+    /// Runs the full pipeline for each file (document sync, wait, severity
+    /// filtering, noise filtering, quick-fixes). Files with `[clean]` or
+    /// `[diagnostics unavailable]` results are omitted. Errors are
+    /// best-effort skipped.
+    pub async fn process_files(&self, files: &[&str], entry_id: i64) -> String {
+        use std::fmt::Write;
+
+        let mut output = String::new();
+
+        for &file in files {
+            let Ok(result) = self.process_file(file, entry_id).await else {
+                continue;
+            };
+
+            if result.content.is_empty()
+                || result.content == "[clean]"
+                || result.content == "[diagnostics unavailable]"
+                || result.content == "[no language server]"
+            {
+                continue;
+            }
+
+            if output.is_empty() {
+                output.push_str("diagnostics:\n");
+            }
+            _ = writeln!(output, "\t{file}");
+            for line in result.content.lines() {
+                _ = writeln!(output, "\t{line}");
+            }
+        }
+
+        output
+    }
 }
 
 impl ToolServer for DiagnosticsServer {
