@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Replace tool core: input parsing, flag validation, edit application.
+//! Replace tool core: input parsing, flag validation, edit application,
+//! file scoping, and diff extraction.
 
 use anyhow::{Result, anyhow};
+use globset::Glob;
+use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
+use similar::{ChangeTag, TextDiff};
+use std::path::{Path, PathBuf};
+
+use super::diagnostics_server::resolve_path;
 
 /// Input parameters for the `replace` tool.
 #[derive(Debug, Deserialize)]
@@ -458,6 +465,178 @@ fn apply_edit_with_ranges(
     (result_lines.concat(), total_count)
 }
 
+/// Returns `true` if the path passes through a VCS directory.
+fn is_vcs_path(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some(".git" | ".hg" | ".svn")))
+}
+
+/// Returns `true` if the filename is a Catenary snapshot sidecar.
+fn is_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().contains(".catenary_snapshot_"))
+}
+
+/// Resolves the `glob` parameter to a list of target file paths.
+///
+/// - File path → single-element vec (rejects VCS paths).
+/// - Directory → error with guidance.
+/// - Glob pattern → walk with `ignore::WalkBuilder` across roots.
+///
+/// Applies `exclude`, `include_gitignored`, `include_hidden`.
+/// Skips sidecar files and VCS directories.
+///
+/// # Errors
+///
+/// Returns an error if the path is inside a VCS directory, is a directory,
+/// or if a glob/exclude pattern is invalid.
+pub fn resolve_targets(
+    glob_param: &str,
+    roots: &[PathBuf],
+    exclude: Option<&str>,
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> Result<Vec<PathBuf>> {
+    let resolved = resolve_path(glob_param)?;
+
+    if resolved.is_file() {
+        if is_vcs_path(&resolved) {
+            return Err(anyhow!("refusing to modify files inside .git/"));
+        }
+        return Ok(vec![resolved]);
+    }
+
+    if resolved.is_dir() {
+        return Err(anyhow!(
+            "{} is a directory — use a glob pattern (e.g., {}/*.rs)",
+            resolved.display(),
+            resolved.display()
+        ));
+    }
+
+    // Treat as glob pattern.
+    let matcher = Glob::new(glob_param)
+        .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
+        .compile_matcher();
+
+    let exclude_matcher = exclude
+        .map(|ex| {
+            Glob::new(ex)
+                .map_err(|e| anyhow!("Invalid exclude pattern: {e}"))
+                .map(|g| g.compile_matcher())
+        })
+        .transpose()?;
+
+    let search_roots = if roots.is_empty() {
+        vec![
+            std::env::current_dir()
+                .map_err(|e| anyhow!("Failed to get current working directory: {e}"))?,
+        ]
+    } else {
+        roots.to_vec()
+    };
+
+    let mut matched_files: Vec<PathBuf> = Vec::new();
+
+    for root in &search_roots {
+        let walker = WalkBuilder::new(root)
+            .git_ignore(!include_gitignored)
+            .hidden(!include_hidden)
+            .build();
+
+        for entry in walker.flatten() {
+            let entry_path = entry.into_path();
+
+            if !entry_path.is_file() {
+                continue;
+            }
+
+            if is_vcs_path(&entry_path) || is_sidecar(&entry_path) {
+                continue;
+            }
+
+            let rel_path = entry_path.strip_prefix(root).unwrap_or(&entry_path);
+
+            if !matcher.is_match(rel_path) {
+                continue;
+            }
+
+            if let Some(ref ex) = exclude_matcher
+                && ex.is_match(rel_path)
+            {
+                continue;
+            }
+
+            matched_files.push(entry_path);
+        }
+    }
+
+    matched_files.sort();
+    matched_files.dedup();
+
+    Ok(matched_files)
+}
+
+/// Reads file content as UTF-8. Returns `Err` for non-UTF-8 (binary) files.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or contains non-UTF-8 bytes.
+pub fn read_file_utf8(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| anyhow!("not UTF-8: {}", path.display()))
+}
+
+/// Extracts line-level diffs between old and new content.
+///
+/// Returns `(old_line, new_line)` pairs from diff hunks using
+/// the `similar` crate with patience diff algorithm.
+#[must_use]
+pub fn extract_diffs(old: &str, new: &str) -> Vec<(String, String)> {
+    let diff = TextDiff::configure()
+        .algorithm(similar::Algorithm::Patience)
+        .diff_lines(old, new);
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut deletes: Vec<String> = Vec::new();
+    let mut inserts: Vec<String> = Vec::new();
+
+    let flush = |deletes: &mut Vec<String>,
+                 inserts: &mut Vec<String>,
+                 pairs: &mut Vec<(String, String)>| {
+        let max_len = deletes.len().max(inserts.len());
+        for i in 0..max_len {
+            let d = deletes.get(i).cloned().unwrap_or_default();
+            let ins = inserts.get(i).cloned().unwrap_or_default();
+            pairs.push((d, ins));
+        }
+        deletes.clear();
+        inserts.clear();
+    };
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                flush(&mut deletes, &mut inserts, &mut pairs);
+            }
+            ChangeTag::Delete => {
+                if !inserts.is_empty() {
+                    flush(&mut deletes, &mut inserts, &mut pairs);
+                }
+                deletes.push(change.value().trim_end_matches('\n').to_owned());
+            }
+            ChangeTag::Insert => {
+                inserts.push(change.value().trim_end_matches('\n').to_owned());
+            }
+        }
+    }
+
+    flush(&mut deletes, &mut inserts, &mut pairs);
+
+    pairs
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -724,6 +903,111 @@ mod tests {
             assert!(lr.contains(line), "line {line} should be in range");
         }
         assert!(!lr.contains(9), "line 9 should not be in range");
+    }
+
+    // --- File scoping ---
+
+    #[test]
+    fn test_resolve_single_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("hello.rs");
+        std::fs::write(&file, "fn main() {}").expect("write");
+
+        let result = resolve_targets(file.to_str().expect("utf8"), &[], None, false, false)
+            .expect("resolve");
+        assert_eq!(result, vec![file]);
+    }
+
+    #[test]
+    fn test_resolve_directory_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let err = resolve_targets(dir.path().to_str().expect("utf8"), &[], None, false, false)
+            .expect_err("should error on directory");
+        let msg = err.to_string();
+        assert!(msg.contains("is a directory"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_glob_pattern() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "a").expect("write");
+        std::fs::write(dir.path().join("b.rs"), "b").expect("write");
+        std::fs::write(dir.path().join("c.txt"), "c").expect("write");
+
+        let roots = vec![dir.path().to_path_buf()];
+        let result = resolve_targets("*.rs", &roots, None, false, false).expect("resolve");
+        assert_eq!(result.len(), 2);
+        assert!(
+            result
+                .iter()
+                .all(|p| p.extension().is_some_and(|e| e == "rs"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_vcs_rejection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).expect("mkdir");
+        let config = git_dir.join("config");
+        std::fs::write(&config, "[core]").expect("write");
+
+        let err = resolve_targets(config.to_str().expect("utf8"), &[], None, false, false)
+            .expect_err("should reject VCS path");
+        let msg = err.to_string();
+        assert!(msg.contains(".git"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_sidecar_exclusion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("foo.rs"), "code").expect("write");
+        std::fs::write(dir.path().join("foo.catenary_snapshot_1.rs"), "snapshot").expect("write");
+
+        let roots = vec![dir.path().to_path_buf()];
+        let result = resolve_targets("*.rs", &roots, None, false, false).expect("resolve");
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].file_name().expect("name").to_string_lossy() == "foo.rs",
+            "got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_exclude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("src.rs"), "code").expect("write");
+        std::fs::write(dir.path().join("test_src.rs"), "test").expect("write");
+
+        let roots = vec![dir.path().to_path_buf()];
+        let result =
+            resolve_targets("*.rs", &roots, Some("test_*"), false, false).expect("resolve");
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].file_name().expect("name").to_string_lossy() == "src.rs",
+            "got: {result:?}"
+        );
+    }
+
+    // --- Diff extraction ---
+
+    #[test]
+    fn test_diff_simple() {
+        let old = "line1\nline2\n";
+        let new = "line1\nchanged\n";
+        let pairs = extract_diffs(old, new);
+        assert_eq!(pairs, vec![("line2".to_owned(), "changed".to_owned())]);
+    }
+
+    #[test]
+    fn test_diff_multi_line() {
+        let old = "one\ntwo\nthree\nfour\nfive\n";
+        let new = "one\nTWO\nthree\nFOUR\nfive\n";
+        let pairs = extract_diffs(old, new);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("two".to_owned(), "TWO".to_owned()));
+        assert_eq!(pairs[1], ("four".to_owned(), "FOUR".to_owned()));
     }
 
     #[test]
