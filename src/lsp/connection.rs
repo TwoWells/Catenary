@@ -17,8 +17,16 @@ use tracing::{debug, error, warn};
 
 use super::inbox::Inbox;
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
-use crate::logger::Logger;
-use crate::session::{Direction, EventKind, Protocol};
+use crate::session::MessageLog;
+
+/// Tracks an in-flight request so we can annotate the response with
+/// the original method name and causation chain.
+struct PendingRequest {
+    method: String,
+    parent_id: Option<i64>,
+    message_id: i64,
+    sender: oneshot::Sender<ResponseMessage>,
+}
 
 /// Poll interval for failure detection sampling.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -32,12 +40,13 @@ const REQUEST_THRESHOLD: u64 = 1000;
 pub struct Connection {
     child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
-    pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
+    pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     alive: Arc<AtomicBool>,
     next_id: AtomicI64,
     inbox: Arc<dyn Inbox>,
     language: String,
-    logger: Arc<dyn Logger>,
+    message_log: Arc<MessageLog>,
+    server_name: String,
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
     _reader_handle: tokio::task::JoinHandle<()>,
 }
@@ -56,7 +65,8 @@ impl Connection {
         stderr: Stdio,
         inbox: Arc<dyn Inbox>,
         language: String,
-        logger: Arc<dyn Logger>,
+        message_log: Arc<MessageLog>,
+        server_name: &str,
     ) -> Result<Self> {
         let mut child = Command::new(program)
             .args(args)
@@ -78,7 +88,7 @@ impl Connection {
             .ok_or_else(|| anyhow!("stdout not captured"))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>> =
+        let pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
 
@@ -88,8 +98,8 @@ impl Connection {
             alive.clone(),
             inbox.clone(),
             stdout,
-            logger.clone(),
-            language.clone(),
+            message_log.clone(),
+            server_name.to_string(),
         ));
 
         Ok(Self {
@@ -100,7 +110,8 @@ impl Connection {
             next_id: AtomicI64::new(1),
             inbox,
             language,
-            logger,
+            message_log,
+            server_name: server_name.to_string(),
             monitor: std::sync::Mutex::new(monitor),
             _reader_handle: reader_handle,
         })
@@ -120,6 +131,7 @@ impl Connection {
         &self,
         method: &str,
         params: serde_json::Value,
+        parent_id: Option<i64>,
     ) -> Result<serde_json::Value> {
         // Retry loop for ContentModified errors
         for _attempt in 0..3 {
@@ -132,10 +144,30 @@ impl Connection {
                 params: params.clone(),
             };
 
+            let message_id = serde_json::to_value(&request).map_or(0, |payload| {
+                self.message_log.log(
+                    "lsp",
+                    method,
+                    &self.server_name,
+                    "catenary",
+                    None,
+                    parent_id,
+                    &payload,
+                )
+            });
+
             let (tx, rx) = oneshot::channel();
             {
                 let mut pending = self.pending.lock().await;
-                pending.insert(id.clone(), tx);
+                pending.insert(
+                    id.clone(),
+                    PendingRequest {
+                        method: method.to_string(),
+                        parent_id,
+                        message_id,
+                        sender: tx,
+                    },
+                );
             }
 
             self.send_message(&request).await?;
@@ -229,13 +261,28 @@ impl Connection {
     }
 
     /// Send a notification (no response expected).
-    pub async fn notify(&self, method: &str, params: serde_json::Value) -> Result<()> {
+    pub async fn notify(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        parent_id: Option<i64>,
+    ) -> Result<()> {
         let notification = super::protocol::NotificationMessage {
             jsonrpc: "2.0".to_string(),
             method: method.to_string(),
             params,
         };
-
+        if let Ok(payload) = serde_json::to_value(&notification) {
+            self.message_log.log(
+                "lsp",
+                method,
+                &self.server_name,
+                "catenary",
+                None,
+                parent_id,
+                &payload,
+            );
+        }
         self.send_message(&notification).await
     }
 
@@ -270,16 +317,6 @@ impl Connection {
         let body = serde_json::to_string(message)?;
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
-        // Tee: capture outgoing LSP message
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-            self.logger.log(EventKind::ProtocolMessage {
-                protocol: Protocol::Lsp,
-                language: Some(self.language.clone()),
-                direction: Direction::Send,
-                message: value,
-            });
-        }
-
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(header.as_bytes()).await?;
         stdin.write_all(body.as_bytes()).await?;
@@ -296,12 +333,12 @@ impl Connection {
     )]
     async fn reader_loop(
         stdin: Arc<Mutex<ChildStdin>>,
-        pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ResponseMessage>>>>,
+        pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
         alive: Arc<AtomicBool>,
         inbox: Arc<dyn Inbox>,
         stdout: tokio::process::ChildStdout,
-        logger: Arc<dyn Logger>,
-        language: String,
+        message_log: Arc<MessageLog>,
+        server_name: String,
     ) {
         let mut reader = BufReader::new(stdout);
         let mut buffer = BytesMut::with_capacity(8192);
@@ -333,20 +370,21 @@ impl Connection {
                     }
                 };
 
-                // Tee: capture incoming LSP message
-                logger.log(EventKind::ProtocolMessage {
-                    protocol: Protocol::Lsp,
-                    language: Some(language.clone()),
-                    direction: Direction::Recv,
-                    message: value.clone(),
-                });
-
                 // Check message type
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                     // Request or Notification
                     if let Some(id) = value.get("id") {
-                        // Server Request
+                        // Server Request — log inbound
                         debug!("Received server request: {} (id: {})", method, id);
+                        let inbound_id = message_log.log(
+                            "lsp",
+                            method,
+                            &server_name,
+                            "catenary",
+                            None,
+                            None,
+                            &value,
+                        );
 
                         let request_id =
                             serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0));
@@ -372,6 +410,19 @@ impl Connection {
                             },
                         };
 
+                        // Log outbound response
+                        if let Ok(response_json) = serde_json::to_value(&response) {
+                            message_log.log(
+                                "lsp",
+                                method,
+                                &server_name,
+                                "catenary",
+                                Some(inbound_id),
+                                None,
+                                &response_json,
+                            );
+                        }
+
                         if let Ok(body) = serde_json::to_string(&response) {
                             let header = format!("Content-Length: {}\r\n\r\n", body.len());
                             let mut stdin_guard = stdin.lock().await;
@@ -384,18 +435,36 @@ impl Connection {
                             }
                         }
                     } else {
-                        // Notification
+                        // Notification — log inbound
+                        message_log.log(
+                            "lsp",
+                            method,
+                            &server_name,
+                            "catenary",
+                            None,
+                            None,
+                            &value,
+                        );
                         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
                         inbox.on_notification(method, params);
                     }
                 } else if value.get("id").is_some() {
-                    // Response
-                    if let Ok(response) = serde_json::from_value::<ResponseMessage>(value)
+                    // Response — log with method from pending map
+                    if let Ok(response) = serde_json::from_value::<ResponseMessage>(value.clone())
                         && let Some(id) = &response.id
                     {
                         let mut pending = pending.lock().await;
-                        if let Some(sender) = pending.remove(id) {
-                            let _ = sender.send(response);
+                        if let Some(req) = pending.remove(id) {
+                            message_log.log(
+                                "lsp",
+                                &req.method,
+                                &server_name,
+                                "catenary",
+                                Some(req.message_id),
+                                req.parent_id,
+                                &value,
+                            );
+                            let _ = req.sender.send(response);
                         } else {
                             warn!("Received response for unknown request id: {:?}", id);
                         }

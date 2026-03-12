@@ -17,8 +17,7 @@ use super::inbox::{Inbox, ServerInbox};
 use super::params;
 use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
-use crate::logger::Logger;
-use crate::session::{EventBroadcaster, EventKind};
+use crate::session::{EventBroadcaster, EventKind, MessageLog};
 
 /// Cached diagnostics for a file: `(version, diagnostics)`.
 ///
@@ -88,6 +87,8 @@ pub struct LspClient {
     /// Server capabilities from the `initialize` response.
     /// Populated after `initialize()` completes.
     server_capabilities: Value,
+    /// Parent message ID for causation tracking (set before tool dispatch).
+    parent_id: Option<i64>,
 }
 
 impl LspClient {
@@ -103,14 +104,14 @@ impl LspClient {
         args: &[&str],
         language: &str,
         broadcaster: EventBroadcaster,
-        logger: Arc<dyn Logger>,
+        message_log: Arc<MessageLog>,
     ) -> Result<Self> {
         Self::spawn_inner(
             program,
             args,
             language,
             broadcaster,
-            logger,
+            message_log,
             Stdio::inherit(),
         )
     }
@@ -125,9 +126,16 @@ impl LspClient {
         args: &[&str],
         language: &str,
         broadcaster: EventBroadcaster,
-        logger: Arc<dyn Logger>,
+        message_log: Arc<MessageLog>,
     ) -> Result<Self> {
-        Self::spawn_inner(program, args, language, broadcaster, logger, Stdio::null())
+        Self::spawn_inner(
+            program,
+            args,
+            language,
+            broadcaster,
+            message_log,
+            Stdio::null(),
+        )
     }
 
     fn spawn_inner(
@@ -135,7 +143,7 @@ impl LspClient {
         args: &[&str],
         language: &str,
         broadcaster: EventBroadcaster,
-        logger: Arc<dyn Logger>,
+        message_log: Arc<MessageLog>,
         stderr: Stdio,
     ) -> Result<Self> {
         let inbox = Arc::new(ServerInbox::new(language.to_string(), broadcaster));
@@ -152,7 +160,8 @@ impl LspClient {
             stderr,
             inbox.clone(),
             language.to_string(),
-            logger,
+            message_log,
+            program,
         )?;
 
         Ok(Self {
@@ -167,6 +176,7 @@ impl LspClient {
             server_command: program.to_string(),
             server_version: None,
             server_capabilities: Value::Object(serde_json::Map::default()),
+            parent_id: None,
         })
     }
 
@@ -188,17 +198,27 @@ impl LspClient {
         self.inbox.is_progress_active()
     }
 
+    /// Sets the parent message ID for causation tracking.
+    ///
+    /// All subsequent requests and notifications will carry this parent ID
+    /// until it is changed or cleared.
+    pub const fn set_parent_id(&mut self, parent_id: Option<i64>) {
+        self.parent_id = parent_id;
+    }
+
     /// Sends a request and waits for the response.
     ///
     /// Delegates to [`Connection::request`] for transport and failure
     /// detection, returning the raw JSON response.
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.connection.request(method, params).await
+        self.connection
+            .request(method, params, self.parent_id)
+            .await
     }
 
     /// Sends a notification (no response expected).
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        self.connection.notify(method, params).await
+        self.connection.notify(method, params, self.parent_id).await
     }
 
     /// Performs the LSP initialize handshake.

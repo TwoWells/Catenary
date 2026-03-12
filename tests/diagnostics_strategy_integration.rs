@@ -303,8 +303,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     // Spawn LspClient directly with mockls --diagnostics-delay 5000
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let broadcaster = EventBroadcaster::noop();
-    let logger: std::sync::Arc<dyn catenary_mcp::logger::Logger> =
-        std::sync::Arc::new(catenary_mcp::logger::TracingLogger);
+    let message_log = std::sync::Arc::new(catenary_mcp::session::MessageLog::noop());
     let mut client = LspClient::spawn(
         mockls_bin,
         &[
@@ -315,7 +314,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
         ],
         MOCK_LANG_A,
         broadcaster,
-        logger,
+        message_log,
     )
     .context("spawn LspClient")?;
 
