@@ -188,6 +188,10 @@ enum Command {
         /// Delete all data for a specific session.
         #[arg(long)]
         session: Option<String>,
+
+        /// Remove sidecar files for all restore snapshots.
+        #[arg(long)]
+        sidecars: bool,
     },
 
     /// Restore a file to a previous snapshot.
@@ -311,9 +315,10 @@ async fn main() -> Result<()> {
             older_than,
             dead,
             session,
+            sidecars,
         }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
-            run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
+            run_gc(&conn, older_than.as_deref(), dead, session.as_deref(), sidecars)
         }
         Some(Command::Restore { file, list, id }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
@@ -1096,6 +1101,7 @@ fn run_gc(
     older_than: Option<&str>,
     dead: bool,
     session_id: Option<&str>,
+    sidecars: bool,
 ) -> Result<()> {
     let mut total_events_deleted: usize = 0;
     let mut sessions_deleted: usize = 0;
@@ -1199,12 +1205,15 @@ fn run_gc(
         );
     }
 
+    // --sidecars: remove all restore sidecar files (content-matched)
+    if sidecars {
+        gc_restore_sidecars(conn)?;
+    }
     // Snapshot cleanup (fixed 7-day retention, always runs)
     let snapshots_deleted = gc_expired_snapshots(conn)?;
 
-    if older_than.is_none() && !dead && session_id.is_none() && snapshots_deleted == 0 {
-        println!("Nothing to do. Use --older-than, --dead, or --session.");
-        return Ok(());
+    if older_than.is_none() && !dead && session_id.is_none() && !sidecars && snapshots_deleted == 0 {
+        println!("Nothing to do. Use --older-than, --dead, --session, or --sidecars.");
     }
 
     // VACUUM if significant data was deleted
@@ -1222,6 +1231,55 @@ fn run_gc(
     }
 
     Ok(())
+}
+
+/// Remove sidecar files for all restore snapshots regardless of age.
+///
+/// Deletes sidecar files whose content matches the snapshot. Sidecars
+/// whose content differs are left in place with a warning.
+///
+/// Returns the number of sidecars removed.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+fn gc_restore_sidecars(conn: &rusqlite::Connection) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, content FROM snapshots WHERE source = 'restore'",
+    )?;
+    let rows: Vec<(i64, String, Vec<u8>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut removed: usize = 0;
+    for (id, file_path, content) in &rows {
+        let sidecar = catenary_mcp::restore::sidecar_path(Path::new(file_path), *id);
+        if sidecar.exists() {
+            match std::fs::read(&sidecar) {
+                Ok(ref disk_content) if disk_content == content => {
+                    let _ = std::fs::remove_file(&sidecar);
+                    removed += 1;
+                    println!("Removed {}", sidecar.display());
+                }
+                Ok(_) => {
+                    println!(
+                        "sidecar {} differs from snapshot #{id} — not deleted.",
+                        sidecar.display(),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    if removed > 0 {
+        println!(
+            "Removed {removed} sidecar{}.",
+            if removed == 1 { "" } else { "s" },
+        );
+    }
+
+    Ok(removed)
 }
 
 /// Clean up expired snapshots (fixed 7-day retention).
@@ -3105,7 +3163,7 @@ mod tests {
         assert!(!found.expect("checked above").1, "session should be dead");
 
         // Run gc --dead
-        run_gc(&conn, None, true, None)?;
+        run_gc(&conn, None, true, None, false)?;
 
         // Should be gone
         assert!(
@@ -3127,7 +3185,7 @@ mod tests {
         drop(s2);
 
         // Delete only s1
-        run_gc(&conn, None, false, Some(&id1))?;
+        run_gc(&conn, None, false, Some(&id1), false)?;
 
         assert!(
             session::get_session_with_conn(&conn, &id1)?.is_none(),
@@ -3146,7 +3204,7 @@ mod tests {
     fn test_gc_no_flags_is_noop() -> Result<()> {
         let (_dir, _path, conn) = test_db();
         // Should not error
-        run_gc(&conn, None, false, None)?;
+        run_gc(&conn, None, false, None, false)?;
         Ok(())
     }
 
