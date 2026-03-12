@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::config::{IconConfig, IconPreset};
-use crate::session::{Direction, EventKind, Protocol, SessionEvent};
+use crate::session::{Direction, EventKind, Protocol, SessionEvent, SessionMessage};
 
 // ── Theme ────────────────────────────────────────────────────────────────
 
@@ -658,31 +658,6 @@ impl IconSet {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/// Collapse consecutive progress events with the same `(language, title)`
-/// into just the last event of each run.
-#[must_use]
-pub fn collapse_progress(events: Vec<&SessionEvent>) -> Vec<&SessionEvent> {
-    let mut result: Vec<&SessionEvent> = Vec::with_capacity(events.len());
-    for ev in events {
-        if let EventKind::Progress {
-            language, title, ..
-        } = &ev.kind
-            && let Some(last) = result.last()
-            && let EventKind::Progress {
-                language: prev_lang,
-                title: prev_title,
-                ..
-            } = &last.kind
-            && prev_lang == language
-            && prev_title == title
-        {
-            result.pop();
-        }
-        result.push(ev);
-    }
-    result
-}
-
 /// Format a `started_at` timestamp as a human-readable duration.
 #[must_use]
 pub fn format_ago(started: chrono::DateTime<chrono::Utc>) -> String {
@@ -922,6 +897,160 @@ pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) ->
     }
 }
 
+/// Determine direction arrow from a JSON-RPC payload.
+///
+/// If the payload has `"result"` or `"error"`, the message is inbound (`←`);
+/// otherwise outbound (`→`).
+fn message_direction_arrow(payload: &serde_json::Value) -> &'static str {
+    if payload.get("result").is_some() || payload.get("error").is_some() {
+        "\u{2190}" // ←
+    } else {
+        "\u{2192}" // →
+    }
+}
+
+/// Build a styled [`Line`] for a protocol message.
+#[must_use]
+pub fn format_message_styled(
+    msg: &SessionMessage,
+    icons: &IconSet,
+    theme: &Theme,
+) -> Line<'static> {
+    let ts = msg.timestamp.format("%H:%M:%S").to_string();
+    let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
+
+    match msg.r#type.as_str() {
+        "lsp" => {
+            let arrow = message_direction_arrow(&msg.payload);
+            Line::from(vec![
+                ts_span,
+                Span::styled(format!("[{}] ", msg.server), theme.accent),
+                Span::styled(format!("{arrow} "), theme.text),
+                Span::styled(msg.method.clone(), theme.text),
+            ])
+        }
+        "mcp" => {
+            if msg.method == "tools/call" {
+                let tool_name = msg
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&msg.method);
+                let icon = tool_icon(tool_name, icons);
+                Line::from(vec![
+                    ts_span,
+                    Span::styled(icon.to_string(), theme.success),
+                    Span::styled(tool_name.to_string(), theme.text),
+                ])
+            } else {
+                let arrow = message_direction_arrow(&msg.payload);
+                Line::from(vec![
+                    ts_span,
+                    Span::styled("[mcp] ".to_string(), theme.text),
+                    Span::styled(format!("{arrow} "), theme.text),
+                    Span::styled(msg.method.clone(), theme.text),
+                ])
+            }
+        }
+        "hook" => {
+            if let Some(count_val) = msg.payload.get("count") {
+                let count = count_val.as_u64().unwrap_or(0);
+                let file = msg
+                    .payload
+                    .get("file")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or(&msg.method);
+                let base = basename(file);
+                if count == 0 {
+                    Line::from(vec![
+                        ts_span,
+                        Span::styled(icons.diag_ok.clone(), theme.success),
+                        Span::styled(base.to_string(), theme.text),
+                    ])
+                } else {
+                    let preview = msg
+                        .payload
+                        .get("preview")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "diagnostic count is always small"
+                    )]
+                    let (icon, style) = diag_style(count as usize, preview, icons, theme);
+                    let label = format!(
+                        "{count} diagnostic{}",
+                        if count == 1 { "" } else { "s" }
+                    );
+                    Line::from(vec![
+                        ts_span,
+                        Span::styled(icon.to_string(), style),
+                        Span::styled(format!("{base}: "), theme.text),
+                        Span::styled(label, style),
+                    ])
+                }
+            } else {
+                Line::from(vec![
+                    ts_span,
+                    Span::styled("[hook] ".to_string(), theme.text),
+                    Span::styled(msg.method.clone(), theme.text),
+                ])
+            }
+        }
+        other => Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{other}] "), theme.text),
+            Span::styled(msg.method.clone(), theme.text),
+        ]),
+    }
+}
+
+/// Plain-text message summary (used for filter matching).
+#[must_use]
+pub fn format_message_plain(msg: &SessionMessage) -> String {
+    let ts = msg.timestamp.format("%H:%M:%S");
+
+    match msg.r#type.as_str() {
+        "lsp" => {
+            let arrow = message_direction_arrow(&msg.payload);
+            format!("{ts} [{}] {arrow} {}", msg.server, msg.method)
+        }
+        "mcp" => {
+            if msg.method == "tools/call" {
+                let tool_name = msg
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&msg.method);
+                format!("{ts} {tool_name}")
+            } else {
+                let arrow = message_direction_arrow(&msg.payload);
+                format!("{ts} [mcp] {arrow} {}", msg.method)
+            }
+        }
+        "hook" => msg.payload.get("count").map_or_else(
+            || format!("{ts} [hook] {}", msg.method),
+            |count_val| {
+                let count = count_val.as_u64().unwrap_or(0);
+                let file = msg
+                    .payload
+                    .get("file")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or(&msg.method);
+                let base = basename(file);
+                if count == 0 {
+                    format!("{ts} {base}")
+                } else {
+                    format!("{ts} {base}: {count} diagnostics")
+                }
+            },
+        ),
+        other => format!("{ts} [{other}] {}", msg.method),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -932,12 +1061,45 @@ mod tests {
     use chrono::{TimeDelta, Utc};
 
     use crate::config::IconConfig;
-    use crate::session::{EventKind, SessionEvent};
+    use crate::session::{EventKind, SessionEvent, SessionMessage};
 
     fn make_event(kind: EventKind) -> SessionEvent {
         SessionEvent {
             timestamp: Utc::now(),
             kind,
+        }
+    }
+
+    fn make_message(r#type: &str, method: &str, server: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
+            timestamp: Utc::now(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn make_message_with_payload(
+        r#type: &str,
+        method: &str,
+        server: &str,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
+            timestamp: Utc::now(),
+            payload,
         }
     }
 
@@ -1029,43 +1191,6 @@ mod tests {
         let plain = format_event_plain(&ev);
         assert!(plain.contains("lib.rs"));
         assert!(plain.contains('3'));
-    }
-
-    #[test]
-    fn test_collapse_progress_consecutive() {
-        let ev1 = make_event(EventKind::Progress {
-            language: "rust".to_string(),
-            title: "Indexing".to_string(),
-            message: Some("1/10".to_string()),
-            percentage: Some(10),
-        });
-        let ev2 = make_event(EventKind::Progress {
-            language: "rust".to_string(),
-            title: "Indexing".to_string(),
-            message: Some("5/10".to_string()),
-            percentage: Some(50),
-        });
-        let ev3 = make_event(EventKind::Progress {
-            language: "rust".to_string(),
-            title: "Indexing".to_string(),
-            message: Some("10/10".to_string()),
-            percentage: Some(100),
-        });
-        let interrupt = make_event(EventKind::Started);
-        let ev4 = make_event(EventKind::Progress {
-            language: "rust".to_string(),
-            title: "Indexing".to_string(),
-            message: Some("1/5".to_string()),
-            percentage: Some(20),
-        });
-
-        // Three consecutive same-key progress events collapse to one.
-        let collapsed = collapse_progress(vec![&ev1, &ev2, &ev3]);
-        assert_eq!(collapsed.len(), 1);
-
-        // Intersperse a non-progress event — the run resets.
-        let collapsed = collapse_progress(vec![&ev1, &ev2, &interrupt, &ev3, &ev4]);
-        assert_eq!(collapsed.len(), 3); // ev2, interrupt, ev4
     }
 
     #[test]
@@ -1224,5 +1349,122 @@ mod tests {
         let theme = Theme::detect();
         // Selection style should be set (either Rgb bg or REVERSED fallback).
         let _ = theme.selection;
+    }
+
+    // ── Message formatter tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_format_message_styled_lsp() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message("lsp", "textDocument/hover", "rust-analyzer");
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("[rust-analyzer]"),
+            "should contain server name"
+        );
+        assert!(
+            text.contains("textDocument/hover"),
+            "should contain method"
+        );
+        assert!(text.contains("\u{2192}"), "outbound request should show →");
+    }
+
+    #[test]
+    fn test_format_message_styled_lsp_response() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            serde_json::json!({"id": 1, "result": {"contents": "fn main()"}}),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("\u{2190}"), "response should show ←");
+    }
+
+    #[test]
+    fn test_format_message_styled_mcp() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("grep"), "should contain tool name");
+    }
+
+    #[test]
+    fn test_format_message_styled_hook() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "hook",
+            "post-tool",
+            "catenary",
+            serde_json::json!({
+                "file": "/src/lib.rs",
+                "count": 2,
+                "preview": "\t:12:1 [error] rustc: bad"
+            }),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("lib.rs"), "should contain file basename");
+        assert!(text.contains("2 diagnostics"), "should show count");
+    }
+
+    #[test]
+    fn test_format_message_styled_hook_clean() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "hook",
+            "post-tool",
+            "catenary",
+            serde_json::json!({"file": "/src/lib.rs", "count": 0}),
+        );
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("lib.rs"), "should contain file basename");
+        assert!(
+            line.spans.iter().any(|s| s.style == theme.success),
+            "clean diagnostics should use success style"
+        );
+    }
+
+    #[test]
+    fn test_format_message_plain() {
+        let msg = make_message("lsp", "textDocument/hover", "rust-analyzer");
+        let plain = format_message_plain(&msg);
+        assert!(plain.contains("[rust-analyzer]"));
+        assert!(plain.contains("textDocument/hover"));
+        assert!(plain.contains("\u{2192}"));
+
+        let mcp_msg = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let plain = format_message_plain(&mcp_msg);
+        assert!(plain.contains("grep"));
+
+        let hook_msg = make_message_with_payload(
+            "hook",
+            "post-tool",
+            "catenary",
+            serde_json::json!({"file": "/src/main.rs", "count": 3}),
+        );
+        let plain = format_message_plain(&hook_msg);
+        assert!(plain.contains("main.rs"));
+        assert!(plain.contains("3 diagnostics"));
     }
 }
