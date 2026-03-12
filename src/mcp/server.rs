@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 use super::types::{
@@ -12,7 +13,7 @@ use super::types::{
     ListToolsResult, METHOD_NOT_FOUND, Notification, Request, RequestId, Response, Root,
     RootsListResult, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
-use crate::session::{Direction, EventBroadcaster, EventKind, Protocol};
+use crate::session::{Direction, EventBroadcaster, EventKind, MessageLog, Protocol};
 
 /// Trait for handling MCP tool calls.
 pub trait ToolHandler: Send + Sync {
@@ -44,6 +45,9 @@ pub struct McpServer<H: ToolHandler> {
     handler: H,
     initialized: bool,
     broadcaster: EventBroadcaster,
+    message_log: Arc<MessageLog>,
+    /// Name of the connected MCP client (learned during initialize).
+    client_name: String,
     on_client_info: Option<ClientInfoCallback>,
     /// Whether the client advertised any `roots` capability.
     client_has_roots: bool,
@@ -59,11 +63,13 @@ pub struct McpServer<H: ToolHandler> {
 
 impl<H: ToolHandler> McpServer<H> {
     /// Creates a new `McpServer`.
-    pub fn new(handler: H, broadcaster: EventBroadcaster) -> Self {
+    pub fn new(handler: H, broadcaster: EventBroadcaster, message_log: Arc<MessageLog>) -> Self {
         Self {
             handler,
             initialized: false,
             broadcaster,
+            message_log,
+            client_name: "unknown".to_string(),
             on_client_info: None,
             client_has_roots: false,
             should_fetch_roots: false,
@@ -122,16 +128,35 @@ impl<H: ToolHandler> McpServer<H> {
             trace!("Received: {}", trimmed);
 
             // Broadcast incoming message
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                self.broadcaster.send(EventKind::ProtocolMessage {
-                    protocol: Protocol::Mcp,
-                    language: None,
-                    direction: Direction::Recv,
-                    message: json,
-                });
-            }
+            let (entry_id, method) =
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    self.broadcaster.send(EventKind::ProtocolMessage {
+                        protocol: Protocol::Mcp,
+                        language: None,
+                        direction: Direction::Recv,
+                        message: json.clone(),
+                    });
 
-            self.dispatch_message(trimmed, &mut writer)?;
+                    let method = json
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("response")
+                        .to_string();
+                    let id = self.message_log.log(
+                        "mcp",
+                        &method,
+                        "catenary",
+                        &self.client_name,
+                        None,
+                        None,
+                        &json,
+                    );
+                    (id, method)
+                } else {
+                    (0, String::new())
+                };
+
+            self.dispatch_message(trimmed, &mut writer, entry_id, &method)?;
 
             // Check if we need to fetch roots
             if self.should_fetch_roots
@@ -146,10 +171,16 @@ impl<H: ToolHandler> McpServer<H> {
     }
 
     /// Dispatches a single message line, writing any response to `writer`.
-    fn dispatch_message(&mut self, line: &str, writer: &mut impl Write) -> Result<()> {
+    fn dispatch_message(
+        &mut self,
+        line: &str,
+        writer: &mut impl Write,
+        entry_id: i64,
+        method: &str,
+    ) -> Result<()> {
         match self.handle_message(line) {
             Ok(Some(response)) => {
-                self.write_response(&response, writer)?;
+                self.write_response(&response, writer, Some(entry_id), method)?;
             }
             Ok(None) => {
                 // Notification, no response needed
@@ -159,7 +190,7 @@ impl<H: ToolHandler> McpServer<H> {
                 // Try to send error response if we can parse the id
                 if let Ok(req) = serde_json::from_str::<Request>(line) {
                     let response = Response::error(req.id, INTERNAL_ERROR, e.to_string());
-                    self.write_response(&response, writer)?;
+                    self.write_response(&response, writer, Some(entry_id), method)?;
                 }
             }
         }
@@ -167,7 +198,13 @@ impl<H: ToolHandler> McpServer<H> {
     }
 
     /// Serializes, broadcasts, and writes a response.
-    fn write_response(&self, response: &Response, writer: &mut impl Write) -> Result<()> {
+    fn write_response(
+        &self,
+        response: &Response,
+        writer: &mut impl Write,
+        request_id: Option<i64>,
+        method: &str,
+    ) -> Result<()> {
         let response_json =
             serde_json::to_string(response).context("Failed to serialize response")?;
         trace!("Sending: {}", response_json);
@@ -177,8 +214,18 @@ impl<H: ToolHandler> McpServer<H> {
                 protocol: Protocol::Mcp,
                 language: None,
                 direction: Direction::Send,
-                message: json,
+                message: json.clone(),
             });
+
+            self.message_log.log(
+                "mcp",
+                method,
+                "catenary",
+                &self.client_name,
+                request_id,
+                None,
+                &json,
+            );
         }
 
         writeln!(writer, "{response_json}")?;
@@ -257,6 +304,7 @@ impl<H: ToolHandler> McpServer<H> {
             .context("Invalid initialize params")?
             .ok_or_else(|| anyhow!("Missing initialize params"))?;
 
+        self.client_name.clone_from(&params.client_info.name);
         let client_name = &params.client_info.name;
         let client_version = params.client_info.version.as_deref().unwrap_or("unknown");
 
@@ -358,6 +406,10 @@ impl<H: ToolHandler> McpServer<H> {
     }
 
     /// Inner implementation of [`Self::fetch_roots`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "dual logging adds lines; will shrink when old EventBroadcaster is removed"
+    )]
     fn fetch_roots_inner(
         &mut self,
         reader: &mut impl BufRead,
@@ -376,14 +428,26 @@ impl<H: ToolHandler> McpServer<H> {
         trace!("Sending roots/list request: {}", request_json);
 
         // Broadcast outbound request
-        if let Ok(json) = serde_json::to_value(&request) {
+        let outbound_entry_id = if let Ok(json) = serde_json::to_value(&request) {
             self.broadcaster.send(EventKind::ProtocolMessage {
                 protocol: Protocol::Mcp,
                 language: None,
                 direction: Direction::Send,
-                message: json,
+                message: json.clone(),
             });
-        }
+
+            self.message_log.log(
+                "mcp",
+                "roots/list",
+                "catenary",
+                &self.client_name,
+                None,
+                None,
+                &json,
+            )
+        } else {
+            0
+        };
 
         writeln!(writer, "{request_json}")?;
         writer.flush()?;
@@ -392,7 +456,7 @@ impl<H: ToolHandler> McpServer<H> {
         // Buffer interleaved requests (id + method) until roots are applied,
         // so they execute against the updated PathValidator.
         // Notifications are dispatched immediately.
-        let mut buffered: Vec<String> = Vec::new();
+        let mut buffered: Vec<(String, i64, String)> = Vec::new();
         let mut line = String::new();
         loop {
             line.clear();
@@ -432,10 +496,22 @@ impl<H: ToolHandler> McpServer<H> {
                 let response: Response =
                     serde_json::from_value(json).context("Failed to parse roots/list response")?;
                 if response.id == request_id {
+                    // Log the response with request_id pointing to the outbound request
+                    if let Ok(resp_json) = serde_json::to_value(&response) {
+                        self.message_log.log(
+                            "mcp",
+                            "roots/list",
+                            "catenary",
+                            &self.client_name,
+                            Some(outbound_entry_id),
+                            None,
+                            &resp_json,
+                        );
+                    }
                     let result = self.handle_roots_response(response);
                     // Replay buffered requests against the updated roots
-                    for msg in &buffered {
-                        self.dispatch_message(msg, writer)?;
+                    for (msg, buf_entry_id, buf_method) in &buffered {
+                        self.dispatch_message(msg, writer, *buf_entry_id, buf_method)?;
                     }
                     return result;
                 }
@@ -446,12 +522,28 @@ impl<H: ToolHandler> McpServer<H> {
                 continue;
             }
 
+            // Non-response: log the incoming message, then buffer or dispatch.
+            let method = json
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("response")
+                .to_string();
+            let entry_id = self.message_log.log(
+                "mcp",
+                &method,
+                "catenary",
+                &self.client_name,
+                None,
+                None,
+                &json,
+            );
+
             // Requests (id + method) are buffered until roots are applied.
             // Notifications dispatch immediately.
             if json.get("id").is_some() && json.get("method").is_some() {
-                buffered.push(trimmed.to_string());
+                buffered.push((trimmed.to_string(), entry_id, method));
             } else {
-                self.dispatch_message(trimmed, writer)?;
+                self.dispatch_message(trimmed, writer, entry_id, &method)?;
             }
         }
     }
@@ -532,7 +624,11 @@ mod tests {
 
     #[test]
     fn test_handle_initialize() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -562,7 +658,11 @@ mod tests {
 
     #[test]
     fn test_handle_tools_list() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -583,7 +683,11 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_success() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -606,7 +710,11 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_error() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -628,7 +736,11 @@ mod tests {
 
     #[test]
     fn test_handle_unknown_method() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -648,7 +760,11 @@ mod tests {
 
     #[test]
     fn test_handle_ping() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -686,7 +802,11 @@ mod tests {
 
     #[test]
     fn test_roots_capability_stored_when_present() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         assert!(!server.client_has_roots);
 
         initialize_server(&mut server, true)?;
@@ -696,7 +816,11 @@ mod tests {
 
     #[test]
     fn test_roots_capability_absent_by_default() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
         Ok(())
@@ -704,7 +828,11 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_after_initialized() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -721,7 +849,11 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_on_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -737,7 +869,11 @@ mod tests {
 
     #[test]
     fn test_no_fetch_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, false)?;
 
         let notification = Notification {
@@ -756,7 +892,11 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -807,7 +947,11 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -869,7 +1013,11 @@ mod tests {
     fn test_fetch_roots_handles_error_response() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -891,7 +1039,11 @@ mod tests {
 
     #[test]
     fn test_list_changed_honored_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         // Initialize WITHOUT roots capability
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
@@ -910,7 +1062,11 @@ mod tests {
 
     #[test]
     fn test_roots_capability_without_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
 
         // Initialize with `roots: {}` (no listChanged field)
         let request = Request {
@@ -934,7 +1090,11 @@ mod tests {
     fn test_fetching_roots_reset_on_error() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop());
+        let mut server = McpServer::new(
+            TestHandler,
+            EventBroadcaster::noop(),
+            Arc::new(MessageLog::noop()),
+        );
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -946,6 +1106,240 @@ mod tests {
         assert!(result.is_err());
         // fetching_roots must be reset even on error
         assert!(!server.fetching_roots);
+        Ok(())
+    }
+
+    // ── MessageLog integration tests ─────────────────────────────────
+
+    /// Row from the messages table for test assertions.
+    struct MsgRow {
+        method: String,
+        client: String,
+        request_id: Option<i64>,
+    }
+
+    /// Create a test DB and return a `MessageLog` backed by it.
+    fn test_message_log() -> (Arc<MessageLog>, Arc<std::sync::Mutex<rusqlite::Connection>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open_and_migrate_at(&dir.keep().join("catenary").join("catenary.db"))
+            .expect("open test db");
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+             VALUES ('test', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert session");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let log = Arc::new(MessageLog::new(conn.clone(), "test".to_string()));
+        (log, conn)
+    }
+
+    /// Query all messages from the test DB, ordered by id.
+    fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
+        let c = conn.lock().expect("lock");
+        let rows: Vec<MsgRow> = c
+            .prepare("SELECT method, client, request_id FROM messages ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok(MsgRow {
+                    method: row.get(0)?,
+                    client: row.get(1)?,
+                    request_id: row.get(2)?,
+                })
+            })
+            .expect("query")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        drop(c);
+        rows
+    }
+
+    #[test]
+    fn test_mcp_log_initialize() -> Result<()> {
+        let (log, conn) = test_message_log();
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"}
+            })),
+        };
+
+        let line = serde_json::to_string(&request)?;
+        let mut writer: Vec<u8> = Vec::new();
+
+        // Parse and log the incoming message (simulating run loop)
+        let json: serde_json::Value = serde_json::from_str(&line)?;
+        let method = json
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("response")
+            .to_string();
+        let entry_id = server.message_log.log(
+            "mcp",
+            &method,
+            "catenary",
+            &server.client_name,
+            None,
+            None,
+            &json,
+        );
+        server.dispatch_message(&line, &mut writer, entry_id, &method)?;
+
+        let msgs = query_messages(&conn);
+        assert_eq!(msgs.len(), 2, "should have request + response");
+        assert_eq!(msgs[0].method, "initialize");
+        assert!(msgs[0].request_id.is_none());
+        assert_eq!(msgs[1].method, "initialize");
+        assert_eq!(
+            msgs[1].request_id,
+            Some(entry_id),
+            "response request_id should point to the incoming request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mcp_log_tools_call() -> Result<()> {
+        let (log, conn) = test_message_log();
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(2),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "test_tool",
+                "arguments": {}
+            })),
+        };
+
+        let line = serde_json::to_string(&request)?;
+        let mut writer: Vec<u8> = Vec::new();
+
+        let json: serde_json::Value = serde_json::from_str(&line)?;
+        let method = "tools/call".to_string();
+        let entry_id = server.message_log.log(
+            "mcp",
+            &method,
+            "catenary",
+            &server.client_name,
+            None,
+            None,
+            &json,
+        );
+        server.dispatch_message(&line, &mut writer, entry_id, &method)?;
+
+        let msgs = query_messages(&conn);
+        assert_eq!(msgs.len(), 2, "should have request + response");
+        assert_eq!(msgs[0].method, "tools/call");
+        assert_eq!(msgs[1].method, "tools/call");
+        assert_eq!(
+            msgs[1].request_id,
+            Some(entry_id),
+            "response request_id should point to the incoming request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mcp_log_notification() -> Result<()> {
+        let (log, conn) = test_message_log();
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+
+        let notification = Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/initialized".to_string(),
+            params: None,
+        };
+
+        let line = serde_json::to_string(&notification)?;
+        let mut writer: Vec<u8> = Vec::new();
+
+        let json: serde_json::Value = serde_json::from_str(&line)?;
+        let method = "notifications/initialized".to_string();
+        let entry_id = server.message_log.log(
+            "mcp",
+            &method,
+            "catenary",
+            &server.client_name,
+            None,
+            None,
+            &json,
+        );
+        server.dispatch_message(&line, &mut writer, entry_id, &method)?;
+
+        let msgs = query_messages(&conn);
+        assert_eq!(msgs.len(), 1, "notification has no response");
+        assert_eq!(msgs[0].method, "notifications/initialized");
+        assert!(msgs[0].request_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_mcp_log_client_name() -> Result<()> {
+        let (log, conn) = test_message_log();
+        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+
+        // Initialize to set client_name
+        let init_request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "claude-code", "version": "2.0.0"}
+            })),
+        };
+
+        let line = serde_json::to_string(&init_request)?;
+        let mut writer: Vec<u8> = Vec::new();
+        let json: serde_json::Value = serde_json::from_str(&line)?;
+        let entry_id = server.message_log.log(
+            "mcp",
+            "initialize",
+            "catenary",
+            &server.client_name,
+            None,
+            None,
+            &json,
+        );
+        server.dispatch_message(&line, &mut writer, entry_id, "initialize")?;
+
+        // Now send a second request — client_name should be "claude-code"
+        let ping = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(2),
+            method: "ping".to_string(),
+            params: None,
+        };
+
+        let line = serde_json::to_string(&ping)?;
+        let json: serde_json::Value = serde_json::from_str(&line)?;
+        let entry_id = server.message_log.log(
+            "mcp",
+            "ping",
+            "catenary",
+            &server.client_name,
+            None,
+            None,
+            &json,
+        );
+        server.dispatch_message(&line, &mut writer, entry_id, "ping")?;
+
+        let msgs = query_messages(&conn);
+        // Messages: init req, init resp, ping req, ping resp = 4
+        assert_eq!(msgs.len(), 4);
+        // The ping request (3rd message) should have client = "claude-code"
+        assert_eq!(msgs[2].client, "claude-code");
+        // The ping response (4th message) should also have client = "claude-code"
+        assert_eq!(msgs[3].client, "claude-code");
         Ok(())
     }
 }
