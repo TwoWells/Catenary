@@ -434,10 +434,16 @@ async fn run_server(args: Args) -> Result<()> {
     )));
 
     // Start the hook server for PostToolUse/PreToolUse hook integration
-    let hook_server = catenary_mcp::hook::HookServer::new(
+    let diagnostics_server = catenary_mcp::bridge::DiagnosticsServer::new(
         client_manager.clone(),
         doc_manager.clone(),
         path_validator.clone(),
+    );
+    let sync_roots_server =
+        catenary_mcp::bridge::SyncRootsServer::new(client_manager.clone(), path_validator.clone());
+    let hook_server = catenary_mcp::hook::HookServer::new(
+        diagnostics_server,
+        sync_roots_server,
         broadcaster.clone(),
         message_log.clone(),
         "host".to_string(),

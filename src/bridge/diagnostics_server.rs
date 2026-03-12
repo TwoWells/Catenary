@@ -35,7 +35,7 @@ pub struct DiagnosticsServer {
 
 impl DiagnosticsServer {
     /// Creates a new `DiagnosticsServer`.
-    pub(crate) const fn new(
+    pub const fn new(
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         path_validator: Arc<RwLock<PathValidator>>,
