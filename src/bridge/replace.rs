@@ -9,7 +9,9 @@ use globset::Glob;
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::diagnostics_server::resolve_path;
@@ -637,6 +639,384 @@ pub fn extract_diffs(old: &str, new: &str) -> Vec<(String, String)> {
     pairs
 }
 
+/// Result of applying edits to a single file.
+#[derive(Debug)]
+pub struct ReplaceFileResult {
+    /// Absolute path to the file.
+    pub path: PathBuf,
+    /// Total replacement count across all edits.
+    pub count: usize,
+    /// Per-edit replacement counts (parallel to input edits array).
+    pub edit_counts: Vec<usize>,
+    /// Snapshot ID if a snapshot was created (populated by ticket 01).
+    pub snapshot_id: Option<i64>,
+    /// Line-level diffs: `(old_line, new_line)` pairs.
+    pub diffs: Vec<(String, String)>,
+    /// LSP diagnostics for this file (populated by ticket 01).
+    pub diagnostics: Vec<Value>,
+    /// Error message if this file failed or was skipped.
+    pub error: Option<String>,
+    /// New file content after edits (for ticket 01 to write).
+    /// `None` if no changes or error.
+    pub new_content: Option<String>,
+}
+
+/// Returns `true` if the error indicates a skipped (non-fatal) file.
+fn is_skip_error(error: &str) -> bool {
+    error == "not UTF-8"
+}
+
+/// Renders the per-file block for a single result.
+///
+/// Returns `None` if the file should be omitted (zero count, no error).
+fn render_file_block(result: &ReplaceFileResult, max_samples: usize) -> Option<String> {
+    if result.error.is_none() && result.count == 0 {
+        return None;
+    }
+
+    let mut block = String::new();
+    let path = result.path.display();
+
+    if let Some(ref error) = result.error {
+        if is_skip_error(error) {
+            _ = writeln!(block, "{path}  (skipped: {error})");
+        } else {
+            _ = writeln!(block, "{path}  (error: {error})");
+        }
+        return Some(block);
+    }
+
+    // Header line.
+    let s = if result.count == 1 {
+        "replacement"
+    } else {
+        "replacements"
+    };
+    _ = write!(block, "{path}  ({} {s})", result.count);
+    if let Some(id) = result.snapshot_id {
+        _ = write!(block, "  [snapshot #{id}]");
+    }
+    block.push('\n');
+
+    // Diff samples (only when tier includes diffs).
+    if max_samples > 0 {
+        let shown = result.diffs.len().min(max_samples);
+        for (old, new) in &result.diffs[..shown] {
+            _ = writeln!(block, "\t- {old}");
+            _ = writeln!(block, "\t+ {new}");
+        }
+        let remaining = result.diffs.len() - shown;
+        if remaining > 0 {
+            _ = writeln!(block, "\t... ({remaining} more)");
+        }
+    }
+
+    Some(block)
+}
+
+/// Builds the summary line for replace output.
+fn render_summary(results: &[ReplaceFileResult]) -> String {
+    let total_count: usize = results.iter().map(|r| r.count).sum();
+    let success_files = results
+        .iter()
+        .filter(|r| r.count > 0 && r.error.is_none())
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|r| r.error.as_deref().is_some_and(is_skip_error))
+        .count();
+    let errors = results
+        .iter()
+        .filter(|r| r.error.as_deref().is_some_and(|e| !is_skip_error(e)))
+        .count();
+
+    let mut line = if total_count == 0 {
+        "0 replacements".to_owned()
+    } else {
+        let r = if total_count == 1 {
+            "replacement"
+        } else {
+            "replacements"
+        };
+        if results.len() > 1 {
+            let f = if success_files == 1 { "file" } else { "files" };
+            format!("{total_count} total {r} across {success_files} {f}")
+        } else {
+            format!("{total_count} total {r}")
+        }
+    };
+
+    if skipped > 0 || errors > 0 {
+        let mut parts = Vec::new();
+        if skipped > 0 {
+            parts.push(format!("{skipped} skipped"));
+        }
+        if errors > 0 {
+            parts.push(format!("{errors} error"));
+        }
+        _ = write!(line, " ({})", parts.join(", "));
+    }
+
+    line
+}
+
+/// Formats diagnostics section for replace output.
+///
+/// Groups diagnostics by code across files. First occurrence of
+/// each code shown in full, remaining files listed under `matching:`.
+/// Diagnostics without a code are shown individually.
+fn render_diagnostics(results: &[ReplaceFileResult]) -> String {
+    // Metadata extracted from a single LSP diagnostic.
+    struct Entry<'a> {
+        severity: &'static str,
+        code: Option<String>,
+        message: String,
+        path: &'a Path,
+        line: u64,
+    }
+
+    let has_diags = results.iter().any(|r| !r.diagnostics.is_empty());
+    if !has_diags {
+        return String::new();
+    }
+
+    let mut entries: Vec<Entry<'_>> = Vec::new();
+    for r in results {
+        for d in &r.diagnostics {
+            let severity = match d.get("severity").and_then(Value::as_u64) {
+                Some(1) => "error",
+                Some(2) => "warning",
+                Some(3) => "info",
+                Some(4) => "hint",
+                _ => "unknown",
+            };
+            let line = d
+                .pointer("/range/start/line")
+                .and_then(Value::as_u64)
+                .map_or(0, |l| l + 1);
+            let code = d.get("code").map(|c| {
+                c.as_str().map_or_else(
+                    || c.as_i64().map_or_else(|| c.to_string(), |n| n.to_string()),
+                    str::to_string,
+                )
+            });
+            let message = d
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+
+            entries.push(Entry {
+                severity,
+                code,
+                message,
+                path: &r.path,
+                line,
+            });
+        }
+    }
+
+    let mut output = String::from("diagnostics:\n");
+
+    // Group by code, preserving first-seen order.
+    let mut code_groups: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut no_code: Vec<usize> = Vec::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(ref c) = entry.code {
+            if let Some(group) = code_groups.iter_mut().find(|(code, _)| code == c) {
+                group.1.push(i);
+            } else {
+                code_groups.push((c.clone(), vec![i]));
+            }
+        } else {
+            no_code.push(i);
+        }
+    }
+
+    // Grouped diagnostics (by code).
+    for (code, indices) in &code_groups {
+        let first = &entries[indices[0]];
+        let path = first.path.display();
+        if indices.len() == 1 {
+            // Single occurrence: compact one-line format.
+            _ = writeln!(
+                output,
+                "\t{path}:{} {}[{code}]: {}",
+                first.line, first.severity, first.message,
+            );
+        } else {
+            // Multiple occurrences: header + matching list.
+            _ = writeln!(output, "\t{}[{code}]: {}", first.severity, first.message,);
+            _ = writeln!(output, "\t  {path}:{}", first.line);
+            output.push_str("\tmatching:\n");
+            for &idx in &indices[1..] {
+                let entry = &entries[idx];
+                let epath = entry.path.display();
+                _ = writeln!(output, "\t  {epath}:{}", entry.line);
+            }
+        }
+    }
+
+    // Individual diagnostics (no code).
+    for &idx in &no_code {
+        let entry = &entries[idx];
+        let path = entry.path.display();
+        _ = writeln!(
+            output,
+            "\t{path}:{} {}: {}",
+            entry.line, entry.severity, entry.message,
+        );
+    }
+
+    output
+}
+
+/// Renders replace results into budget-constrained output text.
+///
+/// Uses promote-from-bottom: renders minimal (counts only), then
+/// tries reduced (1 diff sample per file), then full (3 samples).
+/// Diagnostics are always included and never trimmed.
+#[must_use]
+pub fn render_replace_output(results: &[ReplaceFileResult], budget: u32) -> String {
+    let diagnostics_section = render_diagnostics(results);
+    let summary = render_summary(results);
+
+    let assemble = |max_samples: usize| -> String {
+        let mut out = String::new();
+        for result in results {
+            if let Some(block) = render_file_block(result, max_samples) {
+                out.push_str(&block);
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&summary);
+        if !diagnostics_section.is_empty() {
+            out.push('\n');
+            out.push_str(&diagnostics_section);
+        }
+        out
+    };
+
+    let full = assemble(3);
+    if full.len() <= budget as usize {
+        return full;
+    }
+
+    let reduced = assemble(1);
+    if reduced.len() <= budget as usize {
+        return reduced;
+    }
+
+    assemble(0)
+}
+
+/// Processes a replace operation end-to-end.
+///
+/// Resolves targets, reads files, applies edits, extracts diffs,
+/// and renders output. Does not create snapshots or collect LSP
+/// diagnostics (ticket 01).
+///
+/// `roots` are the workspace roots for glob resolution.
+///
+/// # Errors
+///
+/// Returns an error if edit parsing fails, line range parsing fails,
+/// target resolution fails, or a single-target file cannot be read.
+pub fn process_replace(
+    input: &ReplaceInput,
+    roots: &[PathBuf],
+) -> Result<(Vec<ReplaceFileResult>, String)> {
+    let parsed_edits = parse_edits(&input.edits)?;
+
+    let line_ranges = input.lines.as_deref().map(parse_line_ranges).transpose()?;
+
+    let targets = resolve_targets(
+        &input.glob,
+        roots,
+        input.exclude.as_deref(),
+        input.include_gitignored,
+        input.include_hidden,
+    )?;
+
+    let is_multi = targets.len() > 1;
+    let mut results = Vec::with_capacity(targets.len());
+
+    for path in targets {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                if !is_multi {
+                    return Err(anyhow!("failed to read {}: {e}", path.display()));
+                }
+                results.push(ReplaceFileResult {
+                    path,
+                    count: 0,
+                    edit_counts: vec![],
+                    snapshot_id: None,
+                    diffs: vec![],
+                    diagnostics: vec![],
+                    error: Some(e.to_string()),
+                    new_content: None,
+                });
+                continue;
+            }
+        };
+
+        let Ok(content) = String::from_utf8(bytes) else {
+            if !is_multi {
+                return Err(anyhow!("not UTF-8: {}", path.display()));
+            }
+            results.push(ReplaceFileResult {
+                path,
+                count: 0,
+                edit_counts: vec![],
+                snapshot_id: None,
+                diffs: vec![],
+                diagnostics: vec![],
+                error: Some("not UTF-8".to_owned()),
+                new_content: None,
+            });
+            continue;
+        };
+
+        let (new_content, edit_counts) = apply_edits(&content, &parsed_edits, line_ranges.as_ref());
+
+        if new_content == content {
+            results.push(ReplaceFileResult {
+                path,
+                count: 0,
+                edit_counts,
+                snapshot_id: None,
+                diffs: vec![],
+                diagnostics: vec![],
+                error: None,
+                new_content: None,
+            });
+            continue;
+        }
+
+        let count: usize = edit_counts.iter().sum();
+        let diffs = extract_diffs(&content, &new_content);
+
+        results.push(ReplaceFileResult {
+            path,
+            count,
+            edit_counts,
+            snapshot_id: None,
+            diffs,
+            diagnostics: vec![],
+            error: None,
+            new_content: Some(new_content),
+        });
+    }
+
+    let output = render_replace_output(&results, 4000);
+    Ok((results, output))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1018,5 +1398,133 @@ mod tests {
         let (result, counts) = apply_edits(content, &edits, Some(&lr));
         assert_eq!(result, content);
         assert_eq!(counts, vec![0]);
+    }
+
+    // --- Output rendering ---
+
+    fn make_result(
+        path: &str,
+        count: usize,
+        diffs: Vec<(String, String)>,
+        error: Option<&str>,
+    ) -> ReplaceFileResult {
+        ReplaceFileResult {
+            path: PathBuf::from(path),
+            count,
+            edit_counts: vec![count],
+            snapshot_id: None,
+            diffs,
+            diagnostics: vec![],
+            error: error.map(String::from),
+            new_content: None,
+        }
+    }
+
+    #[test]
+    fn test_render_single_file() {
+        let result = make_result(
+            "src/handler.rs",
+            8,
+            vec![
+                ("use crate::old".to_owned(), "use crate::new".to_owned()),
+                ("OldType".to_owned(), "NewType".to_owned()),
+                ("old_fn()".to_owned(), "new_fn()".to_owned()),
+            ],
+            None,
+        );
+
+        let output = render_replace_output(&[result], 4000);
+        assert!(output.contains("(8 replacements)"), "got: {output}");
+        assert!(output.contains("\t- use crate::old"), "got: {output}");
+        assert!(output.contains("\t+ use crate::new"), "got: {output}");
+        assert!(output.contains("8 total replacements"), "got: {output}");
+        assert!(
+            !output.contains("[snapshot"),
+            "no snapshot expected, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_render_multi_file() {
+        let results = vec![
+            make_result("src/a.rs", 5, vec![("old".into(), "new".into())], None),
+            make_result("src/b.rs", 3, vec![("old".into(), "new".into())], None),
+            make_result("src/c.rs", 2, vec![("old".into(), "new".into())], None),
+        ];
+
+        let output = render_replace_output(&results, 4000);
+        assert!(output.contains("src/a.rs"), "got: {output}");
+        assert!(output.contains("src/b.rs"), "got: {output}");
+        assert!(output.contains("src/c.rs"), "got: {output}");
+        assert!(
+            output.contains("10 total replacements across 3 files"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_render_no_matches() {
+        let result = make_result("src/handler.rs", 0, vec![], None);
+        let output = render_replace_output(&[result], 4000);
+        assert_eq!(output, "0 replacements");
+    }
+
+    #[test]
+    fn test_render_budget_tiers() {
+        let diffs: Vec<(String, String)> = (0..10)
+            .map(|i| {
+                (
+                    format!("old_function_call(arg1, arg2, arg3) // line {i}"),
+                    format!("new_function_call(arg1, arg2, arg3) // line {i}"),
+                )
+            })
+            .collect();
+        let results = [make_result("src/handler.rs", 10, diffs, None)];
+
+        // Full tier: large budget fits all 3 samples.
+        let full = render_replace_output(&results, 50_000);
+        let full_samples = full.matches("\t- ").count();
+        assert_eq!(
+            full_samples, 3,
+            "full tier should show 3 samples, got:\n{full}"
+        );
+
+        // Reduced tier: budget too small for full, fits 1 sample.
+        let reduced = render_replace_output(&results, 200);
+        let reduced_samples = reduced.matches("\t- ").count();
+        assert_eq!(
+            reduced_samples, 1,
+            "reduced tier should show 1 sample, got:\n{reduced}"
+        );
+
+        // Minimal tier: budget too small for reduced, counts only.
+        let minimal = render_replace_output(&results, 50);
+        let minimal_samples = minimal.matches("\t- ").count();
+        assert_eq!(
+            minimal_samples, 0,
+            "minimal tier should show 0 samples, got:\n{minimal}"
+        );
+    }
+
+    #[test]
+    fn test_render_errors() {
+        let results = vec![
+            make_result(
+                "src/handler.rs",
+                8,
+                vec![("old".into(), "new".into())],
+                None,
+            ),
+            make_result("src/binary.dat", 0, vec![], Some("not UTF-8")),
+            make_result("src/readonly.rs", 0, vec![], Some("permission denied")),
+        ];
+
+        let output = render_replace_output(&results, 4000);
+        assert!(output.contains("(skipped: not UTF-8)"), "got: {output}");
+        assert!(
+            output.contains("(error: permission denied)"),
+            "got: {output}"
+        );
+        assert!(output.contains("(1 skipped, 1 error)"), "got: {output}");
     }
 }
