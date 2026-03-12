@@ -172,6 +172,21 @@ const fn default_sessions_width() -> f64 {
     0.25
 }
 
+/// Replace tool configuration.
+///
+/// Stub for future per-tool config (full integration comes with
+/// `SEARCHv2` ticket 03).
+pub struct ReplaceConfig {
+    /// Output budget in characters.
+    pub budget: u32,
+}
+
+impl Default for ReplaceConfig {
+    fn default() -> Self {
+        Self { budget: 4000 }
+    }
+}
+
 const fn default_idle_timeout() -> u64 {
     300
 }

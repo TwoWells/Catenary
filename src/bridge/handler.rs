@@ -32,6 +32,9 @@ use crate::session::{EventBroadcaster, EventKind};
 /// bootstrap discovery loop.
 const GREP_HOVER_THRESHOLD: usize = 10;
 
+use super::diagnostics_server::DiagnosticsServer;
+use super::replace::ReplaceServer;
+use super::tool_server::ToolServer;
 use super::{DocumentManager, DocumentNotification};
 
 /// Result of a server health check against touched language servers.
@@ -61,6 +64,8 @@ pub struct LspBridgeHandler {
     notified_offline: std::sync::Mutex<HashSet<String>>,
     /// Whether to capture full tool output in `ToolResult` events.
     capture_tool_output: bool,
+    /// Batch replacement tool with snapshots and diagnostics.
+    replace: ReplaceServer,
 }
 
 impl LspBridgeHandler {
@@ -71,7 +76,16 @@ impl LspBridgeHandler {
         runtime: Handle,
         broadcaster: EventBroadcaster,
         capture_tool_output: bool,
+        diagnostics: Arc<DiagnosticsServer>,
+        session_id: Option<String>,
     ) -> Self {
+        let replace = ReplaceServer::new(
+            client_manager.clone(),
+            doc_manager.clone(),
+            diagnostics,
+            runtime.clone(),
+            session_id,
+        );
         Self {
             client_manager,
             doc_manager,
@@ -79,6 +93,7 @@ impl LspBridgeHandler {
             broadcaster,
             notified_offline: std::sync::Mutex::new(HashSet::new()),
             capture_tool_output,
+            replace,
         }
     }
     /// Gets the appropriate LSP client for the given file path.
@@ -1128,9 +1143,44 @@ impl ToolHandler for LspBridgeHandler {
                     "required": ["pattern"]
                 }),
             },
+            Tool {
+                name: "replace".to_string(),
+                description: Some("Batch replacement across one or more files.\n\nGLOB (required)\n  File path or glob pattern.\n    src/main.rs          single file\n    src/**/*.rs          all Rust files under src/\n    **/*.md              all markdown files\n\n  Directory paths are not accepted \u{2014} use a glob pattern to match\n  files in a directory (e.g., src/bridge/*.rs).\n\nEDITS (required)\n  Array of {old, new, flags?} replacements applied sequentially.\n\n  old      text to find (literal or regex)\n  new      replacement text ($1, $2, ${name} in regex mode)\n  flags    optional:\n             g  replace all occurrences\n             r  treat old as regex, new supports capture groups\n             i  case insensitive (implies r)\n             m  multiline (implies r)\n             s  dotall (implies r)\n\n  No flags = literal match, first occurrence only (same as Edit).\n\n  Examples:\n    { old: \"OldType\", new: \"NewType\", flags: \"g\" }\n    { old: \"use crate::old\", new: \"use crate::new\" }\n\nLINES (optional)\n  Line ranges to constrain replacements. Space-separated.\n    1-10       lines 1 through 10\n    30         just line 30\n    70-        line 70 through EOF\n\nEXCLUDE (optional)\n  Glob pattern to exclude from matches.\n\nINCLUDE_GITIGNORED (default: false)\n  Include gitignored files in glob expansion.\n\nINCLUDE_HIDDEN (default: false)\n  Include hidden files (dotfiles) in glob expansion.\n\nOUTPUT\n  Per-file replacement count with sample diffs. LSP diagnostics\n  (if any) appear after the summary.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "glob": {
+                            "type": "string",
+                            "description": "File path or glob pattern"
+                        },
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old": { "type": "string", "description": "Text to find" },
+                                    "new": { "type": "string", "description": "Replacement text" },
+                                    "flags": { "type": "string", "description": "Flags: g (global), r (regex), i, m, s" }
+                                },
+                                "required": ["old", "new"]
+                            },
+                            "description": "List of edit operations"
+                        },
+                        "lines": { "type": "string", "description": "Line ranges (e.g., 1-10 30 70-)" },
+                        "exclude": { "type": "string", "description": "Glob pattern to exclude" },
+                        "include_gitignored": { "type": "boolean" },
+                        "include_hidden": { "type": "boolean" }
+                    },
+                    "required": ["glob", "edits"]
+                }),
+            },
         ]
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Replace early dispatch adds necessary branching"
+    )]
     fn call_tool(
         &self,
         name: &str,
@@ -1153,6 +1203,43 @@ impl ToolHandler for LspBridgeHandler {
             file,
             params: params_snapshot.clone(),
         });
+
+        // Replace: early dispatch, no LSP readiness wait — handles its own
+        // LSP interaction via DiagnosticsServer after the file write.
+        if name == "replace" {
+            let params = arguments.unwrap_or(serde_json::Value::Null);
+            let result = self.runtime.block_on(self.replace.execute(&params, None));
+
+            let (success, output, call_result) = match result {
+                Ok(v) => {
+                    let text = v.as_str().unwrap_or("").to_string();
+                    let output = if capture {
+                        if text.is_empty() {
+                            None
+                        } else {
+                            Some(text.clone())
+                        }
+                    } else {
+                        None
+                    };
+                    (true, output, Ok(CallToolResult::text(text)))
+                }
+                Err(e) => {
+                    let output = if capture { Some(e.to_string()) } else { None };
+                    (false, output, Err(e))
+                }
+            };
+
+            self.broadcaster.send(EventKind::ToolResult {
+                tool: name.to_string(),
+                success,
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output,
+                params: params_snapshot,
+            });
+
+            return call_result;
+        }
 
         // Wait for LSP readiness, then check server health.
         // Dead servers are non-fatal — tools degrade gracefully.

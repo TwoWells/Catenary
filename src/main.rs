@@ -434,15 +434,15 @@ async fn run_server(args: Args) -> Result<()> {
     )));
 
     // Start the hook server for PostToolUse/PreToolUse hook integration
-    let diagnostics_server = catenary_mcp::bridge::DiagnosticsServer::new(
+    let diagnostics_server = Arc::new(catenary_mcp::bridge::DiagnosticsServer::new(
         client_manager.clone(),
         doc_manager.clone(),
         path_validator.clone(),
-    );
+    ));
     let sync_roots_server =
         catenary_mcp::bridge::SyncRootsServer::new(client_manager.clone(), path_validator.clone());
     let hook_server = catenary_mcp::hook::HookServer::new(
-        diagnostics_server,
+        diagnostics_server.clone(),
         sync_roots_server,
         broadcaster.clone(),
         message_log.clone(),
@@ -458,12 +458,20 @@ async fn run_server(args: Args) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .set_socket_active();
 
+    let session_id = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .info
+        .id
+        .clone();
     let handler = LspBridgeHandler::new(
         client_manager.clone(),
         doc_manager,
         runtime,
         broadcaster.clone(),
         config.tui.capture_tool_output,
+        diagnostics_server,
+        Some(session_id),
     );
 
     // Run MCP server (blocking - reads from stdin)

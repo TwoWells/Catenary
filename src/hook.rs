@@ -70,7 +70,7 @@ pub enum NotifyResult {
 /// Listens on an IPC endpoint (Unix socket or named pipe) for hook requests
 /// from the host CLI and returns LSP diagnostics or root sync results.
 pub struct HookServer {
-    diagnostics: DiagnosticsServer,
+    diagnostics: Arc<DiagnosticsServer>,
     sync_roots: SyncRootsServer,
     broadcaster: EventBroadcaster,
     message_log: Arc<MessageLog>,
@@ -81,7 +81,7 @@ impl HookServer {
     /// Creates a new `HookServer`.
     #[must_use]
     pub const fn new(
-        diagnostics: DiagnosticsServer,
+        diagnostics: Arc<DiagnosticsServer>,
         sync_roots: SyncRootsServer,
         broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,

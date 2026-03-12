@@ -9,7 +9,6 @@ use globset::Glob;
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -652,8 +651,6 @@ pub struct ReplaceFileResult {
     pub snapshot_id: Option<i64>,
     /// Line-level diffs: `(old_line, new_line)` pairs.
     pub diffs: Vec<(String, String)>,
-    /// LSP diagnostics for this file (populated by ticket 01).
-    pub diagnostics: Vec<Value>,
     /// Error message if this file failed or was skipped.
     pub error: Option<String>,
     /// New file content after edits (for ticket 01 to write).
@@ -760,126 +757,18 @@ fn render_summary(results: &[ReplaceFileResult]) -> String {
     line
 }
 
-/// Formats diagnostics section for replace output.
-///
-/// Groups diagnostics by code across files. First occurrence of
-/// each code shown in full, remaining files listed under `matching:`.
-/// Diagnostics without a code are shown individually.
-fn render_diagnostics(results: &[ReplaceFileResult]) -> String {
-    // Metadata extracted from a single LSP diagnostic.
-    struct Entry<'a> {
-        severity: &'static str,
-        code: Option<String>,
-        message: String,
-        path: &'a Path,
-        line: u64,
-    }
-
-    let has_diags = results.iter().any(|r| !r.diagnostics.is_empty());
-    if !has_diags {
-        return String::new();
-    }
-
-    let mut entries: Vec<Entry<'_>> = Vec::new();
-    for r in results {
-        for d in &r.diagnostics {
-            let severity = match d.get("severity").and_then(Value::as_u64) {
-                Some(1) => "error",
-                Some(2) => "warning",
-                Some(3) => "info",
-                Some(4) => "hint",
-                _ => "unknown",
-            };
-            let line = d
-                .pointer("/range/start/line")
-                .and_then(Value::as_u64)
-                .map_or(0, |l| l + 1);
-            let code = d.get("code").map(|c| {
-                c.as_str().map_or_else(
-                    || c.as_i64().map_or_else(|| c.to_string(), |n| n.to_string()),
-                    str::to_string,
-                )
-            });
-            let message = d
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-
-            entries.push(Entry {
-                severity,
-                code,
-                message,
-                path: &r.path,
-                line,
-            });
-        }
-    }
-
-    let mut output = String::from("diagnostics:\n");
-
-    // Group by code, preserving first-seen order.
-    let mut code_groups: Vec<(String, Vec<usize>)> = Vec::new();
-    let mut no_code: Vec<usize> = Vec::new();
-
-    for (i, entry) in entries.iter().enumerate() {
-        if let Some(ref c) = entry.code {
-            if let Some(group) = code_groups.iter_mut().find(|(code, _)| code == c) {
-                group.1.push(i);
-            } else {
-                code_groups.push((c.clone(), vec![i]));
-            }
-        } else {
-            no_code.push(i);
-        }
-    }
-
-    // Grouped diagnostics (by code).
-    for (code, indices) in &code_groups {
-        let first = &entries[indices[0]];
-        let path = first.path.display();
-        if indices.len() == 1 {
-            // Single occurrence: compact one-line format.
-            _ = writeln!(
-                output,
-                "\t{path}:{} {}[{code}]: {}",
-                first.line, first.severity, first.message,
-            );
-        } else {
-            // Multiple occurrences: header + matching list.
-            _ = writeln!(output, "\t{}[{code}]: {}", first.severity, first.message,);
-            _ = writeln!(output, "\t  {path}:{}", first.line);
-            output.push_str("\tmatching:\n");
-            for &idx in &indices[1..] {
-                let entry = &entries[idx];
-                let epath = entry.path.display();
-                _ = writeln!(output, "\t  {epath}:{}", entry.line);
-            }
-        }
-    }
-
-    // Individual diagnostics (no code).
-    for &idx in &no_code {
-        let entry = &entries[idx];
-        let path = entry.path.display();
-        _ = writeln!(
-            output,
-            "\t{path}:{} {}: {}",
-            entry.line, entry.severity, entry.message,
-        );
-    }
-
-    output
-}
-
 /// Renders replace results into budget-constrained output text.
 ///
 /// Uses promote-from-bottom: renders minimal (counts only), then
 /// tries reduced (1 diff sample per file), then full (3 samples).
-/// Diagnostics are always included and never trimmed.
+/// The `diagnostics` string (from `DiagnosticsServer::process_files`)
+/// is always included and never trimmed.
 #[must_use]
-pub fn render_replace_output(results: &[ReplaceFileResult], budget: u32) -> String {
-    let diagnostics_section = render_diagnostics(results);
+pub fn render_replace_output(
+    results: &[ReplaceFileResult],
+    budget: u32,
+    diagnostics: &str,
+) -> String {
     let summary = render_summary(results);
 
     let assemble = |max_samples: usize| -> String {
@@ -893,9 +782,9 @@ pub fn render_replace_output(results: &[ReplaceFileResult], budget: u32) -> Stri
             out.push('\n');
         }
         out.push_str(&summary);
-        if !diagnostics_section.is_empty() {
+        if !diagnostics.is_empty() {
             out.push('\n');
-            out.push_str(&diagnostics_section);
+            out.push_str(diagnostics);
         }
         out
     };
@@ -957,7 +846,7 @@ pub fn process_replace(
                     edit_counts: vec![],
                     snapshot_id: None,
                     diffs: vec![],
-                    diagnostics: vec![],
+
                     error: Some(e.to_string()),
                     new_content: None,
                 });
@@ -975,7 +864,7 @@ pub fn process_replace(
                 edit_counts: vec![],
                 snapshot_id: None,
                 diffs: vec![],
-                diagnostics: vec![],
+
                 error: Some("not UTF-8".to_owned()),
                 new_content: None,
             });
@@ -991,7 +880,7 @@ pub fn process_replace(
                 edit_counts,
                 snapshot_id: None,
                 diffs: vec![],
-                diagnostics: vec![],
+
                 error: None,
                 new_content: None,
             });
@@ -1007,14 +896,190 @@ pub fn process_replace(
             edit_counts,
             snapshot_id: None,
             diffs,
-            diagnostics: vec![],
             error: None,
             new_content: Some(new_content),
         });
     }
 
-    let output = render_replace_output(&results, 4000);
+    let output = render_replace_output(&results, 4000, "");
     Ok((results, output))
+}
+
+// ─── ReplaceServer ───────────────────────────────────────────────────────
+
+use super::diagnostics_server::DiagnosticsServer;
+use super::tool_server::ToolServer;
+use crate::lsp::ClientManager;
+use rusqlite::Connection;
+use std::sync::Arc;
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
+
+use super::DocumentManager;
+
+/// Batch replacement tool with snapshots and diagnostics.
+///
+/// Implements `ToolServer` — a black box in the transformation layer.
+/// Receives edit parameters, applies them across files, creates `SQLite`
+/// snapshots before writes, and collects LSP diagnostics after writes
+/// via the shared `DiagnosticsServer`.
+pub struct ReplaceServer {
+    client_manager: Arc<ClientManager>,
+    #[allow(dead_code, reason = "reserved for future document sync integration")]
+    doc_manager: Arc<Mutex<DocumentManager>>,
+    diagnostics: Arc<DiagnosticsServer>,
+    #[allow(
+        dead_code,
+        reason = "reserved for future blocking dispatch from sync contexts"
+    )]
+    runtime: Handle,
+    session_id: Option<String>,
+}
+
+impl ReplaceServer {
+    /// Creates a new `ReplaceServer`.
+    pub const fn new(
+        client_manager: Arc<ClientManager>,
+        doc_manager: Arc<Mutex<DocumentManager>>,
+        diagnostics: Arc<DiagnosticsServer>,
+        runtime: Handle,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            client_manager,
+            doc_manager,
+            diagnostics,
+            runtime,
+            session_id,
+        }
+    }
+}
+
+impl ToolServer for ReplaceServer {
+    async fn execute(
+        &self,
+        params: &serde_json::Value,
+        parent_id: Option<i64>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let input: ReplaceInput = serde_json::from_value(params.clone())
+            .map_err(|e| anyhow!("invalid replace parameters: {e}"))?;
+
+        let roots = self.client_manager.roots().await;
+        let (mut results, _) = process_replace(&input, &roots)?;
+
+        // Open a database connection for snapshot creation.
+        let conn = crate::db::open()?;
+
+        let entry_id = parent_id.unwrap_or(0);
+
+        for result in &mut results {
+            let Some(ref new_content) = result.new_content else {
+                continue;
+            };
+
+            // Read original content for the snapshot.
+            let original = std::fs::read(&result.path)
+                .map_err(|e| anyhow!("failed to read {} for snapshot: {e}", result.path.display()));
+
+            let original = match original {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    result.error = Some(e.to_string());
+                    result.new_content = None;
+                    continue;
+                }
+            };
+
+            // Create snapshot — if this fails, abort for this file.
+            let snapshot_id = match create_snapshot(
+                &conn,
+                &result.path,
+                &original,
+                result.edit_counts.len(),
+                result.count,
+                self.session_id.as_deref(),
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    result.error = Some(format!("snapshot failed: {e}. File not modified."));
+                    result.new_content = None;
+                    continue;
+                }
+            };
+
+            result.snapshot_id = Some(snapshot_id);
+
+            // Write new content preserving file permissions.
+            let write_result = write_preserving_permissions(&result.path, new_content.as_bytes());
+            if let Err(e) = write_result {
+                result.error = Some(format!("write failed: {e}"));
+                result.new_content = None;
+            }
+        }
+
+        // Collect diagnostics for all modified files (best-effort).
+        let modified_paths: Vec<String> = results
+            .iter()
+            .filter(|r| r.snapshot_id.is_some() && r.error.is_none())
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        let path_refs: Vec<&str> = modified_paths.iter().map(String::as_str).collect();
+        let diagnostics = self.diagnostics.process_files(&path_refs, entry_id).await;
+
+        let output = render_replace_output(&results, 4000, &diagnostics);
+        Ok(serde_json::Value::String(output))
+    }
+}
+
+/// Creates a snapshot of the file's original content before modification.
+///
+/// Returns the snapshot row ID on success.
+///
+/// # Errors
+///
+/// Returns an error if the database insert fails.
+fn create_snapshot(
+    conn: &Connection,
+    file_path: &Path,
+    content: &[u8],
+    edit_count: usize,
+    replacement_count: usize,
+    session_id: Option<&str>,
+) -> Result<i64> {
+    let pattern = format!("{edit_count} edits");
+
+    conn.execute(
+        "INSERT INTO snapshots \
+             (file_path, content, source, pattern, replacement, count, created_at, session_id) \
+         VALUES (?1, ?2, 'replace', ?3, NULL, ?4, datetime('now'), ?5)",
+        rusqlite::params![
+            file_path.to_string_lossy().as_ref(),
+            content,
+            pattern,
+            replacement_count,
+            session_id,
+        ],
+    )
+    .map_err(|e| anyhow!("failed to insert snapshot: {e}"))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Writes content to a file, preserving the original file permissions.
+///
+/// # Errors
+///
+/// Returns an error if reading metadata, writing content, or setting
+/// permissions fails.
+fn write_preserving_permissions(path: &Path, content: &[u8]) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| anyhow!("failed to read metadata for {}: {e}", path.display()))?;
+    let permissions = metadata.permissions();
+    std::fs::write(path, content)
+        .map_err(|e| anyhow!("failed to write {}: {e}", path.display()))?;
+    std::fs::set_permissions(path, permissions)
+        .map_err(|e| anyhow!("failed to set permissions on {}: {e}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1414,7 +1479,6 @@ mod tests {
             edit_counts: vec![count],
             snapshot_id: None,
             diffs,
-            diagnostics: vec![],
             error: error.map(String::from),
             new_content: None,
         }
@@ -1433,7 +1497,7 @@ mod tests {
             None,
         );
 
-        let output = render_replace_output(&[result], 4000);
+        let output = render_replace_output(&[result], 4000, "");
         assert!(output.contains("(8 replacements)"), "got: {output}");
         assert!(output.contains("\t- use crate::old"), "got: {output}");
         assert!(output.contains("\t+ use crate::new"), "got: {output}");
@@ -1452,7 +1516,7 @@ mod tests {
             make_result("src/c.rs", 2, vec![("old".into(), "new".into())], None),
         ];
 
-        let output = render_replace_output(&results, 4000);
+        let output = render_replace_output(&results, 4000, "");
         assert!(output.contains("src/a.rs"), "got: {output}");
         assert!(output.contains("src/b.rs"), "got: {output}");
         assert!(output.contains("src/c.rs"), "got: {output}");
@@ -1465,7 +1529,7 @@ mod tests {
     #[test]
     fn test_render_no_matches() {
         let result = make_result("src/handler.rs", 0, vec![], None);
-        let output = render_replace_output(&[result], 4000);
+        let output = render_replace_output(&[result], 4000, "");
         assert_eq!(output, "0 replacements");
     }
 
@@ -1482,7 +1546,7 @@ mod tests {
         let results = [make_result("src/handler.rs", 10, diffs, None)];
 
         // Full tier: large budget fits all 3 samples.
-        let full = render_replace_output(&results, 50_000);
+        let full = render_replace_output(&results, 50_000, "");
         let full_samples = full.matches("\t- ").count();
         assert_eq!(
             full_samples, 3,
@@ -1490,7 +1554,7 @@ mod tests {
         );
 
         // Reduced tier: budget too small for full, fits 1 sample.
-        let reduced = render_replace_output(&results, 200);
+        let reduced = render_replace_output(&results, 200, "");
         let reduced_samples = reduced.matches("\t- ").count();
         assert_eq!(
             reduced_samples, 1,
@@ -1498,7 +1562,7 @@ mod tests {
         );
 
         // Minimal tier: budget too small for reduced, counts only.
-        let minimal = render_replace_output(&results, 50);
+        let minimal = render_replace_output(&results, 50, "");
         let minimal_samples = minimal.matches("\t- ").count();
         assert_eq!(
             minimal_samples, 0,
@@ -1519,12 +1583,187 @@ mod tests {
             make_result("src/readonly.rs", 0, vec![], Some("permission denied")),
         ];
 
-        let output = render_replace_output(&results, 4000);
+        let output = render_replace_output(&results, 4000, "");
         assert!(output.contains("(skipped: not UTF-8)"), "got: {output}");
         assert!(
             output.contains("(error: permission denied)"),
             "got: {output}"
         );
         assert!(output.contains("(1 skipped, 1 error)"), "got: {output}");
+    }
+
+    // --- Snapshot tests ---
+
+    fn open_test_db() -> rusqlite::Connection {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let conn = crate::db::open_and_migrate_at(&path).expect("open_and_migrate_at");
+        // Leak the tempdir so the database file persists for the test.
+        std::mem::forget(dir);
+        conn
+    }
+
+    #[test]
+    fn test_snapshot_created() {
+        let conn = open_test_db();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("test.rs");
+        let content = b"fn main() {}";
+        std::fs::write(&file, content).expect("write");
+
+        let id = create_snapshot(&conn, &file, content, 2, 5, None).expect("snapshot");
+        assert!(id > 0, "snapshot id should be positive");
+
+        let (file_path, source, count): (String, String, i64) = conn
+            .query_row(
+                "SELECT file_path, source, count FROM snapshots WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0).expect("col0"),
+                        row.get(1).expect("col1"),
+                        row.get(2).expect("col2"),
+                    ))
+                },
+            )
+            .expect("query");
+        assert_eq!(file_path, file.to_string_lossy().as_ref());
+        assert_eq!(source, "replace");
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_snapshot_content() {
+        let conn = open_test_db();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("test.rs");
+        let content = b"fn main() { println!(\"hello\"); }";
+        std::fs::write(&file, content).expect("write");
+
+        let id =
+            create_snapshot(&conn, &file, content, 1, 1, Some("test-session")).expect("snapshot");
+
+        let (blob, session_id): (Vec<u8>, Option<String>) = conn
+            .query_row(
+                "SELECT content, session_id FROM snapshots WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0).expect("col0"), row.get(1).expect("col1"))),
+            )
+            .expect("query");
+        assert_eq!(blob, content);
+        assert_eq!(session_id.as_deref(), Some("test-session"));
+    }
+
+    #[test]
+    fn test_multi_file_snapshots() {
+        let conn = open_test_db();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        for name in &["a.rs", "b.rs", "c.rs"] {
+            let file = dir.path().join(name);
+            let content = format!("// {name}");
+            std::fs::write(&file, &content).expect("write");
+            create_snapshot(&conn, &file, content.as_bytes(), 1, 1, None).expect("snapshot");
+        }
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_no_snapshot_on_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn main() {}").expect("write");
+
+        let input = ReplaceInput {
+            glob: file.to_string_lossy().to_string(),
+            edits: vec![make_edit("nonexistent", "replacement", None)],
+            lines: None,
+            exclude: None,
+            include_gitignored: false,
+            include_hidden: false,
+        };
+
+        let (results, _) = process_replace(&input, &[]).expect("process");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].count, 0);
+        assert!(results[0].snapshot_id.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_id_in_output() {
+        let mut result = make_result(
+            "src/handler.rs",
+            8,
+            vec![("old".into(), "new".into())],
+            None,
+        );
+        result.snapshot_id = Some(42);
+
+        let output = render_replace_output(&[result], 4000, "");
+        assert!(
+            output.contains("[snapshot #42]"),
+            "should contain snapshot id, got: {output}"
+        );
+    }
+
+    // --- Diagnostics rendering ---
+
+    #[test]
+    fn test_diagnostics_in_output() {
+        let result = make_result(
+            "src/handler.rs",
+            3,
+            vec![("old".into(), "new".into())],
+            None,
+        );
+        let diags =
+            "diagnostics:\n\tsrc/handler.rs\n\t:10:5 [error] rustc(E0308): mismatched types\n";
+
+        let output = render_replace_output(&[result], 4000, diags);
+        assert!(
+            output.contains("diagnostics:"),
+            "should contain diagnostics section, got: {output}"
+        );
+        assert!(
+            output.contains("E0308"),
+            "should contain error code, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_empty_omitted() {
+        let result = make_result(
+            "src/handler.rs",
+            3,
+            vec![("old".into(), "new".into())],
+            None,
+        );
+
+        let output = render_replace_output(&[result], 4000, "");
+        assert!(
+            !output.contains("diagnostics:"),
+            "empty diagnostics should not produce diagnostics section, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_pattern_format() {
+        let conn = open_test_db();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "content").expect("write");
+
+        let id = create_snapshot(&conn, &file, b"content", 4, 10, None).expect("snapshot");
+
+        let pattern: String = conn
+            .query_row("SELECT pattern FROM snapshots WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .expect("query");
+        assert_eq!(pattern, "4 edits");
     }
 }
