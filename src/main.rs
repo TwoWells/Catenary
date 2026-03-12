@@ -377,13 +377,16 @@ async fn run_server(args: Args) -> Result<()> {
     );
     info!("Workspace roots: {}", workspace_display);
     // Create managers
-    let logger: std::sync::Arc<dyn catenary_mcp::logger::Logger> =
-        std::sync::Arc::new(catenary_mcp::logger::DbLogger::new(broadcaster.clone()));
+    let message_log = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .message_log()
+        .clone();
     let client_manager = Arc::new(lsp::ClientManager::new(
         config.clone(),
         roots,
         broadcaster.clone(),
-        logger,
+        message_log.clone(),
     ));
     client_manager.spawn_all().await;
 
@@ -2292,14 +2295,12 @@ async fn run_doctor(args: Args, nocolor: bool, show_diff: bool) -> Result<()> {
 
         // Spawn and initialize the server
         let args_refs: Vec<&str> = server_config.args.iter().map(String::as_str).collect();
-        let doctor_logger: std::sync::Arc<dyn catenary_mcp::logger::Logger> =
-            std::sync::Arc::new(catenary_mcp::logger::TracingLogger);
         let spawn_result = lsp::LspClient::spawn_quiet(
             &server_config.command,
             &args_refs,
             lang,
             broadcaster.clone(),
-            doctor_logger,
+            Arc::new(catenary_mcp::session::MessageLog::noop()),
         );
 
         let mut client = match spawn_result {

@@ -10,10 +10,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::logger::Logger;
 use crate::lsp::LspClient;
 use crate::lsp::state::ServerStatus;
-use crate::session::EventBroadcaster;
+use crate::session::{EventBroadcaster, MessageLog};
 
 /// Manages the lifecycle of LSP clients (spawning, caching, shutdown).
 pub struct ClientManager {
@@ -21,7 +20,7 @@ pub struct ClientManager {
     roots: Mutex<Vec<PathBuf>>,
     active_clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
     broadcaster: EventBroadcaster,
-    logger: Arc<dyn Logger>,
+    message_log: Arc<MessageLog>,
 }
 
 impl ClientManager {
@@ -31,14 +30,14 @@ impl ClientManager {
         config: Config,
         roots: Vec<PathBuf>,
         broadcaster: EventBroadcaster,
-        logger: Arc<dyn Logger>,
+        message_log: Arc<MessageLog>,
     ) -> Self {
         Self {
             config,
             roots: Mutex::new(roots),
             active_clients: Mutex::new(HashMap::new()),
             broadcaster,
-            logger,
+            message_log,
         }
     }
 
@@ -328,7 +327,7 @@ impl ClientManager {
             &args,
             lang,
             self.broadcaster.clone(),
-            self.logger.clone(),
+            self.message_log.clone(),
         )?;
 
         // Initialize
@@ -532,13 +531,13 @@ fn extension_to_config_key(ext: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::config::{IconConfig, ServerConfig};
-    use crate::logger::TracingLogger;
+    use crate::session::MessageLog;
     use anyhow::Result;
 
     const MOCK_LANG_A: &str = "yX4Za";
 
-    fn test_logger() -> Arc<dyn Logger> {
-        Arc::new(TracingLogger)
+    fn test_message_log() -> Arc<MessageLog> {
+        Arc::new(MessageLog::noop())
     }
 
     fn test_config() -> Config {
@@ -612,7 +611,7 @@ mod tests {
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             broadcaster,
-            test_logger(),
+            test_message_log(),
         );
 
         let roots = manager.roots().await;
@@ -629,7 +628,7 @@ mod tests {
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
             broadcaster,
-            test_logger(),
+            test_message_log(),
         );
 
         assert_eq!(manager.roots().await.len(), 1);
@@ -646,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn test_roots_empty_initial() -> Result<()> {
         let broadcaster = EventBroadcaster::noop();
-        let manager = ClientManager::new(test_config(), vec![], broadcaster, test_logger());
+        let manager = ClientManager::new(test_config(), vec![], broadcaster, test_message_log());
 
         assert!(manager.roots().await.is_empty());
         Ok(())
@@ -659,7 +658,7 @@ mod tests {
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             broadcaster,
-            test_logger(),
+            test_message_log(),
         );
 
         assert_eq!(manager.roots().await.len(), 2);
@@ -679,7 +678,7 @@ mod tests {
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             broadcaster,
-            test_logger(),
+            test_message_log(),
         );
 
         // Sync: remove /tmp/root_a, keep /tmp/root_b, add /tmp/root_c
@@ -704,7 +703,7 @@ mod tests {
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
             broadcaster,
-            test_logger(),
+            test_message_log(),
         );
 
         manager
@@ -726,7 +725,7 @@ mod tests {
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             broadcaster,
-            test_logger(),
+            test_message_log(),
         );
 
         let client = manager.get_client(MOCK_LANG_A).await?;
@@ -760,7 +759,7 @@ mod tests {
             mockls_workspace_folders_config(),
             vec![PathBuf::from("/tmp")],
             broadcaster,
-            test_logger(),
+            test_message_log(),
         );
 
         let client = manager.get_client(MOCK_LANG_A).await?;

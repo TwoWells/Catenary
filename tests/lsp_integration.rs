@@ -12,8 +12,8 @@ use anyhow::Result;
 use std::sync::Arc;
 use tempfile::tempdir;
 
-fn test_logger() -> Arc<dyn catenary_mcp::logger::Logger> {
-    Arc::new(catenary_mcp::logger::TracingLogger)
+fn test_message_log() -> Arc<catenary_mcp::session::MessageLog> {
+    Arc::new(catenary_mcp::session::MessageLog::noop())
 }
 
 const MOCK_LANG_A: &str = "yX4Za";
@@ -28,7 +28,7 @@ async fn test_mockls_initialize() -> Result<()> {
         &[MOCK_LANG_A],
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
-        test_logger(),
+        test_message_log(),
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -51,7 +51,7 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
         &[MOCK_LANG_A, "--workspace-folders"],
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
-        test_logger(),
+        test_message_log(),
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -80,7 +80,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         &[MOCK_LANG_A],
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
-        test_logger(),
+        test_message_log(),
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -118,7 +118,7 @@ async fn test_client_capabilities() -> Result<()> {
         &[MOCK_LANG_A, "--log-init-params", log_path],
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
-        test_logger(),
+        test_message_log(),
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -225,7 +225,7 @@ async fn test_content_modified_retry() -> Result<()> {
         &[MOCK_LANG_A, "--content-modified-once"],
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
-        test_logger(),
+        test_message_log(),
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
