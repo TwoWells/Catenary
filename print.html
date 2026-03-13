@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1bf95c55.js";
+            window.path_to_searchindex_js = "searchindex-e966e65e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a743189e.js"></script>
+        <script src="toc-05378142.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1370,17 +1370,17 @@ Catenary configuration.</p>
 <tr><th>Language(s)</th><th>Page</th><th>Server</th></tr>
 </thead>
 <tbody>
-<tr><td>CSS, HTML, JSON</td><td><a href="lsp/css-html-json.html">CSS-HTML-JSON</a></td><td>vscode-langservers-extracted</td></tr>
-<tr><td>Go</td><td><a href="lsp/go.html">Go</a></td><td>gopls</td></tr>
-<tr><td>JavaScript</td><td><a href="lsp/javascript.html">JavaScript</a></td><td>typescript-language-server</td></tr>
-<tr><td>Julia</td><td><a href="lsp/julia.html">Julia</a></td><td>LanguageServer.jl</td></tr>
-<tr><td>Markdown</td><td><a href="lsp/markdown.html">Markdown</a></td><td>marksman</td></tr>
-<tr><td>PHP</td><td><a href="lsp/php.html">PHP</a></td><td>intelephense</td></tr>
-<tr><td>Python</td><td><a href="lsp/python.html">Python</a></td><td>pyright</td></tr>
-<tr><td>Rust</td><td><a href="lsp/rust.html">Rust</a></td><td>rust-analyzer</td></tr>
-<tr><td>Shell (Bash)</td><td><a href="lsp/shell.html">Shell</a></td><td>bash-language-server</td></tr>
-<tr><td>Termux &amp; Packaging</td><td><a href="lsp/termux.html">Termux</a></td><td>termux-language-server</td></tr>
-<tr><td>TypeScript</td><td><a href="lsp/typescript.html">TypeScript</a></td><td>typescript-language-server</td></tr>
+<tr><td>CSS, HTML, JSON</td><td><a href="#css-html-json">CSS-HTML-JSON</a></td><td>vscode-langservers-extracted</td></tr>
+<tr><td>Go</td><td><a href="#go">Go</a></td><td>gopls</td></tr>
+<tr><td>JavaScript</td><td><a href="#javascript">JavaScript</a></td><td>typescript-language-server</td></tr>
+<tr><td>Julia</td><td><a href="#julia">Julia</a></td><td>LanguageServer.jl</td></tr>
+<tr><td>Markdown</td><td><a href="#markdown">Markdown</a></td><td>marksman</td></tr>
+<tr><td>PHP</td><td><a href="#php">PHP</a></td><td>intelephense</td></tr>
+<tr><td>Python</td><td><a href="#python">Python</a></td><td>pyright</td></tr>
+<tr><td>Rust</td><td><a href="#rust">Rust</a></td><td>rust-analyzer</td></tr>
+<tr><td>Shell (Bash)</td><td><a href="#shell-bash">Shell</a></td><td>bash-language-server</td></tr>
+<tr><td>Termux &amp; Packaging</td><td><a href="#termux--packaging">Termux</a></td><td>termux-language-server</td></tr>
+<tr><td>TypeScript</td><td><a href="#typescript">TypeScript</a></td><td>typescript-language-server</td></tr>
 </tbody>
 </table>
 </div>
@@ -1428,6 +1428,171 @@ args = ["--stdio"]
 
 Any gotchas, tips, or links to official docs.
 </code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="css-html-json"><a class="header" href="#css-html-json">CSS, HTML, JSON</a></h1>
+<p>These three languages are bundled together in one package: <code>vscode-langservers-extracted</code>.</p>
+<h2 id="install-1"><a class="header" href="#install-1">Install</a></h2>
+<h3 id="macos"><a class="header" href="#macos">macOS</a></h3>
+<pre><code class="language-bash">npm install -g vscode-langservers-extracted
+</code></pre>
+<h3 id="linux"><a class="header" href="#linux">Linux</a></h3>
+<pre><code class="language-bash">npm install -g vscode-langservers-extracted
+</code></pre>
+<h3 id="windows"><a class="header" href="#windows">Windows</a></h3>
+<pre><code class="language-bash">npm install -g vscode-langservers-extracted
+</code></pre>
+<h2 id="config"><a class="header" href="#config">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.css]
+command = "vscode-css-language-server"
+args = ["--stdio"]
+
+[server.scss]
+command = "vscode-css-language-server"
+args = ["--stdio"]
+
+[server.html]
+command = "vscode-html-language-server"
+args = ["--stdio"]
+
+[server.json]
+command = "vscode-json-language-server"
+args = ["--stdio"]
+</code></pre>
+<h2 id="whats-included"><a class="header" href="#whats-included">What’s Included</a></h2>
+<p>The <code>vscode-langservers-extracted</code> package provides:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Server</th><th>Languages</th></tr>
+</thead>
+<tbody>
+<tr><td><code>vscode-css-language-server</code></td><td>CSS, SCSS, Less</td></tr>
+<tr><td><code>vscode-html-language-server</code></td><td>HTML</td></tr>
+<tr><td><code>vscode-json-language-server</code></td><td>JSON, JSONC</td></tr>
+<tr><td><code>vscode-markdown-language-server</code></td><td>Markdown</td></tr>
+<tr><td><code>vscode-eslint-language-server</code></td><td>ESLint</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
+<ul>
+<li>These servers are extracted from VS Code, so they’re well-maintained and feature-complete</li>
+<li>SCSS and Less use the same CSS server — it auto-detects the language</li>
+<li>For Tailwind CSS support, use <code>tailwindcss-language-server</code> (separate server)</li>
+</ul>
+<h2 id="links"><a class="header" href="#links">Links</a></h2>
+<ul>
+<li><a href="https://www.npmjs.com/package/vscode-langservers-extracted">vscode-langservers-extracted on npm</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="go"><a class="header" href="#go">Go</a></h1>
+<h2 id="install-2"><a class="header" href="#install-2">Install</a></h2>
+<h3 id="macos-1"><a class="header" href="#macos-1">macOS</a></h3>
+<pre><code class="language-bash">go install golang.org/x/tools/gopls@latest
+</code></pre>
+<p>Or via Homebrew:</p>
+<pre><code class="language-bash">brew install gopls
+</code></pre>
+<h3 id="linux-1"><a class="header" href="#linux-1">Linux</a></h3>
+<pre><code class="language-bash">go install golang.org/x/tools/gopls@latest
+</code></pre>
+<h3 id="windows-1"><a class="header" href="#windows-1">Windows</a></h3>
+<pre><code class="language-bash">go install golang.org/x/tools/gopls@latest
+</code></pre>
+<h2 id="config-1"><a class="header" href="#config-1">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.go]
+command = "gopls"
+</code></pre>
+<h2 id="notes-1"><a class="header" href="#notes-1">Notes</a></h2>
+<ul>
+<li><code>gopls</code> is the official Go language server</li>
+<li>Ensure <code>$GOPATH/bin</code> (or <code>$HOME/go/bin</code>) is in your PATH</li>
+<li>Works with Go modules out of the box</li>
+<li>First run indexes your module cache — may take a moment</li>
+</ul>
+<h2 id="links-1"><a class="header" href="#links-1">Links</a></h2>
+<ul>
+<li><a href="https://pkg.go.dev/golang.org/x/tools/gopls">gopls</a></li>
+<li><a href="https://github.com/golang/tools/tree/master/gopls">gopls documentation</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="javascript"><a class="header" href="#javascript">JavaScript</a></h1>
+<p>JavaScript uses the same language server as TypeScript.</p>
+<h2 id="install-3"><a class="header" href="#install-3">Install</a></h2>
+<h3 id="macos-2"><a class="header" href="#macos-2">macOS</a></h3>
+<pre><code class="language-bash">npm install -g typescript typescript-language-server
+</code></pre>
+<h3 id="linux-2"><a class="header" href="#linux-2">Linux</a></h3>
+<pre><code class="language-bash">npm install -g typescript typescript-language-server
+</code></pre>
+<h3 id="windows-2"><a class="header" href="#windows-2">Windows</a></h3>
+<pre><code class="language-bash">npm install -g typescript typescript-language-server
+</code></pre>
+<h2 id="config-2"><a class="header" href="#config-2">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.javascript]
+command = "typescript-language-server"
+args = ["--stdio"]
+</code></pre>
+<h2 id="notes-2"><a class="header" href="#notes-2">Notes</a></h2>
+<ul>
+<li>Same server as <a href="#typescript">TypeScript</a> — install once, configure both</li>
+<li>Works with <code>.js</code>, <code>.jsx</code>, <code>.mjs</code>, <code>.cjs</code> files</li>
+<li>Provides type inference even in plain JavaScript</li>
+<li>Add a <code>jsconfig.json</code> to customize project settings</li>
+</ul>
+<h2 id="jsx--react"><a class="header" href="#jsx--react">JSX / React</a></h2>
+<p>JSX is handled automatically. For React projects, ensure you have:</p>
+<pre><code class="language-toml">[server.javascript]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[server.javascriptreact]
+command = "typescript-language-server"
+args = ["--stdio"]
+</code></pre>
+<h2 id="links-2"><a class="header" href="#links-2">Links</a></h2>
+<ul>
+<li><a href="https://github.com/typescript-language-server/typescript-language-server">typescript-language-server</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="julia"><a class="header" href="#julia">Julia</a></h1>
+<h2 id="install-4"><a class="header" href="#install-4">Install</a></h2>
+<h3 id="macos--linux--windows"><a class="header" href="#macos--linux--windows">macOS / Linux / Windows</a></h3>
+<p>From the Julia REPL:</p>
+<pre><code class="language-julia">using Pkg
+Pkg.add("LanguageServer")
+</code></pre>
+<h2 id="config-3"><a class="header" href="#config-3">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.julia]
+command = "julia"
+args = ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"]
+</code></pre>
+<h2 id="notes-3"><a class="header" href="#notes-3">Notes</a></h2>
+<ul>
+<li>The server starts a Julia process, which has some startup time</li>
+<li><code>--startup-file=no</code> and <code>--history-file=no</code> speed up startup</li>
+<li>First run on a project may take time to load packages and index</li>
+<li>Works best with projects that have a <code>Project.toml</code></li>
+</ul>
+<h2 id="reducing-startup-time"><a class="header" href="#reducing-startup-time">Reducing Startup Time</a></h2>
+<p>For faster startup, you can create a custom sysimage:</p>
+<pre><code class="language-julia">using PackageCompiler
+create_sysimage([:LanguageServer], sysimage_path="languageserver.so")
+</code></pre>
+<p>Then use:</p>
+<pre><code class="language-toml">[server.julia]
+command = "julia"
+args = ["--sysimage=/path/to/languageserver.so", "-e", "using LanguageServer; runserver()"]
+</code></pre>
+<h2 id="links-3"><a class="header" href="#links-3">Links</a></h2>
+<ul>
+<li><a href="https://github.com/julia-vscode/LanguageServer.jl">LanguageServer.jl</a></li>
+<li><a href="https://julialang.org/">Julia</a></li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="language-server-landscape"><a class="header" href="#language-server-landscape">Language Server Landscape</a></h1>
 <p>Compiled from the <a href="https://microsoft.github.io/language-server-protocol/implementors/servers/">Microsoft LSP implementors list</a>
@@ -1810,6 +1975,326 @@ for free.</p>
 source or testing against a live instance. This is a living document.</p>
 </li>
 </ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="markdown"><a class="header" href="#markdown">Markdown</a></h1>
+<h2 id="install-5"><a class="header" href="#install-5">Install</a></h2>
+<h3 id="macos-3"><a class="header" href="#macos-3">macOS</a></h3>
+<pre><code class="language-bash">brew install marksman
+</code></pre>
+<h3 id="linux-3"><a class="header" href="#linux-3">Linux</a></h3>
+<p>Download the latest binary from
+<a href="https://github.com/artempyanykh/marksman/releases">GitHub releases</a>:</p>
+<pre><code class="language-bash"># Example for x86_64
+curl -L https://github.com/artempyanykh/marksman/releases/latest/download/marksman-linux-x64 -o marksman
+chmod +x marksman
+sudo mv marksman /usr/local/bin/
+</code></pre>
+<h3 id="windows-3"><a class="header" href="#windows-3">Windows</a></h3>
+<pre><code class="language-powershell"># With Chocolatey
+choco install marksman
+
+# Or download from GitHub releases
+# https://github.com/artempyanykh/marksman/releases
+</code></pre>
+<h2 id="config-4"><a class="header" href="#config-4">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.markdown]
+command = "marksman"
+args = ["server"]
+</code></pre>
+<h2 id="notes-4"><a class="header" href="#notes-4">Notes</a></h2>
+<ul>
+<li>Marksman provides document symbols (headings), go-to-definition for
+wiki-links, and references</li>
+<li>Works well with <code>codebase_map</code> to show document structure</li>
+<li>Supports wiki-style <code>[[links]]</code> and standard <code>[links](url)</code></li>
+</ul>
+<h2 id="links-4"><a class="header" href="#links-4">Links</a></h2>
+<ul>
+<li><a href="https://github.com/artempyanykh/marksman">Marksman GitHub</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="php"><a class="header" href="#php">PHP</a></h1>
+<h2 id="install-6"><a class="header" href="#install-6">Install</a></h2>
+<p><a href="https://intelephense.com/">Intelephense</a> is the most popular PHP language server.</p>
+<h3 id="macos-4"><a class="header" href="#macos-4">macOS</a></h3>
+<pre><code class="language-bash">npm install -g intelephense
+</code></pre>
+<h3 id="linux-4"><a class="header" href="#linux-4">Linux</a></h3>
+<pre><code class="language-bash">npm install -g intelephense
+</code></pre>
+<h3 id="windows-4"><a class="header" href="#windows-4">Windows</a></h3>
+<pre><code class="language-bash">npm install -g intelephense
+</code></pre>
+<h2 id="config-5"><a class="header" href="#config-5">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.php]
+command = "intelephense"
+args = ["--stdio"]
+</code></pre>
+<h2 id="notes-5"><a class="header" href="#notes-5">Notes</a></h2>
+<ul>
+<li>Intelephense has a free tier and a premium tier with additional features</li>
+<li>The free tier includes: completions, hover, definitions, references, diagnostics, formatting</li>
+<li>Premium adds: rename, code actions, go to implementation</li>
+<li>Works great with Laravel, Symfony, WordPress, and vanilla PHP</li>
+</ul>
+<h2 id="alternatives"><a class="header" href="#alternatives">Alternatives</a></h2>
+<h3 id="phpactor"><a class="header" href="#phpactor">phpactor</a></h3>
+<p>A free, open-source alternative:</p>
+<pre><code class="language-bash"># Install via composer
+composer global require phpactor/phpactor
+</code></pre>
+<pre><code class="language-toml">[server.php]
+command = "phpactor"
+args = ["language-server"]
+</code></pre>
+<h2 id="links-5"><a class="header" href="#links-5">Links</a></h2>
+<ul>
+<li><a href="https://intelephense.com/">Intelephense</a></li>
+<li><a href="https://www.npmjs.com/package/intelephense">Intelephense on npm</a></li>
+<li><a href="https://phpactor.readthedocs.io/">phpactor</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="python"><a class="header" href="#python">Python</a></h1>
+<h2 id="install-7"><a class="header" href="#install-7">Install</a></h2>
+<p><a href="https://github.com/microsoft/pyright">Pyright</a> is a fast, feature-rich Python language server from Microsoft.</p>
+<h3 id="macos-5"><a class="header" href="#macos-5">macOS</a></h3>
+<pre><code class="language-bash">npm install -g pyright
+</code></pre>
+<p>Or via Homebrew:</p>
+<pre><code class="language-bash">brew install pyright
+</code></pre>
+<h3 id="linux-5"><a class="header" href="#linux-5">Linux</a></h3>
+<pre><code class="language-bash">npm install -g pyright
+</code></pre>
+<h3 id="windows-5"><a class="header" href="#windows-5">Windows</a></h3>
+<pre><code class="language-bash">npm install -g pyright
+</code></pre>
+<h2 id="config-6"><a class="header" href="#config-6">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+</code></pre>
+<h2 id="settings"><a class="header" href="#settings">Settings</a></h2>
+<p>Pyright requests configuration via <code>workspace/configuration</code>. Use the <code>settings</code>
+table to provide Python interpreter paths, analysis exclusions, and other options:</p>
+<pre><code class="language-toml">[server.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
+
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+</code></pre>
+<p>Without these settings, pyright may fall back to scanning the entire workspace
+(including large directories like <code>target/</code> or <code>node_modules/</code>), which can
+cause extremely slow initialization.</p>
+<p>See the <a href="https://github.com/microsoft/pyright/blob/main/docs/configuration.md">Pyright configuration docs</a>
+for the full list of available settings.</p>
+<h2 id="notes-6"><a class="header" href="#notes-6">Notes</a></h2>
+<ul>
+<li>Pyright provides type checking even for untyped code (infers types)</li>
+<li>Works well with virtual environments — activate your venv before starting your MCP client</li>
+<li>For Django/Flask projects, Pyright handles most patterns out of the box</li>
+</ul>
+<h2 id="alternatives-1"><a class="header" href="#alternatives-1">Alternatives</a></h2>
+<h3 id="pylsp-python-lsp-server"><a class="header" href="#pylsp-python-lsp-server">Pylsp (python-lsp-server)</a></h3>
+<p>A community-maintained server with plugin support:</p>
+<pre><code class="language-bash">pip install python-lsp-server
+</code></pre>
+<pre><code class="language-toml">[server.python]
+command = "pylsp"
+</code></pre>
+<h3 id="jedi-language-server"><a class="header" href="#jedi-language-server">Jedi Language Server</a></h3>
+<p>Lightweight, uses Jedi for completions:</p>
+<pre><code class="language-bash">pip install jedi-language-server
+</code></pre>
+<pre><code class="language-toml">[server.python]
+command = "jedi-language-server"
+</code></pre>
+<h2 id="links-6"><a class="header" href="#links-6">Links</a></h2>
+<ul>
+<li><a href="https://github.com/microsoft/pyright">Pyright</a></li>
+<li><a href="https://github.com/python-lsp/python-lsp-server">python-lsp-server</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="rust"><a class="header" href="#rust">Rust</a></h1>
+<h2 id="install-8"><a class="header" href="#install-8">Install</a></h2>
+<h3 id="macos-6"><a class="header" href="#macos-6">macOS</a></h3>
+<pre><code class="language-bash">rustup component add rust-analyzer
+</code></pre>
+<h3 id="linux-6"><a class="header" href="#linux-6">Linux</a></h3>
+<pre><code class="language-bash">rustup component add rust-analyzer
+</code></pre>
+<h3 id="windows-6"><a class="header" href="#windows-6">Windows</a></h3>
+<pre><code class="language-bash">rustup component add rust-analyzer
+</code></pre>
+<h2 id="config-7"><a class="header" href="#config-7">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.rust]
+command = "rust-analyzer"
+</code></pre>
+<h2 id="notes-7"><a class="header" href="#notes-7">Notes</a></h2>
+<ul>
+<li>rust-analyzer is the official Rust language server</li>
+<li>Installing via rustup ensures it stays in sync with your Rust toolchain</li>
+<li>First run on a project may take time to index (watch for “Indexing” status)</li>
+</ul>
+<h2 id="links-7"><a class="header" href="#links-7">Links</a></h2>
+<ul>
+<li><a href="https://rust-analyzer.github.io/">rust-analyzer</a></li>
+<li><a href="https://rust-analyzer.github.io/manual.html">rust-analyzer User Manual</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="shell-bash"><a class="header" href="#shell-bash">Shell (Bash)</a></h1>
+<h2 id="install-9"><a class="header" href="#install-9">Install</a></h2>
+<h3 id="macos-7"><a class="header" href="#macos-7">macOS</a></h3>
+<pre><code class="language-bash">npm install -g bash-language-server
+</code></pre>
+<h3 id="linux-7"><a class="header" href="#linux-7">Linux</a></h3>
+<pre><code class="language-bash">npm install -g bash-language-server
+</code></pre>
+<h3 id="windows-7"><a class="header" href="#windows-7">Windows</a></h3>
+<pre><code class="language-bash">npm install -g bash-language-server
+</code></pre>
+<h2 id="config-8"><a class="header" href="#config-8">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.shellscript]
+command = "bash-language-server"
+args = ["start"]
+</code></pre>
+<h2 id="notes-8"><a class="header" href="#notes-8">Notes</a></h2>
+<ul>
+<li>The language ID is <code>shellscript</code>, not <code>bash</code> or <code>sh</code></li>
+<li>Works with <code>.sh</code>, <code>.bash</code>, <code>.zsh</code> files</li>
+<li>Provides completions for commands, variables, and functions</li>
+<li>Integrates with <a href="https://www.shellcheck.net/">ShellCheck</a> for linting (install separately)</li>
+</ul>
+<h2 id="optional-shellcheck-integration"><a class="header" href="#optional-shellcheck-integration">Optional: ShellCheck Integration</a></h2>
+<p>For better diagnostics, install ShellCheck:</p>
+<pre><code class="language-bash"># macOS
+brew install shellcheck
+
+# Linux (Debian/Ubuntu)
+apt install shellcheck
+
+# Linux (Arch)
+pacman -S shellcheck
+</code></pre>
+<p>The language server will automatically use it if available.</p>
+<h2 id="links-8"><a class="header" href="#links-8">Links</a></h2>
+<ul>
+<li><a href="https://github.com/bash-lsp/bash-language-server">bash-language-server</a></li>
+<li><a href="https://www.shellcheck.net/">ShellCheck</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="termux--packaging"><a class="header" href="#termux--packaging">Termux &amp; Packaging</a></h1>
+<p>The <code>termux-language-server</code> provides advanced support for specialized shell scripts used in Termux, Arch Linux (PKGBUILD), Gentoo (ebuild), and Debian development.</p>
+<h2 id="install-10"><a class="header" href="#install-10">Install</a></h2>
+<h3 id="macos-8"><a class="header" href="#macos-8">macOS</a></h3>
+<pre><code class="language-bash">pip install termux-language-server
+</code></pre>
+<h3 id="linux-8"><a class="header" href="#linux-8">Linux</a></h3>
+<pre><code class="language-bash">pip install termux-language-server
+</code></pre>
+<h3 id="windows-8"><a class="header" href="#windows-8">Windows</a></h3>
+<pre><code class="language-bash">pip install termux-language-server
+</code></pre>
+<h2 id="config-9"><a class="header" href="#config-9">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.termux]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.pkgbuild]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.ebuild]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.eclass]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.makepkg]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.devscripts]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.mdd]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.subpackage]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.install]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server.gentoo-make-conf]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server."make.conf"]
+command = "termux-language-server"
+args = ["--stdio"]
+
+[server."color.map"]
+command = "termux-language-server"
+args = ["--stdio"]
+</code></pre>
+<h2 id="notes-9"><a class="header" href="#notes-9">Notes</a></h2>
+<ul>
+<li>This server is specifically designed for packaging and system-level shell scripts.</li>
+<li>It extends the features of <code>bash-language-server</code> for specialized formats.</li>
+<li>Supports file types like <code>PKGBUILD</code>, <code>build.sh</code>, <code>*.ebuild</code>, and <code>*.mdd</code>.</li>
+</ul>
+<h2 id="links-9"><a class="header" href="#links-9">Links</a></h2>
+<ul>
+<li><a href="https://github.com/termux/termux-language-server">termux-language-server GitHub</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="typescript"><a class="header" href="#typescript">TypeScript</a></h1>
+<h2 id="install-11"><a class="header" href="#install-11">Install</a></h2>
+<h3 id="macos-9"><a class="header" href="#macos-9">macOS</a></h3>
+<pre><code class="language-bash">npm install -g typescript typescript-language-server
+</code></pre>
+<h3 id="linux-9"><a class="header" href="#linux-9">Linux</a></h3>
+<pre><code class="language-bash">npm install -g typescript typescript-language-server
+</code></pre>
+<h3 id="windows-9"><a class="header" href="#windows-9">Windows</a></h3>
+<pre><code class="language-bash">npm install -g typescript typescript-language-server
+</code></pre>
+<h2 id="config-10"><a class="header" href="#config-10">Config</a></h2>
+<p>Add to <code>~/.config/catenary/config.toml</code>:</p>
+<pre><code class="language-toml">[server.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+</code></pre>
+<h2 id="notes-10"><a class="header" href="#notes-10">Notes</a></h2>
+<ul>
+<li>The same server handles both TypeScript and JavaScript (see <a href="#javascript">JavaScript</a>)</li>
+<li>Requires <code>typescript</code> as a peer dependency</li>
+<li>Works with <code>.ts</code>, <code>.tsx</code>, <code>.mts</code>, <code>.cts</code> files</li>
+<li>Reads your <code>tsconfig.json</code> for project settings</li>
+</ul>
+<h2 id="links-10"><a class="header" href="#links-10">Links</a></h2>
+<ul>
+<li><a href="https://github.com/typescript-language-server/typescript-language-server">typescript-language-server</a></li>
+<li><a href="https://www.typescriptlang.org/">TypeScript</a></li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="ai-agent-integration"><a class="header" href="#ai-agent-integration">AI Agent Integration</a></h1>
 <p>This guide helps AI coding assistants use Catenary effectively. The goal is to
