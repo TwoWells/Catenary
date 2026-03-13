@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5baba51a.js";
+            window.path_to_searchindex_js = "searchindex-1bf95c55.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a743189e.js"></script>
@@ -220,6 +220,9 @@ check.command = "clippy"
 command = "pyright-langserver"
 args = ["--stdio"]
 
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+
 [server.typescript]
 command = "typescript-language-server"
 args = ["--stdio"]
@@ -246,6 +249,29 @@ check.command = "clippy"
 cargo.features = "all"
 </code></pre>
 <p>Refer to your language server’s documentation for available options.</p>
+<h2 id="server-settings"><a class="header" href="#server-settings">Server Settings</a></h2>
+<p>Some language servers request configuration from the client via
+<code>workspace/configuration</code>. Use the <code>settings</code> table to provide these values.
+The TOML nesting mirrors the JSON object the server expects — Catenary matches
+the <code>section</code> path from each configuration request item and returns the
+corresponding subtree.</p>
+<pre><code class="language-toml">[server.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
+
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+</code></pre>
+<p>When pyright sends <code>workspace/configuration</code> with
+<code>{ "items": [{ "section": "python.analysis" }] }</code>, Catenary traverses
+<code>settings["python"]["analysis"]</code> and returns
+<code>{ "exclude": ["**/target", "**/node_modules"], "extraPaths": [] }</code>.</p>
+<p>Items with no matching path receive <code>{}</code> (the default behavior).</p>
+<p>Refer to your language server’s documentation for available settings.</p>
 <h2 id="language-ids"><a class="header" href="#language-ids">Language IDs</a></h2>
 <p>The <code>[server.&lt;language-id&gt;]</code> key must match the LSP language identifier. Catenary detects these based on file extension and some common filenames:</p>
 <div class="table-wrapper">
