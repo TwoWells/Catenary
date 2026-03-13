@@ -328,6 +328,7 @@ impl ClientManager {
             lang,
             self.broadcaster.clone(),
             self.message_log.clone(),
+            server_config.settings.clone(),
         )?;
 
         // Initialize
@@ -572,6 +573,7 @@ mod tests {
                 args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
                 min_severity: None,
+                settings: None,
             },
         );
         Config {
@@ -593,6 +595,7 @@ mod tests {
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 initialization_options: None,
                 min_severity: None,
+                settings: None,
             },
         );
         Config {
@@ -746,6 +749,50 @@ mod tests {
             !manager.active_clients().await.contains_key(MOCK_LANG_A),
             "mockls client should be removed after sync_roots (no workspace folder support)"
         );
+
+        Ok(())
+    }
+
+    /// mockls with `--send-configuration-request` sends a `workspace/configuration`
+    /// request with `section: "mockls"` during initialization. This test verifies
+    /// that configured settings are threaded through to the response handler.
+    #[tokio::test]
+    async fn test_configuration_returns_settings() -> Result<()> {
+        let bin = mockls_bin();
+        let mut server = HashMap::new();
+        server.insert(
+            MOCK_LANG_A.to_string(),
+            ServerConfig {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![
+                    MOCK_LANG_A.to_string(),
+                    "--send-configuration-request".to_string(),
+                ],
+                initialization_options: None,
+                min_severity: None,
+                settings: Some(serde_json::json!({"mockls": {"key": "value"}})),
+            },
+        );
+        let config = Config {
+            server,
+            idle_timeout: 300,
+            log_retention_days: 7,
+            icons: IconConfig::default(),
+            tui: crate::config::TuiConfig::default(),
+        };
+
+        let broadcaster = EventBroadcaster::noop();
+        let manager = ClientManager::new(
+            config,
+            vec![PathBuf::from("/tmp")],
+            broadcaster,
+            test_message_log(),
+        );
+
+        // get_client spawns + initializes; mockls sends workspace/configuration
+        // during init. If Catenary responds correctly, initialization succeeds.
+        let client = manager.get_client(MOCK_LANG_A).await?;
+        assert!(client.lock().await.is_alive());
 
         Ok(())
     }

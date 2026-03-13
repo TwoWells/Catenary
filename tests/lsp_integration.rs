@@ -29,6 +29,7 @@ async fn test_mockls_initialize() -> Result<()> {
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
+        None,
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -52,6 +53,7 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
+        None,
     )?;
 
     let result = client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -81,6 +83,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -119,6 +122,7 @@ async fn test_client_capabilities() -> Result<()> {
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
@@ -226,6 +230,7 @@ async fn test_content_modified_retry() -> Result<()> {
         MOCK_LANG_A,
         catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
+        None,
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;

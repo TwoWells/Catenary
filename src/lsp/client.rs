@@ -105,6 +105,7 @@ impl LspClient {
         language: &str,
         broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,
+        settings: Option<serde_json::Value>,
     ) -> Result<Self> {
         Self::spawn_inner(
             program,
@@ -113,6 +114,7 @@ impl LspClient {
             broadcaster,
             message_log,
             Stdio::inherit(),
+            settings,
         )
     }
 
@@ -135,6 +137,7 @@ impl LspClient {
             broadcaster,
             message_log,
             Stdio::null(),
+            None,
         )
     }
 
@@ -145,8 +148,13 @@ impl LspClient {
         broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,
         stderr: Stdio,
+        settings: Option<serde_json::Value>,
     ) -> Result<Self> {
-        let inbox = Arc::new(ServerInbox::new(language.to_string(), broadcaster));
+        let inbox = Arc::new(ServerInbox::new(
+            language.to_string(),
+            broadcaster,
+            settings,
+        ));
 
         // Broadcast initial state
         inbox.broadcaster.send(EventKind::ServerState {
@@ -293,6 +301,21 @@ impl LspClient {
 
         // Send initialized notification
         self.notify("initialized", json!({})).await?;
+
+        // Trigger configuration pull: servers that support the pull model
+        // (workspace/configuration) will request specific sections; servers
+        // using the legacy push model read settings directly from this
+        // notification.
+        let settings = self
+            .inbox
+            .settings()
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        self.notify(
+            "workspace/didChangeConfiguration",
+            json!({"settings": settings}),
+        )
+        .await?;
 
         // Mark as ready (server may later report progress if indexing)
         self.inbox

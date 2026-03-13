@@ -24,6 +24,9 @@ command = "rust-analyzer"
 command = "pyright-langserver"
 args = ["--stdio"]
 
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+
 [server.typescript]
 command = "typescript-language-server"
 args = ["--stdio"]

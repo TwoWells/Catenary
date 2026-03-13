@@ -51,6 +51,14 @@ pub struct ServerConfig {
     /// When absent, all severities are delivered.
     #[serde(default)]
     pub min_severity: Option<String>,
+
+    /// Server-specific settings returned in `workspace/configuration` responses.
+    ///
+    /// The TOML nesting mirrors the JSON object the server expects.
+    /// Catenary does not interpret these settings — it matches the
+    /// `section` path from configuration requests and returns the subtree.
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
 }
 
 /// Icon preset selecting a base set of icons.
