@@ -315,6 +315,7 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
         MOCK_LANG_A,
         broadcaster,
         message_log,
+        None,
     )
     .context("spawn LspClient")?;
 

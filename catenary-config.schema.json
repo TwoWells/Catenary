@@ -37,6 +37,11 @@
           "type": "object",
           "description": "Initialization options to pass to the LSP server during the 'initialize' request.",
           "additionalProperties": true
+        },
+        "settings": {
+          "type": "object",
+          "description": "Server-specific settings returned in workspace/configuration responses. The TOML nesting mirrors the JSON the server expects. Catenary matches the 'section' path from configuration requests and returns the subtree.",
+          "additionalProperties": true
         }
       }
     }

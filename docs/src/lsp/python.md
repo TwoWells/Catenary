@@ -38,6 +38,31 @@ command = "pyright-langserver"
 args = ["--stdio"]
 ```
 
+## Settings
+
+Pyright requests configuration via `workspace/configuration`. Use the `settings`
+table to provide Python interpreter paths, analysis exclusions, and other options:
+
+```toml
+[server.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
+
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+```
+
+Without these settings, pyright may fall back to scanning the entire workspace
+(including large directories like `target/` or `node_modules/`), which can
+cause extremely slow initialization.
+
+See the [Pyright configuration docs](https://github.com/microsoft/pyright/blob/main/docs/configuration.md)
+for the full list of available settings.
+
 ## Notes
 
 - Pyright provides type checking even for untyped code (infers types)

@@ -79,11 +79,18 @@ pub struct ServerInbox {
     // Identity / broadcast
     pub(crate) language: String,
     pub(crate) broadcaster: EventBroadcaster,
+
+    // Configuration
+    settings: Option<Value>,
 }
 
 impl ServerInbox {
     /// Creates a new `ServerInbox` with default state.
-    pub(crate) fn new(language: String, broadcaster: EventBroadcaster) -> Self {
+    pub(crate) fn new(
+        language: String,
+        broadcaster: EventBroadcaster,
+        settings: Option<Value>,
+    ) -> Self {
         Self {
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_generation: Arc::new(Mutex::new(HashMap::new())),
@@ -98,8 +105,32 @@ impl ServerInbox {
             has_sent_progress: Arc::new(AtomicBool::new(false)),
             language,
             broadcaster,
+            settings,
         }
     }
+
+    /// Returns the server settings, if configured.
+    pub(crate) const fn settings(&self) -> Option<&Value> {
+        self.settings.as_ref()
+    }
+}
+
+/// Resolves a `workspace/configuration` section path against settings.
+///
+/// Splits `section` on `.` and traverses the JSON object tree.
+/// Returns `{}` if settings are `None`, section is `None`, or the path
+/// doesn't match.
+fn resolve_section(settings: Option<&Value>, section: Option<&str>) -> Value {
+    let (Some(mut current), Some(section)) = (settings, section) else {
+        return Value::Object(serde_json::Map::new());
+    };
+    for key in section.split('.') {
+        match current.get(key) {
+            Some(child) => current = child,
+            None => return Value::Object(serde_json::Map::new()),
+        }
+    }
+    current.clone()
 }
 
 impl Inbox for ServerInbox {
@@ -209,12 +240,16 @@ impl Inbox for ServerInbox {
     fn on_request(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
         match method {
             "workspace/configuration" => {
-                let item_count = params
-                    .get("items")
-                    .and_then(|i| i.as_array())
-                    .map_or(1, Vec::len);
+                let items = params.get("items").and_then(Value::as_array);
+                let item_count = items.map_or(1, Vec::len);
                 let results: Vec<Value> = (0..item_count)
-                    .map(|_| Value::Object(serde_json::Map::new()))
+                    .map(|i| {
+                        let section = items
+                            .and_then(|arr| arr.get(i))
+                            .and_then(|item| item.get("section"))
+                            .and_then(Value::as_str);
+                        resolve_section(self.settings.as_ref(), section)
+                    })
                     .collect();
                 Ok(Value::Array(results))
             }
@@ -257,7 +292,85 @@ mod tests {
     use serde_json::json;
 
     fn test_inbox() -> ServerInbox {
-        ServerInbox::new("test".to_string(), crate::session::EventBroadcaster::noop())
+        ServerInbox::new(
+            "test".to_string(),
+            crate::session::EventBroadcaster::noop(),
+            None,
+        )
+    }
+
+    #[test]
+    fn resolve_section_traverses_dot_path() {
+        let settings = json!({
+            "python": {
+                "analysis": {
+                    "exclude": ["**/target"],
+                    "extraPaths": []
+                },
+                "pythonPath": "/usr/bin/python3"
+            }
+        });
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python.analysis")),
+            json!({"exclude": ["**/target"], "extraPaths": []})
+        );
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python.pythonPath")),
+            json!("/usr/bin/python3")
+        );
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python")),
+            json!({"analysis": {"exclude": ["**/target"], "extraPaths": []}, "pythonPath": "/usr/bin/python3"})
+        );
+    }
+
+    #[test]
+    fn resolve_section_missing_path_returns_empty_object() {
+        let settings = json!({"python": {"analysis": {}}});
+        assert_eq!(resolve_section(Some(&settings), Some("rust")), json!({}));
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python.nonexistent")),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn resolve_section_none_settings_returns_empty_object() {
+        assert_eq!(resolve_section(None, Some("python")), json!({}));
+    }
+
+    #[test]
+    fn resolve_section_none_section_returns_empty_object() {
+        let settings = json!({"python": {}});
+        assert_eq!(resolve_section(Some(&settings), None), json!({}));
+    }
+
+    #[test]
+    fn configuration_request_uses_settings() {
+        let inbox = ServerInbox::new(
+            "test".to_string(),
+            crate::session::EventBroadcaster::noop(),
+            Some(json!({"mockls": {"key": "value"}})),
+        );
+        let result = inbox
+            .on_request(
+                "workspace/configuration",
+                &json!({"items": [{"section": "mockls"}]}),
+            )
+            .expect("configuration request should succeed");
+        assert_eq!(result, json!([{"key": "value"}]));
+    }
+
+    #[test]
+    fn configuration_request_without_settings_returns_empty_objects() {
+        let inbox = test_inbox();
+        let result = inbox
+            .on_request(
+                "workspace/configuration",
+                &json!({"items": [{"section": "mockls"}, {"section": "other"}]}),
+            )
+            .expect("configuration request should succeed");
+        assert_eq!(result, json!([{}, {}]));
     }
 
     #[test]

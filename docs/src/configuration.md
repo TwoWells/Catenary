@@ -49,6 +49,9 @@ check.command = "clippy"
 command = "pyright-langserver"
 args = ["--stdio"]
 
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+
 [server.typescript]
 command = "typescript-language-server"
 args = ["--stdio"]
@@ -80,6 +83,36 @@ cargo.features = "all"
 ```
 
 Refer to your language server's documentation for available options.
+
+## Server Settings
+
+Some language servers request configuration from the client via
+`workspace/configuration`. Use the `settings` table to provide these values.
+The TOML nesting mirrors the JSON object the server expects — Catenary matches
+the `section` path from each configuration request item and returns the
+corresponding subtree.
+
+```toml
+[server.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
+
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+```
+
+When pyright sends `workspace/configuration` with
+`{ "items": [{ "section": "python.analysis" }] }`, Catenary traverses
+`settings["python"]["analysis"]` and returns
+`{ "exclude": ["**/target", "**/node_modules"], "extraPaths": [] }`.
+
+Items with no matching path receive `{}` (the default behavior).
+
+Refer to your language server's documentation for available settings.
 
 ## Language IDs
 
