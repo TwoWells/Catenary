@@ -262,9 +262,9 @@ mod platform {
         /// Opens a process handle with `PROCESS_QUERY_LIMITED_INFORMATION`.
         pub fn new(pid: u32) -> Option<Self> {
             // Safety: `OpenProcess` is called with a valid access flag.
-            // Returns 0 on failure (invalid PID).
+            // Returns null on failure (invalid PID).
             let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-            if handle == 0 {
+            if handle.is_null() {
                 return None;
             }
             Some(Self { handle })
@@ -286,6 +286,9 @@ mod platform {
         }
     }
 
+    // Safety: Windows HANDLEs are kernel objects that can be used from any thread.
+    unsafe impl Send for MonitorInner {}
+
     /// Sample a process via an existing handle.
     ///
     /// # Safety
@@ -293,12 +296,13 @@ mod platform {
     /// Caller must ensure `handle` is a valid process handle with
     /// `PROCESS_QUERY_LIMITED_INFORMATION` access.
     unsafe fn sample_handle(handle: HANDLE) -> Option<(u64, ProcessState)> {
-        let mut creation = std::mem::zeroed();
-        let mut exit = std::mem::zeroed();
-        let mut kernel = std::mem::zeroed();
-        let mut user = std::mem::zeroed();
+        let mut creation = unsafe { std::mem::zeroed() };
+        let mut exit = unsafe { std::mem::zeroed() };
+        let mut kernel = unsafe { std::mem::zeroed() };
+        let mut user = unsafe { std::mem::zeroed() };
 
-        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
         if ok == 0 {
             return None;
         }
@@ -310,7 +314,7 @@ mod platform {
         let total_centiseconds = (user_100ns + kernel_100ns) / 100_000;
 
         let mut exit_code: u32 = 0;
-        GetExitCodeProcess(handle, &mut exit_code);
+        unsafe { GetExitCodeProcess(handle, &mut exit_code) };
         #[allow(
             clippy::cast_sign_loss,
             reason = "STILL_ACTIVE is a well-known Windows constant"
@@ -332,7 +336,7 @@ mod platform {
         // properly closing the handle on all paths.
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle == 0 {
+            if handle.is_null() {
                 return None;
             }
             let result = sample_handle(handle);
