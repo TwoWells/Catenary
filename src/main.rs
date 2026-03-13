@@ -562,13 +562,27 @@ async fn run_server(args: Args) -> Result<()> {
     // Run in a blocking task since MCP server uses synchronous I/O
     let mcp_task = tokio::task::spawn_blocking(move || mcp_server.run());
 
-    // Wait for either the MCP task to finish or a termination signal
+    // Wait for either the MCP task to finish or a termination signal.
+    // On Unix, also catch SIGTERM so the host CLI killing us triggers
+    // graceful LSP shutdown instead of orphaning child processes.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     let mcp_result = tokio::select! {
         res = mcp_task => {
             res?
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal");
+            Ok(())
+        }
+        _ = async {
+            #[cfg(unix)]
+            { sigterm.recv().await }
+            #[cfg(not(unix))]
+            { std::future::pending::<Option<()>>().await }
+        } => {
+            info!("Received SIGTERM");
             Ok(())
         }
     };

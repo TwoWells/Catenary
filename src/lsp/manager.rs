@@ -6,6 +6,7 @@ use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -402,15 +403,28 @@ impl ClientManager {
     }
 
     /// Shuts down all active clients.
+    ///
+    /// Each server gets 5 seconds to respond to the graceful
+    /// `shutdown`/`exit` sequence. Servers that don't respond in time
+    /// are dropped, which triggers [`Connection::Drop`] to SIGKILL them.
     pub async fn shutdown_all(&self) {
         let mut clients = self.active_clients.lock().await;
         for (lang, client_mutex) in clients.drain() {
-            {
-                let mut client = client_mutex.lock().await;
-                if client.is_alive()
-                    && let Err(e) = client.shutdown().await
-                {
-                    warn!("Failed to shutdown LSP server for {}: {}", lang, e);
+            let mut client = client_mutex.lock().await;
+            if client.is_alive() {
+                let result = tokio::time::timeout(Duration::from_secs(5), client.shutdown()).await;
+                drop(client);
+                match result {
+                    Ok(Err(e)) => {
+                        warn!("Failed to shutdown LSP server for {}: {}", lang, e);
+                    }
+                    Err(_) => {
+                        warn!(
+                            "LSP server for {} did not respond to shutdown within 5s, killing",
+                            lang
+                        );
+                    }
+                    Ok(Ok(())) => {}
                 }
             }
         }
