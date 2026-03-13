@@ -394,9 +394,6 @@ impl<'a> PanelState<'a> {
 
 // ── Expansion helpers ───────────────────────────────────────────────────
 
-/// Maximum number of payload lines to show in detail expansion.
-const MAX_DETAIL_PAYLOAD_LINES: usize = 20;
-
 /// Generate styled detail lines for an expanded message.
 ///
 /// Returns an empty vec for messages with empty payloads.
@@ -423,16 +420,9 @@ pub fn detail_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'static>> {
         Span::styled("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", theme.muted),
     ]));
 
-    // Lines 3+: pretty-printed payload, capped
+    // Lines 3+: pretty-printed payload
     if let Ok(pretty) = serde_json::to_string_pretty(payload) {
-        for (i, line) in pretty.lines().enumerate() {
-            if i >= MAX_DETAIL_PAYLOAD_LINES {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled("...", theme.muted),
-                ]));
-                break;
-            }
+        for line in pretty.lines() {
             lines.push(Line::from(vec![
                 Span::raw(indent.to_string()),
                 Span::styled(line.to_string(), theme.muted),
