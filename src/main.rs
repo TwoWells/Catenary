@@ -318,7 +318,13 @@ async fn main() -> Result<()> {
             sidecars,
         }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
-            run_gc(&conn, older_than.as_deref(), dead, session.as_deref(), sidecars)
+            run_gc(
+                &conn,
+                older_than.as_deref(),
+                dead,
+                session.as_deref(),
+                sidecars,
+            )
         }
         Some(Command::Restore { file, list, id }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
@@ -1105,12 +1111,10 @@ fn run_gc(
 ) -> Result<()> {
     let mut total_events_deleted: usize = 0;
     let mut sessions_deleted: usize = 0;
-
     // --older-than: delete old events and filter history
     if let Some(duration_str) = older_than {
         let cutoff = parse_since(duration_str)?;
         let cutoff_str = cutoff.to_rfc3339();
-
         let events_removed =
             conn.execute("DELETE FROM events WHERE timestamp < ?1", [&cutoff_str])?;
         total_events_deleted += events_removed;
@@ -1121,15 +1125,14 @@ fn run_gc(
         )?;
 
         println!(
-            "Deleted {events_removed} event{} older than {duration_str}",
-            if events_removed == 1 { "" } else { "s" }
+            "Deleted {events_removed} event{}{} older than {duration_str}",
+            if events_removed == 1 { "" } else { "s" },
+            if filters_removed > 0 {
+                format!(", {filters_removed} filter history entries")
+            } else {
+                String::new()
+            },
         );
-        if filters_removed > 0 {
-            println!(
-                "Deleted {filters_removed} filter history entr{} older than {duration_str}",
-                if filters_removed == 1 { "y" } else { "ies" }
-            );
-        }
     }
 
     // --dead: detect crashed sessions, then delete all dead sessions
@@ -1205,14 +1208,14 @@ fn run_gc(
         );
     }
 
-    // --sidecars: remove all restore sidecar files (content-matched)
     if sidecars {
         gc_restore_sidecars(conn)?;
-    }
+    } // --sidecars
     // Snapshot cleanup (fixed 7-day retention, always runs)
     let snapshots_deleted = gc_expired_snapshots(conn)?;
 
-    if older_than.is_none() && !dead && session_id.is_none() && !sidecars && snapshots_deleted == 0 {
+    if older_than.is_none() && !dead && session_id.is_none() && !sidecars && snapshots_deleted == 0
+    {
         println!("Nothing to do. Use --older-than, --dead, --session, or --sidecars.");
     }
 
@@ -1244,9 +1247,8 @@ fn run_gc(
 ///
 /// Returns an error if the database query fails.
 fn gc_restore_sidecars(conn: &rusqlite::Connection) -> Result<usize> {
-    let mut stmt = conn.prepare(
-        "SELECT id, file_path, content FROM snapshots WHERE source = 'restore'",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, file_path, content FROM snapshots WHERE source = 'restore'")?;
     let rows: Vec<(i64, String, Vec<u8>)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
