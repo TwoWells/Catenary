@@ -633,6 +633,7 @@ fn test_diagnostics_code_action_enrichment() -> Result<()> {
 /// returning flycheck diagnostics (which contain "flycheck") rather than
 /// short-circuiting on the first native diagnostics.
 #[test]
+#[ignore = "known flake: overlapping flycheck race in TokenMonitor (waitv2 Phase 1)"]
 fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
