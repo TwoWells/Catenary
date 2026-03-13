@@ -15,6 +15,9 @@ use super::types::{
 };
 use crate::session::{Direction, EventBroadcaster, EventKind, MessageLog, Protocol};
 
+/// MCP protocol versions this server supports (newest first).
+const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
+
 /// Trait for handling MCP tool calls.
 pub trait ToolHandler: Send + Sync {
     /// Returns the list of available tools.
@@ -309,7 +312,20 @@ impl<H: ToolHandler> McpServer<H> {
         let client_version = params.client_info.version.as_deref().unwrap_or("unknown");
 
         info!("MCP client connecting: {} v{}", client_name, client_version);
-        info!("Protocol version: {}", params.protocol_version);
+        info!("Protocol version requested: {}", params.protocol_version);
+
+        // Negotiate protocol version per MCP spec: echo the requested
+        // version if we support it, otherwise respond with our latest.
+        let negotiated_version =
+            if SUPPORTED_MCP_VERSIONS.contains(&params.protocol_version.as_str()) {
+                params.protocol_version.clone()
+            } else {
+                info!(
+                    "Unsupported protocol version '{}', responding with {}",
+                    params.protocol_version, SUPPORTED_MCP_VERSIONS[0]
+                );
+                SUPPORTED_MCP_VERSIONS[0].to_string()
+            };
 
         // Store whether client supports roots
         self.client_has_roots = params.capabilities.roots.is_some();
@@ -324,10 +340,10 @@ impl<H: ToolHandler> McpServer<H> {
         }
 
         let result = InitializeResult {
-            protocol_version: params.protocol_version.clone(),
+            protocol_version: negotiated_version,
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
-                    list_changed: Some(true),
+                    list_changed: Some(false),
                 }),
             },
             server_info: ServerInfo {
@@ -338,11 +354,10 @@ impl<H: ToolHandler> McpServer<H> {
                 "Catenary provides LSP-backed code intelligence tools. \
                  Its search tools include all available LSP information \
                  and condense grep-equivalent results into a heatmap. \
-                 Use list_directory for directory browsing. Post-edit LSP \
-                 diagnostics are provided automatically via the notify hook. \
-                 When multiple edits target the same file in one response, \
-                 only the final diagnostics per file are authoritative — \
-                 ignore intermediate results."
+                 Post-edit LSP diagnostics are provided automatically via \
+                 the notify hook. When multiple edits target the same file \
+                 in one response, only the final diagnostics per file are \
+                 authoritative \u{2014} ignore intermediate results."
                     .to_string(),
             ),
         };
