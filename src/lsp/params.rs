@@ -90,6 +90,9 @@ pub fn initialize(
                 },
                 "codeAction": {
                     "dynamicRegistration": false
+                },
+                "diagnostic": {
+                    "dynamicRegistration": false
                 }
             },
             "workspace": {
@@ -264,6 +267,16 @@ pub fn supertypes(item: &Value) -> Value {
     json!({ "item": item })
 }
 
+// ── Diagnostics ─────────────────────────────────────────────────────
+
+/// Builds `DocumentDiagnosticParams`.
+#[must_use]
+pub fn text_document_diagnostic(uri: &str) -> Value {
+    json!({
+        "textDocument": { "uri": uri }
+    })
+}
+
 /// Builds `TypeHierarchySubtypesParams`.
 ///
 /// `item` is a pass-through `TypeHierarchyItem` from the prepare response.
@@ -333,6 +346,9 @@ mod tests {
                         "dynamicRegistration": false
                     },
                     "codeAction": {
+                        "dynamicRegistration": false
+                    },
+                    "diagnostic": {
                         "dynamicRegistration": false
                     }
                 },
@@ -585,6 +601,20 @@ mod tests {
         let ours = outgoing_calls(&item);
 
         assert_eq!(ours, json!({ "item": item }));
+    }
+
+    // ── Diagnostics ──────────────────────────────────────────────────
+
+    #[test]
+    fn text_document_diagnostic_golden() {
+        let ours = text_document_diagnostic("file:///foo.rs");
+
+        assert_eq!(
+            ours,
+            json!({
+                "textDocument": { "uri": "file:///foo.rs" }
+            })
+        );
     }
 
     // ── Type hierarchy ──────────────────────────────────────────────

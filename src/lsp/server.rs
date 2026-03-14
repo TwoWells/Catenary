@@ -24,7 +24,6 @@ pub struct LspServer {
     capabilities: Value,
 
     /// Whether the server advertises `diagnosticProvider` (pull model).
-    #[allow(dead_code, reason = "Phase 1a-02 will use for pull diagnostics")]
     pulls_diagnostics: bool,
 
     /// Set on first `textDocument/publishDiagnostics` notification.
@@ -57,7 +56,6 @@ impl LspServer {
     }
 
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
-    #[allow(dead_code, reason = "Phase 1a-02 will use for pull diagnostics")]
     pub const fn pulls_diagnostics(&self) -> bool {
         self.pulls_diagnostics
     }

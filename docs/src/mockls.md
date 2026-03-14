@@ -30,7 +30,8 @@ Flags are composable behavioral axes, not named presets.
 | `--indexing-delay <ms>` | 0 | Emit `window/workDoneProgress/create` + `$/progress` begin/end after `initialized` |
 | `--response-delay <ms>` | 0 | Sleep before every response |
 | `--diagnostics-delay <ms>` | 0 | Delay before publishing diagnostics |
-| `--no-diagnostics` | off | Never publish diagnostics |
+| `--no-push-diagnostics` | off | Never publish push diagnostics (`textDocument/publishDiagnostics`) |
+| `--pull-diagnostics` | off | Advertise `diagnosticProvider` and handle `textDocument/diagnostic` requests |
 | `--diagnostics-on-save` | off | Only publish diagnostics on `didSave`, not `didOpen`/`didChange` |
 | `--drop-after <n>` | none | Close stdout after n responses (simulate crash) |
 | `--hang-on <method>` | none | Never respond to this method (repeatable) |
@@ -105,7 +106,7 @@ The flags document exactly what behavior each test targets.
 | `initialized` | Starts indexing simulation if `--indexing-delay` is set |
 | `textDocument/didOpen` | Stores content, publishes diagnostics (unless suppressed) |
 | `textDocument/didChange` | Updates content, republishes diagnostics (unless suppressed) |
-| `textDocument/didSave` | Publishes diagnostics (unless `--no-diagnostics`) |
+| `textDocument/didSave` | Publishes diagnostics (unless `--no-push-diagnostics`) |
 | `textDocument/didClose` | Removes document from store |
 | `workspace/didChangeWorkspaceFolders` | Accepted silently |
 | `exit` | Exits the process |
@@ -127,7 +128,7 @@ mockls never publishes diagnostics spontaneously at startup — only in response
 |---|---|---|---|
 | Default | publishes | publishes | publishes |
 | `--diagnostics-on-save` | no | no | publishes |
-| `--no-diagnostics` | no | no | no |
+| `--no-push-diagnostics` | no | no | no |
 | `--diagnostics-delay <ms>` | publishes after delay | publishes after delay | publishes after delay |
 | `--publish-version` | version field included | version field included | version field included |
 | `--progress-on-change` | no | progress + publishes | no |
@@ -137,7 +138,7 @@ These map to specific code paths in Catenary's `wait_for_diagnostics_update`:
 
 - **Default:** Server publishes promptly on `didOpen`, exercises Phase 1 generation advance via the `ProcessMonitor` strategy (no progress tokens, no version).
 - **`--diagnostics-on-save`:** Server ignores `didOpen`/`didChange`. Catenary sends `didSave` unconditionally after every change, which triggers mockls to publish.
-- **`--no-diagnostics`:** Exercises the "never published" grace period timeout path. Catenary handles servers that never emit diagnostics without hanging.
+- **`--no-push-diagnostics`:** Exercises the "never published" grace period timeout path. Catenary handles servers that never emit push diagnostics without hanging.
 - **`--diagnostics-delay`:** Diagnostics arrive late, exercises Phase 1 activity tracking.
 - **`--publish-version`:** Exercises the `Version` strategy — Catenary waits for `publishDiagnostics` with a version field, matching generation advance.
 - **`--progress-on-change`:** Exercises the `TokenMonitor` strategy — Catenary waits for `$/progress` Active -> Idle cycle around diagnostic computation.

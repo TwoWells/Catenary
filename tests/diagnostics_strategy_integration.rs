@@ -571,6 +571,31 @@ fn test_diagnostics_refactor_filtered() -> Result<()> {
     Ok(())
 }
 
+/// mockls with `--pull-diagnostics --no-push-diagnostics`: server advertises
+/// pull diagnostics but never pushes. Verifies that Catenary uses the pull
+/// path to retrieve diagnostics instead of returning `[diagnostics unavailable]`.
+#[test]
+fn test_diagnostics_pull_only() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = BridgeProcess::spawn(
+        &["--pull-diagnostics", "--no-push-diagnostics"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("mock diagnostic"),
+        "Pull-only server should return diagnostics via pull path. Got: {text}"
+    );
+
+    Ok(())
+}
+
 /// Scans the sessions directory for a `notify.sock` file.
 fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
     // Poll briefly for the socket to appear (bridge may still be starting)
@@ -682,7 +707,7 @@ fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
     std::fs::write(&file, "echo hello\n")?;
 
     let mut bridge = BridgeProcess::spawn(
-        &["--progress-on-change", "--no-diagnostics"],
+        &["--progress-on-change", "--no-push-diagnostics"],
         dir.path().to_str().context("path")?,
     )?;
     bridge.initialize()?;

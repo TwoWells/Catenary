@@ -130,8 +130,11 @@ impl DiagnosticsServer {
 
             drop(doc_manager);
 
-            if client.wait_for_diagnostics_update(&uri, snapshot).await
-                == DiagnosticsWaitResult::Nothing
+            let pulls = client.pulls_diagnostics();
+
+            if !pulls
+                && client.wait_for_diagnostics_update(&uri, snapshot).await
+                    == DiagnosticsWaitResult::Nothing
             {
                 client.set_parent_id(None);
                 return Ok(DiagnosticsResult {
@@ -143,7 +146,18 @@ impl DiagnosticsServer {
             drop(doc_manager);
         }
 
-        let diagnostics = client.get_diagnostics(&uri);
+        // Pull path: if the server advertises diagnosticProvider, pull
+        // diagnostics directly instead of reading the push cache.
+        let pulls = client.pulls_diagnostics();
+
+        let diagnostics = if pulls {
+            client
+                .pull_diagnostics(&uri)
+                .await
+                .unwrap_or_else(|_| client.get_diagnostics(&uri))
+        } else {
+            client.get_diagnostics(&uri)
+        };
 
         // Extract filter context before dropping the client lock
         let server_command = client.server_command().to_string();

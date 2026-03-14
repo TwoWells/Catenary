@@ -566,6 +566,13 @@ impl LspClient {
         super::extract::workspace_symbol_resolve_provider(self.capabilities())
     }
 
+    /// Returns whether the server advertises `diagnosticProvider` (pull model).
+    pub fn pulls_diagnostics(&self) -> bool {
+        self.lsp_server
+            .as_ref()
+            .is_some_and(|s| s.pulls_diagnostics())
+    }
+
     /// Returns whether the server advertises `typeHierarchyProvider`.
     pub fn supports_type_hierarchy(&self) -> bool {
         super::extract::has_type_hierarchy_provider(self.capabilities())
@@ -676,6 +683,24 @@ impl LspClient {
             }
         });
         self.request("textDocument/codeAction", params).await
+    }
+
+    /// Pulls diagnostics from the server via `textDocument/diagnostic`.
+    ///
+    /// Returns the diagnostics array from the response, or an empty
+    /// vec on error/timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out.
+    pub async fn pull_diagnostics(&self, uri: &str) -> Result<Vec<Value>> {
+        let result = self
+            .request(
+                "textDocument/diagnostic",
+                params::text_document_diagnostic(uri),
+            )
+            .await?;
+        Ok(super::extract::document_diagnostic_report(&result))
     }
 
     /// Gets cached diagnostics for a specific URI.

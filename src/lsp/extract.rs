@@ -147,6 +147,24 @@ pub fn progress_token(params: &Value) -> Option<&Value> {
     params.get("token")
 }
 
+// ── DocumentDiagnosticReport (pull diagnostics response) ────────────
+
+/// Extracts diagnostics from a `DocumentDiagnosticReport`.
+///
+/// Returns the `items` array for a "full" report, or an empty
+/// `Vec` for "unchanged" or unrecognized responses.
+#[must_use]
+pub fn document_diagnostic_report(result: &Value) -> Vec<Value> {
+    match result.get("kind").and_then(Value::as_str) {
+        Some("full") => result
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 // ── Individual diagnostic fields ────────────────────────────────────
 
 /// Extracts the severity from a diagnostic (1=Error, 2=Warning, 3=Info, 4=Hint).
@@ -559,6 +577,54 @@ mod tests {
     #[test]
     fn progress_token_missing() {
         assert!(progress_token(&json!({})).is_none());
+    }
+
+    // ── DocumentDiagnosticReport extractors ──────────────────────────
+
+    #[test]
+    fn document_diagnostic_report_full() {
+        let result = json!({
+            "kind": "full",
+            "items": [{
+                "message": "unused variable",
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                }
+            }]
+        });
+        let diags = document_diagnostic_report(&result);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].get("message").and_then(Value::as_str),
+            Some("unused variable")
+        );
+    }
+
+    #[test]
+    fn document_diagnostic_report_unchanged() {
+        let result = json!({
+            "kind": "unchanged",
+            "resultId": "abc123"
+        });
+        assert!(document_diagnostic_report(&result).is_empty());
+    }
+
+    #[test]
+    fn document_diagnostic_report_empty_items() {
+        let result = json!({
+            "kind": "full",
+            "items": []
+        });
+        assert!(document_diagnostic_report(&result).is_empty());
+    }
+
+    #[test]
+    fn document_diagnostic_report_missing_kind() {
+        let result = json!({
+            "items": [{ "message": "err" }]
+        });
+        assert!(document_diagnostic_report(&result).is_empty());
     }
 
     // ── Diagnostic extractors ───────────────────────────────────────

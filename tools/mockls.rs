@@ -50,9 +50,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     diagnostics_delay: u64,
 
-    /// Never publish diagnostics.
+    /// Never publish push diagnostics (`textDocument/publishDiagnostics`).
     #[arg(long)]
-    no_diagnostics: bool,
+    no_push_diagnostics: bool,
+
+    /// Advertise `diagnosticProvider` and handle `textDocument/diagnostic`
+    /// pull requests.
+    #[arg(long)]
+    pull_diagnostics: bool,
 
     /// Only publish diagnostics on `didSave`, not `didOpen`/`didChange`.
     #[arg(long)]
@@ -450,6 +455,7 @@ impl MockServer {
                 self.handle_type_hierarchy_prepare(&request.params)
             }
             "typeHierarchy/subtypes" => self.handle_type_hierarchy_subtypes(&request.params),
+            "textDocument/diagnostic" => Some(self.handle_pull_diagnostics(&request.params)),
             "textDocument/codeAction" => Some(self.handle_code_action(&request.params)),
             "textDocument/prepareRename" => self.handle_prepare_rename(&request.params),
             "callHierarchy/outgoingCalls" | "typeHierarchy/supertypes" => {
@@ -523,7 +529,7 @@ impl MockServer {
                     self.rebuild_types();
                     self.rebuild_imports();
 
-                    if !self.args.no_diagnostics && !self.args.diagnostics_on_save {
+                    if !self.args.no_push_diagnostics && !self.args.diagnostics_on_save {
                         self.publish_diagnostics(uri);
                     }
                 }
@@ -559,7 +565,7 @@ impl MockServer {
 
                     if self.args.progress_on_change {
                         self.simulate_progress_around_diagnostics(uri);
-                    } else if !self.args.no_diagnostics && !self.args.diagnostics_on_save {
+                    } else if !self.args.no_push_diagnostics && !self.args.diagnostics_on_save {
                         self.publish_diagnostics(uri);
                     }
                 }
@@ -569,7 +575,7 @@ impl MockServer {
                     let uri = td.get("uri").and_then(Value::as_str).unwrap_or_default();
                     if let Some(ref cmd) = self.args.flycheck_command {
                         self.run_flycheck(uri, cmd);
-                    } else if !self.args.no_diagnostics {
+                    } else if !self.args.no_push_diagnostics {
                         self.publish_diagnostics(uri);
                     }
                 }
@@ -686,6 +692,13 @@ impl MockServer {
 
         if !self.args.no_code_actions {
             capabilities["codeActionProvider"] = serde_json::json!(true);
+        }
+
+        if self.args.pull_diagnostics {
+            capabilities["diagnosticProvider"] = serde_json::json!({
+                "interFileDependencies": false,
+                "workspaceDiagnostics": false
+            });
         }
 
         if self.args.workspace_folders {
@@ -1075,6 +1088,36 @@ impl MockServer {
         Some(Value::Array(subtypes))
     }
 
+    fn handle_pull_diagnostics(&self, params: &Value) -> Value {
+        if !self.args.pull_diagnostics {
+            return serde_json::json!({
+                "kind": "full",
+                "items": []
+            });
+        }
+
+        let uri = params
+            .get("textDocument")
+            .and_then(|td| td.get("uri"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
+
+        serde_json::json!({
+            "kind": "full",
+            "items": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "severity": 2,
+                "source": "mockls",
+                "message": format!("mockls: mock diagnostic ({line_count} lines)")
+            }]
+        })
+    }
+
     fn handle_code_action(&self, params: &Value) -> Value {
         if self.args.no_code_actions {
             return Value::Array(Vec::new());
@@ -1280,7 +1323,7 @@ impl MockServer {
         let uri_owned = uri.to_string();
         let writer = self.writer.clone();
         let next_id = self.next_request_id.clone();
-        let no_diagnostics = self.args.no_diagnostics;
+        let no_diagnostics = self.args.no_push_diagnostics;
         let publish_version = self.args.publish_version;
         let diagnostics_delay = self.args.diagnostics_delay;
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
@@ -1352,7 +1395,7 @@ impl MockServer {
         let command_owned = command.to_string();
         let writer = self.writer.clone();
         let next_id = self.next_request_id.clone();
-        let no_diagnostics = self.args.no_diagnostics;
+        let no_diagnostics = self.args.no_push_diagnostics;
         let publish_version = self.args.publish_version;
         let flycheck_ticks = self.args.flycheck_ticks;
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
@@ -1825,7 +1868,8 @@ mod tests {
             indexing_delay: 0,
             response_delay: 0,
             diagnostics_delay: 0,
-            no_diagnostics: false,
+            no_push_diagnostics: false,
+            pull_diagnostics: false,
             diagnostics_on_save: false,
             drop_after: None,
             hang_on: vec![],
