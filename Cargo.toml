@@ -34,8 +34,8 @@ required-features = ["mockls"]
 mockls = []
 
 [dependencies]
-catenary-proc = { path = "crates/catenary-proc" }
-catenary-ts = { path = "crates/catenary-ts" }
+catenary-proc = { path = "crates/catenary-proc", version = "0.1.0" }
+catenary-ts = { path = "crates/catenary-ts", version = "0.1.0" }
 anyhow = "1.0.100"
 bytes = "1.10"
 cc = "1"
