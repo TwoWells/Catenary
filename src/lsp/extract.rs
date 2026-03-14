@@ -20,9 +20,7 @@ fn as_u32(v: &Value) -> Option<u32> {
 // ── Server capabilities (from InitializeResult.capabilities) ────────
 
 /// Returns whether the server advertises `diagnosticProvider` (pull model).
-// Wired up by Phase 1 (PullProvider detection)
 #[must_use]
-#[allow(dead_code, reason = "Phase 1 — PullProvider detection at init")]
 pub fn has_diagnostic_provider(caps: &Value) -> bool {
     caps.get("diagnosticProvider").is_some_and(|v| !v.is_null())
 }

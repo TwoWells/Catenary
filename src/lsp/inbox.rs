@@ -6,13 +6,14 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
 
 use super::client::DiagnosticsCache;
 use super::extract;
 use super::protocol::RpcError;
+use super::server::LspServer;
 use super::state::{ProgressTracker, ServerState};
 use crate::session::{EventBroadcaster, EventKind};
 
@@ -72,9 +73,10 @@ pub struct ServerInbox {
     pub(crate) state_notify: Arc<Notify>,
 
     // Observation flags
-    pub(crate) has_published_diagnostics: Arc<AtomicBool>,
     pub(crate) publishes_version: Arc<AtomicBool>,
-    pub(crate) has_sent_progress: Arc<AtomicBool>,
+
+    // Server profile (set after initialize completes)
+    lsp_server: OnceLock<Arc<LspServer>>,
 
     // Identity / broadcast
     pub(crate) language: String,
@@ -100,9 +102,8 @@ impl ServerInbox {
             progress_notify: Arc::new(Notify::new()),
             state: Arc::new(AtomicU8::new(ServerState::Initializing.as_u8())),
             state_notify: Arc::new(Notify::new()),
-            has_published_diagnostics: Arc::new(AtomicBool::new(false)),
             publishes_version: Arc::new(AtomicBool::new(false)),
-            has_sent_progress: Arc::new(AtomicBool::new(false)),
+            lsp_server: OnceLock::new(),
             language,
             broadcaster,
             settings,
@@ -112,6 +113,20 @@ impl ServerInbox {
     /// Returns the server settings, if configured.
     pub(crate) const fn settings(&self) -> Option<&Value> {
         self.settings.as_ref()
+    }
+
+    /// Sets the server profile after the `initialize` handshake completes.
+    ///
+    /// Called once from `LspClient::initialize()`. Subsequent calls are
+    /// no-ops (the `OnceLock` ignores them).
+    pub(crate) fn set_lsp_server(&self, server: Arc<LspServer>) {
+        let _ = self.lsp_server.set(server);
+    }
+
+    /// Returns the server profile, if available.
+    #[allow(dead_code, reason = "Phase 1a-02 will use for pull diagnostics")]
+    pub(crate) fn lsp_server(&self) -> Option<&Arc<LspServer>> {
+        self.lsp_server.get()
     }
 }
 
@@ -134,6 +149,7 @@ fn resolve_section(settings: Option<&Value>, section: Option<&str>) -> Value {
 }
 
 impl Inbox for ServerInbox {
+    #[allow(clippy::too_many_lines, reason = "match dispatcher with per-arm logic")]
     fn on_notification(&self, method: &str, params: &Value) {
         match method {
             "textDocument/publishDiagnostics" => {
@@ -150,7 +166,9 @@ impl Inbox for ServerInbox {
                     uri,
                     version,
                 );
-                self.has_published_diagnostics.store(true, Ordering::SeqCst);
+                if let Some(server) = self.lsp_server.get() {
+                    server.on_publish_diagnostics();
+                }
 
                 // Track whether server provides version in diagnostics
                 if version.is_some() && !self.publishes_version.swap(true, Ordering::SeqCst) {
@@ -183,15 +201,27 @@ impl Inbox for ServerInbox {
                     .as_str()
                     .map_or_else(|| token_value.to_string(), str::to_string);
 
-                if !self.has_sent_progress.swap(true, Ordering::SeqCst) {
-                    self.capability_notify.notify_waiters();
-                }
-
                 let mut tracker = self
                     .progress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 tracker.update(&token_str, &params["value"]);
+
+                // Update server profile based on progress kind
+                if let Some(server) = self.lsp_server.get() {
+                    let kind = params["value"]["kind"].as_str();
+                    match kind {
+                        Some("begin") => {
+                            if server.on_progress_begin() {
+                                self.capability_notify.notify_waiters();
+                            }
+                        }
+                        Some("end") => {
+                            server.on_progress_end();
+                        }
+                        _ => {}
+                    }
+                }
 
                 // Update state based on progress.
                 // The Dead guard is the only exclusion — Stuck servers
@@ -397,5 +427,78 @@ mod tests {
             }),
         );
         assert!(!inbox.is_progress_active());
+    }
+
+    /// Helper that creates a test inbox with an `LspServer` profile attached.
+    fn test_inbox_with_server() -> ServerInbox {
+        let inbox = test_inbox();
+        let server = Arc::new(LspServer::new(json!({})));
+        inbox.set_lsp_server(server);
+        inbox
+    }
+
+    #[test]
+    fn publish_diagnostics_sets_pushes_diagnostics() {
+        let inbox = test_inbox_with_server();
+        let server = inbox.lsp_server().expect("server should be set");
+        assert!(!server.pushes_diagnostics());
+
+        inbox.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": "file:///test.rs",
+                "diagnostics": []
+            }),
+        );
+        assert!(server.pushes_diagnostics());
+    }
+
+    #[test]
+    fn progress_begin_end_updates_server_profile() {
+        let inbox = test_inbox_with_server();
+        let server = inbox.lsp_server().expect("server should be set");
+        assert!(!server.sends_progress());
+        assert_eq!(server.in_progress_count(), 0);
+
+        // Begin
+        inbox.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-1",
+                "value": { "kind": "begin", "title": "Checking", "percentage": 0 }
+            }),
+        );
+        assert!(server.sends_progress());
+        assert_eq!(server.in_progress_count(), 1);
+
+        // Second begin (overlapping token)
+        inbox.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-2",
+                "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
+            }),
+        );
+        assert_eq!(server.in_progress_count(), 2);
+
+        // End first
+        inbox.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-1",
+                "value": { "kind": "end" }
+            }),
+        );
+        assert_eq!(server.in_progress_count(), 1);
+
+        // End second
+        inbox.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-2",
+                "value": { "kind": "end" }
+            }),
+        );
+        assert_eq!(server.in_progress_count(), 0);
     }
 }

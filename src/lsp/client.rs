@@ -15,6 +15,7 @@ use tracing::{debug, info};
 use super::connection::Connection;
 use super::inbox::{Inbox, ServerInbox};
 use super::params;
+use super::server::LspServer;
 use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
 use crate::session::{EventBroadcaster, EventKind, MessageLog};
@@ -84,9 +85,9 @@ pub struct LspClient {
     /// Populated after `initialize()` completes; `None` if the server
     /// did not report a version.
     server_version: Option<String>,
-    /// Server capabilities from the `initialize` response.
-    /// Populated after `initialize()` completes.
-    server_capabilities: Value,
+    /// Server profile constructed during `initialize()`.
+    /// `None` before `initialize()` completes.
+    lsp_server: Option<Arc<LspServer>>,
     /// Parent message ID for causation tracking (set before tool dispatch).
     parent_id: Option<i64>,
 }
@@ -183,7 +184,7 @@ impl LspClient {
             wants_did_save: false,
             server_command: program.to_string(),
             server_version: None,
-            server_capabilities: Value::Object(serde_json::Map::default()),
+            lsp_server: None,
             parent_id: None,
         })
     }
@@ -295,9 +296,11 @@ impl LspClient {
             self.inbox.language, self.wants_did_save
         );
 
-        // Store server info and capabilities
+        // Store server info and construct server profile
         self.server_version = super::extract::server_version(&raw).map(str::to_string);
-        self.server_capabilities = caps;
+        let server = Arc::new(LspServer::new(caps));
+        self.inbox.set_lsp_server(Arc::clone(&server));
+        self.lsp_server = Some(server);
 
         // Send initialized notification
         self.notify("initialized", json!({})).await?;
@@ -331,8 +334,14 @@ impl LspClient {
     }
 
     /// Returns the server capabilities from the `initialize` response.
-    pub const fn capabilities(&self) -> &Value {
-        &self.server_capabilities
+    ///
+    /// Returns an empty object before `initialize()` completes.
+    pub fn capabilities(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        self.lsp_server.as_ref().map_or_else(
+            || EMPTY.get_or_init(|| Value::Object(serde_json::Map::new())),
+            |s| s.capabilities(),
+        )
     }
 
     /// Sends shutdown request and exit notification.
@@ -554,12 +563,12 @@ impl LspClient {
 
     /// Returns whether the server advertises `workspaceSymbol/resolve` support.
     pub fn supports_workspace_symbol_resolve(&self) -> bool {
-        super::extract::workspace_symbol_resolve_provider(&self.server_capabilities)
+        super::extract::workspace_symbol_resolve_provider(self.capabilities())
     }
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
     pub fn supports_type_hierarchy(&self) -> bool {
-        super::extract::has_type_hierarchy_provider(&self.server_capabilities)
+        super::extract::has_type_hierarchy_provider(self.capabilities())
     }
 
     /// Prepares call hierarchy for a position.
@@ -743,7 +752,8 @@ impl LspClient {
     pub(crate) fn diagnostics_strategy(&self) -> Option<super::diagnostics::DiagnosticsStrategy> {
         use super::diagnostics::DiagnosticsStrategy;
 
-        if self.inbox.has_sent_progress.load(Ordering::SeqCst) {
+        let sends_progress = self.lsp_server.as_ref().is_some_and(|s| s.sends_progress());
+        if sends_progress {
             Some(DiagnosticsStrategy::TokenMonitor)
         } else if self.inbox.publishes_version.load(Ordering::SeqCst) {
             Some(DiagnosticsStrategy::Version)
@@ -762,9 +772,8 @@ impl LspClient {
     /// intelligence but do not get `didSave` and are not waited on for
     /// diagnostics.
     pub fn supports_diagnostics_wait(&self) -> bool {
-        if self.inbox.publishes_version.load(Ordering::SeqCst)
-            || self.inbox.has_sent_progress.load(Ordering::SeqCst)
-        {
+        let sends_progress = self.lsp_server.as_ref().is_some_and(|s| s.sends_progress());
+        if self.inbox.publishes_version.load(Ordering::SeqCst) || sends_progress {
             return true;
         }
         // Log once when we determine the server lacks support (after warmup)
@@ -823,7 +832,11 @@ impl LspClient {
         // ── Grace period ─────────────────────────────────────────────
         // For servers that haven't published diagnostics yet, wait for
         // the first publishDiagnostics using load-aware failure detection.
-        if !self.inbox.has_published_diagnostics.load(Ordering::SeqCst) {
+        let pushes_diagnostics = self
+            .lsp_server
+            .as_ref()
+            .is_some_and(|s| s.pushes_diagnostics());
+        if !pushes_diagnostics {
             let grace_ok = load_aware_grace(
                 &mut || self.sample_monitor(),
                 PREAMBLE_THRESHOLD,
@@ -863,9 +876,9 @@ impl LspClient {
             }
         };
         debug!(
-            "Diagnostics strategy: {:?} (has_progress={}, publishes_version={})",
+            "Diagnostics strategy: {:?} (sends_progress={}, publishes_version={})",
             strategy,
-            self.inbox.has_sent_progress.load(Ordering::SeqCst),
+            self.lsp_server.as_ref().is_some_and(|s| s.sends_progress()),
             self.inbox.publishes_version.load(Ordering::SeqCst),
         );
 

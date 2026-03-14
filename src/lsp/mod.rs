@@ -17,6 +17,8 @@ pub mod manager;
 pub(crate) mod params;
 /// LSP message protocol definitions.
 pub mod protocol;
+/// Server profile: init-time capabilities and runtime observations.
+pub(crate) mod server;
 /// Server state and progress tracking.
 pub mod state;
 /// Small local types for LSP concepts.
