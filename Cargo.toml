@@ -61,6 +61,7 @@ similar = "2.6"
 tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = "0.7"
 tree-sitter = "0.24"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }

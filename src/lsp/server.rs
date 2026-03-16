@@ -39,6 +39,7 @@ pub struct LspServer {
 impl LspServer {
     /// Creates a new server profile from the capabilities extracted during
     /// the `initialize` handshake.
+    #[must_use]
     pub fn new(capabilities: Value) -> Self {
         let pulls_diagnostics = extract::has_diagnostic_provider(&capabilities);
         Self {
@@ -71,7 +72,6 @@ impl LspServer {
     }
 
     /// Returns the number of in-flight progress tokens.
-    #[allow(dead_code, reason = "Phase 1b will use for settle logic")]
     pub fn in_progress_count(&self) -> u32 {
         self.in_progress_count.load(Ordering::SeqCst)
     }

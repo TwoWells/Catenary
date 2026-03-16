@@ -19,6 +19,8 @@ pub(crate) mod params;
 pub mod protocol;
 /// Server profile: init-time capabilities and runtime observations.
 pub(crate) mod server;
+/// Settle sampling loop: polls process tree and yields per-process samples.
+pub mod settle;
 /// Server state and progress tracking.
 pub mod state;
 /// Small local types for LSP concepts.
@@ -29,4 +31,5 @@ pub(crate) mod wait;
 pub use client::DiagnosticsWaitResult;
 pub use client::{LspClient, WARMUP_PERIOD};
 pub use manager::{ClientManager, detect_workspace_languages};
+pub use server::LspServer;
 pub use state::{ProgressTracker, ServerState, ServerStatus};
