@@ -190,15 +190,16 @@ impl Connection {
                         }
                         () = tokio::time::sleep(POLL_INTERVAL) => {
                             // Failure detection
-                            if let Some((delta, state)) = self.sample_monitor() {
-                                if state == catenary_proc::ProcessState::Dead {
+                            if let Some(d) = self.sample_monitor() {
+                                if d.state == catenary_proc::ProcessState::Dead {
                                     self.pending.lock().await.remove(&id);
                                     break Err(anyhow!(
                                         "[{}] server died during '{method}'",
                                         self.language
                                     ));
                                 }
-                                if state == catenary_proc::ProcessState::Running
+                                let delta = d.delta_utime + d.delta_stime;
+                                if d.state == catenary_proc::ProcessState::Running
                                     && delta > 0
                                     && !self.inbox.is_progress_active()
                                 {
@@ -301,9 +302,10 @@ impl Connection {
 
     /// Sample the process monitor for CPU-tick failure detection.
     ///
-    /// Returns `(delta, state)` where delta is ticks since the last sample.
-    /// Returns `None` if the process is gone or monitoring is unavailable.
-    pub fn sample_monitor(&self) -> Option<(u64, catenary_proc::ProcessState)> {
+    /// Returns [`ProcessDelta`](catenary_proc::ProcessDelta) with per-counter
+    /// deltas since the last sample. Returns `None` if the process is gone
+    /// or monitoring is unavailable.
+    pub fn sample_monitor(&self) -> Option<catenary_proc::ProcessDelta> {
         self.monitor.lock().ok()?.as_mut()?.sample()
     }
 

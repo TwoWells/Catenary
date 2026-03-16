@@ -191,9 +191,10 @@ impl LspClient {
 
     /// Samples the server process via the persistent `ProcessMonitor`.
     ///
-    /// Returns `(delta, state)` where delta is ticks since the last sample.
-    /// Returns `None` if the process is gone or monitoring is unavailable.
-    fn sample_monitor(&self) -> Option<(u64, catenary_proc::ProcessState)> {
+    /// Returns [`ProcessDelta`](catenary_proc::ProcessDelta) with per-counter
+    /// deltas since the last sample. Returns `None` if the process is gone
+    /// or monitoring is unavailable.
+    fn sample_monitor(&self) -> Option<catenary_proc::ProcessDelta> {
         self.connection.sample_monitor()
     }
 
@@ -931,11 +932,12 @@ impl LspClient {
                     }
 
                     // Failure detection
-                    if let Some((delta, state)) = self.sample_monitor() {
-                        if state == catenary_proc::ProcessState::Dead {
+                    if let Some(d) = self.sample_monitor() {
+                        if d.state == catenary_proc::ProcessState::Dead {
                             return DiagnosticsWaitResult::Nothing;
                         }
-                        if state == catenary_proc::ProcessState::Running
+                        let delta = d.delta_utime + d.delta_stime;
+                        if d.state == catenary_proc::ProcessState::Running
                             && delta > 0
                             && !self.progress_active()
                         {
@@ -1020,11 +1022,12 @@ impl LspClient {
                     }
 
                     // Failure detection (progress-aware)
-                    if let Some((delta, state)) = self.sample_monitor() {
-                        if state == catenary_proc::ProcessState::Dead {
+                    if let Some(d) = self.sample_monitor() {
+                        if d.state == catenary_proc::ProcessState::Dead {
                             return DiagnosticsWaitResult::Nothing;
                         }
-                        if state == catenary_proc::ProcessState::Running
+                        let delta = d.delta_utime + d.delta_stime;
+                        if d.state == catenary_proc::ProcessState::Running
                             && delta > 0
                             && !self.progress_active()
                         {
@@ -1101,10 +1104,10 @@ impl LspClient {
 
         // During warmup, verify the server is actually idle
         if self.spawn_time.elapsed() < Duration::from_secs(3) {
-            let Some((_delta, state)) = self.sample_monitor() else {
+            let Some(d) = self.sample_monitor() else {
                 return false;
             };
-            return state == catenary_proc::ProcessState::Sleeping;
+            return d.state == catenary_proc::ProcessState::Sleeping;
         }
 
         true
@@ -1178,8 +1181,10 @@ impl LspClient {
                 // Busy and the process is sleeping with flat ticks,
                 // the server accepted the notification and went idle.
                 if self.server_state() == ServerState::Busy && self.is_alive() {
-                    if let Some((delta, process_state)) = self.sample_monitor() {
-                        if process_state == catenary_proc::ProcessState::Sleeping && delta == 0 {
+                    if let Some(d) = self.sample_monitor() {
+                        if d.state == catenary_proc::ProcessState::Sleeping
+                            && d.delta_utime + d.delta_stime == 0
+                        {
                             let count = flat_count.fetch_add(1, Ordering::SeqCst) + 1;
                             if count >= SETTLE_SAMPLES {
                                 tracing::debug!(
@@ -1228,9 +1233,9 @@ impl LspClient {
             return false;
         }
 
-        if let Some((delta, process_state)) = self.sample_monitor()
-            && process_state == catenary_proc::ProcessState::Sleeping
-            && delta == 0
+        if let Some(d) = self.sample_monitor()
+            && d.state == catenary_proc::ProcessState::Sleeping
+            && d.delta_utime + d.delta_stime == 0
         {
             debug!("try_idle_recover: stuck server is idle — transitioning to Ready");
             self.inbox

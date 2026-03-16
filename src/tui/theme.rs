@@ -201,12 +201,13 @@ fn detect_terminal_bg() -> Option<(u8, u8, u8)> {
             Err(RecvTimeoutError::Timeout) => {}
         }
 
-        let (delta, state) = monitor.sample()?;
-        if state == catenary_proc::ProcessState::Dead {
+        let d = monitor.sample()?;
+        if d.state == catenary_proc::ProcessState::Dead {
             break None;
         }
         // Only drain threshold on unexplained CPU work: Running + advancing ticks.
-        if state == catenary_proc::ProcessState::Running && delta > 0 {
+        let delta = d.delta_utime + d.delta_stime;
+        if d.state == catenary_proc::ProcessState::Running && delta > 0 {
             remaining_threshold -= i64::try_from(delta).unwrap_or(remaining_threshold);
         }
 

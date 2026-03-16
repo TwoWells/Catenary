@@ -8,7 +8,7 @@
 //! request timeouts. It replaces wall-clock timeouts with CPU-tick
 //! failure detection.
 
-use catenary_proc::ProcessState;
+use catenary_proc::ProcessDelta;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -36,7 +36,7 @@ const SAFETY_CAP: Duration = Duration::from_secs(300);
 ///
 /// # Parameters
 ///
-/// - `sample_fn`: Samples the server process. Returns `(delta, state)`.
+/// - `sample_fn`: Samples the server process. Returns [`ProcessDelta`].
 ///   Returns `None` when the process is gone.
 /// - `threshold`: CPU ticks of unexplained work before giving up.
 /// - `max_wall`: Maximum wall-clock time to wait. Use `None` for the
@@ -54,7 +54,7 @@ pub async fn load_aware_grace<S, F, Fut>(
     condition: F,
 ) -> bool
 where
-    S: FnMut() -> Option<(u64, ProcessState)>,
+    S: FnMut() -> Option<ProcessDelta>,
     F: Fn() -> Fut,
     Fut: Future<Output = bool>,
 {
@@ -82,19 +82,23 @@ where
         }
 
         // Sample the server process
-        let Some((delta, state)) = sample_fn() else {
+        let Some(d) = sample_fn() else {
             // Can't sample — process is gone
             return false;
         };
 
-        match state {
-            ProcessState::Dead => return false,
-            ProcessState::Blocked => {
+        match d.state {
+            catenary_proc::ProcessState::Dead => return false,
+            catenary_proc::ProcessState::Blocked => {
                 // Kernel I/O — free wait, don't drain threshold
             }
-            ProcessState::Running | ProcessState::Sleeping => {
+            catenary_proc::ProcessState::Running | catenary_proc::ProcessState::Sleeping => {
                 // Only count unexplained work: Running + ticks advanced + no progress
-                if state == ProcessState::Running && delta > 0 && !progress_active() {
+                let delta = d.delta_utime + d.delta_stime;
+                if d.state == catenary_proc::ProcessState::Running
+                    && delta > 0
+                    && !progress_active()
+                {
                     remaining_threshold -= i64::try_from(delta).unwrap_or(remaining_threshold);
                 }
                 // Sleeping + flat ticks, Running + flat ticks, or progress Active:
