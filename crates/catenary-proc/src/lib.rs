@@ -13,6 +13,8 @@
 //! and scheduling state. CPU times are normalized to centiseconds (100 Hz)
 //! across platforms; 1 tick = 10ms. Page faults are raw counts.
 
+use std::collections::{HashMap, HashSet};
+
 /// A snapshot of a single process's CPU consumption, page faults, and state.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessSample {
@@ -121,6 +123,138 @@ impl ProcessMonitor {
     }
 }
 
+/// Per-process sample from a tree walk.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeSample {
+    /// Process ID.
+    pub pid: u32,
+    /// Parent process ID.
+    pub ppid: u32,
+    /// User CPU time delta since last sample (centiseconds).
+    pub delta_utime: u64,
+    /// System CPU time delta since last sample (centiseconds).
+    pub delta_stime: u64,
+    /// Page fault count delta since last sample.
+    pub delta_pfc: u64,
+    /// Current scheduling/execution state.
+    pub state: ProcessState,
+}
+
+/// Result of sampling the entire process tree.
+#[derive(Debug)]
+pub struct TreeSnapshot {
+    /// Per-process samples (root + all descendants).
+    pub samples: Vec<TreeSample>,
+    /// Total processes discovered (root + children).
+    pub process_count: usize,
+}
+
+/// Monitors a root process and all its descendants.
+///
+/// On each [`sample`](TreeMonitor::sample) call, discovers live descendants
+/// via platform-specific tree walking, inserts fresh [`ProcessMonitor`]s for
+/// new children, drops monitors for exited children, and returns per-process
+/// deltas for the entire tree.
+pub struct TreeMonitor {
+    root_pid: u32,
+    monitors: HashMap<u32, ProcessMonitor>,
+}
+
+impl TreeMonitor {
+    /// Creates a new tree monitor for the given root PID.
+    ///
+    /// Returns `None` if the root process doesn't exist or can't be monitored.
+    #[must_use]
+    pub fn new(root_pid: u32) -> Option<Self> {
+        let root_monitor = ProcessMonitor::new(root_pid)?;
+        let mut monitors = HashMap::new();
+        monitors.insert(root_pid, root_monitor);
+        Some(Self { root_pid, monitors })
+    }
+
+    /// Sample the root and all live descendants.
+    ///
+    /// Discovers children via tree walk on every call. New children get a
+    /// fresh `ProcessMonitor` (first delta = 0). Children that have exited
+    /// are dropped. Returns one [`TreeSample`] per process.
+    #[allow(
+        clippy::similar_names,
+        reason = "delta_utime/delta_stime are standard counter names"
+    )]
+    pub fn sample(&mut self) -> TreeSnapshot {
+        // Discover all live descendants.
+        let mut live_pids = HashSet::new();
+        live_pids.insert(self.root_pid);
+        for child_pid in platform::discover_children(self.root_pid) {
+            live_pids.insert(child_pid);
+        }
+
+        // Insert monitors for newly discovered PIDs.
+        for &pid in &live_pids {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.monitors.entry(pid)
+                && let Some(monitor) = ProcessMonitor::new(pid)
+            {
+                e.insert(monitor);
+            }
+        }
+
+        // Remove monitors for exited PIDs.
+        self.monitors.retain(|pid, _| live_pids.contains(pid));
+
+        let process_count = live_pids.len();
+
+        // If the root is gone, return empty.
+        if !self.monitors.contains_key(&self.root_pid) {
+            return TreeSnapshot {
+                samples: Vec::new(),
+                process_count: 0,
+            };
+        }
+
+        // Sample every monitor.
+        let mut samples = Vec::with_capacity(self.monitors.len());
+        for (&pid, monitor) in &mut self.monitors {
+            if let Some(delta) = monitor.sample() {
+                samples.push(TreeSample {
+                    pid,
+                    ppid: delta.ppid,
+                    delta_utime: delta.delta_utime,
+                    delta_stime: delta.delta_stime,
+                    delta_pfc: delta.delta_pfc,
+                    state: delta.state,
+                });
+            }
+        }
+
+        TreeSnapshot {
+            samples,
+            process_count,
+        }
+    }
+
+    /// Returns the number of currently tracked monitors (for testing).
+    #[cfg(test)]
+    fn monitor_count(&self) -> usize {
+        self.monitors.len()
+    }
+}
+
+/// Compute work intensity: log-scaled page faults per CPU tick.
+///
+/// Returns `0.0` when idle (0 or 1 page faults per tick). Returns `None`
+/// when `delta_utime` is 0 (server wasn't scheduled — no data).
+#[must_use]
+pub fn intensity(delta_pfc: u64, delta_utime: u64) -> Option<f64> {
+    if delta_utime == 0 {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "counter values fit comfortably in f64 mantissa"
+    )]
+    Some((1.0_f64.max(delta_pfc as f64 / delta_utime as f64)).ln())
+}
+
 /// Sample a single process by PID (stateless).
 ///
 /// Returns absolute CPU times (centiseconds), page fault count, parent PID,
@@ -197,6 +331,31 @@ mod platform {
         };
 
         Some((utime, stime, minflt + majflt, ppid, state))
+    }
+
+    /// Discover all descendant PIDs by walking `/proc/{pid}/task/{tid}/children`.
+    pub fn discover_children(root_pid: u32) -> Vec<u32> {
+        let mut result = Vec::new();
+        let mut stack = vec![root_pid];
+        while let Some(pid) = stack.pop() {
+            let task_dir = format!("/proc/{pid}/task");
+            let Ok(entries) = std::fs::read_dir(&task_dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let children_path = entry.path().join("children");
+                let Ok(contents) = std::fs::read_to_string(&children_path) else {
+                    continue;
+                };
+                for token in contents.split_whitespace() {
+                    if let Ok(child_pid) = token.parse::<u32>() {
+                        result.push(child_pid);
+                        stack.push(child_pid);
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Stateless sample — opens, reads, closes.
@@ -334,6 +493,63 @@ mod platform {
         };
 
         Some((info, state))
+    }
+
+    /// Discover all descendant PIDs via `proc_listchildpids`.
+    pub fn discover_children(root_pid: u32) -> Vec<u32> {
+        let mut result = Vec::new();
+        let mut stack = vec![root_pid];
+        while let Some(pid) = stack.pop() {
+            // Safety: `proc_listchildpids` is a standard macOS API called with
+            // a correctly sized buffer.
+            let children = unsafe { list_child_pids(pid) };
+            for child_pid in children {
+                result.push(child_pid);
+                stack.push(child_pid);
+            }
+        }
+        result
+    }
+
+    /// List direct child PIDs of a process.
+    ///
+    /// # Safety
+    ///
+    /// Calls `libc::proc_listchildpids` with a correctly sized buffer.
+    unsafe fn list_child_pids(pid: u32) -> Vec<u32> {
+        let pid_i32 = match i32::try_from(pid) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        // First call with size 0 to get the count.
+        let count = unsafe { libc::proc_listchildpids(pid_i32, std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Vec::new();
+        }
+
+        #[allow(clippy::cast_sign_loss, reason = "count is checked > 0 above")]
+        let num = count as usize;
+        let mut buf = vec![0i32; num];
+        let buf_size = match i32::try_from(num * std::mem::size_of::<i32>()) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        let ret = unsafe { libc::proc_listchildpids(pid_i32, buf.as_mut_ptr().cast(), buf_size) };
+        if ret <= 0 {
+            return Vec::new();
+        }
+
+        #[allow(clippy::cast_sign_loss, reason = "ret is checked > 0 above")]
+        let actual = ret as usize / std::mem::size_of::<i32>();
+        buf.truncate(actual);
+
+        #[allow(clippy::cast_sign_loss, reason = "PIDs are always non-negative")]
+        buf.into_iter()
+            .filter(|&p| p > 0)
+            .map(|p| p as u32)
+            .collect()
     }
 
     /// Stateless sample for the `sample(pid)` function.
@@ -494,6 +710,56 @@ mod platform {
         found
     }
 
+    /// Discover all descendant PIDs via a toolhelp snapshot.
+    pub fn discover_children(root_pid: u32) -> Vec<u32> {
+        // Safety: calling Win32 ToolHelp APIs with correctly sized buffers.
+        unsafe { discover_children_inner(root_pid) }
+    }
+
+    /// # Safety
+    ///
+    /// Calls Win32 `CreateToolhelp32Snapshot`, `Process32FirstW`, and
+    /// `Process32NextW` with correctly sized buffers.
+    unsafe fn discover_children_inner(root_pid: u32) -> Vec<u32> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+
+        // Build parent → children map from the full snapshot.
+        let mut children_map: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap_or(0);
+
+        if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
+            loop {
+                children_map
+                    .entry(entry.th32ParentProcessID)
+                    .or_default()
+                    .push(entry.th32ProcessID);
+                if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+
+        unsafe { CloseHandle(snapshot) };
+
+        // Walk from root, collecting all descendants.
+        let mut result = Vec::new();
+        let mut stack = vec![root_pid];
+        while let Some(pid) = stack.pop() {
+            if let Some(kids) = children_map.get(&pid) {
+                for &child_pid in kids {
+                    result.push(child_pid);
+                    stack.push(child_pid);
+                }
+            }
+        }
+        result
+    }
+
     /// Stateless sample — opens handle, reads, closes.
     pub fn sample(pid: u32) -> Option<ProcessSample> {
         // Safety: calling Win32 APIs with correctly sized buffers and
@@ -535,6 +801,10 @@ mod platform {
         pub fn sample(&mut self) -> Option<(u64, u64, u64, u32, ProcessState)> {
             None
         }
+    }
+
+    pub fn discover_children(_root_pid: u32) -> Vec<u32> {
+        Vec::new()
     }
 
     pub fn sample(_pid: u32) -> Option<ProcessSample> {
@@ -676,5 +946,162 @@ mod tests {
             "Page fault delta should advance after large allocation, got {}",
             d.delta_pfc,
         );
+    }
+
+    // ─── TreeMonitor tests ─────────────────────────────────────────────
+
+    #[test]
+    fn tree_monitor_self_succeeds() {
+        let pid = std::process::id();
+        let mut tm = TreeMonitor::new(pid).expect("Should monitor own process tree");
+        let snap = tm.sample();
+        assert!(
+            !snap.samples.is_empty(),
+            "Tree sample should contain at least the root"
+        );
+        assert!(
+            snap.process_count >= 1,
+            "Process count should be at least 1"
+        );
+    }
+
+    #[test]
+    fn tree_monitor_root_sample_has_correct_pid() {
+        let pid = std::process::id();
+        let mut tm = TreeMonitor::new(pid).expect("Should monitor own process tree");
+        let snap = tm.sample();
+        let root = snap.samples.iter().find(|s| s.pid == pid);
+        assert!(root.is_some(), "Root PID should appear in samples");
+    }
+
+    #[test]
+    fn tree_monitor_nonexistent_returns_none() {
+        let result = TreeMonitor::new(u32::MAX);
+        assert!(result.is_none(), "Nonexistent PID should return None");
+    }
+
+    #[test]
+    fn tree_monitor_discovers_child() {
+        use std::process::Command;
+
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("Failed to spawn sleep");
+
+        let pid = std::process::id();
+        let mut tm = TreeMonitor::new(pid).expect("Should monitor own process tree");
+        let snap = tm.sample();
+        assert!(
+            snap.samples.len() >= 2,
+            "Should find root + child, got {} samples",
+            snap.samples.len()
+        );
+
+        child.kill().expect("Failed to kill child");
+        child.wait().expect("Failed to wait for child");
+
+        // Give the OS a moment to clean up.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let snap = tm.sample();
+        assert_eq!(
+            snap.samples.len(),
+            1,
+            "After child exit, should have only root"
+        );
+    }
+
+    #[test]
+    fn tree_monitor_drops_exited_child() {
+        use std::process::Command;
+
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("Failed to spawn sleep");
+
+        let pid = std::process::id();
+        let mut tm = TreeMonitor::new(pid).expect("Should monitor own process tree");
+        let _ = tm.sample();
+        assert!(
+            tm.monitor_count() >= 2,
+            "Should track root + child, got {}",
+            tm.monitor_count()
+        );
+
+        child.kill().expect("Failed to kill child");
+        child.wait().expect("Failed to wait for child");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let _ = tm.sample();
+        assert_eq!(
+            tm.monitor_count(),
+            1,
+            "After child exit, monitor map should shrink to 1"
+        );
+    }
+
+    // ─── intensity() tests ─────────────────────────────────────────────
+
+    #[test]
+    fn intensity_zero_pfc_returns_zero() {
+        let v = intensity(0, 100);
+        assert_eq!(v, Some(0.0));
+    }
+
+    #[test]
+    fn intensity_one_pfc_returns_zero() {
+        // max(1, 1/100) = 1, ln(1) = 0
+        let v = intensity(1, 100);
+        assert_eq!(v, Some(0.0));
+    }
+
+    #[test]
+    fn intensity_high_pfc_returns_positive() {
+        let v = intensity(10000, 100).expect("Should return Some");
+        assert!(
+            v > 0.0,
+            "High pfc/utime ratio should give positive intensity, got {v}"
+        );
+    }
+
+    #[test]
+    fn intensity_zero_utime_returns_none() {
+        let v = intensity(100, 0);
+        assert_eq!(v, None);
+    }
+
+    // ─── Platform-specific tree walk tests ─────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tree_walk_discovers_children_linux() {
+        use std::process::Command;
+
+        // Spawn a shell that itself spawns a child (two levels deep).
+        let mut parent = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60 & wait")
+            .spawn()
+            .expect("Failed to spawn sh");
+
+        // Give the shell time to spawn its child.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let pid = std::process::id();
+        let mut tm = TreeMonitor::new(pid).expect("Should monitor own process tree");
+        let snap = tm.sample();
+
+        // We should see: our process, the sh, and the sleep (3+).
+        assert!(
+            snap.samples.len() >= 3,
+            "Should find root + sh + sleep, got {} samples",
+            snap.samples.len()
+        );
+
+        parent.kill().expect("Failed to kill parent");
+        parent.wait().expect("Failed to wait for parent");
     }
 }
