@@ -36,10 +36,10 @@ test-scripts:
 # Run ignored tests (e.g. requiring real LSP): make test-ignored T=ra_symbol_universe
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
 test-ignored:
-	@cargo nextest run --workspace --features mockls --run-ignored ignored-only --status-level all --final-status-level all --no-capture $(if $(T),$(CLEAN_T),)
+	@cargo nextest run --workspace --features mockls --run-ignored ignored-only --status-level all --final-status-level all --no-capture $(if $(T),-E 'test($(CLEAN_T))',)
 
 test:
-	@cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',$(T)),)
+	@cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # Verify we're in a good state for release
 pre-release-check:

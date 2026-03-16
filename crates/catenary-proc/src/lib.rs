@@ -1083,14 +1083,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn tree_walk_discovers_children_linux() {
+        use std::os::unix::process::CommandExt;
         use std::process::Command;
 
         // Spawn a shell that itself spawns a child (two levels deep).
-        let mut parent = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 60 & wait")
-            .spawn()
-            .expect("Failed to spawn sh");
+        // Use process_group(0) so the shell and its children share a
+        // process group — killing the group reaps the backgrounded sleep.
+        let mut parent = unsafe {
+            Command::new("sh")
+                .arg("-c")
+                .arg("sleep 60 & wait")
+                .pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                })
+                .spawn()
+                .expect("Failed to spawn sh")
+        };
 
         // Give the shell time to spawn its child.
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1106,7 +1115,9 @@ mod tests {
             snap.samples.len()
         );
 
-        parent.kill().expect("Failed to kill parent");
+        // Kill the entire process group (negative PID = group).
+        let pgid = parent.id();
+        unsafe { libc::kill(-(i32::try_from(pgid).expect("PID fits i32")), libc::SIGKILL) };
         parent.wait().expect("Failed to wait for parent");
     }
 }
