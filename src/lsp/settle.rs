@@ -51,8 +51,9 @@ pub trait SettleSink: Send {
 /// `server`, and calls `sink.record()` for each per-process sample.
 /// Runs until `sink.record()` returns `false` or the `cancel` token fires.
 ///
-/// Skips processes where all three counters (`delta_utime`, `delta_stime`,
-/// `delta_pfc`) are zero — the process was truly idle.
+/// Emits a sample for every process in the tree on every interval,
+/// including idle processes with all-zero deltas. The caller needs
+/// explicit idle samples to detect settling.
 #[allow(
     clippy::similar_names,
     reason = "delta_utime/delta_stime are standard counter names"
@@ -76,11 +77,6 @@ pub async fn settle_loop(
         let timestamp = Instant::now();
 
         for ts in &snapshot.samples {
-            // Skip processes that were truly idle — no CPU, no page faults.
-            if ts.delta_utime == 0 && ts.delta_stime == 0 && ts.delta_pfc == 0 {
-                continue;
-            }
-
             let sample = SettleSample {
                 timestamp,
                 server: server_name.to_string(),

@@ -22,11 +22,12 @@
 //!
 //! Run with:
 //! ```text
-//! make test-ignored T=profile_intensity
+//! PROFILE_DB=internal_repo/data/intensity.db make test-ignored T=profile_intensity
 //! ```
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -42,9 +43,13 @@ use catenary_mcp::lsp::settle::{SettleSample, SettleSink, settle_loop};
 // ── Constants ────────────────────────────────────────────────────────
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
-const IDLE_DURATION: Duration = Duration::from_secs(5);
+const IDLE_DURATION: Duration = Duration::from_secs(20);
 const STIMULUS_DURATION: Duration = Duration::from_secs(10);
 const RECOVERY_DURATION: Duration = Duration::from_secs(10);
+
+/// Delay after initialize before sending didOpen — lets the server begin
+/// indexing before we hand it a document.
+const INIT_SETTLE: Duration = Duration::from_secs(2);
 
 // ── Server definitions ───────────────────────────────────────────────
 
@@ -54,7 +59,12 @@ struct ServerDef {
     args: &'static [&'static str],
     language_id: &'static str,
     fixture_dir: &'static str,
+    /// File that will receive the bad→clean cycle.
     bad_file: &'static str,
+    /// Source of clean content for `bad_file`. If `Some`, the clean
+    /// content is read from this file; during stimulus, `bad_file`'s
+    /// original content becomes the "bad" payload. If `None`, `bad_file`
+    /// is opened as-is (no clean→bad→clean cycle).
     clean_file: Option<&'static str>,
 }
 
@@ -226,12 +236,6 @@ async fn recv_lsp(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
     serde_json::from_slice(&body).context("Failed to parse LSP JSON")
 }
 
-/// Drain any pending messages from the server (non-blocking).
-async fn drain_lsp(reader: &mut BufReader<ChildStdout>) {
-    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(100), recv_lsp(reader)).await {
-    }
-}
-
 // ── Binary lookup ────────────────────────────────────────────────────
 
 fn find_binary(name: &str) -> Option<PathBuf> {
@@ -311,13 +315,68 @@ async fn initialize_server(
     Ok(capabilities)
 }
 
+// ── Reader task ─────────────────────────────────────────────────────
+
+/// Background task that reads all LSP messages from the server, wires
+/// `$/progress` notifications into the `LspServer` profile, and responds
+/// to `window/workDoneProgress/create` requests.
+async fn reader_loop(
+    mut reader: BufReader<ChildStdout>,
+    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    server: Arc<LspServer>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let msg = tokio::select! {
+            result = recv_lsp(&mut reader) => {
+                match result {
+                    Ok(m) => m,
+                    Err(_) => return, // server closed stdout
+                }
+            }
+            () = cancel.cancelled() => { return; }
+        };
+
+        let method = msg.get("method").and_then(Value::as_str);
+        let has_id = msg.get("id").is_some();
+
+        match method {
+            Some("$/progress") => {
+                let params = msg.get("params").unwrap_or(&Value::Null);
+                let kind = params
+                    .get("value")
+                    .and_then(|v| v.get("kind"))
+                    .and_then(Value::as_str);
+                match kind {
+                    Some("begin") => {
+                        server.on_progress_begin();
+                    }
+                    Some("end") => {
+                        server.on_progress_end();
+                    }
+                    _ => {}
+                }
+            }
+            Some("window/workDoneProgress/create") if has_id => {
+                // Must respond so the server can use progress tokens.
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": msg["id"],
+                    "result": null
+                });
+                let mut guard = stdin.lock().await;
+                let _ = send_lsp(&mut guard, &response).await;
+            }
+            _ => {} // Ignore all other messages.
+        }
+    }
+}
+
 // ── Shutdown ─────────────────────────────────────────────────────────
 
-async fn shutdown_server(
-    stdin: &mut ChildStdin,
-    reader: &mut BufReader<ChildStdout>,
-    child: &mut Child,
-) {
+async fn shutdown_server(stdin: &Arc<tokio::sync::Mutex<ChildStdin>>, child: &mut Child) {
+    let mut guard = stdin.lock().await;
+
     // Send shutdown request.
     let shutdown = json!({
         "jsonrpc": "2.0",
@@ -325,18 +384,17 @@ async fn shutdown_server(
         "method": "shutdown",
         "params": null
     });
-    let _ = send_lsp(stdin, &shutdown).await;
+    let _ = send_lsp(&mut guard, &shutdown).await;
 
-    // Try to read shutdown response with timeout.
-    let _ = tokio::time::timeout(Duration::from_secs(5), recv_lsp(reader)).await;
-
-    // Send exit notification.
+    // Send exit notification (don't wait for response — reader task
+    // may already be cancelled).
     let exit = json!({
         "jsonrpc": "2.0",
         "method": "exit",
         "params": null
     });
-    let _ = send_lsp(stdin, &exit).await;
+    let _ = send_lsp(&mut guard, &exit).await;
+    drop(guard);
 
     // Give the process a moment to exit gracefully, then kill.
     match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
@@ -345,6 +403,81 @@ async fn shutdown_server(
             let _ = child.kill().await;
         }
     }
+}
+
+// ── LSP document helpers ────────────────────────────────────────────
+
+async fn send_did_open(
+    stdin: &mut ChildStdin,
+    uri: &str,
+    language_id: &str,
+    text: &str,
+) -> Result<()> {
+    send_lsp(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text
+                }
+            }
+        }),
+    )
+    .await
+}
+
+async fn send_did_change(
+    stdin: &mut ChildStdin,
+    uri: &str,
+    version: i64,
+    text: &str,
+) -> Result<()> {
+    send_lsp(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{ "text": text }]
+            }
+        }),
+    )
+    .await
+}
+
+async fn send_did_save(stdin: &mut ChildStdin, uri: &str, text: &str) -> Result<()> {
+    send_lsp(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {
+                "textDocument": { "uri": uri },
+                "text": text
+            }
+        }),
+    )
+    .await
+}
+
+async fn send_did_close(stdin: &mut ChildStdin, uri: &str) -> Result<()> {
+    send_lsp(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {
+                "textDocument": { "uri": uri }
+            }
+        }),
+    )
+    .await
 }
 
 // ── Summary output ───────────────────────────────────────────────────
@@ -490,31 +623,37 @@ async fn profile_intensity() -> Result<()> {
             .spawn()
             .with_context(|| format!("Failed to spawn {}", def.name))?;
 
-        let mut stdin = child.stdin.take().context("No stdin")?;
+        let child_stdin = child.stdin.take().context("No stdin")?;
         let stdout = child.stdout.take().context("No stdout")?;
         let mut reader = BufReader::new(stdout);
 
+        // Shared stdin — reader task needs it for workDoneProgress/create responses.
+        let stdin = Arc::new(tokio::sync::Mutex::new(child_stdin));
+
         // Initialize.
-        let capabilities = match tokio::time::timeout(
-            Duration::from_secs(30),
-            initialize_server(&mut stdin, &mut reader, &root_uri),
-        )
-        .await
-        {
-            Ok(Ok(caps)) => caps,
-            Ok(Err(e)) => {
-                println!("  SKIP: initialize failed: {e}");
-                let _ = child.kill().await;
-                continue;
-            }
-            Err(_) => {
-                println!("  SKIP: initialize timed out");
-                let _ = child.kill().await;
-                continue;
+        let capabilities = {
+            let mut guard = stdin.lock().await;
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                initialize_server(&mut guard, &mut reader, &root_uri),
+            )
+            .await
+            {
+                Ok(Ok(caps)) => caps,
+                Ok(Err(e)) => {
+                    println!("  SKIP: initialize failed: {e}");
+                    let _ = child.kill().await;
+                    continue;
+                }
+                Err(_) => {
+                    println!("  SKIP: initialize timed out");
+                    let _ = child.kill().await;
+                    continue;
+                }
             }
         };
 
-        let server = LspServer::new(capabilities);
+        let server = Arc::new(LspServer::new(capabilities));
 
         let pid = child
             .id()
@@ -528,92 +667,92 @@ async fn profile_intensity() -> Result<()> {
         // Create recording sink.
         let mut sink = RecordingSink::new(&db_path)?;
 
-        // Start settle loop.
+        // Cancellation token shared by settle loop and reader task.
         let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
 
-        // The settle loop runs in a spawned task so we can do stimulus
-        // work concurrently. All owned data moves into the task.
+        // ── Spawn reader task (wires progress tokens) ────────────
+        let reader_cancel = cancel.clone();
+        let reader_server = Arc::clone(&server);
+        let reader_stdin = Arc::clone(&stdin);
+        let reader_handle = tokio::spawn(async move {
+            reader_loop(reader, reader_stdin, reader_server, reader_cancel).await;
+        });
+
+        // ── Spawn settle loop ────────────────────────────────────
+        let settle_cancel = cancel.clone();
+        let settle_server = Arc::clone(&server);
         let server_name = def.name.to_string();
         let settle_handle = tokio::spawn(async move {
             settle_loop(
                 &mut tree_monitor,
-                &server,
+                &settle_server,
                 &server_name,
                 SAMPLE_INTERVAL,
                 &mut sink,
-                cancel_clone,
+                settle_cancel,
             )
             .await;
         });
 
-        // ── Idle baseline ────────────────────────────────────────────
-        println!("  idle baseline ({IDLE_DURATION:?})...");
-        tokio::time::sleep(IDLE_DURATION).await;
+        // ── Let server begin indexing ────────────────────────────
+        tokio::time::sleep(INIT_SETTLE).await;
 
-        // ── Stimulus: open bad file ──────────────────────────────────
+        // ── Read file contents ───────────────────────────────────
         let bad_path = work_dir.path().join(def.bad_file);
-        let bad_content = std::fs::read_to_string(&bad_path).unwrap_or_default();
         let bad_uri = format!("file://{}", bad_path.display());
+        let bad_content = std::fs::read_to_string(&bad_path).unwrap_or_default();
 
-        let open_bad = json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didOpen",
-            "params": {
-                "textDocument": {
-                    "uri": bad_uri,
-                    "languageId": def.language_id,
-                    "version": 1,
-                    "text": bad_content
-                }
-            }
-        });
-        send_lsp(&mut stdin, &open_bad).await?;
+        let clean_content = def.clean_file.map_or_else(
+            || bad_content.clone(),
+            |clean_file| {
+                let clean_path = work_dir.path().join(clean_file);
+                std::fs::read_to_string(&clean_path).unwrap_or_default()
+            },
+        );
+
+        // ── didOpen with clean content ───────────────────────────
+        {
+            let mut guard = stdin.lock().await;
+            send_did_open(&mut guard, &bad_uri, def.language_id, &clean_content).await?;
+        }
+
+        // ── Idle baseline ────────────────────────────────────────
+        let idle_remaining = IDLE_DURATION.saturating_sub(INIT_SETTLE);
+        println!("  idle baseline ({IDLE_DURATION:?})...");
+        tokio::time::sleep(idle_remaining).await;
+
+        // ── Stimulus: inject bad content + didSave ───────────────
         println!("  stimulus ({STIMULUS_DURATION:?})...");
+        if def.clean_file.is_some() {
+            // Write bad content to disk (for flycheck) and update buffer.
+            std::fs::write(&bad_path, &bad_content)?;
+            let mut guard = stdin.lock().await;
+            send_did_change(&mut guard, &bad_uri, 2, &bad_content).await?;
+            send_did_save(&mut guard, &bad_uri, &bad_content).await?;
+        }
+        // For servers without clean_file, the didOpen already opened
+        // the bad content — server is already analyzing it.
         tokio::time::sleep(STIMULUS_DURATION).await;
 
-        // Drain any pending messages.
-        drain_lsp(&mut reader).await;
-
-        // ── Recovery: open clean file or close bad file ──────────────
-        if let Some(clean_file) = def.clean_file {
-            let clean_path = work_dir.path().join(clean_file);
-            let clean_content = std::fs::read_to_string(&clean_path).unwrap_or_default();
-            let clean_uri = format!("file://{}", clean_path.display());
-
-            let open_clean = json!({
-                "jsonrpc": "2.0",
-                "method": "textDocument/didOpen",
-                "params": {
-                    "textDocument": {
-                        "uri": clean_uri,
-                        "languageId": def.language_id,
-                        "version": 1,
-                        "text": clean_content
-                    }
-                }
-            });
-            send_lsp(&mut stdin, &open_clean).await?;
-        } else {
-            // Close the bad file to trigger re-analysis.
-            let close = json!({
-                "jsonrpc": "2.0",
-                "method": "textDocument/didClose",
-                "params": {
-                    "textDocument": { "uri": bad_uri }
-                }
-            });
-            send_lsp(&mut stdin, &close).await?;
-        }
+        // ── Recovery: restore clean content + didSave ────────────
         println!("  recovery ({RECOVERY_DURATION:?})...");
+        if def.clean_file.is_some() {
+            std::fs::write(&bad_path, &clean_content)?;
+            let mut guard = stdin.lock().await;
+            send_did_change(&mut guard, &bad_uri, 3, &clean_content).await?;
+            send_did_save(&mut guard, &bad_uri, &clean_content).await?;
+        } else {
+            let mut guard = stdin.lock().await;
+            send_did_close(&mut guard, &bad_uri).await?;
+        }
         tokio::time::sleep(RECOVERY_DURATION).await;
 
-        // ── Teardown ─────────────────────────────────────────────────
+        // ── Teardown ─────────────────────────────────────────────
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), settle_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), reader_handle).await;
 
-        drain_lsp(&mut reader).await;
-        shutdown_server(&mut stdin, &mut reader, &mut child).await;
+        shutdown_server(&stdin, &mut child).await;
 
         println!("  done.");
         any_server_ran = true;
@@ -627,6 +766,179 @@ async fn profile_intensity() -> Result<()> {
     print_summary(&db_path)?;
 
     // Print DB path so the user can query it manually.
+    println!("Database: {}", db_path.display());
+
+    Ok(())
+}
+
+// ── Large project test ───────────────────────────────────────────────
+
+/// Longer durations for large-project profiling. rust-analyzer needs
+/// 30-60s to index the full Catenary workspace, and flycheck on a
+/// 3400-line file can take 10+ seconds.
+const LARGE_IDLE: Duration = Duration::from_secs(45);
+const LARGE_STIMULUS: Duration = Duration::from_secs(30);
+const LARGE_RECOVERY: Duration = Duration::from_secs(30);
+
+/// Type error appended to main.rs as stimulus.
+const INJECTED_ERROR: &str = "\nfn _profile_stimulus_error() { let _: i32 = \"oops\"; }\n";
+
+/// Drop guard that restores a file's original content on drop.
+/// Ensures the working tree is clean even if the test panics.
+struct FileGuard {
+    path: PathBuf,
+    original: String,
+}
+
+impl Drop for FileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.original);
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual profiling test — runs rust-analyzer against full Catenary workspace"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-server profiling with setup/stimulus/teardown phases"
+)]
+async fn profile_intensity_large() -> Result<()> {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target_file = workspace.join("src/main.rs");
+
+    if find_binary("rust-analyzer").is_none() {
+        bail!("rust-analyzer not found");
+    }
+
+    // Read original content and set up restore guard.
+    let original = std::fs::read_to_string(&target_file).context("Failed to read src/main.rs")?;
+    let _guard = FileGuard {
+        path: target_file.clone(),
+        original: original.clone(),
+    };
+
+    let bad_content = format!("{original}{INJECTED_ERROR}");
+    let file_uri = format!("file://{}", target_file.display());
+    let root_uri = format!("file://{}", workspace.display());
+
+    // DB path.
+    let tmp_dir_guard;
+    let db_path = if let Ok(path) = std::env::var("PROFILE_DB") {
+        tmp_dir_guard = None;
+        let p = PathBuf::from(&path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        p
+    } else {
+        let td = tempfile::tempdir()?;
+        let p = td.path().join("intensity_large.db");
+        tmp_dir_guard = Some(td);
+        p
+    };
+    let _ = &tmp_dir_guard;
+
+    println!("PROFILING: rust-analyzer (large, Catenary workspace)");
+
+    // Spawn rust-analyzer.
+    let mut child = Command::new("rust-analyzer")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .current_dir(&workspace)
+        .spawn()
+        .context("Failed to spawn rust-analyzer")?;
+
+    let child_stdin = child.stdin.take().context("No stdin")?;
+    let stdout = child.stdout.take().context("No stdout")?;
+    let mut reader = BufReader::new(stdout);
+    let stdin = Arc::new(tokio::sync::Mutex::new(child_stdin));
+
+    // Initialize.
+    let capabilities = {
+        let mut guard = stdin.lock().await;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            initialize_server(&mut guard, &mut reader, &root_uri),
+        )
+        .await
+        .context("Timeout waiting for initialize")?
+        .context("Initialize failed")?
+    };
+
+    let server = Arc::new(LspServer::new(capabilities));
+
+    let pid = child.id().context("No PID after spawn")?;
+    let mut tree_monitor =
+        catenary_proc::TreeMonitor::new(pid).context("Could not create TreeMonitor")?;
+
+    let mut sink = RecordingSink::new(&db_path)?;
+    let cancel = CancellationToken::new();
+
+    // Spawn reader task.
+    let reader_cancel = cancel.clone();
+    let reader_server = Arc::clone(&server);
+    let reader_stdin = Arc::clone(&stdin);
+    let reader_handle = tokio::spawn(async move {
+        reader_loop(reader, reader_stdin, reader_server, reader_cancel).await;
+    });
+
+    // Spawn settle loop.
+    let settle_cancel = cancel.clone();
+    let settle_server = Arc::clone(&server);
+    let settle_handle = tokio::spawn(async move {
+        settle_loop(
+            &mut tree_monitor,
+            &settle_server,
+            "rust-analyzer-large",
+            SAMPLE_INTERVAL,
+            &mut sink,
+            settle_cancel,
+        )
+        .await;
+    });
+
+    // Let server begin indexing, then open the file.
+    tokio::time::sleep(INIT_SETTLE).await;
+    {
+        let mut guard = stdin.lock().await;
+        send_did_open(&mut guard, &file_uri, "rust", &original).await?;
+    }
+
+    // Idle baseline — wait for indexing to complete.
+    let idle_remaining = LARGE_IDLE.saturating_sub(INIT_SETTLE);
+    println!("  idle baseline ({LARGE_IDLE:?})...");
+    tokio::time::sleep(idle_remaining).await;
+
+    // Stimulus: inject type error + didSave.
+    println!("  stimulus ({LARGE_STIMULUS:?})...");
+    std::fs::write(&target_file, &bad_content)?;
+    {
+        let mut guard = stdin.lock().await;
+        send_did_change(&mut guard, &file_uri, 2, &bad_content).await?;
+        send_did_save(&mut guard, &file_uri, &bad_content).await?;
+    }
+    tokio::time::sleep(LARGE_STIMULUS).await;
+
+    // Recovery: restore clean content + didSave.
+    println!("  recovery ({LARGE_RECOVERY:?})...");
+    std::fs::write(&target_file, &original)?;
+    {
+        let mut guard = stdin.lock().await;
+        send_did_change(&mut guard, &file_uri, 3, &original).await?;
+        send_did_save(&mut guard, &file_uri, &original).await?;
+    }
+    tokio::time::sleep(LARGE_RECOVERY).await;
+
+    // Teardown.
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), settle_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader_handle).await;
+    shutdown_server(&stdin, &mut child).await;
+
+    println!("  done.");
+
+    print_summary(&db_path)?;
     println!("Database: {}", db_path.display());
 
     Ok(())
