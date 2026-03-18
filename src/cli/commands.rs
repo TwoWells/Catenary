@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::cli::{self, ColorConfig, ColumnWidths, QueryFormat};
-use crate::session::{self, Direction, EventKind, Protocol, SessionEvent};
+use crate::session::{self, SessionMessage};
 
 /// List all active sessions.
 ///
@@ -151,48 +151,47 @@ pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> 
 
     println!("Monitoring session {full_id} (Ctrl+C to stop)\n");
 
-    let mut reader = session::tail_events(&full_id)?;
+    let mut reader = session::tail_messages_new(&full_id)?;
 
-    // Track last progress (language, title) for line collapsing.
-    // When consecutive progress events share the same title, the monitor
-    // overwrites the previous line instead of scrolling.
+    // Track last progress key (server, title) for line collapsing.
     let mut last_progress: Option<(String, String)> = None;
 
     loop {
-        match reader.try_next_event() {
-            Ok(Some(event)) => {
+        match reader.try_next_message() {
+            Ok(Some(msg)) => {
                 // Apply filter if set
                 if let Some(ref re) = filter_regex {
-                    let event_str = format!("{:?}", event.kind);
-                    if !re.is_match(&event_str) {
+                    let msg_str = format!("{} {} {}", msg.r#type, msg.method, msg.server);
+                    if !re.is_match(&msg_str) {
                         continue;
                     }
                 }
 
                 if raw {
-                    print_event_raw(&event);
+                    print_message_raw(&msg);
                 } else {
                     // Collapse consecutive progress lines with the same title
-                    if let EventKind::Progress {
-                        ref language,
-                        ref title,
-                        ..
-                    } = event.kind
-                    {
-                        let key = (language.clone(), title.clone());
+                    if msg.r#type == "lsp" && msg.method == "$/progress" {
+                        let title = msg
+                            .payload
+                            .get("value")
+                            .and_then(|v| v.get("title"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let key = (msg.server.clone(), title);
                         if last_progress.as_ref() == Some(&key) {
-                            // Same progress context — erase previous line
                             print!("\x1b[A\x1b[2K");
                         }
                         last_progress = Some(key);
                     } else {
                         last_progress = None;
                     }
-                    print_event_annotated(&event, &colors, term_width);
+                    print_message_annotated(&msg, &colors, term_width);
                 }
             }
             Ok(None) => {
-                // No new event — check liveness
+                // No new message — check liveness
                 std::thread::sleep(Duration::from_millis(100));
 
                 if let Ok(Some((_, alive))) = session::get_session_with_conn(&conn, &full_id) {
@@ -244,13 +243,15 @@ pub fn run_status(id: &str) -> Result<()> {
         println!();
     }
 
-    // Show recent events
-    println!("\nRecent events:");
-    let events = session::monitor_events_with_conn(&conn, &session.id)?;
-    let recent: Vec<_> = events.iter().rev().take(10).collect();
+    // Show recent messages
+    println!("\nRecent messages:");
+    let messages = session::monitor_messages_with_conn(&conn, &session.id)?;
+    let recent: Vec<_> = messages.iter().rev().take(10).collect();
 
-    for event in recent.iter().rev() {
-        print_event(event);
+    let colors = ColorConfig::new(false);
+    let term_width = cli::terminal_width();
+    for msg in recent.iter().rev() {
+        print_message_annotated(msg, &colors, term_width);
     }
 
     Ok(())
@@ -350,29 +351,29 @@ pub fn run_query(
         return Ok(());
     }
 
-    // Build structured query
+    // Build structured query against messages table
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if let Some(sid) = session_filter {
         let resolved = resolve_session_id(conn, sid)?;
-        conditions.push(format!("e.session_id = ?{}", params.len() + 1));
+        conditions.push(format!("m.session_id = ?{}", params.len() + 1));
         params.push(Box::new(resolved.id));
     }
 
     if let Some(since_str) = since {
         let cutoff = parse_since(since_str)?;
-        conditions.push(format!("e.timestamp > ?{}", params.len() + 1));
+        conditions.push(format!("m.timestamp > ?{}", params.len() + 1));
         params.push(Box::new(cutoff.to_rfc3339()));
     }
 
     if let Some(k) = kind {
-        conditions.push(format!("e.kind = ?{}", params.len() + 1));
+        conditions.push(format!("m.type = ?{}", params.len() + 1));
         params.push(Box::new(k.to_string()));
     }
 
     if let Some(s) = search {
-        conditions.push(format!("e.payload LIKE ?{}", params.len() + 1));
+        conditions.push(format!("m.payload LIKE ?{}", params.len() + 1));
         params.push(Box::new(format!("%{s}%")));
     }
 
@@ -383,8 +384,9 @@ pub fn run_query(
     };
 
     let sql = format!(
-        "SELECT e.id, e.session_id, e.timestamp, e.kind, e.payload \
-         FROM events e{where_clause} ORDER BY e.id DESC LIMIT 100"
+        "SELECT m.id, m.session_id, m.timestamp, m.type, m.method, m.server, \
+         m.payload \
+         FROM messages m{where_clause} ORDER BY m.id DESC LIMIT 100"
     );
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
@@ -395,7 +397,9 @@ pub fn run_query(
         "ID".to_string(),
         "SESSION".to_string(),
         "TIME".to_string(),
-        "KIND".to_string(),
+        "TYPE".to_string(),
+        "METHOD".to_string(),
+        "SERVER".to_string(),
         "PAYLOAD".to_string(),
     ];
     let mut rows_out: Vec<Vec<String>> = Vec::new();
@@ -403,8 +407,10 @@ pub fn run_query(
         let id: i64 = row.get(0)?;
         let sid: String = row.get(1)?;
         let ts: String = row.get(2)?;
-        let k: String = row.get(3)?;
-        let payload: String = row.get(4)?;
+        let r#type: String = row.get(3)?;
+        let method: String = row.get(4)?;
+        let server: String = row.get(5)?;
+        let payload: String = row.get(6)?;
 
         // Shorten session ID and timestamp for table display
         let short_sid = if sid.len() > 8 { &sid[..8] } else { &sid };
@@ -416,7 +422,9 @@ pub fn run_query(
             id.to_string(),
             short_sid.to_string(),
             short_ts,
-            k,
+            r#type,
+            method,
+            server,
             payload,
         ]);
     }
@@ -850,199 +858,178 @@ pub fn format_duration_ago(timestamp: chrono::DateTime<Utc>) -> String {
     }
 }
 
-/// Print an event in raw JSON format.
-fn print_event_raw(event: &SessionEvent) {
-    let time = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
-
-    if let EventKind::ProtocolMessage {
-        protocol,
-        language,
-        direction,
-        message,
-    } = &event.kind
-    {
-        let tag = match protocol {
-            Protocol::Mcp => "[mcp]".to_string(),
-            Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
-        };
-        let arrow = match direction {
-            Direction::Recv => "\u{2192}",
-            Direction::Send => "\u{2190}",
-        };
-        println!("[{time}] {tag} {arrow}");
-        let pretty = serde_json::to_string_pretty(message).unwrap_or_default();
-        println!("{pretty}");
+/// Print a message in raw JSON format.
+fn print_message_raw(msg: &SessionMessage) {
+    let time = msg.timestamp.with_timezone(&Local).format("%H:%M:%S");
+    let tag = match msg.r#type.as_str() {
+        "lsp" => format!("[{}]", msg.server),
+        "mcp" => "[mcp]".to_string(),
+        "hook" => "[hook]".to_string(),
+        other => format!("[{other}]"),
+    };
+    let arrow = if msg.payload.get("result").is_some() || msg.payload.get("error").is_some() {
+        "\u{2190}" // ←
     } else {
-        // For non-protocol events, print as JSON
-        let json = serde_json::to_string_pretty(&event.kind).unwrap_or_default();
-        println!("[{time}] {json}");
-    }
+        "\u{2192}" // →
+    };
+    println!("[{time}] {tag} {arrow}");
+    let pretty = serde_json::to_string_pretty(&msg.payload).unwrap_or_default();
+    println!("{pretty}");
 }
 
-/// Print an event with annotations and colors.
-#[allow(clippy::too_many_lines, reason = "Match arms for each event kind")]
-fn print_event_annotated(event: &SessionEvent, colors: &ColorConfig, term_width: usize) {
-    let time = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
+/// Print a message with annotations and colors.
+#[allow(clippy::too_many_lines, reason = "match arms for each message type")]
+fn print_message_annotated(msg: &SessionMessage, colors: &ColorConfig, term_width: usize) {
+    let time = msg.timestamp.with_timezone(&Local).format("%H:%M:%S");
     let time_str = colors.dim(&format!("[{time}]"));
 
-    match &event.kind {
-        EventKind::Started => {
-            println!("{time_str} Session started");
-        }
-        EventKind::Shutdown => {
-            println!("{time_str} Session shutting down");
-        }
-        EventKind::ServerState { language, state } => {
-            let lang = colors.cyan(language);
-            println!("{time_str} {lang}: {state}");
-        }
-        EventKind::Progress {
-            language,
-            title,
-            message,
-            percentage,
-        } => {
-            let lang = colors.cyan(language);
-            let pct = percentage.map(|p| format!(" {p}%")).unwrap_or_default();
-            let msg = message
-                .as_ref()
-                .map(|m| format!(" ({m})"))
-                .unwrap_or_default();
-            println!("{time_str} {lang}: {title}{pct}{msg}");
-        }
-        EventKind::ProgressEnd { language } => {
-            let lang = colors.cyan(language);
-            println!("{time_str} {lang}: Ready");
-        }
-        EventKind::ToolCall { tool, file, .. } => {
-            let arrow = colors.green("→");
-            let file_str = file
-                .as_ref()
-                .map(|f| format!(" on {f}"))
-                .unwrap_or_default();
-            println!("{time_str} {arrow} {tool}{file_str}");
-        }
-        EventKind::ToolResult {
-            tool,
-            success,
-            duration_ms,
-            ..
-        } => {
-            let arrow = colors.blue("←");
-            let status = if *success {
-                "ok".to_string()
-            } else {
-                colors.red("error")
-            };
-            println!("{time_str} {arrow} {tool} -> {status} ({duration_ms}ms)");
-        }
-        EventKind::Diagnostics {
-            file,
-            count,
-            preview,
-        } => {
-            let basename = std::path::Path::new(file)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file);
-            if *count == 0 {
-                let check = colors.green("ok");
-                println!("{time_str} {basename}: {check}");
-            } else {
-                let label = colors.yellow(&format!(
-                    "{count} diagnostic{}",
-                    if *count == 1 { "" } else { "s" }
-                ));
-                let detail = if preview.is_empty() {
-                    String::new()
+    let is_response = msg.payload.get("result").is_some() || msg.payload.get("error").is_some();
+
+    match msg.r#type.as_str() {
+        "lsp" => {
+            let lang = colors.cyan(&msg.server);
+            if msg.method == "$/progress" {
+                let title = msg
+                    .payload
+                    .get("value")
+                    .and_then(|v| v.get("title"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                let pct = msg
+                    .payload
+                    .get("value")
+                    .and_then(|v| v.get("percentage"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|p| format!(" {p}%"))
+                    .unwrap_or_default();
+                let detail = msg
+                    .payload
+                    .get("value")
+                    .and_then(|v| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|m| format!(" ({m})"))
+                    .unwrap_or_default();
+                println!("{time_str} {lang}: {title}{pct}{detail}");
+            } else if is_response {
+                let arrow = colors.blue("\u{2190}");
+                if msg.payload.get("error").is_some() {
+                    let err_msg = msg
+                        .payload
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Unknown error");
+                    println!(
+                        "{time_str} {lang} {arrow} {} {}",
+                        msg.method,
+                        colors.red(err_msg)
+                    );
                 } else {
-                    let max_len = term_width.saturating_sub(14 + basename.len() + 20);
-                    format!(" -- {}", cli::truncate(preview, max_len))
-                };
-                println!("{time_str} {basename}: {label}{detail}");
+                    println!("{time_str} {lang} {arrow} {}", msg.method);
+                }
+            } else {
+                let arrow = colors.green("\u{2192}");
+                println!("{time_str} {lang} {arrow} {}", msg.method);
             }
         }
-        EventKind::ProtocolMessage {
-            protocol,
-            language,
-            direction,
-            message,
-        } => {
-            let tag = match protocol {
-                Protocol::Mcp => "[mcp]".to_string(),
-                Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
-            };
-            let arrow_colored = match direction {
-                Direction::Recv => colors.green("\u{2192}"),
-                Direction::Send => colors.blue("\u{2190}"),
-            };
-
-            // Extract meaningful info from protocol message
-            let summary = extract_mcp_summary(message, colors);
-
-            // Calculate available width for message
-            // Format: [HH:MM:SS] [tag] → summary
-            let prefix_len = 10 + tag.len() + 2 + 2; // [time] + tag + arrow + spaces
+        "mcp" => {
+            let summary = extract_message_summary(&msg.payload, colors);
+            let prefix_len = 10 + 5 + 2 + 2; // [time] + [mcp] + arrow + spaces
             let max_summary_len = term_width.saturating_sub(prefix_len);
 
-            let summary = cli::truncate(&summary, max_summary_len);
-            println!("{time_str} {tag} {arrow_colored} {summary}");
+            if is_response {
+                let arrow = colors.blue("\u{2190}");
+                let summary = cli::truncate(&summary, max_summary_len);
+                println!("{time_str} [mcp] {arrow} {summary}");
+            } else {
+                let arrow = colors.green("\u{2192}");
+                let summary = cli::truncate(&summary, max_summary_len);
+                println!("{time_str} [mcp] {arrow} {summary}");
+            }
 
-            // Check for errors in response
-            if matches!(direction, Direction::Send)
-                && let Some(obj) = message.as_object()
-                && obj.contains_key("error")
-                && let Some(error) = obj.get("error")
-            {
+            if let Some(error) = msg.payload.get("error") {
                 let err_msg = error
                     .get("message")
-                    .and_then(|m: &serde_json::Value| m.as_str())
+                    .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
                 println!("    {}", colors.red(&format!("Error: {err_msg}")));
             }
         }
+        "hook" => {
+            if let Some(count_val) = msg.payload.get("count") {
+                let count = count_val.as_u64().unwrap_or(0);
+                let file = msg
+                    .payload
+                    .get("file")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or(&msg.method);
+                let basename = std::path::Path::new(file)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(file);
+
+                if count == 0 {
+                    let check = colors.green("ok");
+                    println!("{time_str} {basename}: {check}");
+                } else {
+                    let label = colors.yellow(&format!(
+                        "{count} diagnostic{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                    let preview = msg
+                        .payload
+                        .get("preview")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    let detail = if preview.is_empty() {
+                        String::new()
+                    } else {
+                        let max_len = term_width.saturating_sub(14 + basename.len() + 20);
+                        format!(" -- {}", cli::truncate(preview, max_len))
+                    };
+                    println!("{time_str} {basename}: {label}{detail}");
+                }
+            } else {
+                println!("{time_str} [hook] {}", msg.method);
+            }
+        }
+        other => {
+            println!("{time_str} [{other}] {}", msg.method);
+        }
     }
 }
 
-/// Extract a human-readable summary from an MCP message.
-fn extract_mcp_summary(message: &serde_json::Value, colors: &ColorConfig) -> String {
-    let Some(obj) = message.as_object() else {
-        return message.to_string();
+/// Extract a human-readable summary from a JSON-RPC payload.
+fn extract_message_summary(payload: &serde_json::Value, colors: &ColorConfig) -> String {
+    let Some(obj) = payload.as_object() else {
+        return payload.to_string();
     };
 
-    // Check if this is a request (has method)
     obj.get("method").and_then(|m| m.as_str()).map_or_else(
         || {
-            // Check if this is a response (has result or error)
             if obj.contains_key("result") || obj.contains_key("error") {
                 let id = obj.get("id").map(|i| format!("#{i}")).unwrap_or_default();
-
                 if obj.contains_key("error") {
                     format!("{} {}", colors.red("error"), id)
                 } else {
                     format!("result {id}")
                 }
             } else {
-                // Fallback: show compact JSON
-                serde_json::to_string(message).unwrap_or_default()
+                serde_json::to_string(payload).unwrap_or_default()
             }
         },
         |method| {
             let id = obj.get("id").map(|i| format!("#{i}")).unwrap_or_default();
-
-            // Extract params summary based on method
             let params_summary = match method {
                 "tools/call" => {
                     if let Some(params) = obj.get("params")
                         && let Some(name) = params.get("name").and_then(|n| n.as_str())
                     {
-                        // Try to get file argument if present
                         let file_info = params
                             .get("arguments")
                             .and_then(|a| a.get("file_path").or_else(|| a.get("path")))
                             .and_then(|f| f.as_str())
                             .map(|f| {
-                                // Just show filename, not full path
                                 std::path::Path::new(f)
                                     .file_name()
                                     .and_then(|n| n.to_str())
@@ -1075,13 +1062,6 @@ fn extract_mcp_summary(message: &serde_json::Value, colors: &ColorConfig) -> Str
             }
         },
     )
-}
-
-/// Print an event in human-readable format (used by `run_status`).
-fn print_event(event: &SessionEvent) {
-    let colors = ColorConfig::new(false);
-    let term_width = cli::terminal_width();
-    print_event_annotated(event, &colors, term_width);
 }
 
 #[cfg(test)]
@@ -1173,12 +1153,87 @@ mod tests {
     // ── query tests ─────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "05b: uses removed EventBroadcaster"]
-    fn test_query_with_kind_filter() {}
+    fn test_query_with_type_filter() -> anyhow::Result<()> {
+        let (_dir, path, conn) = test_db();
+        let conn_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
+            &path,
+        )?));
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = session::MessageLog::new(conn_arc, "s1".to_string());
+        log.log(
+            "mcp",
+            "tools/call",
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &serde_json::json!({"params": {"name": "grep"}}),
+        );
+        log.log(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            "catenary",
+            None,
+            None,
+            &serde_json::json!({}),
+        );
+
+        // Query with --kind mcp should work (now --type)
+        run_query(
+            &conn,
+            Some("s1"),
+            None,
+            Some("mcp"),
+            None,
+            None,
+            QueryFormat::Table,
+        )?;
+        Ok(())
+    }
 
     #[test]
-    #[ignore = "05b: uses removed EventBroadcaster"]
-    fn test_query_with_search() {}
+    fn test_query_with_search() -> anyhow::Result<()> {
+        let (_dir, path, conn) = test_db();
+        let conn_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
+            &path,
+        )?));
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let log = session::MessageLog::new(conn_arc, "s1".to_string());
+        log.log(
+            "mcp",
+            "tools/call",
+            "catenary",
+            "claude-code",
+            None,
+            None,
+            &serde_json::json!({"params": {"name": "grep"}}),
+        );
+
+        // Search for "grep" in payload should succeed
+        run_query(
+            &conn,
+            Some("s1"),
+            None,
+            None,
+            Some("grep"),
+            None,
+            QueryFormat::Table,
+        )?;
+        Ok(())
+    }
 
     // ── gc tests ────────────────────────────────────────────────────
 

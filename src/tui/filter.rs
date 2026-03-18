@@ -12,8 +12,8 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use super::theme::{Theme, format_event_plain};
-use crate::session::SessionEvent;
+use super::theme::{Theme, format_message_plain};
+use crate::session::SessionMessage;
 
 /// Maximum number of autocomplete suggestions shown.
 const MAX_SUGGESTIONS: usize = 5;
@@ -277,18 +277,18 @@ impl FilterState {
 
 // ── Filtering ────────────────────────────────────────────────────────────
 
-/// Return indices of events matching the pattern.
+/// Return indices of messages matching the pattern.
 ///
 /// Performs a case-insensitive substring match on the plain-text
-/// representation of each event (via [`format_event_plain`]).
+/// representation of each message (via [`format_message_plain`]).
 #[must_use]
-pub fn filter_events(events: &[SessionEvent], pattern: &str) -> Vec<usize> {
+pub fn filter_messages(messages: &[SessionMessage], pattern: &str) -> Vec<usize> {
     let lower_pattern = pattern.to_lowercase();
-    events
+    messages
         .iter()
         .enumerate()
-        .filter(|(_, ev)| {
-            format_event_plain(ev)
+        .filter(|(_, msg)| {
+            format_message_plain(msg)
                 .to_lowercase()
                 .contains(&lower_pattern)
         })
@@ -407,22 +407,23 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::config::IconConfig;
-    use crate::session::{EventKind, SessionEvent};
-    use crate::tui::theme::IconSet;
+    use crate::session::SessionMessage;
 
     fn test_theme() -> Theme {
         Theme::new()
     }
 
-    fn test_icons() -> IconSet {
-        IconSet::from_config(IconConfig::default())
-    }
-
-    fn make_event(kind: EventKind) -> SessionEvent {
-        SessionEvent {
+    fn make_message(method: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: "mcp".to_string(),
+            method: method.to_string(),
+            server: "catenary".to_string(),
+            client: "claude-code".to_string(),
+            request_id: None,
+            parent_id: None,
             timestamp: chrono::Utc::now(),
-            kind,
+            payload: serde_json::json!({"params": {"name": method}}),
         }
     }
 
@@ -635,40 +636,26 @@ mod tests {
         );
     }
 
-    // ── 10. filter_events case insensitive ──────────────────────────────
+    // ── 10. filter_messages case insensitive ─────────────────────────────
 
     #[test]
-    fn test_filter_events_case_insensitive() {
-        let events = vec![
-            make_event(EventKind::ToolCall {
-                tool: "Hover".to_string(),
-                file: None,
-                params: None,
-            }),
-            make_event(EventKind::ToolCall {
-                tool: "hover".to_string(),
-                file: None,
-                params: None,
-            }),
-        ];
+    fn test_filter_messages_case_insensitive() {
+        let messages = vec![make_message("Hover"), make_message("hover")];
 
-        let result = filter_events(&events, "HOVER");
+        let result = filter_messages(&messages, "HOVER");
         // Both should match.
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], 0);
         assert_eq!(result[1], 1);
     }
 
-    // ── 11. filter_events no match ──────────────────────────────────────
+    // ── 11. filter_messages no match ──────────────────────────────────────
 
     #[test]
-    fn test_filter_events_no_match() {
-        let events = vec![
-            make_event(EventKind::Started),
-            make_event(EventKind::Shutdown),
-        ];
+    fn test_filter_messages_no_match() {
+        let messages = vec![make_message("tools/call"), make_message("initialize")];
 
-        let result = filter_events(&events, "zzzzz");
+        let result = filter_messages(&messages, "zzzzz");
         assert!(result.is_empty());
     }
 
@@ -677,7 +664,6 @@ mod tests {
     #[test]
     fn test_render_filter_bar_typing() {
         let theme = test_theme();
-        let _icons = test_icons();
         let mut f = FilterState::new(FilterScope::Local(0));
         for c in "hov".chars() {
             f.push_char(c);
@@ -710,7 +696,6 @@ mod tests {
     #[test]
     fn test_render_filter_bar_with_suggestion() {
         let theme = test_theme();
-        let _icons = test_icons();
         let mut f = FilterState::new(FilterScope::Local(0));
         for c in "hover error".chars() {
             f.push_char(c);
@@ -751,7 +736,6 @@ mod tests {
     #[test]
     fn test_render_filter_liftup() {
         let theme = test_theme();
-        let _icons = test_icons();
         let mut f = FilterState::new(FilterScope::Local(0));
 
         // Build history with 3 matching entries.

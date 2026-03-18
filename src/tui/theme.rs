@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::config::{IconConfig, IconPreset};
-use crate::session::{Direction, EventKind, Protocol, SessionEvent, SessionMessage};
+use crate::session::SessionMessage;
 
 // ── Theme ────────────────────────────────────────────────────────────────
 
@@ -677,57 +677,6 @@ pub fn format_ago(started: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Plain-text event summary (used for filter matching).
-#[must_use]
-pub fn format_event_plain(ev: &SessionEvent) -> String {
-    let ts = ev.timestamp.format("%H:%M:%S");
-    match &ev.kind {
-        EventKind::Started => format!("{ts} session started"),
-        EventKind::Shutdown => format!("{ts} session shutdown"),
-        EventKind::ServerState { language, state } => format!("{ts} {language} {state}"),
-        EventKind::Progress {
-            language, title, ..
-        } => format!("{ts} {language} {title}"),
-        EventKind::ProgressEnd { language } => format!("{ts} {language} complete"),
-        EventKind::ToolCall { tool, file, .. } => {
-            format!("{ts} {tool} {}", file.as_deref().unwrap_or(""))
-        }
-        EventKind::ToolResult {
-            tool,
-            success,
-            output: _,
-            ..
-        } => {
-            format!("{ts} {tool} {}", if *success { "ok" } else { "error" })
-        }
-        EventKind::Diagnostics {
-            file,
-            count,
-            preview,
-        } => format!("{ts} {file} {count} {preview}"),
-        EventKind::ProtocolMessage {
-            protocol,
-            language,
-            direction,
-            message,
-        } => {
-            let tag = match protocol {
-                Protocol::Mcp => "[mcp]".to_string(),
-                Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
-            };
-            let arrow = match direction {
-                Direction::Send => "\u{2192}",
-                Direction::Recv => "\u{2190}",
-            };
-            let method = message
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("response");
-            format!("{ts} {tag} {arrow} {method}")
-        }
-    }
-}
-
 /// Choose an icon for a tool call based on the tool name.
 #[must_use]
 pub fn tool_icon<'a>(name: &str, icons: &'a IconSet) -> &'a str {
@@ -768,133 +717,6 @@ pub fn diag_style<'a>(
         (&icons.diag_info, theme.info)
     } else {
         (&icons.diag_warn, theme.warning)
-    }
-}
-
-/// Build a styled [`Line`] for a single event.
-#[must_use]
-#[allow(clippy::too_many_lines, reason = "match arms for each event kind")]
-pub fn format_event_styled(ev: &SessionEvent, icons: &IconSet, theme: &Theme) -> Line<'static> {
-    let ts = ev.timestamp.format("%H:%M:%S").to_string();
-    let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
-
-    match &ev.kind {
-        EventKind::Started => Line::from(vec![
-            ts_span,
-            Span::styled(icons.session_started.clone(), theme.success),
-            Span::styled("session started", theme.text),
-        ]),
-        EventKind::Shutdown => Line::from(vec![
-            ts_span,
-            Span::styled(icons.session_shutdown.clone(), theme.muted),
-            Span::styled("session shutdown", theme.text),
-        ]),
-        EventKind::ServerState { language, state } => Line::from(vec![
-            ts_span,
-            Span::styled(icons.server_state.clone(), theme.accent),
-            Span::styled(format!("[{language}] "), theme.accent),
-            Span::styled(format!("state → {state}"), theme.text),
-        ]),
-        EventKind::Progress {
-            language,
-            title,
-            message,
-            percentage,
-        } => {
-            let pct = percentage.map_or(String::new(), |p| format!(" ({p}%)"));
-            let msg = message.as_ref().map_or(String::new(), |m| format!(": {m}"));
-            Line::from(vec![
-                ts_span,
-                Span::styled(icons.progress.clone(), theme.text),
-                Span::styled(format!("[{language}] "), theme.accent),
-                Span::styled(format!("{title}{msg}{pct}"), theme.text),
-            ])
-        }
-        EventKind::ProgressEnd { language } => Line::from(vec![
-            ts_span,
-            Span::styled(icons.progress.clone(), theme.text),
-            Span::styled(format!("[{language}] "), theme.accent),
-            Span::styled("complete", theme.text),
-        ]),
-        EventKind::ToolCall { tool, file, .. } => {
-            let icon = tool_icon(tool, icons);
-            let file_str = file
-                .as_ref()
-                .map(|f| format!(" {}", basename(f)))
-                .unwrap_or_default();
-            Line::from(vec![
-                ts_span,
-                Span::styled(icon.to_string(), theme.success),
-                Span::styled(format!("{tool}{file_str}"), theme.text),
-            ])
-        }
-        EventKind::ToolResult {
-            tool,
-            success,
-            duration_ms,
-            ..
-        } => {
-            let (status_text, status_style) = if *success {
-                ("ok", theme.success)
-            } else {
-                ("error", theme.error)
-            };
-            Line::from(vec![
-                ts_span,
-                Span::styled(icons.tool_result.clone(), theme.info),
-                Span::styled(format!("{tool} {}", icons.tool_result_sep), theme.text),
-                Span::styled(status_text.to_string(), status_style),
-                Span::styled(format!(" ({duration_ms}ms)"), theme.text),
-            ])
-        }
-        EventKind::Diagnostics {
-            file,
-            count,
-            preview,
-        } => {
-            let (icon, style) = diag_style(*count, preview, icons, theme);
-            let base = basename(file);
-            if *count == 0 {
-                Line::from(vec![
-                    ts_span,
-                    Span::styled(icon.to_string(), style),
-                    Span::styled(base.to_string(), theme.text),
-                ])
-            } else {
-                let label = format!("{count} diagnostic{}", if *count == 1 { "" } else { "s" });
-                Line::from(vec![
-                    ts_span,
-                    Span::styled(icon.to_string(), style),
-                    Span::styled(format!("{base}: "), theme.text),
-                    Span::styled(label, style),
-                ])
-            }
-        }
-        EventKind::ProtocolMessage {
-            protocol,
-            language,
-            direction,
-            message,
-        } => {
-            let tag = match protocol {
-                Protocol::Mcp => "[mcp]".to_string(),
-                Protocol::Lsp => format!("[{}]", language.as_deref().unwrap_or("lsp")),
-            };
-            let arrow = match direction {
-                Direction::Send => "\u{2192}",
-                Direction::Recv => "\u{2190}",
-            };
-            let method = message
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("response");
-            Line::from(vec![
-                ts_span,
-                Span::styled(format!("{tag} "), theme.text),
-                Span::styled(format!("{arrow} "), theme.text),
-                Span::styled(method.to_string(), theme.text),
-            ])
-        }
     }
 }
 
@@ -1059,14 +881,7 @@ mod tests {
     use chrono::{TimeDelta, Utc};
 
     use crate::config::IconConfig;
-    use crate::session::{EventKind, SessionEvent, SessionMessage};
-
-    fn make_event(kind: EventKind) -> SessionEvent {
-        SessionEvent {
-            timestamp: Utc::now(),
-            kind,
-        }
-    }
+    use crate::session::SessionMessage;
 
     fn make_message(r#type: &str, method: &str, server: &str) -> SessionMessage {
         SessionMessage {
@@ -1166,29 +981,6 @@ mod tests {
         };
         let icons = IconSet::from_config(config);
         assert_eq!(icons.diag_error, "ERR ");
-    }
-
-    #[test]
-    fn test_format_event_plain_tool_call() {
-        let ev = make_event(EventKind::ToolCall {
-            tool: "grep".to_string(),
-            file: Some("/src/main.rs".to_string()),
-            params: None,
-        });
-        let plain = format_event_plain(&ev);
-        assert!(plain.contains("grep"));
-    }
-
-    #[test]
-    fn test_format_event_plain_diagnostics() {
-        let ev = make_event(EventKind::Diagnostics {
-            file: "/src/lib.rs".to_string(),
-            count: 3,
-            preview: "[error] something".to_string(),
-        });
-        let plain = format_event_plain(&ev);
-        assert!(plain.contains("lib.rs"));
-        assert!(plain.contains('3'));
     }
 
     #[test]
