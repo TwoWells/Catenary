@@ -10,7 +10,6 @@ intelligence to AI coding assistants.
 - **[Installation](installation.md)** — Get Catenary running
 - **[Configuration](configuration.md)** — Configure your language servers
 - **[LSP Servers](lsp/README.md)** — Language server setup guides
-- **[Roadmap](roadmap.md)** — What's next for Catenary
 
 ## What is Catenary?
 

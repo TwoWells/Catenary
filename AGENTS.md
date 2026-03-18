@@ -29,7 +29,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Hooks:** Catenary integrates with host CLIs (Claude Code, Gemini CLI) via
   hooks that fire before/after tool use. Hook definitions live in
   `plugins/catenary/hooks/hooks.json` (Claude Code) and `hooks/hooks.json`
-  (Gemini CLI). See `docs/src/plugin-architecture.md` for the full hook contract.
+  (Gemini CLI). See `internal_repo/architecture/catenary/plugin-architecture.md` for the full hook contract.
 - **Diagnostics:** The `catenary hook post-tool` command (`src/hook.rs` for the
   IPC server) runs in PostToolUse hooks after file edits. It connects to the
   running session's hook socket, sends the changed file path, and returns
@@ -40,7 +40,7 @@ find-references, rename, and search without shell-based text scanning.
 
 ### Architecture references
 
-- `docs/src/plugin-architecture.md` — plugin layout, hook contracts, version management.
+- `internal_repo/architecture/catenary/plugin-architecture.md` — plugin layout, hook contracts, version management.
 - `src/db.rs` — SQLite connection management, schema creation, and migrations.
 - `src/session.rs` — session lifecycle and event broadcasting.
 - `docs/src/` — full documentation source.

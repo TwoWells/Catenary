@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: build-release check deny test test-ignored test-scripts release release-patch release-minor release-major tag-current
+.PHONY: build-release check deny docs test test-ignored test-scripts release release-patch release-minor release-major tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -22,6 +22,10 @@ check:
 	@cargo clippy --tests --features mockls --quiet -- -D warnings
 	@cargo deny --log-level error check
 	@cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+
+# Build the mdbook documentation
+docs:
+	@mdbook build docs/
 
 # Run cargo-deny license and advisory checks
 deny:

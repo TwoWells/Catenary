@@ -298,6 +298,4 @@ require LSP.
 
 ## See Also
 
-- [Archive: CLI Design](archive/cli-design.md) — Original custom CLI design
-  (abandoned)
 - [Configuration](configuration.md) — catenary-mcp configuration reference
