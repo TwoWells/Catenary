@@ -27,7 +27,6 @@ async fn test_mockls_initialize() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
-        catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
         None,
     )?;
@@ -51,7 +50,6 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--workspace-folders"],
         MOCK_LANG_A,
-        catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
         None,
     )?;
@@ -81,7 +79,6 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
-        catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
         None,
     )?;
@@ -120,7 +117,6 @@ async fn test_client_capabilities() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--log-init-params", log_path],
         MOCK_LANG_A,
-        catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
         None,
     )?;
@@ -228,7 +224,6 @@ async fn test_content_modified_retry() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--content-modified-once"],
         MOCK_LANG_A,
-        catenary_mcp::session::EventBroadcaster::noop(),
         test_message_log(),
         None,
     )?;

@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::diagnostics_server::DiagnosticsServer;
 use crate::bridge::sync_roots_server::SyncRootsServer;
-use crate::session::{EventBroadcaster, EventKind, MessageLog};
+use crate::session::MessageLog;
 
 /// Request from `catenary hook PostToolUse` (file change) or `catenary hook PreToolUse` (root sync).
 #[derive(Debug, Deserialize)]
@@ -72,7 +72,6 @@ pub enum NotifyResult {
 pub struct HookServer {
     diagnostics: Arc<DiagnosticsServer>,
     sync_roots: SyncRootsServer,
-    broadcaster: EventBroadcaster,
     message_log: Arc<MessageLog>,
     client_name: String,
 }
@@ -83,14 +82,12 @@ impl HookServer {
     pub const fn new(
         diagnostics: Arc<DiagnosticsServer>,
         sync_roots: SyncRootsServer,
-        broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,
         client_name: String,
     ) -> Self {
         Self {
             diagnostics,
             sync_roots,
-            broadcaster,
             message_log,
             client_name,
         }
@@ -259,15 +256,7 @@ impl HookServer {
     /// Processes a file change notification and returns a [`NotifyResult`] as JSON.
     async fn process_file(&self, file_path: &str, entry_id: i64) -> String {
         let result = match self.diagnostics.process_file(file_path, entry_id).await {
-            Ok(diag_result) => {
-                // Broadcast diagnostics event for monitor visibility
-                self.broadcaster.send(EventKind::Diagnostics {
-                    file: file_path.to_string(),
-                    count: diag_result.count,
-                    preview: diag_result.content.clone(),
-                });
-                NotifyResult::Content(diag_result.content)
-            }
+            Ok(diag_result) => NotifyResult::Content(diag_result.content),
             Err(e) => {
                 warn!("Notify error for {file_path}: {e}");
                 NotifyResult::Error(e.to_string())

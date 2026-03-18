@@ -3,8 +3,36 @@
 
 //! CLI utilities for terminal output formatting and colors.
 
+pub mod commands;
+pub mod doctor;
+pub mod hooks;
+
+use clap::ValueEnum;
 use crossterm::tty::IsTty;
 use std::io::stdout;
+
+/// Output format for hook commands.
+///
+/// Determines how hook output is structured for the host CLI.
+/// Required on all hook-facing subcommands (`notify`, `sync-roots`).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum HostFormat {
+    /// Claude Code hooks (`PostToolUse` / `PreToolUse`).
+    Claude,
+    /// Gemini CLI hooks (`AfterTool` / `BeforeTool`).
+    Gemini,
+}
+
+/// Output format for the `query` command.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum QueryFormat {
+    /// Human-readable table.
+    Table,
+    /// JSON array.
+    Json,
+    /// Comma-separated values with headers.
+    Csv,
+}
 
 /// Configuration for color output.
 #[derive(Debug, Clone)]

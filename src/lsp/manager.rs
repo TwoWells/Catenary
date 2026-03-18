@@ -13,31 +13,24 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::lsp::LspClient;
 use crate::lsp::state::ServerStatus;
-use crate::session::{EventBroadcaster, MessageLog};
+use crate::session::MessageLog;
 
 /// Manages the lifecycle of LSP clients (spawning, caching, shutdown).
 pub struct ClientManager {
     config: Config,
     roots: Mutex<Vec<PathBuf>>,
     active_clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
-    broadcaster: EventBroadcaster,
     message_log: Arc<MessageLog>,
 }
 
 impl ClientManager {
     /// Creates a new `ClientManager`.
     #[must_use]
-    pub fn new(
-        config: Config,
-        roots: Vec<PathBuf>,
-        broadcaster: EventBroadcaster,
-        message_log: Arc<MessageLog>,
-    ) -> Self {
+    pub fn new(config: Config, roots: Vec<PathBuf>, message_log: Arc<MessageLog>) -> Self {
         Self {
             config,
             roots: Mutex::new(roots),
             active_clients: Mutex::new(HashMap::new()),
-            broadcaster,
             message_log,
         }
     }
@@ -327,7 +320,6 @@ impl ClientManager {
             &server_config.command,
             &args,
             lang,
-            self.broadcaster.clone(),
             self.message_log.clone(),
             server_config.settings.clone(),
         )?;
@@ -623,11 +615,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_returns_initial_roots() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
-            broadcaster,
             test_message_log(),
         );
 
@@ -640,11 +630,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_root_appends() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
-            broadcaster,
             test_message_log(),
         );
 
@@ -661,8 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_empty_initial() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop();
-        let manager = ClientManager::new(test_config(), vec![], broadcaster, test_message_log());
+        let manager = ClientManager::new(test_config(), vec![], test_message_log());
 
         assert!(manager.roots().await.is_empty());
         Ok(())
@@ -670,11 +657,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_root() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
-            broadcaster,
             test_message_log(),
         );
 
@@ -690,11 +675,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_roots_adds_and_removes() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
-            broadcaster,
             test_message_log(),
         );
 
@@ -715,11 +698,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_roots_no_change() -> Result<()> {
-        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
-            broadcaster,
             test_message_log(),
         );
 
@@ -737,11 +718,9 @@ mod tests {
     async fn test_sync_roots_shuts_down_unsupported_client() -> Result<()> {
         // mockls without --workspace-folders does NOT advertise workspace folder support.
         // When roots change, the client should be shut down (and lazily respawned).
-        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            broadcaster,
             test_message_log(),
         );
 
@@ -795,13 +774,7 @@ mod tests {
             tui: crate::config::TuiConfig::default(),
         };
 
-        let broadcaster = EventBroadcaster::noop();
-        let manager = ClientManager::new(
-            config,
-            vec![PathBuf::from("/tmp")],
-            broadcaster,
-            test_message_log(),
-        );
+        let manager = ClientManager::new(config, vec![PathBuf::from("/tmp")], test_message_log());
 
         // get_client spawns + initializes; mockls sends workspace/configuration
         // during init. If Catenary responds correctly, initialization succeeds.
@@ -815,11 +788,9 @@ mod tests {
     async fn test_sync_roots_notifies_supported_client() -> Result<()> {
         // mockls with --workspace-folders DOES advertise workspace folder support.
         // When roots change, it should receive a notification instead of being shut down.
-        let broadcaster = EventBroadcaster::noop();
         let manager = ClientManager::new(
             mockls_workspace_folders_config(),
             vec![PathBuf::from("/tmp")],
-            broadcaster,
             test_message_log(),
         );
 

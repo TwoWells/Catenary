@@ -312,7 +312,6 @@ pub struct Session {
     pub info: SessionInfo,
 
     conn: Arc<Mutex<Connection>>,
-    broadcaster: EventBroadcaster,
     message_log: Arc<MessageLog>,
 
     /// Path to the notify IPC endpoint (if started).
@@ -380,24 +379,14 @@ impl Session {
         std::fs::create_dir_all(&socket_dir)
             .with_context(|| format!("failed to create socket dir: {}", socket_dir.display()))?;
 
-        let broadcaster = EventBroadcaster {
-            inner: BroadcasterInner::Live {
-                conn: conn.clone(),
-                session_id: info.id.clone(),
-            },
-        };
-
         let message_log = Arc::new(MessageLog::new(conn.clone(), info.id.clone()));
 
         let session = Self {
             info,
             conn,
-            broadcaster,
             message_log,
             socket_path: None,
         };
-
-        session.broadcast(EventKind::Started);
 
         Ok(session)
     }
@@ -459,21 +448,6 @@ impl Session {
         }
     }
 
-    /// Broadcast an event to listeners.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "public API takes ownership by convention"
-    )]
-    pub fn broadcast(&self, kind: EventKind) {
-        self.broadcaster.send(kind);
-    }
-
-    /// Get a broadcaster that can be cloned and shared.
-    #[must_use]
-    pub fn broadcaster(&self) -> EventBroadcaster {
-        self.broadcaster.clone()
-    }
-
     /// Get the message log for this session.
     #[must_use]
     pub const fn message_log(&self) -> &Arc<MessageLog> {
@@ -483,8 +457,6 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.broadcast(EventKind::Shutdown);
-
         if let Ok(c) = self.conn.lock() {
             let _ = c.execute(
                 "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
@@ -506,12 +478,17 @@ impl Drop for Session {
 }
 
 /// Cloneable broadcaster for sharing across components.
+///
+/// Retained for type compatibility during the collapse migration.
+/// Removed in ticket 05b.
 #[derive(Clone)]
+#[allow(dead_code, reason = "05b removes EventBroadcaster entirely")]
 pub struct EventBroadcaster {
     inner: BroadcasterInner,
 }
 
 #[derive(Clone)]
+#[allow(dead_code, reason = "05b removes EventBroadcaster entirely")]
 enum BroadcasterInner {
     Live {
         conn: Arc<Mutex<Connection>>,
@@ -1345,60 +1322,6 @@ mod tests {
     }
 
     #[test]
-    fn test_event_broadcast() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let session = create_session(&path, "/tmp/test-events")?;
-        let id = session.info.id.clone();
-
-        session.broadcast(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Busy".to_string(),
-        });
-
-        session.broadcast(EventKind::Progress {
-            language: "rust".to_string(),
-            title: "Loading".to_string(),
-            message: Some("crates".to_string()),
-            percentage: Some(50),
-        });
-
-        // Read events back (Started + 2 broadcast events = at least 3)
-        assert!(monitor_events_with_conn(&conn, &id)?.len() >= 3);
-
-        drop(session);
-        delete_session_data_with_conn(&conn, &id)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_event_broadcast_serialization() -> Result<()> {
-        let (_dir, path, conn) = test_db();
-        let session = create_session(&path, "/tmp/test-serialization")?;
-        let id = session.info.id.clone();
-
-        session.broadcast(EventKind::ToolCall {
-            tool: "grep".to_string(),
-            file: Some("/tmp/test.rs".to_string()),
-            params: None,
-        });
-
-        let events = monitor_events_with_conn(&conn, &id)?;
-        let tool_call = events
-            .iter()
-            .find(|e| matches!(&e.kind, EventKind::ToolCall { .. }))
-            .expect("ToolCall event should be present");
-
-        if let EventKind::ToolCall { tool, file, .. } = &tool_call.kind {
-            assert_eq!(tool, "grep");
-            assert_eq!(file.as_deref(), Some("/tmp/test.rs"));
-        }
-
-        drop(session);
-        delete_session_data_with_conn(&conn, &id)?;
-        Ok(())
-    }
-
-    #[test]
     fn test_session_set_client_info() -> Result<()> {
         let (_dir, path, conn) = test_db();
         let mut session = create_session(&path, "/tmp/test-client-info")?;
@@ -1414,18 +1337,6 @@ mod tests {
         drop(session);
         delete_session_data_with_conn(&conn, &id)?;
         Ok(())
-    }
-
-    #[test]
-    fn test_broadcaster_noop() {
-        let broadcaster = EventBroadcaster::noop();
-
-        // Should not panic or error
-        broadcaster.send(EventKind::Started);
-        broadcaster.send(EventKind::ServerState {
-            language: "rust".to_string(),
-            state: "Ready".to_string(),
-        });
     }
 
     #[test]

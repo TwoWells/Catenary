@@ -13,7 +13,7 @@ use super::types::{
     ListToolsResult, METHOD_NOT_FOUND, Notification, Request, RequestId, Response, Root,
     RootsListResult, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
-use crate::session::{Direction, EventBroadcaster, EventKind, MessageLog, Protocol};
+use crate::session::MessageLog;
 
 /// MCP protocol versions this server supports (newest first).
 const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
@@ -47,7 +47,6 @@ pub type RootsChangedCallback = Box<dyn Fn(Vec<Root>) -> Result<()> + Send + Syn
 pub struct McpServer<H: ToolHandler> {
     handler: H,
     initialized: bool,
-    broadcaster: EventBroadcaster,
     message_log: Arc<MessageLog>,
     /// Name of the connected MCP client (learned during initialize).
     client_name: String,
@@ -66,11 +65,10 @@ pub struct McpServer<H: ToolHandler> {
 
 impl<H: ToolHandler> McpServer<H> {
     /// Creates a new `McpServer`.
-    pub fn new(handler: H, broadcaster: EventBroadcaster, message_log: Arc<MessageLog>) -> Self {
+    pub fn new(handler: H, message_log: Arc<MessageLog>) -> Self {
         Self {
             handler,
             initialized: false,
-            broadcaster,
             message_log,
             client_name: "unknown".to_string(),
             on_client_info: None,
@@ -130,16 +128,9 @@ impl<H: ToolHandler> McpServer<H> {
 
             trace!("Received: {}", trimmed);
 
-            // Broadcast incoming message
+            // Log incoming message
             let (entry_id, method) =
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    self.broadcaster.send(EventKind::ProtocolMessage {
-                        protocol: Protocol::Mcp,
-                        language: None,
-                        direction: Direction::Recv,
-                        message: json.clone(),
-                    });
-
                     let method = json
                         .get("method")
                         .and_then(|m| m.as_str())
@@ -213,13 +204,6 @@ impl<H: ToolHandler> McpServer<H> {
         trace!("Sending: {}", response_json);
 
         if let Ok(json) = serde_json::to_value(response) {
-            self.broadcaster.send(EventKind::ProtocolMessage {
-                protocol: Protocol::Mcp,
-                language: None,
-                direction: Direction::Send,
-                message: json.clone(),
-            });
-
             self.message_log.log(
                 "mcp",
                 method,
@@ -421,10 +405,6 @@ impl<H: ToolHandler> McpServer<H> {
     }
 
     /// Inner implementation of [`Self::fetch_roots`].
-    #[allow(
-        clippy::too_many_lines,
-        reason = "dual logging adds lines; will shrink when old EventBroadcaster is removed"
-    )]
     fn fetch_roots_inner(
         &mut self,
         reader: &mut impl BufRead,
@@ -442,15 +422,8 @@ impl<H: ToolHandler> McpServer<H> {
             serde_json::to_string(&request).context("Failed to serialize roots/list request")?;
         trace!("Sending roots/list request: {}", request_json);
 
-        // Broadcast outbound request
+        // Log outbound request
         let outbound_entry_id = if let Ok(json) = serde_json::to_value(&request) {
-            self.broadcaster.send(EventKind::ProtocolMessage {
-                protocol: Protocol::Mcp,
-                language: None,
-                direction: Direction::Send,
-                message: json.clone(),
-            });
-
             self.message_log.log(
                 "mcp",
                 "roots/list",
@@ -491,16 +464,9 @@ impl<H: ToolHandler> McpServer<H> {
 
             trace!("Received (during roots/list wait): {}", trimmed);
 
-            // Parse JSON once for disambiguation and broadcasting
+            // Parse JSON once for disambiguation and logging
             let json: serde_json::Value = serde_json::from_str(trimmed)
                 .context("Failed to parse JSON during roots/list wait")?;
-
-            self.broadcaster.send(EventKind::ProtocolMessage {
-                protocol: Protocol::Mcp,
-                language: None,
-                direction: Direction::Recv,
-                message: json.clone(),
-            });
 
             // Response: has `id` + no `method` + (`result` or `error`)
             let is_response = json.get("id").is_some()
@@ -639,11 +605,7 @@ mod tests {
 
     #[test]
     fn test_handle_initialize() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -673,11 +635,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_list() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -698,11 +656,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_success() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -725,11 +679,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_error() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -751,11 +701,7 @@ mod tests {
 
     #[test]
     fn test_handle_unknown_method() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -775,11 +721,7 @@ mod tests {
 
     #[test]
     fn test_handle_ping() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -817,11 +759,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_stored_when_present() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         assert!(!server.client_has_roots);
 
         initialize_server(&mut server, true)?;
@@ -831,11 +769,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_absent_by_default() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
         Ok(())
@@ -843,11 +777,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_after_initialized() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -864,11 +794,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_on_list_changed() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -884,11 +810,7 @@ mod tests {
 
     #[test]
     fn test_no_fetch_without_capability() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, false)?;
 
         let notification = Notification {
@@ -907,11 +829,7 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -962,11 +880,7 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1028,11 +942,7 @@ mod tests {
     fn test_fetch_roots_handles_error_response() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -1054,11 +964,7 @@ mod tests {
 
     #[test]
     fn test_list_changed_honored_without_capability() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         // Initialize WITHOUT roots capability
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
@@ -1077,11 +983,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_without_list_changed() -> Result<()> {
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
 
         // Initialize with `roots: {}` (no listChanged field)
         let request = Request {
@@ -1105,11 +1007,7 @@ mod tests {
     fn test_fetching_roots_reset_on_error() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(
-            TestHandler,
-            EventBroadcaster::noop(),
-            Arc::new(MessageLog::noop()),
-        );
+        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -1172,7 +1070,7 @@ mod tests {
     #[test]
     fn test_mcp_log_initialize() -> Result<()> {
         let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+        let mut server = McpServer::new(TestHandler, log);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1222,7 +1120,7 @@ mod tests {
     #[test]
     fn test_mcp_log_tools_call() -> Result<()> {
         let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+        let mut server = McpServer::new(TestHandler, log);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1265,7 +1163,7 @@ mod tests {
     #[test]
     fn test_mcp_log_notification() -> Result<()> {
         let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+        let mut server = McpServer::new(TestHandler, log);
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
@@ -1299,7 +1197,7 @@ mod tests {
     #[test]
     fn test_mcp_log_client_name() -> Result<()> {
         let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, EventBroadcaster::noop(), log);
+        let mut server = McpServer::new(TestHandler, log);
 
         // Initialize to set client_name
         let init_request = Request {

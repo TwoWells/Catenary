@@ -20,8 +20,6 @@ pub mod filter;
 pub mod hook;
 /// Grammar installation, listing, and removal for tree-sitter integration.
 pub mod install;
-/// Logger trait for capturing protocol events.
-pub mod logger;
 /// LSP client implementation and server management.
 pub mod lsp;
 /// MCP server implementation and type definitions.

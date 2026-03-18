@@ -18,7 +18,7 @@ use super::params;
 use super::server::LspServer;
 use super::state::{ServerState, ServerStatus};
 use super::wait::load_aware_grace;
-use crate::session::{EventBroadcaster, EventKind, MessageLog};
+use crate::session::MessageLog;
 
 /// Cached diagnostics for a file: `(version, diagnostics)`.
 ///
@@ -104,7 +104,6 @@ impl LspClient {
         program: &str,
         args: &[&str],
         language: &str,
-        broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
@@ -112,7 +111,6 @@ impl LspClient {
             program,
             args,
             language,
-            broadcaster,
             message_log,
             Stdio::inherit(),
             settings,
@@ -128,40 +126,20 @@ impl LspClient {
         program: &str,
         args: &[&str],
         language: &str,
-        broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,
     ) -> Result<Self> {
-        Self::spawn_inner(
-            program,
-            args,
-            language,
-            broadcaster,
-            message_log,
-            Stdio::null(),
-            None,
-        )
+        Self::spawn_inner(program, args, language, message_log, Stdio::null(), None)
     }
 
     fn spawn_inner(
         program: &str,
         args: &[&str],
         language: &str,
-        broadcaster: EventBroadcaster,
         message_log: Arc<MessageLog>,
         stderr: Stdio,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
-        let inbox = Arc::new(ServerInbox::new(
-            language.to_string(),
-            broadcaster,
-            settings,
-        ));
-
-        // Broadcast initial state
-        inbox.broadcaster.send(EventKind::ServerState {
-            language: language.to_string(),
-            state: "Initializing".to_string(),
-        });
+        let inbox = Arc::new(ServerInbox::new(language.to_string(), settings));
 
         let connection = Connection::new(
             program,

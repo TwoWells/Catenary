@@ -15,7 +15,6 @@ use super::extract;
 use super::protocol::RpcError;
 use super::server::LspServer;
 use super::state::{ProgressTracker, ServerState};
-use crate::session::{EventBroadcaster, EventKind};
 
 /// Receives server-initiated messages from the Connection reader loop.
 ///
@@ -78,9 +77,8 @@ pub struct ServerInbox {
     // Server profile (set after initialize completes)
     lsp_server: OnceLock<Arc<LspServer>>,
 
-    // Identity / broadcast
+    // Identity
     pub(crate) language: String,
-    pub(crate) broadcaster: EventBroadcaster,
 
     // Configuration
     settings: Option<Value>,
@@ -88,11 +86,7 @@ pub struct ServerInbox {
 
 impl ServerInbox {
     /// Creates a new `ServerInbox` with default state.
-    pub(crate) fn new(
-        language: String,
-        broadcaster: EventBroadcaster,
-        settings: Option<Value>,
-    ) -> Self {
+    pub(crate) fn new(language: String, settings: Option<Value>) -> Self {
         Self {
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_generation: Arc::new(Mutex::new(HashMap::new())),
@@ -105,7 +99,6 @@ impl ServerInbox {
             publishes_version: Arc::new(AtomicBool::new(false)),
             lsp_server: OnceLock::new(),
             language,
-            broadcaster,
             settings,
         }
     }
@@ -236,20 +229,11 @@ impl Inbox for ServerInbox {
                             && let Some(p) = tracker.primary_progress()
                         {
                             debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
-                            self.broadcaster.send(EventKind::Progress {
-                                language: self.language.clone(),
-                                title: p.title.clone(),
-                                message: p.message.clone(),
-                                percentage: p.percentage,
-                            });
                         }
                     } else {
                         self.state
                             .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
                         debug!("Server ready (progress completed)");
-                        self.broadcaster.send(EventKind::ProgressEnd {
-                            language: self.language.clone(),
-                        });
                     }
                     // Fire notifies after state update
                     self.progress_notify.notify_waiters();
@@ -322,11 +306,7 @@ mod tests {
     use serde_json::json;
 
     fn test_inbox() -> ServerInbox {
-        ServerInbox::new(
-            "test".to_string(),
-            crate::session::EventBroadcaster::noop(),
-            None,
-        )
+        ServerInbox::new("test".to_string(), None)
     }
 
     #[test]
@@ -379,7 +359,6 @@ mod tests {
     fn configuration_request_uses_settings() {
         let inbox = ServerInbox::new(
             "test".to_string(),
-            crate::session::EventBroadcaster::noop(),
             Some(json!({"mockls": {"key": "value"}})),
         );
         let result = inbox

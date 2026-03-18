@@ -24,7 +24,6 @@ use super::symbols::{
 
 use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
-use crate::session::{EventBroadcaster, EventKind};
 
 /// Maximum unique LSP symbols for hover display in output. Above this
 /// threshold, hover content is omitted but structural enrichment (references,
@@ -58,12 +57,9 @@ pub struct LspBridgeHandler {
     pub(super) client_manager: Arc<ClientManager>,
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
     pub(super) runtime: Handle,
-    pub(super) broadcaster: EventBroadcaster,
     /// Languages whose servers have been reported offline to the agent.
     /// Used for one-time notification: offline is reported once, recovery once.
     notified_offline: std::sync::Mutex<HashSet<String>>,
-    /// Whether to capture full tool output in `ToolResult` events.
-    capture_tool_output: bool,
     /// Batch replacement tool with snapshots and diagnostics.
     replace: ReplaceServer,
 }
@@ -74,8 +70,6 @@ impl LspBridgeHandler {
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
-        broadcaster: EventBroadcaster,
-        capture_tool_output: bool,
         diagnostics: Arc<DiagnosticsServer>,
         session_id: Option<String>,
     ) -> Self {
@@ -90,9 +84,7 @@ impl LspBridgeHandler {
             client_manager,
             doc_manager,
             runtime,
-            broadcaster,
             notified_offline: std::sync::Mutex::new(HashSet::new()),
-            capture_tool_output,
             replace,
         }
     }
@@ -1177,32 +1169,16 @@ impl ToolHandler for LspBridgeHandler {
         ]
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Replace early dispatch adds necessary branching"
-    )]
     fn call_tool(
         &self,
         name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        let start = std::time::Instant::now();
         let file_path = if name == "glob" {
             Self::extract_glob_file_path(arguments.as_ref())
         } else {
             Self::extract_file_path(arguments.as_ref())
         };
-        let file = file_path.as_ref().map(|p| p.to_string_lossy().to_string());
-
-        let capture = self.capture_tool_output;
-        let params_snapshot = if capture { arguments.clone() } else { None };
-
-        // Broadcast tool call
-        self.broadcaster.send(EventKind::ToolCall {
-            tool: name.to_string(),
-            file,
-            params: params_snapshot.clone(),
-        });
 
         // Replace: early dispatch, no LSP readiness wait — handles its own
         // LSP interaction via DiagnosticsServer after the file write.
@@ -1210,35 +1186,13 @@ impl ToolHandler for LspBridgeHandler {
             let params = arguments.unwrap_or(serde_json::Value::Null);
             let result = self.runtime.block_on(self.replace.execute(&params, None));
 
-            let (success, output, call_result) = match result {
+            return match result {
                 Ok(v) => {
                     let text = v.as_str().unwrap_or("").to_string();
-                    let output = if capture {
-                        if text.is_empty() {
-                            None
-                        } else {
-                            Some(text.clone())
-                        }
-                    } else {
-                        None
-                    };
-                    (true, output, Ok(CallToolResult::text(text)))
+                    Ok(CallToolResult::text(text))
                 }
-                Err(e) => {
-                    let output = if capture { Some(e.to_string()) } else { None };
-                    (false, output, Err(e))
-                }
+                Err(e) => Err(e),
             };
-
-            self.broadcaster.send(EventKind::ToolResult {
-                tool: name.to_string(),
-                success,
-                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                output,
-                params: params_snapshot,
-            });
-
-            return call_result;
         }
 
         // Wait for LSP readiness, then check server health.
@@ -1270,18 +1224,6 @@ impl ToolHandler for LspBridgeHandler {
         // File-scoped tool with dead server: skip dispatch, return notification
         if !health.dead.is_empty() && file_path.is_some() && name != "glob" {
             let notification = health.notification.unwrap_or_default();
-            let output = if capture {
-                Some(notification.clone())
-            } else {
-                None
-            };
-            self.broadcaster.send(EventKind::ToolResult {
-                tool: name.to_string(),
-                success: true,
-                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                output,
-                params: params_snapshot,
-            });
             return Ok(CallToolResult::text(notification));
         }
 
@@ -1298,35 +1240,6 @@ impl ToolHandler for LspBridgeHandler {
         {
             res.content.insert(0, ToolContent::Text { text: note });
         }
-
-        let (success, output) = match &result {
-            Ok(res) => {
-                let output = if capture {
-                    let text: String = res
-                        .content
-                        .iter()
-                        .map(|c| {
-                            let ToolContent::Text { text } = c;
-                            text.as_str()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if text.is_empty() { None } else { Some(text) }
-                } else {
-                    None
-                };
-                (res.is_error.is_none(), output)
-            }
-            Err(e) => (false, if capture { Some(e.to_string()) } else { None }),
-        };
-
-        self.broadcaster.send(EventKind::ToolResult {
-            tool: name.to_string(),
-            success,
-            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            output,
-            params: params_snapshot,
-        });
 
         result
     }

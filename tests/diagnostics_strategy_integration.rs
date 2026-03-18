@@ -289,8 +289,6 @@ fn test_diagnostics_server_death() -> Result<()> {
 #[tokio::test]
 async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
     use catenary_mcp::lsp::{DiagnosticsWaitResult, LspClient};
-    use catenary_mcp::session::EventBroadcaster;
-
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
 
@@ -302,7 +300,6 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
 
     // Spawn LspClient directly with mockls --diagnostics-delay 5000
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let broadcaster = EventBroadcaster::noop();
     let message_log = std::sync::Arc::new(catenary_mcp::session::MessageLog::noop());
     let mut client = LspClient::spawn(
         mockls_bin,
@@ -313,7 +310,6 @@ async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
             "--publish-version",
         ],
         MOCK_LANG_A,
-        broadcaster,
         message_log,
         None,
     )
