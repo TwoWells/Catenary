@@ -17,8 +17,6 @@ pub mod path_security;
 pub mod replace;
 /// Shared symbol types and helpers for handler and file_tools.
 mod symbols;
-/// Workspace root synchronization for PreToolUse hook requests.
-pub mod sync_roots_server;
 /// Transformation layer trait between protocol boundaries and LSP.
 pub mod tool_server;
 
@@ -26,5 +24,4 @@ pub use diagnostics_server::DiagnosticsServer;
 pub use document_manager::{DocumentManager, DocumentNotification};
 pub use handler::LspBridgeHandler;
 pub use path_security::PathValidator;
-pub use sync_roots_server::SyncRootsServer;
 pub use tool_server::ToolServer;

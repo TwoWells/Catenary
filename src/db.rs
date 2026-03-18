@@ -266,12 +266,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_snapshots_file
              ON snapshots(file_path, id DESC);
 
-         CREATE TABLE IF NOT EXISTS root_sync_state (
-             session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-             offset      INTEGER NOT NULL DEFAULT 0,
-             roots       TEXT NOT NULL DEFAULT '[]'
-         );
-
          COMMIT;",
     )
     .context("failed to create database schema")?;
@@ -455,7 +449,6 @@ mod tests {
             "messages",
             "language_servers",
             "filter_history",
-            "root_sync_state",
             "grammars",
             "symbols",
             "file_parse_state",

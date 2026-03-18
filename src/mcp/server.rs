@@ -6,6 +6,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::io::{BufRead, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, trace, warn};
 
 use super::types::{
@@ -61,6 +62,8 @@ pub struct McpServer<H: ToolHandler> {
     next_outbound_id: i64,
     /// Callback invoked when roots change.
     on_roots_changed: Option<RootsChangedCallback>,
+    /// Shared flag set by `HookServer` when a `PreToolUse` hook fires.
+    refresh_roots: Arc<AtomicBool>,
 }
 
 impl<H: ToolHandler> McpServer<H> {
@@ -77,6 +80,7 @@ impl<H: ToolHandler> McpServer<H> {
             fetching_roots: false,
             next_outbound_id: 0,
             on_roots_changed: None,
+            refresh_roots: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -91,6 +95,13 @@ impl<H: ToolHandler> McpServer<H> {
     #[must_use]
     pub fn on_roots_changed(mut self, callback: RootsChangedCallback) -> Self {
         self.on_roots_changed = Some(callback);
+        self
+    }
+
+    /// Set a shared flag that the hook server uses to request a `roots/list` fetch.
+    #[must_use]
+    pub fn with_refresh_roots(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.refresh_roots = flag;
         self
     }
 
@@ -151,6 +162,11 @@ impl<H: ToolHandler> McpServer<H> {
                 };
 
             self.dispatch_message(trimmed, &mut writer, entry_id, &method)?;
+
+            // Check if the hook server requested a roots refresh
+            if self.refresh_roots.swap(false, Ordering::Acquire) {
+                self.should_fetch_roots = true;
+            }
 
             // Check if we need to fetch roots
             if self.should_fetch_roots

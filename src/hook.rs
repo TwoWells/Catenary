@@ -4,9 +4,9 @@
 //! IPC server for host CLI hook integration.
 //!
 //! `HookServer` is a protocol boundary: it parses IPC requests, dispatches
-//! to the appropriate tool server (`DiagnosticsServer` or `SyncRootsServer`),
-//! logs protocol messages, and formats responses. The transformation logic
-//! lives in the tool server implementations under `bridge/`.
+//! diagnostics to `DiagnosticsServer`, sets root-refresh flags, logs protocol
+//! messages, and formats responses. Root synchronization is handled by the
+//! MCP server's `roots/list` fetch, triggered via a shared `AtomicBool`.
 //!
 //! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
@@ -14,13 +14,13 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
 use crate::bridge::diagnostics_server::DiagnosticsServer;
-use crate::bridge::sync_roots_server::SyncRootsServer;
 use crate::session::MessageLog;
 
 /// Request from `catenary hook PostToolUse` (file change) or `catenary hook PreToolUse` (root sync).
@@ -40,15 +40,14 @@ enum NotifyRequest {
         )]
         tool: Option<String>,
     },
-    /// A request to synchronize workspace roots (full replacement).
-    SyncRoots {
-        /// Complete set of workspace roots — server diffs against current state.
-        sync_roots: Vec<String>,
-    },
-    /// A request to add new workspace roots (incremental).
-    AddRoots {
-        /// Absolute paths of directories to add as roots.
-        add_roots: Vec<String>,
+    /// A request to refresh workspace roots via MCP `roots/list`.
+    RefreshRoots {
+        /// Always `true` — presence triggers a `roots/list` fetch in the MCP server.
+        #[allow(
+            dead_code,
+            reason = "field drives serde variant selection, not read in code"
+        )]
+        refresh_roots: bool,
     },
 }
 
@@ -71,7 +70,7 @@ pub enum NotifyResult {
 /// from the host CLI and returns LSP diagnostics or root sync results.
 pub struct HookServer {
     diagnostics: Arc<DiagnosticsServer>,
-    sync_roots: SyncRootsServer,
+    refresh_roots: Arc<AtomicBool>,
     message_log: Arc<MessageLog>,
     client_name: String,
 }
@@ -81,13 +80,13 @@ impl HookServer {
     #[must_use]
     pub const fn new(
         diagnostics: Arc<DiagnosticsServer>,
-        sync_roots: SyncRootsServer,
+        refresh_roots: Arc<AtomicBool>,
         message_log: Arc<MessageLog>,
         client_name: String,
     ) -> Self {
         Self {
             diagnostics,
-            sync_roots,
+            refresh_roots,
             message_log,
             client_name,
         }
@@ -206,7 +205,7 @@ impl HookServer {
 
         let method = match &request {
             NotifyRequest::File { .. } => "post-tool",
-            NotifyRequest::SyncRoots { .. } | NotifyRequest::AddRoots { .. } => "pre-tool",
+            NotifyRequest::RefreshRoots { .. } => "pre-tool",
         };
 
         // Log incoming hook request
@@ -225,13 +224,10 @@ impl HookServer {
                 debug!("Hook: processing file {file}");
                 self.process_file(&file, entry_id).await
             }
-            NotifyRequest::SyncRoots { sync_roots } => {
-                debug!("Hook: syncing {} root(s)", sync_roots.len());
-                self.sync_roots.sync_roots(&sync_roots).await
-            }
-            NotifyRequest::AddRoots { add_roots } => {
-                debug!("Hook: adding {} root(s)", add_roots.len());
-                self.sync_roots.add_roots(&add_roots).await
+            NotifyRequest::RefreshRoots { .. } => {
+                debug!("Hook: refresh roots requested");
+                self.refresh_roots.store(true, Ordering::Release);
+                String::new()
             }
         };
 
@@ -388,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_log_sync_roots() {
+    fn test_hook_log_refresh_roots() {
         let (_dir, _path, conn) = test_db();
         let conn = Arc::new(std::sync::Mutex::new(conn));
 
@@ -404,7 +400,7 @@ mod tests {
         let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
 
         let method = "pre-tool";
-        let request_payload = serde_json::json!({"sync_roots": ["/tmp/root1"]});
+        let request_payload = serde_json::json!({"refresh_roots": true});
         let entry_id = log.log(
             "hook",
             method,
@@ -415,7 +411,7 @@ mod tests {
             &request_payload,
         );
 
-        let response_payload = serde_json::json!("Added roots: /tmp/root1");
+        let response_payload = serde_json::json!("");
         log.log(
             "hook",
             method,

@@ -6,7 +6,7 @@
 #![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cli::HostFormat;
@@ -198,24 +198,15 @@ pub fn run_notify(format: HostFormat) {
     }
 }
 
-/// Sync workspace roots from Claude Code transcript to a running Catenary session.
+/// Signal a running Catenary session to refresh workspace roots via MCP `roots/list`.
 ///
-/// Reads hook JSON from stdin, scans the transcript for `/add-dir` additions
-/// and directory removal messages, and sends the full root set to the session's
-/// notify endpoint. The server diffs against its current state, handling both
-/// additions and removals.
+/// Reads hook JSON from stdin, finds the session for the working directory,
+/// connects to the IPC endpoint, and sends a `refresh_roots` request. The
+/// session's hook server sets an `AtomicBool` that the MCP server checks
+/// before processing the next tool call, triggering a `roots/list` fetch.
 ///
-/// Uses the `root_sync_state` table in the `SQLite` database to track the byte
-/// offset and the full discovered root set across invocations.
-///
-/// Silently succeeds on any error to avoid breaking Claude Code's flow.
-#[allow(
-    clippy::too_many_lines,
-    reason = "Sequential hook processing with early returns"
-)]
-pub fn run_sync_roots(format: HostFormat) {
-    use std::io::{BufRead, Seek, SeekFrom};
-
+/// Silently succeeds on any error to avoid breaking the host CLI's flow.
+pub fn run_sync_roots(_format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -224,22 +215,15 @@ pub fn run_sync_roots(format: HostFormat) {
         return;
     };
 
-    // Extract transcript_path and cwd from hook input
-    let Some(transcript_path) = hook_json.get("transcript_path").and_then(|v| v.as_str()) else {
-        return;
-    };
-
     let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
         || std::env::current_dir().unwrap_or_default(),
         PathBuf::from,
     );
 
-    // Open DB for root_sync_state persistence and session lookup
     let Ok(db) = crate::db::open_and_migrate() else {
         return;
     };
 
-    // Find the session whose workspace matches cwd
     let sessions = session::list_sessions_with_conn(&db).unwrap_or_default();
     let cwd_str = cwd.to_string_lossy();
     let session = sessions
@@ -259,156 +243,13 @@ pub fn run_sync_roots(format: HostFormat) {
         );
     }
 
-    // Load persistent state: byte offset + known root set
-    let (start_offset, mut known_roots) = db
-        .query_row(
-            "SELECT offset, roots FROM root_sync_state WHERE session_id = ?1",
-            [&session.id],
-            |row| {
-                let offset: i64 = row.get(0)?;
-                let roots_json: String = row.get(1)?;
-                Ok((offset, roots_json))
-            },
-        )
-        .map_or_else(
-            |_| (0u64, Vec::new()),
-            |(offset, roots_json)| {
-                let roots: Vec<String> = serde_json::from_str(&roots_json).unwrap_or_default();
-                (
-                    u64::try_from(offset).unwrap_or(0),
-                    roots.into_iter().map(PathBuf::from).collect(),
-                )
-            },
-        );
-
-    // Open transcript and seek to offset
-    let Ok(mut file) = std::fs::File::open(transcript_path) else {
-        return;
-    };
-
-    if file.seek(SeekFrom::Start(start_offset)).is_err() {
-        return;
-    }
-
-    // Transcript patterns (raw JSON-escaped forms):
-    // Add:    Added \u001b[1m/path\u001b[22m as a working directory
-    // Remove: Removed directory \u001b[1m/path\u001b[22m from workspace
-    let add_prefix = "Added \\u001b[1m";
-    let add_suffix = "\\u001b[22m as a working directory";
-    let remove_prefix = "Removed directory \\u001b[1m";
-    let remove_suffix = "\\u001b[22m from workspace";
-
-    let mut changed = false;
-    let reader = std::io::BufReader::new(&mut file);
-
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            break;
-        };
-
-        // Scan for additions
-        if line.contains(add_prefix) {
-            let mut search_from = 0;
-            while let Some(start) = line[search_from..].find(add_prefix) {
-                let abs_start = search_from + start + add_prefix.len();
-                if let Some(end) = line[abs_start..].find(add_suffix) {
-                    let path_str = unescape_json_path(&line[abs_start..abs_start + end]);
-                    let resolved = resolve_transcript_path(&path_str, &cwd);
-                    if !known_roots.contains(&resolved) {
-                        known_roots.push(resolved);
-                        changed = true;
-                    }
-                    search_from = abs_start + end + add_suffix.len();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Scan for removals
-        if line.contains(remove_prefix) {
-            let mut search_from = 0;
-            while let Some(start) = line[search_from..].find(remove_prefix) {
-                let abs_start = search_from + start + remove_prefix.len();
-                if let Some(end) = line[abs_start..].find(remove_suffix) {
-                    let path_str = unescape_json_path(&line[abs_start..abs_start + end]);
-                    let resolved = resolve_transcript_path(&path_str, &cwd);
-                    if let Some(pos) = known_roots.iter().position(|r| r == &resolved) {
-                        known_roots.remove(pos);
-                        changed = true;
-                    }
-                    search_from = abs_start + end + remove_suffix.len();
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Save updated state
-    let new_offset = file.stream_position().unwrap_or(start_offset);
-    let roots_strs: Vec<String> = known_roots
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    let roots_json = serde_json::to_string(&roots_strs).unwrap_or_else(|_| "[]".to_string());
-    let _ = db.execute(
-        "INSERT OR REPLACE INTO root_sync_state (session_id, offset, roots) VALUES (?1, ?2, ?3)",
-        rusqlite::params![
-            &session.id,
-            i64::try_from(new_offset).unwrap_or(0),
-            roots_json
-        ],
-    );
-
-    if !changed {
-        return;
-    }
-
-    // Build the full root set: cwd is always present
-    let mut full_roots = vec![cwd];
-    for root in &known_roots {
-        if !full_roots.contains(root) {
-            full_roots.push(root.clone());
-        }
-    }
-
     let endpoint = notify_endpoint(&session.id);
     let Some(stream) = notify_connect(&endpoint) else {
         return;
     };
 
-    let root_strings: Vec<String> = full_roots
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    let request = serde_json::json!({ "sync_roots": root_strings });
-    let lines = ipc_exchange(stream, &request);
-
-    if lines.is_empty() {
-        return;
-    }
-
-    let content = lines.join("\n");
-    let output = format_diagnostics(&content, format, "PreToolUse");
-    print!("{output}");
-}
-
-/// Unescape JSON string escapes from a transcript path.
-fn unescape_json_path(raw: &str) -> String {
-    raw.replace("\\\\", "\\")
-        .replace("\\/", "/")
-        .replace("\\\"", "\"")
-}
-
-/// Resolve a transcript path to an absolute path.
-fn resolve_transcript_path(path_str: &str, cwd: &Path) -> PathBuf {
-    let path = PathBuf::from(path_str);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    }
+    let request = serde_json::json!({ "refresh_roots": true });
+    let _ = ipc_exchange(stream, &request);
 }
 
 /// Extracts the file path from hook JSON's `tool_input`.

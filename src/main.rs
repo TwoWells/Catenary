@@ -18,6 +18,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use std::sync::atomic::AtomicBool;
+
 use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler, PathValidator};
 use catenary_mcp::cli::{self, HostFormat, QueryFormat};
 use catenary_mcp::lsp;
@@ -457,11 +459,10 @@ async fn run_server(args: Args) -> Result<()> {
         doc_manager.clone(),
         path_validator.clone(),
     ));
-    let sync_roots_server =
-        catenary_mcp::bridge::SyncRootsServer::new(client_manager.clone(), path_validator.clone());
+    let refresh_roots_flag = Arc::new(AtomicBool::new(false));
     let hook_server = catenary_mcp::hook::HookServer::new(
         diagnostics_server.clone(),
-        sync_roots_server,
+        refresh_roots_flag.clone(),
         message_log.clone(),
         "host".to_string(),
     );
@@ -500,6 +501,7 @@ async fn run_server(args: Args) -> Result<()> {
         .message_log()
         .clone();
     let mut mcp_server = McpServer::new(handler, message_log)
+        .with_refresh_roots(refresh_roots_flag)
         .on_client_info(Box::new(move |name: &str, version: &str| {
             if let Ok(mut session) = session_for_callback.lock() {
                 session.set_client_info(name, version);

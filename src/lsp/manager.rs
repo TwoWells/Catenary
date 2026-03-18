@@ -73,55 +73,6 @@ impl ClientManager {
         self.roots.lock().await.clone()
     }
 
-    /// Adds a new workspace root and notifies all active LSP clients.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the root path cannot be converted to a valid URI.
-    pub async fn add_root(&self, root: PathBuf) -> Result<()> {
-        let uri = format!("file://{}", root.display());
-        let name = root.file_name().map_or_else(
-            || "workspace".to_string(),
-            |s| s.to_string_lossy().to_string(),
-        );
-
-        self.roots.lock().await.push(root);
-
-        // Notify clients that support dynamic workspace folders,
-        // restart those that don't.
-        let clients = self.active_clients.lock().await.clone();
-        let mut to_restart = Vec::new();
-        for (lang, client_mutex) in &clients {
-            let client = client_mutex.lock().await;
-            if !client.is_alive() {
-                continue;
-            }
-            if client.supports_workspace_folders() {
-                if let Err(e) = client
-                    .did_change_workspace_folders(&[(&uri, &name)], &[])
-                    .await
-                {
-                    warn!(
-                        "Failed to notify {} server about new workspace folder: {}",
-                        lang, e
-                    );
-                }
-            } else {
-                to_restart.push(lang.clone());
-            }
-        }
-
-        for lang in &to_restart {
-            info!(
-                "{} server does not support workspace folder changes, restarting",
-                lang
-            );
-            self.shutdown_client(lang).await;
-        }
-
-        Ok(())
-    }
-
     /// Removes a workspace root and notifies all active LSP clients.
     ///
     /// # Errors
@@ -624,25 +575,6 @@ mod tests {
         let roots = manager.roots().await;
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0], PathBuf::from("/tmp/root_a"));
-        assert_eq!(roots[1], PathBuf::from("/tmp/root_b"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_add_root_appends() -> Result<()> {
-        let manager = ClientManager::new(
-            test_config(),
-            vec![PathBuf::from("/tmp/root_a")],
-            test_message_log(),
-        );
-
-        assert_eq!(manager.roots().await.len(), 1);
-
-        // add_root with no active clients should succeed silently
-        manager.add_root(PathBuf::from("/tmp/root_b")).await?;
-
-        let roots = manager.roots().await;
-        assert_eq!(roots.len(), 2);
         assert_eq!(roots[1], PathBuf::from("/tmp/root_b"));
         Ok(())
     }
