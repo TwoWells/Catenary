@@ -16,7 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use super::panel::{FlatLine, PanelState, detail_lines, pair_detail_lines};
-use super::theme::{format_ago, format_message_plain, format_pair_plain};
+use super::theme::{format_ago, format_collapsed_plain, format_message_plain, format_pair_plain};
 use super::tree::{SessionTree, TreeItem};
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -145,6 +145,18 @@ pub fn yank_text(panel: &PanelState<'_>, selection: &VisualSelection) -> String 
                         lines.push(plain);
                     }
                 }
+            }
+            FlatLine::CollapsedHeader {
+                start_index,
+                end_index,
+                count,
+            } => {
+                lines.push(format_collapsed_plain(
+                    &panel.messages,
+                    *start_index,
+                    *end_index,
+                    *count,
+                ));
             }
         }
     }
@@ -374,8 +386,9 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        // Use hook messages (never collapse) so each gets its own flat line.
         let messages: Vec<SessionMessage> = (0..5)
-            .map(|_| make_message("lsp", "textDocument/hover", "rust-analyzer"))
+            .map(|i| make_message("hook", &format!("test-{i}"), "catenary"))
             .collect();
         panel.load_messages(messages);
 
@@ -388,10 +401,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            assert!(
-                line.contains("textDocument/hover"),
-                "each line should contain method"
-            );
+            assert!(line.contains("test-"), "each line should contain method");
         }
     }
 

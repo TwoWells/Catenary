@@ -17,10 +17,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use super::category;
 use super::selection::VisualSelection;
 use super::theme::{
-    IconSet, Theme, format_message_plain, format_message_styled, format_pair_plain,
-    format_pair_styled,
+    IconSet, Theme, format_collapsed_plain, format_collapsed_styled, format_message_plain,
+    format_message_styled, format_pair_plain, format_pair_styled,
 };
 use crate::session::SessionMessage;
 
@@ -50,7 +51,7 @@ pub struct LanguageServerStatus {
     pub state: LsState,
 }
 
-/// A display pipeline entry — single message or merged request/response pair.
+/// A display pipeline entry — single message, merged pair, or collapsed run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayEntry {
     /// A single message (not merged).
@@ -64,6 +65,15 @@ pub enum DisplayEntry {
         request_index: usize,
         /// Index of the response message.
         response_index: usize,
+    },
+    /// A run of consecutive messages collapsed into one line.
+    Collapsed {
+        /// Index of the first message in the run.
+        start_index: usize,
+        /// Index of the last message in the run (inclusive).
+        end_index: usize,
+        /// Number of messages in the run.
+        count: usize,
     },
 }
 
@@ -91,7 +101,80 @@ pub fn pair_merge(messages: &[SessionMessage]) -> Vec<DisplayEntry> {
     entries
 }
 
-/// A line in the flattened view — either a message header or a detail line.
+/// Run collapse pass: merge consecutive `Single` entries with the same
+/// collapse key into `Collapsed` entries. `Paired` entries never collapse.
+#[must_use]
+pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Vec<DisplayEntry> {
+    let mut result = Vec::with_capacity(entries.len());
+
+    // Current run state.
+    let mut run_key: Option<String> = None;
+    let mut run_start: usize = 0;
+    let mut run_end: usize = 0;
+    let mut run_count: usize = 0;
+
+    let flush = |result: &mut Vec<DisplayEntry>,
+                 key: &Option<String>,
+                 start: usize,
+                 end: usize,
+                 count: usize| {
+        if key.is_none() || count == 0 {
+            return;
+        }
+        if count == 1 {
+            result.push(DisplayEntry::Single { index: start });
+        } else {
+            result.push(DisplayEntry::Collapsed {
+                start_index: start,
+                end_index: end,
+                count,
+            });
+        }
+    };
+
+    for entry in entries {
+        match *entry {
+            DisplayEntry::Single { index } => {
+                let key = category::collapse_key(&messages[index]);
+                if let Some(ref k) = key
+                    && let Some(ref rk) = run_key
+                    && k == rk
+                {
+                    // Extend current run.
+                    run_end = index;
+                    run_count += 1;
+                } else {
+                    // Flush previous run, start new one.
+                    flush(&mut result, &run_key, run_start, run_end, run_count);
+                    if key.is_some() {
+                        run_key = key;
+                        run_start = index;
+                        run_end = index;
+                        run_count = 1;
+                    } else {
+                        run_key = None;
+                        run_count = 0;
+                        result.push(DisplayEntry::Single { index });
+                    }
+                }
+            }
+            DisplayEntry::Paired { .. } | DisplayEntry::Collapsed { .. } => {
+                // Flush any pending run, then emit as-is.
+                flush(&mut result, &run_key, run_start, run_end, run_count);
+                run_key = None;
+                run_count = 0;
+                result.push(entry.clone());
+            }
+        }
+    }
+
+    // Flush trailing run.
+    flush(&mut result, &run_key, run_start, run_end, run_count);
+
+    result
+}
+
+/// A line in the flattened view — message header, detail, or collapsed run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlatLine {
     /// A message header (the one-line summary).
@@ -107,6 +190,15 @@ pub enum FlatLine {
         message_index: usize,
         /// Index of this detail line within the expansion.
         detail_index: usize,
+    },
+    /// A collapsed run header (summary of N consecutive messages).
+    CollapsedHeader {
+        /// Index of the first message in the run.
+        start_index: usize,
+        /// Index of the last message in the run (inclusive).
+        end_index: usize,
+        /// Number of messages in the run.
+        count: usize,
     },
 }
 
@@ -368,12 +460,14 @@ impl<'a> PanelState<'a> {
     // ── Expansion ───────────────────────────────────────────────────────
 
     /// Build a flat list of lines: message headers interleaved with detail
-    /// lines for any expanded messages. Uses pair merge to combine adjacent
-    /// request/response pairs into single header lines.
+    /// lines for any expanded messages. Uses pair merge then run collapse
+    /// to combine adjacent request/response pairs and consecutive same-key
+    /// messages into single lines.
     #[must_use]
     pub fn flat_lines(&self) -> Vec<FlatLine> {
         let lower_pattern = self.filter_pattern.as_ref().map(|p| p.to_lowercase());
-        let entries = pair_merge(&self.messages);
+        let merged = pair_merge(&self.messages);
+        let entries = run_collapse(&merged, &self.messages);
         let mut lines = Vec::new();
 
         for entry in &entries {
@@ -426,6 +520,44 @@ impl<'a> PanelState<'a> {
                         }
                     }
                 }
+                DisplayEntry::Collapsed {
+                    start_index,
+                    end_index,
+                    count,
+                } => {
+                    if let Some(ref pat) = lower_pattern {
+                        let plain =
+                            format_collapsed_plain(&self.messages, start_index, end_index, count);
+                        if !plain.to_lowercase().contains(pat) {
+                            continue;
+                        }
+                    }
+                    if self.expanded.contains(&start_index) {
+                        // Show individual messages when expanded.
+                        for idx in start_index..=end_index {
+                            lines.push(FlatLine::MessageHeader {
+                                message_index: idx,
+                                paired_response: None,
+                            });
+                            if self.expanded.contains(&idx) {
+                                let msg = &self.messages[idx];
+                                let detail_count = detail_lines(msg, self.theme).len();
+                                for detail_index in 0..detail_count {
+                                    lines.push(FlatLine::Detail {
+                                        message_index: idx,
+                                        detail_index,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        lines.push(FlatLine::CollapsedHeader {
+                            start_index,
+                            end_index,
+                            count,
+                        });
+                    }
+                }
             }
         }
         lines
@@ -474,6 +606,13 @@ impl<'a> PanelState<'a> {
                     matches!(fl, FlatLine::MessageHeader { message_index: mi, .. } if *mi == message_index)
                 }) {
                     self.cursor = pos;
+                }
+            }
+            FlatLine::CollapsedHeader { start_index, .. } => {
+                if self.expanded.contains(&start_index) {
+                    self.expanded.remove(&start_index);
+                } else {
+                    self.expanded.insert(start_index);
                 }
             }
         }
@@ -877,6 +1016,18 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
                 .get(*detail_index)
                 .cloned()
                 .unwrap_or_default(),
+            FlatLine::CollapsedHeader {
+                start_index,
+                end_index,
+                count,
+            } => format_collapsed_styled(
+                &state.messages,
+                *start_index,
+                *end_index,
+                *count,
+                state.icons,
+                state.theme,
+            ),
         };
 
         let display_line = if state.horizontal_scroll > 0
@@ -946,6 +1097,13 @@ mod tests {
             timestamp: chrono::Utc::now(),
             payload: serde_json::json!({}),
         }
+    }
+
+    /// Create N messages that never collapse (hook messages have `None` collapse key).
+    fn make_non_collapsing_messages(n: usize) -> Vec<SessionMessage> {
+        (0..n)
+            .map(|i| make_message("hook", &format!("test-{i}"), "catenary"))
+            .collect()
     }
 
     fn make_message_with_payload(
@@ -1022,9 +1180,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..10)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(10);
         panel.load_messages(messages);
         assert_eq!(panel.messages.len(), 10);
         assert_eq!(panel.cursor, 9);
@@ -1036,9 +1192,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..5)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(5);
         panel.load_messages(messages);
         assert_eq!(panel.cursor, 4);
 
@@ -1053,9 +1207,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..5)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(5);
         panel.load_messages(messages);
 
         // Navigate up to detach.
@@ -1074,9 +1226,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..10)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(10);
         panel.load_messages(messages);
         assert_eq!(panel.cursor, 9);
         assert!(panel.tail_attached);
@@ -1091,9 +1241,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..5)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(5);
         panel.load_messages(messages);
 
         // Navigate up to detach.
@@ -1117,9 +1265,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..20)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(20);
         panel.load_messages(messages);
 
         panel.scroll_to_top();
@@ -1133,9 +1279,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..20)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(20);
         panel.load_messages(messages);
 
         panel.scroll_to_top();
@@ -1151,9 +1295,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..100)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(100);
         panel.load_messages(messages);
 
         // Move cursor to 50 and snap viewport.
@@ -1171,9 +1313,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..100)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(100);
         panel.load_messages(messages);
 
         // Cursor near top — can't center.
@@ -1190,9 +1330,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("abc123".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..100)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(100);
         panel.load_messages(messages);
 
         // Cursor near bottom.
@@ -1208,6 +1346,7 @@ mod tests {
     fn test_panel_render_messages() {
         let theme = test_theme();
         let icons = test_icons();
+        // Use a hook message in between to break any potential collapse.
         let messages: Vec<SessionMessage> = vec![
             make_message_with_payload(
                 "mcp",
@@ -1215,6 +1354,7 @@ mod tests {
                 "catenary",
                 serde_json::json!({"params": {"name": "grep"}}),
             ),
+            make_message("hook", "break", "catenary"),
             make_message_with_payload(
                 "mcp",
                 "tools/call",
@@ -1268,16 +1408,7 @@ mod tests {
     fn test_panel_render_cursor_highlight() {
         let theme = test_theme();
         let icons = test_icons();
-        let messages: Vec<SessionMessage> = (0..5)
-            .map(|_| {
-                make_message_with_payload(
-                    "mcp",
-                    "tools/call",
-                    "catenary",
-                    serde_json::json!({"params": {"name": "grep"}}),
-                )
-            })
-            .collect();
+        let messages = make_non_collapsing_messages(5);
 
         let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
         panel.load_messages(messages);
@@ -1339,9 +1470,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let messages: Vec<SessionMessage> = (0..5)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let messages = make_non_collapsing_messages(5);
         panel.load_messages(messages);
 
         let flat = panel.flat_lines();
@@ -1535,9 +1664,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        let mut messages: Vec<SessionMessage> = (0..10)
-            .map(|_| make_message("lsp", "initialized", "rust-analyzer"))
-            .collect();
+        let mut messages = make_non_collapsing_messages(10);
         // Replace message 5 with an expandable one.
         messages[5] = make_lsp_message();
         panel.load_messages(messages);
@@ -1836,5 +1963,105 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("grep"), "should contain tool name: {text}");
         assert!(text.contains("ok"), "should contain result status: {text}");
+    }
+
+    // ── Run collapse tests ───────────────────────────────────────────────
+
+    fn make_progress_message(server: &str, token: &str) -> SessionMessage {
+        make_message_with_payload(
+            "lsp",
+            "$/progress",
+            server,
+            serde_json::json!({"token": token}),
+        )
+    }
+
+    #[test]
+    fn test_run_collapse_consecutive_progress() {
+        let messages = vec![
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+        ];
+        let entries = pair_merge(&messages);
+        let collapsed = run_collapse(&entries, &messages);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(
+            collapsed[0],
+            DisplayEntry::Collapsed {
+                start_index: 0,
+                end_index: 2,
+                count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_run_collapse_split_by_different_key() {
+        let messages = vec![
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_progress_message("rust-analyzer", "ra/flycheck"),
+        ];
+        let entries = pair_merge(&messages);
+        let collapsed = run_collapse(&entries, &messages);
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0], DisplayEntry::Single { index: 0 });
+        assert_eq!(collapsed[1], DisplayEntry::Single { index: 1 });
+    }
+
+    #[test]
+    fn test_run_collapse_split_by_interleaving() {
+        let messages = vec![
+            make_progress_message("rust-analyzer", "ra/indexing"),
+            make_message_with_payload(
+                "mcp",
+                "tools/call",
+                "catenary",
+                serde_json::json!({"params": {"name": "grep"}}),
+            ),
+            make_progress_message("rust-analyzer", "ra/indexing"),
+        ];
+        let entries = pair_merge(&messages);
+        let collapsed = run_collapse(&entries, &messages);
+        assert_eq!(
+            collapsed.len(),
+            3,
+            "interleaving tool call should split the run"
+        );
+    }
+
+    #[test]
+    fn test_run_collapse_paired_not_collapsed() {
+        let messages = vec![
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
+            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
+            make_message_with_id(3, "lsp", "textDocument/hover", "rust-analyzer", None),
+            make_message_with_id(4, "lsp", "textDocument/hover", "rust-analyzer", Some(3)),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 2, "should have 2 pairs");
+        let collapsed = run_collapse(&entries, &messages);
+        assert_eq!(collapsed.len(), 2, "pairs should not collapse");
+        assert!(
+            matches!(collapsed[0], DisplayEntry::Paired { .. }),
+            "first should be Paired"
+        );
+        assert!(
+            matches!(collapsed[1], DisplayEntry::Paired { .. }),
+            "second should be Paired"
+        );
+    }
+
+    #[test]
+    fn test_run_collapse_single_message_no_collapse() {
+        let messages = vec![make_progress_message("rust-analyzer", "ra/indexing")];
+        let entries = pair_merge(&messages);
+        let collapsed = run_collapse(&entries, &messages);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(
+            collapsed[0],
+            DisplayEntry::Single { index: 0 },
+            "single message should not collapse"
+        );
     }
 }

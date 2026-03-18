@@ -1020,6 +1020,70 @@ pub fn format_pair_plain(request: &SessionMessage, response: &SessionMessage) ->
     }
 }
 
+/// Build a styled [`Line`] for a collapsed run of messages.
+///
+/// Generic format: `HH:MM:SS [server] method (N messages)`
+///
+/// Uses the last message's timestamp (most recent in the run).
+#[must_use]
+pub fn format_collapsed_styled(
+    messages: &[SessionMessage],
+    _start: usize,
+    end: usize,
+    count: usize,
+    _icons: &IconSet,
+    theme: &Theme,
+) -> Line<'static> {
+    let last = &messages[end];
+    let ts = last.timestamp.format("%H:%M:%S").to_string();
+    let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
+
+    let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+
+    match last.r#type.as_str() {
+        "lsp" => {
+            let server_span = Span::styled(format!("[{}] ", last.server), theme.accent);
+            Line::from(vec![
+                ts_span,
+                server_span,
+                Span::styled(last.method.clone(), theme.text),
+                Span::styled(format!(" ({label})"), theme.muted),
+            ])
+        }
+        "mcp" => Line::from(vec![
+            ts_span,
+            Span::styled("[mcp] ".to_string(), theme.text),
+            Span::styled(last.method.clone(), theme.text),
+            Span::styled(format!(" ({label})"), theme.muted),
+        ]),
+        other => Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{other}] "), theme.text),
+            Span::styled(last.method.clone(), theme.text),
+            Span::styled(format!(" ({label})"), theme.muted),
+        ]),
+    }
+}
+
+/// Plain-text summary for a collapsed run (filter matching, yank).
+#[must_use]
+pub fn format_collapsed_plain(
+    messages: &[SessionMessage],
+    start: usize,
+    _end: usize,
+    count: usize,
+) -> String {
+    let first = &messages[start];
+    let ts = first.timestamp.format("%H:%M:%S");
+    let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+
+    match first.r#type.as_str() {
+        "lsp" => format!("{ts} [{}] {} ({label})", first.server, first.method),
+        "mcp" => format!("{ts} [mcp] {} ({label})", first.method),
+        other => format!("{ts} [{other}] {} ({label})", first.method),
+    }
+}
+
 /// Plain-text message summary (used for filter matching).
 #[must_use]
 pub fn format_message_plain(msg: &SessionMessage) -> String {
@@ -1447,5 +1511,73 @@ mod tests {
         let plain = format_message_plain(&hook_msg);
         assert!(plain.contains("main.rs"));
         assert!(plain.contains("3 diagnostics"));
+    }
+
+    // ── Collapsed rendering tests ────────────────────────────────────────
+
+    #[test]
+    fn test_format_collapsed_progress() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({"token": "ra/indexing"}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({"token": "ra/indexing"}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({"token": "ra/indexing"}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 2, 3, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("3 messages"),
+            "should contain message count: {text}"
+        );
+        assert!(
+            text.contains("[rust-analyzer]"),
+            "should contain server name: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_sync() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "textDocument/didOpen",
+                "rust-analyzer",
+                serde_json::json!({"textDocument": {"uri": "file:///src/main.rs"}}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "textDocument/didSave",
+                "rust-analyzer",
+                serde_json::json!({"textDocument": {"uri": "file:///src/main.rs"}}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("2 messages"),
+            "should contain message count: {text}"
+        );
+        assert!(
+            text.contains("textDocument/did"),
+            "should contain method: {text}"
+        );
     }
 }

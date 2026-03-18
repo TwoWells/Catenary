@@ -13,6 +13,7 @@
 //! theme the user has configured.
 
 pub mod app;
+pub mod category;
 pub mod data;
 pub mod degradation;
 pub mod filter;
