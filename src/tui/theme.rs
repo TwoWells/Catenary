@@ -1069,18 +1069,18 @@ pub fn format_collapsed_styled(
 #[must_use]
 pub fn format_collapsed_plain(
     messages: &[SessionMessage],
-    start: usize,
-    _end: usize,
+    _start: usize,
+    end: usize,
     count: usize,
 ) -> String {
-    let first = &messages[start];
-    let ts = first.timestamp.format("%H:%M:%S");
+    let last = &messages[end];
+    let ts = last.timestamp.format("%H:%M:%S");
     let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
 
-    match first.r#type.as_str() {
-        "lsp" => format!("{ts} [{}] {} ({label})", first.server, first.method),
-        "mcp" => format!("{ts} [mcp] {} ({label})", first.method),
-        other => format!("{ts} [{other}] {} ({label})", first.method),
+    match last.r#type.as_str() {
+        "lsp" => format!("{ts} [{}] {} ({label})", last.server, last.method),
+        "mcp" => format!("{ts} [mcp] {} ({label})", last.method),
+        other => format!("{ts} [{other}] {} ({label})", last.method),
     }
 }
 
