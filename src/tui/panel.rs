@@ -685,7 +685,7 @@ pub fn pair_detail_lines(
 // ── Rendering ───────────────────────────────────────────────────────────
 
 /// Build the title line for a panel.
-fn build_title(state: &PanelState<'_>) -> Line<'static> {
+fn build_title<'a>(state: &'a PanelState<'a>) -> Line<'a> {
     let id_short = if state.display_id.len() > 8 {
         &state.display_id[..8]
     } else {
@@ -703,8 +703,8 @@ fn build_title(state: &PanelState<'_>) -> Line<'static> {
             if i > 0 {
                 spans.push(Span::raw(" \u{2571} ")); // ╱
             }
-            spans.push(Span::styled(state.icons.ls_active.clone(), style));
-            spans.push(Span::styled(name.clone(), style));
+            spans.push(Span::styled(state.icons.ls_active.as_str(), style));
+            spans.push(Span::styled(name.as_str(), style));
         }
     }
 
