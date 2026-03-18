@@ -12,8 +12,6 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthStr;
 
-use super::panel::LsState;
-
 // ── Constants ───────────────────────────────────────────────────────────
 
 /// Minimum useful workspace tail length (in chars) for title level 1.
@@ -510,7 +508,7 @@ pub fn degrade_sessions_path(path: &str, max_width: u16) -> String {
 /// 3. Names space-separated: `rust ts`
 /// 4. Empty string (not enough room).
 #[must_use]
-pub fn degrade_ls_title(servers: &[(String, LsState)], max_width: u16) -> String {
+pub fn degrade_ls_title(servers: &[String], max_width: u16) -> String {
     if servers.is_empty() {
         return String::new();
     }
@@ -540,9 +538,9 @@ pub fn degrade_ls_title(servers: &[(String, LsState)], max_width: u16) -> String
 }
 
 /// Build a language server info string with configurable icons and separators.
-fn build_ls_string(servers: &[(String, LsState)], icons: bool, fancy_sep: bool) -> String {
+fn build_ls_string(servers: &[String], icons: bool, fancy_sep: bool) -> String {
     let mut result = String::new();
-    for (i, (name, _state)) in servers.iter().enumerate() {
+    for (i, name) in servers.iter().enumerate() {
         if i > 0 {
             if fancy_sep {
                 result.push_str(" \u{2571} "); // ╱
@@ -750,10 +748,7 @@ mod tests {
 
     #[test]
     fn test_ls_title_full() {
-        let servers = vec![
-            ("rust".to_string(), LsState::Healthy),
-            ("ts".to_string(), LsState::Healthy),
-        ];
+        let servers = vec!["rust".to_string(), "ts".to_string()];
         let result = degrade_ls_title(&servers, 40);
         assert!(
             result.contains("rust"),
@@ -771,10 +766,7 @@ mod tests {
 
     #[test]
     fn test_ls_title_dropped() {
-        let servers = vec![
-            ("rust".to_string(), LsState::Healthy),
-            ("ts".to_string(), LsState::Healthy),
-        ];
+        let servers = vec!["rust".to_string(), "ts".to_string()];
         let result = degrade_ls_title(&servers, 5);
         assert!(
             result.is_empty(),

@@ -27,30 +27,6 @@ use crate::session::SessionMessage;
 
 // ── Data types ──────────────────────────────────────────────────────────
 
-/// Language server lifecycle state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LsState {
-    /// Server has not been loaded yet.
-    NotLoaded,
-    /// Server is initializing.
-    Initializing,
-    /// Server is sending progress notifications.
-    Progress,
-    /// Server is healthy and running.
-    Healthy,
-    /// Server has crashed.
-    Crashed,
-}
-
-/// Language server status shown in the panel title.
-#[derive(Clone, Debug)]
-pub struct LanguageServerStatus {
-    /// Language server name (e.g., "rust", "ts").
-    pub name: String,
-    /// Current lifecycle state.
-    pub state: LsState,
-}
-
 /// A display pipeline entry — single message, merged pair, or collapsed run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayEntry {
@@ -218,8 +194,8 @@ pub struct PanelState<'a> {
     pub horizontal_scroll: usize,
     /// Whether this panel is pinned (enlarged).
     pub pinned: bool,
-    /// Language server statuses for the title bar.
-    pub language_servers: Vec<LanguageServerStatus>,
+    /// Language server names for the title bar.
+    pub language_servers: Vec<String>,
     /// Indices of expanded messages (in the messages Vec).
     pub expanded: HashSet<usize>,
     /// Active visual selection, if any.
@@ -413,10 +389,9 @@ impl<'a> PanelState<'a> {
         (start, end)
     }
 
-    /// Derive language server statuses from messages.
+    /// Derive language server names from messages.
     ///
-    /// Scans for LSP messages and tracks unique server names. Any server
-    /// with messages is considered healthy.
+    /// Scans for LSP messages and tracks unique server names.
     pub fn update_language_servers(&mut self) {
         let mut seen: HashSet<String> = HashSet::new();
         let mut order: Vec<String> = Vec::new();
@@ -427,13 +402,7 @@ impl<'a> PanelState<'a> {
             }
         }
 
-        self.language_servers = order
-            .into_iter()
-            .map(|name| LanguageServerStatus {
-                name,
-                state: LsState::Healthy,
-            })
-            .collect();
+        self.language_servers = order;
     }
 
     /// Snap viewport so cursor is centered (`scrolloff=999` behavior).
@@ -563,35 +532,17 @@ impl<'a> PanelState<'a> {
         lines
     }
 
-    /// Quick check: does this message (or pair) have expandable detail?
-    #[must_use]
-    pub fn has_detail(&self, message_index: usize, paired_response: Option<usize>) -> bool {
-        let has_payload = |idx: usize| {
-            self.messages
-                .get(idx)
-                .is_some_and(|msg| msg.payload.as_object().is_some_and(|o| !o.is_empty()))
-        };
-        has_payload(message_index) || paired_response.is_some_and(has_payload)
-    }
-
     /// Toggle expansion of the message under the cursor.
     ///
     /// - On a `MessageHeader`: toggle the message in/out of `expanded`.
     /// - On a `Detail` line: collapse the parent message, move cursor to its header.
-    /// - On a message with no detail: no-op.
     pub fn toggle_expansion(&mut self) {
         let flat = self.flat_lines();
         let Some(current) = flat.get(self.cursor) else {
             return;
         };
         match *current {
-            FlatLine::MessageHeader {
-                message_index,
-                paired_response,
-            } => {
-                if !self.has_detail(message_index, paired_response) {
-                    return;
-                }
+            FlatLine::MessageHeader { message_index, .. } => {
                 if self.expanded.contains(&message_index) {
                     self.expanded.remove(&message_index);
                 } else {
@@ -733,25 +684,6 @@ pub fn pair_detail_lines(
 
 // ── Rendering ───────────────────────────────────────────────────────────
 
-/// Style for a language server status icon.
-fn ls_status_style(state: &LsState) -> Style {
-    match state {
-        LsState::NotLoaded => Style::default().fg(Color::White),
-        LsState::Initializing => Style::default().fg(Color::Yellow),
-        LsState::Progress => Style::default().fg(Color::Cyan),
-        LsState::Healthy => Style::default().fg(Color::Green),
-        LsState::Crashed => Style::default().fg(Color::Red),
-    }
-}
-
-/// Status icon for a language server state, resolved from the icon set.
-fn ls_status_icon<'a>(state: &LsState, icons: &'a IconSet) -> &'a str {
-    match state {
-        LsState::NotLoaded => &icons.ls_inactive,
-        _ => &icons.ls_active,
-    }
-}
-
 /// Build the title line for a panel.
 fn build_title(state: &PanelState<'_>) -> Line<'static> {
     let id_short = if state.display_id.len() > 8 {
@@ -765,17 +697,14 @@ fn build_title(state: &PanelState<'_>) -> Line<'static> {
     if state.language_servers.is_empty() {
         spans.push(Span::styled(" no ls", Style::default().fg(Color::DarkGray)));
     } else {
+        let style = Style::default().fg(Color::Green);
         spans.push(Span::raw(" "));
-        for (i, ls) in state.language_servers.iter().enumerate() {
+        for (i, name) in state.language_servers.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw(" \u{2571} ")); // ╱
             }
-            let style = ls_status_style(&ls.state);
-            spans.push(Span::styled(
-                ls_status_icon(&ls.state, state.icons).to_string(),
-                style,
-            ));
-            spans.push(Span::styled(ls.name.clone(), style));
+            spans.push(Span::styled(state.icons.ls_active.clone(), style));
+            spans.push(Span::styled(name.clone(), style));
         }
     }
 
@@ -1457,10 +1386,8 @@ mod tests {
 
         panel.update_language_servers();
         assert_eq!(panel.language_servers.len(), 2);
-        assert_eq!(panel.language_servers[0].name, "rust-analyzer");
-        assert_eq!(panel.language_servers[0].state, LsState::Healthy);
-        assert_eq!(panel.language_servers[1].name, "typescript-language-server");
-        assert_eq!(panel.language_servers[1].state, LsState::Healthy);
+        assert_eq!(panel.language_servers[0], "rust-analyzer");
+        assert_eq!(panel.language_servers[1], "typescript-language-server");
     }
 
     // ── Expansion tests ─────────────────────────────────────────────────
@@ -1591,17 +1518,20 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_expansion_no_detail() {
+    fn test_toggle_expansion_empty_payload() {
         let theme = test_theme();
         let icons = test_icons();
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        // Empty payload → no detail
+        // Empty payload — expansion is allowed but produces zero detail lines.
         let messages = vec![make_message("lsp", "initialized", "rust-analyzer")];
         panel.load_messages(messages);
         panel.cursor = 0;
 
         panel.toggle_expansion();
-        assert!(panel.expanded.is_empty());
+        assert!(panel.expanded.contains(&0));
+        // Flat lines: header only (no detail lines for empty payload).
+        let flat = panel.flat_lines();
+        assert_eq!(flat.len(), 1);
     }
 
     #[test]
@@ -1711,25 +1641,6 @@ mod tests {
         assert!(content.contains("lib.rs"), "expected file name in header");
         // Detail lines should contain the payload.
         assert!(content.contains("post-tool"), "expected method in detail");
-    }
-
-    #[test]
-    fn test_has_detail_non_empty_payload() {
-        let theme = test_theme();
-        let icons = test_icons();
-        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
-        panel.messages = vec![
-            make_lsp_message(),
-            make_message("lsp", "initialized", "rust-analyzer"),
-        ];
-        assert!(
-            panel.has_detail(0, None),
-            "non-empty payload should have detail"
-        );
-        assert!(
-            !panel.has_detail(1, None),
-            "empty payload should not have detail"
-        );
     }
 
     // ── Pair merge tests ───────────────────────────────────────────────
