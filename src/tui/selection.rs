@@ -15,8 +15,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
-use super::panel::{FlatLine, PanelState, detail_lines};
-use super::theme::{format_ago, format_message_plain};
+use super::panel::{FlatLine, PanelState, detail_lines, pair_detail_lines};
+use super::theme::{format_ago, format_message_plain, format_pair_plain};
 use super::tree::{SessionTree, TreeItem};
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -105,17 +105,41 @@ pub fn yank_text(panel: &PanelState<'_>, selection: &VisualSelection) -> String 
 
     for fl in flat.iter().skip(start).take(end - start + 1) {
         match fl {
-            FlatLine::MessageHeader { message_index } => {
+            FlatLine::MessageHeader {
+                message_index,
+                paired_response,
+            } => {
                 if let Some(msg) = panel.messages.get(*message_index) {
-                    lines.push(format_message_plain(msg));
+                    if let Some(ri) = paired_response {
+                        if let Some(resp) = panel.messages.get(*ri) {
+                            lines.push(format_pair_plain(msg, resp));
+                        }
+                    } else {
+                        lines.push(format_message_plain(msg));
+                    }
                 }
             }
             FlatLine::Detail {
                 message_index,
                 detail_index,
             } => {
+                // Check if this detail belongs to a paired header.
+                let resp_idx = flat.iter().find_map(|fl| {
+                    if let FlatLine::MessageHeader {
+                        message_index: mi,
+                        paired_response: Some(ri),
+                    } = fl
+                        && *mi == *message_index
+                    {
+                        return Some(*ri);
+                    }
+                    None
+                });
                 if let Some(msg) = panel.messages.get(*message_index) {
-                    let details = detail_lines(msg, panel.theme);
+                    let details = resp_idx.and_then(|ri| panel.messages.get(ri)).map_or_else(
+                        || detail_lines(msg, panel.theme),
+                        |resp| pair_detail_lines(msg, resp, panel.theme),
+                    );
                     if let Some(line) = details.get(*detail_index) {
                         let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                         lines.push(plain);

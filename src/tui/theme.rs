@@ -826,6 +826,200 @@ pub fn format_message_styled(
     }
 }
 
+/// Format a timing delta as a compact string.
+///
+/// Sub-10s: one decimal place (`0.5s`, `3.2s`).
+/// 10s+: integer seconds (`12s`, `45s`).
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "millisecond timing values never exceed f64 mantissa range"
+)]
+pub fn format_duration_short(millis: i64) -> String {
+    let millis = millis.max(0);
+    if millis < 10_000 {
+        let secs = millis as f64 / 1000.0;
+        format!("{secs:.1}s")
+    } else {
+        format!("{}s", millis / 1000)
+    }
+}
+
+/// Extract a result summary from a response payload.
+///
+/// Returns `"ok"` or `"error"` based on the JSON-RPC response structure.
+fn result_summary(response: &SessionMessage) -> &'static str {
+    let p = &response.payload;
+    // MCP tools/call: check isError in result content
+    if response.method == "tools/call"
+        && let Some(result) = p.get("result")
+    {
+        if let Some(content) = result.get("content")
+            && content
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("isError"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return "error";
+        }
+        if result
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return "error";
+        }
+    }
+    if p.get("error").is_some() {
+        "error"
+    } else {
+        "ok"
+    }
+}
+
+/// Build a styled [`Line`] for a merged request/response pair.
+///
+/// Format: `HH:MM:SS [server] <-> method (result, Xs)`
+///
+/// Cancellations (`notifications/cancelled`) render with `x->`.
+#[must_use]
+pub fn format_pair_styled(
+    request: &SessionMessage,
+    response: &SessionMessage,
+    icons: &IconSet,
+    theme: &Theme,
+) -> Line<'static> {
+    let ts = request.timestamp.format("%H:%M:%S").to_string();
+    let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
+
+    let is_cancel = response.method == "notifications/cancelled";
+    let arrow = if is_cancel { "x-> " } else { "<-> " };
+    let arrow_style = if is_cancel { theme.error } else { theme.text };
+
+    let delta_ms = response
+        .timestamp
+        .signed_duration_since(request.timestamp)
+        .num_milliseconds();
+    let timing = format_duration_short(delta_ms);
+
+    let summary = if is_cancel {
+        "cancelled"
+    } else {
+        result_summary(response)
+    };
+    let summary_style = if summary == "error" {
+        theme.error
+    } else {
+        theme.muted
+    };
+
+    match request.r#type.as_str() {
+        "lsp" => Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{}] ", request.server), theme.accent),
+            Span::styled(arrow.to_string(), arrow_style),
+            Span::styled(request.method.clone(), theme.text),
+            Span::styled(format!(" ({summary}, {timing})"), summary_style),
+        ]),
+        "mcp" => {
+            if request.method == "tools/call" && !is_cancel {
+                let tool_name = request
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&request.method);
+                let icon = tool_icon(tool_name, icons);
+                Line::from(vec![
+                    ts_span,
+                    Span::styled(icon.to_string(), theme.success),
+                    Span::styled(tool_name.to_string(), theme.text),
+                    Span::styled(format!(" ({summary}, {timing})"), summary_style),
+                ])
+            } else {
+                let label = if request.method == "tools/call" {
+                    request
+                        .payload
+                        .get("params")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or(&request.method)
+                } else {
+                    &request.method
+                };
+                Line::from(vec![
+                    ts_span,
+                    Span::styled("[mcp] ".to_string(), theme.text),
+                    Span::styled(arrow.to_string(), arrow_style),
+                    Span::styled(label.to_string(), theme.text),
+                    Span::styled(format!(" ({summary}, {timing})"), summary_style),
+                ])
+            }
+        }
+        other => Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{other}] "), theme.text),
+            Span::styled(arrow.to_string(), arrow_style),
+            Span::styled(request.method.clone(), theme.text),
+            Span::styled(format!(" ({summary}, {timing})"), summary_style),
+        ]),
+    }
+}
+
+/// Plain-text summary for a merged request/response pair (filter matching, yank).
+#[must_use]
+pub fn format_pair_plain(request: &SessionMessage, response: &SessionMessage) -> String {
+    let ts = request.timestamp.format("%H:%M:%S");
+    let is_cancel = response.method == "notifications/cancelled";
+    let arrow = if is_cancel { "x->" } else { "<->" };
+    let delta_ms = response
+        .timestamp
+        .signed_duration_since(request.timestamp)
+        .num_milliseconds();
+    let timing = format_duration_short(delta_ms);
+    let summary = if is_cancel {
+        "cancelled"
+    } else {
+        result_summary(response)
+    };
+
+    match request.r#type.as_str() {
+        "lsp" => format!(
+            "{ts} [{}] {arrow} {} ({summary}, {timing})",
+            request.server, request.method
+        ),
+        "mcp" => {
+            if request.method == "tools/call" && !is_cancel {
+                let tool_name = request
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&request.method);
+                format!("{ts} {tool_name} ({summary}, {timing})")
+            } else {
+                let label = if request.method == "tools/call" {
+                    request
+                        .payload
+                        .get("params")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or(&request.method)
+                } else {
+                    &request.method
+                };
+                format!("{ts} [mcp] {arrow} {label} ({summary}, {timing})")
+            }
+        }
+        other => format!(
+            "{ts} [{other}] {arrow} {} ({summary}, {timing})",
+            request.method
+        ),
+    }
+}
+
 /// Plain-text message summary (used for filter matching).
 #[must_use]
 pub fn format_message_plain(msg: &SessionMessage) -> String {

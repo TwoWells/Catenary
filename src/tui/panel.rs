@@ -18,7 +18,10 @@ use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::selection::VisualSelection;
-use super::theme::{IconSet, Theme, format_message_plain, format_message_styled};
+use super::theme::{
+    IconSet, Theme, format_message_plain, format_message_styled, format_pair_plain,
+    format_pair_styled,
+};
 use crate::session::SessionMessage;
 
 // ── Data types ──────────────────────────────────────────────────────────
@@ -47,17 +50,60 @@ pub struct LanguageServerStatus {
     pub state: LsState,
 }
 
+/// A display pipeline entry — single message or merged request/response pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisplayEntry {
+    /// A single message (not merged).
+    Single {
+        /// Index into the messages vec.
+        index: usize,
+    },
+    /// A request/response pair merged into one line.
+    Paired {
+        /// Index of the request message.
+        request_index: usize,
+        /// Index of the response message.
+        response_index: usize,
+    },
+}
+
+/// Run pair merge on a message list.
+///
+/// If a message has `request_id` set and the value equals the `id` of
+/// the immediately preceding message, both merge into a single `Paired`
+/// entry. Non-adjacent pairs remain as separate `Single` entries.
+#[must_use]
+pub fn pair_merge(messages: &[SessionMessage]) -> Vec<DisplayEntry> {
+    let mut entries = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        if i + 1 < messages.len() && messages[i + 1].request_id == Some(messages[i].id) {
+            entries.push(DisplayEntry::Paired {
+                request_index: i,
+                response_index: i + 1,
+            });
+            i += 2;
+        } else {
+            entries.push(DisplayEntry::Single { index: i });
+            i += 1;
+        }
+    }
+    entries
+}
+
 /// A line in the flattened view — either a message header or a detail line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlatLine {
     /// A message header (the one-line summary).
     MessageHeader {
-        /// Index into the messages vec.
+        /// Index into the messages vec (request index for pairs).
         message_index: usize,
+        /// If this header is a merged pair, the response message index.
+        paired_response: Option<usize>,
     },
     /// A detail line within an expanded message.
     Detail {
-        /// Index into the messages vec.
+        /// Index into the messages vec (request index for pairs).
         message_index: usize,
         /// Index of this detail line within the expansion.
         detail_index: usize,
@@ -322,38 +368,78 @@ impl<'a> PanelState<'a> {
     // ── Expansion ───────────────────────────────────────────────────────
 
     /// Build a flat list of lines: message headers interleaved with detail
-    /// lines for any expanded messages.
+    /// lines for any expanded messages. Uses pair merge to combine adjacent
+    /// request/response pairs into single header lines.
     #[must_use]
     pub fn flat_lines(&self) -> Vec<FlatLine> {
         let lower_pattern = self.filter_pattern.as_ref().map(|p| p.to_lowercase());
+        let entries = pair_merge(&self.messages);
         let mut lines = Vec::new();
-        for (message_index, msg) in self.messages.iter().enumerate() {
-            if let Some(ref pat) = lower_pattern {
-                let plain = format_message_plain(msg);
-                if !plain.to_lowercase().contains(pat) {
-                    continue;
-                }
-            }
-            lines.push(FlatLine::MessageHeader { message_index });
-            if self.expanded.contains(&message_index) {
-                let count = detail_lines(msg, self.theme).len();
-                for detail_index in 0..count {
-                    lines.push(FlatLine::Detail {
-                        message_index,
-                        detail_index,
+
+        for entry in &entries {
+            match *entry {
+                DisplayEntry::Single { index } => {
+                    let msg = &self.messages[index];
+                    if let Some(ref pat) = lower_pattern {
+                        let plain = format_message_plain(msg);
+                        if !plain.to_lowercase().contains(pat) {
+                            continue;
+                        }
+                    }
+                    lines.push(FlatLine::MessageHeader {
+                        message_index: index,
+                        paired_response: None,
                     });
+                    if self.expanded.contains(&index) {
+                        let count = detail_lines(msg, self.theme).len();
+                        for detail_index in 0..count {
+                            lines.push(FlatLine::Detail {
+                                message_index: index,
+                                detail_index,
+                            });
+                        }
+                    }
+                }
+                DisplayEntry::Paired {
+                    request_index,
+                    response_index,
+                } => {
+                    let req = &self.messages[request_index];
+                    let resp = &self.messages[response_index];
+                    if let Some(ref pat) = lower_pattern {
+                        let plain = format_pair_plain(req, resp);
+                        if !plain.to_lowercase().contains(pat) {
+                            continue;
+                        }
+                    }
+                    lines.push(FlatLine::MessageHeader {
+                        message_index: request_index,
+                        paired_response: Some(response_index),
+                    });
+                    if self.expanded.contains(&request_index) {
+                        let count = pair_detail_lines(req, resp, self.theme).len();
+                        for detail_index in 0..count {
+                            lines.push(FlatLine::Detail {
+                                message_index: request_index,
+                                detail_index,
+                            });
+                        }
+                    }
                 }
             }
         }
         lines
     }
 
-    /// Quick check: does this message have expandable detail?
+    /// Quick check: does this message (or pair) have expandable detail?
     #[must_use]
-    pub fn has_detail(&self, message_index: usize) -> bool {
-        self.messages
-            .get(message_index)
-            .is_some_and(|msg| msg.payload.as_object().is_some_and(|o| !o.is_empty()))
+    pub fn has_detail(&self, message_index: usize, paired_response: Option<usize>) -> bool {
+        let has_payload = |idx: usize| {
+            self.messages
+                .get(idx)
+                .is_some_and(|msg| msg.payload.as_object().is_some_and(|o| !o.is_empty()))
+        };
+        has_payload(message_index) || paired_response.is_some_and(has_payload)
     }
 
     /// Toggle expansion of the message under the cursor.
@@ -367,8 +453,11 @@ impl<'a> PanelState<'a> {
             return;
         };
         match *current {
-            FlatLine::MessageHeader { message_index } => {
-                if !self.has_detail(message_index) {
+            FlatLine::MessageHeader {
+                message_index,
+                paired_response,
+            } => {
+                if !self.has_detail(message_index, paired_response) {
                     return;
                 }
                 if self.expanded.contains(&message_index) {
@@ -382,7 +471,7 @@ impl<'a> PanelState<'a> {
                 // Move cursor to the parent header.
                 let new_flat = self.flat_lines();
                 if let Some(pos) = new_flat.iter().position(|fl| {
-                    matches!(fl, FlatLine::MessageHeader { message_index: mi } if *mi == message_index)
+                    matches!(fl, FlatLine::MessageHeader { message_index: mi, .. } if *mi == message_index)
                 }) {
                     self.cursor = pos;
                 }
@@ -427,6 +516,76 @@ pub fn detail_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'static>> {
                 Span::raw(indent.to_string()),
                 Span::styled(line.to_string(), theme.muted),
             ]));
+        }
+    }
+
+    lines
+}
+
+/// Generate styled detail lines for an expanded request/response pair.
+///
+/// Shows the request payload under a `→` header and the response payload
+/// under a `←` header.
+#[must_use]
+pub fn pair_detail_lines(
+    request: &SessionMessage,
+    response: &SessionMessage,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let indent = "          ";
+    let mut lines = Vec::new();
+
+    // Request section
+    let req_payload = &request.payload;
+    if req_payload.as_object().is_some_and(|o| !o.is_empty()) {
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(
+                format!("\u{2192} {} [{}]", request.method, request.r#type),
+                theme.muted,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(
+                "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                theme.muted,
+            ),
+        ]));
+        if let Ok(pretty) = serde_json::to_string_pretty(req_payload) {
+            for line in pretty.lines() {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(line.to_string(), theme.muted),
+                ]));
+            }
+        }
+    }
+
+    // Response section
+    let resp_payload = &response.payload;
+    if resp_payload.as_object().is_some_and(|o| !o.is_empty()) {
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(
+                format!("\u{2190} {} [{}]", response.method, response.r#type),
+                theme.muted,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(
+                "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                theme.muted,
+            ),
+        ]));
+        if let Ok(pretty) = serde_json::to_string_pretty(resp_payload) {
+            for line in pretty.lines() {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(line.to_string(), theme.muted),
+                ]));
+            }
         }
     }
 
@@ -610,7 +769,8 @@ fn clip_line_horizontal(line: &Line<'_>, h_scroll: usize, width: usize) -> Line<
 /// (grid) handles junction characters.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
+    clippy::too_many_lines,
+    reason = "terminal coordinates are always small; pair merge adds detail lookup logic"
 )]
 pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focused: bool) {
     if area.width < 4 || area.height < 2 {
@@ -670,15 +830,50 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
         }
 
         let line = match fl {
-            FlatLine::MessageHeader { message_index } => {
-                format_message_styled(&state.messages[*message_index], state.icons, state.theme)
-            }
+            FlatLine::MessageHeader {
+                message_index,
+                paired_response,
+            } => paired_response.map_or_else(
+                || format_message_styled(&state.messages[*message_index], state.icons, state.theme),
+                |resp_idx| {
+                    format_pair_styled(
+                        &state.messages[*message_index],
+                        &state.messages[resp_idx],
+                        state.icons,
+                        state.theme,
+                    )
+                },
+            ),
             FlatLine::Detail {
                 message_index,
                 detail_index,
             } => detail_cache
                 .entry(*message_index)
-                .or_insert_with(|| detail_lines(&state.messages[*message_index], state.theme))
+                .or_insert_with(|| {
+                    // Find the parent header to check for pair.
+                    let resp_idx = flat.iter().find_map(|fl| {
+                        if let FlatLine::MessageHeader {
+                            message_index: mi,
+                            paired_response: Some(ri),
+                        } = fl
+                            && *mi == *message_index
+                        {
+                            Some(*ri)
+                        } else {
+                            None
+                        }
+                    });
+                    resp_idx.map_or_else(
+                        || detail_lines(&state.messages[*message_index], state.theme),
+                        |ri| {
+                            pair_detail_lines(
+                                &state.messages[*message_index],
+                                &state.messages[ri],
+                                state.theme,
+                            )
+                        },
+                    )
+                })
                 .get(*detail_index)
                 .cloned()
                 .unwrap_or_default(),
@@ -1152,7 +1347,13 @@ mod tests {
         let flat = panel.flat_lines();
         assert_eq!(flat.len(), 5);
         for (i, fl) in flat.iter().enumerate() {
-            assert_eq!(*fl, FlatLine::MessageHeader { message_index: i });
+            assert_eq!(
+                *fl,
+                FlatLine::MessageHeader {
+                    message_index: i,
+                    paired_response: None,
+                }
+            );
         }
     }
 
@@ -1174,8 +1375,20 @@ mod tests {
         let detail_count = detail_lines(&panel.messages[1], &theme).len();
         assert!(detail_count > 0, "hook diag message should have details");
         assert_eq!(flat.len(), 3 + detail_count);
-        assert_eq!(flat[0], FlatLine::MessageHeader { message_index: 0 });
-        assert_eq!(flat[1], FlatLine::MessageHeader { message_index: 1 });
+        assert_eq!(
+            flat[0],
+            FlatLine::MessageHeader {
+                message_index: 0,
+                paired_response: None,
+            }
+        );
+        assert_eq!(
+            flat[1],
+            FlatLine::MessageHeader {
+                message_index: 1,
+                paired_response: None,
+            }
+        );
         for i in 0..detail_count {
             assert_eq!(
                 flat[2 + i],
@@ -1187,7 +1400,10 @@ mod tests {
         }
         assert_eq!(
             flat[2 + detail_count],
-            FlatLine::MessageHeader { message_index: 2 }
+            FlatLine::MessageHeader {
+                message_index: 2,
+                paired_response: None,
+            }
         );
     }
 
@@ -1379,7 +1595,246 @@ mod tests {
             make_lsp_message(),
             make_message("lsp", "initialized", "rust-analyzer"),
         ];
-        assert!(panel.has_detail(0), "non-empty payload should have detail");
-        assert!(!panel.has_detail(1), "empty payload should not have detail");
+        assert!(
+            panel.has_detail(0, None),
+            "non-empty payload should have detail"
+        );
+        assert!(
+            !panel.has_detail(1, None),
+            "empty payload should not have detail"
+        );
+    }
+
+    // ── Pair merge tests ───────────────────────────────────────────────
+
+    fn make_message_with_id(
+        id: i64,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        request_id: Option<i64>,
+    ) -> SessionMessage {
+        SessionMessage {
+            id,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id,
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn make_message_with_id_ts(
+        id: i64,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        request_id: Option<i64>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            id,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id,
+            parent_id: None,
+            timestamp,
+            payload,
+        }
+    }
+
+    #[test]
+    fn test_pair_merge_adjacent() {
+        let messages = vec![
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
+            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            DisplayEntry::Paired {
+                request_index: 0,
+                response_index: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_pair_merge_non_adjacent() {
+        let messages = vec![
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
+            make_message_with_id(2, "lsp", "$/progress", "rust-analyzer", None),
+            make_message_with_id(3, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], DisplayEntry::Single { index: 0 });
+        assert_eq!(entries[1], DisplayEntry::Single { index: 1 });
+        assert_eq!(entries[2], DisplayEntry::Single { index: 2 });
+    }
+
+    #[test]
+    fn test_pair_merge_consecutive_pairs() {
+        let messages = vec![
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
+            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
+            make_message_with_id(3, "lsp", "textDocument/definition", "rust-analyzer", None),
+            make_message_with_id(
+                4,
+                "lsp",
+                "textDocument/definition",
+                "rust-analyzer",
+                Some(3),
+            ),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            DisplayEntry::Paired {
+                request_index: 0,
+                response_index: 1,
+            }
+        );
+        assert_eq!(
+            entries[1],
+            DisplayEntry::Paired {
+                request_index: 2,
+                response_index: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_pair_merge_no_request_id() {
+        let messages = vec![
+            make_message_with_id(1, "lsp", "$/progress", "rust-analyzer", None),
+            make_message_with_id(2, "lsp", "$/progress", "rust-analyzer", None),
+            make_message_with_id(3, "lsp", "$/progress", "rust-analyzer", None),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 3);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(*entry, DisplayEntry::Single { index: i });
+        }
+    }
+
+    #[test]
+    fn test_pair_merge_cancellation() {
+        let messages = vec![
+            make_message_with_id(1, "mcp", "tools/call", "catenary", None),
+            make_message_with_id(2, "mcp", "notifications/cancelled", "catenary", Some(1)),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            DisplayEntry::Paired {
+                request_index: 0,
+                response_index: 1,
+            }
+        );
+
+        // Verify rendering uses x-> arrow.
+        let theme = test_theme();
+        let icons = test_icons();
+        let line =
+            super::super::theme::format_pair_styled(&messages[0], &messages[1], &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("x->"), "cancellation should show x-> arrow");
+    }
+
+    #[test]
+    fn test_format_pair_styled_timing() {
+        use chrono::{TimeDelta, Utc};
+
+        let now = Utc::now();
+        let later = now + TimeDelta::milliseconds(1500);
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let request = make_message_with_id_ts(
+            1,
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            None,
+            now,
+            serde_json::json!({}),
+        );
+        let response = make_message_with_id_ts(
+            2,
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            Some(1),
+            later,
+            serde_json::json!({"result": null}),
+        );
+
+        let line = super::super::theme::format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("1.5s"), "should contain timing delta: {text}");
+    }
+
+    #[test]
+    fn test_format_pair_styled_lsp() {
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let request = make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None);
+        let mut response =
+            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1));
+        response.payload = serde_json::json!({"result": {"contents": "fn main()"}});
+
+        let line = super::super::theme::format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("[rust-analyzer]"),
+            "should contain server name: {text}"
+        );
+        assert!(text.contains("<->"), "should contain <-> arrow: {text}");
+        assert!(
+            text.contains("textDocument/hover"),
+            "should contain method: {text}"
+        );
+        assert!(text.contains("ok"), "should contain ok result: {text}");
+    }
+
+    #[test]
+    fn test_format_pair_styled_mcp() {
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let request = make_message_with_id_ts(
+            1,
+            "mcp",
+            "tools/call",
+            "catenary",
+            None,
+            chrono::Utc::now(),
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_id_ts(
+            2,
+            "mcp",
+            "tools/call",
+            "catenary",
+            Some(1),
+            chrono::Utc::now(),
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "results"}]}}),
+        );
+
+        let line = super::super::theme::format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("grep"), "should contain tool name: {text}");
+        assert!(text.contains("ok"), "should contain result status: {text}");
     }
 }
