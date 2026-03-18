@@ -39,9 +39,7 @@ pub struct SessionInfo {
 
 /// A protocol message row from the `messages` table.
 ///
-/// All envelope fields plus the raw protocol payload. This is the
-/// universal message type — replaces `SessionEvent` after the
-/// collapse migration.
+/// All envelope fields plus the raw protocol payload.
 #[derive(Debug, Clone)]
 pub struct SessionMessage {
     /// Unique message ID (autoincrement primary key).
@@ -66,9 +64,8 @@ pub struct SessionMessage {
 
 /// Shared protocol message logger.
 ///
-/// Replaces `EventBroadcaster` and the `Logger` trait. Each protocol
-/// boundary component holds `Arc<MessageLog>` and calls `log()` for
-/// every message that crosses the wire.
+/// Each protocol boundary component holds `Arc<MessageLog>` and calls
+/// `log()` for every message that crosses the wire.
 pub struct MessageLog {
     inner: MessageLogInner,
 }
@@ -371,8 +368,7 @@ impl Drop for Session {
 
 // ── Message tailing (SQLite-backed) ──────────────────────────────────
 
-/// Polls the messages table for new messages, parallel to
-/// [`SqliteEventTail`] for events.
+/// Polls the `messages` table for new rows since the last read.
 pub struct SqliteMessageTail {
     conn: Connection,
     session_id: String,

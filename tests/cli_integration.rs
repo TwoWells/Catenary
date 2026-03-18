@@ -298,7 +298,6 @@ fn test_monitor_numeric_session_id_resolves() -> Result<()> {
 }
 
 #[test]
-#[ignore = "05b: run_monitor depends on old EventBroadcaster, rewrite pending"]
 fn test_monitor_raw_flag() -> Result<()> {
     use std::sync::mpsc;
 
@@ -433,7 +432,6 @@ fn test_monitor_nocolor_flag() -> Result<()> {
 }
 
 #[test]
-#[ignore = "05b: run_monitor depends on old EventBroadcaster, rewrite pending"]
 fn test_monitor_filter_flag() -> Result<()> {
     use std::sync::mpsc;
 
@@ -501,7 +499,6 @@ fn test_monitor_filter_flag() -> Result<()> {
 }
 
 #[test]
-#[ignore = "05b: run_monitor depends on old EventBroadcaster, rewrite pending"]
 fn test_monitor_uses_arrows() -> Result<()> {
     use std::sync::mpsc;
 
