@@ -187,6 +187,105 @@ fn extract_sync_uri(payload: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+// ── Collapsed run payload extractors ────────────────────────────────
+
+/// Extract the progress title from a run of `$/progress` messages.
+///
+/// Looks for the first message with `value.kind == "begin"` and a `title`
+/// field. Falls back to the progress token from the first message.
+pub(crate) fn extract_progress_title(
+    messages: &[SessionMessage],
+    start: usize,
+    end: usize,
+) -> String {
+    for msg in &messages[start..=end] {
+        if let Some(value) = msg.payload.get("value")
+            && value.get("kind").and_then(|k| k.as_str()) == Some("begin")
+            && let Some(title) = value.get("title").and_then(|t| t.as_str())
+        {
+            return title.to_string();
+        }
+    }
+    // Fall back to progress token from the first message.
+    extract_progress_token(&messages[start].payload).unwrap_or_default()
+}
+
+/// Extract the percentage range from a run of `$/progress` messages.
+///
+/// Returns the first and last `value.percentage` values found in the run.
+pub(crate) fn extract_progress_pct_range(
+    messages: &[SessionMessage],
+    start: usize,
+    end: usize,
+) -> (Option<u64>, Option<u64>) {
+    let mut first = None;
+    let mut last = None;
+    for msg in &messages[start..=end] {
+        if let Some(value) = msg.payload.get("value")
+            && let Some(pct) = value.get("percentage").and_then(serde_json::Value::as_u64)
+        {
+            if first.is_none() {
+                first = Some(pct);
+            }
+            last = Some(pct);
+        }
+    }
+    (first, last)
+}
+
+/// Extract the file basename from a sync run's `textDocument.uri`.
+pub(crate) fn extract_sync_basename(
+    messages: &[SessionMessage],
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    for msg in &messages[start..=end] {
+        if let Some(uri) = extract_sync_uri(&msg.payload) {
+            let name = std::path::Path::new(uri.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&uri);
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Extract deduplicated operation labels from a sync run, preserving order.
+///
+/// Maps `didOpen` → `open`, `didChange` → `change`, etc.
+pub(crate) fn extract_sync_operations(
+    messages: &[SessionMessage],
+    start: usize,
+    end: usize,
+) -> Vec<&'static str> {
+    let mut ops: Vec<&'static str> = Vec::new();
+    for msg in &messages[start..=end] {
+        let label = match msg.method.as_str() {
+            "textDocument/didOpen" => "open",
+            "textDocument/didChange" => "change",
+            "textDocument/didSave" => "save",
+            "textDocument/didClose" => "close",
+            _ => continue,
+        };
+        if !ops.contains(&label) {
+            ops.push(label);
+        }
+    }
+    ops
+}
+
+/// Map a log collapse key's level to a human-readable label.
+///
+/// Collapse key format: `log:{server}:{level}`.
+/// Level 3 = info, level 4 = log.
+pub(crate) fn log_level_label(collapse_key: &str) -> &'static str {
+    match collapse_key.rsplit(':').next() {
+        Some("3") => "info",
+        _ => "log",
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::category;
 use crate::config::{IconConfig, IconPreset};
 use crate::session::SessionMessage;
 
@@ -1020,15 +1021,29 @@ pub fn format_pair_plain(request: &SessionMessage, response: &SessionMessage) ->
     }
 }
 
+/// Format the detail portion of a collapsed progress run.
+///
+/// Combines message count with an optional percentage range.
+fn format_progress_detail(count: usize, first_pct: Option<u64>, last_pct: Option<u64>) -> String {
+    let count_label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+    match (first_pct, last_pct) {
+        (Some(f), Some(l)) if f != l => format!("{count_label}, {f}%\u{2192}{l}%"),
+        (Some(p), _) | (_, Some(p)) => format!("{count_label}, {p}%"),
+        _ => count_label,
+    }
+}
+
 /// Build a styled [`Line`] for a collapsed run of messages.
 ///
-/// Generic format: `HH:MM:SS [server] method (N messages)`
+/// Category-specific rendering for progress, sync, lifecycle, log, and
+/// MCP init runs. Falls back to generic `method (N messages)` for
+/// protocol-level runs.
 ///
 /// Uses the last message's timestamp (most recent in the run).
 #[must_use]
 pub fn format_collapsed_styled(
     messages: &[SessionMessage],
-    _start: usize,
+    start: usize,
     end: usize,
     count: usize,
     _icons: &IconSet,
@@ -1038,49 +1053,121 @@ pub fn format_collapsed_styled(
     let ts = last.timestamp.format("%H:%M:%S").to_string();
     let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
 
-    let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+    let key = category::collapse_key(&messages[start]);
+    let key_str = key.as_deref().unwrap_or("");
 
-    match last.r#type.as_str() {
-        "lsp" => {
-            let server_span = Span::styled(format!("[{}] ", last.server), theme.accent);
-            Line::from(vec![
+    if key_str.starts_with("progress:") {
+        let title = category::extract_progress_title(messages, start, end);
+        let (first_pct, last_pct) = category::extract_progress_pct_range(messages, start, end);
+        let detail = format_progress_detail(count, first_pct, last_pct);
+        let server = &messages[start].server;
+        Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{server}] "), theme.accent),
+            Span::styled(title, theme.text),
+            Span::styled(format!(" ({detail})"), theme.muted),
+        ])
+    } else if key_str.starts_with("log:") {
+        let label = category::log_level_label(key_str);
+        let count_label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+        let server = &messages[start].server;
+        Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{server}] "), theme.accent),
+            Span::styled(label.to_string(), theme.text),
+            Span::styled(format!(" ({count_label})"), theme.muted),
+        ])
+    } else if key_str.starts_with("sync:") {
+        let file = category::extract_sync_basename(messages, start, end).unwrap_or_default();
+        let ops = category::extract_sync_operations(messages, start, end);
+        let ops_str = ops.join(", ");
+        let server = &messages[start].server;
+        Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{server}] "), theme.accent),
+            Span::styled(format!("sync {file}"), theme.text),
+            Span::styled(format!(" ({ops_str})"), theme.muted),
+        ])
+    } else if key_str.starts_with("lifecycle:") {
+        let server = &messages[start].server;
+        Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{server}] "), theme.accent),
+            Span::styled("initialized".to_string(), theme.text),
+        ])
+    } else if key_str == "init:mcp" {
+        Line::from(vec![
+            ts_span,
+            Span::styled("mcp initialized".to_string(), theme.text),
+        ])
+    } else {
+        // Generic fallback (proto: or unknown).
+        let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+        match last.r#type.as_str() {
+            "lsp" => Line::from(vec![
                 ts_span,
-                server_span,
+                Span::styled(format!("[{}] ", last.server), theme.accent),
                 Span::styled(last.method.clone(), theme.text),
                 Span::styled(format!(" ({label})"), theme.muted),
-            ])
+            ]),
+            "mcp" => Line::from(vec![
+                ts_span,
+                Span::styled("[mcp] ".to_string(), theme.text),
+                Span::styled(last.method.clone(), theme.text),
+                Span::styled(format!(" ({label})"), theme.muted),
+            ]),
+            other => Line::from(vec![
+                ts_span,
+                Span::styled(format!("[{other}] "), theme.text),
+                Span::styled(last.method.clone(), theme.text),
+                Span::styled(format!(" ({label})"), theme.muted),
+            ]),
         }
-        "mcp" => Line::from(vec![
-            ts_span,
-            Span::styled("[mcp] ".to_string(), theme.text),
-            Span::styled(last.method.clone(), theme.text),
-            Span::styled(format!(" ({label})"), theme.muted),
-        ]),
-        other => Line::from(vec![
-            ts_span,
-            Span::styled(format!("[{other}] "), theme.text),
-            Span::styled(last.method.clone(), theme.text),
-            Span::styled(format!(" ({label})"), theme.muted),
-        ]),
     }
 }
 
 /// Plain-text summary for a collapsed run (filter matching, yank).
+///
+/// Category-specific rendering matching [`format_collapsed_styled`].
 #[must_use]
 pub fn format_collapsed_plain(
     messages: &[SessionMessage],
-    _start: usize,
+    start: usize,
     end: usize,
     count: usize,
 ) -> String {
     let last = &messages[end];
     let ts = last.timestamp.format("%H:%M:%S");
-    let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
 
-    match last.r#type.as_str() {
-        "lsp" => format!("{ts} [{}] {} ({label})", last.server, last.method),
-        "mcp" => format!("{ts} [mcp] {} ({label})", last.method),
-        other => format!("{ts} [{other}] {} ({label})", last.method),
+    let key = category::collapse_key(&messages[start]);
+    let key_str = key.as_deref().unwrap_or("");
+
+    if key_str.starts_with("progress:") {
+        let title = category::extract_progress_title(messages, start, end);
+        let (first_pct, last_pct) = category::extract_progress_pct_range(messages, start, end);
+        let detail = format_progress_detail(count, first_pct, last_pct);
+        format!("{ts} [{}] {title} ({detail})", messages[start].server)
+    } else if key_str.starts_with("log:") {
+        let label = category::log_level_label(key_str);
+        let count_label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+        format!("{ts} [{}] {label} ({count_label})", messages[start].server)
+    } else if key_str.starts_with("sync:") {
+        let file = category::extract_sync_basename(messages, start, end).unwrap_or_default();
+        let ops = category::extract_sync_operations(messages, start, end);
+        let ops_str = ops.join(", ");
+        format!("{ts} [{}] sync {file} ({ops_str})", messages[start].server)
+    } else if key_str.starts_with("lifecycle:") {
+        format!("{ts} [{}] initialized", messages[start].server)
+    } else if key_str == "init:mcp" {
+        format!("{ts} mcp initialized")
+    } else {
+        // Generic fallback (proto: or unknown).
+        let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
+        match last.r#type.as_str() {
+            "lsp" => format!("{ts} [{}] {} ({label})", last.server, last.method),
+            "mcp" => format!("{ts} [mcp] {} ({label})", last.method),
+            other => format!("{ts} [{other}] {} ({label})", last.method),
+        }
     }
 }
 
@@ -1572,12 +1659,283 @@ mod tests {
         let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
+            text.contains("sync main.rs"),
+            "should contain sync + basename: {text}"
+        );
+        assert!(
+            text.contains("open, save"),
+            "should contain operations: {text}"
+        );
+    }
+
+    // ── Category-specific collapsed rendering tests ─────────────────────
+
+    #[test]
+    fn test_format_collapsed_progress_with_title() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "rust-analyzer/Roots Scanned",
+                    "value": {"kind": "begin", "title": "Roots Scanned", "percentage": 0}
+                }),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "rust-analyzer/Roots Scanned",
+                    "value": {"kind": "report", "percentage": 13}
+                }),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "rust-analyzer/Roots Scanned",
+                    "value": {"kind": "report", "percentage": 49}
+                }),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "rust-analyzer/Roots Scanned",
+                    "value": {"kind": "end"}
+                }),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 3, 4, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("Roots Scanned"),
+            "should contain title: {text}"
+        );
+        assert!(
+            text.contains("0%\u{2192}49%"),
+            "should contain percentage range: {text}"
+        );
+
+        let plain = format_collapsed_plain(&messages, 0, 3, 4);
+        assert!(
+            plain.contains("Roots Scanned"),
+            "plain should contain title: {plain}"
+        );
+        assert!(
+            plain.contains("0%\u{2192}49%"),
+            "plain should contain percentage range: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_progress_no_percentage() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "rust-analyzer/indexing",
+                    "value": {"kind": "begin", "title": "Indexing"}
+                }),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "rust-analyzer/indexing",
+                    "value": {"kind": "end"}
+                }),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Indexing"), "should contain title: {text}");
+        assert!(text.contains("2 messages"), "should contain count: {text}");
+        assert!(!text.contains('%'), "should not contain percentage: {text}");
+
+        let plain = format_collapsed_plain(&messages, 0, 1, 2);
+        assert!(
+            plain.contains("Indexing"),
+            "plain should contain title: {plain}"
+        );
+        assert!(
+            !plain.contains('%'),
+            "plain should not contain percentage: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_sync_operations() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "textDocument/didOpen",
+                "rust-analyzer",
+                serde_json::json!({"textDocument": {"uri": "file:///src/main.rs"}}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "textDocument/didSave",
+                "rust-analyzer",
+                serde_json::json!({"textDocument": {"uri": "file:///src/main.rs"}}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("main.rs"), "should contain basename: {text}");
+        assert!(text.contains("open"), "should contain open: {text}");
+        assert!(text.contains("save"), "should contain save: {text}");
+
+        let plain = format_collapsed_plain(&messages, 0, 1, 2);
+        assert!(
+            plain.contains("sync main.rs"),
+            "plain should contain sync + basename: {plain}"
+        );
+        assert!(
+            plain.contains("open, save"),
+            "plain should contain operations: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_lifecycle() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message("lsp", "initialize", "shellscript"),
+            make_message("lsp", "initialized", "shellscript"),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("initialized"),
+            "should contain initialized: {text}"
+        );
+        assert!(
+            text.contains("[shellscript]"),
+            "should contain server name: {text}"
+        );
+
+        let plain = format_collapsed_plain(&messages, 0, 1, 2);
+        assert!(
+            plain.contains("initialized"),
+            "plain should contain initialized: {plain}"
+        );
+        assert!(
+            plain.contains("[shellscript]"),
+            "plain should contain server name: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_mcp_init() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message("mcp", "initialize", "catenary"),
+            make_message("mcp", "notifications/initialized", "catenary"),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("mcp initialized"),
+            "should contain mcp initialized: {text}"
+        );
+
+        let plain = format_collapsed_plain(&messages, 0, 1, 2);
+        assert!(
+            plain.contains("mcp initialized"),
+            "plain should contain mcp initialized: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_log_info() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "window/logMessage",
+                "python",
+                serde_json::json!({"type": 3, "message": "Loading..."}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "window/logMessage",
+                "python",
+                serde_json::json!({"type": 3, "message": "Ready."}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "window/logMessage",
+                "python",
+                serde_json::json!({"type": 3, "message": "Done."}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 2, 3, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("info"), "should contain info label: {text}");
+        assert!(text.contains("3 messages"), "should contain count: {text}");
+
+        let plain = format_collapsed_plain(&messages, 0, 2, 3);
+        assert!(plain.contains("info"), "plain should contain info: {plain}");
+        assert!(
+            plain.contains("[python]"),
+            "plain should contain server: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_generic_fallback() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "workspace/configuration",
+                "rust-analyzer",
+                serde_json::json!({"id": 1}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "workspace/configuration",
+                "rust-analyzer",
+                serde_json::json!({"id": 2}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
             text.contains("2 messages"),
             "should contain message count: {text}"
         );
         assert!(
-            text.contains("textDocument/did"),
+            text.contains("workspace/configuration"),
             "should contain method: {text}"
+        );
+
+        let plain = format_collapsed_plain(&messages, 0, 1, 2);
+        assert!(
+            plain.contains("2 messages"),
+            "plain should contain count: {plain}"
+        );
+        assert!(
+            plain.contains("workspace/configuration"),
+            "plain should contain method: {plain}"
         );
     }
 }
