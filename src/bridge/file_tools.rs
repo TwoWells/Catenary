@@ -18,9 +18,14 @@ use std::fmt::Write;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 
-use super::handler::LspBridgeHandler;
+use super::handler::resolve_path;
 use super::symbols::{format_symbol_kind, is_outline_kind};
+use super::{DocumentManager, DocumentNotification};
+use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::CallToolResult;
 
 /// Input for the `glob` tool.
@@ -92,17 +97,77 @@ fn extract_outline_symbols(response: &Value) -> OutlineSymbols {
     symbols
 }
 
-impl LspBridgeHandler {
+/// Glob tool server: unified file/directory/pattern browsing with LSP symbols.
+pub struct GlobServer {
+    pub(super) client_manager: Arc<ClientManager>,
+    pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
+    pub(super) runtime: Handle,
+}
+
+impl GlobServer {
+    /// Gets the appropriate LSP client for the given file path.
+    async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
+        let lang_id = {
+            let doc_manager = self.doc_manager.lock().await;
+            doc_manager.language_id_for_path(path).to_string()
+        };
+
+        self.client_manager
+            .get_client_for_path(path, &lang_id)
+            .await
+    }
+
+    /// Ensures a document is open and synced with the LSP server.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Client lock held across notification send"
+    )]
+    async fn ensure_document_open(&self, path: &Path) -> Result<(String, Arc<Mutex<LspClient>>)> {
+        let client_mutex = self.get_client_for_path(path).await?;
+        let mut doc_manager = self.doc_manager.lock().await;
+        let client = client_mutex.lock().await;
+
+        if !client.is_alive() {
+            return Err(anyhow!(
+                "[{}] server is no longer running",
+                client.language()
+            ));
+        }
+
+        let uri = doc_manager.uri_for_path(path)?;
+
+        if let Some(notification) = doc_manager.ensure_open(path).await? {
+            match notification {
+                DocumentNotification::Open {
+                    language_id,
+                    version,
+                    text,
+                    ..
+                } => {
+                    client.did_open(&uri, &language_id, version, &text).await?;
+                }
+                DocumentNotification::Change { version, text, .. } => {
+                    client.did_change(&uri, version, &text).await?;
+                }
+            }
+
+            drop(doc_manager);
+            drop(client);
+            return Ok((uri, client_mutex.clone()));
+        }
+
+        drop(doc_manager);
+        drop(client);
+        Ok((uri, client_mutex.clone()))
+    }
+
     /// Handles the `glob` tool call.
-    pub(super) fn handle_glob(
-        &self,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<CallToolResult> {
+    pub fn handle_glob(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
         let input: GlobInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = Self::resolve_path(&input.pattern)?;
+        let path = resolve_path(&input.pattern)?;
 
         tracing::debug!("glob: {}", input.pattern);
 
@@ -314,11 +379,11 @@ impl LspBridgeHandler {
     /// Extracts a file path from `glob` arguments, returning `Some(path)` only
     /// if the pattern resolves to an existing file. For directories and glob
     /// patterns, returns `None` (triggers wait-for-all-servers).
-    pub(super) fn extract_glob_file_path(arguments: Option<&serde_json::Value>) -> Option<PathBuf> {
+    pub fn extract_glob_file_path(arguments: Option<&serde_json::Value>) -> Option<PathBuf> {
         let pattern = arguments
             .and_then(|v| v.get("pattern"))
             .and_then(|v| v.as_str())?;
-        let path = Self::resolve_path(pattern).ok()?;
+        let path = resolve_path(pattern).ok()?;
         if path.is_file() { Some(path) } else { None }
     }
 }

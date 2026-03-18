@@ -587,6 +587,7 @@ mod tests {
                     "type": "object",
                     "properties": {}
                 }),
+                annotations: None,
             }]
         }
 

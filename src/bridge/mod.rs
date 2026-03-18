@@ -7,6 +7,8 @@ pub mod diagnostics_server;
 mod document_manager;
 /// Glob tool handler: unified file/directory/pattern browsing.
 mod file_tools;
+/// Grep tool: ripgrep + workspace/symbol pipeline with LSP enrichment.
+mod grep_server;
 /// Maps MCP tool calls to LSP requests.
 mod handler;
 /// Path validation for LSP-aware operations and config file protection.

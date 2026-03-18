@@ -215,6 +215,9 @@ pub struct Tool {
     pub description: Option<String>,
     /// The JSON schema for the tool's input.
     pub input_schema: Value,
+    /// Optional hints describing tool behavior (MCP 2025-11-25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
 }
 
 /// tools/list response result.
@@ -355,6 +358,7 @@ mod tests {
                 },
                 "required": ["file", "line", "character"]
             }),
+            annotations: None,
         };
 
         let json = serde_json::to_string(&tool)?;
