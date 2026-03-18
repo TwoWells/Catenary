@@ -68,13 +68,19 @@ impl Connection {
         message_log: Arc<MessageLog>,
         server_name: &str,
     ) -> Result<Self> {
-        let mut child = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr)
+            .stderr(stderr);
+        catenary_proc::set_parent_death_signal(cmd.as_std_mut());
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn LSP server: {program}"))?;
+
+        if let Some(pid) = child.id() {
+            catenary_proc::register_child_process(pid);
+        }
 
         let monitor = child.id().and_then(catenary_proc::ProcessMonitor::new);
 

@@ -265,6 +265,123 @@ pub fn sample(pid: u32) -> Option<ProcessSample> {
     platform::sample(pid)
 }
 
+/// Configure a command so its child process receives `SIGTERM` when the
+/// parent process dies.
+///
+/// On Linux, uses `prctl(PR_SET_PDEATHSIG, SIGTERM)` via [`pre_exec`].
+/// This ensures child processes are cleaned up even if the parent is
+/// `SIGKILL`'d (where no signal handler or `Drop` runs).
+///
+/// No-op on non-Linux platforms.
+///
+/// [`pre_exec`]: std::os::unix::process::CommandExt::pre_exec
+#[cfg(target_os = "linux")]
+pub fn set_parent_death_signal(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGTERM)` is async-signal-safe and
+    // only affects the new child process between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Configure a command so its child process receives `SIGTERM` when the
+/// parent process dies.
+///
+/// No-op on non-Linux platforms. See the Linux variant for details.
+#[cfg(not(target_os = "linux"))]
+pub fn set_parent_death_signal(_cmd: &mut std::process::Command) {}
+
+/// Assign a child process to a kill-on-close Job Object so it is
+/// terminated when the parent exits.
+///
+/// On Windows, creates a process-wide Job Object (once) with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assigns the child to it.
+/// When the Catenary process exits — even via crash or `TerminateProcess`
+/// — the Job Object handle is closed and Windows kills all assigned
+/// children.
+///
+/// No-op on non-Windows platforms (Linux uses [`set_parent_death_signal`]
+/// instead).
+#[cfg(target_os = "windows")]
+pub fn register_child_process(pid: u32) {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    /// A wrapper so the raw `HANDLE` can be stored in a `OnceLock`.
+    struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+    // SAFETY: Windows `HANDLE`s are kernel objects usable from any thread.
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+
+    static JOB: OnceLock<Option<JobHandle>> = OnceLock::new();
+
+    let job = JOB.get_or_init(|| {
+        // SAFETY: `CreateJobObjectW` with null name creates an anonymous job.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle == 0 {
+            return None;
+        }
+
+        // SAFETY: zeroed struct is valid for `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`;
+        // we set only `LimitFlags` which is a bitmask field.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        let size =
+            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(0);
+
+        // SAFETY: `handle` is valid, `info` is correctly sized.
+        let ok = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                size,
+            )
+        };
+        if ok == 0 {
+            unsafe { CloseHandle(handle) };
+            return None;
+        }
+
+        Some(JobHandle(handle))
+    });
+
+    let Some(job) = job else { return };
+
+    // SAFETY: `OpenProcess` with valid access flags; handle closed after use.
+    let child_handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+    if child_handle == 0 {
+        return;
+    }
+    // SAFETY: both handles are valid.
+    unsafe { AssignProcessToJobObject(job.0, child_handle) };
+    unsafe { CloseHandle(child_handle) };
+}
+
+/// Assign a child process to a kill-on-close Job Object so it is
+/// terminated when the parent exits.
+///
+/// No-op on non-Windows platforms. See the Windows variant for details.
+#[cfg(not(target_os = "windows"))]
+pub const fn register_child_process(_pid: u32) {}
+
 // ─── Linux ──────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
@@ -1046,6 +1163,24 @@ mod tests {
             1,
             "After child exit, monitor map should shrink to 1"
         );
+    }
+
+    // ─── set_parent_death_signal tests ──────────────────────────────────
+
+    #[test]
+    fn set_parent_death_signal_spawns_successfully() {
+        use std::process::Command;
+
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        set_parent_death_signal(&mut cmd);
+        let mut child = cmd.spawn().expect("Failed to spawn with death signal");
+
+        // Child should be alive
+        assert!(child.try_wait().expect("try_wait failed").is_none());
+
+        child.kill().expect("Failed to kill child");
+        child.wait().expect("Failed to wait for child");
     }
 
     // ─── intensity() tests ─────────────────────────────────────────────
