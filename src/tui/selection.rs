@@ -15,10 +15,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
+use super::flat::FlatLine;
 use super::format::{
     format_ago, format_collapsed_plain, format_message_plain, format_pair_plain, format_scope_plain,
 };
-use super::panel::{FlatLine, PanelState, detail_lines, pair_detail_lines};
+use super::panel::{PanelState, detail_lines, pair_detail_lines};
 use super::tree::{SessionTree, TreeItem};
 
 // ── Types ────────────────────────────────────────────────────────────────

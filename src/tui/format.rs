@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 
 use super::category;
 use super::icons::{IconSet, basename, diag_style, tool_icon};
-use super::panel::{DisplayEntry, SegmentPosition};
+use super::pipeline::{DisplayEntry, SegmentPosition};
 use super::theme::Theme;
 use crate::session::SessionMessage;
 
