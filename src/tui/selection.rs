@@ -15,7 +15,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
-use super::format::{format_ago, format_collapsed_plain, format_message_plain, format_pair_plain};
+use super::format::{
+    format_ago, format_collapsed_plain, format_message_plain, format_pair_plain, format_scope_plain,
+};
 use super::panel::{FlatLine, PanelState, detail_lines, pair_detail_lines};
 use super::tree::{SessionTree, TreeItem};
 
@@ -90,13 +92,73 @@ impl VisualSelection {
 
 // ── Yank ─────────────────────────────────────────────────────────────────
 
+/// Format a single `FlatLine` as plain text for yank.
+fn flat_line_plain(fl: &FlatLine, all_flat: &[FlatLine], panel: &PanelState<'_>) -> String {
+    match fl {
+        FlatLine::MessageHeader {
+            message_index,
+            paired_response,
+        } => panel
+            .messages
+            .get(*message_index)
+            .map_or_else(String::new, |msg| {
+                paired_response
+                    .and_then(|ri| panel.messages.get(ri))
+                    .map_or_else(
+                        || format_message_plain(msg),
+                        |resp| format_pair_plain(msg, resp),
+                    )
+            }),
+        FlatLine::Detail {
+            message_index,
+            detail_index,
+        } => {
+            let resp_idx = all_flat.iter().find_map(|fl2| {
+                if let FlatLine::MessageHeader {
+                    message_index: mi,
+                    paired_response: Some(ri),
+                } = fl2
+                    && *mi == *message_index
+                {
+                    Some(*ri)
+                } else {
+                    None
+                }
+            });
+            panel
+                .messages
+                .get(*message_index)
+                .map_or_else(String::new, |msg| {
+                    let details = resp_idx.and_then(|ri| panel.messages.get(ri)).map_or_else(
+                        || detail_lines(msg, panel.theme),
+                        |resp| pair_detail_lines(msg, resp, panel.theme),
+                    );
+                    details.get(*detail_index).map_or_else(String::new, |line| {
+                        line.spans.iter().map(|s| s.content.as_ref()).collect()
+                    })
+                })
+        }
+        FlatLine::CollapsedHeader {
+            start_index,
+            end_index,
+            count,
+        } => format_collapsed_plain(&panel.messages, *start_index, *end_index, *count),
+        FlatLine::ScopeHeader {
+            parent,
+            child_count,
+        } => format_scope_plain(parent, *child_count, &panel.messages),
+        FlatLine::ScopeChild { depth, inner, .. } => {
+            let indent = " ".repeat(depth * 4);
+            let inner_text = flat_line_plain(inner, all_flat, panel);
+            format!("{indent}{inner_text}")
+        }
+    }
+}
+
 /// Generate the clipboard text for the selection.
 ///
-/// For each line in the selection range:
-/// - `FlatLine::MessageHeader`: uses `format_message_plain()`.
-/// - `FlatLine::Detail`: uses the rendered detail text (plain, without styling).
-///
-/// Lines are separated by `\n`.
+/// For each line in the selection range, formats the `FlatLine` as
+/// plain text. Lines are separated by `\n`.
 #[must_use]
 pub fn yank_text(panel: &PanelState<'_>, selection: &VisualSelection) -> String {
     let flat = panel.flat_lines();
@@ -104,61 +166,7 @@ pub fn yank_text(panel: &PanelState<'_>, selection: &VisualSelection) -> String 
     let mut lines: Vec<String> = Vec::with_capacity(end.saturating_sub(start) + 1);
 
     for fl in flat.iter().skip(start).take(end - start + 1) {
-        match fl {
-            FlatLine::MessageHeader {
-                message_index,
-                paired_response,
-            } => {
-                if let Some(msg) = panel.messages.get(*message_index) {
-                    if let Some(ri) = paired_response {
-                        if let Some(resp) = panel.messages.get(*ri) {
-                            lines.push(format_pair_plain(msg, resp));
-                        }
-                    } else {
-                        lines.push(format_message_plain(msg));
-                    }
-                }
-            }
-            FlatLine::Detail {
-                message_index,
-                detail_index,
-            } => {
-                // Check if this detail belongs to a paired header.
-                let resp_idx = flat.iter().find_map(|fl| {
-                    if let FlatLine::MessageHeader {
-                        message_index: mi,
-                        paired_response: Some(ri),
-                    } = fl
-                        && *mi == *message_index
-                    {
-                        return Some(*ri);
-                    }
-                    None
-                });
-                if let Some(msg) = panel.messages.get(*message_index) {
-                    let details = resp_idx.and_then(|ri| panel.messages.get(ri)).map_or_else(
-                        || detail_lines(msg, panel.theme),
-                        |resp| pair_detail_lines(msg, resp, panel.theme),
-                    );
-                    if let Some(line) = details.get(*detail_index) {
-                        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                        lines.push(plain);
-                    }
-                }
-            }
-            FlatLine::CollapsedHeader {
-                start_index,
-                end_index,
-                count,
-            } => {
-                lines.push(format_collapsed_plain(
-                    &panel.messages,
-                    *start_index,
-                    *end_index,
-                    *count,
-                ));
-            }
-        }
+        lines.push(flat_line_plain(fl, &flat, panel));
     }
 
     lines.join("\n")

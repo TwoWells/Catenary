@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 
 use super::category;
 use super::icons::{IconSet, basename, diag_style, tool_icon};
+use super::panel::DisplayEntry;
 use super::theme::Theme;
 use crate::session::SessionMessage;
 
@@ -535,6 +536,162 @@ pub fn format_collapsed_plain(
             "mcp" => format!("{ts} [mcp] {} ({label})", last.method),
             other => format!("{ts} [{other}] {} ({label})", last.method),
         }
+    }
+}
+
+// ── Scope formatters ──────────────────────────────────────────────────
+
+/// Build a styled [`Line`] for a scope header (parent with grouped children).
+///
+/// Basic rendering: the parent's summary with child count appended.
+/// For tool calls: `HH:MM:SS icon tool_name (N children, Xs)`.
+/// The formatter rewrite (tickets 04a/04b) will enhance this with icons,
+/// error extraction, and argument surfacing.
+#[must_use]
+pub fn format_scope_styled(
+    parent: &DisplayEntry,
+    child_count: usize,
+    messages: &[SessionMessage],
+    icons: &IconSet,
+    theme: &Theme,
+) -> Line<'static> {
+    let children_label = format!(
+        "{child_count} child{}",
+        if child_count == 1 { "" } else { "ren" }
+    );
+
+    match parent {
+        DisplayEntry::Paired {
+            request_index,
+            response_index,
+            ..
+        } => {
+            let req = &messages[*request_index];
+            let resp = &messages[*response_index];
+            let ts = req.timestamp.format("%H:%M:%S").to_string();
+            let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
+
+            let delta_ms = resp
+                .timestamp
+                .signed_duration_since(req.timestamp)
+                .num_milliseconds();
+            let timing = format_duration_short(delta_ms);
+
+            if req.method == "tools/call" {
+                let tool_name = req
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&req.method);
+                let icon = tool_icon(tool_name, icons);
+                Line::from(vec![
+                    ts_span,
+                    Span::styled(icon.to_string(), theme.success),
+                    Span::styled(tool_name.to_string(), theme.text),
+                    Span::styled(format!(" ({children_label}, {timing})"), theme.muted),
+                ])
+            } else {
+                Line::from(vec![
+                    ts_span,
+                    Span::styled(format!("[{}] ", req.server), theme.accent),
+                    Span::styled(req.method.clone(), theme.text),
+                    Span::styled(format!(" ({children_label}, {timing})"), theme.muted),
+                ])
+            }
+        }
+        DisplayEntry::Single { index, .. } => {
+            let msg = &messages[*index];
+            let ts = msg.timestamp.format("%H:%M:%S").to_string();
+            let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
+            if msg.method == "tools/call" {
+                let tool_name = msg
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&msg.method);
+                let icon = tool_icon(tool_name, icons);
+                Line::from(vec![
+                    ts_span,
+                    Span::styled(icon.to_string(), theme.success),
+                    Span::styled(tool_name.to_string(), theme.text),
+                    Span::styled(format!(" ({children_label})"), theme.muted),
+                ])
+            } else {
+                Line::from(vec![
+                    ts_span,
+                    Span::styled(msg.method.clone(), theme.text),
+                    Span::styled(format!(" ({children_label})"), theme.muted),
+                ])
+            }
+        }
+        // Collapsed and Scope parents are unlikely but handle uniformly.
+        _ => {
+            let label = format!("scope ({children_label})");
+            Line::from(vec![Span::styled(label, theme.text)])
+        }
+    }
+}
+
+/// Plain-text summary for a scope header (filter matching, yank).
+#[must_use]
+pub fn format_scope_plain(
+    parent: &DisplayEntry,
+    child_count: usize,
+    messages: &[SessionMessage],
+) -> String {
+    let children_label = format!(
+        "{child_count} child{}",
+        if child_count == 1 { "" } else { "ren" }
+    );
+
+    match parent {
+        DisplayEntry::Paired {
+            request_index,
+            response_index,
+            ..
+        } => {
+            let req = &messages[*request_index];
+            let resp = &messages[*response_index];
+            let ts = req.timestamp.format("%H:%M:%S");
+            let delta_ms = resp
+                .timestamp
+                .signed_duration_since(req.timestamp)
+                .num_milliseconds();
+            let timing = format_duration_short(delta_ms);
+
+            if req.method == "tools/call" {
+                let tool_name = req
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&req.method);
+                format!("{ts} {tool_name} ({children_label}, {timing})")
+            } else {
+                format!(
+                    "{ts} [{}] {} ({children_label}, {timing})",
+                    req.server, req.method
+                )
+            }
+        }
+        DisplayEntry::Single { index, .. } => {
+            let msg = &messages[*index];
+            let ts = msg.timestamp.format("%H:%M:%S");
+            if msg.method == "tools/call" {
+                let tool_name = msg
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(&msg.method);
+                format!("{ts} {tool_name} ({children_label})")
+            } else {
+                format!("{ts} {} ({children_label})", msg.method)
+            }
+        }
+        _ => format!("scope ({children_label})"),
     }
 }
 

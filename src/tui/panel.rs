@@ -20,7 +20,7 @@ use unicode_width::UnicodeWidthStr;
 use super::category;
 use super::format::{
     format_collapsed_plain, format_collapsed_styled, format_message_plain, format_message_styled,
-    format_pair_plain, format_pair_styled,
+    format_pair_plain, format_pair_styled, format_scope_plain, format_scope_styled,
 };
 use super::icons::IconSet;
 use super::selection::VisualSelection;
@@ -29,7 +29,7 @@ use crate::session::SessionMessage;
 
 // ── Data types ──────────────────────────────────────────────────────────
 
-/// A display pipeline entry — single message, merged pair, or collapsed run.
+/// A display pipeline entry — single message, merged pair, collapsed run, or scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayEntry {
     /// A single message (not merged).
@@ -59,6 +59,58 @@ pub enum DisplayEntry {
         /// Scope/causation parent from the first message in the run.
         parent_id: Option<i64>,
     },
+    /// A scope: a parent entry with child entries grouped under it.
+    Scope {
+        /// The parent entry (MCP tools/call request, typically Paired).
+        parent: Box<Self>,
+        /// Child entries belonging to this scope.
+        children: Vec<Self>,
+    },
+}
+
+impl DisplayEntry {
+    /// Extract the `parent_id` from any variant.
+    #[must_use]
+    pub fn parent_id(&self) -> Option<i64> {
+        match self {
+            Self::Single { parent_id, .. }
+            | Self::Paired { parent_id, .. }
+            | Self::Collapsed { parent_id, .. } => *parent_id,
+            Self::Scope { parent, .. } => parent.parent_id(),
+        }
+    }
+
+    /// Return the database message `id` for this entry's primary message.
+    ///
+    /// - Single: `messages[index].id`
+    /// - Paired: `messages[request_index].id`
+    /// - Collapsed: `messages[start_index].id`
+    /// - Scope: delegates to parent
+    #[must_use]
+    pub fn message_id(&self, messages: &[SessionMessage]) -> i64 {
+        match self {
+            Self::Single { index, .. } => messages[*index].id,
+            Self::Paired { request_index, .. } => messages[*request_index].id,
+            Self::Collapsed { start_index, .. } => messages[*start_index].id,
+            Self::Scope { parent, .. } => parent.message_id(messages),
+        }
+    }
+
+    /// Return the primary message index (into the messages vec) for expansion key.
+    ///
+    /// - Single: `index`
+    /// - Paired: `request_index`
+    /// - Collapsed: `start_index`
+    /// - Scope: delegates to parent
+    #[must_use]
+    pub fn expansion_index(&self) -> usize {
+        match self {
+            Self::Single { index, .. } => *index,
+            Self::Paired { request_index, .. } => *request_index,
+            Self::Collapsed { start_index, .. } => *start_index,
+            Self::Scope { parent, .. } => parent.expansion_index(),
+        }
+    }
 }
 
 /// Run pair merge on a message list.
@@ -89,10 +141,93 @@ pub fn pair_merge(messages: &[SessionMessage]) -> Vec<DisplayEntry> {
     entries
 }
 
-/// Run collapse pass: merge consecutive `Single` entries with the same
-/// collapse key into `Collapsed` entries. `Paired` entries never collapse.
+/// Scope collapse pass: group entries by `parent_id` into `Scope` entries.
+///
+/// Entries whose `parent_id` points to another entry's message ID are
+/// collected as children of that parent. The parent becomes a `Scope`
+/// entry at its original position. Entries without a `parent_id` (or whose
+/// parent is not in the entry list) pass through unchanged.
 #[must_use]
-pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Vec<DisplayEntry> {
+pub fn scope_collapse(
+    entries: Vec<DisplayEntry>,
+    messages: &[SessionMessage],
+) -> Vec<DisplayEntry> {
+    if entries.is_empty() {
+        return entries;
+    }
+
+    // First pass: collect the set of parent_id values referenced by any entry,
+    // and map each entry's message ID to its index.
+    let mut referenced_parents: HashSet<i64> = HashSet::new();
+    let mut msg_id_to_idx: HashMap<i64, usize> = HashMap::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        let mid = entry.message_id(messages);
+        msg_id_to_idx.insert(mid, i);
+        if let Some(pid) = entry.parent_id() {
+            referenced_parents.insert(pid);
+        }
+    }
+
+    // Identify which entry indices are scope parents (their message ID is
+    // referenced as a parent_id by another entry in the list).
+    let scope_parent_indices: HashSet<usize> = referenced_parents
+        .iter()
+        .filter_map(|pid| msg_id_to_idx.get(pid).copied())
+        .collect();
+
+    // Second pass: separate entries into parents, children, and passthrough.
+    // Use Option slots to preserve ordering for final assembly.
+    let len = entries.len();
+    let mut parent_entries: HashMap<usize, DisplayEntry> = HashMap::new();
+    let mut children: HashMap<usize, Vec<DisplayEntry>> = HashMap::new();
+    let mut passthrough: HashMap<usize, DisplayEntry> = HashMap::new();
+
+    for (i, entry) in entries.into_iter().enumerate() {
+        if scope_parent_indices.contains(&i) {
+            // This entry is a scope parent — hold it for wrapping.
+            parent_entries.insert(i, entry);
+        } else if let Some(pid) = entry.parent_id() {
+            // Check if this entry's parent is in the entry list.
+            if let Some(&parent_idx) = msg_id_to_idx.get(&pid)
+                && scope_parent_indices.contains(&parent_idx)
+            {
+                children.entry(parent_idx).or_default().push(entry);
+                continue;
+            }
+            // Orphaned child — parent not in view.
+            passthrough.insert(i, entry);
+        } else {
+            passthrough.insert(i, entry);
+        }
+    }
+
+    // Final assembly: iterate in original order, emitting Scope for parents
+    // and passthrough for everything else. Children are consumed by their parent.
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Some(parent) = parent_entries.remove(&i) {
+            let kids = children.remove(&i).unwrap_or_default();
+            result.push(DisplayEntry::Scope {
+                parent: Box::new(parent),
+                children: kids,
+            });
+        } else if let Some(entry) = passthrough.remove(&i) {
+            result.push(entry);
+        }
+        // Children are skipped — they were consumed above.
+    }
+
+    result
+}
+
+/// Run collapse pass: merge consecutive `Single` entries with the same
+/// collapse key into `Collapsed` entries.
+///
+/// `Paired` and `Scope` entries never collapse — they break the current
+/// run and pass through as-is. Takes ownership to avoid cloning scope trees.
+#[must_use]
+pub fn run_collapse(entries: Vec<DisplayEntry>, messages: &[SessionMessage]) -> Vec<DisplayEntry> {
     let mut result = Vec::with_capacity(entries.len());
 
     // Current run state.
@@ -127,7 +262,7 @@ pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Ve
     };
 
     for entry in entries {
-        match *entry {
+        match entry {
             DisplayEntry::Single {
                 index,
                 parent_id: _,
@@ -165,7 +300,9 @@ pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Ve
                     }
                 }
             }
-            DisplayEntry::Paired { .. } | DisplayEntry::Collapsed { .. } => {
+            DisplayEntry::Paired { .. }
+            | DisplayEntry::Collapsed { .. }
+            | DisplayEntry::Scope { .. } => {
                 // Flush any pending run, then emit as-is.
                 flush(
                     &mut result,
@@ -177,7 +314,7 @@ pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Ve
                 );
                 run_key = None;
                 run_count = 0;
-                result.push(entry.clone());
+                result.push(entry);
             }
         }
     }
@@ -220,6 +357,22 @@ pub enum FlatLine {
         end_index: usize,
         /// Number of messages in the run.
         count: usize,
+    },
+    /// A scope header (parent of grouped children).
+    ScopeHeader {
+        /// The parent `DisplayEntry` (for rendering the summary line).
+        parent: Box<DisplayEntry>,
+        /// Number of child entries in the scope.
+        child_count: usize,
+    },
+    /// An indented child line within an expanded scope.
+    ScopeChild {
+        /// Depth level for indentation.
+        depth: usize,
+        /// Message index of the scope parent (expansion key).
+        scope_parent_index: usize,
+        /// The inner `FlatLine` (`MessageHeader`, `CollapsedHeader`, etc.).
+        inner: Box<Self>,
     },
 }
 
@@ -493,18 +646,24 @@ impl<'a> PanelState<'a> {
     /// to combine adjacent request/response pairs and consecutive same-key
     /// messages into single lines.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "scope collapse adds a fourth variant arm"
+    )]
     pub fn flat_lines(&self) -> Vec<FlatLine> {
         let lower_pattern = self.filter_pattern.as_ref().map(|p| p.to_lowercase());
         let merged = pair_merge(&self.messages);
-        let entries = run_collapse(&merged, &self.messages);
+        let scoped = scope_collapse(merged, &self.messages);
+        let entries = run_collapse(scoped, &self.messages);
         let mut lines = Vec::new();
 
         for entry in &entries {
-            match *entry {
+            match entry {
                 DisplayEntry::Single {
                     index,
                     parent_id: _,
                 } => {
+                    let index = *index;
                     let msg = &self.messages[index];
                     if let Some(ref pat) = lower_pattern {
                         let plain = format_message_plain(msg);
@@ -531,6 +690,8 @@ impl<'a> PanelState<'a> {
                     response_index,
                     parent_id: _,
                 } => {
+                    let request_index = *request_index;
+                    let response_index = *response_index;
                     let req = &self.messages[request_index];
                     let resp = &self.messages[response_index];
                     if let Some(ref pat) = lower_pattern {
@@ -559,6 +720,9 @@ impl<'a> PanelState<'a> {
                     count,
                     parent_id: _,
                 } => {
+                    let start_index = *start_index;
+                    let end_index = *end_index;
+                    let count = *count;
                     if let Some(ref pat) = lower_pattern {
                         let plain =
                             format_collapsed_plain(&self.messages, start_index, end_index, count);
@@ -592,9 +756,130 @@ impl<'a> PanelState<'a> {
                         });
                     }
                 }
+                DisplayEntry::Scope { parent, children } => {
+                    let child_count = children.len();
+                    if let Some(ref pat) = lower_pattern {
+                        let plain = format_scope_plain(parent, child_count, &self.messages);
+                        if !plain.to_lowercase().contains(pat) {
+                            continue;
+                        }
+                    }
+                    let scope_key = parent.expansion_index();
+                    lines.push(FlatLine::ScopeHeader {
+                        parent: parent.clone(),
+                        child_count,
+                    });
+                    if self.expanded.contains(&scope_key) {
+                        self.flatten_scope_children(children, scope_key, 1, &mut lines);
+                    }
+                }
             }
         }
         lines
+    }
+
+    /// Flatten scope children into `ScopeChild` flat lines.
+    fn flatten_scope_children(
+        &self,
+        children: &[DisplayEntry],
+        scope_parent_index: usize,
+        depth: usize,
+        lines: &mut Vec<FlatLine>,
+    ) {
+        for child in children {
+            match child {
+                DisplayEntry::Single { index, .. } => {
+                    let index = *index;
+                    lines.push(FlatLine::ScopeChild {
+                        depth,
+                        scope_parent_index,
+                        inner: Box::new(FlatLine::MessageHeader {
+                            message_index: index,
+                            paired_response: None,
+                        }),
+                    });
+                    if self.expanded.contains(&index) {
+                        let msg = &self.messages[index];
+                        let count = detail_lines(msg, self.theme).len();
+                        for detail_index in 0..count {
+                            lines.push(FlatLine::ScopeChild {
+                                depth,
+                                scope_parent_index,
+                                inner: Box::new(FlatLine::Detail {
+                                    message_index: index,
+                                    detail_index,
+                                }),
+                            });
+                        }
+                    }
+                }
+                DisplayEntry::Paired {
+                    request_index,
+                    response_index,
+                    ..
+                } => {
+                    let request_index = *request_index;
+                    let response_index = *response_index;
+                    lines.push(FlatLine::ScopeChild {
+                        depth,
+                        scope_parent_index,
+                        inner: Box::new(FlatLine::MessageHeader {
+                            message_index: request_index,
+                            paired_response: Some(response_index),
+                        }),
+                    });
+                    if self.expanded.contains(&request_index) {
+                        let req = &self.messages[request_index];
+                        let resp = &self.messages[response_index];
+                        let count = pair_detail_lines(req, resp, self.theme).len();
+                        for detail_index in 0..count {
+                            lines.push(FlatLine::ScopeChild {
+                                depth,
+                                scope_parent_index,
+                                inner: Box::new(FlatLine::Detail {
+                                    message_index: request_index,
+                                    detail_index,
+                                }),
+                            });
+                        }
+                    }
+                }
+                DisplayEntry::Collapsed {
+                    start_index,
+                    end_index,
+                    count,
+                    ..
+                } => {
+                    lines.push(FlatLine::ScopeChild {
+                        depth,
+                        scope_parent_index,
+                        inner: Box::new(FlatLine::CollapsedHeader {
+                            start_index: *start_index,
+                            end_index: *end_index,
+                            count: *count,
+                        }),
+                    });
+                }
+                DisplayEntry::Scope {
+                    parent: nested_parent,
+                    children: nested_children,
+                } => {
+                    let nested_child_count = nested_children.len();
+                    lines.push(FlatLine::ScopeChild {
+                        depth,
+                        scope_parent_index,
+                        inner: Box::new(FlatLine::ScopeHeader {
+                            parent: nested_parent.clone(),
+                            child_count: nested_child_count,
+                        }),
+                    });
+                    let nested_key = nested_parent.expansion_index();
+                    if self.expanded.contains(&nested_key) {
+                        self.flatten_scope_children(nested_children, nested_key, depth + 1, lines);
+                    }
+                }
+            }
+        }
     }
 
     /// Toggle expansion of the message under the cursor.
@@ -629,6 +914,26 @@ impl<'a> PanelState<'a> {
                     self.expanded.remove(&start_index);
                 } else {
                     self.expanded.insert(start_index);
+                }
+            }
+            FlatLine::ScopeHeader { ref parent, .. } => {
+                let key = parent.expansion_index();
+                if self.expanded.contains(&key) {
+                    self.expanded.remove(&key);
+                } else {
+                    self.expanded.insert(key);
+                }
+            }
+            FlatLine::ScopeChild {
+                scope_parent_index, ..
+            } => {
+                // Collapse the parent scope and move cursor to its header.
+                self.expanded.remove(&scope_parent_index);
+                let new_flat = self.flat_lines();
+                if let Some(pos) = new_flat.iter().position(|fl| {
+                    matches!(fl, FlatLine::ScopeHeader { parent, .. } if parent.expansion_index() == scope_parent_index)
+                }) {
+                    self.cursor = pos;
                 }
             }
         }
@@ -895,6 +1200,99 @@ fn clip_line_horizontal(line: &Line<'_>, h_scroll: usize, width: usize) -> Line<
     Line::from(result_spans)
 }
 
+/// Render a single `FlatLine` into a styled `Line`.
+///
+/// Shared between the top-level render loop and `ScopeChild` indentation.
+fn render_flat_line_styled(
+    fl: &FlatLine,
+    all_flat: &[FlatLine],
+    state: &PanelState<'_>,
+    detail_cache: &mut HashMap<usize, Vec<Line<'static>>>,
+) -> Line<'static> {
+    match fl {
+        FlatLine::MessageHeader {
+            message_index,
+            paired_response,
+        } => paired_response.map_or_else(
+            || format_message_styled(&state.messages[*message_index], state.icons, state.theme),
+            |resp_idx| {
+                format_pair_styled(
+                    &state.messages[*message_index],
+                    &state.messages[resp_idx],
+                    state.icons,
+                    state.theme,
+                )
+            },
+        ),
+        FlatLine::Detail {
+            message_index,
+            detail_index,
+        } => detail_cache
+            .entry(*message_index)
+            .or_insert_with(|| {
+                let resp_idx = all_flat.iter().find_map(|fl2| {
+                    if let FlatLine::MessageHeader {
+                        message_index: mi,
+                        paired_response: Some(ri),
+                    } = fl2
+                        && *mi == *message_index
+                    {
+                        Some(*ri)
+                    } else {
+                        None
+                    }
+                });
+                resp_idx.map_or_else(
+                    || detail_lines(&state.messages[*message_index], state.theme),
+                    |ri| {
+                        pair_detail_lines(
+                            &state.messages[*message_index],
+                            &state.messages[ri],
+                            state.theme,
+                        )
+                    },
+                )
+            })
+            .get(*detail_index)
+            .cloned()
+            .unwrap_or_default(),
+        FlatLine::CollapsedHeader {
+            start_index,
+            end_index,
+            count,
+        } => format_collapsed_styled(
+            &state.messages,
+            *start_index,
+            *end_index,
+            *count,
+            state.icons,
+            state.theme,
+        ),
+        FlatLine::ScopeHeader {
+            parent,
+            child_count,
+        } => format_scope_styled(
+            parent,
+            *child_count,
+            &state.messages,
+            state.icons,
+            state.theme,
+        ),
+        FlatLine::ScopeChild { depth, inner, .. } => {
+            let indent = " ".repeat(depth * 4);
+            let inner_line = render_flat_line_styled(inner, all_flat, state, detail_cache);
+            let mut spans = vec![Span::raw(indent)];
+            spans.extend(
+                inner_line
+                    .spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.content.into_owned(), s.style)),
+            );
+            Line::from(spans)
+        }
+    }
+}
+
 /// Render a single messages panel into the given buffer area.
 ///
 /// The panel owns its top row (title bar) and right column (scrollbar,
@@ -962,67 +1360,7 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
             break;
         }
 
-        let line = match fl {
-            FlatLine::MessageHeader {
-                message_index,
-                paired_response,
-            } => paired_response.map_or_else(
-                || format_message_styled(&state.messages[*message_index], state.icons, state.theme),
-                |resp_idx| {
-                    format_pair_styled(
-                        &state.messages[*message_index],
-                        &state.messages[resp_idx],
-                        state.icons,
-                        state.theme,
-                    )
-                },
-            ),
-            FlatLine::Detail {
-                message_index,
-                detail_index,
-            } => detail_cache
-                .entry(*message_index)
-                .or_insert_with(|| {
-                    // Find the parent header to check for pair.
-                    let resp_idx = flat.iter().find_map(|fl| {
-                        if let FlatLine::MessageHeader {
-                            message_index: mi,
-                            paired_response: Some(ri),
-                        } = fl
-                            && *mi == *message_index
-                        {
-                            Some(*ri)
-                        } else {
-                            None
-                        }
-                    });
-                    resp_idx.map_or_else(
-                        || detail_lines(&state.messages[*message_index], state.theme),
-                        |ri| {
-                            pair_detail_lines(
-                                &state.messages[*message_index],
-                                &state.messages[ri],
-                                state.theme,
-                            )
-                        },
-                    )
-                })
-                .get(*detail_index)
-                .cloned()
-                .unwrap_or_default(),
-            FlatLine::CollapsedHeader {
-                start_index,
-                end_index,
-                count,
-            } => format_collapsed_styled(
-                &state.messages,
-                *start_index,
-                *end_index,
-                *count,
-                state.icons,
-                state.theme,
-            ),
-        };
+        let line = render_flat_line_styled(fl, &flat, state, &mut detail_cache);
 
         let display_line = if state.horizontal_scroll > 0
             || UnicodeWidthStr::width(
@@ -1061,7 +1399,8 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    clippy::panic,
+    reason = "tests use expect/panic for readable assertions"
 )]
 mod tests {
     use super::*;
@@ -1988,7 +2327,7 @@ mod tests {
             make_progress_message("rust-analyzer", "ra/indexing"),
         ];
         let entries = pair_merge(&messages);
-        let collapsed = run_collapse(&entries, &messages);
+        let collapsed = run_collapse(entries, &messages);
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             collapsed[0],
@@ -2008,7 +2347,7 @@ mod tests {
             make_progress_message("rust-analyzer", "ra/flycheck"),
         ];
         let entries = pair_merge(&messages);
-        let collapsed = run_collapse(&entries, &messages);
+        let collapsed = run_collapse(entries, &messages);
         assert_eq!(collapsed.len(), 2);
         assert_eq!(
             collapsed[0],
@@ -2039,7 +2378,7 @@ mod tests {
             make_progress_message("rust-analyzer", "ra/indexing"),
         ];
         let entries = pair_merge(&messages);
-        let collapsed = run_collapse(&entries, &messages);
+        let collapsed = run_collapse(entries, &messages);
         assert_eq!(
             collapsed.len(),
             3,
@@ -2057,7 +2396,7 @@ mod tests {
         ];
         let entries = pair_merge(&messages);
         assert_eq!(entries.len(), 2, "should have 2 pairs");
-        let collapsed = run_collapse(&entries, &messages);
+        let collapsed = run_collapse(entries, &messages);
         assert_eq!(collapsed.len(), 2, "pairs should not collapse");
         assert!(
             matches!(collapsed[0], DisplayEntry::Paired { .. }),
@@ -2073,7 +2412,7 @@ mod tests {
     fn test_run_collapse_single_message_no_collapse() {
         let messages = vec![make_progress_message("rust-analyzer", "ra/indexing")];
         let entries = pair_merge(&messages);
-        let collapsed = run_collapse(&entries, &messages);
+        let collapsed = run_collapse(entries, &messages);
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             collapsed[0],
@@ -2192,7 +2531,7 @@ mod tests {
             },
         ];
         let entries = pair_merge(&messages);
-        let collapsed = run_collapse(&entries, &messages);
+        let collapsed = run_collapse(entries, &messages);
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             collapsed[0],
@@ -2234,6 +2573,361 @@ mod tests {
                 response_index: 1,
                 parent_id: Some(10),
             }
+        );
+    }
+
+    // ── Scope collapse tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_scope_collapse_basic() {
+        // MCP tools/call (id=1), three LSP children with parent_id=1,
+        // MCP response (request_id=1). After pair merge + scope collapse:
+        // one Scope entry containing the parent pair and three children.
+        let messages = vec![
+            // MCP request (id=1)
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            // LSP child 1 (parent_id=1)
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // LSP child 2 (parent_id=1)
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            // LSP child 3 (parent_id=1)
+            make_message_with_id_parent(
+                4,
+                "lsp",
+                "textDocument/references",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // MCP response (request_id=1, so pairs with id=1)
+            make_message_with_id_parent(5, "mcp", "tools/call", "catenary", Some(1), None),
+        ];
+        let merged = pair_merge(&messages);
+        // pair merge: Paired(0,4) because msg[4].request_id != msg[3].id,
+        // but msg[1].request_id is None so no pair there. Actually:
+        // msg[0].id=1, msg[1].request_id=None → no pair. Singles 0..4, then
+        // msg[4].request_id=Some(1) != msg[3].id=4 → no pair either.
+        // So we get 5 singles. Let's verify.
+        // Actually pair_merge only merges *adjacent* pairs. msg[4].request_id=Some(1),
+        // msg[3].id=4, so no pair. All 5 are singles.
+
+        let scoped = scope_collapse(merged, &messages);
+        // msg[0] (id=1) is referenced by msg[1..=3] (parent_id=1) → scope parent
+        // msg[4] has no parent_id → passthrough
+        assert_eq!(scoped.len(), 2, "expected scope + MCP response: {scoped:?}");
+        match &scoped[0] {
+            DisplayEntry::Scope { parent, children } => {
+                assert!(
+                    matches!(**parent, DisplayEntry::Single { index: 0, .. }),
+                    "parent should be Single(0)"
+                );
+                assert_eq!(children.len(), 3, "should have 3 children");
+            }
+            other => panic!("expected Scope, got {other:?}"),
+        }
+        assert!(
+            matches!(scoped[1], DisplayEntry::Single { index: 4, .. }),
+            "MCP response should be passthrough"
+        );
+    }
+
+    #[test]
+    fn test_scope_collapse_no_parent_id() {
+        // Messages without parent_id pass through unchanged.
+        let messages = vec![
+            make_message_with_id_parent(1, "lsp", "$/progress", "rust-analyzer", None, None),
+            make_message_with_id_parent(2, "lsp", "$/progress", "rust-analyzer", None, None),
+            make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, None),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+        assert_eq!(scoped.len(), 3);
+        for entry in &scoped {
+            assert!(
+                matches!(entry, DisplayEntry::Single { .. }),
+                "all entries should be Single"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scope_collapse_preserves_order() {
+        // Two tool calls interleaved. Each scope contains only its own children.
+        let messages = vec![
+            // Tool call A (id=1)
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            // Child of A
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // Tool call B (id=3)
+            make_message_with_id_parent(3, "mcp", "tools/call", "catenary", None, None),
+            // Child of B
+            make_message_with_id_parent(4, "lsp", "workspace/symbol", "taplo", None, Some(3)),
+            // Another child of A
+            make_message_with_id_parent(
+                5,
+                "lsp",
+                "textDocument/references",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+        // Scope A at position 0 (with children msg[1] and msg[4]),
+        // Scope B at position 2 (with child msg[3]).
+        assert_eq!(scoped.len(), 2, "expected 2 scopes: {scoped:?}");
+        match &scoped[0] {
+            DisplayEntry::Scope { parent, children } => {
+                assert!(
+                    matches!(**parent, DisplayEntry::Single { index: 0, .. }),
+                    "first scope parent should be index 0"
+                );
+                assert_eq!(children.len(), 2, "scope A should have 2 children");
+            }
+            other => panic!("expected Scope A, got {other:?}"),
+        }
+        match &scoped[1] {
+            DisplayEntry::Scope { parent, children } => {
+                assert!(
+                    matches!(**parent, DisplayEntry::Single { index: 2, .. }),
+                    "second scope parent should be index 2"
+                );
+                assert_eq!(children.len(), 1, "scope B should have 1 child");
+            }
+            other => panic!("expected Scope B, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scope_collapse_root_level_unaffected() {
+        // MCP initialize / notifications/initialized have no parent_id,
+        // remain as root entries.
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "initialize", "catenary", None, None),
+            make_message_with_id_parent(
+                2,
+                "mcp",
+                "notifications/initialized",
+                "catenary",
+                None,
+                None,
+            ),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+        assert_eq!(scoped.len(), 2);
+        assert!(
+            matches!(scoped[0], DisplayEntry::Single { index: 0, .. }),
+            "initialize should be Single"
+        );
+        assert!(
+            matches!(scoped[1], DisplayEntry::Single { index: 1, .. }),
+            "initialized should be Single"
+        );
+    }
+
+    #[test]
+    fn test_scope_flat_lines_collapsed() {
+        // A scope that is not expanded produces a single ScopeHeader line.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+        ];
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+
+        let flat = panel.flat_lines();
+        // Scope with 2 children → 1 ScopeHeader (collapsed)
+        assert_eq!(flat.len(), 1, "collapsed scope should be 1 line: {flat:?}");
+        assert!(
+            matches!(flat[0], FlatLine::ScopeHeader { child_count: 2, .. }),
+            "should be ScopeHeader with 2 children: {:?}",
+            flat[0]
+        );
+    }
+
+    #[test]
+    fn test_scope_flat_lines_expanded() {
+        // An expanded scope produces a ScopeHeader followed by ScopeChild entries.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+        ];
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+        // Expand the scope (key is parent's message index = 0).
+        panel.expanded.insert(0);
+
+        let flat = panel.flat_lines();
+        // ScopeHeader + 2 ScopeChild entries
+        assert_eq!(flat.len(), 3, "expanded scope should be 3 lines: {flat:?}");
+        assert!(
+            matches!(flat[0], FlatLine::ScopeHeader { .. }),
+            "first should be ScopeHeader"
+        );
+        assert!(
+            matches!(
+                flat[1],
+                FlatLine::ScopeChild {
+                    depth: 1,
+                    scope_parent_index: 0,
+                    ..
+                }
+            ),
+            "second should be ScopeChild at depth 1: {:?}",
+            flat[1]
+        );
+        assert!(
+            matches!(
+                flat[2],
+                FlatLine::ScopeChild {
+                    depth: 1,
+                    scope_parent_index: 0,
+                    ..
+                }
+            ),
+            "third should be ScopeChild at depth 1: {:?}",
+            flat[2]
+        );
+    }
+
+    #[test]
+    fn test_scope_toggle_expansion() {
+        // Toggle on ScopeHeader adds/removes from expanded.
+        // Toggle on ScopeChild collapses parent, moves cursor.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+        ];
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+        // Cursor on the ScopeHeader (line 0).
+        panel.cursor = 0;
+
+        // Toggle: expand scope.
+        panel.toggle_expansion();
+        assert!(
+            panel.expanded.contains(&0),
+            "scope should be expanded after toggle"
+        );
+        let flat = panel.flat_lines();
+        assert_eq!(flat.len(), 3, "expanded should show 3 lines");
+
+        // Toggle again: collapse scope.
+        panel.cursor = 0;
+        panel.toggle_expansion();
+        assert!(
+            !panel.expanded.contains(&0),
+            "scope should be collapsed after second toggle"
+        );
+
+        // Expand again, then toggle on a child.
+        panel.cursor = 0;
+        panel.toggle_expansion();
+        assert!(panel.expanded.contains(&0));
+        // Move cursor to first ScopeChild (line 1).
+        panel.cursor = 1;
+        panel.toggle_expansion();
+        assert!(
+            !panel.expanded.contains(&0),
+            "toggling on ScopeChild should collapse parent"
+        );
+        assert_eq!(
+            panel.cursor, 0,
+            "cursor should move to ScopeHeader after child toggle"
+        );
+    }
+
+    #[test]
+    fn test_scope_render_basic() {
+        // Render a panel with a scope. Verify the tool name appears in the output.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            {
+                let mut m =
+                    make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+                m.payload = serde_json::json!({"params": {"name": "grep"}});
+                m
+            },
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+        ];
+
+        let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_panel(&panel, area, f.buffer_mut(), true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains("grep"),
+            "expected grep tool name in scope header: {content}"
+        );
+        assert!(
+            content.contains("2 children"),
+            "expected child count in scope header: {content}"
         );
     }
 }
