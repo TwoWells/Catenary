@@ -13,7 +13,7 @@ use std::rc::Rc;
 use super::format::{
     format_collapsed_plain, format_message_plain, format_pair_plain, format_scope_plain,
 };
-use super::panel::{PanelState, detail_lines, pair_detail_lines};
+use super::panel::{PanelState, frontmatter_lines};
 use super::pipeline::{DisplayEntry, SegmentPosition, pair_merge, run_collapse, scope_collapse};
 
 /// A line in the flattened view — message header, detail, or collapsed run.
@@ -100,7 +100,7 @@ impl PanelState<'_> {
                         paired_response: None,
                     });
                     if self.expanded.contains(&index) {
-                        let count = detail_lines(msg, self.theme).len();
+                        let count = frontmatter_lines(msg, self.theme).len();
                         for detail_index in 0..count {
                             lines.push(FlatLine::Detail {
                                 message_index: index,
@@ -129,7 +129,7 @@ impl PanelState<'_> {
                         paired_response: Some(response_index),
                     });
                     if self.expanded.contains(&request_index) {
-                        let count = pair_detail_lines(req, resp, self.theme).len();
+                        let count = frontmatter_lines(req, self.theme).len();
                         for detail_index in 0..count {
                             lines.push(FlatLine::Detail {
                                 message_index: request_index,
@@ -163,7 +163,7 @@ impl PanelState<'_> {
                             });
                             if self.expanded.contains(&idx) {
                                 let msg = &self.messages[idx];
-                                let detail_count = detail_lines(msg, self.theme).len();
+                                let detail_count = frontmatter_lines(msg, self.theme).len();
                                 for detail_index in 0..detail_count {
                                     lines.push(FlatLine::Detail {
                                         message_index: idx,
@@ -231,7 +231,7 @@ impl PanelState<'_> {
                     });
                     if self.expanded.contains(&index) {
                         let msg = &self.messages[index];
-                        let count = detail_lines(msg, self.theme).len();
+                        let count = frontmatter_lines(msg, self.theme).len();
                         for detail_index in 0..count {
                             lines.push(FlatLine::ScopeChild {
                                 depth,
@@ -261,8 +261,7 @@ impl PanelState<'_> {
                     });
                     if self.expanded.contains(&request_index) {
                         let req = &self.messages[request_index];
-                        let resp = &self.messages[response_index];
-                        let count = pair_detail_lines(req, resp, self.theme).len();
+                        let count = frontmatter_lines(req, self.theme).len();
                         for detail_index in 0..count {
                             lines.push(FlatLine::ScopeChild {
                                 depth,
@@ -328,7 +327,7 @@ mod tests {
     use crate::config::IconConfig;
     use crate::session::SessionMessage;
     use crate::tui::icons::IconSet;
-    use crate::tui::panel::{PanelState, detail_lines};
+    use crate::tui::panel::{PanelState, frontmatter_lines};
     use crate::tui::theme::Theme;
 
     fn test_theme() -> Theme {
@@ -447,7 +446,7 @@ mod tests {
         panel.expanded.insert(1);
 
         let flat = panel.flat_lines();
-        let detail_count = detail_lines(&panel.messages[1], &theme).len();
+        let detail_count = frontmatter_lines(&panel.messages[1], &theme).len();
         assert!(detail_count > 0, "hook diag message should have details");
         assert_eq!(flat.len(), 3 + detail_count);
         assert_eq!(
@@ -479,6 +478,76 @@ mod tests {
                 message_index: 2,
                 paired_response: None,
             }
+        );
+    }
+
+    #[test]
+    fn test_frontmatter_lines_paired_uses_request() {
+        // Expand a Paired entry. Detail lines should contain the request
+        // payload, not the response payload.
+        let theme = test_theme();
+        let icons = test_icons();
+
+        let mut req = SessionMessage {
+            id: 1,
+            r#type: "lsp".to_string(),
+            method: "textDocument/hover".to_string(),
+            server: "rust-analyzer".to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload: serde_json::json!({"params": {"uri": "file:///src/main.rs"}}),
+        };
+        req.request_id = None;
+
+        let resp = SessionMessage {
+            id: 2,
+            r#type: "lsp".to_string(),
+            method: "textDocument/hover".to_string(),
+            server: "rust-analyzer".to_string(),
+            client: "catenary".to_string(),
+            request_id: Some(1),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload: serde_json::json!({"result": {"contents": "fn main()"}}),
+        };
+
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(vec![req, resp]);
+        // Expand the paired entry (request index = 0).
+        panel.expanded.insert(0);
+
+        let flat = panel.flat_lines();
+        // Collect all Detail line texts.
+        let detail_text: String = flat
+            .iter()
+            .filter_map(|fl| {
+                if let FlatLine::Detail {
+                    message_index,
+                    detail_index,
+                } = fl
+                {
+                    let lines = frontmatter_lines(&panel.messages[*message_index], &theme);
+                    lines.get(*detail_index).map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            detail_text.contains("main.rs"),
+            "detail should contain request payload: {detail_text}"
+        );
+        assert!(
+            !detail_text.contains("fn main()"),
+            "detail should NOT contain response payload: {detail_text}"
         );
     }
 

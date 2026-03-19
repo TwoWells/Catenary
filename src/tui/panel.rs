@@ -352,11 +352,15 @@ impl<'a> PanelState<'a> {
 
 // ── Expansion helpers ───────────────────────────────────────────────────
 
-/// Generate styled detail lines for an expanded message.
+/// Generate styled frontmatter lines for an expanded message.
+///
+/// Shows only the pretty-printed payload JSON with 10-space indent and
+/// muted style. No method header or separator — the method is already
+/// visible in the summary line.
 ///
 /// Returns an empty vec for messages with empty payloads.
 #[must_use]
-pub fn detail_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'static>> {
+pub fn frontmatter_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'static>> {
     let payload = &msg.payload;
     if payload.as_object().is_none_or(serde_json::Map::is_empty) {
         return Vec::new();
@@ -366,95 +370,12 @@ pub fn detail_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'static>> {
     let indent = "          ";
     let mut lines = Vec::new();
 
-    // Line 1: method [type]
-    lines.push(Line::from(vec![
-        Span::raw(indent.to_string()),
-        Span::styled(format!("{} [{}]", msg.method, msg.r#type), theme.muted),
-    ]));
-
-    // Line 2: separator
-    lines.push(Line::from(vec![
-        Span::raw(indent.to_string()),
-        Span::styled("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", theme.muted),
-    ]));
-
-    // Lines 3+: pretty-printed payload
     if let Ok(pretty) = serde_json::to_string_pretty(payload) {
         for line in pretty.lines() {
             lines.push(Line::from(vec![
                 Span::raw(indent.to_string()),
                 Span::styled(line.to_string(), theme.muted),
             ]));
-        }
-    }
-
-    lines
-}
-
-/// Generate styled detail lines for an expanded request/response pair.
-///
-/// Shows the request payload under a `→` header and the response payload
-/// under a `←` header.
-#[must_use]
-pub fn pair_detail_lines(
-    request: &SessionMessage,
-    response: &SessionMessage,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let indent = "          ";
-    let mut lines = Vec::new();
-
-    // Request section
-    let req_payload = &request.payload;
-    if req_payload.as_object().is_some_and(|o| !o.is_empty()) {
-        lines.push(Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(
-                format!("\u{2192} {} [{}]", request.method, request.r#type),
-                theme.muted,
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(
-                "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-                theme.muted,
-            ),
-        ]));
-        if let Ok(pretty) = serde_json::to_string_pretty(req_payload) {
-            for line in pretty.lines() {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled(line.to_string(), theme.muted),
-                ]));
-            }
-        }
-    }
-
-    // Response section
-    let resp_payload = &response.payload;
-    if resp_payload.as_object().is_some_and(|o| !o.is_empty()) {
-        lines.push(Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(
-                format!("\u{2190} {} [{}]", response.method, response.r#type),
-                theme.muted,
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(
-                "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-                theme.muted,
-            ),
-        ]));
-        if let Ok(pretty) = serde_json::to_string_pretty(resp_payload) {
-            for line in pretty.lines() {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled(line.to_string(), theme.muted),
-                ]));
-            }
         }
     }
 
@@ -614,7 +535,6 @@ fn clip_line_horizontal(line: &Line<'_>, h_scroll: usize, width: usize) -> Line<
 /// Shared between the top-level render loop and `ScopeChild` indentation.
 fn render_flat_line_styled(
     fl: &FlatLine,
-    all_flat: &[FlatLine],
     state: &PanelState<'_>,
     detail_cache: &mut HashMap<usize, Vec<Line<'static>>>,
 ) -> Line<'static> {
@@ -638,30 +558,7 @@ fn render_flat_line_styled(
             detail_index,
         } => detail_cache
             .entry(*message_index)
-            .or_insert_with(|| {
-                let resp_idx = all_flat.iter().find_map(|fl2| {
-                    if let FlatLine::MessageHeader {
-                        message_index: mi,
-                        paired_response: Some(ri),
-                    } = fl2
-                        && *mi == *message_index
-                    {
-                        Some(*ri)
-                    } else {
-                        None
-                    }
-                });
-                resp_idx.map_or_else(
-                    || detail_lines(&state.messages[*message_index], state.theme),
-                    |ri| {
-                        pair_detail_lines(
-                            &state.messages[*message_index],
-                            &state.messages[ri],
-                            state.theme,
-                        )
-                    },
-                )
-            })
+            .or_insert_with(|| frontmatter_lines(&state.messages[*message_index], state.theme))
             .get(*detail_index)
             .cloned()
             .unwrap_or_default(),
@@ -692,7 +589,7 @@ fn render_flat_line_styled(
         ),
         FlatLine::ScopeChild { depth, inner, .. } => {
             let indent = " ".repeat(depth * 4);
-            let inner_line = render_flat_line_styled(inner, all_flat, state, detail_cache);
+            let inner_line = render_flat_line_styled(inner, state, detail_cache);
             let mut spans = vec![Span::raw(indent)];
             spans.extend(
                 inner_line
@@ -772,7 +669,7 @@ pub fn render_panel(state: &PanelState<'_>, area: Rect, buf: &mut Buffer, focuse
             break;
         }
 
-        let line = render_flat_line_styled(fl, &flat, state, &mut detail_cache);
+        let line = render_flat_line_styled(fl, state, &mut detail_cache);
 
         let display_line = if state.horizontal_scroll > 0
             || UnicodeWidthStr::width(
@@ -1309,32 +1206,107 @@ mod tests {
     }
 
     #[test]
-    fn test_detail_lines_non_empty_payload() {
+    fn test_frontmatter_lines_non_empty_payload() {
         let msg = make_lsp_message();
         let theme = test_theme();
 
-        let lines = detail_lines(&msg, &theme);
-        // Should have: method [type] header + separator + payload lines
-        assert!(lines.len() >= 3, "should have header + sep + payload");
-        let hdr: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let lines = frontmatter_lines(&msg, &theme);
+        assert!(!lines.is_empty(), "non-empty payload should have lines");
+        // Payload content should be present.
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
         assert!(
-            hdr.contains("textDocument/hover"),
-            "header should contain method"
+            all_text.contains("textDocument/hover"),
+            "should contain payload content"
         );
-        assert!(hdr.contains("[lsp]"), "header should contain type");
-        let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(sep.contains("\u{2500}"), "second line should be separator");
+        // No method [type] header line.
+        assert!(
+            !all_text.contains("textDocument/hover [lsp]"),
+            "should not contain method [type] header"
+        );
+        // No box-drawing separator.
+        assert!(
+            !all_text.contains('\u{2500}'),
+            "should not contain box-drawing separator"
+        );
+        // All lines use muted style.
+        for line in &lines {
+            for span in &line.spans {
+                if !span.content.trim().is_empty() {
+                    assert_eq!(
+                        span.style, theme.muted,
+                        "content spans should use muted style"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn test_detail_lines_empty_payload() {
+    fn test_frontmatter_lines_empty_payload() {
         let msg = make_message("lsp", "initialized", "rust-analyzer");
         let theme = test_theme();
 
-        let lines = detail_lines(&msg, &theme);
+        let lines = frontmatter_lines(&msg, &theme);
         assert!(
             lines.is_empty(),
-            "empty payload should have no detail lines"
+            "empty payload should have no frontmatter lines"
+        );
+    }
+
+    #[test]
+    fn test_frontmatter_lines_format() {
+        let theme = test_theme();
+        let msg = make_message_with_payload(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            serde_json::json!({"id": 1, "method": "textDocument/hover"}),
+        );
+
+        let lines = frontmatter_lines(&msg, &theme);
+        // Line count matches pretty-printed JSON.
+        let pretty = serde_json::to_string_pretty(&msg.payload).expect("serialize");
+        assert_eq!(
+            lines.len(),
+            pretty.lines().count(),
+            "line count should match pretty-printed JSON"
+        );
+
+        // Each line: 10-space indent + muted-styled content.
+        for line in &lines {
+            assert_eq!(
+                line.spans.len(),
+                2,
+                "each line should have indent + content"
+            );
+            let indent_text: &str = &line.spans[0].content;
+            assert_eq!(indent_text, "          ", "indent should be 10 spaces");
+            assert_eq!(
+                line.spans[1].style, theme.muted,
+                "content should use muted style"
+            );
+        }
+
+        // No method [type] header.
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            !all_text.contains("[lsp]"),
+            "should not contain [type] header"
+        );
+        // No separators.
+        assert!(
+            !all_text.contains('\u{2500}'),
+            "should not contain box-drawing separator"
+        );
+        assert!(
+            !all_text.contains("---"),
+            "should not contain --- separator"
         );
     }
 
@@ -1350,7 +1322,7 @@ mod tests {
         panel.expanded.insert(5);
 
         let flat = panel.flat_lines();
-        let detail_count = detail_lines(&panel.messages[5], &theme).len();
+        let detail_count = frontmatter_lines(&panel.messages[5], &theme).len();
         // 10 headers + detail lines for message 5
         assert_eq!(flat.len(), 10 + detail_count);
 
@@ -1388,8 +1360,11 @@ mod tests {
 
         // Header should show the diagnostics summary.
         assert!(content.contains("lib.rs"), "expected file name in header");
-        // Detail lines should contain the payload.
-        assert!(content.contains("post-tool"), "expected method in detail");
+        // Detail lines should contain the payload (no method header).
+        assert!(
+            content.contains("count"),
+            "expected payload content in detail"
+        );
     }
 
     // ── Format tests ──────────────────────────────────────────────────

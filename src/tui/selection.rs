@@ -19,7 +19,7 @@ use super::flat::FlatLine;
 use super::format::{
     format_ago, format_collapsed_plain, format_message_plain, format_pair_plain, format_scope_plain,
 };
-use super::panel::{PanelState, detail_lines, pair_detail_lines};
+use super::panel::{PanelState, frontmatter_lines};
 use super::tree::{SessionTree, TreeItem};
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -94,7 +94,7 @@ impl VisualSelection {
 // ── Yank ─────────────────────────────────────────────────────────────────
 
 /// Format a single `FlatLine` as plain text for yank.
-fn flat_line_plain(fl: &FlatLine, all_flat: &[FlatLine], panel: &PanelState<'_>) -> String {
+fn flat_line_plain(fl: &FlatLine, panel: &PanelState<'_>) -> String {
     match fl {
         FlatLine::MessageHeader {
             message_index,
@@ -113,32 +113,15 @@ fn flat_line_plain(fl: &FlatLine, all_flat: &[FlatLine], panel: &PanelState<'_>)
         FlatLine::Detail {
             message_index,
             detail_index,
-        } => {
-            let resp_idx = all_flat.iter().find_map(|fl2| {
-                if let FlatLine::MessageHeader {
-                    message_index: mi,
-                    paired_response: Some(ri),
-                } = fl2
-                    && *mi == *message_index
-                {
-                    Some(*ri)
-                } else {
-                    None
-                }
-            });
-            panel
-                .messages
-                .get(*message_index)
-                .map_or_else(String::new, |msg| {
-                    let details = resp_idx.and_then(|ri| panel.messages.get(ri)).map_or_else(
-                        || detail_lines(msg, panel.theme),
-                        |resp| pair_detail_lines(msg, resp, panel.theme),
-                    );
-                    details.get(*detail_index).map_or_else(String::new, |line| {
-                        line.spans.iter().map(|s| s.content.as_ref()).collect()
-                    })
+        } => panel
+            .messages
+            .get(*message_index)
+            .map_or_else(String::new, |msg| {
+                let details = frontmatter_lines(msg, panel.theme);
+                details.get(*detail_index).map_or_else(String::new, |line| {
+                    line.spans.iter().map(|s| s.content.as_ref()).collect()
                 })
-        }
+            }),
         FlatLine::CollapsedHeader {
             start_index,
             end_index,
@@ -152,7 +135,7 @@ fn flat_line_plain(fl: &FlatLine, all_flat: &[FlatLine], panel: &PanelState<'_>)
         } => format_scope_plain(parent, *child_count, *position, &panel.messages),
         FlatLine::ScopeChild { depth, inner, .. } => {
             let indent = " ".repeat(depth * 4);
-            let inner_text = flat_line_plain(inner, all_flat, panel);
+            let inner_text = flat_line_plain(inner, panel);
             format!("{indent}{inner_text}")
         }
     }
@@ -169,7 +152,7 @@ pub fn yank_text(panel: &PanelState<'_>, selection: &VisualSelection) -> String 
     let mut lines: Vec<String> = Vec::with_capacity(end.saturating_sub(start) + 1);
 
     for fl in flat.iter().skip(start).take(end - start + 1) {
-        lines.push(flat_line_plain(fl, &flat, panel));
+        lines.push(flat_line_plain(fl, panel));
     }
 
     lines.join("\n")
@@ -447,8 +430,11 @@ mod tests {
         };
         let text = yank_text(&panel, &sel);
         assert!(text.contains("lib.rs"), "header should mention file");
-        // Detail lines contain pretty-printed payload.
-        assert!(text.contains("post-tool"), "detail should contain method");
+        // Detail lines contain pretty-printed payload (no method header).
+        assert!(
+            text.contains("count"),
+            "detail should contain payload content"
+        );
         assert!(
             text.lines().count() >= 3,
             "should have at least 3 lines of output"
