@@ -704,8 +704,9 @@ mod tests {
     use crate::session::{SessionInfo, SessionMessage};
     use crate::tui::app::{App, FocusedPane, InputMode};
     use crate::tui::data::{MockDataSource, SessionRow};
+    use crate::tui::icons::IconSet;
     use crate::tui::render::{draw, handle_key_normal};
-    use crate::tui::theme::{IconSet, Theme};
+    use crate::tui::theme::Theme;
     use crate::tui::tree::TreeItem;
 
     fn make_session(id: &str, workspace: &str, alive: bool) -> SessionRow {

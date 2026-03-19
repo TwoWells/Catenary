@@ -12,7 +12,8 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use super::theme::{Theme, format_message_plain};
+use super::format::format_message_plain;
+use super::theme::Theme;
 use crate::session::SessionMessage;
 
 /// Maximum number of autocomplete suggestions shown.

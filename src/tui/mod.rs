@@ -17,8 +17,10 @@ pub mod category;
 pub mod data;
 pub mod degradation;
 pub mod filter;
+pub mod format;
 pub mod grid;
 pub mod hints;
+pub mod icons;
 pub mod layout;
 pub mod mouse;
 pub mod panel;
@@ -51,9 +53,10 @@ use crate::session;
 
 use self::app::{FocusedPane, InputMode};
 use self::data::SqliteDataSource;
+use self::icons::IconSet;
 use self::mouse::{DragState, MouseAction};
 use self::render::{draw, handle_key_filter, handle_key_normal, handle_key_visual};
-use self::theme::{IconSet, Theme};
+use self::theme::Theme;
 
 /// Tick interval for the event loop.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);

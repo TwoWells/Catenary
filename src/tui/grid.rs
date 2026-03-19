@@ -14,9 +14,10 @@ use std::collections::HashSet;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use super::icons::IconSet;
 use super::layout::{Composition, closest_composition, compute_layout, curated_layouts};
 use super::panel::{PanelState, render_panel};
-use super::theme::{IconSet, Theme};
+use super::theme::Theme;
 
 /// The pin ratio used for pinned panels (pinned panels get 2x space).
 const PIN_RATIO: f64 = 2.0;

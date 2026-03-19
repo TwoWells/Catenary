@@ -15,8 +15,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
+use super::format::{format_ago, format_collapsed_plain, format_message_plain, format_pair_plain};
 use super::panel::{FlatLine, PanelState, detail_lines, pair_detail_lines};
-use super::theme::{format_ago, format_collapsed_plain, format_message_plain, format_pair_plain};
 use super::tree::{SessionTree, TreeItem};
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -298,8 +298,9 @@ mod tests {
     use crate::config::IconConfig;
     use crate::session::{SessionInfo, SessionMessage};
     use crate::tui::data::SessionRow;
+    use crate::tui::icons::IconSet;
     use crate::tui::panel::PanelState;
-    use crate::tui::theme::{IconSet, Theme};
+    use crate::tui::theme::Theme;
     use crate::tui::tree::SessionTree;
 
     fn test_theme() -> Theme {

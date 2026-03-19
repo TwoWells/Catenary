@@ -18,11 +18,13 @@ use ratatui::widgets::{Block, Borders, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::category;
-use super::selection::VisualSelection;
-use super::theme::{
-    IconSet, Theme, format_collapsed_plain, format_collapsed_styled, format_message_plain,
-    format_message_styled, format_pair_plain, format_pair_styled,
+use super::format::{
+    format_collapsed_plain, format_collapsed_styled, format_message_plain, format_message_styled,
+    format_pair_plain, format_pair_styled,
 };
+use super::icons::IconSet;
+use super::selection::VisualSelection;
+use super::theme::Theme;
 use crate::session::SessionMessage;
 
 // ── Data types ──────────────────────────────────────────────────────────
@@ -1799,7 +1801,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let line =
-            super::super::theme::format_pair_styled(&messages[0], &messages[1], &icons, &theme);
+            super::super::format::format_pair_styled(&messages[0], &messages[1], &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("x->"), "cancellation should show x-> arrow");
     }
@@ -1832,7 +1834,7 @@ mod tests {
             serde_json::json!({"result": null}),
         );
 
-        let line = super::super::theme::format_pair_styled(&request, &response, &icons, &theme);
+        let line = super::super::format::format_pair_styled(&request, &response, &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1.5s"), "should contain timing delta: {text}");
     }
@@ -1847,7 +1849,7 @@ mod tests {
             make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1));
         response.payload = serde_json::json!({"result": {"contents": "fn main()"}});
 
-        let line = super::super::theme::format_pair_styled(&request, &response, &icons, &theme);
+        let line = super::super::format::format_pair_styled(&request, &response, &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("[rust-analyzer]"),
@@ -1885,7 +1887,7 @@ mod tests {
             serde_json::json!({"result": {"content": [{"type": "text", "text": "results"}]}}),
         );
 
-        let line = super::super::theme::format_pair_styled(&request, &response, &icons, &theme);
+        let line = super::super::format::format_pair_styled(&request, &response, &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("grep"), "should contain tool name: {text}");
         assert!(text.contains("ok"), "should contain result status: {text}");

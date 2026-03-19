@@ -13,9 +13,10 @@ use ratatui::layout::Rect;
 use super::data::{DataSource, MessageTail};
 use super::filter::FilterState;
 use super::grid::EventsGrid;
+use super::icons::IconSet;
 use super::layout::PanelLayout;
 use super::mouse::DragState;
-use super::theme::{IconSet, Theme};
+use super::theme::Theme;
 use super::tree::{SessionTree, TreeItem};
 
 /// Which region has keyboard focus.

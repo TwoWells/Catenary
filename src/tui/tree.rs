@@ -11,8 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use super::data::SessionRow;
+use super::icons::IconSet;
 use super::selection::VisualSelection;
-use super::theme::{IconSet, Theme};
+use super::theme::Theme;
 
 // ── Data types ──────────────────────────────────────────────────────────
 
@@ -423,7 +424,7 @@ fn format_workspace_path(path: &str, max_width: usize) -> &str {
 
 /// Format a session age from `started_at`.
 fn format_age(started: chrono::DateTime<chrono::Utc>) -> String {
-    super::theme::format_ago(started)
+    super::format::format_ago(started)
 }
 
 /// Render the sessions tree into the given buffer area.
