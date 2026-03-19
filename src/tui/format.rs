@@ -186,37 +186,62 @@ pub fn format_duration_short(millis: i64) -> String {
     }
 }
 
-/// Extract a result summary from a response payload.
-///
-/// Returns `"ok"` or `"error"` based on the JSON-RPC response structure.
-fn result_summary(response: &SessionMessage) -> &'static str {
-    let p = &response.payload;
-    // MCP tools/call: check isError in result content
-    if response.method == "tools/call"
-        && let Some(result) = p.get("result")
-    {
-        if let Some(content) = result.get("content")
-            && content
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|c| c.get("isError"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        {
-            return "error";
+/// Outcome of a merged request/response pair.
+enum PairOutcome {
+    Success,
+    Error { message: Option<String> },
+    Cancelled,
+}
+
+/// Determine the outcome of a merged pair from the response payload.
+fn pair_outcome(response: &SessionMessage) -> PairOutcome {
+    if response.method == "notifications/cancelled" {
+        return PairOutcome::Cancelled;
+    }
+    if let Some(msg) = extract_jsonrpc_error(&response.payload) {
+        return PairOutcome::Error { message: Some(msg) };
+    }
+    if response.method == "tools/call" {
+        if let Some(msg) = extract_tool_error(&response.payload) {
+            return PairOutcome::Error { message: Some(msg) };
         }
-        if result
-            .get("isError")
+        // Top-level isError without content text.
+        if response
+            .payload
+            .get("result")
+            .and_then(|r| r.get("isError"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {
-            return "error";
+            return PairOutcome::Error { message: None };
         }
     }
-    if p.get("error").is_some() {
-        "error"
+    PairOutcome::Success
+}
+
+/// Extract an error message from a JSON-RPC error response.
+fn extract_jsonrpc_error(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("error")?
+        .get("message")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Extract an error message from an MCP tool error response.
+///
+/// Looks for `result.content[0].isError == true` and returns the text.
+fn extract_tool_error(payload: &serde_json::Value) -> Option<String> {
+    let content = payload.get("result")?.get("content")?.as_array()?;
+    let first = content.first()?;
+    if first
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        first.get("text")?.as_str().map(String::from)
     } else {
-        "ok"
+        None
     }
 }
 
@@ -224,9 +249,8 @@ fn result_summary(response: &SessionMessage) -> &'static str {
 
 /// Build a styled [`Line`] for a merged request/response pair.
 ///
-/// Format: `HH:MM:SS [server] <-> method (result, Xs)`
-///
-/// Cancellations (`notifications/cancelled`) render with `x->`.
+/// Icon-based rendering: outcome icons replace directional arrows.
+/// Error messages are extracted from response payloads and shown inline.
 #[must_use]
 pub fn format_pair_styled(
     request: &SessionMessage,
@@ -237,77 +261,96 @@ pub fn format_pair_styled(
     let ts = request.timestamp.format("%H:%M:%S").to_string();
     let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
 
-    let is_cancel = response.method == "notifications/cancelled";
-    let arrow = if is_cancel { "x-> " } else { "<-> " };
-    let arrow_style = if is_cancel { theme.error } else { theme.text };
-
     let delta_ms = response
         .timestamp
         .signed_duration_since(request.timestamp)
         .num_milliseconds();
     let timing = format_duration_short(delta_ms);
+    let outcome = pair_outcome(response);
 
-    let summary = if is_cancel {
-        "cancelled"
+    // Resolve the tool name for MCP tools/call requests.
+    let tool_name = if request.method == "tools/call" {
+        request
+            .payload
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
     } else {
-        result_summary(response)
-    };
-    let summary_style = if summary == "error" {
-        theme.error
-    } else {
-        theme.muted
+        None
     };
 
-    match request.r#type.as_str() {
-        "lsp" => Line::from(vec![
-            ts_span,
-            Span::styled(format!("[{}] ", request.server), theme.accent),
-            Span::styled(arrow.to_string(), arrow_style),
-            Span::styled(request.method.clone(), theme.text),
-            Span::styled(format!(" ({summary}, {timing})"), summary_style),
-        ]),
-        "mcp" => {
-            if request.method == "tools/call" && !is_cancel {
-                let tool_name = request
-                    .payload
-                    .get("params")
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or(&request.method);
-                let icon = tool_icon(tool_name, icons);
-                Line::from(vec![
-                    ts_span,
-                    Span::styled(icon.to_string(), theme.success),
-                    Span::styled(tool_name.to_string(), theme.text),
-                    Span::styled(format!(" ({summary}, {timing})"), summary_style),
-                ])
-            } else {
-                let label = if request.method == "tools/call" {
-                    request
-                        .payload
-                        .get("params")
-                        .and_then(|p| p.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or(&request.method)
-                } else {
-                    &request.method
-                };
-                Line::from(vec![
-                    ts_span,
-                    Span::styled("[mcp] ".to_string(), theme.text),
-                    Span::styled(arrow.to_string(), arrow_style),
-                    Span::styled(label.to_string(), theme.text),
-                    Span::styled(format!(" ({summary}, {timing})"), summary_style),
-                ])
+    match &outcome {
+        PairOutcome::Cancelled => {
+            let label = tool_name.unwrap_or(&request.method);
+            let mut spans = vec![ts_span];
+            match request.r#type.as_str() {
+                "lsp" => {
+                    spans.push(Span::styled(format!("[{}] ", request.server), theme.accent));
+                }
+                "mcp" if tool_name.is_none() => {
+                    spans.push(Span::styled("[mcp] ".to_string(), theme.text));
+                }
+                _ => {}
             }
+            spans.push(Span::styled(icons.cancelled.clone(), theme.muted));
+            spans.push(Span::styled(label.to_string(), theme.text));
+            spans.push(Span::styled(format!(" (cancelled, {timing})"), theme.muted));
+            Line::from(spans)
         }
-        other => Line::from(vec![
-            ts_span,
-            Span::styled(format!("[{other}] "), theme.text),
-            Span::styled(arrow.to_string(), arrow_style),
-            Span::styled(request.method.clone(), theme.text),
-            Span::styled(format!(" ({summary}, {timing})"), summary_style),
-        ]),
+        PairOutcome::Error { message } => {
+            let label = tool_name.unwrap_or(&request.method);
+            let error_suffix = message
+                .as_deref()
+                .map_or(String::new(), |m| format!(": {m}"));
+            let mut spans = vec![ts_span];
+            match request.r#type.as_str() {
+                "lsp" => {
+                    spans.push(Span::styled(format!("[{}] ", request.server), theme.accent));
+                }
+                "mcp" if tool_name.is_none() => {
+                    spans.push(Span::styled("[mcp] ".to_string(), theme.text));
+                }
+                _ => {}
+            }
+            spans.push(Span::styled(icons.proto_error.clone(), theme.error));
+            spans.push(Span::styled(format!("{label}{error_suffix}"), theme.text));
+            spans.push(Span::styled(format!(" ({timing})"), theme.muted));
+            Line::from(spans)
+        }
+        PairOutcome::Success => match request.r#type.as_str() {
+            "lsp" => Line::from(vec![
+                ts_span,
+                Span::styled(format!("[{}] ", request.server), theme.accent),
+                Span::styled(icons.proto_ok.clone(), theme.success),
+                Span::styled(request.method.clone(), theme.text),
+                Span::styled(format!(" ({timing})"), theme.muted),
+            ]),
+            "mcp" => {
+                if let Some(name) = tool_name {
+                    let icon = tool_icon(name, icons);
+                    Line::from(vec![
+                        ts_span,
+                        Span::styled(icon.to_string(), theme.success),
+                        Span::styled(name.to_string(), theme.text),
+                        Span::styled(format!(" ({timing})"), theme.muted),
+                    ])
+                } else {
+                    Line::from(vec![
+                        ts_span,
+                        Span::styled(icons.proto_ok.clone(), theme.success),
+                        Span::styled(request.method.clone(), theme.text),
+                        Span::styled(format!(" ({timing})"), theme.muted),
+                    ])
+                }
+            }
+            other => Line::from(vec![
+                ts_span,
+                Span::styled(format!("[{other}] "), theme.text),
+                Span::styled(icons.proto_ok.clone(), theme.success),
+                Span::styled(request.method.clone(), theme.text),
+                Span::styled(format!(" ({timing})"), theme.muted),
+            ]),
+        },
     }
 }
 
@@ -315,51 +358,49 @@ pub fn format_pair_styled(
 #[must_use]
 pub fn format_pair_plain(request: &SessionMessage, response: &SessionMessage) -> String {
     let ts = request.timestamp.format("%H:%M:%S");
-    let is_cancel = response.method == "notifications/cancelled";
-    let arrow = if is_cancel { "x->" } else { "<->" };
     let delta_ms = response
         .timestamp
         .signed_duration_since(request.timestamp)
         .num_milliseconds();
     let timing = format_duration_short(delta_ms);
-    let summary = if is_cancel {
-        "cancelled"
+    let outcome = pair_outcome(response);
+
+    let tool_name = if request.method == "tools/call" {
+        request
+            .payload
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
     } else {
-        result_summary(response)
+        None
     };
 
-    match request.r#type.as_str() {
-        "lsp" => format!(
-            "{ts} [{}] {arrow} {} ({summary}, {timing})",
-            request.server, request.method
-        ),
-        "mcp" => {
-            if request.method == "tools/call" && !is_cancel {
-                let tool_name = request
-                    .payload
-                    .get("params")
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or(&request.method);
-                format!("{ts} {tool_name} ({summary}, {timing})")
-            } else {
-                let label = if request.method == "tools/call" {
-                    request
-                        .payload
-                        .get("params")
-                        .and_then(|p| p.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or(&request.method)
-                } else {
-                    &request.method
-                };
-                format!("{ts} [mcp] {arrow} {label} ({summary}, {timing})")
+    match &outcome {
+        PairOutcome::Cancelled => {
+            let label = tool_name.unwrap_or(&request.method);
+            match request.r#type.as_str() {
+                "lsp" => format!("{ts} [{}] {label} (cancelled, {timing})", request.server),
+                _ => format!("{ts} {label} (cancelled, {timing})"),
             }
         }
-        other => format!(
-            "{ts} [{other}] {arrow} {} ({summary}, {timing})",
-            request.method
-        ),
+        PairOutcome::Error { message } => {
+            let label = tool_name.unwrap_or(&request.method);
+            let error_suffix = message
+                .as_deref()
+                .map_or(String::new(), |m| format!(": {m}"));
+            match request.r#type.as_str() {
+                "lsp" => format!("{ts} [{}] {label}{error_suffix} ({timing})", request.server),
+                _ => format!("{ts} {label}{error_suffix} ({timing})"),
+            }
+        }
+        PairOutcome::Success => match request.r#type.as_str() {
+            "lsp" => format!("{ts} [{}] {} ({timing})", request.server, request.method),
+            "mcp" => tool_name.map_or_else(
+                || format!("{ts} {} ({timing})", request.method),
+                |name| format!("{ts} {name} ({timing})"),
+            ),
+            other => format!("{ts} [{other}] {} ({timing})", request.method),
+        },
     }
 }
 
@@ -523,12 +564,95 @@ pub fn format_collapsed_plain(
 
 // ── Scope formatters ──────────────────────────────────────────────────
 
+/// Build a scope header line for a Paired parent entry.
+///
+/// Outcome-aware: icons reflect success/error/cancellation with error
+/// messages extracted from the response payload.
+fn format_scope_pair(
+    req: &SessionMessage,
+    resp: &SessionMessage,
+    position: SegmentPosition,
+    children_label: &str,
+    has_metrics: bool,
+    icons: &IconSet,
+    theme: &Theme,
+) -> Line<'static> {
+    let ts = req.timestamp.format("%H:%M:%S").to_string();
+    let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
+
+    let delta_ms = resp
+        .timestamp
+        .signed_duration_since(req.timestamp)
+        .num_milliseconds();
+    let timing = format_duration_short(delta_ms);
+    let outcome = pair_outcome(resp);
+
+    let tool_name = if req.method == "tools/call" {
+        req.payload
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+    } else {
+        None
+    };
+
+    let label = tool_name.unwrap_or(&req.method);
+    let name = segment_tool_name(label, position);
+
+    let (icon, icon_style, name_text, meta) = match &outcome {
+        PairOutcome::Cancelled => {
+            let meta = if has_metrics {
+                format!(" (cancelled, {children_label}, {timing})")
+            } else {
+                format!(" (cancelled, {children_label})")
+            };
+            (icons.cancelled.clone(), theme.muted, name, meta)
+        }
+        PairOutcome::Error { message } => {
+            let error_suffix = message
+                .as_deref()
+                .map_or(String::new(), |m| format!(": {m}"));
+            let meta = if has_metrics {
+                format!(" ({children_label}, {timing})")
+            } else {
+                format!(" ({children_label})")
+            };
+            (
+                icons.proto_error.clone(),
+                theme.error,
+                format!("{name}{error_suffix}"),
+                meta,
+            )
+        }
+        PairOutcome::Success => {
+            let meta = if has_metrics {
+                format!(" ({children_label}, {timing})")
+            } else {
+                format!(" ({children_label})")
+            };
+            let icon = tool_name.map_or_else(
+                || icons.proto_ok.clone(),
+                |tn| tool_icon(tn, icons).to_string(),
+            );
+            (icon, theme.success, name, meta)
+        }
+    };
+
+    let mut spans = vec![ts_span];
+    if req.r#type == "lsp" {
+        spans.push(Span::styled(format!("[{}] ", req.server), theme.accent));
+    }
+    spans.push(Span::styled(icon, icon_style));
+    spans.push(Span::styled(name_text, theme.text));
+    spans.push(Span::styled(meta, theme.muted));
+    Line::from(spans)
+}
+
 /// Build a styled [`Line`] for a scope header (parent with grouped children).
 ///
-/// Basic rendering: the parent's summary with child count appended.
+/// Outcome-aware rendering: icons reflect success/error/cancellation.
 /// For tool calls: `HH:MM:SS icon tool_name (N children, Xs)`.
-/// The formatter rewrite (tickets 04a/04b) will enhance this with icons,
-/// error extraction, and argument surfacing.
+/// Error messages are extracted from the response payload and shown inline.
 ///
 /// Segment position controls the ellipsis convention on tool names:
 /// - `Only`: `tool_name (metrics)` — full scope, no ellipsis
@@ -555,53 +679,15 @@ pub fn format_scope_styled(
             request_index,
             response_index,
             ..
-        } => {
-            let req = &messages[*request_index];
-            let resp = &messages[*response_index];
-            let ts = req.timestamp.format("%H:%M:%S").to_string();
-            let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
-
-            let delta_ms = resp
-                .timestamp
-                .signed_duration_since(req.timestamp)
-                .num_milliseconds();
-            let timing = format_duration_short(delta_ms);
-
-            if req.method == "tools/call" {
-                let tool_name = req
-                    .payload
-                    .get("params")
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or(&req.method);
-                let icon = tool_icon(tool_name, icons);
-                let name = segment_tool_name(tool_name, position);
-                let meta = if has_metrics {
-                    format!(" ({children_label}, {timing})")
-                } else {
-                    format!(" ({children_label})")
-                };
-                Line::from(vec![
-                    ts_span,
-                    Span::styled(icon.to_string(), theme.success),
-                    Span::styled(name, theme.text),
-                    Span::styled(meta, theme.muted),
-                ])
-            } else {
-                let method = segment_tool_name(&req.method, position);
-                let meta = if has_metrics {
-                    format!(" ({children_label}, {timing})")
-                } else {
-                    format!(" ({children_label})")
-                };
-                Line::from(vec![
-                    ts_span,
-                    Span::styled(format!("[{}] ", req.server), theme.accent),
-                    Span::styled(method, theme.text),
-                    Span::styled(meta, theme.muted),
-                ])
-            }
-        }
+        } => format_scope_pair(
+            &messages[*request_index],
+            &messages[*response_index],
+            position,
+            &children_label,
+            has_metrics,
+            icons,
+            theme,
+        ),
         DisplayEntry::Single { index, .. } => {
             let msg = &messages[*index];
             let ts = msg.timestamp.format("%H:%M:%S").to_string();
@@ -681,29 +767,50 @@ pub fn format_scope_plain(
                 .signed_duration_since(req.timestamp)
                 .num_milliseconds();
             let timing = format_duration_short(delta_ms);
+            let outcome = pair_outcome(resp);
 
-            if req.method == "tools/call" {
-                let tool_name = req
-                    .payload
+            let tool_name = if req.method == "tools/call" {
+                req.payload
                     .get("params")
                     .and_then(|p| p.get("name"))
                     .and_then(|n| n.as_str())
-                    .unwrap_or(&req.method);
-                let name = segment_tool_name(tool_name, position);
-                if has_metrics {
-                    format!("{ts} {name} ({children_label}, {timing})")
-                } else {
-                    format!("{ts} {name} ({children_label})")
-                }
             } else {
-                let method = segment_tool_name(&req.method, position);
-                if has_metrics {
-                    format!(
-                        "{ts} [{}] {method} ({children_label}, {timing})",
-                        req.server
-                    )
-                } else {
-                    format!("{ts} [{}] {method} ({children_label})", req.server)
+                None
+            };
+
+            let label = tool_name.unwrap_or(&req.method);
+            let name = segment_tool_name(label, position);
+
+            let prefix = if req.r#type == "lsp" {
+                format!("{ts} [{}] ", req.server)
+            } else {
+                format!("{ts} ")
+            };
+
+            match &outcome {
+                PairOutcome::Cancelled => {
+                    if has_metrics {
+                        format!("{prefix}{name} (cancelled, {children_label}, {timing})")
+                    } else {
+                        format!("{prefix}{name} (cancelled, {children_label})")
+                    }
+                }
+                PairOutcome::Error { message } => {
+                    let error_suffix = message
+                        .as_deref()
+                        .map_or(String::new(), |m| format!(": {m}"));
+                    if has_metrics {
+                        format!("{prefix}{name}{error_suffix} ({children_label}, {timing})")
+                    } else {
+                        format!("{prefix}{name}{error_suffix} ({children_label})")
+                    }
+                }
+                PairOutcome::Success => {
+                    if has_metrics {
+                        format!("{prefix}{name} ({children_label}, {timing})")
+                    } else {
+                        format!("{prefix}{name} ({children_label})")
+                    }
                 }
             }
         }
@@ -1421,6 +1528,301 @@ mod tests {
         assert!(
             !text.contains('\u{2192}') && !text.contains('\u{2190}'),
             "LSP single should have no arrow: {text}"
+        );
+    }
+
+    // ── Pair formatter tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_format_pair_lsp_error_with_message() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message("lsp", "workspace/diagnostic/refresh", "rust-analyzer");
+        let response = make_message_with_payload(
+            "lsp",
+            "workspace/diagnostic/refresh",
+            "rust-analyzer",
+            serde_json::json!({"error": {"code": -32601, "message": "Method not found"}}),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2718}"),
+            "LSP error should show ✘ icon: {text}"
+        );
+        assert!(
+            text.contains("Method not found"),
+            "should contain error message: {text}"
+        );
+        assert!(!text.contains("<->"), "should not contain arrow: {text}");
+    }
+
+    #[test]
+    fn test_format_pair_mcp_tool_error() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "invalid pattern", "isError": true}]}}),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2718}"),
+            "MCP tool error should show ✘ icon: {text}"
+        );
+        assert!(
+            text.contains("invalid pattern"),
+            "should contain error text: {text}"
+        );
+        assert!(text.contains("grep"), "should contain tool name: {text}");
+    }
+
+    #[test]
+    fn test_format_pair_mcp_tool_success() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "results"}]}}),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2B9E}"),
+            "MCP tool success should show tool icon ⮞, not proto_ok: {text}"
+        );
+        assert!(
+            !text.contains("\u{2714}"),
+            "MCP tool success should not show ✔ proto_ok: {text}"
+        );
+        assert!(text.contains("grep"), "should contain tool name: {text}");
+    }
+
+    #[test]
+    fn test_format_pair_cancelled() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message("mcp", "notifications/cancelled", "catenary");
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2501}"),
+            "cancellation should show ━ icon: {text}"
+        );
+        assert!(
+            text.contains("cancelled"),
+            "cancellation should show cancelled text: {text}"
+        );
+        assert!(
+            !text.contains("x->"),
+            "should not contain x-> arrow: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_pair_plain_no_arrows() {
+        let request = make_message("lsp", "textDocument/hover", "rust-analyzer");
+        let mut response = make_message("lsp", "textDocument/hover", "rust-analyzer");
+        response.payload = serde_json::json!({"result": null});
+        let plain = format_pair_plain(&request, &response);
+        assert!(
+            !plain.contains("<->") && !plain.contains("x->"),
+            "plain pair should not contain arrows: {plain}"
+        );
+
+        let cancel_response = make_message("mcp", "notifications/cancelled", "catenary");
+        let cancel_plain = format_pair_plain(&request, &cancel_response);
+        assert!(
+            !cancel_plain.contains("<->") && !cancel_plain.contains("x->"),
+            "plain cancelled pair should not contain arrows: {cancel_plain}"
+        );
+    }
+
+    #[test]
+    fn test_extract_jsonrpc_error() {
+        let payload = serde_json::json!({"error": {"code": -32601, "message": "Method not found"}});
+        assert_eq!(
+            extract_jsonrpc_error(&payload).as_deref(),
+            Some("Method not found")
+        );
+
+        let no_error = serde_json::json!({"result": null});
+        assert_eq!(extract_jsonrpc_error(&no_error), None);
+
+        let no_message = serde_json::json!({"error": {"code": -32601}});
+        assert_eq!(extract_jsonrpc_error(&no_message), None);
+    }
+
+    #[test]
+    fn test_extract_tool_error() {
+        let payload = serde_json::json!({
+            "result": {"content": [{"type": "text", "text": "bad pattern", "isError": true}]}
+        });
+        assert_eq!(extract_tool_error(&payload).as_deref(), Some("bad pattern"));
+
+        let success = serde_json::json!({
+            "result": {"content": [{"type": "text", "text": "results"}]}
+        });
+        assert_eq!(extract_tool_error(&success), None);
+
+        let empty = serde_json::json!({"result": {"content": []}});
+        assert_eq!(extract_tool_error(&empty), None);
+    }
+
+    // ── Scope formatter tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_format_scope_styled_error() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "bad pattern", "isError": true}]}}),
+        );
+        let messages = vec![request, response];
+        let parent = DisplayEntry::Paired {
+            request_index: 0,
+            response_index: 1,
+            parent_id: None,
+        };
+        let line =
+            format_scope_styled(&parent, 5, SegmentPosition::Only, &messages, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2718}"),
+            "scope with error should show ✘ icon: {text}"
+        );
+        assert!(
+            text.contains("bad pattern"),
+            "scope with error should show error message: {text}"
+        );
+        assert!(
+            text.contains("5 children"),
+            "scope should show child count: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_scope_styled_success() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"result": {"content": [{"type": "text", "text": "results"}]}}),
+        );
+        let messages = vec![request, response];
+        let parent = DisplayEntry::Paired {
+            request_index: 0,
+            response_index: 1,
+            parent_id: None,
+        };
+        let line =
+            format_scope_styled(&parent, 3, SegmentPosition::Only, &messages, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2B9E}"),
+            "scope success should show tool icon ⮞: {text}"
+        );
+        assert!(
+            !text.contains("\u{2718}"),
+            "scope success should not show error icon: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_scope_styled_cancelled() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message("mcp", "notifications/cancelled", "catenary");
+        let messages = vec![request, response];
+        let parent = DisplayEntry::Paired {
+            request_index: 0,
+            response_index: 1,
+            parent_id: None,
+        };
+        let line =
+            format_scope_styled(&parent, 2, SegmentPosition::Only, &messages, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2501}"),
+            "scope cancelled should show ━ icon: {text}"
+        );
+        assert!(
+            text.contains("cancelled"),
+            "scope cancelled should show cancelled text: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_pair_zero_results_not_error() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"result": {"content": [{"type": "text", "text": ""}]}}),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2B9E}"),
+            "zero results should show tool icon ⮞: {text}"
+        );
+        assert!(
+            !text.contains("\u{2718}"),
+            "zero results should not show error icon ✘: {text}"
         );
     }
 }

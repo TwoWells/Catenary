@@ -1456,13 +1456,20 @@ mod tests {
             }
         );
 
-        // Verify rendering uses x-> arrow.
+        // Verify rendering uses cancelled icon.
         let theme = test_theme();
         let icons = test_icons();
         let line =
             super::super::format::format_pair_styled(&messages[0], &messages[1], &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("x->"), "cancellation should show x-> arrow");
+        assert!(
+            text.contains("\u{2501}"),
+            "cancellation should show ━ icon: {text}"
+        );
+        assert!(
+            text.contains("cancelled"),
+            "cancellation should show cancelled text: {text}"
+        );
     }
 
     #[test]
@@ -1514,12 +1521,15 @@ mod tests {
             text.contains("[rust-analyzer]"),
             "should contain server name: {text}"
         );
-        assert!(text.contains("<->"), "should contain <-> arrow: {text}");
+        assert!(
+            text.contains("\u{2714}"),
+            "LSP success should show ✔ icon: {text}"
+        );
         assert!(
             text.contains("textDocument/hover"),
             "should contain method: {text}"
         );
-        assert!(text.contains("ok"), "should contain ok result: {text}");
+        assert!(!text.contains("<->"), "should not contain arrow: {text}");
     }
 
     #[test]
@@ -1549,7 +1559,11 @@ mod tests {
         let line = super::super::format::format_pair_styled(&request, &response, &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("grep"), "should contain tool name: {text}");
-        assert!(text.contains("ok"), "should contain result status: {text}");
+        assert!(
+            text.contains("\u{2B9E}"),
+            "MCP tool success should show tool icon ⮞: {text}"
+        );
+        assert!(!text.contains("<->"), "should not contain arrow: {text}");
     }
 
     // ── Scope tests (PanelState integration) ──────────────────────────
