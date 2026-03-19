@@ -56,6 +56,12 @@ pub struct IconSet {
     pub ls_active: String,
     /// Language server inactive status icon.
     pub ls_inactive: String,
+    /// Protocol success icon (request completed successfully).
+    pub proto_ok: String,
+    /// Protocol error icon (JSON-RPC error or tool isError).
+    pub proto_error: String,
+    /// Request cancelled icon.
+    pub cancelled: String,
     /// Spinner grow phase frames (plays once at start).
     pub spinner_grow: Vec<String>,
     /// Spinner cycle phase frames (loops during progress).
@@ -85,21 +91,24 @@ struct PresetDefaults {
     tool_sed: &'static str,
     ls_active: &'static str,
     ls_inactive: &'static str,
+    proto_ok: &'static str,
+    proto_error: &'static str,
+    cancelled: &'static str,
     spinner_grow: &'static [&'static str],
     spinner_cycle: &'static [&'static str],
     spinner_done: &'static str,
 }
 
 const PRESET_UNICODE: PresetDefaults = PresetDefaults {
-    diag_error: "\u{2717} ",                                          // ✗
-    diag_warn: "\u{26A0} ",                                           // ⚠
+    diag_error: "\u{00D7} ",                                          // ×
+    diag_warn: "! ",                                                  // !
     diag_info: "\u{2139} ",                                           // ℹ
-    diag_ok: "\u{2713} ",                                             // ✓
+    diag_ok: "\u{25CF} ",                                             // ●
     tool_search: "\u{2B9E} ",                                         // ⮞
     tool_glob: "\u{2B9E} ",                                           // ⮞
     tool_default: "\u{2B9E} ",                                        // ⮞
-    workspace_open: "\u{25BE} ",                                      // ▾
-    workspace_closed: "\u{25B8} ",                                    // ▸
+    workspace_open: "\u{25BC} ",                                      // ▼
+    workspace_closed: "\u{25B6} ",                                    // ▶
     pinned: "\u{2020}",                                               // †
     progress: "\u{2726} ",                                            // ✦
     session_started: "\u{25CF} ",                                     // ●
@@ -110,6 +119,9 @@ const PRESET_UNICODE: PresetDefaults = PresetDefaults {
     tool_sed: "\u{2B9E} ",                                            // ⮞
     ls_active: "\u{25CF} ",                                           // ●
     ls_inactive: "\u{25CB} ",                                         // ○
+    proto_ok: "\u{2714} ",                                            // ✔
+    proto_error: "\u{2718} ",                                         // ✘
+    cancelled: "\u{2501} ",                                           // ━
     spinner_grow: &["\u{2596}", "\u{258C}", "\u{259B}"],              // ▖ ▌ ▛
     spinner_cycle: &["\u{259C}", "\u{259F}", "\u{2599}", "\u{259B}"], // ▜ ▟ ▙ ▛
     spinner_done: "\u{2588}",                                         // █
@@ -135,6 +147,9 @@ const PRESET_NERD: PresetDefaults = PresetDefaults {
     tool_sed: "\u{EA73} ",    // nf-cod-edit
     ls_active: "\u{EAB0} ",   // nf-cod-circle_filled
     ls_inactive: "\u{EAB1} ", // nf-cod-circle_outline
+    proto_ok: "\u{F0C1} ",    // nf-fa-chain
+    proto_error: "\u{F127} ", // nf-fa-chain_broken
+    cancelled: "\u{F0374} ",  // nf-md-minus_thick
     spinner_grow: &[],
     spinner_cycle: &[
         "\u{F144B}",
@@ -173,6 +188,9 @@ const PRESET_EMOJI: PresetDefaults = PresetDefaults {
     tool_sed: "\u{270F}\u{FE0F}",         // ✏️
     ls_active: "\u{1F7E2}",               // 🟢
     ls_inactive: "\u{26AA}",              // ⚪
+    proto_ok: "\u{2705}",                 // ✅
+    proto_error: "\u{274C}",              // ❌
+    cancelled: "\u{1F6AB}",               // 🚫
     spinner_grow: &[],
     spinner_cycle: &[
         "\u{1F550}",
@@ -262,6 +280,13 @@ impl IconSet {
             ls_inactive: config
                 .ls_inactive
                 .unwrap_or_else(|| base.ls_inactive.to_string()),
+            proto_ok: config.proto_ok.unwrap_or_else(|| base.proto_ok.to_string()),
+            proto_error: config
+                .proto_error
+                .unwrap_or_else(|| base.proto_error.to_string()),
+            cancelled: config
+                .cancelled
+                .unwrap_or_else(|| base.cancelled.to_string()),
             spinner_grow: config
                 .spinner_grow
                 .unwrap_or_else(|| base.spinner_grow.iter().map(|s| (*s).to_string()).collect()),
@@ -336,7 +361,7 @@ mod tests {
     #[test]
     fn test_icon_set_unicode_preset() {
         let icons = IconSet::from_config(IconConfig::default());
-        assert_eq!(icons.diag_error, "\u{2717} ");
+        assert_eq!(icons.diag_error, "\u{00D7} ");
     }
 
     #[test]
@@ -389,5 +414,72 @@ mod tests {
         };
         let icons = IconSet::from_config(config);
         assert_eq!(icons.diag_error, "ERR ");
+    }
+
+    #[test]
+    fn test_icon_set_proto_ok_unicode() {
+        let icons = IconSet::from_config(IconConfig::default());
+        assert_eq!(icons.proto_ok, "\u{2714} ");
+    }
+
+    #[test]
+    fn test_icon_set_proto_error_unicode() {
+        let icons = IconSet::from_config(IconConfig::default());
+        assert_eq!(icons.proto_error, "\u{2718} ");
+    }
+
+    #[test]
+    fn test_icon_set_cancelled_unicode() {
+        let icons = IconSet::from_config(IconConfig::default());
+        assert_eq!(icons.cancelled, "\u{2501} ");
+    }
+
+    #[test]
+    fn test_icon_set_proto_ok_nerd() {
+        let config = IconConfig {
+            preset: IconPreset::Nerd,
+            ..IconConfig::default()
+        };
+        let icons = IconSet::from_config(config);
+        assert_eq!(icons.proto_ok, "\u{F0C1} ");
+    }
+
+    #[test]
+    fn test_icon_set_proto_ok_emoji() {
+        let config = IconConfig {
+            preset: IconPreset::Emoji,
+            ..IconConfig::default()
+        };
+        let icons = IconSet::from_config(config);
+        assert_eq!(icons.proto_ok, "\u{2705}");
+    }
+
+    #[test]
+    fn test_icon_set_proto_ok_override() {
+        let config = IconConfig {
+            proto_ok: Some("OK ".into()),
+            ..IconConfig::default()
+        };
+        let icons = IconSet::from_config(config);
+        assert_eq!(icons.proto_ok, "OK ");
+    }
+
+    #[test]
+    fn test_glyph_families_distinct() {
+        for preset in [IconPreset::Unicode, IconPreset::Nerd, IconPreset::Emoji] {
+            let config = IconConfig {
+                preset,
+                ..IconConfig::default()
+            };
+            let icons = IconSet::from_config(config);
+            assert_ne!(
+                icons.proto_ok, icons.diag_ok,
+                "proto_ok and diag_ok must be distinct"
+            );
+            assert_ne!(
+                icons.proto_error, icons.diag_error,
+                "proto_error and diag_error must be distinct"
+            );
+        }
     }
 }

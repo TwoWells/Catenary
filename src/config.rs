@@ -129,6 +129,12 @@ pub struct IconConfig {
     pub ls_active: Option<String>,
     /// Language server inactive icon.
     pub ls_inactive: Option<String>,
+    /// Protocol success icon.
+    pub proto_ok: Option<String>,
+    /// Protocol error icon.
+    pub proto_error: Option<String>,
+    /// Request cancelled icon.
+    pub cancelled: Option<String>,
     /// Spinner grow phase frames (plays once at start).
     pub spinner_grow: Option<Vec<String>>,
     /// Spinner cycle phase frames (loops during progress).
