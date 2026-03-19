@@ -496,30 +496,20 @@ pub fn format_collapsed_plain(
         let title = category::extract_progress_title(messages, start, end);
         let (first_pct, last_pct) = category::extract_progress_pct_range(messages, start, end);
         let detail = format_progress_detail(count, first_pct, last_pct);
-        format!(
-            "{ts} [{}] \u{2726} {title} ({detail})",
-            messages[start].server
-        )
+        format!("{ts} [{}] {title} ({detail})", messages[start].server)
     } else if key_str.starts_with("log:") {
         let label = category::log_level_label(key_str);
         let count_label = format!("{count} message{}", if count == 1 { "" } else { "s" });
-        if label == "info" {
-            format!(
-                "{ts} [{}] \u{25A2} {label} ({count_label})",
-                messages[start].server
-            )
-        } else {
-            format!("{ts} [{}] {label} ({count_label})", messages[start].server)
-        }
+        format!("{ts} [{}] {label} ({count_label})", messages[start].server)
     } else if key_str.starts_with("sync:") {
         let file = category::extract_sync_basename(messages, start, end).unwrap_or_default();
         let ops = category::extract_sync_operations(messages, start, end);
         let ops_str = ops.join(", ");
         format!("{ts} [{}] sync {file} ({ops_str})", messages[start].server)
     } else if key_str.starts_with("lifecycle:") {
-        format!("{ts} [{}] \u{25CF} initialized", messages[start].server)
+        format!("{ts} [{}] initialized", messages[start].server)
     } else if key_str == "init:mcp" {
-        format!("{ts} \u{25CF} mcp initialized")
+        format!("{ts} mcp initialized")
     } else {
         // Generic fallback (proto: or unknown).
         let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
