@@ -8,6 +8,7 @@
 //! multi-panel grid (05), scrollbar (06), and selection (07) on top of this.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -28,6 +29,23 @@ use super::theme::Theme;
 use crate::session::SessionMessage;
 
 // ── Data types ──────────────────────────────────────────────────────────
+
+/// Position of a scope segment in a segmented scope.
+///
+/// When a scope's children are interrupted by unrelated root-level events
+/// (e.g., progress tokens), the scope is split into segments. Each segment
+/// covers a contiguous run of children between interruptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentPosition {
+    /// Single segment (no interruptions) — full scope.
+    Only,
+    /// First segment — scope opened, ongoing.
+    First,
+    /// Middle segment — continuation, still ongoing.
+    Middle,
+    /// Last segment — final, carries metrics.
+    Last,
+}
 
 /// A display pipeline entry — single message, merged pair, collapsed run, or scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,11 +78,18 @@ pub enum DisplayEntry {
         parent_id: Option<i64>,
     },
     /// A scope: a parent entry with child entries grouped under it.
+    ///
+    /// When scope children are interrupted by root-level events, the scope
+    /// is split into segments. Each segment shares an `Rc` to the same
+    /// parent entry; `position` indicates where in the sequence it falls.
     Scope {
         /// The parent entry (MCP tools/call request, typically Paired).
-        parent: Box<Self>,
-        /// Child entries belonging to this scope.
+        /// Shared via `Rc` across segments of the same scope.
+        parent: Rc<Self>,
+        /// Child entries belonging to this segment.
         children: Vec<Self>,
+        /// Position of this segment within the segmented scope.
+        position: SegmentPosition,
     },
 }
 
@@ -101,14 +126,18 @@ impl DisplayEntry {
     /// - Single: `index`
     /// - Paired: `request_index`
     /// - Collapsed: `start_index`
-    /// - Scope: delegates to parent
+    /// - Scope: first child's message index (unique per segment)
     #[must_use]
     pub fn expansion_index(&self) -> usize {
         match self {
             Self::Single { index, .. } => *index,
             Self::Paired { request_index, .. } => *request_index,
             Self::Collapsed { start_index, .. } => *start_index,
-            Self::Scope { parent, .. } => parent.expansion_index(),
+            Self::Scope {
+                children, parent, ..
+            } => children
+                .first()
+                .map_or_else(|| parent.expansion_index(), Self::expansion_index),
         }
     }
 }
@@ -141,12 +170,79 @@ pub fn pair_merge(messages: &[SessionMessage]) -> Vec<DisplayEntry> {
     entries
 }
 
-/// Scope collapse pass: group entries by `parent_id` into `Scope` entries.
+/// Per-scope state used during the segmentation scan in [`scope_collapse`].
+struct ScopeBuilder {
+    /// Shared parent entry (one allocation, all segments reference it).
+    parent: Rc<DisplayEntry>,
+    /// Original entry index of the parent (for ordering in final assembly).
+    parent_idx: usize,
+    /// Children accumulated in the current (open) segment.
+    current_segment: Vec<DisplayEntry>,
+    /// Original entry index of the current segment's first child.
+    current_segment_start: usize,
+    /// Completed segments: (first child's entry index, children).
+    completed_segments: Vec<(usize, Vec<DisplayEntry>)>,
+}
+
+impl ScopeBuilder {
+    /// Close the current segment if it has any children.
+    fn close_segment(&mut self) {
+        if !self.current_segment.is_empty() {
+            self.completed_segments.push((
+                self.current_segment_start,
+                std::mem::take(&mut self.current_segment),
+            ));
+        }
+    }
+
+    /// Record a child entry, tracking the start index for new segments.
+    fn push_child(&mut self, entry_idx: usize, entry: DisplayEntry) {
+        if self.current_segment.is_empty() {
+            self.current_segment_start = entry_idx;
+        }
+        self.current_segment.push(entry);
+    }
+
+    /// Consume the builder into `(sort_key, Scope)` pairs.
+    ///
+    /// The first segment uses the parent's entry index as its sort key
+    /// (so it appears at the parent's chronological position). Subsequent
+    /// segments use their first child's entry index.
+    fn into_keyed_scopes(mut self) -> Vec<(usize, DisplayEntry)> {
+        self.close_segment();
+        let total = self.completed_segments.len();
+        self.completed_segments
+            .into_iter()
+            .enumerate()
+            .map(|(i, (child_start, children))| {
+                let position = match (i, total) {
+                    (_, 1) => SegmentPosition::Only,
+                    (0, _) => SegmentPosition::First,
+                    (n, t) if n == t - 1 => SegmentPosition::Last,
+                    _ => SegmentPosition::Middle,
+                };
+                let sort_key = if i == 0 { self.parent_idx } else { child_start };
+                let scope = DisplayEntry::Scope {
+                    parent: Rc::clone(&self.parent),
+                    children,
+                    position,
+                };
+                (sort_key, scope)
+            })
+            .collect()
+    }
+}
+
+/// Scope collapse pass: group entries by `parent_id` into segmented `Scope` entries.
 ///
 /// Entries whose `parent_id` points to another entry's message ID are
-/// collected as children of that parent. The parent becomes a `Scope`
-/// entry at its original position. Entries without a `parent_id` (or whose
-/// parent is not in the entry list) pass through unchanged.
+/// collected as children of that parent. When root-level entries (no
+/// `parent_id` or orphaned) appear between children of an open scope,
+/// the scope is split into segments separated by the interrupting events.
+///
+/// Each segment is an independent `Scope` entry sharing an `Rc` to the
+/// same parent. Segment position (`Only`, `First`, `Middle`, `Last`)
+/// drives the ellipsis rendering convention.
 #[must_use]
 pub fn scope_collapse(
     entries: Vec<DisplayEntry>,
@@ -176,49 +272,66 @@ pub fn scope_collapse(
         .filter_map(|pid| msg_id_to_idx.get(pid).copied())
         .collect();
 
-    // Second pass: separate entries into parents, children, and passthrough.
-    // Use Option slots to preserve ordering for final assembly.
+    // Second pass: stateful left-to-right scan. Track per-scope builders,
+    // and output slots for root-level entries. Children are consumed by
+    // their scope's builder. Root-level entries interrupt all open scopes.
     let len = entries.len();
-    let mut parent_entries: HashMap<usize, DisplayEntry> = HashMap::new();
-    let mut children: HashMap<usize, Vec<DisplayEntry>> = HashMap::new();
-    let mut passthrough: HashMap<usize, DisplayEntry> = HashMap::new();
+    let mut builders: HashMap<usize, ScopeBuilder> = HashMap::new();
+    // Output slots: (original_index, entry_or_placeholder).
+    // Root-level entries go directly into slots. Scope parents reserve
+    // a slot that will be expanded into segments in final assembly.
+    let mut root_slots: Vec<(usize, DisplayEntry)> = Vec::new();
 
     for (i, entry) in entries.into_iter().enumerate() {
         if scope_parent_indices.contains(&i) {
-            // This entry is a scope parent — hold it for wrapping.
-            parent_entries.insert(i, entry);
+            // Scope parent — create builder, no output slot yet.
+            builders.insert(
+                i,
+                ScopeBuilder {
+                    parent: Rc::new(entry),
+                    parent_idx: i,
+                    current_segment: Vec::new(),
+                    current_segment_start: 0,
+                    completed_segments: Vec::new(),
+                },
+            );
         } else if let Some(pid) = entry.parent_id() {
-            // Check if this entry's parent is in the entry list.
             if let Some(&parent_idx) = msg_id_to_idx.get(&pid)
-                && scope_parent_indices.contains(&parent_idx)
+                && let Some(builder) = builders.get_mut(&parent_idx)
             {
-                children.entry(parent_idx).or_default().push(entry);
+                // Child of a known scope — add to current segment.
+                builder.push_child(i, entry);
                 continue;
             }
-            // Orphaned child — parent not in view.
-            passthrough.insert(i, entry);
+            // Orphaned child — treat as root-level.
+            for builder in builders.values_mut() {
+                builder.close_segment();
+            }
+            root_slots.push((i, entry));
         } else {
-            passthrough.insert(i, entry);
+            // Root-level entry — interrupts all open scopes.
+            for builder in builders.values_mut() {
+                builder.close_segment();
+            }
+            root_slots.push((i, entry));
         }
     }
 
-    // Final assembly: iterate in original order, emitting Scope for parents
-    // and passthrough for everything else. Children are consumed by their parent.
-    let mut result = Vec::with_capacity(len);
-    for i in 0..len {
-        if let Some(parent) = parent_entries.remove(&i) {
-            let kids = children.remove(&i).unwrap_or_default();
-            result.push(DisplayEntry::Scope {
-                parent: Box::new(parent),
-                children: kids,
-            });
-        } else if let Some(entry) = passthrough.remove(&i) {
-            result.push(entry);
-        }
-        // Children are skipped — they were consumed above.
-    }
+    // Final assembly: merge scope segments and root-level entries in
+    // original chronological order. Each segment gets its own sort key:
+    // first segment at parent position, subsequent segments at their
+    // first child's position.
+    let mut ordered: Vec<(usize, DisplayEntry)> = Vec::with_capacity(len);
 
-    result
+    for (idx, entry) in root_slots {
+        ordered.push((idx, entry));
+    }
+    for (_, builder) in builders {
+        ordered.extend(builder.into_keyed_scopes());
+    }
+    ordered.sort_by_key(|(idx, _)| *idx);
+
+    ordered.into_iter().map(|(_, entry)| entry).collect()
 }
 
 /// Run collapse pass: merge consecutive `Single` entries with the same
@@ -361,9 +474,13 @@ pub enum FlatLine {
     /// A scope header (parent of grouped children).
     ScopeHeader {
         /// The parent `DisplayEntry` (for rendering the summary line).
-        parent: Box<DisplayEntry>,
+        parent: Rc<DisplayEntry>,
         /// Number of child entries in the scope.
         child_count: usize,
+        /// Segment position within a segmented scope.
+        position: SegmentPosition,
+        /// Expansion key (first child's message index for this segment).
+        expansion_key: usize,
     },
     /// An indented child line within an expanded scope.
     ScopeChild {
@@ -756,18 +873,25 @@ impl<'a> PanelState<'a> {
                         });
                     }
                 }
-                DisplayEntry::Scope { parent, children } => {
+                DisplayEntry::Scope {
+                    parent,
+                    children,
+                    position,
+                } => {
                     let child_count = children.len();
                     if let Some(ref pat) = lower_pattern {
-                        let plain = format_scope_plain(parent, child_count, &self.messages);
+                        let plain =
+                            format_scope_plain(parent, child_count, *position, &self.messages);
                         if !plain.to_lowercase().contains(pat) {
                             continue;
                         }
                     }
-                    let scope_key = parent.expansion_index();
+                    let scope_key = entry.expansion_index();
                     lines.push(FlatLine::ScopeHeader {
-                        parent: parent.clone(),
+                        parent: Rc::clone(parent),
                         child_count,
+                        position: *position,
+                        expansion_key: scope_key,
                     });
                     if self.expanded.contains(&scope_key) {
                         self.flatten_scope_children(children, scope_key, 1, &mut lines);
@@ -863,17 +987,20 @@ impl<'a> PanelState<'a> {
                 DisplayEntry::Scope {
                     parent: nested_parent,
                     children: nested_children,
+                    position: nested_position,
                 } => {
                     let nested_child_count = nested_children.len();
+                    let nested_key = child.expansion_index();
                     lines.push(FlatLine::ScopeChild {
                         depth,
                         scope_parent_index,
                         inner: Box::new(FlatLine::ScopeHeader {
-                            parent: nested_parent.clone(),
+                            parent: Rc::clone(nested_parent),
                             child_count: nested_child_count,
+                            position: *nested_position,
+                            expansion_key: nested_key,
                         }),
                     });
-                    let nested_key = nested_parent.expansion_index();
                     if self.expanded.contains(&nested_key) {
                         self.flatten_scope_children(nested_children, nested_key, depth + 1, lines);
                     }
@@ -916,22 +1043,21 @@ impl<'a> PanelState<'a> {
                     self.expanded.insert(start_index);
                 }
             }
-            FlatLine::ScopeHeader { ref parent, .. } => {
-                let key = parent.expansion_index();
-                if self.expanded.contains(&key) {
-                    self.expanded.remove(&key);
+            FlatLine::ScopeHeader { expansion_key, .. } => {
+                if self.expanded.contains(&expansion_key) {
+                    self.expanded.remove(&expansion_key);
                 } else {
-                    self.expanded.insert(key);
+                    self.expanded.insert(expansion_key);
                 }
             }
             FlatLine::ScopeChild {
                 scope_parent_index, ..
             } => {
-                // Collapse the parent scope and move cursor to its header.
+                // Collapse the parent scope segment and move cursor to its header.
                 self.expanded.remove(&scope_parent_index);
                 let new_flat = self.flat_lines();
                 if let Some(pos) = new_flat.iter().position(|fl| {
-                    matches!(fl, FlatLine::ScopeHeader { parent, .. } if parent.expansion_index() == scope_parent_index)
+                    matches!(fl, FlatLine::ScopeHeader { expansion_key, .. } if *expansion_key == scope_parent_index)
                 }) {
                     self.cursor = pos;
                 }
@@ -1271,9 +1397,12 @@ fn render_flat_line_styled(
         FlatLine::ScopeHeader {
             parent,
             child_count,
+            position,
+            ..
         } => format_scope_styled(
             parent,
             *child_count,
+            *position,
             &state.messages,
             state.icons,
             state.theme,
@@ -2623,12 +2752,17 @@ mod tests {
         // msg[4] has no parent_id → passthrough
         assert_eq!(scoped.len(), 2, "expected scope + MCP response: {scoped:?}");
         match &scoped[0] {
-            DisplayEntry::Scope { parent, children } => {
+            DisplayEntry::Scope {
+                parent,
+                children,
+                position,
+            } => {
                 assert!(
-                    matches!(**parent, DisplayEntry::Single { index: 0, .. }),
+                    matches!(*parent.as_ref(), DisplayEntry::Single { index: 0, .. }),
                     "parent should be Single(0)"
                 );
                 assert_eq!(children.len(), 3, "should have 3 children");
+                assert_eq!(*position, SegmentPosition::Only);
             }
             other => panic!("expected Scope, got {other:?}"),
         }
@@ -2692,22 +2826,32 @@ mod tests {
         // Scope B at position 2 (with child msg[3]).
         assert_eq!(scoped.len(), 2, "expected 2 scopes: {scoped:?}");
         match &scoped[0] {
-            DisplayEntry::Scope { parent, children } => {
+            DisplayEntry::Scope {
+                parent,
+                children,
+                position,
+            } => {
                 assert!(
-                    matches!(**parent, DisplayEntry::Single { index: 0, .. }),
+                    matches!(*parent.as_ref(), DisplayEntry::Single { index: 0, .. }),
                     "first scope parent should be index 0"
                 );
                 assert_eq!(children.len(), 2, "scope A should have 2 children");
+                assert_eq!(*position, SegmentPosition::Only);
             }
             other => panic!("expected Scope A, got {other:?}"),
         }
         match &scoped[1] {
-            DisplayEntry::Scope { parent, children } => {
+            DisplayEntry::Scope {
+                parent,
+                children,
+                position,
+            } => {
                 assert!(
-                    matches!(**parent, DisplayEntry::Single { index: 2, .. }),
+                    matches!(*parent.as_ref(), DisplayEntry::Single { index: 2, .. }),
                     "second scope parent should be index 2"
                 );
                 assert_eq!(children.len(), 1, "scope B should have 1 child");
+                assert_eq!(*position, SegmentPosition::Only);
             }
             other => panic!("expected Scope B, got {other:?}"),
         }
@@ -2790,8 +2934,8 @@ mod tests {
         ];
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         panel.load_messages(messages);
-        // Expand the scope (key is parent's message index = 0).
-        panel.expanded.insert(0);
+        // Expand the scope (key is first child's message index = 1).
+        panel.expanded.insert(1);
 
         let flat = panel.flat_lines();
         // ScopeHeader + 2 ScopeChild entries
@@ -2805,7 +2949,7 @@ mod tests {
                 flat[1],
                 FlatLine::ScopeChild {
                     depth: 1,
-                    scope_parent_index: 0,
+                    scope_parent_index: 1,
                     ..
                 }
             ),
@@ -2817,7 +2961,7 @@ mod tests {
                 flat[2],
                 FlatLine::ScopeChild {
                     depth: 1,
-                    scope_parent_index: 0,
+                    scope_parent_index: 1,
                     ..
                 }
             ),
@@ -2849,10 +2993,10 @@ mod tests {
         // Cursor on the ScopeHeader (line 0).
         panel.cursor = 0;
 
-        // Toggle: expand scope.
+        // Toggle: expand scope (expansion key is first child's index = 1).
         panel.toggle_expansion();
         assert!(
-            panel.expanded.contains(&0),
+            panel.expanded.contains(&1),
             "scope should be expanded after toggle"
         );
         let flat = panel.flat_lines();
@@ -2862,19 +3006,19 @@ mod tests {
         panel.cursor = 0;
         panel.toggle_expansion();
         assert!(
-            !panel.expanded.contains(&0),
+            !panel.expanded.contains(&1),
             "scope should be collapsed after second toggle"
         );
 
         // Expand again, then toggle on a child.
         panel.cursor = 0;
         panel.toggle_expansion();
-        assert!(panel.expanded.contains(&0));
+        assert!(panel.expanded.contains(&1));
         // Move cursor to first ScopeChild (line 1).
         panel.cursor = 1;
         panel.toggle_expansion();
         assert!(
-            !panel.expanded.contains(&0),
+            !panel.expanded.contains(&1),
             "toggling on ScopeChild should collapse parent"
         );
         assert_eq!(
@@ -2928,6 +3072,435 @@ mod tests {
         assert!(
             content.contains("2 children"),
             "expected child count in scope header: {content}"
+        );
+    }
+
+    // ── Segmented scope tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_segmented_scope_one_interruption() {
+        // Tool call with 2 children, 1 root interruption, 1 more child.
+        // Produces two segments: First, Last.
+        let messages = vec![
+            // MCP request (id=1)
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            // Child 1 (parent_id=1)
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // Child 2 (parent_id=1)
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            // Root interruption (no parent_id)
+            make_message_with_id_parent(4, "lsp", "$/progress", "rust-analyzer", None, None),
+            // Child 3 (parent_id=1)
+            make_message_with_id_parent(
+                5,
+                "lsp",
+                "textDocument/references",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+        // First segment, root interruption, Last segment.
+        assert_eq!(
+            scoped.len(),
+            3,
+            "expected 2 segments + 1 interruption: {scoped:?}"
+        );
+        match &scoped[0] {
+            DisplayEntry::Scope {
+                parent,
+                children,
+                position,
+            } => {
+                assert!(
+                    matches!(*parent.as_ref(), DisplayEntry::Single { index: 0, .. }),
+                    "parent should be Single(0)"
+                );
+                assert_eq!(children.len(), 2, "first segment should have 2 children");
+                assert_eq!(*position, SegmentPosition::First);
+            }
+            other => panic!("expected First Scope, got {other:?}"),
+        }
+        assert!(
+            matches!(scoped[1], DisplayEntry::Single { index: 3, .. }),
+            "interruption should be Single(3): {:?}",
+            scoped[1]
+        );
+        match &scoped[2] {
+            DisplayEntry::Scope {
+                parent,
+                children,
+                position,
+            } => {
+                assert!(
+                    matches!(*parent.as_ref(), DisplayEntry::Single { index: 0, .. }),
+                    "parent should be Single(0)"
+                );
+                assert_eq!(children.len(), 1, "last segment should have 1 child");
+                assert_eq!(*position, SegmentPosition::Last);
+            }
+            other => panic!("expected Last Scope, got {other:?}"),
+        }
+        // Both segments share the same Rc parent.
+        if let (DisplayEntry::Scope { parent: p1, .. }, DisplayEntry::Scope { parent: p2, .. }) =
+            (&scoped[0], &scoped[2])
+        {
+            assert!(
+                Rc::ptr_eq(p1, p2),
+                "segments should share the same Rc parent"
+            );
+        }
+    }
+
+    #[test]
+    fn test_segmented_scope_two_interruptions() {
+        // Three segments: First, Middle, Last.
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            // Segment 1 child
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // Interruption 1
+            make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, None),
+            // Segment 2 child
+            make_message_with_id_parent(
+                4,
+                "lsp",
+                "textDocument/references",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // Interruption 2
+            make_message_with_id_parent(5, "lsp", "$/progress", "rust-analyzer", None, None),
+            // Segment 3 child
+            make_message_with_id_parent(
+                6,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+        // First, interruption, Middle, interruption, Last
+        assert_eq!(
+            scoped.len(),
+            5,
+            "expected 3 segments + 2 interruptions: {scoped:?}"
+        );
+        assert_eq!(
+            match &scoped[0] {
+                DisplayEntry::Scope { position, .. } => *position,
+                other => panic!("expected Scope, got {other:?}"),
+            },
+            SegmentPosition::First
+        );
+        assert!(matches!(scoped[1], DisplayEntry::Single { index: 2, .. }));
+        assert_eq!(
+            match &scoped[2] {
+                DisplayEntry::Scope { position, .. } => *position,
+                other => panic!("expected Scope, got {other:?}"),
+            },
+            SegmentPosition::Middle
+        );
+        assert!(matches!(scoped[3], DisplayEntry::Single { index: 4, .. }));
+        assert_eq!(
+            match &scoped[4] {
+                DisplayEntry::Scope { position, .. } => *position,
+                other => panic!("expected Scope, got {other:?}"),
+            },
+            SegmentPosition::Last
+        );
+    }
+
+    #[test]
+    fn test_segmented_scope_no_interruption() {
+        // Contiguous children → single Only segment (regression guard).
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+        assert_eq!(scoped.len(), 1, "expected single scope: {scoped:?}");
+        match &scoped[0] {
+            DisplayEntry::Scope {
+                children, position, ..
+            } => {
+                assert_eq!(children.len(), 2);
+                assert_eq!(*position, SegmentPosition::Only);
+            }
+            other => panic!("expected Only Scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_segmented_scope_rendering() {
+        // Verify ellipsis convention: First → "grep…", Middle → "…grep…",
+        // Last → "…grep (metrics)".
+        let theme = test_theme();
+        let icons = test_icons();
+        let make_tool_call = || {
+            let mut m = make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+            m.payload = serde_json::json!({"params": {"name": "grep"}});
+            m
+        };
+
+        let parent_entry = DisplayEntry::Single {
+            index: 0,
+            parent_id: None,
+        };
+        let parent_rc = Rc::new(parent_entry);
+        let messages = vec![make_tool_call()];
+
+        // First segment: "grep…"
+        let line = format_scope_styled(
+            &parent_rc,
+            3,
+            SegmentPosition::First,
+            &messages,
+            &icons,
+            &theme,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("grep\u{2026}"),
+            "First should render grep…: {text}"
+        );
+        assert!(
+            !text.contains("grep\u{2026}\u{2026}"),
+            "First should not have double ellipsis: {text}"
+        );
+
+        // Middle segment: "…grep…"
+        let line = format_scope_styled(
+            &parent_rc,
+            2,
+            SegmentPosition::Middle,
+            &messages,
+            &icons,
+            &theme,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2026}grep\u{2026}"),
+            "Middle should render …grep…: {text}"
+        );
+
+        // Last segment: "…grep" with metrics
+        let line = format_scope_styled(
+            &parent_rc,
+            1,
+            SegmentPosition::Last,
+            &messages,
+            &icons,
+            &theme,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2026}grep"),
+            "Last should render …grep: {text}"
+        );
+
+        // Only segment: "grep" without ellipsis
+        let line = format_scope_styled(
+            &parent_rc,
+            5,
+            SegmentPosition::Only,
+            &messages,
+            &icons,
+            &theme,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("grep"), "Only should contain grep: {text}");
+        assert!(
+            !text.contains('\u{2026}'),
+            "Only should not contain ellipsis: {text}"
+        );
+    }
+
+    #[test]
+    fn test_segmented_scope_independent_expansion() {
+        // Expand segment 1, verify segment 2 remains collapsed.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            // Segment 1 children
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            // Root interruption
+            make_message_with_id_parent(4, "lsp", "$/progress", "rust-analyzer", None, None),
+            // Segment 2 child
+            make_message_with_id_parent(
+                5,
+                "lsp",
+                "textDocument/references",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+        ];
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+
+        // Expand segment 1 only (first child index = 1).
+        panel.expanded.insert(1);
+        let flat = panel.flat_lines();
+
+        // Segment 1 ScopeHeader + 2 ScopeChildren + interruption + Segment 2 ScopeHeader (collapsed)
+        assert_eq!(
+            flat.len(),
+            5,
+            "segment 1 expanded, segment 2 collapsed: {flat:?}"
+        );
+        assert!(
+            matches!(flat[0], FlatLine::ScopeHeader { .. }),
+            "first should be segment 1 ScopeHeader"
+        );
+        assert!(
+            matches!(flat[1], FlatLine::ScopeChild { .. }),
+            "second should be ScopeChild"
+        );
+        assert!(
+            matches!(flat[2], FlatLine::ScopeChild { .. }),
+            "third should be ScopeChild"
+        );
+        // flat[3] is the interruption (single or collapsed)
+        assert!(
+            matches!(flat[4], FlatLine::ScopeHeader { .. }),
+            "fifth should be segment 2 ScopeHeader (collapsed)"
+        );
+    }
+
+    #[test]
+    fn test_segmented_scope_filter_hides_interruption() {
+        // Filter out the interrupting entry. The pipeline runs scope
+        // collapse before filtering, so the two segments remain — but
+        // the interruption is hidden from the flat line output.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            {
+                let mut m =
+                    make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+                m.payload = serde_json::json!({"params": {"name": "grep"}});
+                m
+            },
+            // Segment 1 child
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // Root interruption — progress with a distinct method for filtering
+            make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, None),
+            // Segment 2 child
+            make_message_with_id_parent(
+                4,
+                "lsp",
+                "textDocument/references",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+        ];
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+
+        // Without filter: 2 segments + 1 interruption = 3 flat lines.
+        let flat = panel.flat_lines();
+        assert_eq!(
+            flat.len(),
+            3,
+            "unfiltered: 2 segments + 1 interruption: {flat:?}"
+        );
+
+        // Filter to only show "grep" — matches scope headers but not the
+        // progress interruption. Segments remain separate (scope collapse
+        // runs before filtering) but the interruption is hidden.
+        panel.filter_pattern = Some("grep".to_string());
+        let flat = panel.flat_lines();
+        assert_eq!(
+            flat.len(),
+            2,
+            "filtered: 2 segments, interruption hidden: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn test_segmented_scope_plain_format() {
+        // Verify plain text output includes the ellipsis convention.
+        let make_tool_call = || {
+            let mut m = make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+            m.payload = serde_json::json!({"params": {"name": "grep"}});
+            m
+        };
+
+        let parent_entry = DisplayEntry::Single {
+            index: 0,
+            parent_id: None,
+        };
+        let messages = vec![make_tool_call()];
+
+        let plain_first = format_scope_plain(&parent_entry, 3, SegmentPosition::First, &messages);
+        assert!(
+            plain_first.contains("grep\u{2026}"),
+            "First plain should contain grep…: {plain_first}"
+        );
+
+        let plain_middle = format_scope_plain(&parent_entry, 2, SegmentPosition::Middle, &messages);
+        assert!(
+            plain_middle.contains("\u{2026}grep\u{2026}"),
+            "Middle plain should contain …grep…: {plain_middle}"
+        );
+
+        let plain_last = format_scope_plain(&parent_entry, 1, SegmentPosition::Last, &messages);
+        assert!(
+            plain_last.contains("\u{2026}grep"),
+            "Last plain should contain …grep: {plain_last}"
+        );
+
+        let plain_only = format_scope_plain(&parent_entry, 5, SegmentPosition::Only, &messages);
+        assert!(
+            !plain_only.contains('\u{2026}'),
+            "Only plain should not contain ellipsis: {plain_only}"
         );
     }
 }

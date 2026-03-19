@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 
 use super::category;
 use super::icons::{IconSet, basename, diag_style, tool_icon};
-use super::panel::DisplayEntry;
+use super::panel::{DisplayEntry, SegmentPosition};
 use super::theme::Theme;
 use crate::session::SessionMessage;
 
@@ -547,10 +547,17 @@ pub fn format_collapsed_plain(
 /// For tool calls: `HH:MM:SS icon tool_name (N children, Xs)`.
 /// The formatter rewrite (tickets 04a/04b) will enhance this with icons,
 /// error extraction, and argument surfacing.
+///
+/// Segment position controls the ellipsis convention on tool names:
+/// - `Only`: `tool_name (metrics)` — full scope, no ellipsis
+/// - `First`: `tool_name…` — scope opened, no metrics yet
+/// - `Middle`: `…tool_name…` — continuation, no metrics yet
+/// - `Last`: `…tool_name (metrics)` — final segment with metrics
 #[must_use]
 pub fn format_scope_styled(
     parent: &DisplayEntry,
     child_count: usize,
+    position: SegmentPosition,
     messages: &[SessionMessage],
     icons: &IconSet,
     theme: &Theme,
@@ -559,6 +566,7 @@ pub fn format_scope_styled(
         "{child_count} child{}",
         if child_count == 1 { "" } else { "ren" }
     );
+    let has_metrics = matches!(position, SegmentPosition::Only | SegmentPosition::Last);
 
     match parent {
         DisplayEntry::Paired {
@@ -585,18 +593,30 @@ pub fn format_scope_styled(
                     .and_then(|n| n.as_str())
                     .unwrap_or(&req.method);
                 let icon = tool_icon(tool_name, icons);
+                let name = segment_tool_name(tool_name, position);
+                let meta = if has_metrics {
+                    format!(" ({children_label}, {timing})")
+                } else {
+                    format!(" ({children_label})")
+                };
                 Line::from(vec![
                     ts_span,
                     Span::styled(icon.to_string(), theme.success),
-                    Span::styled(tool_name.to_string(), theme.text),
-                    Span::styled(format!(" ({children_label}, {timing})"), theme.muted),
+                    Span::styled(name, theme.text),
+                    Span::styled(meta, theme.muted),
                 ])
             } else {
+                let method = segment_tool_name(&req.method, position);
+                let meta = if has_metrics {
+                    format!(" ({children_label}, {timing})")
+                } else {
+                    format!(" ({children_label})")
+                };
                 Line::from(vec![
                     ts_span,
                     Span::styled(format!("[{}] ", req.server), theme.accent),
-                    Span::styled(req.method.clone(), theme.text),
-                    Span::styled(format!(" ({children_label}, {timing})"), theme.muted),
+                    Span::styled(method, theme.text),
+                    Span::styled(meta, theme.muted),
                 ])
             }
         }
@@ -612,16 +632,18 @@ pub fn format_scope_styled(
                     .and_then(|n| n.as_str())
                     .unwrap_or(&msg.method);
                 let icon = tool_icon(tool_name, icons);
+                let name = segment_tool_name(tool_name, position);
                 Line::from(vec![
                     ts_span,
                     Span::styled(icon.to_string(), theme.success),
-                    Span::styled(tool_name.to_string(), theme.text),
+                    Span::styled(name, theme.text),
                     Span::styled(format!(" ({children_label})"), theme.muted),
                 ])
             } else {
+                let method = segment_tool_name(&msg.method, position);
                 Line::from(vec![
                     ts_span,
-                    Span::styled(msg.method.clone(), theme.text),
+                    Span::styled(method, theme.text),
                     Span::styled(format!(" ({children_label})"), theme.muted),
                 ])
             }
@@ -634,17 +656,34 @@ pub fn format_scope_styled(
     }
 }
 
+/// Apply the segment ellipsis convention to a tool/method name.
+///
+/// - `Only`: `name` (no ellipsis)
+/// - `First`: `name…`
+/// - `Middle`: `…name…`
+/// - `Last`: `…name`
+fn segment_tool_name(name: &str, position: SegmentPosition) -> String {
+    match position {
+        SegmentPosition::Only => name.to_string(),
+        SegmentPosition::First => format!("{name}\u{2026}"),
+        SegmentPosition::Middle => format!("\u{2026}{name}\u{2026}"),
+        SegmentPosition::Last => format!("\u{2026}{name}"),
+    }
+}
+
 /// Plain-text summary for a scope header (filter matching, yank).
 #[must_use]
 pub fn format_scope_plain(
     parent: &DisplayEntry,
     child_count: usize,
+    position: SegmentPosition,
     messages: &[SessionMessage],
 ) -> String {
     let children_label = format!(
         "{child_count} child{}",
         if child_count == 1 { "" } else { "ren" }
     );
+    let has_metrics = matches!(position, SegmentPosition::Only | SegmentPosition::Last);
 
     match parent {
         DisplayEntry::Paired {
@@ -668,12 +707,22 @@ pub fn format_scope_plain(
                     .and_then(|p| p.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or(&req.method);
-                format!("{ts} {tool_name} ({children_label}, {timing})")
+                let name = segment_tool_name(tool_name, position);
+                if has_metrics {
+                    format!("{ts} {name} ({children_label}, {timing})")
+                } else {
+                    format!("{ts} {name} ({children_label})")
+                }
             } else {
-                format!(
-                    "{ts} [{}] {} ({children_label}, {timing})",
-                    req.server, req.method
-                )
+                let method = segment_tool_name(&req.method, position);
+                if has_metrics {
+                    format!(
+                        "{ts} [{}] {method} ({children_label}, {timing})",
+                        req.server
+                    )
+                } else {
+                    format!("{ts} [{}] {method} ({children_label})", req.server)
+                }
             }
         }
         DisplayEntry::Single { index, .. } => {
@@ -686,9 +735,11 @@ pub fn format_scope_plain(
                     .and_then(|p| p.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or(&msg.method);
-                format!("{ts} {tool_name} ({children_label})")
+                let name = segment_tool_name(tool_name, position);
+                format!("{ts} {name} ({children_label})")
             } else {
-                format!("{ts} {} ({children_label})", msg.method)
+                let method = segment_tool_name(&msg.method, position);
+                format!("{ts} {method} ({children_label})")
             }
         }
         _ => format!("scope ({children_label})"),

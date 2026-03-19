@@ -146,7 +146,9 @@ fn flat_line_plain(fl: &FlatLine, all_flat: &[FlatLine], panel: &PanelState<'_>)
         FlatLine::ScopeHeader {
             parent,
             child_count,
-        } => format_scope_plain(parent, *child_count, &panel.messages),
+            position,
+            ..
+        } => format_scope_plain(parent, *child_count, *position, &panel.messages),
         FlatLine::ScopeChild { depth, inner, .. } => {
             let indent = " ".repeat(depth * 4);
             let inner_text = flat_line_plain(inner, all_flat, panel);
