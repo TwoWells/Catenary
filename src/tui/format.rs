@@ -34,18 +34,6 @@ pub fn format_ago(started: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Determine direction arrow from a JSON-RPC payload.
-///
-/// If the payload has `"result"` or `"error"`, the message is inbound (`←`);
-/// otherwise outbound (`→`).
-fn message_direction_arrow(payload: &serde_json::Value) -> &'static str {
-    if payload.get("result").is_some() || payload.get("error").is_some() {
-        "\u{2190}" // ←
-    } else {
-        "\u{2192}" // →
-    }
-}
-
 // ── Single message formatters ────────────────────────────────────────────
 
 /// Build a styled [`Line`] for a protocol message.
@@ -59,15 +47,11 @@ pub fn format_message_styled(
     let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
 
     match msg.r#type.as_str() {
-        "lsp" => {
-            let arrow = message_direction_arrow(&msg.payload);
-            Line::from(vec![
-                ts_span,
-                Span::styled(format!("[{}] ", msg.server), theme.accent),
-                Span::styled(format!("{arrow} "), theme.text),
-                Span::styled(msg.method.clone(), theme.text),
-            ])
-        }
+        "lsp" => Line::from(vec![
+            ts_span,
+            Span::styled(format!("[{}] ", msg.server), theme.accent),
+            Span::styled(msg.method.clone(), theme.text),
+        ]),
         "mcp" => {
             if msg.method == "tools/call" {
                 let tool_name = msg
@@ -83,11 +67,9 @@ pub fn format_message_styled(
                     Span::styled(tool_name.to_string(), theme.text),
                 ])
             } else {
-                let arrow = message_direction_arrow(&msg.payload);
                 Line::from(vec![
                     ts_span,
                     Span::styled("[mcp] ".to_string(), theme.text),
-                    Span::styled(format!("{arrow} "), theme.text),
                     Span::styled(msg.method.clone(), theme.text),
                 ])
             }
@@ -148,10 +130,7 @@ pub fn format_message_plain(msg: &SessionMessage) -> String {
     let ts = msg.timestamp.format("%H:%M:%S");
 
     match msg.r#type.as_str() {
-        "lsp" => {
-            let arrow = message_direction_arrow(&msg.payload);
-            format!("{ts} [{}] {arrow} {}", msg.server, msg.method)
-        }
+        "lsp" => format!("{ts} [{}] {}", msg.server, msg.method),
         "mcp" => {
             if msg.method == "tools/call" {
                 let tool_name = msg
@@ -162,8 +141,7 @@ pub fn format_message_plain(msg: &SessionMessage) -> String {
                     .unwrap_or(&msg.method);
                 format!("{ts} {tool_name}")
             } else {
-                let arrow = message_direction_arrow(&msg.payload);
-                format!("{ts} [mcp] {arrow} {}", msg.method)
+                format!("{ts} [mcp] {}", msg.method)
             }
         }
         "hook" => msg.payload.get("count").map_or_else(
@@ -414,7 +392,7 @@ pub fn format_collapsed_styled(
     start: usize,
     end: usize,
     count: usize,
-    _icons: &IconSet,
+    icons: &IconSet,
     theme: &Theme,
 ) -> Line<'static> {
     let last = &messages[end];
@@ -432,6 +410,7 @@ pub fn format_collapsed_styled(
         Line::from(vec![
             ts_span,
             Span::styled(format!("[{server}] "), theme.accent),
+            Span::styled(icons.progress.clone(), theme.muted),
             Span::styled(title, theme.text),
             Span::styled(format!(" ({detail})"), theme.muted),
         ])
@@ -439,12 +418,13 @@ pub fn format_collapsed_styled(
         let label = category::log_level_label(key_str);
         let count_label = format!("{count} message{}", if count == 1 { "" } else { "s" });
         let server = &messages[start].server;
-        Line::from(vec![
-            ts_span,
-            Span::styled(format!("[{server}] "), theme.accent),
-            Span::styled(label.to_string(), theme.text),
-            Span::styled(format!(" ({count_label})"), theme.muted),
-        ])
+        let mut spans = vec![ts_span, Span::styled(format!("[{server}] "), theme.accent)];
+        if label == "info" {
+            spans.push(Span::styled(icons.log_info.clone(), theme.info));
+        }
+        spans.push(Span::styled(label.to_string(), theme.text));
+        spans.push(Span::styled(format!(" ({count_label})"), theme.muted));
+        Line::from(spans)
     } else if key_str.starts_with("sync:") {
         let file = category::extract_sync_basename(messages, start, end).unwrap_or_default();
         let ops = category::extract_sync_operations(messages, start, end);
@@ -461,11 +441,13 @@ pub fn format_collapsed_styled(
         Line::from(vec![
             ts_span,
             Span::styled(format!("[{server}] "), theme.accent),
+            Span::styled(icons.session_started.clone(), theme.accent),
             Span::styled("initialized".to_string(), theme.text),
         ])
     } else if key_str == "init:mcp" {
         Line::from(vec![
             ts_span,
+            Span::styled(icons.session_started.clone(), theme.accent),
             Span::styled("mcp initialized".to_string(), theme.text),
         ])
     } else {
@@ -514,20 +496,30 @@ pub fn format_collapsed_plain(
         let title = category::extract_progress_title(messages, start, end);
         let (first_pct, last_pct) = category::extract_progress_pct_range(messages, start, end);
         let detail = format_progress_detail(count, first_pct, last_pct);
-        format!("{ts} [{}] {title} ({detail})", messages[start].server)
+        format!(
+            "{ts} [{}] \u{2726} {title} ({detail})",
+            messages[start].server
+        )
     } else if key_str.starts_with("log:") {
         let label = category::log_level_label(key_str);
         let count_label = format!("{count} message{}", if count == 1 { "" } else { "s" });
-        format!("{ts} [{}] {label} ({count_label})", messages[start].server)
+        if label == "info" {
+            format!(
+                "{ts} [{}] \u{25A2} {label} ({count_label})",
+                messages[start].server
+            )
+        } else {
+            format!("{ts} [{}] {label} ({count_label})", messages[start].server)
+        }
     } else if key_str.starts_with("sync:") {
         let file = category::extract_sync_basename(messages, start, end).unwrap_or_default();
         let ops = category::extract_sync_operations(messages, start, end);
         let ops_str = ops.join(", ");
         format!("{ts} [{}] sync {file} ({ops_str})", messages[start].server)
     } else if key_str.starts_with("lifecycle:") {
-        format!("{ts} [{}] initialized", messages[start].server)
+        format!("{ts} [{}] \u{25CF} initialized", messages[start].server)
     } else if key_str == "init:mcp" {
-        format!("{ts} mcp initialized")
+        format!("{ts} \u{25CF} mcp initialized")
     } else {
         // Generic fallback (proto: or unknown).
         let label = format!("{count} message{}", if count == 1 { "" } else { "s" });
@@ -823,7 +815,10 @@ mod tests {
             "should contain server name"
         );
         assert!(text.contains("textDocument/hover"), "should contain method");
-        assert!(text.contains("\u{2192}"), "outbound request should show →");
+        assert!(
+            !text.contains("\u{2192}") && !text.contains("\u{2190}"),
+            "should not contain direction arrows"
+        );
     }
 
     #[test]
@@ -838,7 +833,10 @@ mod tests {
         );
         let line = format_message_styled(&msg, &icons, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("\u{2190}"), "response should show ←");
+        assert!(
+            !text.contains("\u{2190}") && !text.contains("\u{2192}"),
+            "should not contain direction arrows"
+        );
     }
 
     #[test]
@@ -901,7 +899,10 @@ mod tests {
         let plain = format_message_plain(&msg);
         assert!(plain.contains("[rust-analyzer]"));
         assert!(plain.contains("textDocument/hover"));
-        assert!(plain.contains("\u{2192}"));
+        assert!(
+            !plain.contains("\u{2192}") && !plain.contains("\u{2190}"),
+            "should not contain direction arrows"
+        );
 
         let mcp_msg = make_message_with_payload(
             "mcp",
@@ -1259,6 +1260,177 @@ mod tests {
         assert!(
             plain.contains("workspace/configuration"),
             "plain should contain method: {plain}"
+        );
+    }
+
+    // ── Icon presence / absence tests ───────────────────────────────────
+
+    #[test]
+    fn test_format_collapsed_progress_has_icon() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "ra/indexing",
+                    "value": {"kind": "begin", "title": "Indexing"}
+                }),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "$/progress",
+                "rust-analyzer",
+                serde_json::json!({
+                    "token": "ra/indexing",
+                    "value": {"kind": "end"}
+                }),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{2726}"),
+            "progress run should contain progress icon (✦): {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_lifecycle_has_icon() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message("lsp", "initialize", "rust-analyzer"),
+            make_message("lsp", "initialized", "rust-analyzer"),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{25CF}"),
+            "lifecycle run should contain session_started icon (●): {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_mcp_init_has_icon() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message("mcp", "initialize", "catenary"),
+            make_message("mcp", "notifications/initialized", "catenary"),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{25CF}"),
+            "MCP init run should contain session_started icon (●): {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_log_info_has_icon() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "window/logMessage",
+                "rust-analyzer",
+                serde_json::json!({"type": 3, "message": "Loading..."}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "window/logMessage",
+                "rust-analyzer",
+                serde_json::json!({"type": 3, "message": "Ready."}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("\u{25A2}"),
+            "info log run should contain log_info icon (▢): {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_sync_no_icon() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "textDocument/didOpen",
+                "rust-analyzer",
+                serde_json::json!({"textDocument": {"uri": "file:///src/main.rs"}}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "textDocument/didSave",
+                "rust-analyzer",
+                serde_json::json!({"textDocument": {"uri": "file:///src/main.rs"}}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let first_content_span = line
+            .spans
+            .iter()
+            .find(|s| !s.content.trim().is_empty() && s.style != theme.timestamp)
+            .expect("should have a non-timestamp span");
+        assert!(
+            !first_content_span.content.starts_with('\u{2726}')
+                && !first_content_span.content.starts_with('\u{25CF}')
+                && !first_content_span.content.starts_with('\u{25A2}'),
+            "sync run should not start with an icon: {:?}",
+            first_content_span.content
+        );
+    }
+
+    #[test]
+    fn test_format_collapsed_generic_no_icon() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let messages = vec![
+            make_message_with_payload(
+                "lsp",
+                "workspace/configuration",
+                "rust-analyzer",
+                serde_json::json!({"id": 1}),
+            ),
+            make_message_with_payload(
+                "lsp",
+                "workspace/configuration",
+                "rust-analyzer",
+                serde_json::json!({"id": 2}),
+            ),
+        ];
+        let line = format_collapsed_styled(&messages, 0, 1, 2, &icons, &theme);
+        let first_content_span = line
+            .spans
+            .iter()
+            .find(|s| !s.content.trim().is_empty() && s.style != theme.timestamp)
+            .expect("should have a non-timestamp span");
+        assert!(
+            !first_content_span.content.starts_with('\u{2726}')
+                && !first_content_span.content.starts_with('\u{25CF}')
+                && !first_content_span.content.starts_with('\u{25A2}'),
+            "generic run should not start with an icon: {:?}",
+            first_content_span.content
+        );
+    }
+
+    #[test]
+    fn test_format_message_styled_no_arrow() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message("lsp", "textDocument/definition", "rust-analyzer");
+        let line = format_message_styled(&msg, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains('\u{2192}') && !text.contains('\u{2190}'),
+            "LSP single should have no arrow: {text}"
         );
     }
 }

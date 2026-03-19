@@ -62,6 +62,8 @@ pub struct IconSet {
     pub proto_error: String,
     /// Request cancelled icon.
     pub cancelled: String,
+    /// Server log info icon (collapsed `window/logMessage` runs at info level).
+    pub log_info: String,
     /// Spinner grow phase frames (plays once at start).
     pub spinner_grow: Vec<String>,
     /// Spinner cycle phase frames (loops during progress).
@@ -94,6 +96,7 @@ struct PresetDefaults {
     proto_ok: &'static str,
     proto_error: &'static str,
     cancelled: &'static str,
+    log_info: &'static str,
     spinner_grow: &'static [&'static str],
     spinner_cycle: &'static [&'static str],
     spinner_done: &'static str,
@@ -122,6 +125,7 @@ const PRESET_UNICODE: PresetDefaults = PresetDefaults {
     proto_ok: "\u{2714} ",                                            // ✔
     proto_error: "\u{2718} ",                                         // ✘
     cancelled: "\u{2501} ",                                           // ━
+    log_info: "\u{25A2} ",                                            // ▢
     spinner_grow: &["\u{2596}", "\u{258C}", "\u{259B}"],              // ▖ ▌ ▛
     spinner_cycle: &["\u{259C}", "\u{259F}", "\u{2599}", "\u{259B}"], // ▜ ▟ ▙ ▛
     spinner_done: "\u{2588}",                                         // █
@@ -150,6 +154,7 @@ const PRESET_NERD: PresetDefaults = PresetDefaults {
     proto_ok: "\u{F0C1} ",    // nf-fa-chain
     proto_error: "\u{F127} ", // nf-fa-chain_broken
     cancelled: "\u{F0374} ",  // nf-md-minus_thick
+    log_info: "\u{F0B79} ",   // nf-md-chat
     spinner_grow: &[],
     spinner_cycle: &[
         "\u{F144B}",
@@ -191,6 +196,7 @@ const PRESET_EMOJI: PresetDefaults = PresetDefaults {
     proto_ok: "\u{2705}",                 // ✅
     proto_error: "\u{274C}",              // ❌
     cancelled: "\u{1F6AB}",               // 🚫
+    log_info: "\u{1F5E8}\u{FE0F}",        // 🗨️
     spinner_grow: &[],
     spinner_cycle: &[
         "\u{1F550}",
@@ -287,6 +293,7 @@ impl IconSet {
             cancelled: config
                 .cancelled
                 .unwrap_or_else(|| base.cancelled.to_string()),
+            log_info: config.log_info.unwrap_or_else(|| base.log_info.to_string()),
             spinner_grow: config
                 .spinner_grow
                 .unwrap_or_else(|| base.spinner_grow.iter().map(|s| (*s).to_string()).collect()),

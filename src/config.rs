@@ -135,6 +135,8 @@ pub struct IconConfig {
     pub proto_error: Option<String>,
     /// Request cancelled icon.
     pub cancelled: Option<String>,
+    /// Server log info icon (collapsed `window/logMessage` runs at info level).
+    pub log_info: Option<String>,
     /// Spinner grow phase frames (plays once at start).
     pub spinner_grow: Option<Vec<String>>,
     /// Spinner cycle phase frames (loops during progress).
