@@ -36,6 +36,8 @@ pub enum DisplayEntry {
     Single {
         /// Index into the messages vec.
         index: usize,
+        /// Scope/causation parent from the source message.
+        parent_id: Option<i64>,
     },
     /// A request/response pair merged into one line.
     Paired {
@@ -43,6 +45,8 @@ pub enum DisplayEntry {
         request_index: usize,
         /// Index of the response message.
         response_index: usize,
+        /// Scope/causation parent from the request message.
+        parent_id: Option<i64>,
     },
     /// A run of consecutive messages collapsed into one line.
     Collapsed {
@@ -52,6 +56,8 @@ pub enum DisplayEntry {
         end_index: usize,
         /// Number of messages in the run.
         count: usize,
+        /// Scope/causation parent from the first message in the run.
+        parent_id: Option<i64>,
     },
 }
 
@@ -69,10 +75,14 @@ pub fn pair_merge(messages: &[SessionMessage]) -> Vec<DisplayEntry> {
             entries.push(DisplayEntry::Paired {
                 request_index: i,
                 response_index: i + 1,
+                parent_id: messages[i].parent_id,
             });
             i += 2;
         } else {
-            entries.push(DisplayEntry::Single { index: i });
+            entries.push(DisplayEntry::Single {
+                index: i,
+                parent_id: messages[i].parent_id,
+            });
             i += 1;
         }
     }
@@ -95,24 +105,33 @@ pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Ve
                  key: &Option<String>,
                  start: usize,
                  end: usize,
-                 count: usize| {
+                 count: usize,
+                 msgs: &[SessionMessage]| {
         if key.is_none() || count == 0 {
             return;
         }
+        let parent_id = msgs[start].parent_id;
         if count == 1 {
-            result.push(DisplayEntry::Single { index: start });
+            result.push(DisplayEntry::Single {
+                index: start,
+                parent_id,
+            });
         } else {
             result.push(DisplayEntry::Collapsed {
                 start_index: start,
                 end_index: end,
                 count,
+                parent_id,
             });
         }
     };
 
     for entry in entries {
         match *entry {
-            DisplayEntry::Single { index } => {
+            DisplayEntry::Single {
+                index,
+                parent_id: _,
+            } => {
                 let key = category::collapse_key(&messages[index]);
                 if let Some(ref k) = key
                     && let Some(ref rk) = run_key
@@ -123,7 +142,14 @@ pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Ve
                     run_count += 1;
                 } else {
                     // Flush previous run, start new one.
-                    flush(&mut result, &run_key, run_start, run_end, run_count);
+                    flush(
+                        &mut result,
+                        &run_key,
+                        run_start,
+                        run_end,
+                        run_count,
+                        messages,
+                    );
                     if key.is_some() {
                         run_key = key;
                         run_start = index;
@@ -132,13 +158,23 @@ pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Ve
                     } else {
                         run_key = None;
                         run_count = 0;
-                        result.push(DisplayEntry::Single { index });
+                        result.push(DisplayEntry::Single {
+                            index,
+                            parent_id: messages[index].parent_id,
+                        });
                     }
                 }
             }
             DisplayEntry::Paired { .. } | DisplayEntry::Collapsed { .. } => {
                 // Flush any pending run, then emit as-is.
-                flush(&mut result, &run_key, run_start, run_end, run_count);
+                flush(
+                    &mut result,
+                    &run_key,
+                    run_start,
+                    run_end,
+                    run_count,
+                    messages,
+                );
                 run_key = None;
                 run_count = 0;
                 result.push(entry.clone());
@@ -147,7 +183,14 @@ pub fn run_collapse(entries: &[DisplayEntry], messages: &[SessionMessage]) -> Ve
     }
 
     // Flush trailing run.
-    flush(&mut result, &run_key, run_start, run_end, run_count);
+    flush(
+        &mut result,
+        &run_key,
+        run_start,
+        run_end,
+        run_count,
+        messages,
+    );
 
     result
 }
@@ -458,7 +501,10 @@ impl<'a> PanelState<'a> {
 
         for entry in &entries {
             match *entry {
-                DisplayEntry::Single { index } => {
+                DisplayEntry::Single {
+                    index,
+                    parent_id: _,
+                } => {
                     let msg = &self.messages[index];
                     if let Some(ref pat) = lower_pattern {
                         let plain = format_message_plain(msg);
@@ -483,6 +529,7 @@ impl<'a> PanelState<'a> {
                 DisplayEntry::Paired {
                     request_index,
                     response_index,
+                    parent_id: _,
                 } => {
                     let req = &self.messages[request_index];
                     let resp = &self.messages[response_index];
@@ -510,6 +557,7 @@ impl<'a> PanelState<'a> {
                     start_index,
                     end_index,
                     count,
+                    parent_id: _,
                 } => {
                     if let Some(ref pat) = lower_pattern {
                         let plain =
@@ -1717,6 +1765,7 @@ mod tests {
             DisplayEntry::Paired {
                 request_index: 0,
                 response_index: 1,
+                parent_id: None,
             }
         );
     }
@@ -1730,9 +1779,27 @@ mod tests {
         ];
         let entries = pair_merge(&messages);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], DisplayEntry::Single { index: 0 });
-        assert_eq!(entries[1], DisplayEntry::Single { index: 1 });
-        assert_eq!(entries[2], DisplayEntry::Single { index: 2 });
+        assert_eq!(
+            entries[0],
+            DisplayEntry::Single {
+                index: 0,
+                parent_id: None
+            }
+        );
+        assert_eq!(
+            entries[1],
+            DisplayEntry::Single {
+                index: 1,
+                parent_id: None
+            }
+        );
+        assert_eq!(
+            entries[2],
+            DisplayEntry::Single {
+                index: 2,
+                parent_id: None
+            }
+        );
     }
 
     #[test]
@@ -1756,6 +1823,7 @@ mod tests {
             DisplayEntry::Paired {
                 request_index: 0,
                 response_index: 1,
+                parent_id: None,
             }
         );
         assert_eq!(
@@ -1763,6 +1831,7 @@ mod tests {
             DisplayEntry::Paired {
                 request_index: 2,
                 response_index: 3,
+                parent_id: None,
             }
         );
     }
@@ -1777,7 +1846,13 @@ mod tests {
         let entries = pair_merge(&messages);
         assert_eq!(entries.len(), 3);
         for (i, entry) in entries.iter().enumerate() {
-            assert_eq!(*entry, DisplayEntry::Single { index: i });
+            assert_eq!(
+                *entry,
+                DisplayEntry::Single {
+                    index: i,
+                    parent_id: None
+                }
+            );
         }
     }
 
@@ -1794,6 +1869,7 @@ mod tests {
             DisplayEntry::Paired {
                 request_index: 0,
                 response_index: 1,
+                parent_id: None,
             }
         );
 
@@ -1920,6 +1996,7 @@ mod tests {
                 start_index: 0,
                 end_index: 2,
                 count: 3,
+                parent_id: None,
             }
         );
     }
@@ -1933,8 +2010,20 @@ mod tests {
         let entries = pair_merge(&messages);
         let collapsed = run_collapse(&entries, &messages);
         assert_eq!(collapsed.len(), 2);
-        assert_eq!(collapsed[0], DisplayEntry::Single { index: 0 });
-        assert_eq!(collapsed[1], DisplayEntry::Single { index: 1 });
+        assert_eq!(
+            collapsed[0],
+            DisplayEntry::Single {
+                index: 0,
+                parent_id: None
+            }
+        );
+        assert_eq!(
+            collapsed[1],
+            DisplayEntry::Single {
+                index: 1,
+                parent_id: None
+            }
+        );
     }
 
     #[test]
@@ -1988,8 +2077,163 @@ mod tests {
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             collapsed[0],
-            DisplayEntry::Single { index: 0 },
+            DisplayEntry::Single {
+                index: 0,
+                parent_id: None
+            },
             "single message should not collapse"
+        );
+    }
+
+    // ── parent_id propagation tests ─────────────────────────────────────
+
+    fn make_message_with_id_parent(
+        id: i64,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        request_id: Option<i64>,
+        parent_id: Option<i64>,
+    ) -> SessionMessage {
+        SessionMessage {
+            id,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id,
+            parent_id,
+            timestamp: chrono::Utc::now(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn test_pair_merge_propagates_parent_id() {
+        let messages = vec![
+            make_message_with_id_parent(
+                1,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                Some(100),
+            ),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                Some(1),
+                Some(100),
+            ),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            DisplayEntry::Paired {
+                request_index: 0,
+                response_index: 1,
+                parent_id: Some(100),
+            }
+        );
+    }
+
+    #[test]
+    fn test_pair_merge_none_parent_id() {
+        let messages = vec![
+            make_message_with_id_parent(
+                1,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                None,
+            ),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                Some(1),
+                None,
+            ),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            DisplayEntry::Paired {
+                request_index: 0,
+                response_index: 1,
+                parent_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_run_collapse_propagates_parent_id() {
+        let messages = vec![
+            {
+                let mut m = make_progress_message("rust-analyzer", "ra/indexing");
+                m.parent_id = Some(42);
+                m
+            },
+            {
+                let mut m = make_progress_message("rust-analyzer", "ra/indexing");
+                m.parent_id = Some(42);
+                m
+            },
+            {
+                let mut m = make_progress_message("rust-analyzer", "ra/indexing");
+                m.parent_id = Some(42);
+                m
+            },
+        ];
+        let entries = pair_merge(&messages);
+        let collapsed = run_collapse(&entries, &messages);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(
+            collapsed[0],
+            DisplayEntry::Collapsed {
+                start_index: 0,
+                end_index: 2,
+                count: 3,
+                parent_id: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn test_pair_merge_parent_id_from_request() {
+        let messages = vec![
+            make_message_with_id_parent(
+                1,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                Some(10),
+            ),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                Some(1),
+                Some(10),
+            ),
+        ];
+        let entries = pair_merge(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            DisplayEntry::Paired {
+                request_index: 0,
+                response_index: 1,
+                parent_id: Some(10),
+            }
         );
     }
 }
