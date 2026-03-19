@@ -245,6 +245,74 @@ fn extract_tool_error(payload: &serde_json::Value) -> Option<String> {
     }
 }
 
+// ── Tool metric extractors ───────────────────────────────────────────────
+
+/// Extract the total line count from an MCP tool response payload.
+///
+/// Walks `result.content[]` and sums `.lines().count()` for every
+/// `type: "text"` item. Returns `None` if the path doesn't exist
+/// (non-tool response), `Some(0)` for empty text content.
+fn extract_line_count(response: &SessionMessage) -> Option<usize> {
+    let result = response.payload.get("result")?;
+    let content = result.get("content")?.as_array()?;
+    let mut total = 0;
+    for item in content {
+        let is_text = item
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "text");
+        if !is_text {
+            continue;
+        }
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            total += text.lines().count();
+        }
+    }
+    Some(total)
+}
+
+/// Render a JSON value as a compact inline string.
+///
+/// Strings are quoted, numbers/bools/null are literal, and nested
+/// arrays/objects are opaque (`[...]` / `{...}`).
+fn compact_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("\"{s}\""),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(_) => "[...]".to_string(),
+        serde_json::Value::Object(_) => "{...}".to_string(),
+    }
+}
+
+/// Extract tool call arguments from an MCP request payload.
+///
+/// Returns a compact `{key: value, key2: value2}` string where keys are
+/// unquoted and values use [`compact_value`] rendering.
+fn extract_tool_arguments(request: &SessionMessage) -> Option<String> {
+    let args = request.payload.get("params")?.get("arguments")?;
+    let obj = args.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let pairs: Vec<String> = obj
+        .iter()
+        .map(|(k, v)| format!("{k}: {}", compact_value(v)))
+        .collect();
+    Some(format!("{{{}}}", pairs.join(", ")))
+}
+
+/// Build a metrics parenthetical string for a tool call pair.
+///
+/// Combines optional line count with timing into the parenthetical content.
+fn format_tool_metrics(line_count: Option<usize>, timing: &str) -> String {
+    line_count.map_or_else(
+        || timing.to_string(),
+        |n| format!("{n} line{}, {timing}", if n == 1 { "" } else { "s" }),
+    )
+}
+
 // ── Pair formatters ──────────────────────────────────────────────────────
 
 /// Build a styled [`Line`] for a merged request/response pair.
@@ -328,12 +396,19 @@ pub fn format_pair_styled(
             "mcp" => {
                 if let Some(name) = tool_name {
                     let icon = tool_icon(name, icons);
-                    Line::from(vec![
+                    let line_count = extract_line_count(response);
+                    let metrics = format_tool_metrics(line_count, &timing);
+                    let args = extract_tool_arguments(request);
+                    let mut spans = vec![
                         ts_span,
                         Span::styled(icon.to_string(), theme.success),
                         Span::styled(name.to_string(), theme.text),
-                        Span::styled(format!(" ({timing})"), theme.muted),
-                    ])
+                        Span::styled(format!(" ({metrics})"), theme.muted),
+                    ];
+                    if let Some(args_str) = args {
+                        spans.push(Span::styled(format!(" {args_str}"), theme.muted));
+                    }
+                    Line::from(spans)
                 } else {
                     Line::from(vec![
                         ts_span,
@@ -375,12 +450,19 @@ pub fn format_pair_plain(request: &SessionMessage, response: &SessionMessage) ->
         None
     };
 
+    let args_suffix = tool_name
+        .and_then(|_| extract_tool_arguments(request))
+        .map_or(String::new(), |a| format!(" {a}"));
+
     match &outcome {
         PairOutcome::Cancelled => {
             let label = tool_name.unwrap_or(&request.method);
             match request.r#type.as_str() {
-                "lsp" => format!("{ts} [{}] {label} (cancelled, {timing})", request.server),
-                _ => format!("{ts} {label} (cancelled, {timing})"),
+                "lsp" => format!(
+                    "{ts} [{}] {label} (cancelled, {timing}){args_suffix}",
+                    request.server
+                ),
+                _ => format!("{ts} {label} (cancelled, {timing}){args_suffix}"),
             }
         }
         PairOutcome::Error { message } => {
@@ -389,15 +471,22 @@ pub fn format_pair_plain(request: &SessionMessage, response: &SessionMessage) ->
                 .as_deref()
                 .map_or(String::new(), |m| format!(": {m}"));
             match request.r#type.as_str() {
-                "lsp" => format!("{ts} [{}] {label}{error_suffix} ({timing})", request.server),
-                _ => format!("{ts} {label}{error_suffix} ({timing})"),
+                "lsp" => format!(
+                    "{ts} [{}] {label}{error_suffix} ({timing}){args_suffix}",
+                    request.server
+                ),
+                _ => format!("{ts} {label}{error_suffix} ({timing}){args_suffix}"),
             }
         }
         PairOutcome::Success => match request.r#type.as_str() {
             "lsp" => format!("{ts} [{}] {} ({timing})", request.server, request.method),
             "mcp" => tool_name.map_or_else(
                 || format!("{ts} {} ({timing})", request.method),
-                |name| format!("{ts} {name} ({timing})"),
+                |name| {
+                    let line_count = extract_line_count(response);
+                    let metrics = format_tool_metrics(line_count, &timing);
+                    format!("{ts} {name} ({metrics}){args_suffix}")
+                },
             ),
             other => format!("{ts} [{other}] {} ({timing})", request.method),
         },
@@ -599,6 +688,13 @@ fn format_scope_pair(
     let label = tool_name.unwrap_or(&req.method);
     let name = segment_tool_name(label, position);
 
+    // Line count metrics only for completed tool calls (Only/Last positions).
+    let line_count = if has_metrics && tool_name.is_some() {
+        extract_line_count(resp)
+    } else {
+        None
+    };
+
     let (icon, icon_style, name_text, meta) = match &outcome {
         PairOutcome::Cancelled => {
             let meta = if has_metrics {
@@ -626,7 +722,8 @@ fn format_scope_pair(
         }
         PairOutcome::Success => {
             let meta = if has_metrics {
-                format!(" ({children_label}, {timing})")
+                let metrics = format_tool_metrics(line_count, &timing);
+                format!(" ({metrics}, {children_label})")
             } else {
                 format!(" ({children_label})")
             };
@@ -638,6 +735,12 @@ fn format_scope_pair(
         }
     };
 
+    let args = if tool_name.is_some() {
+        extract_tool_arguments(req)
+    } else {
+        None
+    };
+
     let mut spans = vec![ts_span];
     if req.r#type == "lsp" {
         spans.push(Span::styled(format!("[{}] ", req.server), theme.accent));
@@ -645,6 +748,9 @@ fn format_scope_pair(
     spans.push(Span::styled(icon, icon_style));
     spans.push(Span::styled(name_text, theme.text));
     spans.push(Span::styled(meta, theme.muted));
+    if let Some(args_str) = args {
+        spans.push(Span::styled(format!(" {args_str}"), theme.muted));
+    }
     Line::from(spans)
 }
 
@@ -787,12 +893,24 @@ pub fn format_scope_plain(
                 format!("{ts} ")
             };
 
+            let args_suffix = tool_name
+                .and_then(|_| extract_tool_arguments(req))
+                .map_or(String::new(), |a| format!(" {a}"));
+
+            let line_count = if has_metrics && tool_name.is_some() {
+                extract_line_count(resp)
+            } else {
+                None
+            };
+
             match &outcome {
                 PairOutcome::Cancelled => {
                     if has_metrics {
-                        format!("{prefix}{name} (cancelled, {children_label}, {timing})")
+                        format!(
+                            "{prefix}{name} (cancelled, {children_label}, {timing}){args_suffix}"
+                        )
                     } else {
-                        format!("{prefix}{name} (cancelled, {children_label})")
+                        format!("{prefix}{name} (cancelled, {children_label}){args_suffix}")
                     }
                 }
                 PairOutcome::Error { message } => {
@@ -800,16 +918,19 @@ pub fn format_scope_plain(
                         .as_deref()
                         .map_or(String::new(), |m| format!(": {m}"));
                     if has_metrics {
-                        format!("{prefix}{name}{error_suffix} ({children_label}, {timing})")
+                        format!(
+                            "{prefix}{name}{error_suffix} ({children_label}, {timing}){args_suffix}"
+                        )
                     } else {
-                        format!("{prefix}{name}{error_suffix} ({children_label})")
+                        format!("{prefix}{name}{error_suffix} ({children_label}){args_suffix}")
                     }
                 }
                 PairOutcome::Success => {
                     if has_metrics {
-                        format!("{prefix}{name} ({children_label}, {timing})")
+                        let metrics = format_tool_metrics(line_count, &timing);
+                        format!("{prefix}{name} ({metrics}, {children_label}){args_suffix}")
                     } else {
-                        format!("{prefix}{name} ({children_label})")
+                        format!("{prefix}{name} ({children_label}){args_suffix}")
                     }
                 }
             }
@@ -1823,6 +1944,316 @@ mod tests {
         assert!(
             !text.contains("\u{2718}"),
             "zero results should not show error icon ✘: {text}"
+        );
+    }
+
+    // ── Line count extraction tests ────────────────────────────────────
+
+    #[test]
+    fn test_extract_line_count_text() {
+        let msg = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [{"type": "text", "text": "a\nb\nc\nd\ne"}]}
+            }),
+        );
+        assert_eq!(extract_line_count(&msg), Some(5));
+    }
+
+    #[test]
+    fn test_extract_line_count_empty() {
+        let msg = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [{"type": "text", "text": ""}]}
+            }),
+        );
+        assert_eq!(extract_line_count(&msg), Some(0));
+    }
+
+    #[test]
+    fn test_extract_line_count_no_content() {
+        let msg = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        assert_eq!(extract_line_count(&msg), None);
+    }
+
+    #[test]
+    fn test_extract_line_count_multi_content() {
+        let msg = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [
+                    {"type": "text", "text": "a\nb\nc"},
+                    {"type": "text", "text": "d\ne"}
+                ]}
+            }),
+        );
+        assert_eq!(extract_line_count(&msg), Some(5));
+    }
+
+    // ── Tool arguments extraction tests ────────────────────────────────
+
+    #[test]
+    fn test_extract_tool_arguments() {
+        let msg = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "params": {
+                    "name": "grep",
+                    "arguments": {"pattern": "foo", "glob": "**/*.rs"}
+                }
+            }),
+        );
+        let args = extract_tool_arguments(&msg).expect("should extract arguments");
+        assert!(
+            args.contains("pattern: \"foo\""),
+            "should contain pattern: {args}"
+        );
+        assert!(
+            args.contains("glob: \"**/*.rs\""),
+            "should contain glob: {args}"
+        );
+        assert!(
+            args.starts_with('{') && args.ends_with('}'),
+            "should be wrapped in braces: {args}"
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_arguments_none() {
+        let msg = make_message_with_payload(
+            "lsp",
+            "textDocument/hover",
+            "rust-analyzer",
+            serde_json::json!({"id": 1}),
+        );
+        assert_eq!(extract_tool_arguments(&msg), None);
+    }
+
+    // ── Pair formatter metrics tests ───────────────────────────────────
+
+    #[test]
+    fn test_format_pair_with_metrics() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [{"type": "text", "text": "a\nb\nc\nd\ne"}]}
+            }),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("5 lines"),
+            "should contain line count: {text}"
+        );
+        assert!(text.contains('s'), "should contain timing: {text}");
+    }
+
+    #[test]
+    fn test_format_pair_with_arguments() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "params": {
+                    "name": "grep",
+                    "arguments": {"pattern": "foo"}
+                }
+            }),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [{"type": "text", "text": "results"}]}
+            }),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("{pattern: \"foo\"}"),
+            "should contain arguments block: {text}"
+        );
+        // Arguments should be in a muted-styled span.
+        let args_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("pattern"))
+            .expect("should have an arguments span");
+        assert_eq!(
+            args_span.style, theme.muted,
+            "arguments should use muted style"
+        );
+    }
+
+    #[test]
+    fn test_format_pair_zero_lines() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [{"type": "text", "text": ""}]}
+            }),
+        );
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("0 lines"),
+            "zero lines should show '0 lines': {text}"
+        );
+        assert!(
+            !text.contains("\u{2718}"),
+            "zero lines should not show error icon: {text}"
+        );
+    }
+
+    #[test]
+    fn test_format_pair_cancelled_no_metrics() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep"}}),
+        );
+        let response = make_message("mcp", "notifications/cancelled", "catenary");
+        let line = format_pair_styled(&request, &response, &icons, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("cancelled"), "should show cancelled: {text}");
+        assert!(
+            !text.contains("lines"),
+            "cancelled should not show line count: {text}"
+        );
+    }
+
+    // ── Scope formatter metrics tests ──────────────────────────────────
+
+    #[test]
+    fn test_format_scope_last_segment_metrics() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({"params": {"name": "grep", "arguments": {"pattern": "foo"}}}),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [{"type": "text", "text": "a\nb\nc"}]}
+            }),
+        );
+        let messages = vec![request, response];
+        let parent = DisplayEntry::Paired {
+            request_index: 0,
+            response_index: 1,
+            parent_id: None,
+        };
+
+        // Last segment should show metrics.
+        let last =
+            format_scope_styled(&parent, 5, SegmentPosition::Last, &messages, &icons, &theme);
+        let last_text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            last_text.contains("3 lines"),
+            "Last segment should show line count: {last_text}"
+        );
+        assert!(
+            last_text.contains("pattern"),
+            "Last segment should show arguments: {last_text}"
+        );
+
+        // First segment should not show line count.
+        let first = format_scope_styled(
+            &parent,
+            5,
+            SegmentPosition::First,
+            &messages,
+            &icons,
+            &theme,
+        );
+        let first_text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !first_text.contains("lines"),
+            "First segment should not show line count: {first_text}"
+        );
+        assert!(
+            first_text.contains("pattern"),
+            "First segment should still show arguments: {first_text}"
+        );
+    }
+
+    // ── Plain formatter metrics tests ──────────────────────────────────
+
+    #[test]
+    fn test_format_pair_plain_with_metrics() {
+        let request = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "params": {
+                    "name": "grep",
+                    "arguments": {"pattern": "foo", "glob": "**/*.rs"}
+                }
+            }),
+        );
+        let response = make_message_with_payload(
+            "mcp",
+            "tools/call",
+            "catenary",
+            serde_json::json!({
+                "result": {"content": [{"type": "text", "text": "a\nb\nc"}]}
+            }),
+        );
+        let plain = format_pair_plain(&request, &response);
+        assert!(
+            plain.contains("3 lines"),
+            "plain should contain line count: {plain}"
+        );
+        assert!(
+            plain.contains("pattern: \"foo\""),
+            "plain should contain arguments: {plain}"
         );
     }
 }
