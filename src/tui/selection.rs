@@ -133,6 +133,7 @@ fn flat_line_plain(fl: &FlatLine, panel: &PanelState<'_>) -> String {
             position,
             ..
         } => format_scope_plain(parent, *child_count, *position, &panel.messages),
+        FlatLine::Separator => "---".to_string(),
         FlatLine::ScopeChild { depth, inner, .. } => {
             let indent = " ".repeat(depth * 4);
             let inner_text = flat_line_plain(inner, panel);

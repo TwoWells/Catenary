@@ -226,7 +226,7 @@ impl<H: ToolHandler> McpServer<H> {
                 "catenary",
                 &self.client_name,
                 request_id,
-                None,
+                request_id,
                 &json,
             );
         }

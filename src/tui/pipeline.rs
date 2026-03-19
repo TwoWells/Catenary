@@ -307,6 +307,41 @@ pub fn scope_collapse(
         }
     }
 
+    // Nested scope resolution: inner builders whose parent has a parent_id
+    // referencing another builder become children of that outer builder.
+    // Loop until stable so deeper nesting (A → B → C) resolves leaves first.
+    loop {
+        let inner_keys: Vec<usize> = builders
+            .keys()
+            .filter(|&&k| {
+                let pid = builders[&k].parent.parent_id();
+                pid.is_some_and(|p| {
+                    msg_id_to_idx
+                        .get(&p)
+                        .is_some_and(|&idx| idx != k && builders.contains_key(&idx))
+                })
+            })
+            .copied()
+            .collect();
+
+        if inner_keys.is_empty() {
+            break;
+        }
+
+        for key in inner_keys {
+            if let Some(inner_builder) = builders.remove(&key)
+                && let Some(outer_parent_id) = inner_builder.parent.parent_id()
+                && let Some(&outer_key) = msg_id_to_idx.get(&outer_parent_id)
+                && let Some(outer_builder) = builders.get_mut(&outer_key)
+            {
+                let scopes = inner_builder.into_keyed_scopes();
+                for (sort_key, scope_entry) in scopes {
+                    outer_builder.push_child(sort_key, scope_entry);
+                }
+            }
+        }
+    }
+
     // Final assembly: merge scope segments and root-level entries in
     // original chronological order. Each segment gets its own sort key:
     // first segment at parent position, subsequent segments at their
@@ -1176,6 +1211,68 @@ mod tests {
                 assert_eq!(*position, SegmentPosition::Only);
             }
             other => panic!("expected Only Scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scope_collapse_nesting() {
+        // Non-adjacent LSP req/resp under an MCP scope. The LSP request
+        // is both a scope parent (response references it) and a child of
+        // the MCP scope (its parent_id references the MCP request).
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            // LSP request — child of MCP (parent_id=1), scope parent for LSP response
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            // Notification interrupts, preventing pair merge
+            make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, Some(1)),
+            // LSP response — parent_id=2 (its request), not adjacent so not pair-merged
+            make_message_with_id_parent(
+                4,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                Some(2),
+                Some(2),
+            ),
+        ];
+        let merged = pair_merge(&messages);
+        let scoped = scope_collapse(merged, &messages);
+
+        // The MCP scope should contain the LSP scope as a nested child.
+        assert_eq!(scoped.len(), 1, "expected 1 top-level scope: {scoped:?}");
+        match &scoped[0] {
+            DisplayEntry::Scope {
+                parent,
+                children,
+                position,
+            } => {
+                assert!(
+                    matches!(*parent.as_ref(), DisplayEntry::Single { index: 0, .. }),
+                    "parent should be MCP request at index 0"
+                );
+                assert_eq!(*position, SegmentPosition::Only);
+                // Children: the notification, plus the nested LSP scope
+                assert!(
+                    children.len() >= 2,
+                    "MCP scope should have at least 2 children (notification + nested scope): {children:?}"
+                );
+                // At least one child should be a nested Scope
+                let has_nested_scope = children
+                    .iter()
+                    .any(|c| matches!(c, DisplayEntry::Scope { .. }));
+                assert!(
+                    has_nested_scope,
+                    "MCP scope should contain a nested LSP scope: {children:?}"
+                );
+            }
+            other => panic!("expected Scope, got {other:?}"),
         }
     }
 }

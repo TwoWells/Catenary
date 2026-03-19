@@ -333,6 +333,9 @@ impl<'a> PanelState<'a> {
                     self.expanded.insert(expansion_key);
                 }
             }
+            FlatLine::Separator => {
+                // Separators only appear inside ScopeChild; bare separator is inert.
+            }
             FlatLine::ScopeChild {
                 scope_parent_index, ..
             } => {
@@ -587,6 +590,13 @@ fn render_flat_line_styled(
             state.icons,
             state.theme,
         ),
+        FlatLine::Separator => {
+            let indent = "          "; // 10 spaces
+            Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled("---".to_string(), state.theme.muted),
+            ])
+        }
         FlatLine::ScopeChild { depth, inner, .. } => {
             let indent = " ".repeat(depth * 4);
             let inner_line = render_flat_line_styled(inner, state, detail_cache);
@@ -1912,6 +1922,89 @@ mod tests {
         assert!(
             !plain_only.contains('\u{2026}'),
             "Only plain should not contain ellipsis: {plain_only}"
+        );
+    }
+
+    fn make_message_with_id_parent_payload(
+        id: i64,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        request_id: Option<i64>,
+        parent_id: Option<i64>,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            id,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id,
+            parent_id,
+            timestamp: chrono::Utc::now(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn test_separator_toggle_collapses_parent() {
+        // Cursor on a separator line (inside ScopeChild). Toggle expansion.
+        // Verify parent scope collapses and cursor moves to the ScopeHeader.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent_payload(
+                1,
+                "mcp",
+                "tools/call",
+                "catenary",
+                None,
+                None,
+                serde_json::json!({"params": {"name": "grep"}}),
+            ),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+        ];
+        let fm_count = frontmatter_lines(&messages[0], &theme).len();
+        assert!(fm_count > 0, "parent should have frontmatter");
+
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+        // Expansion key = first child index = 1
+        panel.expanded.insert(1);
+
+        // Find the separator line index
+        let flat = panel.flat_lines();
+        let sep_idx = flat
+            .iter()
+            .position(|fl| {
+                matches!(
+                    fl,
+                    FlatLine::ScopeChild { inner, .. }
+                        if matches!(inner.as_ref(), FlatLine::Separator)
+                )
+            })
+            .expect("should have separator");
+
+        panel.cursor = sep_idx;
+        panel.toggle_expansion();
+
+        // Scope should be collapsed
+        assert!(
+            !panel.expanded.contains(&1),
+            "scope should be collapsed after toggling on separator"
+        );
+        // Cursor should be on the ScopeHeader
+        assert_eq!(
+            panel.cursor, 0,
+            "cursor should move to ScopeHeader after separator toggle"
         );
     }
 }

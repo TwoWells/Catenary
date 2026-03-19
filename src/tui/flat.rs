@@ -53,6 +53,8 @@ pub enum FlatLine {
         /// Expansion key (first child's message index for this segment).
         expansion_key: usize,
     },
+    /// A `---` separator line between frontmatter and children.
+    Separator,
     /// An indented child line within an expanded scope.
     ScopeChild {
         /// Depth level for indentation.
@@ -201,12 +203,53 @@ impl PanelState<'_> {
                         expansion_key: scope_key,
                     });
                     if self.expanded.contains(&scope_key) {
+                        self.emit_scope_frontmatter(parent, 1, scope_key, &mut lines);
                         self.flatten_scope_children(children, scope_key, 1, &mut lines);
                     }
                 }
             }
         }
         lines
+    }
+
+    /// Emit frontmatter `Detail` lines and a `Separator` for a scope parent.
+    ///
+    /// Extracts the request message index from the parent entry, generates
+    /// frontmatter lines, and pushes them as `ScopeChild` wrappers. If the
+    /// parent has a non-empty payload, a `Separator` is appended after the
+    /// last detail line.
+    fn emit_scope_frontmatter(
+        &self,
+        parent: &DisplayEntry,
+        depth: usize,
+        scope_parent_index: usize,
+        lines: &mut Vec<FlatLine>,
+    ) {
+        let msg_index = match parent {
+            DisplayEntry::Single { index, .. } => Some(*index),
+            DisplayEntry::Paired { request_index, .. } => Some(*request_index),
+            _ => None,
+        };
+        if let Some(mi) = msg_index {
+            let fm_count = frontmatter_lines(&self.messages[mi], self.theme).len();
+            for detail_index in 0..fm_count {
+                lines.push(FlatLine::ScopeChild {
+                    depth,
+                    scope_parent_index,
+                    inner: Box::new(FlatLine::Detail {
+                        message_index: mi,
+                        detail_index,
+                    }),
+                });
+            }
+            if fm_count > 0 {
+                lines.push(FlatLine::ScopeChild {
+                    depth,
+                    scope_parent_index,
+                    inner: Box::new(FlatLine::Separator),
+                });
+            }
+        }
     }
 
     /// Flatten scope children into `ScopeChild` flat lines.
@@ -308,6 +351,7 @@ impl PanelState<'_> {
                         }),
                     });
                     if self.expanded.contains(&nested_key) {
+                        self.emit_scope_frontmatter(nested_parent, depth + 1, nested_key, lines);
                         self.flatten_scope_children(nested_children, nested_key, depth + 1, lines);
                     }
                 }
@@ -628,6 +672,206 @@ mod tests {
             ),
             "third should be ScopeChild at depth 1: {:?}",
             flat[2]
+        );
+    }
+
+    fn make_message_with_id_parent_payload(
+        id: i64,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        request_id: Option<i64>,
+        parent_id: Option<i64>,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            id,
+            r#type: r#type.to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id,
+            parent_id,
+            timestamp: chrono::Utc::now(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn test_scope_frontmatter_emission() {
+        // Scope parent with non-empty payload. Expand. Verify:
+        // ScopeHeader → ScopeChild(Detail)... → ScopeChild(Separator) → ScopeChild(MessageHeader).
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent_payload(
+                1,
+                "mcp",
+                "tools/call",
+                "catenary",
+                None,
+                None,
+                serde_json::json!({"params": {"name": "grep"}}),
+            ),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+        ];
+        let fm_count = frontmatter_lines(&messages[0], &theme).len();
+        assert!(fm_count > 0, "parent should have frontmatter lines");
+
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+        panel.expanded.insert(1); // expansion key = first child index
+
+        let flat = panel.flat_lines();
+        // Expected: ScopeHeader + fm_count Detail lines + 1 Separator + 1 child MessageHeader
+        let expected_len = 1 + fm_count + 1 + 1;
+        assert_eq!(
+            flat.len(),
+            expected_len,
+            "expected {expected_len} lines (1 header + {fm_count} frontmatter + 1 separator + 1 child): {flat:?}"
+        );
+        assert!(matches!(flat[0], FlatLine::ScopeHeader { .. }));
+        // Frontmatter detail lines
+        for i in 0..fm_count {
+            assert!(
+                matches!(
+                    &flat[1 + i],
+                    FlatLine::ScopeChild { inner, .. }
+                        if matches!(inner.as_ref(), FlatLine::Detail { .. })
+                ),
+                "line {} should be ScopeChild(Detail): {:?}",
+                1 + i,
+                flat[1 + i]
+            );
+        }
+        // Separator
+        assert!(
+            matches!(
+                &flat[1 + fm_count],
+                FlatLine::ScopeChild { inner, .. }
+                    if matches!(inner.as_ref(), FlatLine::Separator)
+            ),
+            "line {} should be ScopeChild(Separator): {:?}",
+            1 + fm_count,
+            flat[1 + fm_count]
+        );
+        // Child message header
+        assert!(
+            matches!(
+                &flat[2 + fm_count],
+                FlatLine::ScopeChild { inner, .. }
+                    if matches!(inner.as_ref(), FlatLine::MessageHeader { .. })
+            ),
+            "last line should be ScopeChild(MessageHeader): {:?}",
+            flat[2 + fm_count]
+        );
+    }
+
+    #[test]
+    fn test_scope_frontmatter_empty_payload() {
+        // Scope parent with empty payload — no frontmatter or separator.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+        ];
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+        panel.expanded.insert(1);
+
+        let flat = panel.flat_lines();
+        // ScopeHeader + 2 children, no frontmatter or separator
+        assert_eq!(
+            flat.len(),
+            3,
+            "empty payload scope should have no frontmatter: {flat:?}"
+        );
+        assert!(matches!(flat[0], FlatLine::ScopeHeader { .. }));
+        // No Separator anywhere
+        let has_separator = flat.iter().any(|fl| {
+            matches!(fl, FlatLine::ScopeChild { inner, .. } if matches!(inner.as_ref(), FlatLine::Separator))
+        });
+        assert!(
+            !has_separator,
+            "empty payload scope should have no separator"
+        );
+    }
+
+    #[test]
+    fn test_separator_in_flat_lines() {
+        // Verify Separator appears between last frontmatter Detail and first child.
+        let theme = test_theme();
+        let icons = test_icons();
+        let messages = vec![
+            make_message_with_id_parent_payload(
+                1,
+                "mcp",
+                "tools/call",
+                "catenary",
+                None,
+                None,
+                serde_json::json!({"params": {"name": "glob"}}),
+            ),
+            make_message_with_id_parent(
+                2,
+                "lsp",
+                "workspace/symbol",
+                "rust-analyzer",
+                None,
+                Some(1),
+            ),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+        ];
+        let fm_count = frontmatter_lines(&messages[0], &theme).len();
+        assert!(fm_count > 0, "parent should have frontmatter");
+
+        let mut panel = PanelState::new("test".to_string(), &theme, &icons);
+        panel.load_messages(messages);
+        panel.expanded.insert(1);
+
+        let flat = panel.flat_lines();
+        // Find the separator
+        let sep_idx = flat.iter().position(|fl| {
+            matches!(fl, FlatLine::ScopeChild { inner, .. } if matches!(inner.as_ref(), FlatLine::Separator))
+        });
+        assert!(sep_idx.is_some(), "should have a separator: {flat:?}");
+        let sep_idx = sep_idx.expect("checked above");
+
+        // Line before separator should be a Detail
+        assert!(
+            matches!(
+                &flat[sep_idx - 1],
+                FlatLine::ScopeChild { inner, .. }
+                    if matches!(inner.as_ref(), FlatLine::Detail { .. })
+            ),
+            "line before separator should be Detail: {:?}",
+            flat[sep_idx - 1]
+        );
+        // Line after separator should be a MessageHeader (first child)
+        assert!(
+            matches!(
+                &flat[sep_idx + 1],
+                FlatLine::ScopeChild { inner, .. }
+                    if matches!(inner.as_ref(), FlatLine::MessageHeader { .. })
+            ),
+            "line after separator should be MessageHeader: {:?}",
+            flat[sep_idx + 1]
         );
     }
 }

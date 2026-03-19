@@ -239,9 +239,10 @@ async fn test_lsp_log_parent_id() -> Result<()> {
             .collect::<Vec<_>>()
     );
 
-    // Both request and response should carry the parent_id
+    // Request carries the MCP parent_id; response points to the request.
+    let request_id = hover_msgs[0].id;
     assert_eq!(hover_msgs[0].parent_id, Some(parent_id));
-    assert_eq!(hover_msgs[1].parent_id, Some(parent_id));
+    assert_eq!(hover_msgs[1].parent_id, Some(request_id));
 
     Ok(())
 }

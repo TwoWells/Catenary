@@ -23,7 +23,6 @@ use crate::session::MessageLog;
 /// the original method name and causation chain.
 struct PendingRequest {
     method: String,
-    parent_id: Option<i64>,
     message_id: i64,
     sender: oneshot::Sender<ResponseMessage>,
 }
@@ -169,7 +168,6 @@ impl Connection {
                     id.clone(),
                     PendingRequest {
                         method: method.to_string(),
-                        parent_id,
                         message_id,
                         sender: tx,
                     },
@@ -426,7 +424,7 @@ impl Connection {
                                 &server_name,
                                 "catenary",
                                 Some(inbound_id),
-                                None,
+                                Some(inbound_id),
                                 &response_json,
                             );
                         }
@@ -469,7 +467,7 @@ impl Connection {
                                 &server_name,
                                 "catenary",
                                 Some(req.message_id),
-                                req.parent_id,
+                                Some(req.message_id),
                                 &value,
                             );
                             let _ = req.sender.send(response);
