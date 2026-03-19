@@ -395,9 +395,11 @@ impl SessionTree {
 const CHEATSHEET: &[(&str, &str)] = &[
     ("j/k", "navigate"),
     ("Enter", "select/expand"),
-    ("Space", "pin/unpin panel"),
+    ("Space", "toggle"),
+    ("h/l", "scroll / collapse"),
     ("Tab", "focus next panel"),
     ("w", "cycle layout"),
+    ("p", "pin/unpin panel"),
     ("z", "center cursor"),
     ("v", "visual select"),
     ("y", "yank (copy)"),

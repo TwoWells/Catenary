@@ -368,6 +368,21 @@ impl<'a> PanelState<'a> {
         self.navigate(-(half as isize));
     }
 
+    /// Scroll horizontally by `delta` columns.
+    ///
+    /// Positive delta scrolls right, negative scrolls left. Clamps to zero.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "delta is checked positive before cast"
+    )]
+    pub const fn scroll_horizontal(&mut self, delta: isize) {
+        if delta < 0 {
+            self.horizontal_scroll = self.horizontal_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.horizontal_scroll = self.horizontal_scroll.saturating_add(delta as usize);
+        }
+    }
+
     /// Page down — `Ctrl+D`.
     pub fn page_down(&mut self, height: usize) {
         let half = (height / 2).max(1);

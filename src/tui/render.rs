@@ -403,12 +403,26 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
             }
             true
         }
-        KeyCode::Char('h') | KeyCode::Left if app.focus == FocusedPane::Sessions => {
-            app.tree.collapse_at_cursor();
+        KeyCode::Char('h') | KeyCode::Left => {
+            match app.focus {
+                FocusedPane::Sessions => app.tree.collapse_at_cursor(),
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.scroll_horizontal(-1);
+                    }
+                }
+            }
             true
         }
-        KeyCode::Char('l') | KeyCode::Right if app.focus == FocusedPane::Sessions => {
-            app.tree.expand_at_cursor();
+        KeyCode::Char('l') | KeyCode::Right => {
+            match app.focus {
+                FocusedPane::Sessions => app.tree.expand_at_cursor(),
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.scroll_horizontal(1);
+                    }
+                }
+            }
             true
         }
         KeyCode::Char('x') if app.focus == FocusedPane::Events => {
@@ -429,8 +443,21 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
             app.grid.cycle_layout();
             true
         }
-        KeyCode::Char(' ') if app.focus == FocusedPane::Events => {
+        KeyCode::Char('p') if app.focus == FocusedPane::Events => {
             app.grid.toggle_pin();
+            true
+        }
+        KeyCode::Char(' ') => {
+            match app.focus {
+                FocusedPane::Sessions => {
+                    app.tree.toggle_at_cursor();
+                }
+                FocusedPane::Events => {
+                    if let Some(panel) = app.grid.focused_panel_mut() {
+                        panel.toggle_expansion();
+                    }
+                }
+            }
             true
         }
         KeyCode::Char('g') if app.focus == FocusedPane::Events => {
