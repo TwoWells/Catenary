@@ -1,6 +1,17 @@
 {
-  "description": "LSP diagnostics and root sync via catenary hooks",
+  "description": "LSP diagnostics, editing state enforcement, and root sync via catenary hooks",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook session-start --format=claude"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "",
@@ -28,6 +39,28 @@
           {
             "type": "command",
             "command": "catenary hook post-tool --format=claude"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook stop --format=claude"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook stop --format=claude"
           }
         ]
       }

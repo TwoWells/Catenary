@@ -1,5 +1,29 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "name": "catenary-session-start",
+            "type": "command",
+            "command": "catenary hook session-start --format=gemini"
+          }
+        ]
+      }
+    ],
+    "BeforeTool": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "name": "catenary-pre-tool",
+            "type": "command",
+            "command": "catenary hook pre-tool --format=gemini"
+          }
+        ]
+      }
+    ],
     "AfterTool": [
       {
         "matcher": "read_file|write_file|replace",
@@ -18,6 +42,18 @@
             "name": "catenary-notify",
             "type": "command",
             "command": "catenary hook post-tool --format=gemini"
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "name": "catenary-stop",
+            "type": "command",
+            "command": "catenary hook stop --format=gemini"
           }
         ]
       }
