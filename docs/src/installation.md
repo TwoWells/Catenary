@@ -2,35 +2,24 @@
 
 ## Prerequisites
 
+- [Rust toolchain](https://rustup.rs/) (for installing via cargo)
 - Language servers for the languages you want to use (see [LSP Servers](lsp/README.md))
 
 ## Install Catenary
 
-### Download binary (recommended)
-
-Download the latest release for your platform from
-[GitHub Releases](https://github.com/MarkWells-Dev/Catenary/releases/latest):
-
-| Platform     | Asset                       |
-| :----------- | :-------------------------- |
-| Linux x86_64 | `catenary-linux-amd64`      |
-| Linux ARM64  | `catenary-linux-arm64`      |
-| macOS x86_64 | `catenary-macos-amd64`      |
-| macOS ARM64  | `catenary-macos-arm64`      |
-| Windows      | `catenary-windows-amd64.exe`|
-
-Place the binary somewhere on your `PATH`:
+### From crates.io (recommended)
 
 ```bash
-# Linux / macOS example
-chmod +x catenary-linux-amd64
-sudo mv catenary-linux-amd64 /usr/local/bin/catenary
+cargo install catenary-mcp
 ```
 
-### Quick install (Linux / macOS)
+### From source
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MarkWells-Dev/Catenary/main/install.sh | sh
+git clone https://github.com/MarkWells-Dev/Catenary
+cd Catenary
+cargo build --release
+# Binary is at ./target/release/catenary
 ```
 
 ## Add to Your MCP Client
