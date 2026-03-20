@@ -10,6 +10,9 @@ on:
 permissions:
   contents: write
 
+env:
+  NAS_REPO: mark@192.168.1.183:/share/git/Catenary.git
+
 jobs:
   build-macos:
     runs-on: [self-hosted, macOS, ARM64]
@@ -17,7 +20,7 @@ jobs:
       - name: Clone source
         run: |
           rm -rf source
-          git clone --branch ${{ inputs.version }} --depth 1 nas:/share/git/Catenary.git source
+          git clone --branch ${{ inputs.version }} --depth 1 $NAS_REPO source
 
       - name: Build arm64
         run: |
@@ -50,8 +53,36 @@ jobs:
         if: always()
         run: rm -rf source catenary-macos-arm64 catenary-macos-amd64
 
+  build-windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Clone source
+        shell: bash
+        run: |
+          rm -rf source
+          git clone --branch ${{ inputs.version }} --depth 1 $NAS_REPO source
+
+      - name: Build
+        shell: bash
+        run: cd source && cargo build --release
+
+      - name: Prepare asset
+        shell: bash
+        run: cp source/target/release/catenary.exe catenary-windows-amd64.exe
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: catenary-windows-amd64.exe
+          path: catenary-windows-amd64.exe
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -rf source catenary-windows-amd64.exe
+
   release:
-    needs: [build-macos]
+    needs: [build-macos, build-windows]
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - name: Download artifacts
