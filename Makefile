@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: build-release check deny docs test test-ignored test-scripts release release-patch release-minor release-major tag-current
+.PHONY: build-release check deny docs test test-ignored test-scripts release release-patch release-minor release-major publish tag-current sync-public
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -119,7 +119,7 @@ release: pre-release-check
 	@git tag -a "v$(V)" -m "Release v$(V)"
 	@echo ""
 	@echo "Release v$(V) prepared locally."
-	@echo "Run 'git push && git push --tags' to trigger CD pipeline."
+	@echo "Run 'make publish' to build, push, and create the release."
 
 # Convenience targets
 release-patch: pre-release-check next-patch
@@ -131,6 +131,30 @@ release-minor: pre-release-check next-minor
 release-major: pre-release-check next-major
 	@$(MAKE) release V=$(V)
 
+# Build Linux binary, push to NAS, trigger macOS builds, upload, publish.
+# Requires: release commit + tag already created (via make release-*)
+GITHUB_REPO := MarkWells-Dev/Catenary
+publish:
+	@echo "Building Linux binary..."
+	@cargo build --release
+	@cp target/release/catenary catenary-linux-amd64
+	@echo "Pushing to origin..."
+	@git push && git push --tags
+	@echo "Triggering macOS builds on Ghost..."
+	@gh workflow run release.yml -f version=v$(CURRENT_VERSION) --repo $(GITHUB_REPO)
+	@echo "Waiting for workflow to start..."
+	@sleep 10
+	@echo "Waiting for workflow to complete..."
+	@gh run watch --repo $(GITHUB_REPO) $$(gh run list --repo $(GITHUB_REPO) --workflow=release.yml --limit=1 --json databaseId --jq '.[0].databaseId')
+	@echo "Uploading Linux binary..."
+	@gh release upload v$(CURRENT_VERSION) catenary-linux-amd64 --repo $(GITHUB_REPO)
+	@echo "Publishing release..."
+	@gh release edit v$(CURRENT_VERSION) --draft=false --repo $(GITHUB_REPO)
+	@rm -f catenary-linux-amd64
+	@echo ""
+	@echo "Release v$(CURRENT_VERSION) published."
+	@echo "https://github.com/$(GITHUB_REPO)/releases/tag/v$(CURRENT_VERSION)"
+
 # Tag current version (for when you forgot to tag)
 tag-current:
 	@if git rev-parse "v$(CURRENT_VERSION)" >/dev/null 2>&1; then \
@@ -139,7 +163,36 @@ tag-current:
 	fi
 	@echo "Creating tag v$(CURRENT_VERSION) for current version..."
 	@git tag -a "v$(CURRENT_VERSION)" -m "Release v$(CURRENT_VERSION)"
-	@echo "Tag created. Run 'git push --tags' to trigger CD pipeline."
+	@echo "Tag created. Run 'make publish' to build and release."
+
+# Sync public files to the dist/ submodule and push to GitHub.
+DIST := dist
+DIST_FILES := \
+	.claude-plugin/marketplace.json \
+	plugins/catenary/.claude-plugin/plugin.json \
+	plugins/catenary/.mcp.json \
+	plugins/catenary/hooks/hooks.json \
+	plugins/catenary/config.example.toml \
+	plugins/catenary/README.md \
+	hooks/hooks.json \
+	gemini-extension.json \
+	install.sh
+
+sync-public:
+	@echo "Syncing public files to dist/..."
+	@for f in $(DIST_FILES); do \
+		mkdir -p $(DIST)/$$(dirname $$f); \
+		cp $$f $(DIST)/$$f; \
+	done
+	@rsync -a --delete docs/src/ $(DIST)/docs/src/
+	@cd $(DIST) && git add -A && \
+		if git diff --cached --quiet; then \
+			echo "No changes to sync."; \
+		else \
+			git commit -m "sync: update public files" && \
+			git push origin main && \
+			echo "Public repo updated."; \
+		fi
 
 # Show current version info
 version:

@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.6.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NAS_REPO: mark@192.168.1.183:/share/git/Catenary.git
+
+jobs:
+  build-macos:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - name: Clone source
+        run: |
+          rm -rf source
+          git clone --branch ${{ inputs.version }} --depth 1 $NAS_REPO source
+
+      - name: Build arm64
+        run: |
+          export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
+          cd source && cargo build --release --target aarch64-apple-darwin
+
+      - name: Build x86_64
+        run: |
+          export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
+          cd source && cargo build --release --target x86_64-apple-darwin
+
+      - name: Prepare assets
+        run: |
+          cp source/target/aarch64-apple-darwin/release/catenary catenary-macos-arm64
+          cp source/target/x86_64-apple-darwin/release/catenary catenary-macos-amd64
+
+      - name: Upload arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: catenary-macos-arm64
+          path: catenary-macos-arm64
+
+      - name: Upload x86_64
+        uses: actions/upload-artifact@v4
+        with:
+          name: catenary-macos-amd64
+          path: catenary-macos-amd64
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf source catenary-macos-arm64 catenary-macos-amd64
+
+  build-windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Clone source
+        shell: bash
+        run: |
+          rm -rf source
+          git clone --branch ${{ inputs.version }} --depth 1 $NAS_REPO source
+
+      - name: Build
+        shell: bash
+        run: cd source && cargo build --release
+
+      - name: Prepare asset
+        shell: bash
+        run: cp source/target/release/catenary.exe catenary-windows-amd64.exe
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: catenary-windows-amd64.exe
+          path: catenary-windows-amd64.exe
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -rf source catenary-windows-amd64.exe
+
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          gh release create ${{ inputs.version }} \
+            artifacts/* \
+            --repo MarkWells-Dev/Catenary \
+            --title "${{ inputs.version }}" \
+            --draft \
+            --generate-notes
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf artifacts
