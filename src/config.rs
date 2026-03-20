@@ -119,10 +119,6 @@ pub struct IconConfig {
     pub session_shutdown: Option<String>,
     /// Server state change event icon.
     pub server_state: Option<String>,
-    /// Tool result arrow icon.
-    pub tool_result: Option<String>,
-    /// Tool result separator icon.
-    pub tool_result_sep: Option<String>,
     /// Sed tool icon.
     pub tool_sed: Option<String>,
     /// Language server active icon.

@@ -46,10 +46,6 @@ pub struct IconSet {
     pub session_shutdown: String,
     /// Server state change event icon.
     pub server_state: String,
-    /// Tool result arrow icon.
-    pub tool_result: String,
-    /// Tool result separator icon.
-    pub tool_result_sep: String,
     /// Sed tool icon.
     pub tool_sed: String,
     /// Language server active status icon.
@@ -88,8 +84,6 @@ struct PresetDefaults {
     session_started: &'static str,
     session_shutdown: &'static str,
     server_state: &'static str,
-    tool_result: &'static str,
-    tool_result_sep: &'static str,
     tool_sed: &'static str,
     ls_active: &'static str,
     ls_inactive: &'static str,
@@ -117,8 +111,6 @@ const PRESET_UNICODE: PresetDefaults = PresetDefaults {
     session_started: "\u{25CF} ",                                     // ●
     session_shutdown: "\u{25CB} ",                                    // ○
     server_state: "\u{25C6} ",                                        // ◆
-    tool_result: "\u{2B9C} ",                                         // ⮜
-    tool_result_sep: "\u{276F} ",                                     // ❯
     tool_sed: "\u{2B9E} ",                                            // ⮞
     ls_active: "\u{25CF} ",                                           // ●
     ls_inactive: "\u{25CB} ",                                         // ○
@@ -146,15 +138,13 @@ const PRESET_NERD: PresetDefaults = PresetDefaults {
     session_started: "\u{EB2C} ",  // nf-cod-play
     session_shutdown: "\u{EB67} ", // nf-cod-debug_stop
     server_state: "\u{EB99} ",     // nf-cod-server
-    tool_result: "\u{EA9B} ",      // nf-cod-arrow_left
-    tool_result_sep: "\u{F07F6} ",
-    tool_sed: "\u{EA73} ",    // nf-cod-edit
-    ls_active: "\u{EAB0} ",   // nf-cod-circle_filled
-    ls_inactive: "\u{EAB1} ", // nf-cod-circle_outline
-    proto_ok: "\u{F0C1} ",    // nf-fa-chain
-    proto_error: "\u{F127} ", // nf-fa-chain_broken
-    cancelled: "\u{F0374} ",  // nf-md-minus_thick
-    log_info: "\u{F0B79} ",   // nf-md-chat
+    tool_sed: "\u{EA73} ",         // nf-cod-edit
+    ls_active: "\u{EAB0} ",        // nf-cod-circle_filled
+    ls_inactive: "\u{EAB1} ",      // nf-cod-circle_outline
+    proto_ok: "\u{F0C1} ",         // nf-fa-chain
+    proto_error: "\u{F127} ",      // nf-fa-chain_broken
+    cancelled: "\u{F0374} ",       // nf-md-minus_thick
+    log_info: "\u{F0B79} ",        // nf-md-chat
     spinner_grow: &[],
     spinner_cycle: &[
         "\u{F144B}",
@@ -174,29 +164,27 @@ const PRESET_NERD: PresetDefaults = PresetDefaults {
 };
 
 const PRESET_EMOJI: PresetDefaults = PresetDefaults {
-    diag_error: "\u{274C}\u{FE0F}",       // ❌️
-    diag_warn: "\u{26A0}\u{FE0F} ",       // ⚠️
-    diag_info: "\u{2139}\u{FE0F} ",       // ℹ️
-    diag_ok: "\u{2705}\u{FE0F}",          // ✅️
-    tool_search: "\u{1F50D}",             // 🔍
-    tool_glob: "\u{1F5C2}\u{FE0F}",       // 🗂️
-    tool_default: "\u{27A1}\u{FE0F}",     // ➡️
-    workspace_open: "\u{1F4C2}",          // 📂
-    workspace_closed: "\u{1F4C1}",        // 📁
-    pinned: "\u{1F4CC}",                  // 📌
-    progress: "\u{2726} ",                // ✦ (static fallback; snake spinner is animated)
-    session_started: "\u{1F7E2}",         // 🟢
-    session_shutdown: "\u{1F534}",        // 🔴
-    server_state: "\u{1F537}",            // 🔷
-    tool_result: "\u{21A9}\u{FE0F} ",     // ↩️
-    tool_result_sep: "\u{1F5E8}\u{FE0F}", // 🗨️
-    tool_sed: "\u{270F}\u{FE0F}",         // ✏️
-    ls_active: "\u{1F7E2}",               // 🟢
-    ls_inactive: "\u{26AA}",              // ⚪
-    proto_ok: "\u{2705}",                 // ✅
-    proto_error: "\u{274C}",              // ❌
-    cancelled: "\u{1F6AB}",               // 🚫
-    log_info: "\u{1F5E8}\u{FE0F}",        // 🗨️
+    diag_error: "\u{274C}\u{FE0F}",   // ❌️
+    diag_warn: "\u{26A0}\u{FE0F} ",   // ⚠️
+    diag_info: "\u{2139}\u{FE0F} ",   // ℹ️
+    diag_ok: "\u{2705}\u{FE0F}",      // ✅️
+    tool_search: "\u{1F50D}",         // 🔍
+    tool_glob: "\u{1F5C2}\u{FE0F}",   // 🗂️
+    tool_default: "\u{27A1}\u{FE0F}", // ➡️
+    workspace_open: "\u{1F4C2}",      // 📂
+    workspace_closed: "\u{1F4C1}",    // 📁
+    pinned: "\u{1F4CC}",              // 📌
+    progress: "\u{2726} ",            // ✦ (static fallback; snake spinner is animated)
+    session_started: "\u{1F7E2}",     // 🟢
+    session_shutdown: "\u{1F534}",    // 🔴
+    server_state: "\u{1F537}",        // 🔷
+    tool_sed: "\u{270F}\u{FE0F}",     // ✏️
+    ls_active: "\u{1F7E2}",           // 🟢
+    ls_inactive: "\u{26AA}",          // ⚪
+    proto_ok: "\u{2705}",             // ✅
+    proto_error: "\u{274C}",          // ❌
+    cancelled: "\u{1F6AB}",           // 🚫
+    log_info: "\u{1F5E8}\u{FE0F}",    // 🗨️
     spinner_grow: &[],
     spinner_cycle: &[
         "\u{1F550}",
@@ -273,12 +261,6 @@ impl IconSet {
             server_state: config
                 .server_state
                 .unwrap_or_else(|| base.server_state.to_string()),
-            tool_result: config
-                .tool_result
-                .unwrap_or_else(|| base.tool_result.to_string()),
-            tool_result_sep: config
-                .tool_result_sep
-                .unwrap_or_else(|| base.tool_result_sep.to_string()),
             tool_sed: config.tool_sed.unwrap_or_else(|| base.tool_sed.to_string()),
             ls_active: config
                 .ls_active
@@ -387,8 +369,6 @@ mod tests {
         assert_eq!(icons.session_started, "\u{25CF} ");
         assert_eq!(icons.session_shutdown, "\u{25CB} ");
         assert_eq!(icons.server_state, "\u{25C6} ");
-        assert_eq!(icons.tool_result, "\u{2B9C} ");
-        assert_eq!(icons.tool_result_sep, "\u{276F} ");
         assert_eq!(icons.tool_sed, "\u{2B9E} ");
         assert_eq!(icons.ls_active, "\u{25CF} ");
         assert_eq!(icons.ls_inactive, "\u{25CB} ");
