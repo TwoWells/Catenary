@@ -1,0 +1,36 @@
+{
+  "description": "LSP diagnostics and root sync via catenary hooks",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook pre-tool --format=claude"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook post-tool --format=claude"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash(catenary restore *)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook post-tool --format=claude"
+          }
+        ]
+      }
+    ]
+  }
+}
