@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Bridge handler that maps MCP tool calls to LSP requests.
@@ -14,6 +14,7 @@ use tracing::warn;
 
 use super::DocumentManager;
 use super::diagnostics_server::DiagnosticsServer;
+use super::editing::EditingServer;
 use super::file_tools::GlobServer;
 use super::grep_server::GrepServer;
 use super::replace::ReplaceServer;
@@ -45,6 +46,8 @@ pub struct LspBridgeHandler {
     notified_offline: std::sync::Mutex<HashSet<String>>,
     /// Batch replacement tool with snapshots and diagnostics.
     replace: ReplaceServer,
+    /// Per-file diagnostic batching (start_editing / done_editing).
+    editing: EditingServer,
 }
 
 impl LspBridgeHandler {
@@ -56,6 +59,10 @@ impl LspBridgeHandler {
         diagnostics: Arc<DiagnosticsServer>,
         session_id: Option<String>,
     ) -> Self {
+        let editing = EditingServer::new(
+            diagnostics.clone(),
+            session_id.clone().unwrap_or_default(),
+        );
         let replace = ReplaceServer::new(
             client_manager.clone(),
             doc_manager.clone(),
@@ -81,6 +88,7 @@ impl LspBridgeHandler {
             runtime,
             notified_offline: std::sync::Mutex::new(HashSet::new()),
             replace,
+            editing,
         }
     }
 
@@ -316,6 +324,46 @@ impl ToolHandler for LspBridgeHandler {
                 })),
             },
             Tool {
+                name: "start_editing".to_string(),
+                description: Some("Signal that you intend to make multiple edits to a file. Diagnostics are suppressed until done_editing is called. Call this before using Edit on a file.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "File path to start editing"
+                        }
+                    },
+                    "required": ["file"]
+                }),
+                annotations: Some(serde_json::json!({
+                    "readOnlyHint": false,
+                    "destructiveHint": false,
+                    "idempotentHint": true,
+                    "openWorldHint": false
+                })),
+            },
+            Tool {
+                name: "done_editing".to_string(),
+                description: Some("Signal that you are finished editing a file. Returns LSP diagnostics for the final state. Must be called after start_editing before using non-Edit tools.".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "File path to finish editing"
+                        }
+                    },
+                    "required": ["file"]
+                }),
+                annotations: Some(serde_json::json!({
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "idempotentHint": false,
+                    "openWorldHint": false
+                })),
+            },
+            Tool {
                 name: "replace".to_string(),
                 description: Some("Batch replacement across one or more files.\n\nGLOB (required)\n  File path or glob pattern.\n    src/main.rs          single file\n    src/**/*.rs          all Rust files under src/\n    **/*.md              all markdown files\n\n  Directory paths are not accepted \u{2014} use a glob pattern to match\n  files in a directory (e.g., src/bridge/*.rs).\n\nEDITS (required)\n  Array of {old, new, flags?} replacements applied sequentially.\n\n  old      text to find (literal or regex)\n  new      replacement text ($1, $2, ${name} in regex mode)\n  flags    optional:\n             g  replace all occurrences\n             r  treat old as regex, new supports capture groups\n             i  case insensitive (implies r)\n             m  multiline (implies r)\n             s  dotall (implies r)\n\n  No flags = literal match, first occurrence only (same as Edit).\n\n  Examples:\n    { old: \"OldType\", new: \"NewType\", flags: \"g\" }\n    { old: \"use crate::old\", new: \"use crate::new\" }\n\nLINES (optional)\n  Line ranges to constrain replacements. Space-separated.\n    1-10       lines 1 through 10\n    30         just line 30\n    70-        line 70 through EOF\n\nEXCLUDE (optional)\n  Glob pattern to exclude from matches.\n\nINCLUDE_GITIGNORED (default: false)\n  Include gitignored files in glob expansion.\n\nINCLUDE_HIDDEN (default: false)\n  Include hidden files (dotfiles) in glob expansion.\n\nOUTPUT\n  Per-file replacement count with sample diffs. LSP diagnostics\n  (if any) appear after the summary.\n\nSAFETY\n  Every call creates a pre-edit snapshot. Undo with:\n    catenary restore <file>         most recent snapshot\n    catenary restore --id <N>       specific snapshot\n    catenary restore --list         show all snapshots\n  Clean up sidecars: catenary gc --sidecars".to_string()),
                 input_schema: serde_json::json!({
@@ -365,6 +413,30 @@ impl ToolHandler for LspBridgeHandler {
         } else {
             Self::extract_file_path(arguments.as_ref())
         };
+
+        // Editing tools: early dispatch, no LSP readiness wait.
+        // start_editing is db-only; done_editing delegates to DiagnosticsServer.
+        if name == "start_editing" || name == "done_editing" {
+            let file = arguments
+                .as_ref()
+                .and_then(|v| v.get("file"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("{name} requires a 'file' parameter"))?;
+
+            let roots = self.runtime.block_on(self.client_manager.roots());
+
+            let result = if name == "start_editing" {
+                self.editing.start_editing(file, &roots)
+            } else {
+                self.runtime
+                    .block_on(self.editing.done_editing(file, &roots))
+            };
+
+            return match result {
+                Ok(text) => Ok(CallToolResult::text(text)),
+                Err(e) => Ok(CallToolResult::error(e.to_string())),
+            };
+        }
 
         // Replace: early dispatch, no LSP readiness wait — handles its own
         // LSP interaction via DiagnosticsServer after the file write.

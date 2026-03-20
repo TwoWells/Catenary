@@ -1,8 +1,10 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 /// Diagnostics pipeline for PostToolUse hook requests.
 pub mod diagnostics_server;
+/// MCP tools for per-file diagnostic batching (start_editing / done_editing).
+pub mod editing;
 /// Manages document lifecycle and sync between disk and LSP servers.
 mod document_manager;
 /// Glob tool handler: unified file/directory/pattern browsing.
