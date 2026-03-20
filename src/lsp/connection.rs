@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Transport layer: process lifecycle, reader loop, request/response correlation.

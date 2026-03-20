@@ -1,5 +1,5 @@
 # cargo-deny configuration
-# Protects dual GPL-3.0 + commercial licensing
+# Protects PolyForm Noncommercial licensing
 
 [advisories]
 version = 2
@@ -9,8 +9,7 @@ ignore = []
 version = 2
 confidence-threshold = 0.8
 
-# Only permissive licenses - safe for both GPL and commercial
-# One codebase, no split maintenance
+# Only permissive licenses for dependencies
 allow = [
     "MIT",
     "Apache-2.0",
@@ -28,11 +27,11 @@ allow = [
 
 # Denied by omission: GPL, AGPL, LGPL, SSPL, proprietary, unknown
 
-# Catenary itself is GPL-3.0 (dual-licensed), but dependencies must be permissive
+# Catenary crates use PolyForm Noncommercial (not in SPDX registry)
 exceptions = [
-    { name = "catenary-mcp", allow = ["GPL-3.0-or-later"] },
-    { name = "catenary-proc", allow = ["GPL-3.0-or-later"] },
-    { name = "catenary-ts", allow = ["GPL-3.0-or-later"] },
+    { name = "catenary-mcp", allow = ["PolyForm-Noncommercial-1.0.0"] },
+    { name = "catenary-proc", allow = ["PolyForm-Noncommercial-1.0.0"] },
+    { name = "catenary-ts", allow = ["PolyForm-Noncommercial-1.0.0"] },
 ]
 
 [licenses.private]

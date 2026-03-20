@@ -2,7 +2,7 @@
 name = "catenary-ts"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "Safe FFI wrapper for loading tree-sitter grammars from shared libraries"
 repository = "https://github.com/MarkWells-Dev/Catenary"
 readme = "../../README.md"

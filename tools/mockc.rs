@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! A mock compiler subprocess for testing load-aware wait detection.
