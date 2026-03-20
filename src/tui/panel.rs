@@ -337,17 +337,35 @@ impl<'a> PanelState<'a> {
                 // Separators only appear inside ScopeChild; bare separator is inert.
             }
             FlatLine::ScopeChild {
-                scope_parent_index, ..
-            } => {
-                // Collapse the parent scope segment and move cursor to its header.
-                self.expanded.remove(&scope_parent_index);
-                let new_flat = self.flat_lines();
-                if let Some(pos) = new_flat.iter().position(|fl| {
-                    matches!(fl, FlatLine::ScopeHeader { expansion_key, .. } if *expansion_key == scope_parent_index)
-                }) {
-                    self.cursor = pos;
+                scope_parent_index,
+                ref inner,
+                ..
+            } => match inner.as_ref() {
+                FlatLine::CollapsedHeader { start_index, .. } => {
+                    if self.expanded.contains(start_index) {
+                        self.expanded.remove(start_index);
+                    } else {
+                        self.expanded.insert(*start_index);
+                    }
                 }
-            }
+                FlatLine::ScopeHeader { expansion_key, .. } => {
+                    if self.expanded.contains(expansion_key) {
+                        self.expanded.remove(expansion_key);
+                    } else {
+                        self.expanded.insert(*expansion_key);
+                    }
+                }
+                _ => {
+                    // MessageHeader, Detail, Separator — collapse parent scope.
+                    self.expanded.remove(&scope_parent_index);
+                    let new_flat = self.flat_lines();
+                    if let Some(pos) = new_flat.iter().position(|fl| {
+                        matches!(fl, FlatLine::ScopeHeader { expansion_key, .. } if *expansion_key == scope_parent_index)
+                    }) {
+                        self.cursor = pos;
+                    }
+                }
+            },
         }
         self.snap_viewport(0);
     }
@@ -1597,10 +1615,10 @@ mod tests {
         // Cursor on the ScopeHeader (line 0).
         panel.cursor = 0;
 
-        // Toggle: expand scope (expansion key is first child's index = 1).
+        // Toggle: expand scope (expansion key is parent's index = 0).
         panel.toggle_expansion();
         assert!(
-            panel.expanded.contains(&1),
+            panel.expanded.contains(&0),
             "scope should be expanded after toggle"
         );
         let flat = panel.flat_lines();
@@ -1610,19 +1628,19 @@ mod tests {
         panel.cursor = 0;
         panel.toggle_expansion();
         assert!(
-            !panel.expanded.contains(&1),
+            !panel.expanded.contains(&0),
             "scope should be collapsed after second toggle"
         );
 
         // Expand again, then toggle on a child.
         panel.cursor = 0;
         panel.toggle_expansion();
-        assert!(panel.expanded.contains(&1));
+        assert!(panel.expanded.contains(&0));
         // Move cursor to first ScopeChild (line 1).
         panel.cursor = 1;
         panel.toggle_expansion();
         assert!(
-            !panel.expanded.contains(&1),
+            !panel.expanded.contains(&0),
             "toggling on ScopeChild should collapse parent"
         );
         assert_eq!(
@@ -1798,8 +1816,8 @@ mod tests {
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         panel.load_messages(messages);
 
-        // Expand segment 1 only (first child index = 1).
-        panel.expanded.insert(1);
+        // Expand segment 1 only (parent index = 0 for First segment).
+        panel.expanded.insert(0);
         let flat = panel.flat_lines();
 
         // Segment 1 ScopeHeader + 2 ScopeChildren + interruption + Segment 2 ScopeHeader (collapsed)
@@ -1977,8 +1995,8 @@ mod tests {
 
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         panel.load_messages(messages);
-        // Expansion key = first child index = 1
-        panel.expanded.insert(1);
+        // Expansion key = parent index = 0
+        panel.expanded.insert(0);
 
         // Find the separator line index
         let flat = panel.flat_lines();
@@ -1998,7 +2016,7 @@ mod tests {
 
         // Scope should be collapsed
         assert!(
-            !panel.expanded.contains(&1),
+            !panel.expanded.contains(&0),
             "scope should be collapsed after toggling on separator"
         );
         // Cursor should be on the ScopeHeader

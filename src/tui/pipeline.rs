@@ -122,10 +122,15 @@ impl DisplayEntry {
             Self::Paired { request_index, .. } => *request_index,
             Self::Collapsed { start_index, .. } => *start_index,
             Self::Scope {
-                children, parent, ..
-            } => children
-                .first()
-                .map_or_else(|| parent.expansion_index(), Self::expansion_index),
+                children,
+                parent,
+                position,
+            } => match position {
+                SegmentPosition::First | SegmentPosition::Only => parent.expansion_index(),
+                _ => children
+                    .first()
+                    .map_or_else(|| parent.expansion_index(), Self::expansion_index),
+            },
         }
     }
 }
