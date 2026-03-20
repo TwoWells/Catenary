@@ -61,6 +61,12 @@ _HEREDOC_MARKER_RE = re.compile(r'<<-?\s*\\?[\'"]?(\w+)[\'"]?')
 _SEQ_SPLIT_RE = re.compile(r'\s*(?:&&|\|\||;)\s*')
 _PIPE_SPLIT_RE = re.compile(r'\s*(?<!\|)\|(?!\|)\s*')
 
+# Matches echo with a bare string literal between sequential operators.
+# Agents insert these as visual separators (e.g. && echo "---" &&).
+_ECHO_SEP_RE = re.compile(
+    r'(&&|\|\||;)\s*echo\s+(?:"[^"]*"|\'[^\']*\')\s*(?=&&|\|\||;|$)'
+)
+
 
 def _mask_quotes(s):
     """Replace quoted content (including delimiters) with spaces.
@@ -182,6 +188,8 @@ def find_command(tokens):
 def check(cmd_string):
     """Check all commands in the string. Return deny reason or None."""
     cmd_string = _strip_heredoc_bodies(cmd_string)
+    # Strip echo separators: && echo "---" && → &&
+    cmd_string = _ECHO_SEP_RE.sub(r'\1', cmd_string)
     # Split on sequential operators first (&& || ;).
     # Do NOT split on bare | here — pipelines are handled in the inner loop so
     # we can allow PIPELINE_SAFE commands that read from stdin (mid-pipeline)

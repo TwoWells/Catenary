@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "BeforeAgent": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "name": "catenary-pre-agent",
+            "type": "command",
+            "command": "catenary hook pre-agent --format=gemini"
+          }
+        ]
+      }
+    ],
     "BeforeTool": [
       {
         "matcher": "",
@@ -53,7 +65,7 @@
           {
             "name": "catenary-stop",
             "type": "command",
-            "command": "catenary hook stop --format=gemini"
+            "command": "catenary hook post-agent --format=gemini"
           }
         ]
       }

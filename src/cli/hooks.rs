@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Hook handlers for host CLI integration (diagnostics and root sync).
+//! Hook handlers for host CLI integration.
+//!
+//! Function names mirror the hook lifecycle:
+//! - `run_pre_agent` — root sync (`UserPromptSubmit` / `BeforeAgent`)
+//! - `run_pre_tool` — editing state enforcement (`PreToolUse` / `BeforeTool`)
+//! - `run_post_tool` — diagnostics (`PostToolUse` / `AfterTool`)
+//! - `run_post_agent` — force `done_editing` (`Stop` / `AfterAgent`)
 
 #![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
@@ -84,7 +90,7 @@ fn ipc_exchange(
 /// Returns `true` if the tool is an edit tool that requires `start_editing`.
 fn is_edit_tool(tool_name: &str, format: HostFormat) -> bool {
     match format {
-        HostFormat::Claude => matches!(tool_name, "Edit" | "NotebookEdit"),
+        HostFormat::Claude => matches!(tool_name, "Edit" | "Write" | "NotebookEdit"),
         HostFormat::Gemini => matches!(tool_name, "write_file" | "replace"),
     }
 }
@@ -222,7 +228,7 @@ pub fn run_session_start(format: HostFormat) {
 /// directing the agent to call `done_editing`. If `stop_hook_active` is true
 /// (Claude Code) indicating a retry, allows the stop — SessionStart cleanup
 /// handles the stale state.
-pub fn run_stop(format: HostFormat) {
+pub fn run_post_agent(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -261,13 +267,13 @@ pub fn run_stop(format: HostFormat) {
     print!("{}", format_stop_block(&reason, format));
 }
 
-/// Run diagnostics notify after reading or editing (`PostToolUse` hook handler).
+/// Run diagnostics after reading or editing (`PostToolUse` / `AfterTool` hook handler).
 ///
 /// Reads hook JSON from stdin, finds the session for the file's workspace,
 /// connects to the notify socket, and returns diagnostics for the model's
 /// context. Emits `systemMessage` JSON on infrastructure errors so the user
 /// sees failures in their terminal.
-pub fn run_notify(format: HostFormat) {
+pub fn run_post_tool(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         print!(
             "{}",
@@ -394,15 +400,46 @@ pub fn run_notify(format: HostFormat) {
     }
 }
 
-/// Pre-tool handler: editing state enforcement + workspace root sync.
+/// Refresh workspace roots (`UserPromptSubmit` / `BeforeAgent` hook handler).
+///
+/// Sends a `refresh_roots` IPC request to the running Catenary session so
+/// `/add-dir` workspace additions are picked up. Runs once per user prompt
+/// rather than on every tool call.
+///
+/// Silently succeeds on any error to avoid breaking the host CLI's flow.
+pub fn run_pre_agent(format: HostFormat) {
+    let _ = format; // Reserved for future per-host output formatting.
+
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    let Ok(conn) = db::open_and_migrate() else {
+        return;
+    };
+
+    if let Some(catenary_sid) = find_session_id(&hook_json, &conn) {
+        let endpoint = notify_endpoint(&catenary_sid);
+        if let Some(stream) = notify_connect(&endpoint) {
+            let request = serde_json::json!({ "refresh_roots": true });
+            let _ = ipc_exchange(stream, &request);
+        }
+    }
+}
+
+/// Editing state enforcement (`PreToolUse` / `BeforeTool` hook handler).
 ///
 /// Checks editing state before allowing tool execution. If the agent is
 /// editing files, only Edit/Read on those files and Catenary editing tools
 /// are allowed. If the agent is not editing, Edit requires `start_editing`
-/// first. After editing checks, refreshes workspace roots via IPC.
+/// first.
 ///
 /// Silently succeeds on any error to avoid breaking the host CLI's flow.
-pub fn run_sync_roots(format: HostFormat) {
+pub fn run_pre_tool(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -416,7 +453,6 @@ pub fn run_sync_roots(format: HostFormat) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // --- Editing state checks ---
     let Ok(conn) = db::open_and_migrate() else {
         // Can't check editing state — allow the tool to proceed.
         return;
@@ -474,13 +510,6 @@ pub fn run_sync_roots(format: HostFormat) {
             );
             print!("{}", format_deny(&reason, format));
             return;
-        }
-
-        // --- Root sync ---
-        let endpoint = notify_endpoint(&catenary_sid);
-        if let Some(stream) = notify_connect(&endpoint) {
-            let request = serde_json::json!({ "refresh_roots": true });
-            let _ = ipc_exchange(stream, &request);
         }
     }
 }

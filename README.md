@@ -1,9 +1,6 @@
-# Catenary Internal
+# Catenary
 
-Private planning and tracking for the Catenary project.
-
-This is a separate git repository nested inside the main Catenary repo.
-It is excluded via `.gitignore` and has its own remote and commit history.
+Internal planning and tracking for the Catenary project.
 
 ## Workstreams
 
@@ -15,50 +12,44 @@ It is excluded via `.gitignore` and has its own remote and commit history.
 | 4 | [SEARCHv2](#4-searchv2) | **In progress** | `tickets/searchv2/README.md` |
 | 5 | [Misc](#5-misc) | **Open** | `tickets/misc/README.md` |
 | 6 | [Wait model redesign](#6-wait-model-redesign) | **Reverted → v2 design** | `tickets/wait/DESIGN.md` |
-| 7 | [Wait model v2](#7-wait-model-v2) | **1b blocked on acquire v1** | `tickets/waitv2/README.md` |
+| 7 | [Wait model v2](#7-wait-model-v2) | **1b ready** | `tickets/waitv2/README.md` |
 | 8 | [Monitoring](#8-monitoring) | **Complete** | `tickets/monitoring/README.md` |
 | 9 | [Filtering](#9-filtering) | **Design complete** | `tickets/filtering/DESIGN.md` |
 | 10 | [Collapse](#10-collapse) | **Complete** | `tickets/collapse/README.md` |
-| 11 | [Replace](#11-replace) | **Superseded by 13** | `tickets/replace/README.md` |
+| 11 | [Replace](#11-replace) | **Removal ready** | `tickets/replace/README.md` |
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
-| 13 | [Diagnostic batching](#13-diagnostic-batching) | **Ticket 00 done, 01 next** | `tickets/acquire/DESIGN.md` |
+| 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 complete** | `tickets/acquire/DESIGN.md` |
 | 14 | [Recommend](#14-recommend) | **Design complete** | `tickets/recommend/DESIGN.md` |
 
 ## Current priority
 
-**Workstream 13 (Diagnostic batching) v1 in progress.** Ticket 00
-(schema + editing state operations) done. Ticket 01 (MCP tools:
-`start_editing`/`done_editing`) next. v1 scope: editing state table,
-MCP tools (no hold semantics, no mutual exclusion), PreToolUse deny,
-PostToolUse suppression, Stop/AfterAgent enforcement. Cold release —
-no LSP changes. Constrained bash rewrite decoupled to workstream 14
-(Recommend). Replace removal is a cleanup ticket after v1 ships.
+**Workstream 13 (Diagnostic batching) v1 complete.** Editing state
+table, MCP tools (`start_editing`/`done_editing`), PreToolUse deny,
+PostToolUse suppression, Stop/AfterAgent enforcement — all shipped.
+v2 (warm state) depends on waitv2 1b infrastructure.
 
-**Workstream 7 (Wait model v2) Phase 1b blocked on v1.**
-1b agents benefit from diagnostic suppression during heavy refactors.
-1b design change: `DocumentManager` retained as ref-counted document
-lifecycle owner (not stripped to utilities). Multiple agents may have
-overlapping files open via v2 warm state — `DocumentManager` tracks
-ref counts per URI, sends `didOpen` on first open and `didClose` on
-last close. Also: make `DiagnosticsServer` pipeline composable, add
-`TextDocumentSyncKind` to `ServerProfile`.
+**Workstream 7 (Wait model v2) Phase 1b now unblocked.**
 Phase 0 (structural refactoring, 8 tickets) complete. Phase 1a
 (protocol compliance, 8 tickets) complete — all profiling done
 (findings 23-25), settle signal validated. 1a-04 deferred to 1b.
 Phase 1b pipeline design finalized: `tickets/waitv2/design/pipeline_1b.md`.
-Settle design superseded by pipeline_1b.md.
-Phase 1b has 10 tickets (1b-00 through 1b-08, including 02a/02b split).
+10 tickets (1b-00 through 1b-08, including 02a/02b split).
 Critical path: 01 → 02a → 02b → 03 → {06, 07} → 08.
 Independent: 00 (capability gates), 04 (OnceLock), 05 (dm utils).
+1b design: `DocumentManager` retained as ref-counted document
+lifecycle owner. `DiagnosticsServer` pipeline made composable.
+`TextDocumentSyncKind` added to `ServerProfile`.
+
+**Workstream 11 (Replace) removal ready.** Strip `ReplaceServer`,
+MCP tool registration, snapshots table, `catenary restore`, and
+sidecar logic. Cleanup now that acquire v1 has shipped.
 
 **Workstream 4 (SEARCHv2) is in progress.** Ticket 00 complete. Next
 eligible: 01, 02a, 03, 04, 05 (parallel). Blocked on capacity.
 
-**Workstream 10 (Collapse) is complete.** All phases (0-5) done.
-
-**Workstream 11 (Replace) is complete.** All 6 tickets (00a-00c,
-01-03) landed. Superseded by acquire — replace tool, snapshots, and
-restore CLI to be removed once acquire v1 ships.
+**Workstream 14 (Recommend) design complete.** Ready for ticketing.
+Replaces `scripts/constrained_bash.py` with Rust in
+`catenary hook pre-tool`.
 
 ---
 
@@ -187,15 +178,14 @@ Design: `tickets/wait/DESIGN.md`.
 
 ## 7. Wait model v2
 
-**Status: Phase 1b blocked on acquire v1.** All 8 Phase 0 tickets
-landed (0a, 0b, 0c, 0d1-0d4, 0e). Three-layer architecture
-(Connection, ServerInbox, Client) in place, `lsp_types` removed, JSON
-builders/extractors throughout. Phase 1a complete.
+**Status: Phase 1b ready.** All 8 Phase 0 tickets landed (0a, 0b,
+0c, 0d1-0d4, 0e). Three-layer architecture (Connection, ServerInbox,
+Client) in place, `lsp_types` removed, JSON builders/extractors
+throughout. Phase 1a complete. Acquire v1 shipped — 1b is unblocked.
 
 Phase 1b pipeline design finalized. 10 tickets (1b-00 through 1b-08,
-including 02a/02b split). Blocked on acquire v1 — 1b agents need
-diagnostic suppression during heavy refactors. 1b tickets need
-updating to accommodate acquire v2:
+including 02a/02b split). 1b tickets need updating to accommodate
+acquire v2:
 - `DocumentManager` removal: strip down to `didChange` utilities
   instead of deleting entirely.
 - `DiagnosticsServer`: make pipeline composable so release can enter
@@ -271,9 +261,9 @@ Tracker: `tickets/collapse/README.md`.
 
 ## 11. Replace
 
-**Status: Superseded by workstream 13 (Acquire).** All 6 tickets
-(00a-00c, 01-03) landed and shipped. MCP tool to be removed in
-workstream 13.
+**Status: Removal ready.** All 6 tickets (00a-00c, 01-03) landed
+and shipped. Acquire v1 complete — `ReplaceServer`, MCP tool,
+snapshots table, `catenary restore`, and sidecar logic to be removed.
 
 Batch edit MCP tool. Accepted a glob pattern and a list of
 `{old, new, flags}` edit operations. Applied all edits in one tool
@@ -321,7 +311,7 @@ Design: `tickets/summarize/DESIGN.md`. Tracker: `tickets/summarize/README.md`.
 
 ## 13. Diagnostic batching
 
-**Status: Ticket 00 done, 01 next.**
+**Status: v1 complete.** v2 blocked on waitv2 1b.
 
 Per-file diagnostic suppression via `start_editing`/`done_editing`
 MCP tools. The agent signals intent to edit a file; diagnostics are
@@ -335,18 +325,15 @@ SessionStart clears stale state. Supersedes the replace MCP tool
 (workstream 11).
 
 Two phases:
-- **v1 (cold release):** Editing state table, MCP tools, PreToolUse
-  deny, PostToolUse suppression, Stop/AfterAgent enforcement. No LSP
-  traffic during editing. `done_editing` calls existing
-  `DiagnosticsServer` unchanged.
+- **v1 (cold release) — complete.** Editing state table, MCP tools,
+  PreToolUse deny, PostToolUse suppression, Stop/AfterAgent
+  enforcement. No LSP traffic during editing. `done_editing` calls
+  existing `DiagnosticsServer` unchanged.
 - **v2 (warm state, after waitv2 1b):** `didOpen` on `start_editing`,
   `didChange` per edit, `done_editing` enters pipeline at `didSave`.
   Requires 1b infrastructure (composable pipeline,
   `TextDocumentSyncKind` on `ServerProfile`, `DocumentManager` as
   ref-counted lifecycle owner).
-
-Constrained bash rewrite decoupled to workstream 14 (Recommend).
-Replace removal is a separate cleanup ticket after v1 ships.
 
 Design: `tickets/acquire/DESIGN.md`.
 Issues: `tickets/acquire/ISSUES.md`.
@@ -377,6 +364,8 @@ Design: `tickets/recommend/DESIGN.md`.
 
 ## Contents
 
+- `dist/` — Public distribution submodule (`MarkWells-Dev/Catenary` on GitHub).
+  Plugin manifests, hooks, docs site, install script, CI/CD, and public README.
 - `architecture/` — Host CLI and Catenary architecture references. Includes
   `lsp/spec-reference.md` (condensed LSP 3.17 spec for Catenary's subset).
 - `decisions/` — Architectural decision records.

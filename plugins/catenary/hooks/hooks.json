@@ -12,6 +12,17 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook pre-agent --format=claude"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "",
@@ -49,7 +60,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary hook stop --format=claude"
+            "command": "catenary hook post-agent --format=claude"
           }
         ]
       }
@@ -60,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "catenary hook stop --format=claude"
+            "command": "catenary hook post-agent --format=claude"
           }
         ]
       }

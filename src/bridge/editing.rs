@@ -13,8 +13,42 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use super::diagnostics_server::DiagnosticsServer;
-use super::handler::{display_path, resolve_path};
+use super::handler::display_path;
 use crate::db;
+
+/// Resolves a file path against workspace roots.
+///
+/// Absolute paths pass through. Relative paths are resolved against each root
+/// in order — the first root where the file exists wins. If the file doesn't
+/// exist under any root, returns an error listing the roots that were checked.
+fn resolve_in_roots(file: &str, roots: &[PathBuf]) -> Result<PathBuf> {
+    let path = PathBuf::from(file);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    // Try each workspace root — first existing file wins.
+    for root in roots {
+        let candidate = root.join(&path);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    // File doesn't exist under any root. If there's exactly one root,
+    // resolve against it (could be a new file). Otherwise, report the
+    // mismatch so the agent can provide an absolute path.
+    if roots.len() == 1 {
+        return Ok(roots[0].join(&path));
+    }
+
+    let root_list: Vec<_> = roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+    Err(anyhow!(
+        "cannot resolve relative path \"{file}\" — file not found under workspace roots: [{}]. \
+         Use an absolute path instead.",
+        root_list.join(", ")
+    ))
+}
 
 /// Handles `start_editing` and `done_editing` MCP tool calls.
 ///
@@ -49,7 +83,7 @@ impl EditingServer {
         file: &str,
         roots: &[PathBuf],
     ) -> Result<String> {
-        let path = resolve_path(file)?;
+        let path = resolve_in_roots(file, roots)?;
         let abs = path.to_string_lossy();
         let display = display_path(&abs, roots);
 
@@ -77,7 +111,7 @@ impl EditingServer {
         file: &str,
         roots: &[PathBuf],
     ) -> Result<String> {
-        let path = resolve_path(file)?;
+        let path = resolve_in_roots(file, roots)?;
         let abs = path.to_string_lossy();
         let display = display_path(&abs, roots);
 

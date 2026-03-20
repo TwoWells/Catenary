@@ -198,23 +198,30 @@ enum Command {
 /// Hook subcommands invoked by host CLI hooks.
 #[derive(Subcommand, Debug)]
 enum HookCommand {
-    /// Post-tool: file-change notification with diagnostics.
-    #[command(name = "post-tool")]
-    PostTool {
+    /// Pre-agent: refresh workspace roots (UserPromptSubmit / BeforeAgent).
+    #[command(name = "pre-agent")]
+    PreAgent {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// Pre-tool: editing state enforcement + workspace root sync.
+    /// Pre-tool: editing state enforcement (PreToolUse / BeforeTool).
     #[command(name = "pre-tool")]
     PreTool {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// Stop / AfterAgent: force done_editing before agent finishes.
-    #[command(name = "stop")]
-    Stop {
+    /// Post-tool: file-change notification with diagnostics (PostToolUse / AfterTool).
+    #[command(name = "post-tool")]
+    PostTool {
+        /// Output format: "claude" or "gemini".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// Post-agent: force done_editing before agent finishes (Stop / AfterAgent).
+    #[command(name = "post-agent")]
+    PostAgent {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
@@ -278,19 +285,20 @@ async fn main() -> Result<()> {
         }
         Some(Command::Hook { command }) => {
             match command {
-                HookCommand::PostTool { format } => cli::hooks::run_notify(format),
-                HookCommand::PreTool { format } => cli::hooks::run_sync_roots(format),
-                HookCommand::Stop { format } => cli::hooks::run_stop(format),
+                HookCommand::PreAgent { format } => cli::hooks::run_pre_agent(format),
+                HookCommand::PreTool { format } => cli::hooks::run_pre_tool(format),
+                HookCommand::PostTool { format } => cli::hooks::run_post_tool(format),
+                HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
             }
             Ok(())
         }
         Some(Command::SyncRoots { format }) => {
-            cli::hooks::run_sync_roots(format);
+            cli::hooks::run_pre_tool(format);
             Ok(())
         }
         Some(Command::Notify { format }) => {
-            cli::hooks::run_notify(format);
+            cli::hooks::run_post_tool(format);
             Ok(())
         }
         Some(Command::Query {
@@ -602,14 +610,14 @@ mod tests {
     // ── CLI hook subcommand tests ─────────────────────────────────
 
     #[test]
-    fn test_cli_hook_post_tool() {
+    fn test_cli_hook_pre_agent() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "post-tool", "--format=claude"]);
-        let args = args.expect("hook post-tool should parse");
+        let args = Args::try_parse_from(["catenary", "hook", "pre-agent", "--format=claude"]);
+        let args = args.expect("hook pre-agent should parse");
         let Some(Command::Hook { command }) = args.command else {
             unreachable!("expected Hook command");
         };
-        assert!(matches!(command, HookCommand::PostTool { .. }));
+        assert!(matches!(command, HookCommand::PreAgent { .. }));
     }
 
     #[test]
@@ -624,14 +632,25 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_hook_stop() {
+    fn test_cli_hook_post_tool() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "stop", "--format=claude"]);
-        let args = args.expect("hook stop should parse");
+        let args = Args::try_parse_from(["catenary", "hook", "post-tool", "--format=claude"]);
+        let args = args.expect("hook post-tool should parse");
         let Some(Command::Hook { command }) = args.command else {
             unreachable!("expected Hook command");
         };
-        assert!(matches!(command, HookCommand::Stop { .. }));
+        assert!(matches!(command, HookCommand::PostTool { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_post_agent() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "post-agent", "--format=claude"]);
+        let args = args.expect("hook post-agent should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::PostAgent { .. }));
     }
 
     #[test]
