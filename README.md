@@ -15,7 +15,7 @@ Internal planning and tracking for the Catenary project.
 | 7 | [Wait model v2](#7-wait-model-v2) | **1b ready** | `tickets/waitv2/README.md` |
 | 8 | [Monitoring](#8-monitoring) | **Complete** | `tickets/monitoring/README.md` |
 | 9 | [Filtering](#9-filtering) | **Design complete** | `tickets/filtering/DESIGN.md` |
-| 10 | [Collapse](#10-collapse) | **Complete** | `tickets/collapse/README.md` |
+| 10 | [Collapse](#10-collapse) | **Phase 6 open** | `tickets/collapse/README.md` |
 | 11 | [Replace](#11-replace) | **Removal ready** | `tickets/replace/README.md` |
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
 | 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 complete** | `tickets/acquire/DESIGN.md` |
@@ -23,33 +23,38 @@ Internal planning and tracking for the Catenary project.
 
 ## Current priority
 
-**Workstream 13 (Diagnostic batching) v1 complete.** Editing state
-table, MCP tools (`start_editing`/`done_editing`), PreToolUse deny,
-PostToolUse suppression, Stop/AfterAgent enforcement — all shipped.
-v2 (warm state) depends on waitv2 1b infrastructure.
+**1. Collapse 11 → Misc 19 — Toolbox + binary file detection.**
+Collapse 11 extracts `Toolbox` from `LspBridgeHandler` (I19 from
+waitv2 design review). Misc 19 adds `FilesystemCache` on `Toolbox`
+with binary detection (null byte scan + 10 MB size gate), shared by
+grep and glob. Blocker on sshfs/NAS workspaces.
 
-**Workstream 7 (Wait model v2) Phase 1b now unblocked.**
-Phase 0 (structural refactoring, 8 tickets) complete. Phase 1a
-(protocol compliance, 8 tickets) complete — all profiling done
-(findings 23-25), settle signal validated. 1a-04 deferred to 1b.
-Phase 1b pipeline design finalized: `tickets/waitv2/design/pipeline_1b.md`.
-10 tickets (1b-00 through 1b-08, including 02a/02b split).
-Critical path: 01 → 02a → 02b → 03 → {06, 07} → 08.
-Independent: 00 (capability gates), 04 (OnceLock), 05 (dm utils).
-1b design: `DocumentManager` retained as ref-counted document
-lifecycle owner. `DiagnosticsServer` pipeline made composable.
-`TextDocumentSyncKind` added to `ServerProfile`.
+~~**2. Misc 21 — Grep glob scoping.**~~ **Complete.** Added `glob`,
+`exclude`, `include_gitignored`, `include_hidden` parameters to grep.
+Both ripgrep file walk and symbol universe filtered to scope.
 
-**Workstream 11 (Replace) removal ready.** Strip `ReplaceServer`,
-MCP tool registration, snapshots table, `catenary restore`, and
-sidecar logic. Cleanup now that acquire v1 has shipped.
+**2. Misc 20 — HookServer as protocol boundary.** All five hooks
+through `HookServer` with caller-supplied method names. Foundation
+cleanup before waitv2 1b. Fixes monitor visibility (pre-agent
+mislabeled, post-agent/session-start invisible). Subsumes misc 07.
 
-**Workstream 4 (SEARCHv2) is in progress.** Ticket 00 complete. Next
-eligible: 01, 02a, 03, 04, 05 (parallel). Blocked on capacity.
+**3. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
+finalized: `tickets/waitv2/design/pipeline_1b.md`. 10 tickets
+(1b-00 through 1b-08, including 02a/02b split). Critical path:
+01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 00 (capability
+gates), 04 (OnceLock), 05 (dm utils). Collapse workstream complete
+— 1b ordering dependency satisfied.
 
-**Workstream 14 (Recommend) design complete.** Ready for ticketing.
-Replaces `scripts/constrained_bash.py` with Rust in
-`catenary hook pre-tool`.
+**Lower priority:**
+
+- **Workstream 13 (Diagnostic batching) v1 complete.** v2 (warm
+  state) blocked on waitv2 1b infrastructure.
+- **Workstream 11 (Replace) removal ready.** Dead code cleanup.
+  Doesn't unlock anything.
+- **Workstream 4 (SEARCHv2) in progress.** Ticket 00 complete.
+  Blocked on capacity.
+- **Workstream 14 (Recommend) design complete.** Python script
+  works today; ship when needed.
 
 ---
 
@@ -134,24 +139,7 @@ Tracker: `tickets/searchv2/README.md`.
 
 ## 5. Misc
 
-Cross-cutting decisions and items.
-
-- [x] 01 — `Stuck` server state and recovery model
-- [x] 02 — Thread `&Connection` for test DB isolation
-- [x] 03 — Diagnostic noise filter trait
-- [x] 04 — Session ID mismatch: Catenary vs Claude Code
-- [x] 05 — Investigate: notify hook output for all cases
-- [x] 06 — Filter rust-analyzer lint attribution diagnostics
-- [x] 07 — Capture `client_session_id` at session start via `SessionStart` hook
-- [x] 08 — Notify hook picks dead sessions + `generate_id` timestamp always zero
-- [ ] 09 — Spawn missing LSP servers mid-session when new file types appear
-- [ ] 10 — Yank strips percentage/count detail from `Progress` events
-- [ ] 11 — Handle MCP `notifications/cancelled`: abort in-flight LSP requests
-- [ ] 12 — Diagnostics budget: cap or summarize when 300+ diagnostics flood context (mitigated by workstream 13 acquire/release)
-- [ ] 13 — Support `scopeUri` in `workspace/configuration` responses
-- [ ] 18 — Split `panel.rs` into `pipeline.rs` + `panel.rs` + `flat.rs`
-- [x] 14 — Kill child LSP processes on session exit
-- [x] 17 — TUI keybinding overhaul: Space toggle + horizontal scroll
+**Status: Open.** Cross-cutting decisions and items.
 
 Tracker: `tickets/misc/README.md`.
 
@@ -231,7 +219,7 @@ Design: `tickets/filtering/DESIGN.md`.
 
 ## 10. Collapse
 
-**Status: Complete.** All phases (0-5) done. Rearchitects the event system around Catenary's identity as a
+**Status: Phase 6 open.** Phases 0-5 done. Ticket 11 (Toolbox extraction) open — pulls tool servers and shared deps out of `LspBridgeHandler`. Rearchitects the event system around Catenary's identity as a
 JSON bridge between three protocols (MCP, LSP, Hooks). Four architectural
 layers, two cleanly separated concerns:
 
