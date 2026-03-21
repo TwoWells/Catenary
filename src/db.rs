@@ -620,9 +620,7 @@ pub fn gc_editing_state(conn: &Connection, live_session_ids: &[&str]) -> Result<
     }
 
     let placeholders = vec!["?"; live_session_ids.len()].join(", ");
-    let sql = format!(
-        "DELETE FROM editing_state WHERE session_id NOT IN ({placeholders})"
-    );
+    let sql = format!("DELETE FROM editing_state WHERE session_id NOT IN ({placeholders})");
 
     let count = conn
         .execute(&sql, rusqlite::params_from_iter(live_session_ids))
@@ -1138,8 +1136,7 @@ mod tests {
         let path = dir.path().join("test.db");
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
-        let created =
-            start_editing(&conn, "/src/main.rs", "s1", "").expect("start_editing failed");
+        let created = start_editing(&conn, "/src/main.rs", "s1", "").expect("start_editing failed");
         assert!(created, "start_editing should return true on first call");
 
         assert!(
@@ -1159,9 +1156,12 @@ mod tests {
             start_editing(&conn, "/src/main.rs", "s1", "").expect("first start_editing failed");
         assert!(first, "first start_editing should return true");
 
-        let second = start_editing(&conn, "/src/main.rs", "s1", "")
-            .expect("second start_editing failed");
-        assert!(!second, "second start_editing on same file should return false");
+        let second =
+            start_editing(&conn, "/src/main.rs", "s1", "").expect("second start_editing failed");
+        assert!(
+            !second,
+            "second start_editing on same file should return false"
+        );
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -1285,7 +1285,10 @@ mod tests {
 
         let edited = is_edited_by_others(&conn, "/src/main.rs", "s1", "agent-a")
             .expect("is_edited_by_others failed");
-        assert!(!edited, "own editing state should not count as edited by others");
+        assert!(
+            !edited,
+            "own editing state should not count as edited by others"
+        );
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -1299,7 +1302,10 @@ mod tests {
 
         let edited = is_edited_by_others(&conn, "/src/main.rs", "s2", "")
             .expect("is_edited_by_others failed");
-        assert!(edited, "editing in another session should count as edited by others");
+        assert!(
+            edited,
+            "editing in another session should count as edited by others"
+        );
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -1339,11 +1345,9 @@ mod tests {
 
         start_editing(&conn, "/src/main.rs", "live-session", "")
             .expect("start_editing live failed");
-        start_editing(&conn, "/src/lib.rs", "dead-session", "")
-            .expect("start_editing dead failed");
+        start_editing(&conn, "/src/lib.rs", "dead-session", "").expect("start_editing dead failed");
 
-        let count =
-            gc_editing_state(&conn, &["live-session"]).expect("gc_editing_state failed");
+        let count = gc_editing_state(&conn, &["live-session"]).expect("gc_editing_state failed");
         assert_eq!(count, 1, "should delete 1 entry for dead session");
 
         assert!(

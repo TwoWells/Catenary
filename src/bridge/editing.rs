@@ -42,7 +42,10 @@ fn resolve_in_roots(file: &str, roots: &[PathBuf]) -> Result<PathBuf> {
         return Ok(roots[0].join(&path));
     }
 
-    let root_list: Vec<_> = roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+    let root_list: Vec<_> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().to_string())
+        .collect();
     Err(anyhow!(
         "cannot resolve relative path \"{file}\" — file not found under workspace roots: [{}]. \
          Use an absolute path instead.",
@@ -78,11 +81,7 @@ impl EditingServer {
     ///
     /// Returns an error if the file path cannot be resolved or the database
     /// operation fails.
-    pub fn start_editing(
-        &self,
-        file: &str,
-        roots: &[PathBuf],
-    ) -> Result<String> {
+    pub fn start_editing(&self, file: &str, roots: &[PathBuf]) -> Result<String> {
         let path = resolve_in_roots(file, roots)?;
         let abs = path.to_string_lossy();
         let display = display_path(&abs, roots);
@@ -106,11 +105,7 @@ impl EditingServer {
     ///
     /// Returns an error if the file is not being edited, the path cannot be
     /// resolved, or diagnostics collection fails.
-    pub async fn done_editing(
-        &self,
-        file: &str,
-        roots: &[PathBuf],
-    ) -> Result<String> {
+    pub async fn done_editing(&self, file: &str, roots: &[PathBuf]) -> Result<String> {
         let path = resolve_in_roots(file, roots)?;
         let abs = path.to_string_lossy();
         let display = display_path(&abs, roots);

@@ -153,17 +153,11 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
 
 /// Find the Catenary session ID for a hook payload, using the working directory
 /// to match against workspace roots. Returns `None` if no matching session.
-fn find_session_id(
-    hook_json: &serde_json::Value,
-    conn: &rusqlite::Connection,
-) -> Option<String> {
-    let cwd = hook_json
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map_or_else(
-            || std::env::current_dir().unwrap_or_default(),
-            PathBuf::from,
-        );
+fn find_session_id(hook_json: &serde_json::Value, conn: &rusqlite::Connection) -> Option<String> {
+    let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        PathBuf::from,
+    );
     let cwd_str = cwd.to_string_lossy();
     let sessions = session::list_sessions_with_conn(conn).unwrap_or_default();
     sessions
@@ -261,9 +255,7 @@ pub fn run_post_agent(format: HostFormat) {
     }
 
     let file_list = files.join(", ");
-    let reason = format!(
-        "call done_editing for {file_list} to get diagnostics before finishing"
-    );
+    let reason = format!("call done_editing for {file_list} to get diagnostics before finishing");
     print!("{}", format_stop_block(&reason, format));
 }
 
@@ -341,8 +333,7 @@ pub fn run_post_tool(format: HostFormat) {
 
     // --- Editing state: suppress diagnostics for files being edited ---
     let agent_id = extract_agent_id(&hook_json);
-    let self_editing =
-        db::is_editing(&conn, &file_path, &session.id, agent_id).unwrap_or(false);
+    let self_editing = db::is_editing(&conn, &file_path, &session.id, agent_id).unwrap_or(false);
     if self_editing {
         // This agent is editing this file — suppress diagnostics entirely.
         return;
@@ -480,8 +471,8 @@ pub fn run_pre_tool(format: HostFormat) {
             } else if is_edit_tool(tool_name, format) {
                 // Edit tool: check if the target file is being edited.
                 if let Some(file_path) = extract_file_path(&hook_json) {
-                    let is_managed = db::is_editing(&conn, &file_path, &catenary_sid, agent_id)
-                        .unwrap_or(false);
+                    let is_managed =
+                        db::is_editing(&conn, &file_path, &catenary_sid, agent_id).unwrap_or(false);
                     if !is_managed {
                         let file_list = editing_files.join(", ");
                         let reason = format!(
@@ -496,18 +487,14 @@ pub fn run_pre_tool(format: HostFormat) {
             } else {
                 // Non-Edit, non-Read tool while editing — deny.
                 let file_list = editing_files.join(", ");
-                let reason = format!(
-                    "call done_editing for {file_list} to get diagnostics"
-                );
+                let reason = format!("call done_editing for {file_list} to get diagnostics");
                 print!("{}", format_deny(&reason, format));
                 return;
             }
         } else if is_edit_tool(tool_name, format) {
             // Agent is not editing any files + Edit tool — deny.
             let file_path = extract_file_path(&hook_json).unwrap_or_default();
-            let reason = format!(
-                "call start_editing for {file_path} before editing"
-            );
+            let reason = format!("call start_editing for {file_path} before editing");
             print!("{}", format_deny(&reason, format));
             return;
         }

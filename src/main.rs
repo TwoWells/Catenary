@@ -656,8 +656,7 @@ mod tests {
     #[test]
     fn test_cli_hook_session_start() {
         use clap::Parser;
-        let args =
-            Args::try_parse_from(["catenary", "hook", "session-start", "--format=gemini"]);
+        let args = Args::try_parse_from(["catenary", "hook", "session-start", "--format=gemini"]);
         let args = args.expect("hook session-start should parse");
         let Some(Command::Hook { command }) = args.command else {
             unreachable!("expected Hook command");
