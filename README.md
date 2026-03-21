@@ -29,10 +29,6 @@ waitv2 design review). Misc 19 adds `FilesystemCache` on `Toolbox`
 with binary detection (null byte scan + 10 MB size gate), shared by
 grep and glob. Blocker on sshfs/NAS workspaces.
 
-~~**2. Misc 21 — Grep glob scoping.**~~ **Complete.** Added `glob`,
-`exclude`, `include_gitignored`, `include_hidden` parameters to grep.
-Both ripgrep file walk and symbol universe filtered to scope.
-
 **2. Misc 20 — HookServer as protocol boundary.** All five hooks
 through `HookServer` with caller-supplied method names. Foundation
 cleanup before waitv2 1b. Fixes monitor visibility (pre-agent
