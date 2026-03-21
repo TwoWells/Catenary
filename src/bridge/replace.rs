@@ -537,12 +537,16 @@ pub fn resolve_targets(
         roots.to_vec()
     };
 
+    // WalkBuilder flags use "skip" semantics: .hidden(true) = skip hidden
+    let skip_gitignored = !include_gitignored;
+    let skip_hidden = !include_hidden;
+
     let mut matched_files: Vec<PathBuf> = Vec::new();
 
     for root in &search_roots {
         let walker = WalkBuilder::new(root)
-            .git_ignore(!include_gitignored)
-            .hidden(!include_hidden)
+            .git_ignore(skip_gitignored)
+            .hidden(skip_hidden)
             .build();
 
         for entry in walker.flatten() {

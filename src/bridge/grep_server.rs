@@ -4,6 +4,7 @@
 //! Grep tool: ripgrep + workspace/symbol pipeline with LSP enrichment.
 
 use anyhow::{Result, anyhow};
+use globset::Glob;
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{Searcher, Sink, SinkMatch};
@@ -37,6 +38,18 @@ const GREP_HOVER_THRESHOLD: usize = 10;
 pub struct GrepInput {
     /// Search pattern (supports `|` for alternation, passed to ripgrep).
     pub pattern: String,
+    /// Glob pattern to scope the search (optional).
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Glob pattern to exclude from matches (optional).
+    #[serde(default)]
+    pub exclude: Option<String>,
+    /// Include gitignored files (default: false).
+    #[serde(default)]
+    pub include_gitignored: bool,
+    /// Include hidden/dot files (default: false).
+    #[serde(default)]
+    pub include_hidden: bool,
 }
 
 /// Grep tool server: ripgrep + workspace/symbol pipeline with LSP enrichment.
@@ -124,10 +137,17 @@ impl GrepServer {
         let roots = self.runtime.block_on(self.client_manager.roots());
 
         // 1. Ripgrep: get matched strings + file/line heatmap in one pass
-        let rg = Self::ripgrep_matches(&input.pattern, &roots)?;
+        let rg = Self::ripgrep_matches(
+            &input.pattern,
+            &roots,
+            input.glob.as_deref(),
+            input.exclude.as_deref(),
+            input.include_gitignored,
+            input.include_hidden,
+        )?;
 
         // 2. Symbol universe: workspace/symbol("") + regex filter, with rg fallback
-        let symbols = self.runtime.block_on(async {
+        let mut symbols = self.runtime.block_on(async {
             let clients = self.client_manager.active_clients().await;
 
             // Try workspace/symbol("") first — returns the full symbol index
@@ -149,6 +169,32 @@ impl GrepServer {
 
             all_symbols
         });
+
+        // Filter symbols to glob/exclude scope
+        if let Some(ref glob_pattern) = input.glob {
+            let gm = Glob::new(glob_pattern)
+                .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
+                .compile_matcher();
+            symbols.retain(|s| {
+                roots.iter().any(|root| {
+                    Path::new(&s.file_path)
+                        .strip_prefix(root)
+                        .is_ok_and(|rel| gm.is_match(rel))
+                })
+            });
+        }
+        if let Some(ref exclude_pattern) = input.exclude {
+            let em = Glob::new(exclude_pattern)
+                .map_err(|e| anyhow!("Invalid exclude pattern: {e}"))?
+                .compile_matcher();
+            symbols.retain(|s| {
+                !roots.iter().any(|root| {
+                    Path::new(&s.file_path)
+                        .strip_prefix(root)
+                        .is_ok_and(|rel| em.is_match(rel))
+                })
+            });
+        }
 
         let show_hover = symbols.len() <= GREP_HOVER_THRESHOLD;
 
@@ -770,7 +816,14 @@ impl GrepServer {
     /// # Errors
     ///
     /// Returns an error if the pattern is not a valid regex.
-    fn ripgrep_matches(pattern: &str, roots: &[PathBuf]) -> Result<RipgrepMatches> {
+    fn ripgrep_matches(
+        pattern: &str,
+        roots: &[PathBuf],
+        glob: Option<&str>,
+        exclude: Option<&str>,
+        include_gitignored: bool,
+        include_hidden: bool,
+    ) -> Result<RipgrepMatches> {
         use ignore::WalkState;
         use std::sync::Mutex as StdMutex;
 
@@ -779,16 +832,39 @@ impl GrepServer {
             .build(pattern)
             .map_err(|e| anyhow!("Invalid regex pattern: {e}"))?;
 
+        let glob_matcher = glob
+            .map(|pat| {
+                Glob::new(pat)
+                    .map_err(|e| anyhow!("Invalid glob pattern: {e}"))
+                    .map(|g| Arc::new(g.compile_matcher()))
+            })
+            .transpose()?;
+
+        let exclude_matcher = exclude
+            .map(|pat| {
+                Glob::new(pat)
+                    .map_err(|e| anyhow!("Invalid exclude pattern: {e}"))
+                    .map(|g| Arc::new(g.compile_matcher()))
+            })
+            .transpose()?;
+
         let collected = Arc::new(StdMutex::new(Vec::<ThreadMatches>::new()));
+
+        // WalkBuilder flags use "skip" semantics: .hidden(true) = skip hidden
+        let skip_gitignored = !include_gitignored;
+        let skip_hidden = !include_hidden;
 
         for root in roots {
             let walker = WalkBuilder::new(root)
-                .git_ignore(true)
-                .hidden(false)
+                .git_ignore(skip_gitignored)
+                .hidden(skip_hidden)
                 .build_parallel();
 
             walker.run(|| {
                 let matcher = matcher.clone();
+                let glob_matcher = glob_matcher.clone();
+                let exclude_matcher = exclude_matcher.clone();
+                let root = root.clone();
                 let mut state = CollectOnDrop {
                     local: ThreadMatches::default(),
                     collected: Arc::clone(&collected),
@@ -801,6 +877,19 @@ impl GrepServer {
                     let path = entry.path();
                     if !path.is_file() {
                         return WalkState::Continue;
+                    }
+
+                    if let Some(ref gm) = glob_matcher {
+                        let rel = path.strip_prefix(&root).unwrap_or(path);
+                        if !gm.is_match(rel) {
+                            return WalkState::Continue;
+                        }
+                    }
+                    if let Some(ref em) = exclude_matcher {
+                        let rel = path.strip_prefix(&root).unwrap_or(path);
+                        if em.is_match(rel) {
+                            return WalkState::Continue;
+                        }
                     }
 
                     let path_str = path.to_string_lossy().to_string();

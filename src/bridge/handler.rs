@@ -59,10 +59,8 @@ impl LspBridgeHandler {
         diagnostics: Arc<DiagnosticsServer>,
         session_id: Option<String>,
     ) -> Self {
-        let editing = EditingServer::new(
-            diagnostics.clone(),
-            session_id.clone().unwrap_or_default(),
-        );
+        let editing =
+            EditingServer::new(diagnostics.clone(), session_id.clone().unwrap_or_default());
         let replace = ReplaceServer::new(
             client_manager.clone(),
             doc_manager.clone(),
@@ -285,13 +283,29 @@ impl ToolHandler for LspBridgeHandler {
         vec![
             Tool {
                 name: "grep".to_string(),
-                description: Some(format!("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Returns per-symbol sections with definitions, hover docs, and references (\u{2264}{GREP_HOVER_THRESHOLD} symbols) or name+kind+location (>{GREP_HOVER_THRESHOLD}).")),
+                description: Some(format!("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Scope with `glob` and `exclude` to narrow the file set. Returns per-symbol sections with definitions, hover docs, and references (\u{2264}{GREP_HOVER_THRESHOLD} symbols) or name+kind+location (>{GREP_HOVER_THRESHOLD}).")),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "pattern": {
                             "type": "string",
                             "description": "Regex pattern to search for (supports | for alternation)"
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Glob pattern to scope the search (e.g., src/**/*.rs)"
+                        },
+                        "exclude": {
+                            "type": "string",
+                            "description": "Glob pattern to exclude from matches"
+                        },
+                        "include_gitignored": {
+                            "type": "boolean",
+                            "description": "Include gitignored files (default: false)"
+                        },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "description": "Include hidden files (default: false)"
                         }
                     },
                     "required": ["pattern"]
