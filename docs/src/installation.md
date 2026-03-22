@@ -4,12 +4,17 @@
 
 - [Rust toolchain](https://rustup.rs/) (for installing via cargo)
 - Language servers for the languages you want to use (see [LSP Servers](lsp/README.md))
+- [Windows Only] Windows Build Tools Latest 2026 (Invdividual components to be installed along with it => [Windows Universal CRT SDK + Windows 11 SDK + Windows Universal C Runtime + MSVC Build tools for x64/x84])
 
 ## Install Catenary
 
 ### From crates.io (recommended)
 
 ```bash
+cargo install catenary-mcp
+```
+
+```x64 Native Tools Command Prompt for VS
 cargo install catenary-mcp
 ```
 
