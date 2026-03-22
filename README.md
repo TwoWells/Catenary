@@ -23,18 +23,24 @@ Internal planning and tracking for the Catenary project.
 
 ## Current priority
 
-**1. Collapse 11 → Misc 19 — Toolbox + binary file detection.**
+**1. Misc 22 → Misc 23 — Error logging + homelab tools/list bug.**
+Misc 22 adds a tracing layer that captures `error!`/`warn!` to
+SQLite. Misc 23 reproduces the homelab `tools/list` failure with
+error logging enabled to capture the root cause. Catenary is
+currently disabled in the homelab workspace as a workaround.
+
+**2. Collapse 11 → Misc 19 — Toolbox + binary file detection.**
 Collapse 11 extracts `Toolbox` from `LspBridgeHandler` (I19 from
 waitv2 design review). Misc 19 adds `FilesystemCache` on `Toolbox`
 with binary detection (null byte scan + 10 MB size gate), shared by
 grep and glob. Blocker on sshfs/NAS workspaces.
 
-**2. Misc 20 — HookServer as protocol boundary.** All five hooks
+**3. Misc 20 — HookServer as protocol boundary.** All five hooks
 through `HookServer` with caller-supplied method names. Foundation
 cleanup before waitv2 1b. Fixes monitor visibility (pre-agent
 mislabeled, post-agent/session-start invisible). Subsumes misc 07.
 
-**3. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
+**4. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
 finalized: `tickets/waitv2/design/pipeline_1b.md`. 10 tickets
 (1b-00 through 1b-08, including 02a/02b split). Critical path:
 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 00 (capability
