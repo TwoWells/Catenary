@@ -53,8 +53,6 @@ pub struct PanelState<'a> {
     pub visual_selection: Option<VisualSelection>,
     /// Last known viewport height (updated each render frame).
     pub viewport_height: usize,
-    /// Display ID for the title bar (client session ID if available, else internal ID).
-    pub display_id: String,
     /// Active filter pattern (case-insensitive substring match).
     pub filter_pattern: Option<String>,
     /// Semantic color theme (borrowed from the application).
@@ -72,7 +70,6 @@ impl<'a> PanelState<'a> {
     /// scroll, not pinned.
     #[must_use]
     pub fn new(session_id: String, theme: &'a Theme, icons: &'a IconSet) -> Self {
-        let display_id = session_id.clone();
         Self {
             session_id,
             messages: Vec::new(),
@@ -83,7 +80,6 @@ impl<'a> PanelState<'a> {
             pinned: false,
             language_servers: Vec::new(),
             expanded: HashSet::new(),
-            display_id,
             visual_selection: None,
             viewport_height: 0,
             filter_pattern: None,
@@ -407,10 +403,10 @@ pub fn frontmatter_lines(msg: &SessionMessage, theme: &Theme) -> Vec<Line<'stati
 
 /// Build the title line for a panel.
 fn build_title<'a>(state: &'a PanelState<'a>) -> Line<'a> {
-    let id_short = if state.display_id.len() > 8 {
-        &state.display_id[..8]
+    let id_short = if state.session_id.len() > 8 {
+        &state.session_id[..8]
     } else {
-        &state.display_id
+        &state.session_id
     };
 
     let mut spans = vec![Span::raw(format!(" Events [{id_short}]"))];

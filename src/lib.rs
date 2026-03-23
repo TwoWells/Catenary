@@ -14,6 +14,8 @@ pub mod cli;
 pub mod config;
 /// SQLite database connection management, schema creation, and migrations.
 pub mod db;
+/// Tracing layer that captures errors and warnings to SQLite.
+pub mod error_layer;
 /// Diagnostic noise filtering for LSP server output.
 pub mod filter;
 /// IPC server for host CLI hook integration (diagnostics and root sync).

@@ -148,7 +148,7 @@ impl GrepServer {
 
         // 2. Symbol universe: workspace/symbol("") + regex filter, with rg fallback
         let mut symbols = self.runtime.block_on(async {
-            let clients = self.client_manager.active_clients().await;
+            let clients = self.client_manager.clients().await;
 
             // Try workspace/symbol("") first — returns the full symbol index
             let mut all_symbols: Vec<SymbolInfo> = self.fetch_symbol_universe(&clients).await;

@@ -509,17 +509,8 @@ fn check_new_sessions(app: &mut App<'_>) {
         }
     }
 
-    // Update panel display IDs from refreshed session data.
-    for panel in &mut app.grid.panels {
-        for ws in &app.tree.workspaces {
-            if let Some(row) = ws.sessions.iter().find(|s| s.info.id == panel.session_id) {
-                if let Some(ref csid) = row.info.client_session_id {
-                    panel.display_id.clone_from(csid);
-                }
-                break;
-            }
-        }
-    }
+    // Panel display_id is the Catenary internal ID (set at construction).
+    // No override needed — the internal ID is the unique per-panel identifier.
 
     // Auto-open panels for new alive sessions.
     for id in &alive_ids {

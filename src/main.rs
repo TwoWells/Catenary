@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 use std::sync::atomic::AtomicBool;
 
@@ -384,9 +386,15 @@ fn run_dashboard(args: &Args) -> Result<()> {
     reason = "Server setup requires sequential initialization steps"
 )]
 async fn run_server(args: Args) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("catenary=info".parse()?))
-        .with_writer(std::io::stderr)
+    let (error_layer, error_layer_handle) = catenary_mcp::error_layer::ErrorLayer::new();
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(EnvFilter::from_default_env().add_directive("catenary=info".parse()?)),
+        )
+        .with(error_layer.with_filter(tracing_subscriber::filter::LevelFilter::WARN))
         .init();
 
     // Load configuration
@@ -461,6 +469,7 @@ async fn run_server(args: Args) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .message_log()
         .clone();
+    error_layer_handle.activate(message_log.clone());
     let client_manager = Arc::new(lsp::ClientManager::new(
         config.clone(),
         roots,
@@ -554,7 +563,11 @@ async fn run_server(args: Args) -> Result<()> {
                 .update_roots(paths.clone());
 
             runtime_for_roots.block_on(client_manager_for_roots.sync_roots(paths))?;
-            runtime_for_roots.block_on(client_manager_for_roots.spawn_all());
+
+            // Fire-and-forget: spawn_all is pre-warming, not a gate.
+            // Tool calls that need a server will trigger get_client on demand.
+            let cm = client_manager_for_roots.clone();
+            runtime_for_roots.spawn(async move { cm.spawn_all().await });
             Ok(())
         }));
 
@@ -594,7 +607,11 @@ async fn run_server(args: Args) -> Result<()> {
     info!("Shutting down LSP servers");
     client_manager.shutdown_all().await;
 
-    // Session cleanup happens automatically via Drop
+    // Mark session dead explicitly — Drop may not run because
+    // spawn_blocking holds an Arc<Session> clone that outlives the runtime.
+    if let Ok(s) = session.lock() {
+        s.mark_dead();
+    }
 
     mcp_result
 }

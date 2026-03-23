@@ -342,10 +342,26 @@ impl Session {
     pub const fn message_log(&self) -> &Arc<MessageLog> {
         &self.message_log
     }
+
+    /// Mark this session as dead in the database.
+    ///
+    /// Call this explicitly before shutdown. `Drop` also marks the session
+    /// dead, but when the `Session` is behind `Arc` the refcount may not
+    /// reach zero before the process exits (e.g. a `spawn_blocking` task
+    /// holds a clone).
+    pub fn mark_dead(&self) {
+        if let Ok(c) = self.conn.lock() {
+            let _ = c.execute(
+                "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",
+                rusqlite::params![Utc::now().to_rfc3339(), &self.info.id],
+            );
+        }
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // mark_dead is idempotent — safe to call again if already called
         if let Ok(c) = self.conn.lock() {
             let _ = c.execute(
                 "UPDATE sessions SET alive = 0, ended_at = ?1 WHERE id = ?2",

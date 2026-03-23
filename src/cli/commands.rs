@@ -62,8 +62,7 @@ pub fn run_list() -> Result<()> {
         let ago = format_duration_ago(s.started_at);
 
         // Truncate fields to fit column widths
-        let display_id = s.client_session_id.as_deref().unwrap_or(&s.id);
-        let id = cli::truncate(display_id, widths.id);
+        let id = cli::truncate(&s.id, widths.id);
         let workspace = cli::truncate(&s.workspace, widths.workspace);
         let client = cli::truncate(&client, widths.client);
 
@@ -819,11 +818,16 @@ pub fn find_session(conn: &rusqlite::Connection, id: &str) -> Result<session::Se
         return Ok(s);
     }
 
-    // Try prefix match
+    // Try prefix match on both internal ID and client session ID
     let sessions = session::list_sessions_with_conn(conn)?;
     let matches: Vec<_> = sessions
         .iter()
-        .filter(|(s, _)| s.id.starts_with(id))
+        .filter(|(s, _)| {
+            s.id.starts_with(id)
+                || s.client_session_id
+                    .as_deref()
+                    .is_some_and(|csid| csid.starts_with(id))
+        })
         .collect();
 
     match matches.len() {

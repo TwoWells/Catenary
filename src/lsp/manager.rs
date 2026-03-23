@@ -19,7 +19,7 @@ use crate::session::MessageLog;
 pub struct ClientManager {
     config: Config,
     roots: Mutex<Vec<PathBuf>>,
-    active_clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
+    clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
     message_log: Arc<MessageLog>,
 }
 
@@ -30,7 +30,7 @@ impl ClientManager {
         Self {
             config,
             roots: Mutex::new(roots),
-            active_clients: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
             message_log,
         }
     }
@@ -89,7 +89,7 @@ impl ClientManager {
 
         // Notify clients that support dynamic workspace folders,
         // restart those that don't.
-        let clients = self.active_clients.lock().await.clone();
+        let clients = self.clients.lock().await.clone();
         let mut to_restart = Vec::new();
         for (lang, client_mutex) in &clients {
             let client = client_mutex.lock().await;
@@ -193,7 +193,7 @@ impl ClientManager {
 
         // Notify clients that support dynamic workspace folders,
         // restart those that don't.
-        let clients = self.active_clients.lock().await.clone();
+        let clients = self.clients.lock().await.clone();
         let mut to_restart = Vec::new();
         for (lang, client_mutex) in &clients {
             let client = client_mutex.lock().await;
@@ -226,27 +226,29 @@ impl ClientManager {
         Ok(())
     }
 
-    /// Gets an active client for the given language, spawning it if necessary.
+    /// Gets a client for the given language, spawning it if necessary.
+    ///
+    /// Dead clients are left in the map as tombstones — a server that
+    /// crashes will not be restarted. Intentional restarts (e.g. after
+    /// `sync_roots`) go through [`shutdown_client`] which removes the
+    /// entry so a fresh spawn can occur.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The server previously died (tombstone).
     /// - No LSP server is configured for the language.
     /// - The server fails to spawn.
     /// - The server fails to initialize.
     pub async fn get_client(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
-        if let Some(client) = self.active_clients.lock().await.get(lang) {
-            // Check if it's still alive
-            let is_alive = client.lock().await.is_alive();
-
-            if is_alive {
+        if let Some(client) = self.clients.lock().await.get(lang) {
+            if client.lock().await.is_alive() {
                 return Ok(client.clone());
             }
-            warn!("LSP server for {} died, restarting...", lang);
-            self.active_clients.lock().await.remove(lang);
+            anyhow::bail!("LSP server for '{lang}' is dead");
         }
 
-        let mut clients = self.active_clients.lock().await;
+        let mut clients = self.clients.lock().await;
 
         // Spawn new client
         let server_config = self
@@ -313,14 +315,14 @@ impl ClientManager {
         self.get_client(ext).await
     }
 
-    /// Returns a snapshot of all currently active clients.
-    pub async fn active_clients(&self) -> HashMap<String, Arc<Mutex<LspClient>>> {
-        self.active_clients.lock().await.clone()
+    /// Returns a snapshot of all clients (including dead ones).
+    pub async fn clients(&self) -> HashMap<String, Arc<Mutex<LspClient>>> {
+        self.clients.lock().await.clone()
     }
 
     /// Returns status of all active servers.
     pub async fn all_server_status(&self) -> Vec<ServerStatus> {
-        let clients = self.active_clients.lock().await.clone();
+        let clients = self.clients.lock().await.clone();
         let mut statuses = Vec::new();
 
         for (lang, client_mutex) in clients {
@@ -333,7 +335,7 @@ impl ClientManager {
 
     /// Shuts down a specific client if it exists.
     pub async fn shutdown_client(&self, lang: &str) {
-        let mut clients = self.active_clients.lock().await;
+        let mut clients = self.clients.lock().await;
         if let Some(client_mutex) = clients.remove(lang) {
             info!("Shutting down idle LSP server for {}", lang);
             let mut client = client_mutex.lock().await;
@@ -351,7 +353,7 @@ impl ClientManager {
     /// `shutdown`/`exit` sequence. Servers that don't respond in time
     /// are dropped, which triggers [`Connection::Drop`] to SIGKILL them.
     pub async fn shutdown_all(&self) {
-        let mut clients = self.active_clients.lock().await;
+        let mut clients = self.clients.lock().await;
         for (lang, client_mutex) in clients.drain() {
             let mut client = client_mutex.lock().await;
             if client.is_alive() {
@@ -663,7 +665,7 @@ mod tests {
             "mockls (no flags) should NOT support workspace folders"
         );
 
-        assert!(manager.active_clients().await.contains_key(MOCK_LANG_A));
+        assert!(manager.clients().await.contains_key(MOCK_LANG_A));
 
         // sync_roots should shut down the unsupported client
         manager
@@ -671,7 +673,7 @@ mod tests {
             .await?;
 
         assert!(
-            !manager.active_clients().await.contains_key(MOCK_LANG_A),
+            !manager.clients().await.contains_key(MOCK_LANG_A),
             "mockls client should be removed after sync_roots (no workspace folder support)"
         );
 
@@ -733,7 +735,7 @@ mod tests {
             "mockls --workspace-folders should support workspace folders"
         );
 
-        assert!(manager.active_clients().await.contains_key(MOCK_LANG_A));
+        assert!(manager.clients().await.contains_key(MOCK_LANG_A));
 
         // sync_roots should send notification, NOT shut down the client
         manager
@@ -742,7 +744,7 @@ mod tests {
 
         // Client should still be active (not removed)
         assert!(
-            manager.active_clients().await.contains_key(MOCK_LANG_A),
+            manager.clients().await.contains_key(MOCK_LANG_A),
             "mockls client should still be active after sync_roots (workspace folders supported)"
         );
 

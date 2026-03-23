@@ -131,7 +131,7 @@ impl LspBridgeHandler {
     /// and the caller uses [`check_server_health`] to detect state.
     /// Used for symbol-only queries that don't target a specific file.
     async fn wait_for_all_servers_ready(&self) {
-        let clients = self.client_manager.active_clients().await;
+        let clients = self.client_manager.clients().await;
 
         for (lang, client_mutex) in clients {
             if !client_mutex.lock().await.wait_ready().await {
@@ -153,7 +153,7 @@ impl LspBridgeHandler {
 
         // Classify each touched server by readiness (not just process liveness —
         // a stuck server is alive but not ready)
-        let clients = self.runtime.block_on(self.client_manager.active_clients());
+        let clients = self.runtime.block_on(self.client_manager.clients());
         for lang in touched_servers {
             let ready = clients.get(lang).is_some_and(|c| {
                 self.runtime.block_on(async {
@@ -233,7 +233,7 @@ impl LspBridgeHandler {
     }
 
     /// Returns the language key for a file path, matching the key used in
-    /// `active_clients()`. This may differ from the LSP language ID for
+    /// `clients()`. This may differ from the LSP language ID for
     /// custom/test languages where the config key is the file extension.
     async fn language_for_path(&self, path: &Path) -> Option<String> {
         let lang_id = {
@@ -475,7 +475,7 @@ impl ToolHandler for LspBridgeHandler {
                 self.runtime.block_on(self.wait_for_all_servers_ready());
                 let touched: Vec<String> = self
                     .runtime
-                    .block_on(self.client_manager.active_clients())
+                    .block_on(self.client_manager.clients())
                     .keys()
                     .cloned()
                     .collect();
