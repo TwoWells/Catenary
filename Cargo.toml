@@ -52,6 +52,7 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.25"
 libc = "0.2"
+memchr = "2"
 notify = "8"
 regex = "1.10"
 rusqlite = { version = "0.34", features = ["bundled"] }

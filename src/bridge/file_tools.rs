@@ -15,8 +15,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -24,6 +22,7 @@ use tokio::sync::Mutex;
 
 use super::handler::resolve_path;
 use super::symbols::{format_symbol_kind, is_outline_kind};
+use super::toolbox::{FilesystemCache, format_file_size};
 use super::{DocumentManager, DocumentNotification};
 use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::CallToolResult;
@@ -37,13 +36,6 @@ pub struct GlobInput {
 
 /// Outline symbols for a single file: `(name, kind_u32, 1-based line)`.
 type OutlineSymbols = Vec<(String, u32, u32)>;
-
-/// Counts lines in a file.
-fn count_lines(path: &Path) -> usize {
-    File::open(path)
-        .map(|f| BufReader::new(f).lines().count())
-        .unwrap_or(0)
-}
 
 /// Extracts depth-0 outline symbols from a document symbol response (`Value`).
 ///
@@ -162,7 +154,11 @@ impl GlobServer {
     }
 
     /// Handles the `glob` tool call.
-    pub fn handle_glob(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
+    pub fn handle_glob(
+        &self,
+        arguments: Option<serde_json::Value>,
+        fs_cache: &FilesystemCache,
+    ) -> Result<CallToolResult> {
         let input: GlobInput =
             serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
                 .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
@@ -172,26 +168,33 @@ impl GlobServer {
         tracing::debug!("glob: {}", input.pattern);
 
         if path.is_file() {
-            Ok(self.handle_glob_file(&path))
+            Ok(self.handle_glob_file(&path, fs_cache))
         } else if path.is_dir() {
-            self.handle_glob_dir(&path)
+            self.handle_glob_dir(&path, fs_cache)
         } else {
-            self.handle_glob_pattern(&input.pattern)
+            self.handle_glob_pattern(&input.pattern, fs_cache)
         }
     }
 
     /// File outline: header with line count + depth-0 outline symbols.
-    fn handle_glob_file(&self, path: &Path) -> CallToolResult {
+    ///
+    /// Binary files show size instead of line count and skip LSP symbols.
+    fn handle_glob_file(&self, path: &Path, fs_cache: &FilesystemCache) -> CallToolResult {
         let mut result = String::new();
-        let line_count = count_lines(path);
         let display = path.to_string_lossy();
-        let _ = writeln!(result, "{display}  ({line_count} lines)");
+        let metadata = std::fs::metadata(path).ok();
 
-        if let Ok(symbols) = self.fetch_outline_symbols(path) {
-            for (name, kind, line) in &symbols {
-                let kind_str = format_symbol_kind(*kind);
-                let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
+        if let Some(line_count) = metadata.as_ref().and_then(|m| fs_cache.line_count(path, m)) {
+            let _ = writeln!(result, "{display}  ({line_count} lines)");
+            if let Ok(symbols) = self.fetch_outline_symbols(path) {
+                for (name, kind, line) in &symbols {
+                    let kind_str = format_symbol_kind(*kind);
+                    let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
+                }
             }
+        } else {
+            let size = metadata.map_or(0, |m| m.len());
+            let _ = writeln!(result, "{display}  ({})", format_file_size(size));
         }
 
         CallToolResult::text(result)
@@ -199,7 +202,7 @@ impl GlobServer {
 
     /// Directory listing with outline symbols and gitignored section.
     #[allow(clippy::too_many_lines, reason = "Two-pass directory classification")]
-    fn handle_glob_dir(&self, dir: &Path) -> Result<CallToolResult> {
+    fn handle_glob_dir(&self, dir: &Path, fs_cache: &FilesystemCache) -> Result<CallToolResult> {
         let canonical = dir
             .canonicalize()
             .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
@@ -227,7 +230,8 @@ impl GlobServer {
             .collect();
 
         let mut dirs = Vec::new();
-        let mut files: Vec<(String, usize, OutlineSymbols)> = Vec::new();
+        // (name, line_count, symbols, binary_size)
+        let mut files: Vec<(String, usize, OutlineSymbols, Option<String>)> = Vec::new();
         let mut symlinks = Vec::new();
         let mut gitignored = Vec::new();
 
@@ -253,10 +257,12 @@ impl GlobServer {
                 symlinks.push(format!("{name} -> {target}"));
             } else if metadata.is_dir() {
                 dirs.push(format!("{name}/"));
-            } else {
-                let line_count = count_lines(&entry_path);
+            } else if let Some(line_count) = fs_cache.line_count(&entry_path, &metadata) {
                 let outline = self.fetch_outline_symbols(&entry_path).unwrap_or_default();
-                files.push((name, line_count, outline));
+                files.push((name, line_count, outline, None));
+            } else {
+                let size = format_file_size(metadata.len());
+                files.push((name, 0, Vec::new(), Some(size)));
             }
         }
 
@@ -272,11 +278,15 @@ impl GlobServer {
             let _ = writeln!(result, "{d}");
         }
 
-        for (name, line_count, symbols) in &files {
-            let _ = writeln!(result, "{name}  ({line_count} lines)");
-            for (sym_name, kind, line) in symbols {
-                let kind_str = format_symbol_kind(*kind);
-                let _ = writeln!(result, "  {sym_name} [{kind_str}] L{line}");
+        for (name, line_count, symbols, binary_size) in &files {
+            if let Some(size) = binary_size {
+                let _ = writeln!(result, "{name}  ({size})");
+            } else {
+                let _ = writeln!(result, "{name}  ({line_count} lines)");
+                for (sym_name, kind, line) in symbols {
+                    let kind_str = format_symbol_kind(*kind);
+                    let _ = writeln!(result, "  {sym_name} [{kind_str}] L{line}");
+                }
             }
         }
 
@@ -300,7 +310,11 @@ impl GlobServer {
     }
 
     /// Glob pattern match across workspace roots.
-    fn handle_glob_pattern(&self, pattern: &str) -> Result<CallToolResult> {
+    fn handle_glob_pattern(
+        &self,
+        pattern: &str,
+        fs_cache: &FilesystemCache,
+    ) -> Result<CallToolResult> {
         let matcher = Glob::new(pattern)
             .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
             .compile_matcher();
@@ -321,11 +335,12 @@ impl GlobServer {
                 .build();
 
             for entry in walker.flatten() {
-                let entry_path = entry.path();
-                if !entry_path.is_file() {
+                let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
+                if !is_file {
                     continue;
                 }
 
+                let entry_path = entry.path();
                 let rel_path = entry_path.strip_prefix(root).unwrap_or(entry_path);
 
                 if matcher.is_match(rel_path) {
@@ -343,15 +358,20 @@ impl GlobServer {
 
         let mut result = String::new();
         for path in &matched_files {
-            let line_count = count_lines(path);
             let display = path.to_string_lossy();
-            let _ = writeln!(result, "{display}  ({line_count} lines)");
+            let metadata = std::fs::metadata(path).ok();
 
-            if let Ok(symbols) = self.fetch_outline_symbols(path) {
-                for (name, kind, line) in &symbols {
-                    let kind_str = format_symbol_kind(*kind);
-                    let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
+            if let Some(line_count) = metadata.as_ref().and_then(|m| fs_cache.line_count(path, m)) {
+                let _ = writeln!(result, "{display}  ({line_count} lines)");
+                if let Ok(symbols) = self.fetch_outline_symbols(path) {
+                    for (name, kind, line) in &symbols {
+                        let kind_str = format_symbol_kind(*kind);
+                        let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
+                    }
                 }
+            } else {
+                let size = metadata.map_or(0, |m| m.len());
+                let _ = writeln!(result, "{display}  ({})", format_file_size(size));
             }
         }
 

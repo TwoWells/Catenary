@@ -8,17 +8,14 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use super::DocumentManager;
 use super::diagnostics_server::DiagnosticsServer;
-use super::editing::EditingServer;
 use super::file_tools::GlobServer;
-use super::grep_server::GrepServer;
-use super::replace::ReplaceServer;
 use super::tool_server::ToolServer;
+use super::toolbox::Toolbox;
 use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
 
@@ -36,68 +33,43 @@ struct ServerHealth {
 /// Bridge handler that implements MCP `ToolHandler` trait.
 /// Handles MCP tool calls by routing them to the appropriate LSP server.
 pub struct LspBridgeHandler {
-    grep: GrepServer,
-    glob: GlobServer,
-    client_manager: Arc<ClientManager>,
-    doc_manager: Arc<Mutex<DocumentManager>>,
-    runtime: Handle,
+    toolbox: Toolbox,
     /// Languages whose servers have been reported offline to the agent.
     /// Used for one-time notification: offline is reported once, recovery once.
     notified_offline: std::sync::Mutex<HashSet<String>>,
-    /// Batch replacement tool with snapshots and diagnostics.
-    replace: ReplaceServer,
-    /// Per-file diagnostic batching (`start_editing` / `done_editing`).
-    editing: EditingServer,
 }
 
 impl LspBridgeHandler {
-    /// Creates a new `LspBridgeHandler`.
+    /// Creates a new `LspBridgeHandler` wrapping a `Toolbox`.
     pub fn new(
         client_manager: Arc<ClientManager>,
         doc_manager: Arc<Mutex<DocumentManager>>,
-        runtime: Handle,
+        runtime: tokio::runtime::Handle,
         diagnostics: Arc<DiagnosticsServer>,
         session_id: Option<String>,
     ) -> Self {
-        let editing =
-            EditingServer::new(diagnostics.clone(), session_id.clone().unwrap_or_default());
-        let replace = ReplaceServer::new(
-            client_manager.clone(),
-            doc_manager.clone(),
-            diagnostics,
-            runtime.clone(),
-            session_id,
-        );
-        let grep = GrepServer {
-            client_manager: client_manager.clone(),
-            doc_manager: doc_manager.clone(),
-            runtime: runtime.clone(),
-        };
-        let glob = GlobServer {
-            client_manager: client_manager.clone(),
-            doc_manager: doc_manager.clone(),
-            runtime: runtime.clone(),
-        };
-        Self {
-            grep,
-            glob,
+        let toolbox = Toolbox::new(
             client_manager,
             doc_manager,
             runtime,
+            diagnostics,
+            session_id,
+        );
+        Self {
+            toolbox,
             notified_offline: std::sync::Mutex::new(HashSet::new()),
-            replace,
-            editing,
         }
     }
 
     /// Gets the appropriate LSP client for the given file path.
     async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
         let lang_id = {
-            let doc_manager = self.doc_manager.lock().await;
+            let doc_manager = self.toolbox.doc_manager.lock().await;
             doc_manager.language_id_for_path(path).to_string()
         };
 
-        self.client_manager
+        self.toolbox
+            .client_manager
             .get_client_for_path(path, &lang_id)
             .await
     }
@@ -131,7 +103,7 @@ impl LspBridgeHandler {
     /// and the caller uses [`check_server_health`] to detect state.
     /// Used for symbol-only queries that don't target a specific file.
     async fn wait_for_all_servers_ready(&self) {
-        let clients = self.client_manager.clients().await;
+        let clients = self.toolbox.client_manager.clients().await;
 
         for (lang, client_mutex) in clients {
             if !client_mutex.lock().await.wait_ready().await {
@@ -153,10 +125,13 @@ impl LspBridgeHandler {
 
         // Classify each touched server by readiness (not just process liveness —
         // a stuck server is alive but not ready)
-        let clients = self.runtime.block_on(self.client_manager.clients());
+        let clients = self
+            .toolbox
+            .runtime
+            .block_on(self.toolbox.client_manager.clients());
         for lang in touched_servers {
             let ready = clients.get(lang).is_some_and(|c| {
-                self.runtime.block_on(async {
+                self.toolbox.runtime.block_on(async {
                     let client = c.lock().await;
                     // Lightweight idle probe: if a stuck server has gone idle,
                     // recover it to Ready before checking readiness.
@@ -237,10 +212,11 @@ impl LspBridgeHandler {
     /// custom/test languages where the config key is the file extension.
     async fn language_for_path(&self, path: &Path) -> Option<String> {
         let lang_id = {
-            let doc_manager = self.doc_manager.lock().await;
+            let doc_manager = self.toolbox.doc_manager.lock().await;
             doc_manager.language_id_for_path(path).to_string()
         };
         let client_mutex = self
+            .toolbox
             .client_manager
             .get_client_for_path(path, &lang_id)
             .await
@@ -437,13 +413,17 @@ impl ToolHandler for LspBridgeHandler {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("{name} requires a 'file' parameter"))?;
 
-            let roots = self.runtime.block_on(self.client_manager.roots());
+            let roots = self
+                .toolbox
+                .runtime
+                .block_on(self.toolbox.client_manager.roots());
 
             let result = if name == "start_editing" {
-                self.editing.start_editing(file, &roots)
+                self.toolbox.editing.start_editing(file, &roots)
             } else {
-                self.runtime
-                    .block_on(self.editing.done_editing(file, &roots))
+                self.toolbox
+                    .runtime
+                    .block_on(self.toolbox.editing.done_editing(file, &roots))
             };
 
             return match result {
@@ -456,7 +436,10 @@ impl ToolHandler for LspBridgeHandler {
         // LSP interaction via DiagnosticsServer after the file write.
         if name == "replace" {
             let params = arguments.unwrap_or(serde_json::Value::Null);
-            let result = self.runtime.block_on(self.replace.execute(&params, None));
+            let result = self
+                .toolbox
+                .runtime
+                .block_on(self.toolbox.replace.execute(&params, None));
 
             return match result {
                 Ok(v) => {
@@ -472,10 +455,13 @@ impl ToolHandler for LspBridgeHandler {
         let health = file_path.as_ref().map_or_else(
             || {
                 // Symbol-only: wait for all servers
-                self.runtime.block_on(self.wait_for_all_servers_ready());
-                let touched: Vec<String> = self
+                self.toolbox
                     .runtime
-                    .block_on(self.client_manager.clients())
+                    .block_on(self.wait_for_all_servers_ready());
+                let touched: Vec<String> = self
+                    .toolbox
+                    .runtime
+                    .block_on(self.toolbox.client_manager.clients())
                     .keys()
                     .cloned()
                     .collect();
@@ -483,8 +469,11 @@ impl ToolHandler for LspBridgeHandler {
             },
             |path| {
                 // File-scoped: wait for the specific server
-                self.runtime.block_on(self.wait_for_server_ready(path));
+                self.toolbox
+                    .runtime
+                    .block_on(self.wait_for_server_ready(path));
                 let touched: Vec<String> = self
+                    .toolbox
                     .runtime
                     .block_on(self.language_for_path(path))
                     .into_iter()
@@ -501,8 +490,14 @@ impl ToolHandler for LspBridgeHandler {
 
         // Dispatch tool
         let mut result = match name {
-            "grep" => self.grep.handle_grep(arguments),
-            "glob" => self.glob.handle_glob(arguments),
+            "grep" => self
+                .toolbox
+                .grep
+                .handle_grep(arguments, &self.toolbox.fs_cache),
+            "glob" => self
+                .toolbox
+                .glob
+                .handle_glob(arguments, &self.toolbox.fs_cache),
             _ => Err(anyhow!("Unknown tool: {name}")),
         };
 

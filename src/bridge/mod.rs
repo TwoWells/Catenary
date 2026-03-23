@@ -21,6 +21,8 @@ pub mod replace;
 mod symbols;
 /// Transformation layer trait between protocol boundaries and LSP.
 pub mod tool_server;
+/// Shared container for tool servers and cross-tool infrastructure.
+pub mod toolbox;
 
 pub use diagnostics_server::DiagnosticsServer;
 pub use document_manager::{DocumentManager, DocumentNotification};

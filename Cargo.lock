@@ -182,6 +182,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "libc",
+ "memchr",
  "notify",
  "ratatui",
  "regex",

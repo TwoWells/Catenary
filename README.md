@@ -15,7 +15,7 @@ Internal planning and tracking for the Catenary project.
 | 7 | [Wait model v2](#7-wait-model-v2) | **1b ready** | `tickets/waitv2/README.md` |
 | 8 | [Monitoring](#8-monitoring) | **Complete** | `tickets/monitoring/README.md` |
 | 9 | [Filtering](#9-filtering) | **Design complete** | `tickets/filtering/DESIGN.md` |
-| 10 | [Collapse](#10-collapse) | **Phase 6 open** | `tickets/collapse/README.md` |
+| 10 | [Collapse](#10-collapse) | **Complete** | `tickets/collapse/README.md` |
 | 11 | [Replace](#11-replace) | **Removal ready** | `tickets/replace/README.md` |
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
 | 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 complete** | `tickets/acquire/DESIGN.md` |
@@ -23,13 +23,7 @@ Internal planning and tracking for the Catenary project.
 
 ## Current priority
 
-**1. Collapse 11 → Misc 19 — Toolbox + binary file detection.**
-Collapse 11 extracts `Toolbox` from `LspBridgeHandler` (I19 from
-waitv2 design review). Misc 19 adds `FilesystemCache` on `Toolbox`
-with binary detection (null byte scan + 10 MB size gate), shared by
-grep and glob. Blocker on sshfs/NAS workspaces.
-
-**2. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
+**1. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
 finalized: `tickets/waitv2/design/pipeline_1b.md`. 10 tickets
 (1b-00 through 1b-08, including 02a/02b split). Critical path:
 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 00 (capability
@@ -210,7 +204,7 @@ Design: `tickets/filtering/DESIGN.md`.
 
 ## 10. Collapse
 
-**Status: Phase 6 open.** Phases 0-5 done. Ticket 11 (Toolbox extraction) open — pulls tool servers and shared deps out of `LspBridgeHandler`. Rearchitects the event system around Catenary's identity as a
+**Status: Complete.** All 6 phases done. Rearchitects the event system around Catenary's identity as a
 JSON bridge between three protocols (MCP, LSP, Hooks). Four architectural
 layers, two cleanly separated concerns:
 

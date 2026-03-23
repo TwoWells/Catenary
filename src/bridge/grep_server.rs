@@ -23,6 +23,7 @@ use super::handler::{display_path, has_cap};
 use super::symbols::{
     self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
 };
+use super::toolbox::FilesystemCache;
 use super::{DocumentManager, DocumentNotification};
 use crate::lsp::{ClientManager, LspClient};
 use crate::mcp::CallToolResult;
@@ -118,7 +119,11 @@ impl GrepServer {
 
     /// Grep: ripgrep + `workspace/symbol("")` pipeline with LSP enrichment.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
-    pub fn handle_grep(&self, arguments: Option<serde_json::Value>) -> Result<CallToolResult> {
+    pub fn handle_grep(
+        &self,
+        arguments: Option<serde_json::Value>,
+        fs_cache: &Arc<FilesystemCache>,
+    ) -> Result<CallToolResult> {
         use std::fmt::Write;
 
         let input: GrepInput =
@@ -144,6 +149,7 @@ impl GrepServer {
             input.exclude.as_deref(),
             input.include_gitignored,
             input.include_hidden,
+            fs_cache,
         )?;
 
         // 2. Symbol universe: workspace/symbol("") + regex filter, with rg fallback
@@ -823,6 +829,7 @@ impl GrepServer {
         exclude: Option<&str>,
         include_gitignored: bool,
         include_hidden: bool,
+        fs_cache: &Arc<FilesystemCache>,
     ) -> Result<RipgrepMatches> {
         use ignore::WalkState;
         use std::sync::Mutex as StdMutex;
@@ -865,6 +872,7 @@ impl GrepServer {
                 let glob_matcher = glob_matcher.clone();
                 let exclude_matcher = exclude_matcher.clone();
                 let root = root.clone();
+                let fs_cache = Arc::clone(fs_cache);
                 let mut state = CollectOnDrop {
                     local: ThreadMatches::default(),
                     collected: Arc::clone(&collected),
@@ -890,6 +898,13 @@ impl GrepServer {
                         if em.is_match(rel) {
                             return WalkState::Continue;
                         }
+                    }
+
+                    // Skip binary files — no meaningful text matches
+                    if let Ok(metadata) = path.metadata()
+                        && fs_cache.is_binary(path, &metadata)
+                    {
+                        return WalkState::Continue;
                     }
 
                     let path_str = path.to_string_lossy().to_string();
