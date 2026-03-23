@@ -94,12 +94,15 @@ pub fn mcp_category(method: &str) -> &'static str {
 }
 
 /// Categorize a hook method.
+///
+/// Matches on the action suffix (after the last `/`) so categories
+/// work with the full `namespace/action` method strings.
 #[must_use]
 pub fn hook_category(method: &str) -> &'static str {
-    match method {
-        "PostToolUse" => "diagnostics",
-        "PreToolUse" => "sync",
-        "SessionStart" => "lifecycle",
+    match method.rsplit('/').next().unwrap_or(method) {
+        "diagnostics" => "diagnostics",
+        "roots-sync" => "sync",
+        "enforce-editing" | "require-release" | "clear-editing" => "lifecycle",
         _ => "unknown",
     }
 }
@@ -361,8 +364,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_category_posttooluse() {
-        assert_eq!(hook_category("PostToolUse"), "diagnostics");
+    fn test_hook_category_methods() {
+        assert_eq!(hook_category("post-tool/diagnostics"), "diagnostics");
+        assert_eq!(hook_category("pre-agent/roots-sync"), "sync");
+        assert_eq!(hook_category("pre-tool/enforce-editing"), "lifecycle");
+        assert_eq!(hook_category("post-agent/require-release"), "lifecycle");
+        assert_eq!(hook_category("session-start/clear-editing"), "lifecycle");
+        assert_eq!(hook_category("unknown/method"), "unknown");
     }
 
     // ── Collapse key tests ───────────────────────────────────────────────

@@ -109,7 +109,7 @@ impl BridgeProcess {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .context("set read timeout")?;
 
-        let request = json!({"file": file});
+        let request = json!({"method": "post-tool/diagnostics", "file": file});
         writeln!(stream, "{request}").context("write to notify socket")?;
         stream
             .shutdown(std::net::Shutdown::Write)
@@ -120,13 +120,15 @@ impl BridgeProcess {
             .read_to_string(&mut response)
             .context("read from notify socket")?;
 
-        // Unwrap NotifyResult wire protocol — return the content string
+        // Unwrap HookResult wire protocol — return the content string
         let trimmed = response.trim();
-        serde_json::from_str::<catenary_mcp::hook::NotifyResult>(trimmed).map_or_else(
+        serde_json::from_str::<catenary_mcp::hook::HookResult>(trimmed).map_or_else(
             |_| Ok(trimmed.to_string()),
             |result| match result {
-                catenary_mcp::hook::NotifyResult::Content(s) => Ok(s),
-                catenary_mcp::hook::NotifyResult::Error(e) => Ok(format!("Notify error: {e}")),
+                catenary_mcp::hook::HookResult::Content(s)
+                | catenary_mcp::hook::HookResult::Courtesy(s) => Ok(s),
+                catenary_mcp::hook::HookResult::Error(e) => Ok(format!("Notify error: {e}")),
+                other => Ok(format!("{other:?}")),
             },
         )
     }

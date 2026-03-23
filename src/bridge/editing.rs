@@ -55,7 +55,7 @@ fn resolve_in_roots(file: &str, roots: &[PathBuf]) -> Result<PathBuf> {
 
 /// Handles `start_editing` and `done_editing` MCP tool calls.
 ///
-/// Manages per-file editing state in SQLite and delegates diagnostic
+/// Manages per-file editing state in `SQLite` and delegates diagnostic
 /// collection to `DiagnosticsServer` on `done_editing`.
 pub struct EditingServer {
     diagnostics: Arc<DiagnosticsServer>,
@@ -64,7 +64,8 @@ pub struct EditingServer {
 
 impl EditingServer {
     /// Creates a new `EditingServer`.
-    pub fn new(diagnostics: Arc<DiagnosticsServer>, session_id: String) -> Self {
+    #[must_use]
+    pub const fn new(diagnostics: Arc<DiagnosticsServer>, session_id: String) -> Self {
         Self {
             diagnostics,
             session_id,

@@ -3,11 +3,18 @@
 
 //! Hook handlers for host CLI integration.
 //!
+//! Each function is a thin transport: read stdin from the host CLI,
+//! connect to the running Catenary session's IPC socket, forward the
+//! request as a `HookRequest`, and format the response for the host.
+//!
+//! All hook logic runs server-side in `HookServer` (`src/hook.rs`).
+//!
 //! Function names mirror the hook lifecycle:
 //! - `run_pre_agent` — root sync (`UserPromptSubmit` / `BeforeAgent`)
 //! - `run_pre_tool` — editing state enforcement (`PreToolUse` / `BeforeTool`)
 //! - `run_post_tool` — diagnostics (`PostToolUse` / `AfterTool`)
 //! - `run_post_agent` — force `done_editing` (`Stop` / `AfterAgent`)
+//! - `run_session_start` — clear stale editing state (`SessionStart`)
 
 #![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
@@ -87,36 +94,7 @@ fn ipc_exchange(
     lines
 }
 
-/// Returns `true` if the tool is an edit tool that requires `start_editing`.
-fn is_edit_tool(tool_name: &str, format: HostFormat) -> bool {
-    match format {
-        HostFormat::Claude => matches!(tool_name, "Edit" | "Write" | "NotebookEdit"),
-        HostFormat::Gemini => matches!(tool_name, "write_file" | "replace"),
-    }
-}
-
-/// Returns `true` if the tool is a read tool (always allowed during editing).
-fn is_read_tool(tool_name: &str, format: HostFormat) -> bool {
-    match format {
-        HostFormat::Claude => matches!(tool_name, "Read" | "NotebookRead"),
-        HostFormat::Gemini => tool_name == "read_file",
-    }
-}
-
-/// Returns `true` if the tool is always allowed during editing mode.
-///
-/// Catenary editing tools (`start_editing`, `done_editing`) must be allowed
-/// so the agent can manage editing state. `ToolSearch` must be allowed
-/// because both editing tools are deferred in Claude Code — blocking
-/// ToolSearch while editing creates an unrecoverable state if the agent
-/// loaded `start_editing` but not `done_editing` before entering editing mode.
-fn is_allowed_during_editing(tool_name: &str) -> bool {
-    tool_name.contains("start_editing")
-        || tool_name.contains("done_editing")
-        || tool_name == "ToolSearch"
-}
-
-/// Format a PreToolUse deny response for the host CLI.
+/// Format a `PreToolUse` deny response for the host CLI.
 fn format_deny(reason: &str, format: HostFormat) -> String {
     match format {
         HostFormat::Claude => serde_json::json!({
@@ -174,6 +152,29 @@ fn extract_agent_id(hook_json: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
+/// Extracts the file path from hook JSON's `tool_input`.
+fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
+    let file_path = hook_json
+        .get("tool_input")
+        .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
+        .and_then(|fp| fp.as_str())?;
+
+    // Resolve to absolute path
+    let abs_path = if std::path::Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        );
+        cwd.join(file_path)
+    };
+
+    Some(abs_path.to_string_lossy().into_owned())
+}
+
+// ── Hook transport functions ────────────────────────────────────────────
+
 /// Clear all editing state for a session (`SessionStart` hook handler).
 ///
 /// Called on session start, resume, `/clear`, and `/compact`. The agent's
@@ -190,26 +191,32 @@ pub fn run_session_start(format: HostFormat) {
     let Ok(conn) = db::open_and_migrate() else {
         return;
     };
-
     let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
         return;
     };
 
-    let count = db::clear_session_editing(&conn, &catenary_sid).unwrap_or(0);
-    if count > 0 {
-        // Store host session ID while we have the connection.
-        if let Some(client_sid) = hook_json.get("session_id").and_then(|v| v.as_str()) {
-            let _ = conn.execute(
-                "UPDATE sessions SET client_session_id = ?1 \
-                 WHERE id = ?2 AND client_session_id IS NULL",
-                rusqlite::params![client_sid, &catenary_sid],
-            );
-        }
-        // Log for verbose mode only — not injected into model context.
+    let endpoint = notify_endpoint(&catenary_sid);
+    let Some(stream) = notify_connect(&endpoint) else {
+        return;
+    };
+
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let mut request = serde_json::json!({"method": "session-start/clear-editing"});
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
+
+    let lines = ipc_exchange(stream, &request);
+
+    if let Some(line) = lines.first()
+        && let Ok(crate::hook::HookResult::Cleared(count)) =
+            serde_json::from_str::<crate::hook::HookResult>(line)
+    {
         let msg = format!("Catenary: cleared {count} stale editing state entries");
         let output = match format {
-            HostFormat::Claude => serde_json::json!({ "systemMessage": msg }),
-            HostFormat::Gemini => serde_json::json!({ "systemMessage": msg }),
+            HostFormat::Claude | HostFormat::Gemini => {
+                serde_json::json!({ "systemMessage": msg })
+            }
         };
         print!("{output}");
     }
@@ -220,7 +227,7 @@ pub fn run_session_start(format: HostFormat) {
 ///
 /// If the agent has files in editing state, blocks the stop with a message
 /// directing the agent to call `done_editing`. If `stop_hook_active` is true
-/// (Claude Code) indicating a retry, allows the stop — SessionStart cleanup
+/// (Claude Code) indicating a retry, allows the stop — `SessionStart` cleanup
 /// handles the stale state.
 pub fn run_post_agent(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
@@ -230,78 +237,52 @@ pub fn run_post_agent(format: HostFormat) {
         return;
     };
 
-    // Prevent infinite loops: if this is already a retry, let the agent stop.
-    let stop_hook_active = hook_json
-        .get("stop_hook_active")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if stop_hook_active {
-        return;
-    }
-
     let Ok(conn) = db::open_and_migrate() else {
         return;
     };
-
     let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
         return;
     };
 
-    let agent_id = extract_agent_id(&hook_json);
-    let files = db::editing_files_for_agent(&conn, &catenary_sid, agent_id).unwrap_or_default();
-
-    if files.is_empty() {
+    let endpoint = notify_endpoint(&catenary_sid);
+    let Some(stream) = notify_connect(&endpoint) else {
         return;
-    }
+    };
 
-    let file_list = files.join(", ");
-    let reason = format!("call done_editing for {file_list} to get diagnostics before finishing");
-    print!("{}", format_stop_block(&reason, format));
+    let stop_hook_active = hook_json
+        .get("stop_hook_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let agent_id = extract_agent_id(&hook_json);
+
+    let request = serde_json::json!({
+        "method": "post-agent/require-release",
+        "agent_id": agent_id,
+        "stop_hook_active": stop_hook_active,
+    });
+
+    let lines = ipc_exchange(stream, &request);
+
+    if let Some(line) = lines.first()
+        && let Ok(crate::hook::HookResult::Block(reason)) =
+            serde_json::from_str::<crate::hook::HookResult>(line)
+    {
+        print!("{}", format_stop_block(&reason, format));
+    }
 }
 
 /// Run diagnostics after reading or editing (`PostToolUse` / `AfterTool` hook handler).
 ///
 /// Reads hook JSON from stdin, finds the session for the file's workspace,
-/// connects to the notify socket, and returns diagnostics for the model's
+/// connects to the IPC socket, and returns diagnostics for the model's
 /// context. Emits `systemMessage` JSON on infrastructure errors so the user
 /// sees failures in their terminal.
 pub fn run_post_tool(format: HostFormat) {
-    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
-        print!(
-            "{}",
-            notify_error(
-                "hook input unavailable — try restarting your session",
-                format
-            )
-        );
+    let Some((file_path, hook_json)) = read_post_tool_input(format) else {
         return;
     };
 
-    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
-        print!(
-            "{}",
-            notify_error(
-                "unexpected hook input — try restarting your session",
-                format
-            )
-        );
-        return;
-    };
-
-    let Some(file_path) = extract_file_path(&hook_json) else {
-        print!(
-            "{}",
-            notify_error(
-                "missing file path in hook input — diagnostics skipped",
-                format
-            )
-        );
-        return;
-    };
-
-    // Notify session for diagnostics
-    let abs_path = PathBuf::from(&file_path);
-    let Ok(conn) = crate::db::open_and_migrate() else {
+    let Ok(conn) = db::open_and_migrate() else {
         print!(
             "{}",
             notify_error(
@@ -311,90 +292,125 @@ pub fn run_post_tool(format: HostFormat) {
         );
         return;
     };
-    let sessions = session::list_sessions_with_conn(&conn).unwrap_or_default();
-    let session = sessions
-        .iter()
-        .find(|(s, alive)| *alive && abs_path.to_string_lossy().starts_with(&s.workspace));
-
-    let Some((session, _)) = session else {
-        // File is outside all session workspaces, or no alive session — nothing to do.
-        // No systemMessage: this isn't actionable for the user.
+    let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
         return;
     };
 
-    // Store the host CLI's session ID (first hook wins, subsequent calls are no-ops).
-    if let Some(client_sid) = hook_json.get("session_id").and_then(|v| v.as_str()) {
-        let _ = conn.execute(
-            "UPDATE sessions SET client_session_id = ?1 \
-             WHERE id = ?2 AND client_session_id IS NULL",
-            rusqlite::params![client_sid, &session.id],
-        );
-    }
-
-    // --- Editing state: suppress diagnostics for files being edited ---
-    let agent_id = extract_agent_id(&hook_json);
-    let self_editing = db::is_editing(&conn, &file_path, &session.id, agent_id).unwrap_or(false);
-    if self_editing {
-        // This agent is editing this file — suppress diagnostics entirely.
-        return;
-    }
-    let other_editing =
-        db::is_edited_by_others(&conn, &file_path, &session.id, agent_id).unwrap_or(false);
-
-    let endpoint = notify_endpoint(&session.id);
+    let endpoint = notify_endpoint(&catenary_sid);
     let Some(stream) = notify_connect(&endpoint) else {
         print!(
             "{}",
             notify_error(
-                &format!(
-                    "session {} is not responding — it may have crashed",
-                    session.id
-                ),
+                &format!("session {catenary_sid} is not responding — it may have crashed"),
                 format,
             )
         );
         return;
     };
 
+    let agent_id = extract_agent_id(&hook_json);
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
     let tool_name = hook_json.get("tool_name").and_then(|v| v.as_str());
-    let mut request = serde_json::json!({ "file": abs_path.to_string_lossy() });
+
+    let mut request = serde_json::json!({
+        "method": "post-tool/diagnostics",
+        "file": file_path,
+        "agent_id": agent_id,
+    });
     if let Some(tool) = tool_name {
         request["tool"] = serde_json::json!(tool);
     }
-    let lines = ipc_exchange(stream, &request);
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
 
-    // Deserialize NotifyResult from the first response line.
-    // Graceful degradation: if parsing fails (version skew), treat raw lines as content.
-    let result = lines
-        .first()
-        .and_then(|line| serde_json::from_str::<crate::hook::NotifyResult>(line).ok())
-        .unwrap_or_else(|| crate::hook::NotifyResult::Content(lines.join("\n")));
+    let lines = ipc_exchange(stream, &request);
+    format_post_tool_response(&lines, &file_path, format);
+}
+
+/// Read and validate stdin for `run_post_tool`. Returns file path and parsed JSON.
+fn read_post_tool_input(format: HostFormat) -> Option<(String, serde_json::Value)> {
+    let stdin_data = std::io::read_to_string(std::io::stdin()).ok().or_else(|| {
+        print!(
+            "{}",
+            notify_error(
+                "hook input unavailable — try restarting your session",
+                format
+            )
+        );
+        None
+    })?;
+    let hook_json: serde_json::Value = serde_json::from_str(&stdin_data).ok().or_else(|| {
+        print!(
+            "{}",
+            notify_error(
+                "unexpected hook input — try restarting your session",
+                format
+            )
+        );
+        None
+    })?;
+    let file_path = extract_file_path(&hook_json).or_else(|| {
+        print!(
+            "{}",
+            notify_error(
+                "missing file path in hook input — diagnostics skipped",
+                format
+            )
+        );
+        None
+    })?;
+    Some((file_path, hook_json))
+}
+
+/// Format and print the IPC response from `post-tool/diagnostics`.
+fn format_post_tool_response(lines: &[String], file_path: &str, format: HostFormat) {
+    let Some(line) = lines.first() else {
+        return; // Empty response = suppress (self-editing)
+    };
+
+    let filename = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file_path);
+
+    let Ok(result) = serde_json::from_str::<crate::hook::HookResult>(line) else {
+        print!(
+            "{}",
+            format_diagnostics(&format!("{filename}\n\t{line}"), format, "PostToolUse")
+        );
+        return;
+    };
 
     match result {
-        crate::hook::NotifyResult::Content(content) => {
-            let filename = std::path::Path::new(&file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&file_path);
-            let courtesy = if other_editing {
-                "\n\t[diagnostics for this file are being deferred by another agent]"
-            } else {
-                ""
-            };
-            let full_content = format!("{filename}\n\t{content}{courtesy}");
-            let output = format_diagnostics(&full_content, format, "PostToolUse");
-            print!("{output}");
+        crate::hook::HookResult::Content(content) => {
+            print!(
+                "{}",
+                format_diagnostics(&format!("{filename}\n\t{content}"), format, "PostToolUse")
+            );
         }
-        crate::hook::NotifyResult::Error(msg) => {
+        crate::hook::HookResult::Courtesy(content) => {
+            let courtesy = "\n\t[diagnostics for this file are being deferred by another agent]";
+            print!(
+                "{}",
+                format_diagnostics(
+                    &format!("{filename}\n\t{content}{courtesy}"),
+                    format,
+                    "PostToolUse"
+                )
+            );
+        }
+        crate::hook::HookResult::Error(msg) => {
             print!("{}", notify_error(&msg, format));
         }
+        _ => {} // unexpected variant for this hook
     }
 }
 
 /// Refresh workspace roots (`UserPromptSubmit` / `BeforeAgent` hook handler).
 ///
-/// Sends a `refresh_roots` IPC request to the running Catenary session so
-/// `/add-dir` workspace additions are picked up. Runs once per user prompt
+/// Sends a `pre-agent/roots-sync` IPC request to the running Catenary session
+/// so `/add-dir` workspace additions are picked up. Runs once per user prompt
 /// rather than on every tool call.
 ///
 /// Silently succeeds on any error to avoid breaking the host CLI's flow.
@@ -416,7 +432,7 @@ pub fn run_pre_agent(format: HostFormat) {
     if let Some(catenary_sid) = find_session_id(&hook_json, &conn) {
         let endpoint = notify_endpoint(&catenary_sid);
         if let Some(stream) = notify_connect(&endpoint) {
-            let request = serde_json::json!({ "refresh_roots": true });
+            let request = serde_json::json!({"method": "pre-agent/roots-sync"});
             let _ = ipc_exchange(stream, &request);
         }
     }
@@ -424,10 +440,8 @@ pub fn run_pre_agent(format: HostFormat) {
 
 /// Editing state enforcement (`PreToolUse` / `BeforeTool` hook handler).
 ///
-/// Checks editing state before allowing tool execution. If the agent is
-/// editing files, only Edit/Read on those files and Catenary editing tools
-/// are allowed. If the agent is not editing, Edit requires `start_editing`
-/// first.
+/// Sends a `pre-tool/enforce-editing` IPC request and formats any deny
+/// response for the host CLI.
 ///
 /// Silently succeeds on any error to avoid breaking the host CLI's flow.
 pub fn run_pre_tool(format: HostFormat) {
@@ -439,88 +453,49 @@ pub fn run_pre_tool(format: HostFormat) {
         return;
     };
 
+    let Ok(conn) = db::open_and_migrate() else {
+        return;
+    };
+    let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
+        return;
+    };
+
+    let endpoint = notify_endpoint(&catenary_sid);
+    let Some(stream) = notify_connect(&endpoint) else {
+        return;
+    };
+
     let tool_name = hook_json
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let file_path = extract_file_path(&hook_json);
+    let agent_id = extract_agent_id(&hook_json);
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
 
-    let Ok(conn) = db::open_and_migrate() else {
-        // Can't check editing state — allow the tool to proceed.
-        return;
-    };
+    let mut request = serde_json::json!({
+        "method": "pre-tool/enforce-editing",
+        "tool_name": tool_name,
+        "agent_id": agent_id,
+    });
+    if let Some(path) = &file_path {
+        request["file_path"] = serde_json::json!(path);
+    }
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
 
-    if let Some(catenary_sid) = find_session_id(&hook_json, &conn) {
-        // Store host session ID.
-        if let Some(client_sid) = hook_json.get("session_id").and_then(|v| v.as_str()) {
-            let _ = conn.execute(
-                "UPDATE sessions SET client_session_id = ?1 \
-                 WHERE id = ?2 AND client_session_id IS NULL",
-                rusqlite::params![client_sid, &catenary_sid],
-            );
-        }
+    let lines = ipc_exchange(stream, &request);
 
-        let agent_id = extract_agent_id(&hook_json);
-        let editing_files =
-            db::editing_files_for_agent(&conn, &catenary_sid, agent_id).unwrap_or_default();
-
-        if !editing_files.is_empty() {
-            // Agent is editing files — restrict to Edit/Read on those files,
-            // plus Catenary editing tools. Deny everything else.
-            if is_allowed_during_editing(tool_name) || is_read_tool(tool_name, format) {
-                // Always allowed.
-            } else if is_edit_tool(tool_name, format) {
-                // Edit tool: check if the target file is being edited.
-                if let Some(file_path) = extract_file_path(&hook_json) {
-                    let is_managed =
-                        db::is_editing(&conn, &file_path, &catenary_sid, agent_id).unwrap_or(false);
-                    if !is_managed {
-                        let file_list = editing_files.join(", ");
-                        let reason = format!(
-                            "call start_editing for {file_path} before editing, \
-                             or done_editing for {file_list} first"
-                        );
-                        print!("{}", format_deny(&reason, format));
-                        return;
-                    }
-                }
-                // File is being edited by this agent — allow.
-            } else {
-                // Non-Edit, non-Read tool while editing — deny.
-                let file_list = editing_files.join(", ");
-                let reason = format!("call done_editing for {file_list} to get diagnostics");
-                print!("{}", format_deny(&reason, format));
-                return;
-            }
-        } else if is_edit_tool(tool_name, format) {
-            // Agent is not editing any files + Edit tool — deny.
-            let file_path = extract_file_path(&hook_json).unwrap_or_default();
-            let reason = format!("call start_editing for {file_path} before editing");
-            print!("{}", format_deny(&reason, format));
-            return;
-        }
+    if let Some(line) = lines.first()
+        && let Ok(crate::hook::HookResult::Deny(reason)) =
+            serde_json::from_str::<crate::hook::HookResult>(line)
+    {
+        print!("{}", format_deny(&reason, format));
     }
 }
 
-/// Extracts the file path from hook JSON's `tool_input`.
-fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
-    let file_path = hook_json
-        .get("tool_input")
-        .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
-        .and_then(|fp| fp.as_str())?;
-
-    // Resolve to absolute path
-    let abs_path = if std::path::Path::new(file_path).is_absolute() {
-        PathBuf::from(file_path)
-    } else {
-        let cwd = hook_json.get("cwd").and_then(|v| v.as_str()).map_or_else(
-            || std::env::current_dir().unwrap_or_default(),
-            PathBuf::from,
-        );
-        cwd.join(file_path)
-    };
-
-    Some(abs_path.to_string_lossy().into_owned())
-}
+// ── Formatting helpers ──────────────────────────────────────────────────
 
 /// Format diagnostic content for the model via `additionalContext`.
 ///

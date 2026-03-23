@@ -118,24 +118,6 @@ enum Command {
         command: HookCommand,
     },
 
-    /// Sync /add-dir roots from Claude Code transcript to a running session.
-    /// Designed for `PreToolUse` hooks — reads hook JSON from stdin.
-    #[command(hide = true)]
-    SyncRoots {
-        /// Output format: "claude" or "gemini".
-        #[arg(long, value_enum)]
-        format: HostFormat,
-    },
-
-    /// Run diagnostics for a file after editing.
-    /// Reads hook JSON from stdin.
-    #[command(hide = true)]
-    Notify {
-        /// Output format: "claude" or "gemini".
-        #[arg(long, value_enum)]
-        format: HostFormat,
-    },
-
     /// Query events from the database.
     Query {
         /// Filter by session ID or prefix.
@@ -200,35 +182,35 @@ enum Command {
 /// Hook subcommands invoked by host CLI hooks.
 #[derive(Subcommand, Debug)]
 enum HookCommand {
-    /// Pre-agent: refresh workspace roots (UserPromptSubmit / BeforeAgent).
+    /// Pre-agent: refresh workspace roots (`UserPromptSubmit` / `BeforeAgent`).
     #[command(name = "pre-agent")]
     PreAgent {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// Pre-tool: editing state enforcement (PreToolUse / BeforeTool).
+    /// Pre-tool: editing state enforcement (`PreToolUse` / `BeforeTool`).
     #[command(name = "pre-tool")]
     PreTool {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// Post-tool: file-change notification with diagnostics (PostToolUse / AfterTool).
+    /// Post-tool: file-change notification with diagnostics (`PostToolUse` / `AfterTool`).
     #[command(name = "post-tool")]
     PostTool {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// Post-agent: force done_editing before agent finishes (Stop / AfterAgent).
+    /// Post-agent: force `done_editing` before agent finishes (`Stop` / `AfterAgent`).
     #[command(name = "post-agent")]
     PostAgent {
         /// Output format: "claude" or "gemini".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// SessionStart: clear stale editing state.
+    /// `SessionStart`: clear stale editing state.
     #[command(name = "session-start")]
     SessionStart {
         /// Output format: "claude" or "gemini".
@@ -293,14 +275,6 @@ async fn main() -> Result<()> {
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
             }
-            Ok(())
-        }
-        Some(Command::SyncRoots { format }) => {
-            cli::hooks::run_pre_tool(format);
-            Ok(())
-        }
-        Some(Command::Notify { format }) => {
-            cli::hooks::run_post_tool(format);
             Ok(())
         }
         Some(Command::Query {
@@ -493,10 +467,23 @@ async fn run_server(args: Args) -> Result<()> {
         path_validator.clone(),
     ));
     let refresh_roots_flag = Arc::new(AtomicBool::new(false));
+    let hook_conn = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .conn()
+        .clone();
+    let hook_session_id = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .info
+        .id
+        .clone();
     let hook_server = catenary_mcp::hook::HookServer::new(
         diagnostics_server.clone(),
         refresh_roots_flag.clone(),
         message_log.clone(),
+        hook_conn,
+        hook_session_id,
         "host".to_string(),
     );
     let socket_path = session
@@ -679,21 +666,5 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::SessionStart { .. }));
-    }
-
-    #[test]
-    fn test_cli_legacy_notify_still_parses() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "notify", "--format=claude"]);
-        let args = args.expect("legacy notify should still parse");
-        assert!(matches!(args.command, Some(Command::Notify { .. })));
-    }
-
-    #[test]
-    fn test_cli_legacy_sync_roots_still_parses() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "sync-roots", "--format=claude"]);
-        let args = args.expect("legacy sync-roots should still parse");
-        assert!(matches!(args.command, Some(Command::SyncRoots { .. })));
     }
 }

@@ -337,6 +337,12 @@ impl Session {
         }
     }
 
+    /// Get the database connection for this session.
+    #[must_use]
+    pub const fn conn(&self) -> &Arc<Mutex<Connection>> {
+        &self.conn
+    }
+
     /// Get the message log for this session.
     #[must_use]
     pub const fn message_log(&self) -> &Arc<MessageLog> {

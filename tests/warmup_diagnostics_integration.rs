@@ -126,7 +126,7 @@ fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
         .set_read_timeout(Some(Duration::from_secs(30)))
         .context("set read timeout")?;
 
-    let request = json!({"file": file_path.to_str().context("invalid path")?});
+    let request = json!({"method": "post-tool/diagnostics", "file": file_path.to_str().context("invalid path")?});
     writeln!(stream, "{request}").context("write to notify socket")?;
     stream
         .shutdown(std::net::Shutdown::Write)

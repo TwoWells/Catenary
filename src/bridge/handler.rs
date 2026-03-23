@@ -46,7 +46,7 @@ pub struct LspBridgeHandler {
     notified_offline: std::sync::Mutex<HashSet<String>>,
     /// Batch replacement tool with snapshots and diagnostics.
     replace: ReplaceServer,
-    /// Per-file diagnostic batching (start_editing / done_editing).
+    /// Per-file diagnostic batching (`start_editing` / `done_editing`).
     editing: EditingServer,
 }
 

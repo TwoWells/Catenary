@@ -29,12 +29,7 @@ waitv2 design review). Misc 19 adds `FilesystemCache` on `Toolbox`
 with binary detection (null byte scan + 10 MB size gate), shared by
 grep and glob. Blocker on sshfs/NAS workspaces.
 
-**2. Misc 20 — HookServer as protocol boundary.** All five hooks
-through `HookServer` with caller-supplied method names. Foundation
-cleanup before waitv2 1b. Fixes monitor visibility (pre-agent
-mislabeled, post-agent/session-start invisible). Subsumes misc 07.
-
-**3. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
+**2. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
 finalized: `tickets/waitv2/design/pipeline_1b.md`. 10 tickets
 (1b-00 through 1b-08, including 02a/02b split). Critical path:
 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 00 (capability

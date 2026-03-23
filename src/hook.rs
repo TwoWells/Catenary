@@ -3,35 +3,65 @@
 
 //! IPC server for host CLI hook integration.
 //!
-//! `HookServer` is a protocol boundary: it parses IPC requests, dispatches
-//! diagnostics to `DiagnosticsServer`, sets root-refresh flags, logs protocol
-//! messages, and formats responses. Root synchronization is handled by the
-//! MCP server's `roots/list` fetch, triggered via a shared `AtomicBool`.
+//! `HookServer` is the protocol boundary for all hook traffic, same as
+//! `McpServer` is for MCP and `Connection`/`LspServer` is for LSP. All
+//! hook logic runs server-side. CLI hook processes are dumb transports:
+//! read stdin from the host CLI, connect to IPC, forward the request,
+//! format the response for the host.
+//!
+//! Hook methods are caller-supplied and follow the `namespace/action`
+//! convention used by MCP (`tools/call`) and LSP (`textDocument/hover`).
 //!
 //! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
 use anyhow::{Result, anyhow};
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
 use crate::bridge::diagnostics_server::DiagnosticsServer;
+use crate::db;
 use crate::session::MessageLog;
 
-/// Request from `catenary hook PostToolUse` (file change) or `catenary hook PreToolUse` (root sync).
+/// IPC request from the CLI hook process to the hook server.
+///
+/// Dispatched by the `method` field. Each variant corresponds to one of the
+/// five host CLI hooks.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum NotifyRequest {
-    /// A file-change notification.
-    File {
+#[serde(tag = "method")]
+enum HookRequest {
+    /// Refresh workspace roots via MCP `roots/list`.
+    #[serde(rename = "pre-agent/roots-sync")]
+    PreAgentRootsSync {},
+
+    /// Editing state enforcement: deny or allow a tool call.
+    #[serde(rename = "pre-tool/enforce-editing")]
+    PreToolEnforceEditing {
+        /// Host CLI tool name (e.g., "Edit", "Write", `"write_file"`).
+        tool_name: String,
+        /// Absolute path to the target file (if applicable).
+        #[serde(default)]
+        file_path: Option<String>,
+        /// Agent ID (empty string for the main agent).
+        #[serde(default)]
+        agent_id: String,
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
+    /// LSP diagnostics for a changed file.
+    #[serde(rename = "post-tool/diagnostics")]
+    PostToolDiagnostics {
         /// Absolute path to the changed file.
         file: String,
-        /// Name of the host CLI tool that triggered the hook (e.g., "Write", "Edit").
+        /// Name of the host CLI tool that triggered the hook.
         /// Included in the logged payload for monitor visibility.
         #[serde(default)]
         #[allow(
@@ -39,39 +69,102 @@ enum NotifyRequest {
             reason = "metadata field — logged in payload, not read in code"
         )]
         tool: Option<String>,
+        /// Agent ID (empty string for the main agent).
+        #[serde(default)]
+        agent_id: String,
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
     },
-    /// A request to refresh workspace roots via MCP `roots/list`.
-    RefreshRoots {
-        /// Always `true` — presence triggers a `roots/list` fetch in the MCP server.
-        #[allow(
-            dead_code,
-            reason = "field drives serde variant selection, not read in code"
-        )]
-        refresh_roots: bool,
+
+    /// Force `done_editing` before the agent stops.
+    #[serde(rename = "post-agent/require-release")]
+    PostAgentRequireRelease {
+        /// Agent ID (empty string for the main agent).
+        #[serde(default)]
+        agent_id: String,
+        /// Whether this is a retry (Claude Code `stop_hook_active`).
+        #[serde(default)]
+        stop_hook_active: bool,
+    },
+
+    /// Clear stale editing state on session start.
+    #[serde(rename = "session-start/clear-editing")]
+    SessionStartClearEditing {
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
     },
 }
 
 /// IPC response from the hook server to the CLI.
 ///
-/// Separates diagnostic content (for the model via `additionalContext`) from
-/// internal errors (for the user via `systemMessage`). The CLI deserializes
-/// this to decide where to route the output.
+/// Handlers return `Option<HookResult>`: `None` means "allow" (empty
+/// response — CLI outputs nothing). Variants carry actionable data
+/// for the CLI to format for the host.
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum NotifyResult {
+pub enum HookResult {
     /// Diagnostic content for the model (may be `[clean]`, `[no language server]`,
     /// `[diagnostics unavailable]`, or formatted diagnostic lines).
     Content(String),
     /// Internal error for the user (path resolution, LSP client failures, etc.).
     Error(String),
+    /// Deny with reason (pre-tool enforcement).
+    Deny(String),
+    /// Block with reason (post-agent enforcement).
+    Block(String),
+    /// Diagnostic content with courtesy notice (another agent is editing).
+    Courtesy(String),
+    /// Cleared editing state entries.
+    Cleared(usize),
 }
 
-/// Listens on an IPC endpoint (Unix socket or named pipe) for hook requests
-/// from the host CLI and returns LSP diagnostics or root sync results.
+// ── Tool classification helpers ─────────────────────────────────────────
+
+/// Returns `true` if the tool is an edit tool that requires `start_editing`.
+///
+/// Checks all known edit tool names across host CLIs (Claude Code and Gemini CLI).
+fn is_edit_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Edit" | "Write" | "NotebookEdit" | "write_file" | "replace"
+    )
+}
+
+/// Returns `true` if the tool is a read tool (always allowed during editing).
+///
+/// Checks all known read tool names across host CLIs.
+fn is_read_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Read" | "NotebookRead" | "read_file")
+}
+
+/// Returns `true` if the tool is always allowed during editing mode.
+///
+/// Catenary editing tools (`start_editing`, `done_editing`) must be allowed
+/// so the agent can manage editing state. `ToolSearch` must be allowed
+/// because both editing tools are deferred in Claude Code — blocking
+/// `ToolSearch` while editing creates an unrecoverable state if the agent
+/// loaded `start_editing` but not `done_editing` before entering editing mode.
+fn is_allowed_during_editing(tool_name: &str) -> bool {
+    tool_name.contains("start_editing")
+        || tool_name.contains("done_editing")
+        || tool_name == "ToolSearch"
+}
+
+// ── HookServer ──────────────────────────────────────────────────────────
+
+/// Listens on an IPC endpoint for hook requests from the host CLI.
+///
+/// Protocol boundary for all hook traffic. Dispatches on caller-supplied
+/// method names, runs editing state logic, diagnostics, and root sync
+/// server-side, and logs all hook messages for monitor visibility.
 pub struct HookServer {
     diagnostics: Arc<DiagnosticsServer>,
     refresh_roots: Arc<AtomicBool>,
     message_log: Arc<MessageLog>,
+    conn: Arc<Mutex<Connection>>,
+    session_id: String,
     client_name: String,
 }
 
@@ -82,12 +175,16 @@ impl HookServer {
         diagnostics: Arc<DiagnosticsServer>,
         refresh_roots: Arc<AtomicBool>,
         message_log: Arc<MessageLog>,
+        conn: Arc<Mutex<Connection>>,
+        session_id: String,
         client_name: String,
     ) -> Self {
         Self {
             diagnostics,
             refresh_roots,
             message_log,
+            conn,
+            session_id,
             client_name,
         }
     }
@@ -95,7 +192,7 @@ impl HookServer {
     /// Starts listening on the given IPC endpoint.
     ///
     /// Spawns a background task that accepts connections and processes
-    /// file-change notifications. Returns a `JoinHandle` for the listener task.
+    /// hook requests. Returns a `JoinHandle` for the listener task.
     ///
     /// # Errors
     ///
@@ -140,7 +237,7 @@ impl HookServer {
     /// Starts listening on the given named pipe path.
     ///
     /// Spawns a background task that accepts connections and processes
-    /// file-change notifications. Returns a `JoinHandle` for the listener task.
+    /// hook requests. Returns a `JoinHandle` for the listener task.
     ///
     /// # Errors
     ///
@@ -192,49 +289,81 @@ impl HookServer {
         Ok(handle)
     }
 
-    /// Handles a single connection: reads a JSON request, dispatches to the
-    /// appropriate handler, and writes back the response.
+    /// Handles a single connection: reads a JSON request, extracts the method
+    /// string, dispatches to the appropriate handler, logs both request and
+    /// response, and writes back the result.
     async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(&self, stream: S) -> Result<()> {
         let (reader, mut writer) = tokio::io::split(stream);
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
         buf_reader.read_line(&mut line).await?;
 
-        let request: NotifyRequest =
+        let raw: Value =
             serde_json::from_str(line.trim()).map_err(|e| anyhow!("Invalid request: {e}"))?;
-
-        let method = match &request {
-            NotifyRequest::File { .. } => "post-tool",
-            NotifyRequest::RefreshRoots { .. } => "pre-tool",
-        };
+        let method = raw
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
 
         // Log incoming hook request
         let entry_id = self.message_log.log(
             "hook",
-            method,
+            &method,
             "catenary",
             &self.client_name,
             None,
             None,
-            &serde_json::from_str::<Value>(line.trim()).unwrap_or_default(),
+            &raw,
         );
 
-        let response = match request {
-            NotifyRequest::File { file, .. } => {
-                debug!("Hook: processing file {file}");
-                self.process_file(&file, entry_id).await
-            }
-            NotifyRequest::RefreshRoots { .. } => {
+        let request: HookRequest =
+            serde_json::from_value(raw).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
+
+        let result = match request {
+            HookRequest::PreAgentRootsSync {} => {
                 debug!("Hook: refresh roots requested");
                 self.refresh_roots.store(true, Ordering::Release);
-                String::new()
+                None
+            }
+            HookRequest::PreToolEnforceEditing {
+                tool_name,
+                file_path,
+                agent_id,
+                session_id,
+            } => {
+                self.store_client_session_id(session_id.as_deref());
+                self.handle_enforce_editing(&tool_name, file_path.as_deref(), &agent_id)
+            }
+            HookRequest::PostToolDiagnostics {
+                file,
+                tool: _,
+                agent_id,
+                session_id,
+            } => {
+                self.store_client_session_id(session_id.as_deref());
+                debug!("Hook: processing file {file}");
+                self.handle_diagnostics(&file, &agent_id, entry_id).await
+            }
+            HookRequest::PostAgentRequireRelease {
+                agent_id,
+                stop_hook_active,
+            } => self.handle_require_release(&agent_id, stop_hook_active),
+            HookRequest::SessionStartClearEditing { session_id } => {
+                self.store_client_session_id(session_id.as_deref());
+                self.handle_clear_editing()
             }
         };
+
+        let response = result
+            .as_ref()
+            .map(|r| serde_json::to_string(r).unwrap_or_default())
+            .unwrap_or_default();
 
         // Log outgoing hook response
         self.message_log.log(
             "hook",
-            method,
+            &method,
             "catenary",
             &self.client_name,
             Some(entry_id),
@@ -249,17 +378,163 @@ impl HookServer {
         Ok(())
     }
 
-    /// Processes a file change notification and returns a [`NotifyResult`] as JSON.
-    async fn process_file(&self, file_path: &str, entry_id: i64) -> String {
-        let result = match self.diagnostics.process_file(file_path, entry_id).await {
-            Ok(diag_result) => NotifyResult::Content(diag_result.content),
+    // ── Hook handlers ───────────────────────────────────────────────────
+
+    /// Editing state enforcement: deny or allow a tool call.
+    ///
+    /// If the agent is editing files, only Edit/Read on those files and
+    /// Catenary editing tools are allowed. If the agent is not editing,
+    /// Edit requires `start_editing` first.
+    fn handle_enforce_editing(
+        &self,
+        tool_name: &str,
+        file_path: Option<&str>,
+        agent_id: &str,
+    ) -> Option<HookResult> {
+        let editing_files = self
+            .conn
+            .lock()
+            .ok()
+            .and_then(|c| db::editing_files_for_agent(&c, &self.session_id, agent_id).ok())
+            .unwrap_or_default();
+
+        if !editing_files.is_empty() {
+            if is_allowed_during_editing(tool_name) || is_read_tool(tool_name) {
+                None
+            } else if is_edit_tool(tool_name) {
+                if let Some(path) = file_path {
+                    let is_managed = self
+                        .conn
+                        .lock()
+                        .ok()
+                        .and_then(|c| db::is_editing(&c, path, &self.session_id, agent_id).ok())
+                        .unwrap_or(false);
+                    if !is_managed {
+                        let file_list = editing_files.join(", ");
+                        return Some(HookResult::Deny(format!(
+                            "call start_editing for {path} before editing, \
+                             or done_editing for {file_list} first"
+                        )));
+                    }
+                }
+                None
+            } else {
+                let file_list = editing_files.join(", ");
+                Some(HookResult::Deny(format!(
+                    "call done_editing for {file_list} to get diagnostics"
+                )))
+            }
+        } else if is_edit_tool(tool_name) {
+            let path = file_path.unwrap_or_default();
+            Some(HookResult::Deny(format!(
+                "call start_editing for {path} before editing"
+            )))
+        } else {
+            None
+        }
+    }
+
+    /// LSP diagnostics for a changed file, with editing state checks.
+    ///
+    /// Suppresses diagnostics when the agent is editing the file (returns
+    /// `None`). Adds a courtesy flag when another agent is editing it.
+    async fn handle_diagnostics(
+        &self,
+        file_path: &str,
+        agent_id: &str,
+        entry_id: i64,
+    ) -> Option<HookResult> {
+        // Check editing state before running diagnostics
+        let (self_editing, other_editing) = {
+            let conn = self.conn.lock().ok();
+            let self_ed = conn
+                .as_ref()
+                .and_then(|c| db::is_editing(c, file_path, &self.session_id, agent_id).ok())
+                .unwrap_or(false);
+            let other_ed = conn
+                .as_ref()
+                .and_then(|c| {
+                    db::is_edited_by_others(c, file_path, &self.session_id, agent_id).ok()
+                })
+                .unwrap_or(false);
+            drop(conn);
+            (self_ed, other_ed)
+        };
+
+        if self_editing {
+            return None;
+        }
+
+        match self.diagnostics.process_file(file_path, entry_id).await {
+            Ok(diag_result) => {
+                if other_editing {
+                    Some(HookResult::Courtesy(diag_result.content))
+                } else {
+                    Some(HookResult::Content(diag_result.content))
+                }
+            }
             Err(e) => {
                 warn!("Notify error for {file_path}: {e}");
-                NotifyResult::Error(e.to_string())
+                Some(HookResult::Error(e.to_string()))
             }
-        };
-        // Safe: NotifyResult serialization cannot fail (no non-string map keys, no floats).
-        serde_json::to_string(&result).unwrap_or_default()
+        }
+    }
+
+    /// Force `done_editing` before the agent stops.
+    ///
+    /// If `stop_hook_active` is true (retry), allows unconditionally.
+    /// Otherwise blocks if the agent has files in editing state.
+    fn handle_require_release(&self, agent_id: &str, stop_hook_active: bool) -> Option<HookResult> {
+        if stop_hook_active {
+            return None;
+        }
+
+        let files = self
+            .conn
+            .lock()
+            .ok()
+            .and_then(|c| db::editing_files_for_agent(&c, &self.session_id, agent_id).ok())
+            .unwrap_or_default();
+
+        if files.is_empty() {
+            None
+        } else {
+            let file_list = files.join(", ");
+            Some(HookResult::Block(format!(
+                "call done_editing for {file_list} to get diagnostics before finishing"
+            )))
+        }
+    }
+
+    /// Clear stale editing state on session start/resume.
+    ///
+    /// Returns the count of cleared entries, or `None` if nothing was cleared.
+    fn handle_clear_editing(&self) -> Option<HookResult> {
+        let count = self
+            .conn
+            .lock()
+            .ok()
+            .and_then(|c| db::clear_session_editing(&c, &self.session_id).ok())
+            .unwrap_or(0);
+
+        if count > 0 {
+            Some(HookResult::Cleared(count))
+        } else {
+            None
+        }
+    }
+
+    /// Store the host CLI's session ID (idempotent — first write wins).
+    fn store_client_session_id(&self, client_session_id: Option<&str>) {
+        if let Some(client_sid) = client_session_id
+            && let Ok(c) = self.conn.lock()
+        {
+            let _ = c.execute(
+                "UPDATE sessions SET client_session_id = ?1 \
+                 WHERE id = ?2 AND client_session_id IS NULL",
+                rusqlite::params![client_sid, &self.session_id],
+            );
+        }
     }
 }
 
@@ -271,11 +546,13 @@ impl HookServer {
 mod tests {
     use super::*;
 
+    // ── Serialization tests ─────────────────────────────────────────────
+
     #[test]
-    fn notify_result_content_round_trip() {
-        let original = NotifyResult::Content("[clean]".into());
+    fn hook_result_content_round_trip() {
+        let original = HookResult::Content("[clean]".into());
         let json = serde_json::to_string(&original).expect("serialize");
-        let parsed: NotifyResult = serde_json::from_str(&json).expect("deserialize");
+        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
 
         let raw: serde_json::Value = serde_json::from_str(&json).expect("parse as value");
@@ -284,10 +561,10 @@ mod tests {
     }
 
     #[test]
-    fn notify_result_error_round_trip() {
-        let original = NotifyResult::Error("path resolution failed".into());
+    fn hook_result_error_round_trip() {
+        let original = HookResult::Error("path resolution failed".into());
         let json = serde_json::to_string(&original).expect("serialize");
-        let parsed: NotifyResult = serde_json::from_str(&json).expect("deserialize");
+        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
 
         let raw: serde_json::Value = serde_json::from_str(&json).expect("parse as value");
@@ -296,24 +573,103 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_request_tool_field() {
-        // With tool field
-        let json = r#"{"file": "/tmp/test.rs", "tool": "Write"}"#;
-        let req: NotifyRequest = serde_json::from_str(json).expect("deserialize with tool");
-        let NotifyRequest::File { file, tool } = req else {
-            unreachable!("expected File variant");
+    fn hook_result_deny_round_trip() {
+        let original = HookResult::Deny("call start_editing first".into());
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn hook_result_block_round_trip() {
+        let original = HookResult::Block("call done_editing first".into());
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn hook_result_courtesy_round_trip() {
+        let original = HookResult::Courtesy("[clean]".into());
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn hook_result_cleared_round_trip() {
+        let original = HookResult::Cleared(3);
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+    }
+
+    // ── Request deserialization tests ────────────────────────────────────
+
+    #[test]
+    fn test_hook_request_tagged_deserialization() {
+        // pre-agent/roots-sync
+        let json = r#"{"method": "pre-agent/roots-sync"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("roots-sync");
+        assert!(matches!(req, HookRequest::PreAgentRootsSync {}));
+
+        // pre-tool/enforce-editing with all fields
+        let json = r#"{"method": "pre-tool/enforce-editing", "tool_name": "Edit", "file_path": "/tmp/foo.rs", "agent_id": "", "session_id": "abc123"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("enforce-editing");
+        let HookRequest::PreToolEnforceEditing {
+            tool_name,
+            file_path,
+            agent_id,
+            session_id,
+        } = req
+        else {
+            unreachable!("expected PreToolEnforceEditing");
+        };
+        assert_eq!(tool_name, "Edit");
+        assert_eq!(file_path.as_deref(), Some("/tmp/foo.rs"));
+        assert_eq!(agent_id, "");
+        assert_eq!(session_id.as_deref(), Some("abc123"));
+
+        // post-tool/diagnostics with optional fields
+        let json =
+            r#"{"method": "post-tool/diagnostics", "file": "/tmp/test.rs", "tool": "Write"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("diagnostics");
+        let HookRequest::PostToolDiagnostics { file, tool, .. } = req else {
+            unreachable!("expected PostToolDiagnostics");
         };
         assert_eq!(file, "/tmp/test.rs");
         assert_eq!(tool.as_deref(), Some("Write"));
 
-        // Without tool field (backward compatibility)
-        let json = r#"{"file": "/tmp/test.rs"}"#;
-        let req: NotifyRequest = serde_json::from_str(json).expect("deserialize without tool");
-        let NotifyRequest::File { tool, .. } = req else {
-            unreachable!("expected File variant");
+        // post-tool/diagnostics without optional fields
+        let json = r#"{"method": "post-tool/diagnostics", "file": "/tmp/test.rs"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("diagnostics minimal");
+        let HookRequest::PostToolDiagnostics { tool, .. } = req else {
+            unreachable!("expected PostToolDiagnostics");
         };
         assert!(tool.is_none());
+
+        // post-agent/require-release
+        let json =
+            r#"{"method": "post-agent/require-release", "agent_id": "", "stop_hook_active": true}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("require-release");
+        let HookRequest::PostAgentRequireRelease {
+            stop_hook_active, ..
+        } = req
+        else {
+            unreachable!("expected PostAgentRequireRelease");
+        };
+        assert!(stop_hook_active);
+
+        // session-start/clear-editing
+        let json = r#"{"method": "session-start/clear-editing", "session_id": "uuid-123"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("clear-editing");
+        let HookRequest::SessionStartClearEditing { session_id } = req else {
+            unreachable!("expected SessionStartClearEditing");
+        };
+        assert_eq!(session_id.as_deref(), Some("uuid-123"));
     }
+
+    // ── Logging tests ───────────────────────────────────────────────────
 
     #[test]
     fn test_hook_log_file_request() {
@@ -332,9 +688,13 @@ mod tests {
 
         let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
 
-        // Simulate what handle_connection does for a File request
-        let method = "post-tool";
-        let request_payload = serde_json::json!({"file": "/tmp/test.rs", "tool": "Write"});
+        // Simulate what handle_connection does for a PostToolDiagnostics request
+        let method = "post-tool/diagnostics";
+        let request_payload = serde_json::json!({
+            "method": "post-tool/diagnostics",
+            "file": "/tmp/test.rs",
+            "tool": "Write"
+        });
         let entry_id = log.log(
             "hook",
             method,
@@ -369,7 +729,7 @@ mod tests {
             )
             .expect("query request");
         assert_eq!(r_type, "hook");
-        assert_eq!(r_method, "post-tool");
+        assert_eq!(r_method, "post-tool/diagnostics");
 
         let stored_req_id: Option<i64> = conn
             .lock()
@@ -399,8 +759,8 @@ mod tests {
 
         let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
 
-        let method = "pre-tool";
-        let request_payload = serde_json::json!({"refresh_roots": true});
+        let method = "pre-agent/roots-sync";
+        let request_payload = serde_json::json!({"method": "pre-agent/roots-sync"});
         let entry_id = log.log(
             "hook",
             method,
@@ -422,7 +782,7 @@ mod tests {
             &response_payload,
         );
 
-        // Verify method is pre-tool
+        // Verify method is pre-agent/roots-sync
         let r_method: String = conn
             .lock()
             .expect("lock")
@@ -432,8 +792,173 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query");
-        assert_eq!(r_method, "pre-tool");
+        assert_eq!(r_method, "pre-agent/roots-sync");
     }
+
+    // ── Tool classification tests ───────────────────────────────────────
+
+    #[test]
+    fn test_is_edit_tool() {
+        // Claude Code edit tools
+        assert!(is_edit_tool("Edit"));
+        assert!(is_edit_tool("Write"));
+        assert!(is_edit_tool("NotebookEdit"));
+        // Gemini CLI edit tools
+        assert!(is_edit_tool("write_file"));
+        assert!(is_edit_tool("replace"));
+        // Non-edit tools
+        assert!(!is_edit_tool("Read"));
+        assert!(!is_edit_tool("Bash"));
+        assert!(!is_edit_tool("grep"));
+    }
+
+    #[test]
+    fn test_is_read_tool() {
+        assert!(is_read_tool("Read"));
+        assert!(is_read_tool("NotebookRead"));
+        assert!(is_read_tool("read_file"));
+        assert!(!is_read_tool("Edit"));
+        assert!(!is_read_tool("Bash"));
+    }
+
+    #[test]
+    fn test_is_allowed_during_editing() {
+        assert!(is_allowed_during_editing("start_editing"));
+        assert!(is_allowed_during_editing("done_editing"));
+        assert!(is_allowed_during_editing("ToolSearch"));
+        // MCP qualified names
+        assert!(is_allowed_during_editing("mcp__catenary__start_editing"));
+        assert!(is_allowed_during_editing("mcp__catenary__done_editing"));
+        assert!(!is_allowed_during_editing("Edit"));
+        assert!(!is_allowed_during_editing("Bash"));
+    }
+
+    // ── Handler tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_hook_enforce_editing_deny() {
+        let server = test_server();
+        // No editing state — Edit should be denied
+        let result = server.handle_enforce_editing("Edit", Some("/tmp/foo.rs"), "");
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("expected Deny, got {result:?}");
+        };
+        assert!(reason.contains("start_editing"));
+    }
+
+    #[test]
+    fn test_hook_enforce_editing_allow() {
+        let server = test_server();
+        // Set up editing state for the file
+        server
+            .conn
+            .lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
+                 VALUES ('/tmp/foo.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert editing state");
+
+        // Edit on a managed file — should allow
+        let result = server.handle_enforce_editing("Edit", Some("/tmp/foo.rs"), "");
+        assert!(result.is_none(), "expected allow, got {result:?}");
+
+        // Read tool — always allowed during editing
+        let result = server.handle_enforce_editing("Read", Some("/tmp/bar.rs"), "");
+        assert!(result.is_none(), "expected allow for Read, got {result:?}");
+
+        // Non-edit, non-read tool while editing — should deny
+        let result = server.handle_enforce_editing("Bash", None, "");
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("expected Deny for Bash, got {result:?}");
+        };
+        assert!(reason.contains("done_editing"));
+    }
+
+    #[test]
+    fn test_hook_require_release_block() {
+        let server = test_server();
+        server
+            .conn
+            .lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
+                 VALUES ('/tmp/foo.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert editing state");
+
+        let result = server.handle_require_release("", false);
+        let Some(HookResult::Block(reason)) = result else {
+            unreachable!("expected Block, got {result:?}");
+        };
+        assert!(reason.contains("done_editing"));
+        assert!(reason.contains("/tmp/foo.rs"));
+    }
+
+    #[test]
+    fn test_hook_require_release_allow() {
+        let server = test_server();
+        // No editing state — should allow
+        let result = server.handle_require_release("", false);
+        assert!(result.is_none(), "expected allow, got {result:?}");
+    }
+
+    #[test]
+    fn test_hook_require_release_retry() {
+        let server = test_server();
+        // Add editing state
+        server
+            .conn
+            .lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
+                 VALUES ('/tmp/foo.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert editing state");
+
+        // stop_hook_active = true → always allow regardless of state
+        let result = server.handle_require_release("", true);
+        assert!(result.is_none(), "expected allow on retry, got {result:?}");
+    }
+
+    #[test]
+    fn test_hook_clear_editing() {
+        let server = test_server();
+        // Insert editing state rows
+        {
+            let c = server.conn.lock().expect("lock");
+            c.execute(
+                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
+                 VALUES ('/tmp/a.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert a");
+            c.execute(
+                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
+                 VALUES ('/tmp/b.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert b");
+        }
+
+        let result = server.handle_clear_editing();
+        assert_eq!(result, Some(HookResult::Cleared(2)));
+
+        // Second call should return None (nothing to clear)
+        let result = server.handle_clear_editing();
+        assert!(
+            result.is_none(),
+            "expected None after clear, got {result:?}"
+        );
+    }
+
+    // ── Test helpers ────────────────────────────────────────────────────
 
     /// Open an isolated test database in a tempdir.
     fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
@@ -441,5 +966,68 @@ mod tests {
         let path = dir.path().join("catenary").join("catenary.db");
         let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
         (dir, path, conn)
+    }
+
+    /// Create a `HookServer` with a test database for handler unit tests.
+    ///
+    /// Uses noop `MessageLog` and minimal dependencies — only `conn` and
+    /// `session_id` are exercised by editing state handlers.
+    fn test_server() -> TestHookServer {
+        let (dir, _path, conn) = test_db();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        // Insert a session for FK constraints.
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let message_log = Arc::new(MessageLog::noop());
+        let config: crate::config::Config = serde_json::from_str("{}").expect("empty config");
+        let client_manager = Arc::new(crate::lsp::ClientManager::new(
+            config,
+            vec![],
+            message_log.clone(),
+        ));
+        let doc_manager = Arc::new(tokio::sync::Mutex::new(
+            crate::bridge::DocumentManager::new(),
+        ));
+        let path_validator = Arc::new(tokio::sync::RwLock::new(crate::bridge::PathValidator::new(
+            vec![],
+        )));
+        let diagnostics = Arc::new(DiagnosticsServer::new(
+            client_manager,
+            doc_manager,
+            path_validator,
+        ));
+        let refresh_roots = Arc::new(AtomicBool::new(false));
+
+        let server = HookServer::new(
+            diagnostics,
+            refresh_roots,
+            message_log,
+            conn,
+            "test-session".to_string(),
+            "test".to_string(),
+        );
+
+        TestHookServer { _dir: dir, server }
+    }
+
+    /// Wrapper that keeps the tempdir alive for the lifetime of the server.
+    struct TestHookServer {
+        _dir: tempfile::TempDir,
+        server: HookServer,
+    }
+
+    impl std::ops::Deref for TestHookServer {
+        type Target = HookServer;
+        fn deref(&self) -> &Self::Target {
+            &self.server
+        }
     }
 }
