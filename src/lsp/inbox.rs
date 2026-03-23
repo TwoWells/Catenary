@@ -267,7 +267,10 @@ impl Inbox for ServerInbox {
                     .collect();
                 Ok(Value::Array(results))
             }
-            "window/workDoneProgress/create" => Ok(Value::Null),
+            "window/workDoneProgress/create"
+            | "client/registerCapability"
+            | "client/unregisterCapability"
+            | "window/showMessageRequest" => Ok(Value::Null),
             _ => Err(RpcError {
                 code: -32601,
                 message: format!("Method '{method}' not supported by client"),
@@ -380,6 +383,51 @@ mod tests {
             )
             .expect("configuration request should succeed");
         assert_eq!(result, json!([{}, {}]));
+    }
+
+    #[test]
+    fn register_capability_accepted() {
+        let inbox = test_inbox();
+        let result = inbox
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{"id": "1", "method": "textDocument/didChangeConfiguration"}]}),
+            )
+            .expect("registerCapability should succeed");
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn unregister_capability_accepted() {
+        let inbox = test_inbox();
+        let result = inbox
+            .on_request(
+                "client/unregisterCapability",
+                &json!({"unregisterations": [{"id": "1", "method": "textDocument/didChangeConfiguration"}]}),
+            )
+            .expect("unregisterCapability should succeed");
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn show_message_request_accepted() {
+        let inbox = test_inbox();
+        let result = inbox
+            .on_request(
+                "window/showMessageRequest",
+                &json!({"type": 1, "message": "Restart?", "actions": [{"title": "Yes"}]}),
+            )
+            .expect("showMessageRequest should succeed");
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn unknown_request_rejected() {
+        let inbox = test_inbox();
+        let err = inbox
+            .on_request("custom/unknownMethod", &json!({}))
+            .expect_err("unknown method should be rejected");
+        assert_eq!(err.code, -32601);
     }
 
     #[test]

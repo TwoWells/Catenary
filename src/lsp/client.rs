@@ -23,7 +23,7 @@ use crate::session::MessageLog;
 /// Cached diagnostics for a file: `(version, diagnostics)`.
 ///
 /// `version` is the document version from `publishDiagnostics`, if the
-/// server includes it. Used by [`DiagnosticsStrategy::Version`] to
+/// server includes it. Used by [`super::diagnostics::DiagnosticsStrategy::Version`] to
 /// match diagnostics to a specific document change.
 pub type DiagnosticsCache = Arc<std::sync::Mutex<HashMap<String, (Option<i32>, Vec<Value>)>>>;
 
@@ -284,10 +284,9 @@ impl LspClient {
         // Send initialized notification
         self.notify("initialized", json!({})).await?;
 
-        // Trigger configuration pull: servers that support the pull model
-        // (workspace/configuration) will request specific sections; servers
-        // using the legacy push model read settings directly from this
-        // notification.
+        // Push current settings. Pull-model servers will also send
+        // workspace/configuration requests, but the push is harmless
+        // and required by legacy servers that don't use the pull model.
         let settings = self
             .inbox
             .settings()
@@ -730,7 +729,7 @@ impl LspClient {
     /// Returns the current diagnostics generation for a URI.
     ///
     /// Callers should snapshot this *before* sending a change notification,
-    /// then pass the snapshot to [`wait_for_diagnostics_update`] to ensure
+    /// then pass the snapshot to [`Self::wait_for_diagnostics_update`] to ensure
     /// the returned diagnostics reflect that specific change.
     pub fn diagnostics_generation(&self, uri: &str) -> u64 {
         let generations = self
@@ -811,7 +810,7 @@ impl LspClient {
     /// Waits for fresh diagnostics after a file change, using the
     /// appropriate strategy for this server.
     ///
-    /// `snapshot` should be obtained via [`diagnostics_generation`] **before**
+    /// `snapshot` should be obtained via [`Self::diagnostics_generation`] **before**
     /// sending the change that triggers new diagnostics.
     ///
     /// Uses CPU tick failure detection instead of wall-clock timeouts.

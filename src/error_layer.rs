@@ -3,7 +3,7 @@
 
 //! Tracing layer that captures `error!()` and `warn!()` events to SQLite.
 //!
-//! Writes to the `messages` table via [`MessageLog`], using `type = "error"`
+//! Writes to the `messages` table via [`crate::session::MessageLog`], using `type = "error"`
 //! or `type = "warn"`. Events are queryable with `catenary query --kind error`.
 //!
 //! # Usage

@@ -230,7 +230,7 @@ impl ClientManager {
     ///
     /// Dead clients are left in the map as tombstones — a server that
     /// crashes will not be restarted. Intentional restarts (e.g. after
-    /// `sync_roots`) go through [`shutdown_client`] which removes the
+    /// `sync_roots`) go through [`Self::shutdown_client`] which removes the
     /// entry so a fresh spawn can occur.
     ///
     /// # Errors
@@ -351,7 +351,7 @@ impl ClientManager {
     ///
     /// Each server gets 5 seconds to respond to the graceful
     /// `shutdown`/`exit` sequence. Servers that don't respond in time
-    /// are dropped, which triggers [`Connection::Drop`] to SIGKILL them.
+    /// are dropped, which triggers the `Connection` drop handler to SIGKILL them.
     pub async fn shutdown_all(&self) {
         let mut clients = self.clients.lock().await;
         for (lang, client_mutex) in clients.drain() {

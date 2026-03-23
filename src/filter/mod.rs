@@ -5,7 +5,7 @@
 //!
 //! Each LSP server may attach noise to diagnostic messages (reference URLs,
 //! lint attribution boilerplate, etc.) that wastes tokens when delivered to
-//! AI agents. This module provides a [`DiagnosticFilter`] trait with
+//! AI agents. This module provides a `DiagnosticFilter` trait with
 //! per-server implementations that rewrite or drop noisy messages.
 //!
 //! Implementations **must** default to pass-through for unrecognized server

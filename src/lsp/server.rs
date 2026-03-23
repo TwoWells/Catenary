@@ -16,8 +16,8 @@ use super::extract;
 
 /// Server profile capturing init-time capabilities and runtime observations.
 ///
-/// Shared via `Arc<LspServer>` between [`super::client::LspClient`] and
-/// [`super::inbox::ServerInbox`]. All runtime fields use interior mutability
+/// Shared via `Arc<LspServer>` between [`super::LspClient`] and
+/// `ServerInbox`. All runtime fields use interior mutability
 /// so readers never need a lock.
 pub struct LspServer {
     /// Raw server capabilities from the `initialize` response.

@@ -102,7 +102,10 @@ pub fn initialize(
                     }
                 },
                 "workspaceFolders": true,
-                "configuration": true
+                "configuration": true,
+                "didChangeConfiguration": {
+                    "dynamicRegistration": false
+                }
             },
             "window": {
                 "workDoneProgress": true
@@ -359,7 +362,10 @@ mod tests {
                         }
                     },
                     "workspaceFolders": true,
-                    "configuration": true
+                    "configuration": true,
+                    "didChangeConfiguration": {
+                        "dynamicRegistration": false
+                    }
                 },
                 "window": {
                     "workDoneProgress": true
@@ -371,6 +377,13 @@ mod tests {
         });
 
         assert_eq!(ours, expected);
+    }
+
+    #[test]
+    fn initialize_capabilities_advertise_did_change_configuration() {
+        let ours = initialize(1, &[("file:///ws", "ws")], None);
+        let dcc = &ours["capabilities"]["workspace"]["didChangeConfiguration"];
+        assert_eq!(dcc["dynamicRegistration"], json!(false));
     }
 
     #[test]

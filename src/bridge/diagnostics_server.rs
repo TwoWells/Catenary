@@ -365,7 +365,7 @@ async fn collect_quick_fixes(
 /// quick-fix code actions for that diagnostic. Pass an empty slice when no
 /// fixes were collected.
 ///
-/// Messages are passed through the provided [`DiagnosticFilter`] for noise
+/// Messages are passed through the provided [`crate::filter::DiagnosticFilter`] for noise
 /// stripping. Diagnostics whose filtered message is empty are dropped.
 pub(crate) fn format_diagnostics_compact(
     diagnostics: &[Value],

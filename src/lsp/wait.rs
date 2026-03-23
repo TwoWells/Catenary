@@ -3,7 +3,7 @@
 
 //! Unified wait infrastructure for load-aware failure detection.
 //!
-//! [`load_aware_grace`] is the single wait pattern used by all sites that
+//! `load_aware_grace` is the single wait pattern used by all sites that
 //! wait on an LSP server process — diagnostics preamble, readiness,
 //! request timeouts. It replaces wall-clock timeouts with CPU-tick
 //! failure detection.

@@ -4,7 +4,7 @@
 //! Settle sampling loop: polls a process tree at a fixed interval and
 //! yields per-process samples to a caller-provided sink.
 //!
-//! Production code — [`super::client::LspClient`] will call this in Phase 1b
+//! Production code — [`LspClient`](crate::lsp::client::LspClient) will call this in Phase 1b
 //! alongside a decision-making sink. The profiling test
 //! (`tests/profile_intensity.rs`) uses the same loop with a recording sink.
 

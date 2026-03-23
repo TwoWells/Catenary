@@ -4,7 +4,7 @@
 //! Diagnostics strategy selection and activity monitoring.
 //!
 //! After the LSP `initialize` handshake, each server is assigned a
-//! [`DiagnosticsStrategy`] based on its observed runtime behavior.
+//! `DiagnosticsStrategy` based on its observed runtime behavior.
 //! The strategy determines how Catenary obtains fresh diagnostics
 //! after a file change.
 //!

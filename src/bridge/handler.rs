@@ -77,7 +77,7 @@ impl LspBridgeHandler {
     /// Waits for the server handling the given path to be ready.
     ///
     /// Dead servers are non-fatal — the wait completes and the caller
-    /// uses [`check_server_health`] to detect the state.
+    /// uses [`Self::check_server_health`] to detect the state.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "Client lock held across wait_ready call"
@@ -100,7 +100,7 @@ impl LspBridgeHandler {
     /// Waits for all active LSP servers to be ready.
     ///
     /// Dead servers are non-fatal — the wait completes for each server
-    /// and the caller uses [`check_server_health`] to detect state.
+    /// and the caller uses [`Self::check_server_health`] to detect state.
     /// Used for symbol-only queries that don't target a specific file.
     async fn wait_for_all_servers_ready(&self) {
         let clients = self.toolbox.client_manager.clients().await;

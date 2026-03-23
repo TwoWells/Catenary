@@ -23,9 +23,9 @@ check:
 	@cargo deny --log-level error check
 	@cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
-# Build the mdbook documentation
+# Build internal rustdoc (includes private items)
 docs:
-	@mdbook build docs/
+	@cargo doc --document-private-items --no-deps --quiet
 
 # Run cargo-deny license and advisory checks
 deny:

@@ -91,7 +91,7 @@ impl PathValidator {
 
     /// Validates a path for write-side operations.
     ///
-    /// Performs the same LSP-awareness root check as [`validate_read`], plus:
+    /// Performs the same LSP-awareness root check as [`Self::validate_read`], plus:
     /// - Rejects Catenary configuration files (`.catenary.toml`,
     ///   `~/.config/catenary/config.toml`) — the one true security invariant.
     ///

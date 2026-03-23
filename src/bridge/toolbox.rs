@@ -187,7 +187,7 @@ pub fn format_file_size(bytes: u64) -> String {
 /// Shared container for tool servers and cross-tool infrastructure.
 ///
 /// Owns the tool implementations and the dependencies they share.
-/// [`LspBridgeHandler`] holds a `Toolbox` and handles protocol boundary
+/// [`super::handler::LspBridgeHandler`] holds a `Toolbox` and handles protocol boundary
 /// concerns (health checks, readiness, dispatch routing).
 pub struct Toolbox {
     /// Grep tool server.

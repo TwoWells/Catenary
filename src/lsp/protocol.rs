@@ -72,7 +72,7 @@ pub struct ResponseError {
     pub data: Option<serde_json::Value>,
 }
 
-/// Error returned by [`Inbox::on_request`](super::inbox::Inbox::on_request)
+/// Error returned by [`Inbox::on_request`](super::inbox::Inbox::on_request())
 /// for server requests the client cannot handle.
 ///
 /// Connection translates this into a JSON-RPC error response.
