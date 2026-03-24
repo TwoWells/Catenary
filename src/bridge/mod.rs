@@ -9,6 +9,8 @@ mod document_manager;
 pub mod editing;
 /// Glob tool handler: unified file/directory/pattern browsing.
 mod file_tools;
+/// Single authority for file classification (binary, language ID, shebang).
+pub mod filesystem_manager;
 /// Grep tool: ripgrep + workspace/symbol pipeline with LSP enrichment.
 mod grep_server;
 /// Maps MCP tool calls to LSP requests.

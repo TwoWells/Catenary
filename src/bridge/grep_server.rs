@@ -18,12 +18,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use super::filesystem_manager::FilesystemManager;
 use super::handler::{check_server_health, display_path, has_cap};
 use super::symbols::{
     self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
 };
 use super::tool_server::ToolServer;
-use super::toolbox::FilesystemCache;
 use super::{DocumentManager, DocumentNotification};
 use crate::lsp::{ClientManager, LspClient};
 
@@ -56,7 +56,7 @@ pub struct GrepInput {
 pub struct GrepServer {
     pub(super) client_manager: Arc<ClientManager>,
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
-    pub(super) fs_cache: Arc<FilesystemCache>,
+    pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
@@ -188,7 +188,7 @@ impl GrepServer {
             input.exclude.as_deref(),
             input.include_gitignored,
             input.include_hidden,
-            &self.fs_cache,
+            &self.fs_manager,
         )?;
 
         // 1b. Ensure servers exist for any new languages in matched files
@@ -886,7 +886,7 @@ impl GrepServer {
         exclude: Option<&str>,
         include_gitignored: bool,
         include_hidden: bool,
-        fs_cache: &Arc<FilesystemCache>,
+        fs_manager: &Arc<FilesystemManager>,
     ) -> Result<RipgrepMatches> {
         use ignore::WalkState;
         use std::sync::Mutex as StdMutex;
@@ -929,7 +929,7 @@ impl GrepServer {
                 let glob_matcher = glob_matcher.clone();
                 let exclude_matcher = exclude_matcher.clone();
                 let root = root.clone();
-                let fs_cache = Arc::clone(fs_cache);
+                let fs_manager = Arc::clone(fs_manager);
                 let mut state = CollectOnDrop {
                     local: ThreadMatches::default(),
                     collected: Arc::clone(&collected),
@@ -959,7 +959,7 @@ impl GrepServer {
 
                     // Skip binary files — no meaningful text matches
                     if let Ok(metadata) = path.metadata()
-                        && fs_cache.is_binary(path, &metadata)
+                        && fs_manager.is_binary(path, &metadata)
                     {
                         return WalkState::Continue;
                     }

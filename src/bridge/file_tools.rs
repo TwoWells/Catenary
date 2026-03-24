@@ -20,10 +20,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{check_server_health, resolve_path};
 use super::symbols::{format_symbol_kind, is_outline_kind};
 use super::tool_server::ToolServer;
-use super::toolbox::{FilesystemCache, format_file_size};
 use super::{DocumentManager, DocumentNotification};
 use crate::lsp::{ClientManager, LspClient};
 
@@ -93,7 +93,7 @@ fn extract_outline_symbols(response: &Value) -> OutlineSymbols {
 pub struct GlobServer {
     pub(super) client_manager: Arc<ClientManager>,
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
-    pub(super) fs_cache: Arc<FilesystemCache>,
+    pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
@@ -279,7 +279,7 @@ impl GlobServer {
 
         if let Some(line_count) = metadata
             .as_ref()
-            .and_then(|m| self.fs_cache.line_count(path, m))
+            .and_then(|m| self.fs_manager.line_count(path, m))
         {
             let _ = writeln!(result, "{display}  ({line_count} lines)");
             if let Ok(symbols) = self.fetch_outline_symbols(path, parent_id).await {
@@ -353,7 +353,7 @@ impl GlobServer {
                 symlinks.push(format!("{name} -> {target}"));
             } else if metadata.is_dir() {
                 dirs.push(format!("{name}/"));
-            } else if let Some(line_count) = self.fs_cache.line_count(&entry_path, &metadata) {
+            } else if let Some(line_count) = self.fs_manager.line_count(&entry_path, &metadata) {
                 let outline = self
                     .fetch_outline_symbols(&entry_path, parent_id)
                     .await
@@ -463,7 +463,7 @@ impl GlobServer {
 
             if let Some(line_count) = metadata
                 .as_ref()
-                .and_then(|m| self.fs_cache.line_count(path, m))
+                .and_then(|m| self.fs_manager.line_count(path, m))
             {
                 let _ = writeln!(result, "{display}  ({line_count} lines)");
                 if let Ok(symbols) = self.fetch_outline_symbols(path, parent_id).await {
