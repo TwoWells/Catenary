@@ -15,18 +15,17 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::handler::{display_path, has_cap};
+use super::handler::{check_server_health, display_path, has_cap};
 use super::symbols::{
     self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
 };
+use super::tool_server::ToolServer;
 use super::toolbox::FilesystemCache;
 use super::{DocumentManager, DocumentNotification};
 use crate::lsp::{ClientManager, LspClient};
-use crate::mcp::CallToolResult;
 
 /// Maximum unique LSP symbols for hover display in output. Above this
 /// threshold, hover content is omitted but structural enrichment (references,
@@ -57,7 +56,52 @@ pub struct GrepInput {
 pub struct GrepServer {
     pub(super) client_manager: Arc<ClientManager>,
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
-    pub(super) runtime: Handle,
+    pub(super) fs_cache: Arc<FilesystemCache>,
+    pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl ToolServer for GrepServer {
+    async fn execute(
+        &self,
+        params: &serde_json::Value,
+        parent_id: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let input: GrepInput = serde_json::from_value(params.clone())
+            .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
+
+        if input.pattern.is_empty() {
+            return Err(anyhow!("pattern must be non-empty"));
+        }
+
+        // Wait for all servers ready (grep doesn't target a specific file)
+        let clients = self.client_manager.clients().await;
+        for (lang, client_mutex) in &clients {
+            if !client_mutex.lock().await.wait_ready().await {
+                warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
+            }
+        }
+
+        // Check health
+        let touched: Vec<String> = clients.keys().cloned().collect();
+        let health =
+            check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
+
+        // Run pipeline
+        let output = self.run(input, parent_id).await?;
+
+        // Prepend notification
+        let text = if let Some(note) = health.notification {
+            if output.is_empty() {
+                note
+            } else {
+                format!("{note}\n\n{output}")
+            }
+        } else {
+            output
+        };
+
+        Ok(Value::String(text))
+    }
 }
 
 impl GrepServer {
@@ -78,12 +122,19 @@ impl GrepServer {
         clippy::significant_drop_tightening,
         reason = "Client lock held across notification send"
     )]
-    async fn ensure_document_open(&self, path: &Path) -> Result<(String, Arc<Mutex<LspClient>>)> {
+    async fn ensure_document_open(
+        &self,
+        path: &Path,
+        parent_id: Option<i64>,
+    ) -> Result<(String, Arc<Mutex<LspClient>>)> {
         let client_mutex = self.get_client_for_path(path).await?;
         let mut doc_manager = self.doc_manager.lock().await;
-        let client = client_mutex.lock().await;
+        let mut client = client_mutex.lock().await;
+
+        client.set_parent_id(parent_id);
 
         if !client.is_alive() {
+            client.set_parent_id(None);
             return Err(anyhow!(
                 "[{}] server is no longer running",
                 client.language()
@@ -119,27 +170,15 @@ impl GrepServer {
 
     /// Grep: ripgrep + `workspace/symbol("")` pipeline with LSP enrichment.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
-    pub fn handle_grep(
-        &self,
-        arguments: Option<serde_json::Value>,
-        fs_cache: &Arc<FilesystemCache>,
-    ) -> Result<CallToolResult> {
+    async fn run(&self, input: GrepInput, parent_id: Option<i64>) -> Result<String> {
         use std::fmt::Write;
-
-        let input: GrepInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        if input.pattern.is_empty() {
-            return Err(anyhow!("pattern must be non-empty"));
-        }
 
         let re = Regex::new(&format!("(?i){}", &input.pattern))
             .map_err(|e| anyhow!("Invalid regex pattern: {e}"))?;
 
         debug!("Grep request: pattern={}", input.pattern);
 
-        let roots = self.runtime.block_on(self.client_manager.roots());
+        let roots = self.client_manager.roots().await;
 
         // 1. Ripgrep: get matched strings + file/line heatmap in one pass
         let rg = Self::ripgrep_matches(
@@ -149,25 +188,27 @@ impl GrepServer {
             input.exclude.as_deref(),
             input.include_gitignored,
             input.include_hidden,
-            fs_cache,
+            &self.fs_cache,
         )?;
 
         // 1b. Ensure servers exist for any new languages in matched files
         let rg_paths: Vec<PathBuf> = rg.file_lines.keys().map(PathBuf::from).collect();
-        self.runtime
-            .block_on(self.client_manager.ensure_clients_for_paths(&rg_paths));
+        self.client_manager
+            .ensure_clients_for_paths(&rg_paths)
+            .await;
 
         // 2. Symbol universe: workspace/symbol("") + regex filter, with rg fallback
-        let mut symbols = self.runtime.block_on(async {
+        let mut symbols = {
             let clients = self.client_manager.clients().await;
 
             // Try workspace/symbol("") first — returns the full symbol index
-            let mut all_symbols: Vec<SymbolInfo> = self.fetch_symbol_universe(&clients).await;
+            let mut all_symbols: Vec<SymbolInfo> =
+                self.fetch_symbol_universe(&clients, parent_id).await;
 
             // Fallback: if symbol("") returned nothing, use rg matched strings
             if all_symbols.is_empty() && !rg.matched_strings.is_empty() {
                 all_symbols = self
-                    .fetch_symbols_by_queries(&rg.matched_strings, &clients)
+                    .fetch_symbols_by_queries(&rg.matched_strings, &clients, parent_id)
                     .await;
             }
 
@@ -179,7 +220,7 @@ impl GrepServer {
             all_symbols.retain(|s| seen.insert((s.name.clone(), s.file_path.clone(), s.line)));
 
             all_symbols
-        });
+        };
 
         // Filter symbols to glob/exclude scope
         if let Some(ref glob_pattern) = input.glob {
@@ -224,7 +265,7 @@ impl GrepServer {
         let mut all_ref_lines: HashMap<String, HashSet<u32>> = HashMap::new();
 
         for sym in &symbols {
-            let enrichment = self.enrich_symbol(sym);
+            let enrichment = self.enrich_symbol(sym, parent_id).await;
             for (file, lines) in &enrichment.ref_lines {
                 all_ref_lines.entry(file.clone()).or_default().extend(lines);
             }
@@ -233,7 +274,9 @@ impl GrepServer {
         }
 
         // 4b. Rg-bootstrapped enrichment: enrich unaccounted rg hits via hover
-        let br = self.bootstrap_from_rg(&rg, &by_name, &all_ref_lines);
+        let br = self
+            .bootstrap_from_rg(&rg, &by_name, &all_ref_lines, parent_id)
+            .await;
         enrichments.extend(br.enrichments);
         for (file, lines) in br.ref_lines {
             all_ref_lines.entry(file).or_default().extend(lines);
@@ -260,7 +303,7 @@ impl GrepServer {
         }
 
         if name_order.is_empty() && rg.file_lines.is_empty() {
-            return Ok(CallToolResult::text("No results found".to_string()));
+            return Ok("No results found".to_string());
         }
 
         let mut output = String::new();
@@ -352,10 +395,10 @@ impl GrepServer {
         output.truncate(trimmed_len);
 
         if output.is_empty() {
-            return Ok(CallToolResult::text("No results found".to_string()));
+            return Ok("No results found".to_string());
         }
 
-        Ok(CallToolResult::text(output))
+        Ok(output)
     }
 
     /// Fetches the full symbol universe via `workspace/symbol("")` from all servers.
@@ -363,11 +406,13 @@ impl GrepServer {
     async fn fetch_symbol_universe(
         &self,
         clients: &HashMap<String, Arc<Mutex<LspClient>>>,
+        parent_id: Option<i64>,
     ) -> Vec<SymbolInfo> {
         let mut all_symbols: Vec<SymbolInfo> = Vec::new();
 
         for client_mutex in clients.values() {
-            let client = client_mutex.lock().await;
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
             let supports_resolve = client.supports_workspace_symbol_resolve();
 
             let Ok(response) = client.workspace_symbols("").await else {
@@ -401,12 +446,14 @@ impl GrepServer {
         &self,
         queries: &[String],
         clients: &HashMap<String, Arc<Mutex<LspClient>>>,
+        parent_id: Option<i64>,
     ) -> Vec<SymbolInfo> {
         let mut all_symbols: Vec<SymbolInfo> = Vec::new();
 
         for query in queries {
             for client_mutex in clients.values() {
-                let client = client_mutex.lock().await;
+                let mut client = client_mutex.lock().await;
+                client.set_parent_id(parent_id);
                 let supports_resolve = client.supports_workspace_symbol_resolve();
 
                 let Ok(response) = client.workspace_symbols(query).await else {
@@ -434,98 +481,97 @@ impl GrepServer {
     }
 
     /// Enriches a symbol with hover, references, and kind-specific labels.
-    fn enrich_symbol(&self, sym: &SymbolInfo) -> SymbolEnrichment {
+    async fn enrich_symbol(&self, sym: &SymbolInfo, parent_id: Option<i64>) -> SymbolEnrichment {
         let path = PathBuf::from(&sym.file_path);
-        self.enrich_at_position(&path, sym.line, sym.character, sym.kind)
+        self.enrich_at_position(&path, sym.line, sym.character, sym.kind, parent_id)
+            .await
     }
 
     /// Enriches a position with hover, references, and kind-specific labels.
     #[allow(clippy::too_many_lines, reason = "Sequential LSP calls by kind")]
-    fn enrich_at_position(
+    async fn enrich_at_position(
         &self,
         path: &Path,
         line_0: u32,
         col: u32,
         kind: u32,
+        parent_id: Option<i64>,
     ) -> SymbolEnrichment {
-        self.runtime.block_on(async {
-            let mut enrichment = SymbolEnrichment::default();
+        let mut enrichment = SymbolEnrichment::default();
 
-            let Ok((uri_str, client_mutex)) = self.ensure_document_open(path).await else {
-                return enrichment;
-            };
+        let Ok((uri_str, client_mutex)) = self.ensure_document_open(path, parent_id).await else {
+            return enrichment;
+        };
 
-            let client = client_mutex.lock().await;
-            let caps = client.capabilities();
+        let mut client = client_mutex.lock().await;
+        client.set_parent_id(parent_id);
+        let caps = client.capabilities();
 
-            // Hover — signature + docs
-            if has_cap(caps, "hoverProvider")
-                && let Ok(hover) = client.hover(&uri_str, line_0, col).await
-            {
-                enrichment.hover = extract_hover_text_from_value(&hover);
+        // Hover — signature + docs
+        if has_cap(caps, "hoverProvider")
+            && let Ok(hover) = client.hover(&uri_str, line_0, col).await
+        {
+            enrichment.hover = extract_hover_text_from_value(&hover);
+        }
+
+        // References — collect line numbers for dedup
+        if has_cap(caps, "referencesProvider")
+            && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
+        {
+            for (file, line, _char) in extract_locations(&refs) {
+                enrichment
+                    .ref_lines
+                    .entry(file)
+                    .or_default()
+                    .insert(line + 1);
             }
+        }
 
-            // References — collect line numbers for dedup
-            if has_cap(caps, "referencesProvider")
-                && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
-            {
-                for (file, line, _char) in extract_locations(&refs) {
-                    enrichment
-                        .ref_lines
-                        .entry(file)
-                        .or_default()
-                        .insert(line + 1);
-                }
-            }
-
-            // Kind-specific enrichment
-            match kind {
-                // Functions/methods/constructors → incoming calls
-                symbols::SK_FUNCTION | symbols::SK_METHOD | symbols::SK_CONSTRUCTOR => {
-                    if has_cap(caps, "callHierarchyProvider")
-                        && let Ok(response) =
-                            client.prepare_call_hierarchy(&uri_str, line_0, col).await
-                        && let Some(items) = response.as_array()
-                    {
-                        for item in items {
-                            if let Ok(calls) = client.incoming_calls(item).await {
-                                extract_incoming_calls(&calls, &mut enrichment);
-                            }
+        // Kind-specific enrichment
+        match kind {
+            // Functions/methods/constructors → incoming calls
+            symbols::SK_FUNCTION | symbols::SK_METHOD | symbols::SK_CONSTRUCTOR => {
+                if has_cap(caps, "callHierarchyProvider")
+                    && let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
+                    && let Some(items) = response.as_array()
+                {
+                    for item in items {
+                        if let Ok(calls) = client.incoming_calls(item).await {
+                            extract_incoming_calls(&calls, &mut enrichment);
                         }
                     }
                 }
-
-                // Structs/classes/enums → implementations
-                symbols::SK_STRUCT | symbols::SK_CLASS | symbols::SK_ENUM => {
-                    if has_cap(caps, "implementationProvider")
-                        && let Ok(response) = client.implementation(&uri_str, line_0, col).await
-                    {
-                        for (file, line, _char) in extract_locations(&response) {
-                            enrichment.implementations.push((file, line + 1));
-                        }
-                    }
-                }
-
-                // Interfaces/traits → subtypes
-                symbols::SK_INTERFACE => {
-                    if client.supports_type_hierarchy()
-                        && let Ok(response) =
-                            client.prepare_type_hierarchy(&uri_str, line_0, col).await
-                        && let Some(items) = response.as_array()
-                    {
-                        for item in items {
-                            if let Ok(subs) = client.subtypes(item).await {
-                                extract_subtypes(&subs, &mut enrichment);
-                            }
-                        }
-                    }
-                }
-
-                _ => {}
             }
 
-            enrichment
-        })
+            // Structs/classes/enums → implementations
+            symbols::SK_STRUCT | symbols::SK_CLASS | symbols::SK_ENUM => {
+                if has_cap(caps, "implementationProvider")
+                    && let Ok(response) = client.implementation(&uri_str, line_0, col).await
+                {
+                    for (file, line, _char) in extract_locations(&response) {
+                        enrichment.implementations.push((file, line + 1));
+                    }
+                }
+            }
+
+            // Interfaces/traits → subtypes
+            symbols::SK_INTERFACE => {
+                if client.supports_type_hierarchy()
+                    && let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
+                    && let Some(items) = response.as_array()
+                {
+                    for item in items {
+                        if let Ok(subs) = client.subtypes(item).await {
+                            extract_subtypes(&subs, &mut enrichment);
+                        }
+                    }
+                }
+            }
+
+            _ => {}
+        }
+
+        enrichment
     }
 
     /// Enriches a position with kind inference — tries all kind-specific
@@ -535,102 +581,102 @@ impl GrepServer {
         clippy::too_many_lines,
         reason = "Sequential LSP calls for kind inference"
     )]
-    fn enrich_at_position_infer_kind(
+    async fn enrich_at_position_infer_kind(
         &self,
         path: &Path,
         line_0: u32,
         col: u32,
+        parent_id: Option<i64>,
     ) -> (u32, Option<String>, SymbolEnrichment) {
-        self.runtime.block_on(async {
-            let mut enrichment = SymbolEnrichment::default();
-            let mut inferred_kind = symbols::SK_VARIABLE;
-            let mut resolved_name: Option<String> = None;
+        let mut enrichment = SymbolEnrichment::default();
+        let mut inferred_kind = symbols::SK_VARIABLE;
+        let mut resolved_name: Option<String> = None;
 
-            let Ok((uri_str, client_mutex)) = self.ensure_document_open(path).await else {
-                return (inferred_kind, resolved_name, enrichment);
-            };
+        let Ok((uri_str, client_mutex)) = self.ensure_document_open(path, parent_id).await else {
+            return (inferred_kind, resolved_name, enrichment);
+        };
 
-            let client = client_mutex.lock().await;
-            let caps = client.capabilities();
+        let mut client = client_mutex.lock().await;
+        client.set_parent_id(parent_id);
+        let caps = client.capabilities();
 
-            // Hover — signature + docs
-            if has_cap(caps, "hoverProvider")
-                && let Ok(hover) = client.hover(&uri_str, line_0, col).await
-            {
-                enrichment.hover = extract_hover_text_from_value(&hover);
+        // Hover — signature + docs
+        if has_cap(caps, "hoverProvider")
+            && let Ok(hover) = client.hover(&uri_str, line_0, col).await
+        {
+            enrichment.hover = extract_hover_text_from_value(&hover);
+        }
+
+        // References — collect line numbers for dedup
+        if has_cap(caps, "referencesProvider")
+            && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
+        {
+            for (file, line, _char) in extract_locations(&refs) {
+                enrichment
+                    .ref_lines
+                    .entry(file)
+                    .or_default()
+                    .insert(line + 1);
             }
+        }
 
-            // References — collect line numbers for dedup
-            if has_cap(caps, "referencesProvider")
-                && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
-            {
-                for (file, line, _char) in extract_locations(&refs) {
-                    enrichment
-                        .ref_lines
-                        .entry(file)
-                        .or_default()
-                        .insert(line + 1);
+        // Try all kind-specific enrichments — infer kind from results
+
+        // Call hierarchy → FUNCTION
+        if has_cap(caps, "callHierarchyProvider")
+            && let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
+            && let Some(items) = response.as_array()
+            && !items.is_empty()
+        {
+            inferred_kind = symbols::SK_FUNCTION;
+            // The first item's name is the LSP-canonical symbol name.
+            resolved_name = items
+                .first()
+                .and_then(|i| i.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            for item in items {
+                if let Ok(calls) = client.incoming_calls(item).await {
+                    extract_incoming_calls(&calls, &mut enrichment);
                 }
             }
+        }
 
-            // Try all kind-specific enrichments — infer kind from results
-
-            // Call hierarchy → FUNCTION
-            if has_cap(caps, "callHierarchyProvider")
-                && let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
-                && let Some(items) = response.as_array()
-                && !items.is_empty()
-            {
-                inferred_kind = symbols::SK_FUNCTION;
-                // The first item's name is the LSP-canonical symbol name.
-                resolved_name = items
-                    .first()
-                    .and_then(|i| i.get("name"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                for item in items {
-                    if let Ok(calls) = client.incoming_calls(item).await {
-                        extract_incoming_calls(&calls, &mut enrichment);
-                    }
+        // Implementation → STRUCT (only if not already identified as function)
+        if inferred_kind == symbols::SK_VARIABLE
+            && has_cap(caps, "implementationProvider")
+            && let Ok(response) = client.implementation(&uri_str, line_0, col).await
+        {
+            let locs = extract_locations(&response);
+            if !locs.is_empty() {
+                inferred_kind = symbols::SK_STRUCT;
+                for (file, line, _char) in locs {
+                    enrichment.implementations.push((file, line + 1));
                 }
             }
+        }
 
-            // Implementation → STRUCT (only if not already identified as function)
-            if inferred_kind == symbols::SK_VARIABLE
-                && has_cap(caps, "implementationProvider")
-                && let Ok(response) = client.implementation(&uri_str, line_0, col).await
-            {
-                let locs = extract_locations(&response);
-                if !locs.is_empty() {
-                    inferred_kind = symbols::SK_STRUCT;
-                    for (file, line, _char) in locs {
-                        enrichment.implementations.push((file, line + 1));
-                    }
+        // Type hierarchy → INTERFACE (only if not already identified)
+        if inferred_kind == symbols::SK_VARIABLE
+            && client.supports_type_hierarchy()
+            && let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
+            && let Some(items) = response.as_array()
+            && !items.is_empty()
+        {
+            inferred_kind = symbols::SK_INTERFACE;
+            resolved_name = items
+                .first()
+                .and_then(|i| i.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            for item in items {
+                if let Ok(subs) = client.subtypes(item).await {
+                    extract_subtypes(&subs, &mut enrichment);
                 }
             }
+        }
 
-            // Type hierarchy → INTERFACE (only if not already identified)
-            if inferred_kind == symbols::SK_VARIABLE
-                && client.supports_type_hierarchy()
-                && let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
-                && let Some(items) = response.as_array()
-                && !items.is_empty()
-            {
-                inferred_kind = symbols::SK_INTERFACE;
-                resolved_name = items
-                    .first()
-                    .and_then(|i| i.get("name"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                for item in items {
-                    if let Ok(subs) = client.subtypes(item).await {
-                        extract_subtypes(&subs, &mut enrichment);
-                    }
-                }
-            }
-
-            (inferred_kind, resolved_name, enrichment)
-        })
+        (inferred_kind, resolved_name, enrichment)
     }
 
     /// Bootstraps LSP enrichment from unaccounted rg hit positions.
@@ -644,11 +690,12 @@ impl GrepServer {
     /// The caller merges these into `by_name` where both the universe
     /// `symbols` vec and the returned vec are in scope.
     #[allow(clippy::too_many_lines, reason = "Iterative elimination loop")]
-    fn bootstrap_from_rg(
+    async fn bootstrap_from_rg(
         &self,
         rg: &RipgrepMatches,
         by_name: &BTreeMap<String, Vec<&SymbolInfo>>,
         all_ref_lines: &HashMap<String, HashSet<u32>>,
+        parent_id: Option<i64>,
     ) -> BootstrapResult {
         let mut result = BootstrapResult {
             symbols: Vec::new(),
@@ -730,24 +777,29 @@ impl GrepServer {
 
                 // prepareRename distinguishes symbols from keywords:
                 // symbol → range, keyword → null. Cheaper than full enrichment.
-                let is_symbol = self.runtime.block_on(async {
-                    let Ok((uri_str, client_mutex)) = self.ensure_document_open(&path).await else {
-                        return false;
-                    };
-                    let client = client_mutex.lock().await;
-                    if !has_cap(client.capabilities(), "renameProvider") {
-                        return true;
+                let is_symbol = {
+                    let open_result = self.ensure_document_open(&path, parent_id).await;
+                    if let Ok((uri_str, client_mutex)) = open_result {
+                        let mut client = client_mutex.lock().await;
+                        client.set_parent_id(parent_id);
+                        if has_cap(client.capabilities(), "renameProvider") {
+                            let response = client.prepare_rename(&uri_str, line_0, col).await;
+                            drop(client);
+                            matches!(response, Ok(ref v) if !v.is_null())
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
                     }
-                    let response = client.prepare_rename(&uri_str, line_0, col).await;
-                    drop(client);
-                    matches!(response, Ok(ref v) if !v.is_null())
-                });
+                };
                 if !is_symbol {
                     continue;
                 }
 
-                let (kind, resolved, enrichment) =
-                    self.enrich_at_position_infer_kind(&path, line_0, col);
+                let (kind, resolved, enrichment) = self
+                    .enrich_at_position_infer_kind(&path, line_0, col, parent_id)
+                    .await;
 
                 // resolved_name comes from prepareCallHierarchy (functions)
                 // or prepareTypeHierarchy (types). If neither returned a name,

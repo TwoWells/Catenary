@@ -1335,20 +1335,14 @@ fn test_wait_ready_failure_detection() -> Result<()> {
         "Dead server should degrade gracefully, not error. Got: {response:?}"
     );
 
-    // Unavailable notification should be prepended
+    // Unavailable notification should be included in the result text
     let content = result["content"]
         .as_array()
         .context("Missing content array")?;
+    let text = content[0]["text"].as_str().context("Missing result text")?;
     assert!(
-        content.len() >= 2,
-        "Expected notification + search results. Got: {content:?}"
-    );
-    let notification = content[0]["text"]
-        .as_str()
-        .context("Missing notification text")?;
-    assert!(
-        notification.contains("server") && notification.contains("unavailable"),
-        "Expected unavailable notification. Got: {notification}"
+        text.contains("server") && text.contains("unavailable"),
+        "Expected unavailable notification in result. Got: {text}"
     );
 
     Ok(())
@@ -2587,6 +2581,118 @@ fn test_grep_rg_bootstrap_keyword_hover_content() -> Result<()> {
     assert!(
         !text.contains("```\nfn\n```"),
         "Hover content should be from the symbol, not the `fn` keyword:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Verify that LSP messages triggered by grep carry the MCP tool call's
+/// `parent_id` in the database (misc 30: `parent_id` threading).
+#[test]
+fn test_grep_parent_id_threading() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn hello()\nhello\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "hello" }
+        }
+    }))?;
+    let _response = bridge.recv()?;
+
+    // Open the database and verify parent_id threading
+    let db_path = PathBuf::from(root).join("catenary").join("catenary.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("open test database")?;
+
+    // Find the tools/call MCP request message
+    let tool_call_id: i64 = conn
+        .query_row(
+            "SELECT id FROM messages WHERE type = 'mcp' AND method = 'tools/call' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("find tools/call message")?;
+
+    // LSP messages from the grep pipeline should carry this parent_id
+    let lsp_with_parent: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE type = 'lsp' AND parent_id = ?1",
+            [tool_call_id],
+            |row| row.get(0),
+        )
+        .context("count LSP messages with parent_id")?;
+
+    assert!(
+        lsp_with_parent > 0,
+        "Expected LSP messages with parent_id={tool_call_id} from grep, found 0"
+    );
+
+    Ok(())
+}
+
+/// Verify that LSP messages triggered by glob carry the MCP tool call's
+/// `parent_id` in the database (misc 30: `parent_id` threading).
+#[test]
+fn test_glob_parent_id_threading() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&test_file, "fn hello()\nhello\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "glob",
+            "arguments": { "pattern": test_file.to_str().context("path")? }
+        }
+    }))?;
+    let _response = bridge.recv()?;
+
+    // Open the database and verify parent_id threading
+    let db_path = PathBuf::from(root).join("catenary").join("catenary.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("open test database")?;
+
+    // Find the tools/call MCP request message
+    let tool_call_id: i64 = conn
+        .query_row(
+            "SELECT id FROM messages WHERE type = 'mcp' AND method = 'tools/call' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("find tools/call message")?;
+
+    // LSP messages from the glob pipeline should carry this parent_id
+    let lsp_with_parent: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE type = 'lsp' AND parent_id = ?1",
+            [tool_call_id],
+            |row| row.get(0),
+        )
+        .context("count LSP messages with parent_id")?;
+
+    assert!(
+        lsp_with_parent > 0,
+        "Expected LSP messages with parent_id={tool_call_id} from glob, found 0"
     );
 
     Ok(())

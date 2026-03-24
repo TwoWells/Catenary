@@ -17,15 +17,15 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::runtime::Handle;
 use tokio::sync::Mutex;
+use tracing::warn;
 
-use super::handler::resolve_path;
+use super::handler::{check_server_health, resolve_path};
 use super::symbols::{format_symbol_kind, is_outline_kind};
+use super::tool_server::ToolServer;
 use super::toolbox::{FilesystemCache, format_file_size};
 use super::{DocumentManager, DocumentNotification};
 use crate::lsp::{ClientManager, LspClient};
-use crate::mcp::CallToolResult;
 
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
@@ -93,7 +93,67 @@ fn extract_outline_symbols(response: &Value) -> OutlineSymbols {
 pub struct GlobServer {
     pub(super) client_manager: Arc<ClientManager>,
     pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
-    pub(super) runtime: Handle,
+    pub(super) fs_cache: Arc<FilesystemCache>,
+    pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl ToolServer for GlobServer {
+    async fn execute(
+        &self,
+        params: &serde_json::Value,
+        parent_id: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let input: GlobInput = serde_json::from_value(params.clone())
+            .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
+
+        let path = resolve_path(&input.pattern)?;
+        let file_path = if path.is_file() {
+            Some(path.clone())
+        } else {
+            None
+        };
+
+        // Wait for readiness and check health
+        let health = if let Some(ref fp) = file_path {
+            self.wait_for_server_ready(fp).await;
+            let touched: Vec<String> = self.language_for_path(fp).await.into_iter().collect();
+            check_server_health(&self.client_manager, &touched, &self.notified_offline).await
+        } else {
+            self.wait_for_all_servers_ready().await;
+            let touched: Vec<String> = self
+                .client_manager
+                .clients()
+                .await
+                .keys()
+                .cloned()
+                .collect();
+            check_server_health(&self.client_manager, &touched, &self.notified_offline).await
+        };
+
+        tracing::debug!("glob: {}", input.pattern);
+
+        // Run pipeline
+        let output = if path.is_file() {
+            self.handle_glob_file(&path, parent_id).await
+        } else if path.is_dir() {
+            self.handle_glob_dir(&path, parent_id).await?
+        } else {
+            self.handle_glob_pattern(&input.pattern, parent_id).await?
+        };
+
+        // Prepend notification
+        let text = if let Some(note) = health.notification {
+            if output.is_empty() {
+                note
+            } else {
+                format!("{note}\n\n{output}")
+            }
+        } else {
+            output
+        };
+
+        Ok(Value::String(text))
+    }
 }
 
 impl GlobServer {
@@ -114,12 +174,19 @@ impl GlobServer {
         clippy::significant_drop_tightening,
         reason = "Client lock held across notification send"
     )]
-    async fn ensure_document_open(&self, path: &Path) -> Result<(String, Arc<Mutex<LspClient>>)> {
+    async fn ensure_document_open(
+        &self,
+        path: &Path,
+        parent_id: Option<i64>,
+    ) -> Result<(String, Arc<Mutex<LspClient>>)> {
         let client_mutex = self.get_client_for_path(path).await?;
         let mut doc_manager = self.doc_manager.lock().await;
-        let client = client_mutex.lock().await;
+        let mut client = client_mutex.lock().await;
+
+        client.set_parent_id(parent_id);
 
         if !client.is_alive() {
+            client.set_parent_id(None);
             return Err(anyhow!(
                 "[{}] server is no longer running",
                 client.language()
@@ -153,40 +220,69 @@ impl GlobServer {
         Ok((uri, client_mutex.clone()))
     }
 
-    /// Handles the `glob` tool call.
-    pub fn handle_glob(
-        &self,
-        arguments: Option<serde_json::Value>,
-        fs_cache: &FilesystemCache,
-    ) -> Result<CallToolResult> {
-        let input: GlobInput =
-            serde_json::from_value(arguments.ok_or_else(|| anyhow!("Missing arguments"))?)
-                .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
+    /// Waits for the server handling the given path to be ready.
+    ///
+    /// Dead servers are non-fatal — the wait completes and the caller
+    /// uses [`check_server_health`] to detect the state.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Client lock held across wait_ready call"
+    )]
+    async fn wait_for_server_ready(&self, path: &Path) {
+        let Ok(client_mutex) = self.get_client_for_path(path).await else {
+            return;
+        };
 
-        let path = resolve_path(&input.pattern)?;
+        let client = client_mutex.lock().await;
+        let lang = client.language().to_string();
+        let is_ready = client.wait_ready().await;
+        drop(client);
 
-        tracing::debug!("glob: {}", input.pattern);
-
-        if path.is_file() {
-            Ok(self.handle_glob_file(&path, fs_cache))
-        } else if path.is_dir() {
-            self.handle_glob_dir(&path, fs_cache)
-        } else {
-            self.handle_glob_pattern(&input.pattern, fs_cache)
+        if !is_ready {
+            warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
         }
+    }
+
+    /// Waits for all active LSP servers to be ready.
+    async fn wait_for_all_servers_ready(&self) {
+        let clients = self.client_manager.clients().await;
+
+        for (lang, client_mutex) in clients {
+            if !client_mutex.lock().await.wait_ready().await {
+                warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
+            }
+        }
+    }
+
+    /// Returns the language key for a file path, matching the key used in
+    /// `clients()`.
+    async fn language_for_path(&self, path: &Path) -> Option<String> {
+        let lang_id = {
+            let doc_manager = self.doc_manager.lock().await;
+            doc_manager.language_id_for_path(path).to_string()
+        };
+        let client_mutex = self
+            .client_manager
+            .get_client_for_path(path, &lang_id)
+            .await
+            .ok()?;
+        Some(client_mutex.lock().await.language().to_string())
     }
 
     /// File outline: header with line count + depth-0 outline symbols.
     ///
     /// Binary files show size instead of line count and skip LSP symbols.
-    fn handle_glob_file(&self, path: &Path, fs_cache: &FilesystemCache) -> CallToolResult {
+    async fn handle_glob_file(&self, path: &Path, parent_id: Option<i64>) -> String {
         let mut result = String::new();
         let display = path.to_string_lossy();
         let metadata = std::fs::metadata(path).ok();
 
-        if let Some(line_count) = metadata.as_ref().and_then(|m| fs_cache.line_count(path, m)) {
+        if let Some(line_count) = metadata
+            .as_ref()
+            .and_then(|m| self.fs_cache.line_count(path, m))
+        {
             let _ = writeln!(result, "{display}  ({line_count} lines)");
-            if let Ok(symbols) = self.fetch_outline_symbols(path) {
+            if let Ok(symbols) = self.fetch_outline_symbols(path, parent_id).await {
                 for (name, kind, line) in &symbols {
                     let kind_str = format_symbol_kind(*kind);
                     let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
@@ -197,12 +293,12 @@ impl GlobServer {
             let _ = writeln!(result, "{display}  ({})", format_file_size(size));
         }
 
-        CallToolResult::text(result)
+        result
     }
 
     /// Directory listing with outline symbols and gitignored section.
     #[allow(clippy::too_many_lines, reason = "Two-pass directory classification")]
-    fn handle_glob_dir(&self, dir: &Path, fs_cache: &FilesystemCache) -> Result<CallToolResult> {
+    async fn handle_glob_dir(&self, dir: &Path, parent_id: Option<i64>) -> Result<String> {
         let canonical = dir
             .canonicalize()
             .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
@@ -257,8 +353,11 @@ impl GlobServer {
                 symlinks.push(format!("{name} -> {target}"));
             } else if metadata.is_dir() {
                 dirs.push(format!("{name}/"));
-            } else if let Some(line_count) = fs_cache.line_count(&entry_path, &metadata) {
-                let outline = self.fetch_outline_symbols(&entry_path).unwrap_or_default();
+            } else if let Some(line_count) = self.fs_cache.line_count(&entry_path, &metadata) {
+                let outline = self
+                    .fetch_outline_symbols(&entry_path, parent_id)
+                    .await
+                    .unwrap_or_default();
                 files.push((name, line_count, outline, None));
             } else {
                 let size = format_file_size(metadata.len());
@@ -306,20 +405,16 @@ impl GlobServer {
             result = "Directory is empty".to_string();
         }
 
-        Ok(CallToolResult::text(result))
+        Ok(result)
     }
 
     /// Glob pattern match across workspace roots.
-    fn handle_glob_pattern(
-        &self,
-        pattern: &str,
-        fs_cache: &FilesystemCache,
-    ) -> Result<CallToolResult> {
+    async fn handle_glob_pattern(&self, pattern: &str, parent_id: Option<i64>) -> Result<String> {
         let matcher = Glob::new(pattern)
             .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
             .compile_matcher();
 
-        let roots = self.runtime.block_on(self.client_manager.roots());
+        let roots = self.client_manager.roots().await;
         let search_roots = if roots.is_empty() {
             vec![std::env::current_dir()?]
         } else {
@@ -353,21 +448,25 @@ impl GlobServer {
         matched_files.dedup();
 
         if matched_files.is_empty() {
-            return Ok(CallToolResult::text("No matches found"));
+            return Ok("No matches found".to_string());
         }
 
         // Ensure servers exist for any new languages in matched files
-        self.runtime
-            .block_on(self.client_manager.ensure_clients_for_paths(&matched_files));
+        self.client_manager
+            .ensure_clients_for_paths(&matched_files)
+            .await;
 
         let mut result = String::new();
         for path in &matched_files {
             let display = path.to_string_lossy();
             let metadata = std::fs::metadata(path).ok();
 
-            if let Some(line_count) = metadata.as_ref().and_then(|m| fs_cache.line_count(path, m)) {
+            if let Some(line_count) = metadata
+                .as_ref()
+                .and_then(|m| self.fs_cache.line_count(path, m))
+            {
                 let _ = writeln!(result, "{display}  ({line_count} lines)");
-                if let Ok(symbols) = self.fetch_outline_symbols(path) {
+                if let Ok(symbols) = self.fetch_outline_symbols(path, parent_id).await {
                     for (name, kind, line) in &symbols {
                         let kind_str = format_symbol_kind(*kind);
                         let _ = writeln!(result, "  [{kind_str}] {name} L{line}");
@@ -379,35 +478,29 @@ impl GlobServer {
             }
         }
 
-        Ok(CallToolResult::text(result))
+        Ok(result)
     }
 
     /// Fetches depth-0 outline symbols for a file from LSP.
     ///
     /// Returns `(name, kind_u32, 1-based line)` tuples. On LSP failure,
     /// returns an error (callers typically use `.unwrap_or_default()`).
-    fn fetch_outline_symbols(&self, path: &Path) -> Result<OutlineSymbols> {
-        self.runtime.block_on(async {
-            let (uri_str, client_mutex) = self.ensure_document_open(path).await?;
+    async fn fetch_outline_symbols(
+        &self,
+        path: &Path,
+        parent_id: Option<i64>,
+    ) -> Result<OutlineSymbols> {
+        let (uri_str, client_mutex) = self.ensure_document_open(path, parent_id).await?;
 
-            let response = client_mutex.lock().await.document_symbols(&uri_str).await?;
+        let mut client = client_mutex.lock().await;
+        client.set_parent_id(parent_id);
+        let response = client.document_symbols(&uri_str).await?;
+        drop(client);
 
-            if response.is_null() {
-                return Ok(Vec::new());
-            }
+        if response.is_null() {
+            return Ok(Vec::new());
+        }
 
-            Ok(extract_outline_symbols(&response))
-        })
-    }
-
-    /// Extracts a file path from `glob` arguments, returning `Some(path)` only
-    /// if the pattern resolves to an existing file. For directories and glob
-    /// patterns, returns `None` (triggers wait-for-all-servers).
-    pub fn extract_glob_file_path(arguments: Option<&serde_json::Value>) -> Option<PathBuf> {
-        let pattern = arguments
-            .and_then(|v| v.get("pattern"))
-            .and_then(|v| v.as_str())?;
-        let path = resolve_path(pattern).ok()?;
-        if path.is_file() { Some(path) } else { None }
+        Ok(extract_outline_symbols(&response))
     }
 }

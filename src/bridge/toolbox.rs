@@ -7,7 +7,7 @@
 //! `LspBridgeHandler` holds a `Toolbox` and handles protocol boundary
 //! concerns (health checks, readiness, dispatch routing).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -218,6 +218,7 @@ impl Toolbox {
         session_id: Option<String>,
     ) -> Self {
         let fs_cache = Arc::new(FilesystemCache::new());
+        let notified_offline = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let editing =
             EditingServer::new(diagnostics.clone(), session_id.clone().unwrap_or_default());
         let replace = ReplaceServer::new(
@@ -230,12 +231,14 @@ impl Toolbox {
         let grep = GrepServer {
             client_manager: client_manager.clone(),
             doc_manager: doc_manager.clone(),
-            runtime: runtime.clone(),
+            fs_cache: fs_cache.clone(),
+            notified_offline: notified_offline.clone(),
         };
         let glob = GlobServer {
             client_manager: client_manager.clone(),
             doc_manager: doc_manager.clone(),
-            runtime: runtime.clone(),
+            fs_cache: fs_cache.clone(),
+            notified_offline,
         };
         Self {
             grep,

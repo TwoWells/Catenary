@@ -24,25 +24,20 @@ Internal planning and tracking for the Catenary project.
 
 ## Current priority
 
-**1. Misc 30 (grep/glob → ToolServer).** Pure refactor, no
-dependencies. Completes the collapse workstream's `ToolServer`
-extraction — moves health checks, readiness waits, and notification
-logic into the tools. Threads `parent_id` for LSP message correlation.
-
-**2. Workstream 15 (Management).** 5 tickets (00–04).
+**1. Workstream 15 (Management).** 5 tickets (00–04).
 `FilesystemCache` → `FilesystemManager`, `ClientManager` →
 `LspClientManager` (absorbs `DocumentManager`), `get_client(path)`,
 `inherit` config model, root resolution. Unblocks misc 28.
 
-**3. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
+**2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
 Unblocks `didChangeConfiguration` dynamic registration for misc 28.
 Just 1b-00 — the rest of the 1b pipeline follows after misc 28.
 
-**4. Misc 28 (multi-root / workspace folders).** Per-root instances
+**3. Misc 28 (multi-root / workspace folders).** Per-root instances
 for legacy servers, routing, two-tier configuration model (`scopeUri`
 resolution). Blocked on workstream 15 and 1b-00. Subsumes misc 13.
 
-**5. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
+**4. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
 tickets (1b-01 through 1b-08, including 02a/02b split). Critical
 path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
 (OnceLock), 05 (dm utils). Full design:
@@ -54,8 +49,10 @@ path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
   state) blocked on waitv2 1b infrastructure.
 - **Workstream 11 (Replace) removal ready.** Dead code cleanup.
   Doesn't unlock anything.
-- **Workstream 4 (SEARCHv2) in progress.** Ticket 00 complete.
-  Blocked on capacity.
+- **Workstream 4 (SEARCHv2) stale.** Ticket 00 complete. Design
+  predates collapse (workstream 10), `ToolServer` trait, and
+  async conversion (misc 30). Tickets 01+ need review against
+  current architecture before resuming.
 - **Workstream 14 (Recommend) design complete.** Python script
   works today; ship when needed.
 

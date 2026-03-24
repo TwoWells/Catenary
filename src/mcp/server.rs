@@ -26,11 +26,21 @@ pub trait ToolHandler: Send + Sync {
 
     /// Handles a tool call and returns the result.
     ///
+    /// `parent_id` is the database ID of the incoming MCP message that
+    /// triggered this call. Implementations forward it to
+    /// [`ToolServer::execute`](super::super::bridge::ToolServer::execute)
+    /// so LSP messages are correlated with the triggering MCP request
+    /// in the monitor.
+    ///
     /// # Errors
     ///
     /// Returns an error if the tool call fails for reasons other than the tool itself reporting an error.
-    fn call_tool(&self, name: &str, arguments: Option<serde_json::Value>)
-    -> Result<CallToolResult>;
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        parent_id: Option<i64>,
+    ) -> Result<CallToolResult>;
 }
 
 /// MCP server that communicates over stdin/stdout.
@@ -64,6 +74,9 @@ pub struct McpServer<H: ToolHandler> {
     on_roots_changed: Option<RootsChangedCallback>,
     /// Shared flag set by `HookServer` when a `PreToolUse` hook fires.
     refresh_roots: Arc<AtomicBool>,
+    /// Database ID of the current incoming message, set per `dispatch_message`.
+    /// Read by `handle_tools_call` to supply `parent_id` to the tool handler.
+    current_entry_id: i64,
 }
 
 impl<H: ToolHandler> McpServer<H> {
@@ -81,6 +94,7 @@ impl<H: ToolHandler> McpServer<H> {
             next_outbound_id: 0,
             on_roots_changed: None,
             refresh_roots: Arc::new(AtomicBool::new(false)),
+            current_entry_id: 0,
         }
     }
 
@@ -161,6 +175,7 @@ impl<H: ToolHandler> McpServer<H> {
                     (0, String::new())
                 };
 
+            self.current_entry_id = entry_id;
             self.dispatch_message(trimmed, &mut writer, entry_id, &method)?;
 
             // Check if the hook server requested a roots refresh
@@ -383,7 +398,11 @@ impl<H: ToolHandler> McpServer<H> {
 
         debug!("Calling tool: {}", params.name);
 
-        match self.handler.call_tool(&params.name, params.arguments) {
+        let parent_id = Some(self.current_entry_id);
+        match self
+            .handler
+            .call_tool(&params.name, params.arguments, parent_id)
+        {
             Ok(result) => Ok(Response::success(request.id, result)?),
             Err(e) => {
                 error!("Tool call failed: {}", e);
@@ -611,6 +630,7 @@ mod tests {
             &self,
             name: &str,
             _arguments: Option<serde_json::Value>,
+            _parent_id: Option<i64>,
         ) -> Result<CallToolResult> {
             match name {
                 "test_tool" => Ok(CallToolResult::text("Test result")),

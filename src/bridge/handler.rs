@@ -6,44 +6,125 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::warn;
 
-use super::DocumentManager;
 use super::diagnostics_server::DiagnosticsServer;
-use super::file_tools::GlobServer;
 use super::tool_server::ToolServer;
 use super::toolbox::Toolbox;
-use crate::lsp::{ClientManager, LspClient};
-use crate::mcp::{CallToolResult, Tool, ToolContent, ToolHandler};
+use crate::lsp::ClientManager;
+use crate::mcp::{CallToolResult, Tool, ToolHandler};
 
 /// Maximum unique LSP symbols for hover display in grep output.
 const GREP_HOVER_THRESHOLD: usize = 10;
 
 /// Result of a server health check against touched language servers.
-struct ServerHealth {
+#[allow(dead_code, reason = "dead field available for future tool-level use")]
+pub(super) struct ServerHealth {
     /// Languages with dead servers.
-    dead: Vec<String>,
+    pub(super) dead: Vec<String>,
     /// One-time batched notification for state transitions (offline/recovery).
-    notification: Option<String>,
+    pub(super) notification: Option<String>,
+}
+
+/// Checks server health for the given languages and generates one-time
+/// state-transition notifications.
+///
+/// Queries each server's liveness, partitions into alive/dead, and
+/// compares against `notified_offline` to produce batched notifications:
+/// - Newly dead servers get a single offline message with scope of impact.
+/// - Previously-offline servers that recovered get a single recovery message.
+pub(super) async fn check_server_health(
+    client_manager: &ClientManager,
+    touched_servers: &[String],
+    notified_offline: &std::sync::Mutex<HashSet<String>>,
+) -> ServerHealth {
+    let mut alive = Vec::new();
+    let mut dead = Vec::new();
+
+    // Classify each touched server by readiness (not just process liveness —
+    // a stuck server is alive but not ready)
+    let clients = client_manager.clients().await;
+    for lang in touched_servers {
+        let ready = if let Some(c) = clients.get(lang) {
+            let client = c.lock().await;
+            // Lightweight idle probe: if a stuck server has gone idle,
+            // recover it to Ready before checking readiness.
+            client.try_idle_recover();
+            client.is_ready()
+        } else {
+            false
+        };
+
+        if ready {
+            alive.push(lang.clone());
+        } else {
+            dead.push(lang.clone());
+        }
+    }
+
+    // Determine state transitions against notified_offline
+    let mut notified = notified_offline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut parts = Vec::new();
+
+    // Recovery: previously unavailable, now alive
+    let recovered: Vec<String> = alive
+        .iter()
+        .filter(|lang| notified.remove(lang.as_str()))
+        .cloned()
+        .collect();
+
+    if !recovered.is_empty() {
+        let langs = recovered.join(", ");
+        parts.push(format!(
+            "Language server{} back online: {langs} \u{2014} \
+             diagnostics and language server enrichment re-enabled for \
+             {langs} files.",
+            if recovered.len() == 1 { "" } else { "s" },
+        ));
+    }
+
+    // Unavailable: newly dead or stuck, not yet reported
+    let newly_dead: Vec<String> = dead
+        .iter()
+        .filter(|lang| notified.insert((*lang).clone()))
+        .cloned()
+        .collect();
+
+    if !newly_dead.is_empty() {
+        let langs = newly_dead.join(", ");
+        parts.push(format!(
+            "Language server{} unavailable: {langs} \u{2014} \
+             diagnostics unavailable for {langs} files. \
+             grep and glob still work but without \
+             language server enrichment.",
+            if newly_dead.len() == 1 { "" } else { "s" },
+        ));
+    }
+
+    let notification = if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    };
+
+    ServerHealth { dead, notification }
 }
 
 /// Bridge handler that implements MCP `ToolHandler` trait.
 /// Handles MCP tool calls by routing them to the appropriate LSP server.
 pub struct LspBridgeHandler {
     toolbox: Toolbox,
-    /// Languages whose servers have been reported offline to the agent.
-    /// Used for one-time notification: offline is reported once, recovery once.
-    notified_offline: std::sync::Mutex<HashSet<String>>,
 }
 
 impl LspBridgeHandler {
     /// Creates a new `LspBridgeHandler` wrapping a `Toolbox`.
     pub fn new(
         client_manager: Arc<ClientManager>,
-        doc_manager: Arc<Mutex<DocumentManager>>,
+        doc_manager: Arc<tokio::sync::Mutex<super::DocumentManager>>,
         runtime: tokio::runtime::Handle,
         diagnostics: Arc<DiagnosticsServer>,
         session_id: Option<String>,
@@ -55,173 +136,7 @@ impl LspBridgeHandler {
             diagnostics,
             session_id,
         );
-        Self {
-            toolbox,
-            notified_offline: std::sync::Mutex::new(HashSet::new()),
-        }
-    }
-
-    /// Gets the appropriate LSP client for the given file path.
-    async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
-        let lang_id = {
-            let doc_manager = self.toolbox.doc_manager.lock().await;
-            doc_manager.language_id_for_path(path).to_string()
-        };
-
-        self.toolbox
-            .client_manager
-            .get_client_for_path(path, &lang_id)
-            .await
-    }
-
-    /// Waits for the server handling the given path to be ready.
-    ///
-    /// Dead servers are non-fatal — the wait completes and the caller
-    /// uses [`Self::check_server_health`] to detect the state.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Client lock held across wait_ready call"
-    )]
-    async fn wait_for_server_ready(&self, path: &Path) {
-        let Ok(client_mutex) = self.get_client_for_path(path).await else {
-            return; // No LSP server configured for this language
-        };
-
-        let client = client_mutex.lock().await;
-        let lang = client.language().to_string();
-        let is_ready = client.wait_ready().await;
-        drop(client);
-
-        if !is_ready {
-            warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
-        }
-    }
-
-    /// Waits for all active LSP servers to be ready.
-    ///
-    /// Dead servers are non-fatal — the wait completes for each server
-    /// and the caller uses [`Self::check_server_health`] to detect state.
-    /// Used for symbol-only queries that don't target a specific file.
-    async fn wait_for_all_servers_ready(&self) {
-        let clients = self.toolbox.client_manager.clients().await;
-
-        for (lang, client_mutex) in clients {
-            if !client_mutex.lock().await.wait_ready().await {
-                warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
-            }
-        }
-    }
-
-    /// Checks server health for the given languages and generates one-time
-    /// state-transition notifications.
-    ///
-    /// Queries each server's liveness, partitions into alive/dead, and
-    /// compares against `notified_offline` to produce batched notifications:
-    /// - Newly dead servers get a single offline message with scope of impact.
-    /// - Previously-offline servers that recovered get a single recovery message.
-    fn check_server_health(&self, touched_servers: &[String]) -> ServerHealth {
-        let mut alive = Vec::new();
-        let mut dead = Vec::new();
-
-        // Classify each touched server by readiness (not just process liveness —
-        // a stuck server is alive but not ready)
-        let clients = self
-            .toolbox
-            .runtime
-            .block_on(self.toolbox.client_manager.clients());
-        for lang in touched_servers {
-            let ready = clients.get(lang).is_some_and(|c| {
-                self.toolbox.runtime.block_on(async {
-                    let client = c.lock().await;
-                    // Lightweight idle probe: if a stuck server has gone idle,
-                    // recover it to Ready before checking readiness.
-                    client.try_idle_recover();
-                    client.is_ready()
-                })
-            });
-
-            if ready {
-                alive.push(lang.clone());
-            } else {
-                dead.push(lang.clone());
-            }
-        }
-
-        // Determine state transitions against notified_offline
-        let mut notified = self
-            .notified_offline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let mut parts = Vec::new();
-
-        // Recovery: previously unavailable, now alive
-        let recovered: Vec<String> = alive
-            .iter()
-            .filter(|lang| notified.remove(lang.as_str()))
-            .cloned()
-            .collect();
-
-        if !recovered.is_empty() {
-            let langs = recovered.join(", ");
-            parts.push(format!(
-                "Language server{} back online: {langs} \u{2014} \
-                 diagnostics and language server enrichment re-enabled for \
-                 {langs} files.",
-                if recovered.len() == 1 { "" } else { "s" },
-            ));
-        }
-
-        // Unavailable: newly dead or stuck, not yet reported
-        let newly_dead: Vec<String> = dead
-            .iter()
-            .filter(|lang| notified.insert((*lang).clone()))
-            .cloned()
-            .collect();
-
-        if !newly_dead.is_empty() {
-            let langs = newly_dead.join(", ");
-            parts.push(format!(
-                "Language server{} unavailable: {langs} \u{2014} \
-                 diagnostics unavailable for {langs} files. \
-                 grep and glob still work but without \
-                 language server enrichment.",
-                if newly_dead.len() == 1 { "" } else { "s" },
-            ));
-        }
-
-        let notification = if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n\n"))
-        };
-
-        ServerHealth { dead, notification }
-    }
-
-    /// Extract file path from arguments if present.
-    fn extract_file_path(arguments: Option<&serde_json::Value>) -> Option<PathBuf> {
-        arguments
-            .and_then(|v| v.get("file"))
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-    }
-
-    /// Returns the language key for a file path, matching the key used in
-    /// `clients()`. This may differ from the LSP language ID for
-    /// custom/test languages where the config key is the file extension.
-    async fn language_for_path(&self, path: &Path) -> Option<String> {
-        let lang_id = {
-            let doc_manager = self.toolbox.doc_manager.lock().await;
-            doc_manager.language_id_for_path(path).to_string()
-        };
-        let client_mutex = self
-            .toolbox
-            .client_manager
-            .get_client_for_path(path, &lang_id)
-            .await
-            .ok()?;
-        Some(client_mutex.lock().await.language().to_string())
+        Self { toolbox }
     }
 }
 
@@ -397,13 +312,8 @@ impl ToolHandler for LspBridgeHandler {
         &self,
         name: &str,
         arguments: Option<serde_json::Value>,
+        parent_id: Option<i64>,
     ) -> Result<CallToolResult> {
-        let file_path = if name == "glob" {
-            GlobServer::extract_glob_file_path(arguments.as_ref())
-        } else {
-            Self::extract_file_path(arguments.as_ref())
-        };
-
         // Editing tools: early dispatch, no LSP readiness wait.
         // start_editing is db-only; done_editing delegates to DiagnosticsServer.
         if name == "start_editing" || name == "done_editing" {
@@ -432,82 +342,30 @@ impl ToolHandler for LspBridgeHandler {
             };
         }
 
-        // Replace: early dispatch, no LSP readiness wait — handles its own
-        // LSP interaction via DiagnosticsServer after the file write.
-        if name == "replace" {
-            let params = arguments.unwrap_or(serde_json::Value::Null);
-            let result = self
+        // ToolServer dispatch: replace, grep, glob
+        let params = arguments.unwrap_or(Value::Null);
+        let result = match name {
+            "replace" => self
                 .toolbox
                 .runtime
-                .block_on(self.toolbox.replace.execute(&params, None));
-
-            return match result {
-                Ok(v) => {
-                    let text = v.as_str().unwrap_or("").to_string();
-                    Ok(CallToolResult::text(text))
-                }
-                Err(e) => Err(e),
-            };
-        }
-
-        // Wait for LSP readiness, then check server health.
-        // Dead servers are non-fatal — tools degrade gracefully.
-        let health = file_path.as_ref().map_or_else(
-            || {
-                // Symbol-only: wait for all servers
-                self.toolbox
-                    .runtime
-                    .block_on(self.wait_for_all_servers_ready());
-                let touched: Vec<String> = self
-                    .toolbox
-                    .runtime
-                    .block_on(self.toolbox.client_manager.clients())
-                    .keys()
-                    .cloned()
-                    .collect();
-                self.check_server_health(&touched)
-            },
-            |path| {
-                // File-scoped: wait for the specific server
-                self.toolbox
-                    .runtime
-                    .block_on(self.wait_for_server_ready(path));
-                let touched: Vec<String> = self
-                    .toolbox
-                    .runtime
-                    .block_on(self.language_for_path(path))
-                    .into_iter()
-                    .collect();
-                self.check_server_health(&touched)
-            },
-        );
-
-        // File-scoped tool with dead server: skip dispatch, return notification
-        if !health.dead.is_empty() && file_path.is_some() && name != "glob" {
-            let notification = health.notification.unwrap_or_default();
-            return Ok(CallToolResult::text(notification));
-        }
-
-        // Dispatch tool
-        let mut result = match name {
+                .block_on(self.toolbox.replace.execute(&params, parent_id)),
             "grep" => self
                 .toolbox
-                .grep
-                .handle_grep(arguments, &self.toolbox.fs_cache),
+                .runtime
+                .block_on(self.toolbox.grep.execute(&params, parent_id)),
             "glob" => self
                 .toolbox
-                .glob
-                .handle_glob(arguments, &self.toolbox.fs_cache),
-            _ => Err(anyhow!("Unknown tool: {name}")),
+                .runtime
+                .block_on(self.toolbox.glob.execute(&params, parent_id)),
+            _ => return Err(anyhow!("Unknown tool: {name}")),
         };
 
-        // Prepend state-transition notification to the result
-        if let Some(note) = health.notification
-            && let Ok(ref mut res) = result
-        {
-            res.content.insert(0, ToolContent::Text { text: note });
+        match result {
+            Ok(v) => {
+                let text = v.as_str().unwrap_or("").to_string();
+                Ok(CallToolResult::text(text))
+            }
+            Err(e) => Err(e),
         }
-
-        result
     }
 }
