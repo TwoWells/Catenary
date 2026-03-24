@@ -20,24 +20,33 @@ Internal planning and tracking for the Catenary project.
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
 | 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 complete** | `tickets/acquire/DESIGN.md` |
 | 14 | [Recommend](#14-recommend) | **Design complete** | `tickets/recommend/DESIGN.md` |
+| 15 | [Management](#15-management) | **Ready** | `tickets/management/README.md` |
 
 ## Current priority
 
-**1. Misc 09 (mid-session server spawn).** Self-contained bug fix,
-no dependencies. Workspace-wide tools miss new file types added
-mid-session.
+**1. Misc 30 (grep/glob → ToolServer).** Pure refactor, no
+dependencies. Completes the collapse workstream's `ToolServer`
+extraction — moves health checks, readiness waits, and notification
+logic into the tools. Threads `parent_id` for LSP message correlation.
 
-**2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
+**2. Workstream 15 (Management).** 5 tickets (00–04).
+`FilesystemCache` → `FilesystemManager`, `ClientManager` →
+`LspClientManager` (absorbs `DocumentManager`), `get_client(path)`,
+`inherit` config model, root resolution. Unblocks misc 28.
+
+**3. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
 Unblocks `didChangeConfiguration` dynamic registration for misc 28.
-Full 1b pipeline design: `tickets/waitv2/design/pipeline_1b.md`.
-10 tickets (1b-00 through 1b-08, including 02a/02b split). Critical
-path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 00
-(capability gates), 04 (OnceLock), 05 (dm utils). Collapse
-workstream complete — 1b ordering dependency satisfied.
+Just 1b-00 — the rest of the 1b pipeline follows after misc 28.
 
-**3. Misc 28 (multi-root / workspace folders).** Per-root instances
+**4. Misc 28 (multi-root / workspace folders).** Per-root instances
 for legacy servers, routing, two-tier configuration model (`scopeUri`
-resolution). Blocked on 1b-00. Subsumes misc 13.
+resolution). Blocked on workstream 15 and 1b-00. Subsumes misc 13.
+
+**5. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
+tickets (1b-01 through 1b-08, including 02a/02b split). Critical
+path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
+(OnceLock), 05 (dm utils). Full design:
+`tickets/waitv2/design/pipeline_1b.md`.
 
 **Lower priority:**
 
@@ -341,6 +350,27 @@ Independent of workstream 13 (Acquire). The existing Python script
 works today; this ships on its own timeline.
 
 Design: `tickets/recommend/DESIGN.md`.
+
+---
+
+## 15. Management
+
+**Status: Ready.** 5 tickets (00–04). Extracted from misc 29.
+
+Rearchitects the file classification and client lookup layers.
+`FilesystemCache` → `FilesystemManager` (single authority for file
+metadata: binary detection, line count, language ID, shebang, root
+resolution). `ClientManager` → `LspClientManager` (absorbs
+`DocumentManager`, provides `get_client(path)`). Config keys unified
+with LSP language IDs via `inherit`. Deletes `detect_language_id`,
+`extension_to_config_key`, `config_key_for_path`, `get_client_for_path`,
+`detect_workspace_languages`.
+
+Foundation for workstream 7 phase 1b and misc 28 (multi-root). No
+external dependencies — can start immediately.
+
+Design: `tickets/misc/29_language_id_config_unification.md`.
+Tracker: `tickets/management/README.md`.
 
 ---
 
