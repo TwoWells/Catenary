@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
-use crate::bridge::diagnostics_server::DiagnosticsServer;
+use crate::bridge::toolbox::Toolbox;
 use crate::db;
 use crate::session::MessageLog;
 
@@ -45,8 +45,10 @@ enum HookRequest {
     PreToolEnforceEditing {
         /// Host CLI tool name (e.g., "Edit", "Write", `"write_file"`).
         tool_name: String,
-        /// Absolute path to the target file (if applicable).
+        /// Absolute path to the target file (unused in stateless API but
+        /// preserved for backwards compatibility with hook callers).
         #[serde(default)]
+        #[allow(dead_code, reason = "kept for IPC backwards compatibility")]
         file_path: Option<String>,
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
@@ -62,12 +64,9 @@ enum HookRequest {
         /// Absolute path to the changed file.
         file: String,
         /// Name of the host CLI tool that triggered the hook.
-        /// Included in the logged payload for monitor visibility.
+        /// Used for file accumulation during editing mode and logged
+        /// in the payload for monitor visibility.
         #[serde(default)]
-        #[allow(
-            dead_code,
-            reason = "metadata field — logged in payload, not read in code"
-        )]
         tool: Option<String>,
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
@@ -160,7 +159,7 @@ fn is_allowed_during_editing(tool_name: &str) -> bool {
 /// method names, runs editing state logic, diagnostics, and root sync
 /// server-side, and logs all hook messages for monitor visibility.
 pub struct HookServer {
-    diagnostics: Arc<DiagnosticsServer>,
+    toolbox: Arc<Toolbox>,
     refresh_roots: Arc<AtomicBool>,
     message_log: Arc<MessageLog>,
     conn: Arc<Mutex<Connection>>,
@@ -172,7 +171,7 @@ impl HookServer {
     /// Creates a new `HookServer`.
     #[must_use]
     pub const fn new(
-        diagnostics: Arc<DiagnosticsServer>,
+        toolbox: Arc<Toolbox>,
         refresh_roots: Arc<AtomicBool>,
         message_log: Arc<MessageLog>,
         conn: Arc<Mutex<Connection>>,
@@ -180,7 +179,7 @@ impl HookServer {
         client_name: String,
     ) -> Self {
         Self {
-            diagnostics,
+            toolbox,
             refresh_roots,
             message_log,
             conn,
@@ -328,22 +327,23 @@ impl HookServer {
             }
             HookRequest::PreToolEnforceEditing {
                 tool_name,
-                file_path,
+                file_path: _,
                 agent_id,
                 session_id,
             } => {
                 self.store_client_session_id(session_id.as_deref());
-                self.handle_enforce_editing(&tool_name, file_path.as_deref(), &agent_id)
+                self.handle_enforce_editing(&tool_name, &agent_id)
             }
             HookRequest::PostToolDiagnostics {
                 file,
-                tool: _,
+                tool,
                 agent_id,
                 session_id,
             } => {
                 self.store_client_session_id(session_id.as_deref());
                 debug!("Hook: processing file {file}");
-                self.handle_diagnostics(&file, &agent_id, entry_id).await
+                self.handle_diagnostics(&file, &agent_id, tool.as_deref(), entry_id)
+                    .await
             }
             HookRequest::PostAgentRequireRelease {
                 agent_id,
@@ -382,53 +382,30 @@ impl HookServer {
 
     /// Editing state enforcement: deny or allow a tool call.
     ///
-    /// If the agent is editing files, only Edit/Read on those files and
-    /// Catenary editing tools are allowed. If the agent is not editing,
-    /// Edit requires `start_editing` first.
-    fn handle_enforce_editing(
-        &self,
-        tool_name: &str,
-        file_path: Option<&str>,
-        agent_id: &str,
-    ) -> Option<HookResult> {
-        let editing_files = self
+    /// If the agent is in editing mode, only Edit/Read/Write and Catenary
+    /// editing tools are allowed. If the agent is not in editing mode,
+    /// Edit/Write requires `start_editing` first.
+    fn handle_enforce_editing(&self, tool_name: &str, agent_id: &str) -> Option<HookResult> {
+        let agent_editing = self
             .conn
             .lock()
             .ok()
-            .and_then(|c| db::editing_files_for_agent(&c, &self.session_id, agent_id).ok())
-            .unwrap_or_default();
+            .and_then(|c| db::is_agent_editing(&c, &self.session_id, agent_id).ok())
+            .unwrap_or(false);
 
-        if !editing_files.is_empty() {
-            if is_allowed_during_editing(tool_name) || is_read_tool(tool_name) {
-                None
-            } else if is_edit_tool(tool_name) {
-                if let Some(path) = file_path {
-                    let is_managed = self
-                        .conn
-                        .lock()
-                        .ok()
-                        .and_then(|c| db::is_editing(&c, path, &self.session_id, agent_id).ok())
-                        .unwrap_or(false);
-                    if !is_managed {
-                        let file_list = editing_files.join(", ");
-                        return Some(HookResult::Deny(format!(
-                            "call start_editing for {path} before editing, \
-                             or done_editing for {file_list} first"
-                        )));
-                    }
-                }
+        if agent_editing {
+            if is_allowed_during_editing(tool_name)
+                || is_read_tool(tool_name)
+                || is_edit_tool(tool_name)
+            {
                 None
             } else {
-                let file_list = editing_files.join(", ");
-                Some(HookResult::Deny(format!(
-                    "call done_editing for {file_list} to get diagnostics"
-                )))
+                Some(HookResult::Deny(
+                    "call done_editing to get diagnostics".into(),
+                ))
             }
         } else if is_edit_tool(tool_name) {
-            let path = file_path.unwrap_or_default();
-            Some(HookResult::Deny(format!(
-                "call start_editing for {path} before editing"
-            )))
+            Some(HookResult::Deny("call start_editing before editing".into()))
         } else {
             None
         }
@@ -436,36 +413,49 @@ impl HookServer {
 
     /// LSP diagnostics for a changed file, with editing state checks.
     ///
-    /// Suppresses diagnostics when the agent is editing the file (returns
-    /// `None`). Adds a courtesy flag when another agent is editing it.
+    /// When the agent is in editing mode: accumulates edit-tool file paths
+    /// and suppresses diagnostics (returns `None`). Adds a courtesy flag
+    /// when another agent has the file in their accumulated files.
     async fn handle_diagnostics(
         &self,
         file_path: &str,
         agent_id: &str,
+        tool_name: Option<&str>,
         entry_id: i64,
     ) -> Option<HookResult> {
         // Check editing state before running diagnostics
-        let (self_editing, other_editing) = {
+        let (agent_editing, other_editing) = {
             let conn = self.conn.lock().ok();
             let self_ed = conn
                 .as_ref()
-                .and_then(|c| db::is_editing(c, file_path, &self.session_id, agent_id).ok())
+                .and_then(|c| db::is_agent_editing(c, &self.session_id, agent_id).ok())
                 .unwrap_or(false);
             let other_ed = conn
                 .as_ref()
                 .and_then(|c| {
-                    db::is_edited_by_others(c, file_path, &self.session_id, agent_id).ok()
+                    db::is_file_edited_by_others(c, file_path, &self.session_id, agent_id).ok()
                 })
                 .unwrap_or(false);
             drop(conn);
             (self_ed, other_ed)
         };
 
-        if self_editing {
+        if agent_editing {
+            // Accumulate edit-tool file paths for done_editing
+            if tool_name.is_some_and(is_edit_tool)
+                && let Ok(conn) = self.conn.lock()
+            {
+                let _ = db::add_editing_file(&conn, &self.session_id, agent_id, file_path);
+            }
             return None;
         }
 
-        match self.diagnostics.process_file(file_path, entry_id).await {
+        match self
+            .toolbox
+            .diagnostics
+            .process_file(file_path, entry_id)
+            .await
+        {
             Ok(diag_result) => {
                 if other_editing {
                     Some(HookResult::Courtesy(diag_result.content))
@@ -483,26 +473,25 @@ impl HookServer {
     /// Force `done_editing` before the agent stops.
     ///
     /// If `stop_hook_active` is true (retry), allows unconditionally.
-    /// Otherwise blocks if the agent has files in editing state.
+    /// Otherwise blocks if the agent is in editing mode.
     fn handle_require_release(&self, agent_id: &str, stop_hook_active: bool) -> Option<HookResult> {
         if stop_hook_active {
             return None;
         }
 
-        let files = self
+        let agent_editing = self
             .conn
             .lock()
             .ok()
-            .and_then(|c| db::editing_files_for_agent(&c, &self.session_id, agent_id).ok())
-            .unwrap_or_default();
+            .and_then(|c| db::is_agent_editing(&c, &self.session_id, agent_id).ok())
+            .unwrap_or(false);
 
-        if files.is_empty() {
-            None
+        if agent_editing {
+            Some(HookResult::Block(
+                "call done_editing to get diagnostics before finishing".into(),
+            ))
         } else {
-            let file_list = files.join(", ");
-            Some(HookResult::Block(format!(
-                "call done_editing for {file_list} to get diagnostics before finishing"
-            )))
+            None
         }
     }
 
@@ -839,7 +828,7 @@ mod tests {
     fn test_hook_enforce_editing_deny() {
         let server = test_server();
         // No editing state — Edit should be denied
-        let result = server.handle_enforce_editing("Edit", Some("/tmp/foo.rs"), "");
+        let result = server.handle_enforce_editing("Edit", "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny, got {result:?}");
         };
@@ -849,28 +838,28 @@ mod tests {
     #[test]
     fn test_hook_enforce_editing_allow() {
         let server = test_server();
-        // Set up editing state for the file
+        // Enter editing mode
         server
             .conn
             .lock()
             .expect("lock")
             .execute(
-                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
-                 VALUES ('/tmp/foo.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                "INSERT INTO editing_state (session_id, agent_id, started_at) \
+                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
                 [],
             )
             .expect("insert editing state");
 
-        // Edit on a managed file — should allow
-        let result = server.handle_enforce_editing("Edit", Some("/tmp/foo.rs"), "");
+        // Edit tool — should allow during editing mode
+        let result = server.handle_enforce_editing("Edit", "");
         assert!(result.is_none(), "expected allow, got {result:?}");
 
         // Read tool — always allowed during editing
-        let result = server.handle_enforce_editing("Read", Some("/tmp/bar.rs"), "");
+        let result = server.handle_enforce_editing("Read", "");
         assert!(result.is_none(), "expected allow for Read, got {result:?}");
 
         // Non-edit, non-read tool while editing — should deny
-        let result = server.handle_enforce_editing("Bash", None, "");
+        let result = server.handle_enforce_editing("Bash", "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for Bash, got {result:?}");
         };
@@ -880,13 +869,14 @@ mod tests {
     #[test]
     fn test_hook_require_release_block() {
         let server = test_server();
+        // Enter editing mode
         server
             .conn
             .lock()
             .expect("lock")
             .execute(
-                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
-                 VALUES ('/tmp/foo.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                "INSERT INTO editing_state (session_id, agent_id, started_at) \
+                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
                 [],
             )
             .expect("insert editing state");
@@ -896,7 +886,6 @@ mod tests {
             unreachable!("expected Block, got {result:?}");
         };
         assert!(reason.contains("done_editing"));
-        assert!(reason.contains("/tmp/foo.rs"));
     }
 
     #[test]
@@ -910,14 +899,14 @@ mod tests {
     #[test]
     fn test_hook_require_release_retry() {
         let server = test_server();
-        // Add editing state
+        // Enter editing mode
         server
             .conn
             .lock()
             .expect("lock")
             .execute(
-                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
-                 VALUES ('/tmp/foo.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                "INSERT INTO editing_state (session_id, agent_id, started_at) \
+                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
                 [],
             )
             .expect("insert editing state");
@@ -930,21 +919,21 @@ mod tests {
     #[test]
     fn test_hook_clear_editing() {
         let server = test_server();
-        // Insert editing state rows
+        // Enter editing mode for two agents
         {
             let c = server.conn.lock().expect("lock");
             c.execute(
-                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
-                 VALUES ('/tmp/a.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                "INSERT INTO editing_state (session_id, agent_id, started_at) \
+                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
                 [],
             )
-            .expect("insert a");
+            .expect("insert agent a");
             c.execute(
-                "INSERT INTO editing_state (file_path, session_id, agent_id, started_at) \
-                 VALUES ('/tmp/b.rs', 'test-session', '', '2026-01-01T00:00:00Z')",
+                "INSERT INTO editing_state (session_id, agent_id, started_at) \
+                 VALUES ('test-session', 'agent-b', '2026-01-01T00:00:00Z')",
                 [],
             )
-            .expect("insert b");
+            .expect("insert agent b");
         }
 
         let result = server.handle_clear_editing();
@@ -988,26 +977,37 @@ mod tests {
 
         let message_log = Arc::new(MessageLog::noop());
         let config: crate::config::Config = serde_json::from_str("{}").expect("empty config");
+
+        // Toolbox requires a tokio runtime handle for async dispatch.
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = runtime.handle().clone();
+
         let client_manager = Arc::new(crate::lsp::ClientManager::new(
             config,
             vec![],
             message_log.clone(),
         ));
         let doc_manager = Arc::new(tokio::sync::Mutex::new(
-            crate::bridge::DocumentManager::new(),
+            crate::bridge::DocumentManager::new(String::new()),
         ));
         let path_validator = Arc::new(tokio::sync::RwLock::new(crate::bridge::PathValidator::new(
             vec![],
         )));
-        let diagnostics = Arc::new(DiagnosticsServer::new(
+        let diagnostics = Arc::new(crate::bridge::DiagnosticsServer::new(
+            client_manager.clone(),
+            doc_manager.clone(),
+            path_validator,
+        ));
+        let toolbox = Arc::new(Toolbox::new(
             client_manager,
             doc_manager,
-            path_validator,
+            handle,
+            diagnostics,
         ));
         let refresh_roots = Arc::new(AtomicBool::new(false));
 
         let server = HookServer::new(
-            diagnostics,
+            toolbox,
             refresh_roots,
             message_log,
             conn,
@@ -1015,12 +1015,17 @@ mod tests {
             "test".to_string(),
         );
 
-        TestHookServer { _dir: dir, server }
+        TestHookServer {
+            _dir: dir,
+            _runtime: runtime,
+            server,
+        }
     }
 
-    /// Wrapper that keeps the tempdir alive for the lifetime of the server.
+    /// Wrapper that keeps the tempdir and runtime alive for the lifetime of the server.
     struct TestHookServer {
         _dir: tempfile::TempDir,
+        _runtime: tokio::runtime::Runtime,
         server: HookServer,
     }
 

@@ -5,8 +5,6 @@
 pub mod diagnostics_server;
 /// Manages document lifecycle and sync between disk and LSP servers.
 mod document_manager;
-/// MCP tools for per-file diagnostic batching (start_editing / done_editing).
-pub mod editing;
 /// Glob tool handler: unified file/directory/pattern browsing.
 mod file_tools;
 /// Single authority for file classification (binary, language ID, shebang).

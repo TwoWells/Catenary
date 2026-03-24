@@ -410,7 +410,13 @@ async fn run_server(args: Args) -> Result<()> {
     ));
     client_manager.spawn_all().await;
 
-    let doc_manager = Arc::new(Mutex::new(DocumentManager::new()));
+    let session_id = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .info
+        .id
+        .clone();
+    let doc_manager = Arc::new(Mutex::new(DocumentManager::new(session_id.clone())));
     let runtime = tokio::runtime::Handle::current();
 
     let current_roots = client_manager.roots().await;
@@ -419,30 +425,32 @@ async fn run_server(args: Args) -> Result<()> {
         current_roots.clone(),
     )));
 
-    // Start the hook server for PostToolUse/PreToolUse hook integration
     let diagnostics_server = Arc::new(catenary_mcp::bridge::DiagnosticsServer::new(
         client_manager.clone(),
         doc_manager.clone(),
         path_validator.clone(),
     ));
+
+    let toolbox = Arc::new(catenary_mcp::bridge::toolbox::Toolbox::new(
+        client_manager.clone(),
+        doc_manager,
+        runtime,
+        diagnostics_server,
+    ));
+
+    // Start the hook server for PostToolUse/PreToolUse hook integration
     let refresh_roots_flag = Arc::new(AtomicBool::new(false));
     let hook_conn = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .conn()
         .clone();
-    let hook_session_id = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .info
-        .id
-        .clone();
     let hook_server = catenary_mcp::hook::HookServer::new(
-        diagnostics_server.clone(),
+        toolbox.clone(),
         refresh_roots_flag.clone(),
         message_log.clone(),
         hook_conn,
-        hook_session_id,
+        session_id,
         "host".to_string(),
     );
     let socket_path = session
@@ -455,19 +463,7 @@ async fn run_server(args: Args) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .set_socket_active();
 
-    let session_id = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .info
-        .id
-        .clone();
-    let handler = LspBridgeHandler::new(
-        client_manager.clone(),
-        doc_manager,
-        runtime,
-        diagnostics_server,
-        Some(session_id),
-    );
+    let handler = LspBridgeHandler::new(toolbox);
 
     // Run MCP server (blocking - reads from stdin)
     let session_for_callback = session.clone();

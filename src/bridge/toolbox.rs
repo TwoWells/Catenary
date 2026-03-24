@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 
 use super::DocumentManager;
 use super::diagnostics_server::DiagnosticsServer;
-use super::editing::EditingServer;
 use super::file_tools::GlobServer;
 use super::filesystem_manager::FilesystemManager;
 use super::grep_server::GrepServer;
@@ -30,11 +29,11 @@ pub struct Toolbox {
     pub grep: GrepServer,
     /// Glob tool server.
     pub glob: GlobServer,
-    /// Per-file diagnostic batching (`start_editing` / `done_editing`).
-    pub editing: EditingServer,
+    /// Diagnostics pipeline for `PostToolUse` hook requests.
+    pub diagnostics: Arc<DiagnosticsServer>,
     /// Shared LSP client manager.
     pub client_manager: Arc<ClientManager>,
-    /// Shared document manager.
+    /// Shared document manager (also owns editing mode lifecycle).
     pub doc_manager: Arc<Mutex<DocumentManager>>,
     /// Tokio runtime handle for blocking dispatch.
     pub runtime: Handle,
@@ -49,11 +48,9 @@ impl Toolbox {
         doc_manager: Arc<Mutex<DocumentManager>>,
         runtime: Handle,
         diagnostics: Arc<DiagnosticsServer>,
-        session_id: Option<String>,
     ) -> Self {
         let fs_manager = Arc::new(FilesystemManager::new());
         let notified_offline = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        let editing = EditingServer::new(diagnostics, session_id.unwrap_or_default());
         let grep = GrepServer {
             client_manager: client_manager.clone(),
             doc_manager: doc_manager.clone(),
@@ -69,7 +66,7 @@ impl Toolbox {
         Self {
             grep,
             glob,
-            editing,
+            diagnostics,
             client_manager,
             doc_manager,
             runtime,

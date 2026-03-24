@@ -9,6 +9,7 @@ use tokio::fs;
 use tracing::{debug, trace};
 
 use super::filesystem_manager::detect_language_id;
+use crate::db;
 
 /// Tracks the state of an open document.
 struct OpenDocument {
@@ -22,22 +23,22 @@ struct OpenDocument {
 /// The LSP protocol requires documents to be explicitly opened before
 /// most operations. This manager handles opening documents on first
 /// access, tracking their versions, and detecting changes on disk.
+///
+/// Also owns the editing mode lifecycle (`start_editing` / `finish_editing`).
+/// In v1, these are thin `SQLite` wrappers. In waitv2, they will manage
+/// `didOpen`/`didChange`/`didSave`/`didClose` directly.
 pub struct DocumentManager {
     documents: HashMap<PathBuf, OpenDocument>,
-}
-
-impl Default for DocumentManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    session_id: String,
 }
 
 impl DocumentManager {
-    /// Creates a new, empty `DocumentManager`.
+    /// Creates a new, empty `DocumentManager` for the given session.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(session_id: String) -> Self {
         Self {
             documents: HashMap::new(),
+            session_id,
         }
     }
 
@@ -198,6 +199,55 @@ impl DocumentManager {
             })
         }
     }
+    // ── Editing mode lifecycle ────────────────────────────────────────────
+
+    /// Enters editing mode. Diagnostics are suppressed until
+    /// [`finish_editing`](Self::finish_editing) is called.
+    ///
+    /// Returns `Ok(true)` if editing mode was entered, `Ok(false)` if
+    /// already in editing mode (no-op).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn start_editing(&self, agent_id: &str) -> Result<bool> {
+        let conn = db::open()?;
+        db::start_editing(&conn, &self.session_id, agent_id)
+    }
+
+    /// Exits editing mode and returns accumulated file paths. The caller
+    /// is responsible for running diagnostics on the returned files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent is not in editing mode or a database
+    /// operation fails.
+    pub fn finish_editing(&self, agent_id: &str) -> Result<Vec<String>> {
+        let conn = db::open()?;
+        let files = db::drain_editing_files(&conn, &self.session_id, agent_id)?;
+        db::done_editing(&conn, &self.session_id, agent_id)?;
+        Ok(files)
+    }
+
+    /// Checks if an agent is in editing mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn is_agent_editing(&self, agent_id: &str) -> Result<bool> {
+        let conn = db::open()?;
+        db::is_agent_editing(&conn, &self.session_id, agent_id)
+    }
+
+    /// Accumulates a modified file path during editing mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn add_editing_file(&self, agent_id: &str, file_path: &str) -> Result<()> {
+        let conn = db::open()?;
+        db::add_editing_file(&conn, &self.session_id, agent_id, file_path)
+    }
 }
 
 /// Notification to send to the LSP server.
@@ -243,7 +293,7 @@ mod tests {
         let mut file = NamedTempFile::with_suffix(".rs")?;
         writeln!(file, "fn main() {{}}")?;
 
-        let mut manager = DocumentManager::new();
+        let mut manager = DocumentManager::new(String::new());
         let notification = manager.ensure_open(file.path()).await?;
 
         assert!(notification.is_some());
@@ -268,7 +318,7 @@ mod tests {
         let mut file = NamedTempFile::with_suffix(".py")?;
         writeln!(file, "print('hello')")?;
 
-        let mut manager = DocumentManager::new();
+        let mut manager = DocumentManager::new(String::new());
 
         // First open
         let notification1 = manager.ensure_open(file.path()).await?;
@@ -286,7 +336,7 @@ mod tests {
         let path = file.path().to_path_buf();
         std::fs::write(&path, "const x = 1;")?;
 
-        let mut manager = DocumentManager::new();
+        let mut manager = DocumentManager::new(String::new());
 
         // First open
         let notification1 = manager.ensure_open(&path).await?;
@@ -313,7 +363,7 @@ mod tests {
         let mut file = NamedTempFile::with_suffix(".go")?;
         writeln!(file, "package main")?;
 
-        let mut manager = DocumentManager::new();
+        let mut manager = DocumentManager::new(String::new());
         manager.ensure_open(file.path()).await?;
 
         let close_params = manager.close(file.path())?;

@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::diagnostics_server::DiagnosticsServer;
 use super::tool_server::ToolServer;
 use super::toolbox::Toolbox;
 use crate::lsp::ClientManager;
@@ -117,25 +116,13 @@ pub(super) async fn check_server_health(
 /// Bridge handler that implements MCP `ToolHandler` trait.
 /// Handles MCP tool calls by routing them to the appropriate LSP server.
 pub struct LspBridgeHandler {
-    toolbox: Toolbox,
+    toolbox: Arc<Toolbox>,
 }
 
 impl LspBridgeHandler {
-    /// Creates a new `LspBridgeHandler` wrapping a `Toolbox`.
-    pub fn new(
-        client_manager: Arc<ClientManager>,
-        doc_manager: Arc<tokio::sync::Mutex<super::DocumentManager>>,
-        runtime: tokio::runtime::Handle,
-        diagnostics: Arc<DiagnosticsServer>,
-        session_id: Option<String>,
-    ) -> Self {
-        let toolbox = Toolbox::new(
-            client_manager,
-            doc_manager,
-            runtime,
-            diagnostics,
-            session_id,
-        );
+    /// Creates a new `LspBridgeHandler` wrapping a shared `Toolbox`.
+    #[must_use]
+    pub const fn new(toolbox: Arc<Toolbox>) -> Self {
         Self { toolbox }
     }
 }
@@ -230,16 +217,10 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "start_editing".to_string(),
-                description: Some("Signal that you intend to make multiple edits to a file. Diagnostics are suppressed until done_editing is called. Call this before using Edit on a file.".to_string()),
+                description: Some("Enter editing mode. Diagnostics are suppressed on all subsequent Edit/Write calls until done_editing is called. Call this before using Edit.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {
-                        "file": {
-                            "type": "string",
-                            "description": "File path to start editing"
-                        }
-                    },
-                    "required": ["file"]
+                    "properties": {},
                 }),
                 annotations: Some(serde_json::json!({
                     "readOnlyHint": false,
@@ -250,16 +231,10 @@ impl ToolHandler for LspBridgeHandler {
             },
             Tool {
                 name: "done_editing".to_string(),
-                description: Some("Signal that you are finished editing a file. Returns LSP diagnostics for the final state. Must be called after start_editing before using non-Edit tools.".to_string()),
+                description: Some("Exit editing mode and return LSP diagnostics for all modified files. Must be called after start_editing before using non-Edit tools.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {
-                        "file": {
-                            "type": "string",
-                            "description": "File path to finish editing"
-                        }
-                    },
-                    "required": ["file"]
+                    "properties": {},
                 }),
                 annotations: Some(serde_json::json!({
                     "readOnlyHint": true,
@@ -278,29 +253,46 @@ impl ToolHandler for LspBridgeHandler {
         parent_id: Option<i64>,
     ) -> Result<CallToolResult> {
         // Editing tools: early dispatch, no LSP readiness wait.
-        // start_editing is db-only; done_editing delegates to DiagnosticsServer.
-        if name == "start_editing" || name == "done_editing" {
-            let file = arguments
-                .as_ref()
-                .and_then(|v| v.get("file"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("{name} requires a 'file' parameter"))?;
-
-            let roots = self
-                .toolbox
-                .runtime
-                .block_on(self.toolbox.client_manager.roots());
-
-            let result = if name == "start_editing" {
-                self.toolbox.editing.start_editing(file, &roots)
-            } else {
-                self.toolbox
+        // start_editing is db-only; done_editing drains files and runs diagnostics.
+        if name == "start_editing" {
+            let result = {
+                let doc_manager = self
+                    .toolbox
                     .runtime
-                    .block_on(self.toolbox.editing.done_editing(file, &roots))
+                    .block_on(self.toolbox.doc_manager.lock());
+                doc_manager.start_editing("")
             };
-
             return match result {
-                Ok(text) => Ok(CallToolResult::text(text)),
+                Ok(true) => Ok(CallToolResult::text(
+                    "editing mode \u{2014} diagnostics deferred until done_editing",
+                )),
+                Ok(false) => Ok(CallToolResult::text("already in editing mode")),
+                Err(e) => Ok(CallToolResult::error(e.to_string())),
+            };
+        }
+
+        if name == "done_editing" {
+            let files = {
+                let doc_manager = self
+                    .toolbox
+                    .runtime
+                    .block_on(self.toolbox.doc_manager.lock());
+                doc_manager.finish_editing("")
+            };
+            return match files {
+                Ok(files) => {
+                    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+                    let entry_id = parent_id.unwrap_or(0);
+                    let output = self
+                        .toolbox
+                        .runtime
+                        .block_on(self.toolbox.diagnostics.process_files(&file_refs, entry_id));
+                    if output.is_empty() {
+                        Ok(CallToolResult::text("done editing [clean]"))
+                    } else {
+                        Ok(CallToolResult::text(format!("done editing\n{output}")))
+                    }
+                }
                 Err(e) => Ok(CallToolResult::error(e.to_string())),
             };
         }

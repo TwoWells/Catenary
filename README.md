@@ -18,33 +18,26 @@ Internal planning and tracking for the Catenary project.
 | 10 | [Collapse](#10-collapse) | **Complete** | `tickets/collapse/README.md` |
 | 11 | [Replace](#11-replace) | **Removed** | `tickets/replace/README.md` |
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
-| 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 complete** | `tickets/acquire/DESIGN.md` |
+| 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 followup complete** | `tickets/acquire/DESIGN.md` |
 | 14 | [Recommend](#14-recommend) | **Design complete** | `tickets/recommend/DESIGN.md` |
 | 15 | [Management](#15-management) | **Ready** | `tickets/management/README.md` |
 
 ## Current priority
 
-**1. Workstream 13 (Acquire) v1 followup (04).** Stateless editing
-API. The per-file `start_editing`/`done_editing` creates ordering
-dependencies — sequential `done_editing` calls diagnose against
-partially-saved workspace state. Stateless API (no file paths)
-batches all saves before diagnosing. Recurring issue in every
-multi-file editing session.
-
-**2. Workstream 15 (Management).** 5 tickets (00–04). 00 done.
+**1. Workstream 15 (Management).** 5 tickets (00–04). 00 done.
 `FilesystemManager` (done), `LspClientManager` (absorbs
 `DocumentManager`), `get_client(path)`, `inherit` config model,
 root resolution. Unblocks misc 28.
 
-**3. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
+**2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
 Unblocks `didChangeConfiguration` dynamic registration for misc 28.
 Just 1b-00 — the rest of the 1b pipeline follows after misc 28.
 
-**4. Misc 28 (multi-root / workspace folders).** Per-root instances
+**3. Misc 28 (multi-root / workspace folders).** Per-root instances
 for legacy servers, routing, two-tier configuration model (`scopeUri`
 resolution). Blocked on workstream 15 and 1b-00. Subsumes misc 13.
 
-**5. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
+**4. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
 tickets (1b-01 through 1b-08, including 02a/02b split). Critical
 path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
 (OnceLock), 05 (dm utils). Full design:
@@ -301,22 +294,24 @@ Design: `tickets/summarize/DESIGN.md`. Tracker: `tickets/summarize/README.md`.
 
 **Status: v1 complete.** v2 blocked on waitv2 1b.
 
-Per-file diagnostic suppression via `start_editing`/`done_editing`
-MCP tools. The agent signals intent to edit a file; diagnostics are
-deferred until the agent signals completion. No mutual exclusion —
-multiple agents can edit the same file simultaneously. Courtesy
-messages inform other agents when a file's diagnostics are deferred.
-Forced adoption via PreToolUse deny (Edit requires `start_editing`).
-Stop/AfterAgent hooks force `done_editing` before the agent can
-finish responding. Per-agent scoping via `(session_id, agent_id)`.
-SessionStart clears stale state. Replace tool (workstream 11)
-removed in v1 followup (acquire 03).
+Diagnostic suppression via `start_editing`/`done_editing` MCP tools.
+Stateless API — both tools take no file arguments. `start_editing`
+enters editing mode; diagnostics are suppressed and modified file
+paths accumulated by PostToolUse hooks. `done_editing` drains all
+accumulated files and returns batch diagnostics. Forced adoption via
+PreToolUse deny (Edit requires `start_editing`). Stop/AfterAgent
+hooks force `done_editing` before the agent can finish responding.
+Per-agent scoping via `(session_id, agent_id)`. SessionStart clears
+stale state. Replace tool (workstream 11) removed in v1 followup
+(acquire 03). Editing lifecycle methods live on `DocumentManager`
+to support future waitv2 integration.
 
 Two phases:
-- **v1 (cold release) — complete.** Editing state table, MCP tools,
-  PreToolUse deny, PostToolUse suppression, Stop/AfterAgent
-  enforcement. No LSP traffic during editing. `done_editing` calls
-  existing `DiagnosticsServer` unchanged.
+- **v1 (cold release) — complete.** Stateless editing mode flag,
+  file accumulation in `editing_files` table, batch diagnostics via
+  `DiagnosticsServer::process_files`. `EditingServer` removed;
+  `Toolbox` holds `Arc<DiagnosticsServer>` shared between
+  `LspBridgeHandler` and `HookServer`.
 - **v2 (warm state, after waitv2 1b):** `didOpen` on `start_editing`,
   `didChange` per edit, `done_editing` enters pipeline at `didSave`.
   Requires 1b infrastructure (composable pipeline,
