@@ -23,12 +23,21 @@ Internal planning and tracking for the Catenary project.
 
 ## Current priority
 
-**1. Workstream 7 (Wait model v2) Phase 1b.** Pipeline design
-finalized: `tickets/waitv2/design/pipeline_1b.md`. 10 tickets
-(1b-00 through 1b-08, including 02a/02b split). Critical path:
-01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 00 (capability
-gates), 04 (OnceLock), 05 (dm utils). Collapse workstream complete
-— 1b ordering dependency satisfied.
+**1. Misc 09 (mid-session server spawn).** Self-contained bug fix,
+no dependencies. Workspace-wide tools miss new file types added
+mid-session.
+
+**2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
+Unblocks `didChangeConfiguration` dynamic registration for misc 28.
+Full 1b pipeline design: `tickets/waitv2/design/pipeline_1b.md`.
+10 tickets (1b-00 through 1b-08, including 02a/02b split). Critical
+path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 00
+(capability gates), 04 (OnceLock), 05 (dm utils). Collapse
+workstream complete — 1b ordering dependency satisfied.
+
+**3. Misc 28 (multi-root / workspace folders).** Per-root instances
+for legacy servers, routing, two-tier configuration model (`scopeUri`
+resolution). Blocked on 1b-00. Subsumes misc 13.
 
 **Lower priority:**
 
