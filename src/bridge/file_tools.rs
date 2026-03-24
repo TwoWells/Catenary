@@ -356,6 +356,10 @@ impl GlobServer {
             return Ok(CallToolResult::text("No matches found"));
         }
 
+        // Ensure servers exist for any new languages in matched files
+        self.runtime
+            .block_on(self.client_manager.ensure_clients_for_paths(&matched_files));
+
         let mut result = String::new();
         for path in &matched_files {
             let display = path.to_string_lossy();

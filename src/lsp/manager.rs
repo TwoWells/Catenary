@@ -315,6 +315,52 @@ impl ClientManager {
         self.get_client(ext).await
     }
 
+    /// Spawns LSP servers for new languages detected in the given file paths.
+    ///
+    /// Used by workspace-wide tools (grep, glob, replace) to discover
+    /// languages added mid-session. For each path, determines the config
+    /// key via filename/extension mapping. Only spawns servers for
+    /// configured languages not already active. Servers that fail to spawn
+    /// are logged and skipped.
+    pub async fn ensure_clients_for_paths(&self, paths: &[PathBuf]) {
+        let configured_keys: HashSet<&str> =
+            self.config.server.keys().map(String::as_str).collect();
+
+        let mut to_spawn: HashSet<String> = HashSet::new();
+
+        {
+            let active = self.clients.lock().await;
+            for path in paths {
+                let key = config_key_for_path(path).map(str::to_string).or_else(|| {
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .map(str::to_string)
+                });
+
+                if let Some(key) = key
+                    && configured_keys.contains(key.as_str())
+                    && !active.contains_key(&key)
+                {
+                    to_spawn.insert(key);
+                }
+            }
+        }
+
+        if to_spawn.is_empty() {
+            return;
+        }
+
+        let mut sorted: Vec<&str> = to_spawn.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        info!("Mid-session server spawn for: {}", sorted.join(", "));
+
+        for lang in &to_spawn {
+            if let Err(e) = self.get_client(lang).await {
+                warn!("Failed to spawn LSP server for {lang}: {e}");
+            }
+        }
+    }
+
     /// Returns a snapshot of all clients (including dead ones).
     pub async fn clients(&self) -> HashMap<String, Arc<Mutex<LspClient>>> {
         self.clients.lock().await.clone()
@@ -437,6 +483,26 @@ pub fn detect_workspace_languages(
     }
 
     detected
+}
+
+/// Maps a file path to its language config key.
+///
+/// Tries filename-based detection first, then extension-based via
+/// [`extension_to_config_key`]. Returns `None` if no mapping exists —
+/// callers that need a fallback can try the raw file extension as a
+/// direct config key.
+fn config_key_for_path(path: &Path) -> Option<&'static str> {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        match name {
+            "Dockerfile" => return Some("dockerfile"),
+            "Makefile" => return Some("makefile"),
+            "CMakeLists.txt" => return Some("cmake"),
+            _ => {}
+        }
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .and_then(extension_to_config_key)
 }
 
 /// Maps a file extension to the language config key used in
@@ -749,5 +815,98 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clients_for_paths_spawns_new_language() -> Result<()> {
+        let manager = ClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_message_log(),
+        );
+
+        assert!(manager.clients().await.is_empty());
+
+        // A file with the mock language extension triggers a spawn
+        let paths = vec![PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"))];
+        manager.ensure_clients_for_paths(&paths).await;
+
+        assert!(
+            manager.clients().await.contains_key(MOCK_LANG_A),
+            "ensure_clients_for_paths should spawn the mock language server"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clients_for_paths_skips_existing() -> Result<()> {
+        let manager = ClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_message_log(),
+        );
+
+        // Pre-spawn the server
+        let _ = manager.get_client(MOCK_LANG_A).await?;
+        assert_eq!(manager.clients().await.len(), 1);
+
+        // ensure_clients_for_paths should not fail or double-spawn
+        let paths = vec![PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"))];
+        manager.ensure_clients_for_paths(&paths).await;
+
+        assert_eq!(
+            manager.clients().await.len(),
+            1,
+            "should not create a duplicate client"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clients_for_paths_ignores_unconfigured() -> Result<()> {
+        let manager = ClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_message_log(),
+        );
+
+        // .xyz has no configured server — should be silently skipped
+        let paths = vec![PathBuf::from("/tmp/test.xyz")];
+        manager.ensure_clients_for_paths(&paths).await;
+
+        assert!(
+            manager.clients().await.is_empty(),
+            "unconfigured languages should not trigger a spawn"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_key_for_path_known_extensions() {
+        assert_eq!(config_key_for_path(Path::new("main.rs")), Some("rust"));
+        assert_eq!(
+            config_key_for_path(Path::new("index.ts")),
+            Some("typescript")
+        );
+        assert_eq!(config_key_for_path(Path::new("lib.c")), Some("c"));
+    }
+
+    #[test]
+    fn test_config_key_for_path_filenames() {
+        assert_eq!(
+            config_key_for_path(Path::new("Dockerfile")),
+            Some("dockerfile")
+        );
+        assert_eq!(config_key_for_path(Path::new("Makefile")), Some("makefile"));
+        assert_eq!(
+            config_key_for_path(Path::new("CMakeLists.txt")),
+            Some("cmake")
+        );
+    }
+
+    #[test]
+    fn test_config_key_for_path_unknown() {
+        assert_eq!(config_key_for_path(Path::new("test.xyz")), None);
+        assert_eq!(config_key_for_path(Path::new("no_extension")), None);
     }
 }

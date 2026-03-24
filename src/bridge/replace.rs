@@ -1021,6 +1021,12 @@ impl ToolServer for ReplaceServer {
             }
         }
 
+        // Ensure servers exist for any new languages in modified files.
+        let replace_paths: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
+        self.client_manager
+            .ensure_clients_for_paths(&replace_paths)
+            .await;
+
         // Collect diagnostics for all modified files (best-effort).
         let modified_paths: Vec<String> = results
             .iter()

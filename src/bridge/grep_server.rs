@@ -152,6 +152,11 @@ impl GrepServer {
             fs_cache,
         )?;
 
+        // 1b. Ensure servers exist for any new languages in matched files
+        let rg_paths: Vec<PathBuf> = rg.file_lines.keys().map(PathBuf::from).collect();
+        self.runtime
+            .block_on(self.client_manager.ensure_clients_for_paths(&rg_paths));
+
         // 2. Symbol universe: workspace/symbol("") + regex filter, with rg fallback
         let mut symbols = self.runtime.block_on(async {
             let clients = self.client_manager.clients().await;
