@@ -18,7 +18,6 @@ use super::editing::EditingServer;
 use super::file_tools::GlobServer;
 use super::filesystem_manager::FilesystemManager;
 use super::grep_server::GrepServer;
-use super::replace::ReplaceServer;
 use crate::lsp::ClientManager;
 
 /// Shared container for tool servers and cross-tool infrastructure.
@@ -31,8 +30,6 @@ pub struct Toolbox {
     pub grep: GrepServer,
     /// Glob tool server.
     pub glob: GlobServer,
-    /// Batch replacement tool with snapshots and diagnostics.
-    pub replace: ReplaceServer,
     /// Per-file diagnostic batching (`start_editing` / `done_editing`).
     pub editing: EditingServer,
     /// Shared LSP client manager.
@@ -56,15 +53,7 @@ impl Toolbox {
     ) -> Self {
         let fs_manager = Arc::new(FilesystemManager::new());
         let notified_offline = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        let editing =
-            EditingServer::new(diagnostics.clone(), session_id.clone().unwrap_or_default());
-        let replace = ReplaceServer::new(
-            client_manager.clone(),
-            doc_manager.clone(),
-            diagnostics,
-            runtime.clone(),
-            session_id,
-        );
+        let editing = EditingServer::new(diagnostics, session_id.unwrap_or_default());
         let grep = GrepServer {
             client_manager: client_manager.clone(),
             doc_manager: doc_manager.clone(),
@@ -80,7 +69,6 @@ impl Toolbox {
         Self {
             grep,
             glob,
-            replace,
             editing,
             client_manager,
             doc_manager,

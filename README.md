@@ -16,7 +16,7 @@ Internal planning and tracking for the Catenary project.
 | 8 | [Monitoring](#8-monitoring) | **Complete** | `tickets/monitoring/README.md` |
 | 9 | [Filtering](#9-filtering) | **Design complete** | `tickets/filtering/DESIGN.md` |
 | 10 | [Collapse](#10-collapse) | **Complete** | `tickets/collapse/README.md` |
-| 11 | [Replace](#11-replace) | **Removal ready** | `tickets/replace/README.md` |
+| 11 | [Replace](#11-replace) | **Removed** | `tickets/replace/README.md` |
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
 | 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 complete** | `tickets/acquire/DESIGN.md` |
 | 14 | [Recommend](#14-recommend) | **Design complete** | `tickets/recommend/DESIGN.md` |
@@ -24,20 +24,27 @@ Internal planning and tracking for the Catenary project.
 
 ## Current priority
 
-**1. Workstream 15 (Management).** 5 tickets (00–04).
-`FilesystemCache` → `FilesystemManager`, `ClientManager` →
-`LspClientManager` (absorbs `DocumentManager`), `get_client(path)`,
-`inherit` config model, root resolution. Unblocks misc 28.
+**1. Workstream 13 (Acquire) v1 followup (04).** Stateless editing
+API. The per-file `start_editing`/`done_editing` creates ordering
+dependencies — sequential `done_editing` calls diagnose against
+partially-saved workspace state. Stateless API (no file paths)
+batches all saves before diagnosing. Recurring issue in every
+multi-file editing session.
 
-**2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
+**2. Workstream 15 (Management).** 5 tickets (00–04). 00 done.
+`FilesystemManager` (done), `LspClientManager` (absorbs
+`DocumentManager`), `get_client(path)`, `inherit` config model,
+root resolution. Unblocks misc 28.
+
+**3. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
 Unblocks `didChangeConfiguration` dynamic registration for misc 28.
 Just 1b-00 — the rest of the 1b pipeline follows after misc 28.
 
-**3. Misc 28 (multi-root / workspace folders).** Per-root instances
+**4. Misc 28 (multi-root / workspace folders).** Per-root instances
 for legacy servers, routing, two-tier configuration model (`scopeUri`
 resolution). Blocked on workstream 15 and 1b-00. Subsumes misc 13.
 
-**4. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
+**5. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
 tickets (1b-01 through 1b-08, including 02a/02b split). Critical
 path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
 (OnceLock), 05 (dm utils). Full design:
@@ -45,10 +52,8 @@ path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
 
 **Lower priority:**
 
-- **Workstream 13 (Diagnostic batching) v1 complete.** v2 (warm
-  state) blocked on waitv2 1b infrastructure.
-- **Workstream 11 (Replace) removal ready.** Dead code cleanup.
-  Doesn't unlock anything.
+- **Workstream 13 (Acquire) v2 (warm state).** Blocked on waitv2
+  1b infrastructure.
 - **Workstream 4 (SEARCHv2) stale.** Ticket 00 complete. Design
   predates collapse (workstream 10), `ToolServer` trait, and
   async conversion (misc 30). Tickets 01+ need review against
@@ -249,25 +254,20 @@ Tracker: `tickets/collapse/README.md`.
 
 ## 11. Replace
 
-**Status: Removal ready.** All 6 tickets (00a-00c, 01-03) landed
-and shipped. Acquire v1 complete — `ReplaceServer`, MCP tool,
-snapshots table, `catenary restore`, and sidecar logic to be removed.
+**Status: Removed.** All 6 tickets (00a-00c, 01-03) landed and
+shipped, then removed in acquire 03. `ReplaceServer`, MCP tool,
+`snapshots` table, `catenary restore`, and sidecar logic deleted.
 
-Batch edit MCP tool. Accepted a glob pattern and a list of
-`{old, new, flags}` edit operations. Applied all edits in one tool
-call, created a snapshot before modification, returned consolidated
-LSP diagnostics after all edits landed. `catenary restore` CLI for
-point-in-time file recovery.
+Was a batch edit MCP tool that accepted a glob pattern and a list
+of `{old, new, flags}` edit operations. Applied all edits in one
+tool call, created a snapshot before modification, returned
+consolidated LSP diagnostics after all edits landed.
 
 The tool solved the diagnostic firehose problem but required
 voluntary adoption — agents never used it because they prefer the
 host's Edit tool (trained behavior). Acquire/release (workstream 13)
 solves the same problem by working with the agent's training:
 the agent uses Edit, the hook system manages diagnostic timing.
-
-The `ReplaceServer`, MCP tool registration, snapshot infrastructure
-(`snapshots` table, `catenary restore`, sidecar logic), and all
-related code are removed in workstream 13.
 
 Design: `designs/REPLACE.md` (superseded by `designs/ACQUIRE.md`).
 Tracker: `tickets/replace/README.md`.
@@ -309,8 +309,8 @@ messages inform other agents when a file's diagnostics are deferred.
 Forced adoption via PreToolUse deny (Edit requires `start_editing`).
 Stop/AfterAgent hooks force `done_editing` before the agent can
 finish responding. Per-agent scoping via `(session_id, agent_id)`.
-SessionStart clears stale state. Supersedes the replace MCP tool
-(workstream 11).
+SessionStart clears stale state. Replace tool (workstream 11)
+removed in v1 followup (acquire 03).
 
 Two phases:
 - **v1 (cold release) — complete.** Editing state table, MCP tools,

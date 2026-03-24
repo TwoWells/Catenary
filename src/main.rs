@@ -158,24 +158,6 @@ enum Command {
         /// Delete all data for a specific session.
         #[arg(long)]
         session: Option<String>,
-
-        /// Remove sidecar files for all restore snapshots.
-        #[arg(long)]
-        sidecars: bool,
-    },
-
-    /// Restore a file to a previous snapshot.
-    Restore {
-        /// File to restore (most recent snapshot).
-        file: Option<String>,
-
-        /// List snapshots instead of restoring.
-        #[arg(long)]
-        list: bool,
-
-        /// Restore to a specific snapshot ID.
-        #[arg(long)]
-        id: Option<i64>,
     },
 }
 
@@ -300,32 +282,9 @@ async fn main() -> Result<()> {
             older_than,
             dead,
             session,
-            sidecars,
         }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
-            cli::commands::run_gc(
-                &conn,
-                older_than.as_deref(),
-                dead,
-                session.as_deref(),
-                sidecars,
-            )
-        }
-        Some(Command::Restore { file, list, id }) => {
-            let conn = catenary_mcp::db::open_and_migrate()?;
-            let output = if list {
-                catenary_mcp::restore::list_snapshots(&conn, file.as_deref())?
-            } else if let Some(id) = id {
-                catenary_mcp::restore::restore_by_id(&conn, id)?
-            } else if let Some(ref file) = file {
-                catenary_mcp::restore::restore_most_recent(&conn, file)?
-            } else {
-                anyhow::bail!(
-                    "usage: catenary restore <file> | catenary restore --id=N | catenary restore --list"
-                );
-            };
-            println!("{output}");
-            Ok(())
+            cli::commands::run_gc(&conn, older_than.as_deref(), dead, session.as_deref())
         }
     }
 }

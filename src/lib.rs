@@ -26,8 +26,6 @@ pub mod install;
 pub mod lsp;
 /// MCP server implementation and type definitions.
 pub mod mcp;
-/// Point-in-time file recovery from snapshots.
-pub mod restore;
 /// Session management and event broadcasting.
 pub mod session;
 /// Interactive TUI for session browsing and event tailing.

@@ -254,21 +254,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
              grammar     TEXT NOT NULL REFERENCES grammars(scope)
          );
 
-         CREATE TABLE IF NOT EXISTS snapshots (
-             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-             file_path   TEXT NOT NULL,
-             content     BLOB NOT NULL,
-             source      TEXT NOT NULL,
-             pattern     TEXT,
-             replacement TEXT,
-             count       INTEGER,
-             created_at  TEXT NOT NULL,
-             session_id  TEXT
-         );
-
-         CREATE INDEX IF NOT EXISTS idx_snapshots_file
-             ON snapshots(file_path, id DESC);
-
          CREATE TABLE IF NOT EXISTS editing_state (
              file_path   TEXT NOT NULL,
              session_id  TEXT NOT NULL,
@@ -286,8 +271,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
 /// Migrates the database from schema version 1 to 2.
 ///
-/// Adds grammar registry, symbol index, file parse state, and snapshot tables
-/// for the `SEARCHv2` and sed features.
+/// Adds grammar registry, symbol index, and file parse state tables
+/// for the `SEARCHv2` feature.
 ///
 /// # Errors
 ///
@@ -323,21 +308,6 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
              mtime_ns    INTEGER NOT NULL,
              grammar     TEXT NOT NULL REFERENCES grammars(scope)
          );
-
-         CREATE TABLE snapshots (
-             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-             file_path   TEXT NOT NULL,
-             content     BLOB NOT NULL,
-             source      TEXT NOT NULL,
-             pattern     TEXT,
-             replacement TEXT,
-             count       INTEGER,
-             created_at  TEXT NOT NULL,
-             session_id  TEXT
-         );
-
-         CREATE INDEX idx_snapshots_file
-             ON snapshots(file_path, id DESC);
 
          UPDATE meta SET value = '2' WHERE key = 'schema_version';
 
@@ -662,7 +632,6 @@ mod tests {
             "grammars",
             "symbols",
             "file_parse_state",
-            "snapshots",
             "editing_state",
         ];
 
@@ -741,7 +710,7 @@ mod tests {
 
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
-        for table in &["grammars", "symbols", "file_parse_state", "snapshots"] {
+        for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
                 table_exists(&conn, table),
                 "table '{table}' should exist after migration"
@@ -908,46 +877,6 @@ mod tests {
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
-    fn test_snapshots_insert_and_query() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        let content = b"fn main() {\n    println!(\"hello\");\n}\n";
-
-        conn.execute(
-            "INSERT INTO snapshots (file_path, content, source, pattern, replacement, count, created_at, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                "src/main.rs",
-                content.as_slice(),
-                "sed",
-                "println!",
-                "eprintln!",
-                1,
-                "2026-03-07T12:00:00Z",
-                None::<String>,
-            ],
-        )
-        .expect("failed to insert snapshot");
-
-        let (id, file_path, stored_content, source): (i64, String, Vec<u8>, String) = conn
-            .query_row(
-                "SELECT id, file_path, content, source FROM snapshots WHERE file_path = ?1 ORDER BY id DESC LIMIT 1",
-                ["src/main.rs"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("failed to query snapshot");
-
-        assert!(id > 0, "snapshot id should be positive");
-        assert_eq!(file_path, "src/main.rs");
-        assert_eq!(stored_content, content);
-        assert_eq!(source, "sed");
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
     fn test_migration_v1_to_v2() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let path = dir.path().join("test.db");
@@ -979,7 +908,7 @@ mod tests {
         let version = current_schema_version(&conn).expect("failed to read schema version");
         assert_eq!(version, 5, "schema version should be 5 after migration");
 
-        for table in &["grammars", "symbols", "file_parse_state", "snapshots"] {
+        for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
                 table_exists(&conn, table),
                 "table '{table}' should exist after v1→v2 migration"

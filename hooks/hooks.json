@@ -38,17 +38,7 @@
     ],
     "AfterTool": [
       {
-        "matcher": "read_file|write_file|replace",
-        "hooks": [
-          {
-            "name": "catenary-notify",
-            "type": "command",
-            "command": "catenary hook post-tool --format=gemini"
-          }
-        ]
-      },
-      {
-        "matcher": "run_shell_command(catenary restore *)",
+        "matcher": "read_file|write_file",
         "hooks": [
           {
             "name": "catenary-notify",

@@ -17,8 +17,6 @@ mod grep_server;
 mod handler;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
-/// Replace tool core: input parsing, edit application, output rendering.
-pub mod replace;
 /// Shared symbol types and helpers for handler and file_tools.
 mod symbols;
 /// Transformation layer trait between protocol boundaries and LSP.

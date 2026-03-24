@@ -268,43 +268,6 @@ impl ToolHandler for LspBridgeHandler {
                     "openWorldHint": false
                 })),
             },
-            Tool {
-                name: "replace".to_string(),
-                description: Some("Batch replacement across one or more files.\n\nGLOB (required)\n  File path or glob pattern.\n    src/main.rs          single file\n    src/**/*.rs          all Rust files under src/\n    **/*.md              all markdown files\n\n  Directory paths are not accepted \u{2014} use a glob pattern to match\n  files in a directory (e.g., src/bridge/*.rs).\n\nEDITS (required)\n  Array of {old, new, flags?} replacements applied sequentially.\n\n  old      text to find (literal or regex)\n  new      replacement text ($1, $2, ${name} in regex mode)\n  flags    optional:\n             g  replace all occurrences\n             r  treat old as regex, new supports capture groups\n             i  case insensitive (implies r)\n             m  multiline (implies r)\n             s  dotall (implies r)\n\n  No flags = literal match, first occurrence only (same as Edit).\n\n  Examples:\n    { old: \"OldType\", new: \"NewType\", flags: \"g\" }\n    { old: \"use crate::old\", new: \"use crate::new\" }\n\nLINES (optional)\n  Line ranges to constrain replacements. Space-separated.\n    1-10       lines 1 through 10\n    30         just line 30\n    70-        line 70 through EOF\n\nEXCLUDE (optional)\n  Glob pattern to exclude from matches.\n\nINCLUDE_GITIGNORED (default: false)\n  Include gitignored files in glob expansion.\n\nINCLUDE_HIDDEN (default: false)\n  Include hidden files (dotfiles) in glob expansion.\n\nOUTPUT\n  Per-file replacement count with sample diffs. LSP diagnostics\n  (if any) appear after the summary.\n\nSAFETY\n  Every call creates a pre-edit snapshot. Undo with:\n    catenary restore <file>         most recent snapshot\n    catenary restore --id <N>       specific snapshot\n    catenary restore --list         show all snapshots\n  Clean up sidecars: catenary gc --sidecars".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "glob": {
-                            "type": "string",
-                            "description": "File path or glob pattern"
-                        },
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "old": { "type": "string", "description": "Text to find" },
-                                    "new": { "type": "string", "description": "Replacement text" },
-                                    "flags": { "type": "string", "description": "Flags: g (global), r (regex), i, m, s" }
-                                },
-                                "required": ["old", "new"]
-                            },
-                            "description": "List of edit operations"
-                        },
-                        "lines": { "type": "string", "description": "Line ranges (e.g., 1-10 30 70-)" },
-                        "exclude": { "type": "string", "description": "Glob pattern to exclude" },
-                        "include_gitignored": { "type": "boolean" },
-                        "include_hidden": { "type": "boolean" }
-                    },
-                    "required": ["glob", "edits"]
-                }),
-                annotations: Some(serde_json::json!({
-                    "readOnlyHint": false,
-                    "destructiveHint": false,
-                    "idempotentHint": false,
-                    "openWorldHint": false
-                })),
-            },
         ]
     }
 
@@ -342,13 +305,9 @@ impl ToolHandler for LspBridgeHandler {
             };
         }
 
-        // ToolServer dispatch: replace, grep, glob
+        // ToolServer dispatch: grep, glob
         let params = arguments.unwrap_or(Value::Null);
         let result = match name {
-            "replace" => self
-                .toolbox
-                .runtime
-                .block_on(self.toolbox.replace.execute(&params, parent_id)),
             "grep" => self
                 .toolbox
                 .runtime
