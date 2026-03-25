@@ -362,7 +362,7 @@ internal dependencies, exposes `sync_roots`/`shutdown`).
 language IDs via `inherit`. `HookRouter` extraction (mirrors `McpRouter`
 pattern). Cleanup pass deletes dead code paths.
 
-Foundation for workstream 7 phase 1b and misc 28 (multi-root).
+Foundation for workstream 7 phase 1b and misc 28a (multi-root).
 
 Design: `tickets/misc/29_language_id_config_unification.md`.
 Tracker: `tickets/management/README.md`.
