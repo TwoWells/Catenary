@@ -75,7 +75,7 @@ impl LspClientManager {
     pub async fn spawn_all(&self) {
         let roots = self.roots.lock().await.clone();
         let configured_keys: HashSet<&str> =
-            self.config.server.keys().map(String::as_str).collect();
+            self.config.language.keys().map(String::as_str).collect();
         let relevant = detect_workspace_languages(&roots, &configured_keys);
 
         if relevant.is_empty() {
@@ -267,50 +267,63 @@ impl LspClientManager {
     /// - The server fails to spawn.
     /// - The server fails to initialize.
     pub async fn get_or_spawn(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
-        if let Some(client) = self.clients.lock().await.get(lang) {
+        // Resolve inherit to find the canonical key
+        let (canonical, lang_config) = self
+            .config
+            .resolve_language(lang)
+            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang}'"))?;
+
+        // Check if a client already exists under the canonical key
+        if let Some(client) = self.clients.lock().await.get(canonical) {
             if client.lock().await.is_alive() {
                 return Ok(client.clone());
             }
-            anyhow::bail!("LSP server for '{lang}' is dead");
+            anyhow::bail!("LSP server for '{canonical}' is dead");
         }
 
         let mut clients = self.clients.lock().await;
 
-        // Spawn new client
-        let server_config = self
-            .config
-            .server
-            .get(lang)
-            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang}'"))?;
+        // Double-check after acquiring write lock
+        if let Some(client) = clients.get(canonical) {
+            if client.lock().await.is_alive() {
+                return Ok(client.clone());
+            }
+            anyhow::bail!("LSP server for '{canonical}' is dead");
+        }
+
+        let command = lang_config
+            .command
+            .as_deref()
+            .ok_or_else(|| anyhow!("No command configured for language '{canonical}'"))?;
 
         info!(
             "Spawning LSP server for {}: {} {}",
-            lang,
-            server_config.command,
-            server_config.args.join(" ")
+            canonical,
+            command,
+            lang_config.args.join(" ")
         );
 
-        let args: Vec<&str> = server_config
+        let args: Vec<&str> = lang_config
             .args
             .iter()
             .map(|s: &String| s.as_str())
             .collect();
         let mut client = LspClient::spawn(
-            &server_config.command,
+            command,
             &args,
-            lang,
+            canonical,
             self.message_log.clone(),
-            server_config.settings.clone(),
+            lang_config.settings.clone(),
         )?;
 
         // Initialize
         let roots = self.roots.lock().await.clone();
         client
-            .initialize(&roots, server_config.initialization_options.clone())
+            .initialize(&roots, lang_config.initialization_options.clone())
             .await?;
 
         let client_mutex = Arc::new(Mutex::new(client));
-        clients.insert(lang.to_string(), client_mutex.clone());
+        clients.insert(canonical.to_string(), client_mutex.clone());
         drop(clients);
 
         Ok(client_mutex)
@@ -409,7 +422,7 @@ impl LspClientManager {
     /// are logged and skipped.
     pub async fn ensure_clients_for_paths(&self, paths: &[PathBuf]) {
         let configured_keys: HashSet<&str> =
-            self.config.server.keys().map(String::as_str).collect();
+            self.config.language.keys().map(String::as_str).collect();
 
         let mut to_spawn: HashSet<String> = HashSet::new();
 
@@ -591,7 +604,7 @@ fn config_key_for_path(path: &Path) -> Option<&'static str> {
 }
 
 /// Maps a file extension to the language config key used in
-/// `config.server`.
+/// `config.language`.
 fn extension_to_config_key(ext: &str) -> Option<&'static str> {
     match ext {
         "rs" => Some("rust"),
@@ -641,7 +654,7 @@ fn extension_to_config_key(ext: &str) -> Option<&'static str> {
 )]
 mod tests {
     use super::*;
-    use crate::config::{IconConfig, ServerConfig};
+    use crate::config::{IconConfig, LanguageConfig};
     use crate::session::MessageLog;
     use anyhow::Result;
 
@@ -657,11 +670,12 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            server: HashMap::new(),
+            language: HashMap::new(),
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
+            deprecated_server_key: false,
         }
     }
 
@@ -679,45 +693,49 @@ mod tests {
 
     fn mockls_config() -> Config {
         let bin = mockls_bin();
-        let mut server = HashMap::new();
-        server.insert(
+        let mut language = HashMap::new();
+        language.insert(
             MOCK_LANG_A.to_string(),
-            ServerConfig {
-                command: bin.to_string_lossy().to_string(),
+            LanguageConfig {
+                command: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
                 min_severity: None,
                 settings: None,
+                inherit: None,
             },
         );
         Config {
-            server,
+            language,
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
+            deprecated_server_key: false,
         }
     }
 
     fn mockls_workspace_folders_config() -> Config {
         let bin = mockls_bin();
-        let mut server = HashMap::new();
-        server.insert(
+        let mut language = HashMap::new();
+        language.insert(
             MOCK_LANG_A.to_string(),
-            ServerConfig {
-                command: bin.to_string_lossy().to_string(),
+            LanguageConfig {
+                command: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 initialization_options: None,
                 min_severity: None,
                 settings: None,
+                inherit: None,
             },
         );
         Config {
-            server,
+            language,
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
+            deprecated_server_key: false,
         }
     }
 
@@ -857,11 +875,11 @@ mod tests {
     #[tokio::test]
     async fn test_configuration_returns_settings() -> Result<()> {
         let bin = mockls_bin();
-        let mut server = HashMap::new();
-        server.insert(
+        let mut language = HashMap::new();
+        language.insert(
             MOCK_LANG_A.to_string(),
-            ServerConfig {
-                command: bin.to_string_lossy().to_string(),
+            LanguageConfig {
+                command: Some(bin.to_string_lossy().to_string()),
                 args: vec![
                     MOCK_LANG_A.to_string(),
                     "--send-configuration-request".to_string(),
@@ -869,14 +887,16 @@ mod tests {
                 initialization_options: None,
                 min_severity: None,
                 settings: Some(serde_json::json!({"mockls": {"key": "value"}})),
+                inherit: None,
             },
         );
         let config = Config {
-            server,
+            language,
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
+            deprecated_server_key: false,
         };
 
         let manager = LspClientManager::new(

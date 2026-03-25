@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,9 +19,9 @@ pub struct Config {
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: i64,
 
-    /// Server definitions keyed by language ID (e.g., "rust", "python").
+    /// Language definitions keyed by language ID (e.g., "rust", "python").
     #[serde(default)]
-    pub server: HashMap<String, ServerConfig>,
+    pub language: HashMap<String, LanguageConfig>,
 
     /// Icon theme configuration.
     #[serde(default)]
@@ -30,13 +30,23 @@ pub struct Config {
     /// TUI configuration.
     #[serde(default)]
     pub tui: TuiConfig,
+
+    /// True if any config source used the deprecated `[server.*]` key.
+    #[serde(skip)]
+    pub deprecated_server_key: bool,
 }
 
-/// Configuration for a specific LSP server.
+/// Per-language configuration for how Catenary handles a language.
+///
+/// Each entry describes which language server to spawn, how to initialize
+/// it, what settings to relay via `workspace/configuration`, and how to
+/// filter diagnostics. Entries with `inherit` delegate to another language's
+/// config (e.g., `typescriptreact` inherits from `typescript`).
 #[derive(Debug, Deserialize, Clone)]
-pub struct ServerConfig {
+pub struct LanguageConfig {
     /// The command to execute (e.g., "rust-analyzer").
-    pub command: String,
+    /// Required for concrete entries, absent for inherit-only entries.
+    pub command: Option<String>,
 
     /// Arguments to pass to the command.
     #[serde(default)]
@@ -59,6 +69,11 @@ pub struct ServerConfig {
     /// `section` path from configuration requests and returns the subtree.
     #[serde(default)]
     pub settings: Option<serde_json::Value>,
+
+    /// Inherit configuration from another language entry.
+    /// The target must be a concrete entry (no chains).
+    #[serde(default)]
+    pub inherit: Option<String>,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -184,21 +199,6 @@ const fn default_sessions_width() -> f64 {
     0.25
 }
 
-/// Replace tool configuration.
-///
-/// Stub for future per-tool config (full integration comes with
-/// `SEARCHv2` ticket 03).
-pub struct ReplaceConfig {
-    /// Output budget in characters.
-    pub budget: u32,
-}
-
-impl Default for ReplaceConfig {
-    fn default() -> Self {
-        Self { budget: 4000 }
-    }
-}
-
 const fn default_idle_timeout() -> u64 {
     300
 }
@@ -207,58 +207,264 @@ const fn default_log_retention_days() -> i64 {
     7
 }
 
+/// Known language variants that inherit from a base language by default.
+///
+/// Applied when the user's config has the base language but no explicit
+/// entry for the variant. User-defined entries take precedence.
+const DEFAULT_INHERIT: &[(&str, &str)] = &[
+    ("typescriptreact", "typescript"),
+    ("javascriptreact", "javascript"),
+];
+
 impl Config {
     /// Load configuration from standard paths or a specific file.
+    ///
+    /// Sources are loaded in order, with later sources overriding earlier ones:
+    /// 1. User config (`~/.config/catenary/config.toml`)
+    /// 2. Project-local config (`.catenary.toml`, searching upward from cwd)
+    /// 3. Explicit file (if provided)
+    /// 4. Environment variable overrides
+    ///
+    /// The deprecated `[server.*]` key is accepted as an alias for
+    /// `[language.*]`. If both are present in the same file, an error is
+    /// returned.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Default values cannot be set.
-    /// - The configuration file exists but cannot be read or parsed.
-    /// - The configuration cannot be deserialized into the `Config` struct.
+    /// - A configuration file exists but cannot be read or parsed.
+    /// - A file uses both `[server.*]` and `[language.*]`.
+    /// - `inherit` targets are missing, chained, or cyclic.
+    /// - A concrete language entry is missing `command`.
     pub fn load(explicit_file: Option<PathBuf>) -> Result<Self> {
-        let mut builder = config::Config::builder();
+        let mut sources: Vec<PathBuf> = Vec::new();
 
-        // 1. Start with defaults
-        builder = builder.set_default("idle_timeout", 300)?;
-        builder = builder.set_default("log_retention_days", 7)?;
-        builder = builder.set_default("icons.preset", "unicode")?;
-
-        // 2. Load from user config directory (~/.config/catenary/config.toml)
+        // 1. User config directory (~/.config/catenary/config.toml)
         if let Some(config_dir) = dirs::config_dir() {
             let config_path = config_dir.join("catenary").join("config.toml");
             if config_path.exists() {
-                builder = builder.add_source(config::File::from(config_path));
+                sources.push(config_path);
             }
         }
 
-        // 3. Load from project-local config (.catenary.toml) searching upwards
+        // 2. Project-local config (.catenary.toml) searching upwards
         if let Ok(cwd) = std::env::current_dir() {
             let mut current = Some(cwd.as_path());
             while let Some(path) = current {
                 let config_path = path.join(".catenary.toml");
                 if config_path.exists() {
-                    builder = builder.add_source(config::File::from(config_path));
+                    sources.push(config_path);
                     break;
                 }
                 current = path.parent();
             }
         }
 
-        // 4. Load from explicit file if provided
+        // 3. Explicit file
         if let Some(path) = explicit_file {
-            builder = builder.add_source(config::File::from(path));
+            sources.push(path);
         }
 
-        // 4. Load from environment variables (CATENARY_IDLE_TIMEOUT, etc.)
-        // Use "__" as separator for nested keys (e.g. CATENARY_ICONS__PRESET=nerd).
-        builder = builder.add_source(config::Environment::with_prefix("CATENARY").separator("__"));
+        Self::load_from_sources(&sources)
+    }
 
-        let config = builder.build().context("Failed to build configuration")?;
+    /// Load configuration from an explicit list of file paths.
+    ///
+    /// Sources are merged in order (later overrides earlier). Environment
+    /// variable overrides, default inherits, and validation are applied
+    /// after merging.
+    fn load_from_sources(sources: &[PathBuf]) -> Result<Self> {
+        let mut config = Self::default();
+        for source in sources {
+            let contents = std::fs::read_to_string(source)
+                .with_context(|| format!("Failed to read config file: {}", source.display()))?;
+            let (layer, deprecated) = Self::deserialize_source(&contents)
+                .with_context(|| format!("Failed to parse config file: {}", source.display()))?;
+            if deprecated {
+                config.deprecated_server_key = true;
+            }
+            config.merge(layer);
+        }
 
-        config
-            .try_deserialize()
-            .context("Failed to deserialize configuration")
+        config.apply_env_overrides();
+        config.apply_default_inherits();
+        config.validate()?;
+
+        Ok(config)
+    }
+
+    /// Deserialize a TOML source, handling the `[server.*]` → `[language.*]`
+    /// migration. Returns the deserialized config and whether the deprecated
+    /// key was present.
+    fn deserialize_source(contents: &str) -> Result<(Self, bool)> {
+        // Parse to Value first to detect deprecated [server.*] key
+        let raw: toml::Value = toml::from_str(contents).context("Failed to parse TOML")?;
+
+        let has_server = raw.get("server").is_some();
+        let has_language = raw.get("language").is_some();
+
+        if has_server && has_language {
+            bail!(
+                "Config contains both [server.*] and [language.*] — \
+                 rename [server.*] to [language.*] and remove [server.*]"
+            );
+        }
+
+        // If using deprecated key, rewrite and re-serialize so that
+        // toml::from_str applies all serde defaults correctly.
+        let config: Self = if has_server {
+            let mut table = raw.as_table().cloned().unwrap_or_default();
+            if let Some(server_val) = table.remove("server") {
+                table.insert("language".to_string(), server_val);
+            }
+            let rewritten = toml::to_string(&toml::Value::Table(table))
+                .context("Failed to re-serialize migrated config")?;
+            toml::from_str(&rewritten).context("Failed to deserialize configuration")?
+        } else {
+            toml::from_str(contents).context("Failed to deserialize configuration")?
+        };
+
+        Ok((config, has_server))
+    }
+
+    /// Merge another config layer into this one. Later values override.
+    fn merge(&mut self, other: Self) {
+        if other.idle_timeout != default_idle_timeout() {
+            self.idle_timeout = other.idle_timeout;
+        }
+        if other.log_retention_days != default_log_retention_days() {
+            self.log_retention_days = other.log_retention_days;
+        }
+        for (key, value) in other.language {
+            self.language.insert(key, value);
+        }
+        // Icons and TUI: override if the source provided them.
+        // Since we can't distinguish "user set default" from "absent",
+        // we always take the later source's values for structured sections.
+        // This matches the previous config crate behavior.
+        self.icons = other.icons;
+        self.tui = other.tui;
+    }
+
+    /// Apply environment variable overrides for supported keys.
+    fn apply_env_overrides(&mut self) {
+        if let Ok(val) = std::env::var("CATENARY_IDLE_TIMEOUT")
+            && let Ok(v) = val.parse()
+        {
+            self.idle_timeout = v;
+        }
+        if let Ok(val) = std::env::var("CATENARY_LOG_RETENTION_DAYS")
+            && let Ok(v) = val.parse()
+        {
+            self.log_retention_days = v;
+        }
+    }
+
+    /// Apply default inherit entries for known language variants.
+    fn apply_default_inherits(&mut self) {
+        for &(variant, base) in DEFAULT_INHERIT {
+            // Only apply if the base language is configured and the
+            // variant is not explicitly defined by the user.
+            if self.language.contains_key(base) && !self.language.contains_key(variant) {
+                self.language.insert(
+                    variant.to_string(),
+                    LanguageConfig {
+                        command: None,
+                        args: Vec::new(),
+                        initialization_options: None,
+                        min_severity: None,
+                        settings: None,
+                        inherit: Some(base.to_string()),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Validate the merged config.
+    fn validate(&self) -> Result<()> {
+        for (key, lang_config) in &self.language {
+            if let Some(ref target) = lang_config.inherit {
+                // Target must exist
+                let target_config = self.language.get(target).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Language '{key}' inherits from '{target}', \
+                             but '{target}' is not configured"
+                    )
+                })?;
+
+                // No chains: target must not itself inherit
+                if target_config.inherit.is_some() {
+                    bail!(
+                        "Language '{key}' inherits from '{target}', \
+                         but '{target}' also inherits — chains are not allowed"
+                    );
+                }
+            } else {
+                // Concrete entry must have a command
+                if lang_config.command.is_none() {
+                    bail!(
+                        "Language '{key}' has no `command` and no `inherit` — \
+                         concrete entries must specify a command"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve `inherit` for a language key, returning the canonical key
+    /// and the effective config.
+    ///
+    /// If the language has `inherit`, returns the target key and a merged
+    /// config (inherit-only overrides applied on top of the base). If no
+    /// `inherit`, returns the key and config as-is.
+    #[must_use]
+    pub fn resolve_language<'a>(&'a self, key: &'a str) -> Option<(&'a str, LanguageConfig)> {
+        let lang_config = self.language.get(key)?;
+
+        if let Some(ref target) = lang_config.inherit {
+            let base = self.language.get(target.as_str())?;
+            let mut resolved = base.clone();
+
+            // Apply per-variant overrides from the inheriting entry
+            if lang_config.command.is_some() {
+                resolved.command.clone_from(&lang_config.command);
+            }
+            if !lang_config.args.is_empty() {
+                resolved.args.clone_from(&lang_config.args);
+            }
+            if lang_config.initialization_options.is_some() {
+                resolved
+                    .initialization_options
+                    .clone_from(&lang_config.initialization_options);
+            }
+            if lang_config.min_severity.is_some() {
+                resolved.min_severity.clone_from(&lang_config.min_severity);
+            }
+            if lang_config.settings.is_some() {
+                resolved.settings.clone_from(&lang_config.settings);
+            }
+            resolved.inherit = None;
+
+            Some((target.as_str(), resolved))
+        } else {
+            Some((key, lang_config.clone()))
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            idle_timeout: default_idle_timeout(),
+            log_retention_days: default_log_retention_days(),
+            language: HashMap::new(),
+            icons: IconConfig::default(),
+            tui: TuiConfig::default(),
+            deprecated_server_key: false,
+        }
     }
 }
 
@@ -273,49 +479,342 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-
     fn test_config_load_local() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+idle_timeout = 42
+
+[language.rust]
+command = "rust-analyzer-local"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        assert_eq!(config.idle_timeout, 42);
+        assert_eq!(
+            config
+                .language
+                .get("rust")
+                .expect("rust language config")
+                .command
+                .as_deref(),
+            Some("rust-analyzer-local"),
+        );
+        assert!(!config.deprecated_server_key);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_deprecated_server_key() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.rust]
+command = "rust-analyzer"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        assert!(config.deprecated_server_key);
+        assert_eq!(
+            config
+                .language
+                .get("rust")
+                .expect("rust language config")
+                .command
+                .as_deref(),
+            Some("rust-analyzer"),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_both_server_and_language_errors() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.rust]
+command = "rust-analyzer"
+
+[language.python]
+command = "pyright"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("both"),
+            "error should mention both keys: {err}",
+        );
+    }
+
+    #[test]
+    fn test_inherit_resolves() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[language.typescriptreact]
+inherit = "typescript"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        let (canonical, resolved) = config
+            .resolve_language("typescriptreact")
+            .expect("should resolve");
+        assert_eq!(canonical, "typescript");
+        assert_eq!(
+            resolved.command.as_deref(),
+            Some("typescript-language-server")
+        );
+        assert_eq!(resolved.args, vec!["--stdio"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inherit_with_override() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+min_severity = "warning"
+
+[language.typescriptreact]
+inherit = "typescript"
+min_severity = "error"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        let (_, resolved) = config
+            .resolve_language("typescriptreact")
+            .expect("should resolve");
+        assert_eq!(resolved.min_severity.as_deref(), Some("error"));
+        assert_eq!(
+            resolved.command.as_deref(),
+            Some("typescript-language-server")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inherit_missing_target() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.typescriptreact]
+inherit = "typescript"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_inherit_chain_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.a]
+command = "server-a"
+
+[language.b]
+inherit = "a"
+
+[language.c]
+inherit = "b"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(err.contains("chains"), "error should mention chains: {err}",);
+    }
+
+    #[test]
+    fn test_inherit_cycle_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.a]
+inherit = "b"
+
+[language.b]
+inherit = "a"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_concrete_without_command_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.rust]
+args = ["--stdio"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("command"),
+            "error should mention command: {err}",
+        );
+    }
+
+    #[test]
+    fn test_default_inherits_applied() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        // Default inherit should have been applied
+        assert!(config.language.contains_key("typescriptreact"));
+        let (canonical, _) = config
+            .resolve_language("typescriptreact")
+            .expect("should resolve");
+        assert_eq!(canonical, "typescript");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_user_defined_overrides_default_inherit() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+
+[language.typescriptreact]
+command = "custom-tsx-server"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        // User-defined entry should win over default inherit
+        let tsx = config
+            .language
+            .get("typescriptreact")
+            .expect("typescriptreact config");
+        assert!(tsx.inherit.is_none());
+        assert_eq!(tsx.command.as_deref(), Some("custom-tsx-server"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_config() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "")?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+        assert_eq!(config.idle_timeout, 300);
+        assert_eq!(config.log_retention_days, 7);
+        assert!(config.language.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_later_source_overrides() -> Result<()> {
         let dir = tempdir()?;
 
         let local_config_path = dir.path().join(".catenary.toml");
-
         fs::write(
             &local_config_path,
             r#"
+idle_timeout = 42
 
-    idle_timeout = 42
-
-
-
-    [server.rust]
-
-    command = "rust-analyzer-local"
-
-    "#,
+[language.rust]
+command = "rust-analyzer-local"
+"#,
         )?;
 
-        // Change current directory to the temp dir
+        let explicit_path = dir.path().join("explicit.toml");
+        fs::write(
+            &explicit_path,
+            r"
+idle_timeout = 99
+",
+        )?;
 
-        let original_dir = std::env::current_dir()?;
+        let config = Config::load_from_sources(&[local_config_path, explicit_path])?;
 
-        std::env::set_current_dir(dir.path())?;
-
-        let config = Config::load(None)?;
-
-        // Restore current directory
-
-        std::env::set_current_dir(original_dir)?;
-
-        assert_eq!(config.idle_timeout, 42);
-
-        assert_eq!(
-            config
-                .server
-                .get("rust")
-                .expect("rust server config")
-                .command,
-            "rust-analyzer-local"
-        );
+        assert_eq!(config.idle_timeout, 99);
+        assert!(config.language.contains_key("rust"));
 
         Ok(())
     }

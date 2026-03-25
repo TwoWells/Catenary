@@ -169,12 +169,13 @@ impl DiagnosticsServer {
         drop(client);
 
         // Apply severity threshold from config
-        let min_severity = self
+        let min_severity_str = self
             .client_manager
             .config()
-            .server
-            .get(&lang_id)
-            .and_then(|sc| sc.min_severity.as_deref())
+            .resolve_language(&lang_id)
+            .and_then(|(_, lc)| lc.min_severity);
+        let min_severity = min_severity_str
+            .as_deref()
             .and_then(crate::filter::parse_severity);
 
         let (diagnostics, fixes) = if let Some(threshold) = min_severity {

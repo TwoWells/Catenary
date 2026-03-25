@@ -60,14 +60,15 @@ pub async fn run_doctor(
             .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?
             .to_string();
         let cmd_args: Vec<String> = parts.map(std::string::ToString::to_string).collect();
-        config.server.insert(
+        config.language.insert(
             lang,
-            crate::config::ServerConfig {
-                command: program,
+            crate::config::LanguageConfig {
+                command: Some(program),
                 args: cmd_args,
                 initialization_options: None,
                 min_severity: None,
                 settings: None,
+                inherit: None,
             },
         );
     }
@@ -97,31 +98,47 @@ pub async fn run_doctor(
     );
     println!();
 
-    if config.server.is_empty() {
+    // Deprecation warning
+    if config.deprecated_server_key {
+        println!(
+            "{}",
+            colors.yellow("⚠  Config uses deprecated [server.*] key — rename to [language.*]"),
+        );
+        println!();
+    }
+
+    if config.language.is_empty() {
         println!("No language servers configured.");
         return Ok(());
     }
 
     // Detect which languages have files in the workspace
     let configured_keys: std::collections::HashSet<&str> =
-        config.server.keys().map(String::as_str).collect();
+        config.language.keys().map(String::as_str).collect();
     let detected = lsp::detect_workspace_languages(&resolved_roots, &configured_keys);
 
-    // Sort servers alphabetically
-    let mut servers: Vec<(&String, &crate::config::ServerConfig)> = config.server.iter().collect();
+    // Sort servers alphabetically — skip inherit-only entries without a command
+    let mut servers: Vec<(&String, &crate::config::LanguageConfig)> = config
+        .language
+        .iter()
+        .filter(|(_, lc)| lc.command.is_some())
+        .collect();
     servers.sort_by_key(|(lang, _)| *lang);
 
     // Determine column width for language name
     let max_lang_width = servers.iter().map(|(l, _)| l.len()).max().unwrap_or(10);
     let max_cmd_width = servers
         .iter()
-        .map(|(_, s)| s.command.len())
+        .filter_map(|(_, s)| s.command.as_ref())
+        .map(String::len)
         .max()
         .unwrap_or(10);
 
-    for (lang, server_config) in &servers {
+    for (lang, lang_config) in &servers {
+        // command is guaranteed Some by the filter above
+        let command = lang_config.command.as_deref().unwrap_or_default();
         let lang_display = format!("{lang:<max_lang_width$}");
-        let cmd_display = format!("{cmd:<max_cmd_width$}", cmd = server_config.command);
+        let cmd_display = format!("{command:<max_cmd_width$}");
 
         // Check if any files for this language exist
         if !detected.contains(lang.as_str()) {
@@ -135,7 +152,7 @@ pub async fn run_doctor(
         }
 
         // Check if binary exists on PATH
-        if !binary_exists(&server_config.command) {
+        if !binary_exists(command) {
             println!(
                 "{}  {}  {}",
                 lang_display,
@@ -146,9 +163,9 @@ pub async fn run_doctor(
         }
 
         // Spawn and initialize the server
-        let args_refs: Vec<&str> = server_config.args.iter().map(String::as_str).collect();
+        let args_refs: Vec<&str> = lang_config.args.iter().map(String::as_str).collect();
         let spawn_result = lsp::LspClient::spawn_quiet(
-            &server_config.command,
+            command,
             &args_refs,
             lang,
             Arc::new(crate::session::MessageLog::noop()),
@@ -168,10 +185,7 @@ pub async fn run_doctor(
         };
 
         match client
-            .initialize(
-                &resolved_roots,
-                server_config.initialization_options.clone(),
-            )
+            .initialize(&resolved_roots, lang_config.initialization_options.clone())
             .await
         {
             Ok(result) => {

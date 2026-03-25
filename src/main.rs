@@ -353,14 +353,15 @@ async fn run_server(args: Args) -> Result<()> {
             .to_string();
         let cmd_args: Vec<String> = parts.map(std::string::ToString::to_string).collect();
 
-        config.server.insert(
+        config.language.insert(
             lang,
-            catenary_mcp::config::ServerConfig {
-                command: program,
+            catenary_mcp::config::LanguageConfig {
+                command: Some(program),
                 args: cmd_args,
                 initialization_options: None,
                 min_severity: None,
                 settings: None,
+                inherit: None,
             },
         );
     }
