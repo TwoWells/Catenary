@@ -6,11 +6,13 @@
 #![allow(clippy::print_stdout, reason = "CLI tool needs to output to stdout")]
 #![allow(clippy::print_stderr, reason = "CLI tool needs to output to stderr")]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::cli::ColorConfig;
 use crate::install;
 use crate::lsp;
@@ -105,12 +107,11 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     }
 
     // Detect which languages have files in the workspace (only when roots provided)
-    let detected: Option<std::collections::HashSet<String>> =
-        resolved_roots.as_ref().map(|roots| {
-            let configured_keys: std::collections::HashSet<&str> =
-                config.language.keys().map(String::as_str).collect();
-            lsp::detect_workspace_languages(roots, &configured_keys)
-        });
+    let detected: Option<HashSet<String>> = resolved_roots.as_ref().map(|roots| {
+        let configured_keys: HashSet<&str> = config.language.keys().map(String::as_str).collect();
+        let fs = FilesystemManager::new();
+        fs.detect_workspace_languages(roots, &configured_keys)
+    });
 
     // Sort servers alphabetically — skip inherit-only entries without a command
     let mut servers: Vec<(&String, &crate::config::LanguageConfig)> = config

@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use tokio::fs;
 use tracing::{debug, trace};
 
-use super::filesystem_manager::detect_language_id;
+use super::filesystem_manager::detect_language_id_opt;
 use crate::db;
 
 /// Tracks the state of an open document.
@@ -87,7 +87,7 @@ impl DocumentManager {
         let uri = path_to_uri(&path);
 
         // Detect language ID from extension
-        let language_id = detect_language_id(&path);
+        let language_id = detect_language_id_opt(&path).unwrap_or("plaintext");
 
         let doc = OpenDocument {
             version: 1,
@@ -131,20 +131,6 @@ impl DocumentManager {
         Ok(path_to_uri(&path.canonicalize()?))
     }
 
-    /// Returns the language ID for a given path.
-    #[must_use]
-    pub fn language_id_for_path(&self, path: &Path) -> &'static str {
-        detect_language_id(path)
-    }
-
-    /// Checks if there are any open documents for the given language ID.
-    #[must_use]
-    pub fn has_open_documents(&self, language_id: &str) -> bool {
-        self.documents
-            .keys()
-            .any(|path| detect_language_id(path) == language_id)
-    }
-
     /// Notifies the manager that a file was written externally (by Catenary itself).
     ///
     /// Updates internal state with the new content and returns the appropriate
@@ -176,7 +162,7 @@ impl DocumentManager {
             })
         } else {
             // Not open — send didOpen
-            let language_id = detect_language_id(&path);
+            let language_id = detect_language_id_opt(&path).unwrap_or("plaintext");
 
             let doc = OpenDocument {
                 version: 1,

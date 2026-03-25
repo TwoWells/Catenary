@@ -7,9 +7,11 @@
 //! language identification (extension, filename, and shebang) behind one
 //! cache keyed by path + mtime. Replaces the former `FilesystemCache`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use ignore::WalkBuilder;
 
 /// Files above this size are assumed binary without reading.
 const BINARY_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
@@ -187,6 +189,62 @@ impl FilesystemManager {
             *current = roots;
         }
     }
+
+    /// Scans workspace roots and returns the set of language keys that have
+    /// matching files present among `configured_keys`.
+    ///
+    /// Respects `.gitignore` and skips hidden files. Uses extension/filename
+    /// detection first, then full classification (including shebang) for
+    /// files without a recognised extension. Falls back to the raw file
+    /// extension for custom languages. Exits early once all configured
+    /// languages have been detected.
+    #[allow(clippy::implicit_hasher, reason = "All callers use the default hasher")]
+    pub fn detect_workspace_languages(
+        &self,
+        roots: &[PathBuf],
+        configured_keys: &HashSet<&str>,
+    ) -> HashSet<String> {
+        let mut detected = HashSet::new();
+
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+
+            let walker = WalkBuilder::new(root).git_ignore(true).hidden(true).build();
+
+            for entry in walker.flatten() {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
+                }
+
+                let path = entry.path();
+
+                // Fast path: extension/filename (no I/O beyond the walk).
+                // Slow path: full classification (shebang detection).
+                let lang = detect_language_id_opt(path).or_else(|| {
+                    let metadata = entry.metadata().ok()?;
+                    self.classify(path, &metadata).language_id()
+                });
+
+                if let Some(lang) = lang {
+                    if configured_keys.contains(lang) {
+                        detected.insert(lang.to_string());
+                    }
+                } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    && configured_keys.contains(ext)
+                {
+                    detected.insert(ext.to_string());
+                }
+
+                if detected.len() == configured_keys.len() {
+                    return detected;
+                }
+            }
+        }
+
+        detected
+    }
 }
 
 /// Formats a file size in human-readable form.
@@ -207,17 +265,8 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
-/// Returns the LSP language identifier for a path, or `"plaintext"` if unknown.
-///
-/// Pure function — uses extension and filename matching only, no I/O.
-/// For shebang-based detection, use [`FilesystemManager::classify`].
-#[must_use]
-pub fn detect_language_id(path: &Path) -> &'static str {
-    detect_language_id_opt(path).unwrap_or("plaintext")
-}
-
 /// Extension/filename detection — returns `None` for unrecognised files.
-fn detect_language_id_opt(path: &Path) -> Option<&'static str> {
+pub(crate) fn detect_language_id_opt(path: &Path) -> Option<&'static str> {
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
         let lang = match file_name {
             "Dockerfile" => "dockerfile",
@@ -480,34 +529,70 @@ mod tests {
 
     #[test]
     fn language_detection_extensions() {
-        assert_eq!(detect_language_id(Path::new("test.rs")), "rust");
-        assert_eq!(detect_language_id(Path::new("test.py")), "python");
-        assert_eq!(detect_language_id(Path::new("test.js")), "javascript");
-        assert_eq!(detect_language_id(Path::new("test.ts")), "typescript");
-        assert_eq!(detect_language_id(Path::new("test.tsx")), "typescriptreact");
-        assert_eq!(detect_language_id(Path::new("test.go")), "go");
-        assert_eq!(detect_language_id(Path::new("test.php")), "php");
-        assert_eq!(detect_language_id(Path::new("test.sh")), "shellscript");
-        assert_eq!(detect_language_id(Path::new("test.bash")), "shellscript");
-        assert_eq!(detect_language_id(Path::new("test.cs")), "csharp");
-        assert_eq!(detect_language_id(Path::new("test.kt")), "kotlin");
-        assert_eq!(detect_language_id(Path::new("test.swift")), "swift");
-        assert_eq!(detect_language_id(Path::new("test.html")), "html");
-        assert_eq!(detect_language_id(Path::new("test.css")), "css");
-        assert_eq!(detect_language_id(Path::new("test.scss")), "scss");
-        assert_eq!(detect_language_id(Path::new("Dockerfile")), "dockerfile");
-        assert_eq!(detect_language_id(Path::new("Makefile")), "makefile");
-        assert_eq!(detect_language_id(Path::new("CMakeLists.txt")), "cmake");
-        assert_eq!(detect_language_id(Path::new("test.zig")), "zig");
-        assert_eq!(detect_language_id(Path::new("test.nix")), "nix");
-        assert_eq!(detect_language_id(Path::new("test.proto")), "proto");
-        assert_eq!(detect_language_id(Path::new("test.graphql")), "graphql");
-        assert_eq!(detect_language_id(Path::new("test.r")), "r");
-        assert_eq!(detect_language_id(Path::new("test.jl")), "julia");
-        assert_eq!(detect_language_id(Path::new("test.ex")), "elixir");
-        assert_eq!(detect_language_id(Path::new("Cargo.toml")), "toml");
-        assert_eq!(detect_language_id(Path::new("test.unknown")), "plaintext");
-        assert_eq!(detect_language_id(Path::new("noextension")), "plaintext");
+        assert_eq!(detect_language_id_opt(Path::new("test.rs")), Some("rust"));
+        assert_eq!(detect_language_id_opt(Path::new("test.py")), Some("python"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.js")),
+            Some("javascript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.ts")),
+            Some("typescript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.tsx")),
+            Some("typescriptreact")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.go")), Some("go"));
+        assert_eq!(detect_language_id_opt(Path::new("test.php")), Some("php"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.sh")),
+            Some("shellscript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.bash")),
+            Some("shellscript")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.cs")), Some("csharp"));
+        assert_eq!(detect_language_id_opt(Path::new("test.kt")), Some("kotlin"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.swift")),
+            Some("swift")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.html")), Some("html"));
+        assert_eq!(detect_language_id_opt(Path::new("test.css")), Some("css"));
+        assert_eq!(detect_language_id_opt(Path::new("test.scss")), Some("scss"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("Dockerfile")),
+            Some("dockerfile")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("Makefile")),
+            Some("makefile")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("CMakeLists.txt")),
+            Some("cmake")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.zig")), Some("zig"));
+        assert_eq!(detect_language_id_opt(Path::new("test.nix")), Some("nix"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.proto")),
+            Some("proto")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.graphql")),
+            Some("graphql")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.r")), Some("r"));
+        assert_eq!(detect_language_id_opt(Path::new("test.jl")), Some("julia"));
+        assert_eq!(detect_language_id_opt(Path::new("test.ex")), Some("elixir"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("Cargo.toml")),
+            Some("toml")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.unknown")), None);
+        assert_eq!(detect_language_id_opt(Path::new("noextension")), None);
     }
 
     // --- Shebang detection ---
