@@ -30,6 +30,6 @@ pub(crate) mod wait;
 
 pub use client::DiagnosticsWaitResult;
 pub use client::{LspClient, WARMUP_PERIOD};
-pub use manager::{ClientManager, detect_workspace_languages};
+pub use manager::{LspClientManager, detect_workspace_languages};
 pub use server::LspServer;
 pub use state::{ProgressTracker, ServerState, ServerStatus};

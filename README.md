@@ -20,14 +20,15 @@ Internal planning and tracking for the Catenary project.
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
 | 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 followup complete** | `tickets/acquire/DESIGN.md` |
 | 14 | [Recommend](#14-recommend) | **Design complete** | `tickets/recommend/DESIGN.md` |
-| 15 | [Management](#15-management) | **Ready** | `tickets/management/README.md` |
+| 15 | [Management](#15-management) | **In progress** | `tickets/management/README.md` |
 
 ## Current priority
 
-**1. Workstream 15 (Management).** 5 tickets (00–04). 00 done.
-`FilesystemManager` (done), `LspClientManager` (absorbs
-`DocumentManager`), `get_client(path)`, `inherit` config model,
-root resolution. Unblocks misc 28.
+**1. Workstream 15 (Management).** 6 tickets (00–05). 00–01 done.
+`FilesystemManager` (done), `LspClientManager` (done — absorbs
+`DocumentManager`, `get_client(path)`, `Toolbox` as application
+container, `McpRouter` rename), `inherit` config model, root
+resolution, `HookRouter` extraction. Unblocks misc 28.
 
 **2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
 Unblocks `didChangeConfiguration` dynamic registration for misc 28.
@@ -347,19 +348,19 @@ Design: `tickets/recommend/DESIGN.md`.
 
 ## 15. Management
 
-**Status: Ready.** 5 tickets (00–04). Extracted from misc 29.
+**Status: In progress.** 6 tickets (00–05). 00–01 done.
 
-Rearchitects the file classification and client lookup layers.
-`FilesystemCache` → `FilesystemManager` (single authority for file
-metadata: binary detection, line count, language ID, shebang, root
-resolution). `ClientManager` → `LspClientManager` (absorbs
-`DocumentManager`, provides `get_client(path)`). Config keys unified
-with LSP language IDs via `inherit`. Deletes `detect_language_id`,
-`extension_to_config_key`, `config_key_for_path`, `get_client_for_path`,
-`detect_workspace_languages`.
+Rearchitects the file classification, client lookup, and application
+container layers. `FilesystemCache` → `FilesystemManager` (done: single
+authority for file metadata). `ClientManager` → `LspClientManager`
+(done: absorbs `DocumentManager`, `get_client(path)`, `FilesystemManager`
+injection). `Toolbox` as application container (done: creates all
+internal dependencies, exposes `sync_roots`/`shutdown`).
+`LspBridgeHandler` → `McpRouter` (done). Config keys unified with LSP
+language IDs via `inherit`. `HookRouter` extraction (mirrors `McpRouter`
+pattern). Cleanup pass deletes dead code paths.
 
-Foundation for workstream 7 phase 1b and misc 28 (multi-root). No
-external dependencies — can start immediately.
+Foundation for workstream 7 phase 1b and misc 28 (multi-root).
 
 Design: `tickets/misc/29_language_id_config_unification.md`.
 Tracker: `tickets/management/README.md`.

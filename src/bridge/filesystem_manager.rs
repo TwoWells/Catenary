@@ -25,6 +25,17 @@ pub struct FileInfo {
     pub kind: FileKind,
 }
 
+impl FileInfo {
+    /// Returns the LSP language identifier, if detectable.
+    #[must_use]
+    pub const fn language_id(&self) -> Option<&'static str> {
+        match self.kind {
+            FileKind::Text { language_id, .. } => language_id,
+            FileKind::Binary => None,
+        }
+    }
+}
+
 /// File classification: binary or text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -122,6 +133,21 @@ impl FilesystemManager {
             FileKind::Binary => None,
             FileKind::Text { lines, .. } => Some(lines),
         }
+    }
+
+    /// Returns the LSP language identifier for a file path, or `None` if unknown.
+    ///
+    /// Tries extension/filename detection first (no I/O). If that fails
+    /// and the file exists on disk, falls back to full classification
+    /// which includes shebang detection.
+    pub fn language_id(&self, path: &Path) -> Option<&'static str> {
+        // Fast path: extension/filename (no I/O)
+        if let Some(lang) = detect_language_id_opt(path) {
+            return Some(lang);
+        }
+        // Slow path: full classification for shebang
+        let metadata = std::fs::metadata(path).ok()?;
+        self.classify(path, &metadata).language_id()
     }
 }
 

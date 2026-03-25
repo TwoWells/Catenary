@@ -7,10 +7,10 @@
 //! document open/change, diagnostics wait, severity filtering, noise
 //! filtering, quick-fix collection, and compact formatting.
 
+use super::DocumentNotification;
 use super::path_security::PathValidator;
 use super::tool_server::ToolServer;
-use super::{DocumentManager, DocumentNotification};
-use crate::lsp::{ClientManager, DiagnosticsWaitResult, LspClient};
+use crate::lsp::{DiagnosticsWaitResult, LspClient, LspClientManager};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -28,21 +28,18 @@ pub struct DiagnosticsResult {
 /// Handles `PostToolUse` hook requests: file-change notification with LSP
 /// diagnostics collection and formatting.
 pub struct DiagnosticsServer {
-    client_manager: Arc<ClientManager>,
-    doc_manager: Arc<Mutex<DocumentManager>>,
+    client_manager: Arc<LspClientManager>,
     path_validator: Arc<RwLock<PathValidator>>,
 }
 
 impl DiagnosticsServer {
     /// Creates a new `DiagnosticsServer`.
     pub const fn new(
-        client_manager: Arc<ClientManager>,
-        doc_manager: Arc<Mutex<DocumentManager>>,
+        client_manager: Arc<LspClientManager>,
         path_validator: Arc<RwLock<PathValidator>>,
     ) -> Self {
         Self {
             client_manager,
-            doc_manager,
             path_validator,
         }
     }
@@ -69,27 +66,20 @@ impl DiagnosticsServer {
         let canonical = self.path_validator.read().await.validate_read(&path)?;
 
         // Try to get the LSP client for this file's language
-        let lang_id = {
-            let doc_manager = self.doc_manager.lock().await;
-            doc_manager.language_id_for_path(&canonical).to_string()
-        };
+        let client_mutex: Arc<Mutex<LspClient>> =
+            match self.client_manager.get_client(&canonical).await {
+                Ok(c) => c,
+                Err(_) => {
+                    return Ok(DiagnosticsResult {
+                        content: "[no language server]".into(),
+                        count: 0,
+                    });
+                }
+            };
 
-        let client_mutex: Arc<Mutex<LspClient>> = match self
-            .client_manager
-            .get_client_for_path(&canonical, &lang_id)
-            .await
-        {
-            Ok(c) => c,
-            Err(_) => {
-                return Ok(DiagnosticsResult {
-                    content: "[no language server]".into(),
-                    count: 0,
-                });
-            }
-        };
-
-        let mut doc_manager = self.doc_manager.lock().await;
+        let mut doc_manager = self.client_manager.doc_manager().lock().await;
         let mut client = client_mutex.lock().await;
+        let lang_id = client.language().to_string();
 
         // Thread parent_id so LSP requests are correlated with this hook
         client.set_parent_id(Some(entry_id));

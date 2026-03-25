@@ -14,7 +14,6 @@ use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -22,9 +21,8 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 use std::sync::atomic::AtomicBool;
 
-use catenary_mcp::bridge::{DocumentManager, LspBridgeHandler, PathValidator};
+use catenary_mcp::bridge::McpRouter;
 use catenary_mcp::cli::{self, HostFormat, QueryFormat};
-use catenary_mcp::lsp;
 use catenary_mcp::mcp::McpServer;
 use catenary_mcp::session::{self, Session};
 
@@ -396,19 +394,13 @@ async fn run_server(args: Args) -> Result<()> {
             .id
     );
     info!("Workspace roots: {}", workspace_display);
-    // Create managers
+    // Create shared application container
     let message_log = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .message_log()
         .clone();
     error_layer_handle.activate(message_log.clone());
-    let client_manager = Arc::new(lsp::ClientManager::new(
-        config.clone(),
-        roots,
-        message_log.clone(),
-    ));
-    client_manager.spawn_all().await;
 
     let session_id = session
         .lock()
@@ -416,27 +408,15 @@ async fn run_server(args: Args) -> Result<()> {
         .info
         .id
         .clone();
-    let doc_manager = Arc::new(Mutex::new(DocumentManager::new(session_id.clone())));
-    let runtime = tokio::runtime::Handle::current();
-
-    let current_roots = client_manager.roots().await;
-
-    let path_validator = Arc::new(tokio::sync::RwLock::new(PathValidator::new(
-        current_roots.clone(),
-    )));
-
-    let diagnostics_server = Arc::new(catenary_mcp::bridge::DiagnosticsServer::new(
-        client_manager.clone(),
-        doc_manager.clone(),
-        path_validator.clone(),
-    ));
 
     let toolbox = Arc::new(catenary_mcp::bridge::toolbox::Toolbox::new(
-        client_manager.clone(),
-        doc_manager,
-        runtime,
-        diagnostics_server,
+        config.clone(),
+        roots,
+        message_log.clone(),
+        session_id.clone(),
+        tokio::runtime::Handle::current(),
     ));
+    toolbox.spawn_all().await;
 
     // Start the hook server for PostToolUse/PreToolUse hook integration
     let refresh_roots_flag = Arc::new(AtomicBool::new(false));
@@ -463,12 +443,12 @@ async fn run_server(args: Args) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .set_socket_active();
 
-    let handler = LspBridgeHandler::new(toolbox);
+    let toolbox_for_roots = toolbox.clone();
+    let toolbox_for_shutdown = toolbox.clone();
+    let handler = McpRouter::new(toolbox);
 
     // Run MCP server (blocking - reads from stdin)
     let session_for_callback = session.clone();
-    let client_manager_for_roots = client_manager.clone();
-    let path_validator_for_roots = path_validator.clone();
     let runtime_for_roots = tokio::runtime::Handle::current();
     let message_log = session
         .lock()
@@ -499,17 +479,7 @@ async fn run_server(args: Args) -> Result<()> {
                 })
                 .collect();
 
-            // Update path validator with new roots
-            runtime_for_roots
-                .block_on(path_validator_for_roots.write())
-                .update_roots(paths.clone());
-
-            runtime_for_roots.block_on(client_manager_for_roots.sync_roots(paths))?;
-
-            // Fire-and-forget: spawn_all is pre-warming, not a gate.
-            // Tool calls that need a server will trigger get_client on demand.
-            let cm = client_manager_for_roots.clone();
-            runtime_for_roots.spawn(async move { cm.spawn_all().await });
+            runtime_for_roots.block_on(toolbox_for_roots.sync_roots(paths))?;
             Ok(())
         }));
 
@@ -547,7 +517,7 @@ async fn run_server(args: Args) -> Result<()> {
 
     // Shutdown LSP clients gracefully
     info!("Shutting down LSP servers");
-    client_manager.shutdown_all().await;
+    toolbox_for_shutdown.shutdown().await;
 
     // Mark session dead explicitly — Drop may not run because
     // spawn_blocking holds an Arc<Session> clone that outlives the runtime.

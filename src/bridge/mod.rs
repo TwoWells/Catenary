@@ -24,6 +24,6 @@ pub mod toolbox;
 
 pub use diagnostics_server::DiagnosticsServer;
 pub use document_manager::{DocumentManager, DocumentNotification};
-pub use handler::LspBridgeHandler;
+pub use handler::McpRouter;
 pub use path_security::PathValidator;
 pub use tool_server::ToolServer;

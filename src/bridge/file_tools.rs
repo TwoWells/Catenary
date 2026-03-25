@@ -17,15 +17,13 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::warn;
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{check_server_health, resolve_path};
 use super::symbols::{format_symbol_kind, is_outline_kind};
 use super::tool_server::ToolServer;
-use super::{DocumentManager, DocumentNotification};
-use crate::lsp::{ClientManager, LspClient};
+use crate::lsp::LspClientManager;
 
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
@@ -91,8 +89,7 @@ fn extract_outline_symbols(response: &Value) -> OutlineSymbols {
 
 /// Glob tool server: unified file/directory/pattern browsing with LSP symbols.
 pub struct GlobServer {
-    pub(super) client_manager: Arc<ClientManager>,
-    pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
+    pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
 }
@@ -157,69 +154,6 @@ impl ToolServer for GlobServer {
 }
 
 impl GlobServer {
-    /// Gets the appropriate LSP client for the given file path.
-    async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
-        let lang_id = {
-            let doc_manager = self.doc_manager.lock().await;
-            doc_manager.language_id_for_path(path).to_string()
-        };
-
-        self.client_manager
-            .get_client_for_path(path, &lang_id)
-            .await
-    }
-
-    /// Ensures a document is open and synced with the LSP server.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Client lock held across notification send"
-    )]
-    async fn ensure_document_open(
-        &self,
-        path: &Path,
-        parent_id: Option<i64>,
-    ) -> Result<(String, Arc<Mutex<LspClient>>)> {
-        let client_mutex = self.get_client_for_path(path).await?;
-        let mut doc_manager = self.doc_manager.lock().await;
-        let mut client = client_mutex.lock().await;
-
-        client.set_parent_id(parent_id);
-
-        if !client.is_alive() {
-            client.set_parent_id(None);
-            return Err(anyhow!(
-                "[{}] server is no longer running",
-                client.language()
-            ));
-        }
-
-        let uri = doc_manager.uri_for_path(path)?;
-
-        if let Some(notification) = doc_manager.ensure_open(path).await? {
-            match notification {
-                DocumentNotification::Open {
-                    language_id,
-                    version,
-                    text,
-                    ..
-                } => {
-                    client.did_open(&uri, &language_id, version, &text).await?;
-                }
-                DocumentNotification::Change { version, text, .. } => {
-                    client.did_change(&uri, version, &text).await?;
-                }
-            }
-
-            drop(doc_manager);
-            drop(client);
-            return Ok((uri, client_mutex.clone()));
-        }
-
-        drop(doc_manager);
-        drop(client);
-        Ok((uri, client_mutex.clone()))
-    }
-
     /// Waits for the server handling the given path to be ready.
     ///
     /// Dead servers are non-fatal — the wait completes and the caller
@@ -229,7 +163,7 @@ impl GlobServer {
         reason = "Client lock held across wait_ready call"
     )]
     async fn wait_for_server_ready(&self, path: &Path) {
-        let Ok(client_mutex) = self.get_client_for_path(path).await else {
+        let Ok(client_mutex) = self.client_manager.get_client(path).await else {
             return;
         };
 
@@ -257,15 +191,7 @@ impl GlobServer {
     /// Returns the language key for a file path, matching the key used in
     /// `clients()`.
     async fn language_for_path(&self, path: &Path) -> Option<String> {
-        let lang_id = {
-            let doc_manager = self.doc_manager.lock().await;
-            doc_manager.language_id_for_path(path).to_string()
-        };
-        let client_mutex = self
-            .client_manager
-            .get_client_for_path(path, &lang_id)
-            .await
-            .ok()?;
+        let client_mutex = self.client_manager.get_client(path).await.ok()?;
         Some(client_mutex.lock().await.language().to_string())
     }
 
@@ -490,7 +416,10 @@ impl GlobServer {
         path: &Path,
         parent_id: Option<i64>,
     ) -> Result<OutlineSymbols> {
-        let (uri_str, client_mutex) = self.ensure_document_open(path, parent_id).await?;
+        let (uri_str, client_mutex) = self
+            .client_manager
+            .ensure_document_open(path, parent_id)
+            .await?;
 
         let mut client = client_mutex.lock().await;
         client.set_parent_id(parent_id);

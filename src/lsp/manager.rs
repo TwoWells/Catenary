@@ -10,34 +10,60 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::bridge::filesystem_manager::FilesystemManager;
+use crate::bridge::{DocumentManager, DocumentNotification};
 use crate::config::Config;
 use crate::lsp::LspClient;
 use crate::lsp::state::ServerStatus;
 use crate::session::MessageLog;
 
-/// Manages the lifecycle of LSP clients (spawning, caching, shutdown).
-pub struct ClientManager {
+/// Manages the lifecycle of LSP clients, document state, and language detection.
+///
+/// Single authority for LSP server spawning, caching, shutdown, and document
+/// lifecycle. Absorbs `DocumentManager` — document open/change tracking and
+/// LSP notifications are tightly coupled to server management.
+pub struct LspClientManager {
     config: Config,
     roots: Mutex<Vec<PathBuf>>,
     clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
     message_log: Arc<MessageLog>,
+    fs: Arc<FilesystemManager>,
+    doc_manager: Mutex<DocumentManager>,
 }
 
-impl ClientManager {
-    /// Creates a new `ClientManager`.
+impl LspClientManager {
+    /// Creates a new `LspClientManager`.
     #[must_use]
-    pub fn new(config: Config, roots: Vec<PathBuf>, message_log: Arc<MessageLog>) -> Self {
+    pub fn new(
+        config: Config,
+        roots: Vec<PathBuf>,
+        message_log: Arc<MessageLog>,
+        fs: Arc<FilesystemManager>,
+        session_id: String,
+    ) -> Self {
         Self {
             config,
             roots: Mutex::new(roots),
             clients: Mutex::new(HashMap::new()),
             message_log,
+            fs,
+            doc_manager: Mutex::new(DocumentManager::new(session_id)),
         }
     }
 
     /// Returns a reference to the configuration.
     pub const fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Returns a reference to the internal document manager.
+    ///
+    /// Prefer [`ensure_document_open`](Self::ensure_document_open) for the
+    /// common case. This lower-level access is for callers that need custom
+    /// notification sequencing (e.g., `DiagnosticsServer` snapshots the
+    /// diagnostics generation before sending notifications).
+    pub const fn doc_manager(&self) -> &Mutex<DocumentManager> {
+        &self.doc_manager
     }
 
     /// Spawns LSP servers for languages detected in the workspace.
@@ -62,7 +88,7 @@ impl ClientManager {
         info!("Detected languages in workspace: {}", sorted.join(", "));
 
         for lang in &relevant {
-            if let Err(e) = self.get_client(lang).await {
+            if let Err(e) = self.get_or_spawn(lang).await {
                 warn!("Failed to spawn LSP server for {lang}: {e}");
             }
         }
@@ -226,7 +252,7 @@ impl ClientManager {
         Ok(())
     }
 
-    /// Gets a client for the given language, spawning it if necessary.
+    /// Gets or spawns a client for the given language key.
     ///
     /// Dead clients are left in the map as tombstones — a server that
     /// crashes will not be restarted. Intentional restarts (e.g. after
@@ -240,7 +266,7 @@ impl ClientManager {
     /// - No LSP server is configured for the language.
     /// - The server fails to spawn.
     /// - The server fails to initialize.
-    pub async fn get_client(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
+    pub async fn get_or_spawn(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
         if let Some(client) = self.clients.lock().await.get(lang) {
             if client.lock().await.is_alive() {
                 return Ok(client.clone());
@@ -290,29 +316,88 @@ impl ClientManager {
         Ok(client_mutex)
     }
 
-    /// Gets a client for a file path, trying the detected language ID first,
-    /// then the file extension as a direct config key.
+    /// Gets a client for a file path, detecting the language automatically.
     ///
-    /// This handles custom or test languages where the file extension itself
-    /// is the configured server key (e.g., `.yX4Za` → config key `"yX4Za"`).
+    /// Uses [`FilesystemManager`] for language detection (extension, filename,
+    /// shebang). Falls back to the raw file extension as a direct config key
+    /// for custom or test languages (e.g., `.yX4Za` → config key `"yX4Za"`).
     ///
     /// # Errors
     ///
-    /// Returns an error if no LSP server matches the language ID or file extension.
-    pub async fn get_client_for_path(
-        &self,
-        path: &Path,
-        lang_id: &str,
-    ) -> Result<Arc<Mutex<LspClient>>> {
-        if let Ok(client) = self.get_client(lang_id).await {
+    /// Returns an error if no language can be detected for the path, or if
+    /// the detected language has no configured server, or if the server
+    /// fails to spawn.
+    pub async fn get_client(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
+        // Primary: use FilesystemManager for language detection
+        if let Some(lang_id) = self.fs.language_id(path)
+            && let Ok(client) = self.get_or_spawn(lang_id).await
+        {
             return Ok(client);
         }
-        // Fallback: try file extension as config key (custom/test languages)
+
+        // Fallback: try file extension as direct config key (custom/test languages)
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang_id}'"))?;
-        self.get_client(ext).await
+            .ok_or_else(|| anyhow!("No LSP server configured for {}", path.display()))?;
+        self.get_or_spawn(ext).await
+    }
+
+    /// Ensures a document is open and synced with its LSP server.
+    ///
+    /// Gets the client for the file's language, opens the document if not
+    /// already open, and sends the appropriate `didOpen` or `didChange`
+    /// notification. Returns the document URI and client for further LSP
+    /// requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if language detection fails, the server is dead,
+    /// or the document cannot be opened.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Client lock held across notification send"
+    )]
+    pub async fn ensure_document_open(
+        &self,
+        path: &Path,
+        parent_id: Option<i64>,
+    ) -> Result<(String, Arc<Mutex<LspClient>>)> {
+        let client_mutex = self.get_client(path).await?;
+        let mut doc_manager = self.doc_manager.lock().await;
+        let mut client = client_mutex.lock().await;
+
+        client.set_parent_id(parent_id);
+
+        if !client.is_alive() {
+            client.set_parent_id(None);
+            return Err(anyhow!(
+                "[{}] server is no longer running",
+                client.language()
+            ));
+        }
+
+        let uri = doc_manager.uri_for_path(path)?;
+
+        if let Some(notification) = doc_manager.ensure_open(path).await? {
+            match notification {
+                DocumentNotification::Open {
+                    language_id,
+                    version,
+                    text,
+                    ..
+                } => {
+                    client.did_open(&uri, &language_id, version, &text).await?;
+                }
+                DocumentNotification::Change { version, text, .. } => {
+                    client.did_change(&uri, version, &text).await?;
+                }
+            }
+        }
+
+        drop(doc_manager);
+        drop(client);
+        Ok((uri, client_mutex))
     }
 
     /// Spawns LSP servers for new languages detected in the given file paths.
@@ -355,7 +440,7 @@ impl ClientManager {
         info!("Mid-session server spawn for: {}", sorted.join(", "));
 
         for lang in &to_spawn {
-            if let Err(e) = self.get_client(lang).await {
+            if let Err(e) = self.get_or_spawn(lang).await {
                 warn!("Failed to spawn LSP server for {lang}: {e}");
             }
         }
@@ -566,6 +651,10 @@ mod tests {
         Arc::new(MessageLog::noop())
     }
 
+    fn test_fs() -> Arc<FilesystemManager> {
+        Arc::new(FilesystemManager::new())
+    }
+
     fn test_config() -> Config {
         Config {
             server: HashMap::new(),
@@ -634,10 +723,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_returns_initial_roots() -> Result<()> {
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
         let roots = manager.roots().await;
@@ -649,7 +740,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_empty_initial() -> Result<()> {
-        let manager = ClientManager::new(test_config(), vec![], test_message_log());
+        let manager = LspClientManager::new(
+            test_config(),
+            vec![],
+            test_message_log(),
+            test_fs(),
+            String::new(),
+        );
 
         assert!(manager.roots().await.is_empty());
         Ok(())
@@ -657,10 +754,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_root() -> Result<()> {
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
         assert_eq!(manager.roots().await.len(), 2);
@@ -675,10 +774,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_roots_adds_and_removes() -> Result<()> {
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
         // Sync: remove /tmp/root_a, keep /tmp/root_b, add /tmp/root_c
@@ -698,10 +799,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_roots_no_change() -> Result<()> {
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
         manager
@@ -718,13 +821,15 @@ mod tests {
     async fn test_sync_roots_shuts_down_unsupported_client() -> Result<()> {
         // mockls without --workspace-folders does NOT advertise workspace folder support.
         // When roots change, the client should be shut down (and lazily respawned).
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
-        let client = manager.get_client(MOCK_LANG_A).await?;
+        let client = manager.get_or_spawn(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
         assert!(
             !client.lock().await.supports_workspace_folders(),
@@ -774,11 +879,17 @@ mod tests {
             tui: crate::config::TuiConfig::default(),
         };
 
-        let manager = ClientManager::new(config, vec![PathBuf::from("/tmp")], test_message_log());
+        let manager = LspClientManager::new(
+            config,
+            vec![PathBuf::from("/tmp")],
+            test_message_log(),
+            test_fs(),
+            String::new(),
+        );
 
         // get_client spawns + initializes; mockls sends workspace/configuration
         // during init. If Catenary responds correctly, initialization succeeds.
-        let client = manager.get_client(MOCK_LANG_A).await?;
+        let client = manager.get_or_spawn(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
 
         Ok(())
@@ -788,13 +899,15 @@ mod tests {
     async fn test_sync_roots_notifies_supported_client() -> Result<()> {
         // mockls with --workspace-folders DOES advertise workspace folder support.
         // When roots change, it should receive a notification instead of being shut down.
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             vec![PathBuf::from("/tmp")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
-        let client = manager.get_client(MOCK_LANG_A).await?;
+        let client = manager.get_or_spawn(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
         assert!(
             client.lock().await.supports_workspace_folders(),
@@ -819,10 +932,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_clients_for_paths_spawns_new_language() -> Result<()> {
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
         assert!(manager.clients().await.is_empty());
@@ -840,14 +955,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_clients_for_paths_skips_existing() -> Result<()> {
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
         // Pre-spawn the server
-        let _ = manager.get_client(MOCK_LANG_A).await?;
+        let _ = manager.get_or_spawn(MOCK_LANG_A).await?;
         assert_eq!(manager.clients().await.len(), 1);
 
         // ensure_clients_for_paths should not fail or double-spawn
@@ -864,10 +981,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_clients_for_paths_ignores_unconfigured() -> Result<()> {
-        let manager = ClientManager::new(
+        let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_message_log(),
+            test_fs(),
+            String::new(),
         );
 
         // .xyz has no configured server — should be silently skipped
@@ -908,5 +1027,57 @@ mod tests {
     fn test_config_key_for_path_unknown() {
         assert_eq!(config_key_for_path(Path::new("test.xyz")), None);
         assert_eq!(config_key_for_path(Path::new("no_extension")), None);
+    }
+
+    #[tokio::test]
+    async fn test_get_client_resolves_language_from_path() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_message_log(),
+            test_fs(),
+            String::new(),
+        );
+
+        // A file with the mock language extension should resolve to the mock server
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let client = manager.get_client(&path).await?;
+        assert!(client.lock().await.is_alive());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_client_unknown_language_errors() {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_message_log(),
+            test_fs(),
+            String::new(),
+        );
+
+        // A file with an unknown extension and no config key should error
+        let result = manager.get_client(Path::new("/tmp/test.xyz")).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_document_open_sends_did_open() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_message_log(),
+            test_fs(),
+            String::new(),
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
+        std::fs::write(&path, "content").expect("write");
+
+        let (uri, client_mutex) = manager.ensure_document_open(&path, None).await?;
+        assert!(uri.starts_with("file://"));
+        assert!(client_mutex.lock().await.is_alive());
+        Ok(())
     }
 }

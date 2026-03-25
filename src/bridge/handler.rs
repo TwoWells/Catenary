@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::tool_server::ToolServer;
 use super::toolbox::Toolbox;
-use crate::lsp::ClientManager;
+use crate::lsp::LspClientManager;
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 
 /// Maximum unique LSP symbols for hover display in grep output.
@@ -34,7 +34,7 @@ pub(super) struct ServerHealth {
 /// - Newly dead servers get a single offline message with scope of impact.
 /// - Previously-offline servers that recovered get a single recovery message.
 pub(super) async fn check_server_health(
-    client_manager: &ClientManager,
+    client_manager: &LspClientManager,
     touched_servers: &[String],
     notified_offline: &std::sync::Mutex<HashSet<String>>,
 ) -> ServerHealth {
@@ -113,14 +113,18 @@ pub(super) async fn check_server_health(
     ServerHealth { dead, notification }
 }
 
-/// Bridge handler that implements MCP `ToolHandler` trait.
-/// Handles MCP tool calls by routing them to the appropriate LSP server.
-pub struct LspBridgeHandler {
+/// MCP tool call router.
+///
+/// Routes `tools/call` requests to the appropriate tool server and
+/// handles editing lifecycle (`start_editing`/`done_editing`).
+/// Implements [`ToolHandler`] to maintain clean dependency direction
+/// between the `mcp` (protocol) and `bridge` (application) modules.
+pub struct McpRouter {
     toolbox: Arc<Toolbox>,
 }
 
-impl LspBridgeHandler {
-    /// Creates a new `LspBridgeHandler` wrapping a shared `Toolbox`.
+impl McpRouter {
+    /// Creates a new `McpRouter` wrapping a shared `Toolbox`.
     #[must_use]
     pub const fn new(toolbox: Arc<Toolbox>) -> Self {
         Self { toolbox }
@@ -156,7 +160,7 @@ pub(super) fn has_cap(caps: &Value, key: &str) -> bool {
     caps.get(key).is_some_and(|v| !v.is_null())
 }
 
-impl ToolHandler for LspBridgeHandler {
+impl ToolHandler for McpRouter {
     fn list_tools(&self) -> Vec<Tool> {
         vec![
             Tool {
@@ -259,7 +263,7 @@ impl ToolHandler for LspBridgeHandler {
                 let doc_manager = self
                     .toolbox
                     .runtime
-                    .block_on(self.toolbox.doc_manager.lock());
+                    .block_on(self.toolbox.client_manager.doc_manager().lock());
                 doc_manager.start_editing("")
             };
             return match result {
@@ -276,7 +280,7 @@ impl ToolHandler for LspBridgeHandler {
                 let doc_manager = self
                     .toolbox
                     .runtime
-                    .block_on(self.toolbox.doc_manager.lock());
+                    .block_on(self.toolbox.client_manager.doc_manager().lock());
                 doc_manager.finish_editing("")
             };
             return match files {

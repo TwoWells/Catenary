@@ -982,27 +982,12 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
 
-        let client_manager = Arc::new(crate::lsp::ClientManager::new(
+        let toolbox = Arc::new(Toolbox::new(
             config,
             vec![],
             message_log.clone(),
-        ));
-        let doc_manager = Arc::new(tokio::sync::Mutex::new(
-            crate::bridge::DocumentManager::new(String::new()),
-        ));
-        let path_validator = Arc::new(tokio::sync::RwLock::new(crate::bridge::PathValidator::new(
-            vec![],
-        )));
-        let diagnostics = Arc::new(crate::bridge::DiagnosticsServer::new(
-            client_manager.clone(),
-            doc_manager.clone(),
-            path_validator,
-        ));
-        let toolbox = Arc::new(Toolbox::new(
-            client_manager,
-            doc_manager,
+            String::new(),
             handle,
-            diagnostics,
         ));
         let refresh_roots = Arc::new(AtomicBool::new(false));
 

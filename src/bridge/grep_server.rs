@@ -24,8 +24,7 @@ use super::symbols::{
     self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
 };
 use super::tool_server::ToolServer;
-use super::{DocumentManager, DocumentNotification};
-use crate::lsp::{ClientManager, LspClient};
+use crate::lsp::{LspClient, LspClientManager};
 
 /// Maximum unique LSP symbols for hover display in output. Above this
 /// threshold, hover content is omitted but structural enrichment (references,
@@ -54,8 +53,7 @@ pub struct GrepInput {
 
 /// Grep tool server: ripgrep + workspace/symbol pipeline with LSP enrichment.
 pub struct GrepServer {
-    pub(super) client_manager: Arc<ClientManager>,
-    pub(super) doc_manager: Arc<Mutex<DocumentManager>>,
+    pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
 }
@@ -105,69 +103,6 @@ impl ToolServer for GrepServer {
 }
 
 impl GrepServer {
-    /// Gets the appropriate LSP client for the given file path.
-    async fn get_client_for_path(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
-        let lang_id = {
-            let doc_manager = self.doc_manager.lock().await;
-            doc_manager.language_id_for_path(path).to_string()
-        };
-
-        self.client_manager
-            .get_client_for_path(path, &lang_id)
-            .await
-    }
-
-    /// Ensures a document is open and synced with the LSP server.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Client lock held across notification send"
-    )]
-    async fn ensure_document_open(
-        &self,
-        path: &Path,
-        parent_id: Option<i64>,
-    ) -> Result<(String, Arc<Mutex<LspClient>>)> {
-        let client_mutex = self.get_client_for_path(path).await?;
-        let mut doc_manager = self.doc_manager.lock().await;
-        let mut client = client_mutex.lock().await;
-
-        client.set_parent_id(parent_id);
-
-        if !client.is_alive() {
-            client.set_parent_id(None);
-            return Err(anyhow!(
-                "[{}] server is no longer running",
-                client.language()
-            ));
-        }
-
-        let uri = doc_manager.uri_for_path(path)?;
-
-        if let Some(notification) = doc_manager.ensure_open(path).await? {
-            match notification {
-                DocumentNotification::Open {
-                    language_id,
-                    version,
-                    text,
-                    ..
-                } => {
-                    client.did_open(&uri, &language_id, version, &text).await?;
-                }
-                DocumentNotification::Change { version, text, .. } => {
-                    client.did_change(&uri, version, &text).await?;
-                }
-            }
-
-            drop(doc_manager);
-            drop(client);
-            return Ok((uri, client_mutex.clone()));
-        }
-
-        drop(doc_manager);
-        drop(client);
-        Ok((uri, client_mutex.clone()))
-    }
-
     /// Grep: ripgrep + `workspace/symbol("")` pipeline with LSP enrichment.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
     async fn run(&self, input: GrepInput, parent_id: Option<i64>) -> Result<String> {
@@ -499,7 +434,11 @@ impl GrepServer {
     ) -> SymbolEnrichment {
         let mut enrichment = SymbolEnrichment::default();
 
-        let Ok((uri_str, client_mutex)) = self.ensure_document_open(path, parent_id).await else {
+        let Ok((uri_str, client_mutex)) = self
+            .client_manager
+            .ensure_document_open(path, parent_id)
+            .await
+        else {
             return enrichment;
         };
 
@@ -592,7 +531,11 @@ impl GrepServer {
         let mut inferred_kind = symbols::SK_VARIABLE;
         let mut resolved_name: Option<String> = None;
 
-        let Ok((uri_str, client_mutex)) = self.ensure_document_open(path, parent_id).await else {
+        let Ok((uri_str, client_mutex)) = self
+            .client_manager
+            .ensure_document_open(path, parent_id)
+            .await
+        else {
             return (inferred_kind, resolved_name, enrichment);
         };
 
@@ -778,7 +721,10 @@ impl GrepServer {
                 // prepareRename distinguishes symbols from keywords:
                 // symbol → range, keyword → null. Cheaper than full enrichment.
                 let is_symbol = {
-                    let open_result = self.ensure_document_open(&path, parent_id).await;
+                    let open_result = self
+                        .client_manager
+                        .ensure_document_open(&path, parent_id)
+                        .await;
                     if let Ok((uri_str, client_mutex)) = open_result {
                         let mut client = client_mutex.lock().await;
                         client.set_parent_id(parent_id);
