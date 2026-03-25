@@ -45,8 +45,9 @@ struct Args {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Workspace root directories. Can be specified multiple times.
-    #[arg(short, long, global = true)]
+    /// Workspace root directories for the MCP server. Can be specified multiple times.
+    /// Defaults to the current directory. Overridden by MCP client initialize params.
+    #[arg(short, long)]
     root: Vec<PathBuf>,
 
     /// Document idle timeout in seconds before auto-close (0 to disable).
@@ -235,10 +236,7 @@ async fn main() -> Result<()> {
             nocolor,
             diff,
         }) => {
-            let mut roots = args.root;
-            if let Some(p) = path {
-                roots.push(p);
-            }
+            let roots: Vec<PathBuf> = path.into_iter().collect();
             cli::doctor::run_doctor(args.config.as_deref(), &args.lsps, &roots, nocolor, diff).await
         }
         Some(Command::Install { spec, list, remove }) => {
@@ -372,7 +370,8 @@ async fn run_server(args: Args) -> Result<()> {
         );
     }
 
-    // Default to current directory if no roots specified
+    // Default to current directory if no roots specified.
+    // MCP client overrides via initialize params.
     let raw_roots = if args.root.is_empty() {
         vec![PathBuf::from(".")]
     } else {
