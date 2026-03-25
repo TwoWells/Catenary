@@ -28,15 +28,17 @@ Internal planning and tracking for the Catenary project.
 `FilesystemManager` (done), `LspClientManager` (done — absorbs
 `DocumentManager`, `get_client(path)`, `Toolbox` as application
 container, `McpRouter` rename), `inherit` config model, root
-resolution, `HookRouter` extraction. Unblocks misc 28.
+resolution, `HookRouter` extraction. Unblocks misc 28a.
 
 **2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
-Unblocks `didChangeConfiguration` dynamic registration for misc 28.
-Just 1b-00 — the rest of the 1b pipeline follows after misc 28.
+Unblocks `didChangeConfiguration` dynamic registration for misc 28a.
+Just 1b-00 — the rest of the 1b pipeline follows after misc 28a.
 
-**3. Misc 28 (multi-root / workspace folders).** Per-root instances
-for legacy servers, routing, two-tier configuration model (`scopeUri`
-resolution). Blocked on workstream 15 and 1b-00. Subsumes misc 13.
+**3. Misc 28a (multi-root / workspace folders, tiers 1–2).**
+Project-scoped servers, user-scoped workspace servers, per-root
+instances for legacy servers, three-tier routing, `scopeUri`
+resolution. Blocked on management 02, management 03, and 1b-00.
+Subsumes misc 13. Misc 28b (single-file tier) follows after waitv2.
 
 **4. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
 tickets (1b-01 through 1b-08, including 02a/02b split). Critical
