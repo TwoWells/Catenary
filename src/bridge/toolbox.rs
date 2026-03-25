@@ -37,6 +37,8 @@ pub struct Toolbox {
     pub diagnostics: Arc<DiagnosticsServer>,
     /// LSP client manager (also owns document manager).
     pub(super) client_manager: Arc<LspClientManager>,
+    /// File classification and root resolution.
+    fs_manager: Arc<FilesystemManager>,
     /// Path validation for LSP-aware operations.
     path_validator: Arc<RwLock<PathValidator>>,
     /// Tokio runtime handle for blocking dispatch.
@@ -54,6 +56,7 @@ impl Toolbox {
         runtime: Handle,
     ) -> Self {
         let fs_manager = Arc::new(FilesystemManager::new());
+        fs_manager.set_roots(roots.clone());
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots.clone())));
         let client_manager = Arc::new(LspClientManager::new(
             config,
@@ -74,7 +77,7 @@ impl Toolbox {
         };
         let glob = GlobServer {
             client_manager: client_manager.clone(),
-            fs_manager,
+            fs_manager: fs_manager.clone(),
             notified_offline,
         };
         Self {
@@ -82,6 +85,7 @@ impl Toolbox {
             glob,
             diagnostics,
             client_manager,
+            fs_manager,
             path_validator,
             runtime,
         }
@@ -101,6 +105,7 @@ impl Toolbox {
     ///
     /// Returns an error if root synchronization fails.
     pub async fn sync_roots(&self, roots: Vec<PathBuf>) -> Result<()> {
+        self.fs_manager.set_roots(roots.clone());
         self.path_validator
             .write()
             .await

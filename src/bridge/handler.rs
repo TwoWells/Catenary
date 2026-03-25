@@ -6,8 +6,10 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use super::filesystem_manager::FilesystemManager;
 
 use super::tool_server::ToolServer;
 use super::toolbox::Toolbox;
@@ -143,16 +145,21 @@ pub(super) fn resolve_path(file: &str) -> Result<PathBuf> {
     }
 }
 
-/// Makes a file path relative to the nearest root, for display.
-pub(super) fn display_path(file: &str, roots: &[PathBuf]) -> String {
-    roots
-        .iter()
-        .find_map(|root| {
-            let root_str = root.to_string_lossy();
-            file.strip_prefix(root_str.as_ref())
-                .map(|rest| rest.strip_prefix('/').unwrap_or(rest).to_string())
-        })
-        .unwrap_or_else(|| file.to_string())
+/// Makes a file path relative to the owning root, for display.
+///
+/// Uses [`FilesystemManager::resolve_root`] for longest-prefix matching
+/// instead of ad-hoc iteration.
+pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
+    let path = Path::new(file);
+    fs.resolve_root(path).map_or_else(
+        || file.to_string(),
+        |root| {
+            path.strip_prefix(&root).map_or_else(
+                |_| file.to_string(),
+                |rel| rel.to_string_lossy().to_string(),
+            )
+        },
+    )
 }
 
 /// Returns `true` if a capability key is present and non-null.

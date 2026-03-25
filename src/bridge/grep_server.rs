@@ -256,7 +256,7 @@ impl GrepServer {
             {
                 let _ = writeln!(output);
                 for (file, file_lines) in lines {
-                    let path = display_path(file, &roots);
+                    let path = display_path(file, &self.fs_manager);
                     let _ = writeln!(output, "{path} {}", format_line_ranges(file_lines));
                 }
             }
@@ -265,7 +265,7 @@ impl GrepServer {
             if let Some(defs) = by_name.get(name) {
                 for sym in defs {
                     let kind = format_symbol_kind(sym.kind);
-                    let path = display_path(&sym.file_path, &roots);
+                    let path = display_path(&sym.file_path, &self.fs_manager);
                     let line = sym.line + 1;
                     let _ = writeln!(output, "\n## [{kind}] {path}:{line}");
 
@@ -285,7 +285,7 @@ impl GrepServer {
                         if !enrichment.incoming_calls.is_empty() {
                             let _ = writeln!(output, "\n### Callers\n");
                             for (name, file, line) in &enrichment.incoming_calls {
-                                let path = display_path(file, &roots);
+                                let path = display_path(file, &self.fs_manager);
                                 let _ = writeln!(output, "{name}  {path}:{line}");
                                 labeled_lines.insert((file.clone(), *line));
                             }
@@ -294,7 +294,7 @@ impl GrepServer {
                         if !enrichment.implementations.is_empty() {
                             let _ = writeln!(output, "\n### Implementations\n");
                             for (file, line) in &enrichment.implementations {
-                                let path = display_path(file, &roots);
+                                let path = display_path(file, &self.fs_manager);
                                 let _ = writeln!(output, "{path}:{line}");
                                 labeled_lines.insert((file.clone(), *line));
                             }
@@ -303,7 +303,7 @@ impl GrepServer {
                         if !enrichment.subtypes.is_empty() {
                             let _ = writeln!(output, "\n### Subtypes\n");
                             for (name, file, line) in &enrichment.subtypes {
-                                let path = display_path(file, &roots);
+                                let path = display_path(file, &self.fs_manager);
                                 let _ = writeln!(output, "{name}  {path}:{line}");
                                 labeled_lines.insert((file.clone(), *line));
                             }
@@ -314,7 +314,7 @@ impl GrepServer {
                             enrichment,
                             &sym.file_path,
                             sym.line,
-                            &roots,
+                            &self.fs_manager,
                             &labeled_lines,
                         );
                         if !ref_output.is_empty() {
@@ -1250,7 +1250,7 @@ fn format_symbol_references(
     enrichment: &SymbolEnrichment,
     def_file: &str,
     def_line_0: u32,
-    roots: &[PathBuf],
+    fs: &FilesystemManager,
     labeled_lines: &HashSet<(String, u32)>,
 ) -> String {
     use std::fmt::Write;
@@ -1280,7 +1280,7 @@ fn format_symbol_references(
             continue;
         }
         filtered.sort_unstable();
-        let path = display_path(file, roots);
+        let path = display_path(file, fs);
         let _ = writeln!(output, "{path} {}", format_line_ranges(&filtered));
     }
 
@@ -1403,18 +1403,20 @@ mod tests {
 
     #[test]
     fn test_display_path_strips_root() {
-        let roots = vec![PathBuf::from("/home/user/project")];
+        let fs = FilesystemManager::new();
+        fs.set_roots(vec![PathBuf::from("/home/user/project")]);
         assert_eq!(
-            display_path("/home/user/project/src/main.rs", &roots),
+            display_path("/home/user/project/src/main.rs", &fs),
             "src/main.rs"
         );
     }
 
     #[test]
     fn test_display_path_no_matching_root() {
-        let roots = vec![PathBuf::from("/home/user/project")];
+        let fs = FilesystemManager::new();
+        fs.set_roots(vec![PathBuf::from("/home/user/project")]);
         assert_eq!(
-            display_path("/other/path/file.rs", &roots),
+            display_path("/other/path/file.rs", &fs),
             "/other/path/file.rs"
         );
     }
@@ -1487,11 +1489,12 @@ mod tests {
             ref_lines,
             ..SymbolEnrichment::default()
         };
-        let roots = vec![PathBuf::from("/")];
+        let fs = FilesystemManager::new();
+        fs.set_roots(vec![PathBuf::from("/")]);
         let labeled = HashSet::new();
 
         // Definition is at line 0 (0-indexed) = line 1 (1-indexed)
-        let result = format_symbol_references(&enrichment, "/src/lib.rs", 0, &roots, &labeled);
+        let result = format_symbol_references(&enrichment, "/src/lib.rs", 0, &fs, &labeled);
         assert!(result.contains("L10"));
         assert!(result.contains("L20"));
         assert!(

@@ -15,12 +15,16 @@ use std::path::{Path, PathBuf};
 const BINARY_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
 
 /// File classification result.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FileInfo {
     /// File modification time (seconds since epoch).
     pub mtime: u64,
     /// File size in bytes.
     pub size: u64,
+    /// Owning workspace root (longest-prefix match), or `None` if outside
+    /// all known roots. Resolved live on every [`FilesystemManager::classify`]
+    /// call — not cached.
+    pub root: Option<PathBuf>,
     /// File kind (binary or text with metadata).
     pub kind: FileKind,
 }
@@ -56,8 +60,11 @@ pub enum FileKind {
 /// Single authority for file metadata: binary detection, line count,
 /// language ID, and shebang detection. Shared by `GrepServer` and
 /// `GlobServer` through `Toolbox`.
+///
+/// Also owns the workspace root list for longest-prefix root resolution.
 pub struct FilesystemManager {
     cache: std::sync::Mutex<HashMap<PathBuf, CachedEntry>>,
+    roots: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 /// Cache entry storing classification results keyed by mtime.
@@ -70,6 +77,7 @@ impl Default for FilesystemManager {
     fn default() -> Self {
         Self {
             cache: std::sync::Mutex::new(HashMap::new()),
+            roots: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -89,6 +97,7 @@ impl FilesystemManager {
     pub fn classify(&self, path: &Path, metadata: &std::fs::Metadata) -> FileInfo {
         let mtime = mtime_secs(metadata);
         let size = metadata.len();
+        let root = self.resolve_root(path);
 
         // Check cache
         if let Ok(cache) = self.cache.lock()
@@ -98,6 +107,7 @@ impl FilesystemManager {
             return FileInfo {
                 mtime,
                 size,
+                root,
                 kind: entry.kind,
             };
         }
@@ -119,7 +129,12 @@ impl FilesystemManager {
             cache.insert(path.to_path_buf(), CachedEntry { mtime, kind });
         }
 
-        FileInfo { mtime, size, kind }
+        FileInfo {
+            mtime,
+            size,
+            root,
+            kind,
+        }
     }
 
     /// Returns `true` if the file is binary, using the cache when possible.
@@ -148,6 +163,29 @@ impl FilesystemManager {
         // Slow path: full classification for shebang
         let metadata = std::fs::metadata(path).ok()?;
         self.classify(path, &metadata).language_id()
+    }
+
+    /// Resolves the owning workspace root for a path.
+    ///
+    /// Returns the longest-prefix match against known roots, or `None` if
+    /// the path is outside all known roots.
+    #[must_use]
+    pub fn resolve_root(&self, path: &Path) -> Option<PathBuf> {
+        let Ok(roots) = self.roots.lock() else {
+            return None;
+        };
+        roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+            .cloned()
+    }
+
+    /// Updates the known workspace root set.
+    pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        if let Ok(mut current) = self.roots.lock() {
+            *current = roots;
+        }
     }
 }
 
@@ -616,5 +654,89 @@ mod tests {
                 language_id: Some("python"),
             }
         );
+    }
+
+    // --- Root resolution ---
+
+    #[test]
+    fn resolve_root_single_match() {
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![PathBuf::from("/home/user/project")]);
+        assert_eq!(
+            mgr.resolve_root(Path::new("/home/user/project/src/main.rs")),
+            Some(PathBuf::from("/home/user/project"))
+        );
+    }
+
+    #[test]
+    fn resolve_root_outside_all_roots() {
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![PathBuf::from("/home/user/project")]);
+        assert_eq!(mgr.resolve_root(Path::new("/other/path/file.rs")), None);
+    }
+
+    #[test]
+    fn resolve_root_longest_prefix_wins() {
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![
+            PathBuf::from("/home/user/project"),
+            PathBuf::from("/home/user/project/subdir"),
+        ]);
+        assert_eq!(
+            mgr.resolve_root(Path::new("/home/user/project/subdir/foo.rs")),
+            Some(PathBuf::from("/home/user/project/subdir"))
+        );
+    }
+
+    #[test]
+    fn resolve_root_no_roots() {
+        let mgr = FilesystemManager::new();
+        assert_eq!(mgr.resolve_root(Path::new("/any/path/file.rs")), None);
+    }
+
+    #[test]
+    fn set_roots_updates_resolution() {
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![PathBuf::from("/home/user/project")]);
+        assert_eq!(
+            mgr.resolve_root(Path::new("/home/user/project/src/main.rs")),
+            Some(PathBuf::from("/home/user/project"))
+        );
+
+        mgr.set_roots(vec![PathBuf::from("/other/root")]);
+        assert_eq!(
+            mgr.resolve_root(Path::new("/home/user/project/src/main.rs")),
+            None
+        );
+        assert_eq!(
+            mgr.resolve_root(Path::new("/other/root/file.rs")),
+            Some(PathBuf::from("/other/root"))
+        );
+    }
+
+    #[test]
+    fn classify_populates_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("code.rs");
+        std::fs::write(&path, "fn main() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let info = mgr.classify(&path, &metadata);
+        assert_eq!(info.root, Some(dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn classify_root_none_when_outside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("code.rs");
+        std::fs::write(&path, "fn main() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        // No roots set
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let info = mgr.classify(&path, &metadata);
+        assert_eq!(info.root, None);
     }
 }
