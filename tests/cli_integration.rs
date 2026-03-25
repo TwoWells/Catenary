@@ -30,8 +30,8 @@ impl ServerProcess {
         let state_dir = tempfile::tempdir().context("Failed to create state tempdir")?;
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.arg("--root").arg(".");
         // Isolate from user-level config and state
+        cmd.env("CATENARY_ROOTS", ".");
         cmd.env("XDG_CONFIG_HOME", ".");
         cmd.env("CATENARY_STATE_DIR", state_dir.path());
 

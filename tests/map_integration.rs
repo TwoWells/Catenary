@@ -38,9 +38,9 @@ impl BridgeProcess {
                 .arg(format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}"));
         }
 
-        for root in roots {
-            cmd.arg("--root").arg(root);
-        }
+        // Set roots via env var
+        let roots_val = std::env::join_paths(roots).unwrap_or_default();
+        cmd.env("CATENARY_ROOTS", &roots_val);
 
         // Isolate from user-level config and state
         if let Some(first_root) = roots.first() {

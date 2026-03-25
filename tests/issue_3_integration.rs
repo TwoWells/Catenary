@@ -38,8 +38,7 @@ impl BridgeProcess {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("--lsp")
             .arg(lsp)
-            .arg("--root")
-            .arg(root)
+            .env("CATENARY_ROOTS", root)
             .env("XDG_CONFIG_HOME", root)
             .env("XDG_STATE_HOME", root)
             .stdin(Stdio::piped())

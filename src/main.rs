@@ -45,11 +45,6 @@ struct Args {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Workspace root directories for the MCP server. Can be specified multiple times.
-    /// Defaults to the current directory. Overridden by MCP client initialize params.
-    #[arg(short, long)]
-    root: Vec<PathBuf>,
-
     /// Document idle timeout in seconds before auto-close (0 to disable).
     /// Overrides config file if set (default in config is 300).
     #[arg(long, global = true)]
@@ -370,12 +365,11 @@ async fn run_server(args: Args) -> Result<()> {
         );
     }
 
-    // Default to current directory if no roots specified.
+    // Bootstrap roots from CATENARY_ROOTS env var (path-separated) or default to cwd.
     // MCP client overrides via initialize params.
-    let raw_roots = if args.root.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        args.root
+    let raw_roots: Vec<PathBuf> = match std::env::var("CATENARY_ROOTS") {
+        Ok(val) if !val.is_empty() => std::env::split_paths(&val).collect(),
+        _ => vec![PathBuf::from(".")],
     };
     let roots: Vec<PathBuf> = raw_roots
         .into_iter()

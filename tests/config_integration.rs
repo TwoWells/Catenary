@@ -42,8 +42,8 @@ fn test_config_loading() -> Result<()> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     let state_dir = tempfile::tempdir()?;
     cmd.arg("--config").arg(config_path);
-    cmd.arg("--root").arg(&root_dir);
     // Isolate from user-level config and state
+    cmd.env("CATENARY_ROOTS", &root_dir);
     cmd.env("XDG_CONFIG_HOME", &root_dir);
     cmd.env("CATENARY_STATE_DIR", state_dir.path());
 
@@ -136,8 +136,8 @@ fn test_config_override() -> Result<()> {
     cmd.arg("--lsp")
         .arg(format!("{MOCK_LANG_B}:{mockls_bin} {MOCK_LANG_B}"));
     cmd.arg("--idle-timeout").arg("10");
-    cmd.arg("--root").arg(&root_dir);
     // Isolate from user-level config and state
+    cmd.env("CATENARY_ROOTS", &root_dir);
     cmd.env("XDG_CONFIG_HOME", &root_dir);
     cmd.env("CATENARY_STATE_DIR", state_dir.path());
 

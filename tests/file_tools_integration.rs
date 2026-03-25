@@ -27,8 +27,8 @@ struct BridgeProcess {
 impl BridgeProcess {
     fn spawn(root: &str) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.arg("--root").arg(root);
         // Isolate from user-level config and state
+        cmd.env("CATENARY_ROOTS", root);
         cmd.env("XDG_CONFIG_HOME", root);
         cmd.env("XDG_STATE_HOME", root);
         cmd.stdin(Stdio::piped())
@@ -51,7 +51,7 @@ impl BridgeProcess {
     fn spawn_with_real_lsp(lsp_arg: &str, root: &str) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("--lsp").arg(lsp_arg);
-        cmd.arg("--root").arg(root);
+        cmd.env("CATENARY_ROOTS", root);
         cmd.env("XDG_CONFIG_HOME", root);
         cmd.env("XDG_STATE_HOME", root);
         cmd.stdin(Stdio::piped())
@@ -77,7 +77,7 @@ impl BridgeProcess {
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.arg("--lsp").arg(lsp);
-        cmd.arg("--root").arg(root);
+        cmd.env("CATENARY_ROOTS", root);
         cmd.env("XDG_CONFIG_HOME", root);
         cmd.env("XDG_STATE_HOME", root);
         cmd.stdin(Stdio::piped())

@@ -42,9 +42,9 @@ impl BridgeProcess {
             cmd.arg("--lsp").arg(lsp);
         }
 
-        for root in roots {
-            cmd.arg("--root").arg(root);
-        }
+        // Set roots via env var
+        let roots_val = std::env::join_paths(roots).unwrap_or_default();
+        cmd.env("CATENARY_ROOTS", &roots_val);
 
         // Isolate from user-level config
         if let Some(first_root) = roots.first() {
@@ -394,8 +394,7 @@ fn test_client_info_stored_in_session() -> Result<()> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--lsp")
         .arg(&lsp)
-        .arg("--root")
-        .arg("/tmp")
+        .env("CATENARY_ROOTS", "/tmp")
         .env("XDG_CONFIG_HOME", "/tmp")
         .env("XDG_STATE_HOME", state_dir.path())
         .stdin(Stdio::piped())

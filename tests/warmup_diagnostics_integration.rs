@@ -64,12 +64,8 @@ fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
     let lsp_arg = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A} --publish-version");
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_catenary"))
-        .args([
-            "--root",
-            dir.path().to_str().context("invalid path")?,
-            "--lsp",
-            &lsp_arg,
-        ])
+        .args(["--lsp", &lsp_arg])
+        .env("CATENARY_ROOTS", dir.path())
         .env("XDG_CONFIG_HOME", dir.path())
         .env("XDG_STATE_HOME", state_dir.path())
         .stdin(Stdio::piped())
