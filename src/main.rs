@@ -86,8 +86,12 @@ enum Command {
     },
 
     /// Check language server health. Tests all configured servers by default.
-    /// Use --root to scope to a specific workspace.
+    /// Pass a path to scope to a specific workspace.
     Doctor {
+        /// Workspace root to scope the check. When provided, only tests
+        /// servers for languages detected in this directory.
+        path: Option<PathBuf>,
+
         /// Disable colored output.
         #[arg(long)]
         nocolor: bool,
@@ -226,15 +230,16 @@ async fn main() -> Result<()> {
             filter,
         }) => cli::commands::run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => cli::commands::run_status(&id),
-        Some(Command::Doctor { nocolor, diff }) => {
-            cli::doctor::run_doctor(
-                args.config.as_deref(),
-                &args.lsps,
-                &args.root,
-                nocolor,
-                diff,
-            )
-            .await
+        Some(Command::Doctor {
+            path,
+            nocolor,
+            diff,
+        }) => {
+            let mut roots = args.root;
+            if let Some(p) = path {
+                roots.push(p);
+            }
+            cli::doctor::run_doctor(args.config.as_deref(), &args.lsps, &roots, nocolor, diff).await
         }
         Some(Command::Install { spec, list, remove }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
