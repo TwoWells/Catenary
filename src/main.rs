@@ -85,7 +85,8 @@ enum Command {
         id: String,
     },
 
-    /// Check language server health for the current workspace.
+    /// Check language server health. Tests all configured servers by default.
+    /// Use --root to scope to a specific workspace.
     Doctor {
         /// Disable colored output.
         #[arg(long)]

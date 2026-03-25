@@ -24,7 +24,11 @@ const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 /// Expected constrained-bash hook script, embedded at compile time.
 const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../../scripts/constrained_bash.py");
 
-/// Run the doctor command: check language server health for the current workspace.
+/// Run the doctor command: check language server health.
+///
+/// When `roots` is empty, tests all configured language servers. When
+/// roots are provided, only tests servers for languages detected in
+/// those directories.
 ///
 /// # Errors
 ///
@@ -80,29 +84,33 @@ pub async fn run_doctor(
         );
     }
 
-    // Resolve workspace roots
-    let resolved_roots: Vec<PathBuf> = if roots.is_empty() {
-        vec![PathBuf::from(".").canonicalize()?]
+    // Resolve workspace roots (if provided)
+    let resolved_roots: Option<Vec<PathBuf>> = if roots.is_empty() {
+        None
     } else {
-        roots
-            .iter()
-            .map(|r| r.canonicalize())
-            .collect::<std::io::Result<Vec<_>>>()?
+        Some(
+            roots
+                .iter()
+                .map(|r| r.canonicalize())
+                .collect::<std::io::Result<Vec<_>>>()?,
+        )
     };
 
-    // Print config and roots
+    // Print config header
     let config_source =
         config_path.map_or_else(|| "default paths".to_string(), |p| p.display().to_string());
     println!("{} {}", colors.bold("Config:"), config_source);
-    println!(
-        "{} {}",
-        colors.bold("Roots: "),
-        resolved_roots
-            .iter()
-            .map(|r| r.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    if let Some(ref resolved) = resolved_roots {
+        println!(
+            "{} {}",
+            colors.bold("Roots: "),
+            resolved
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!();
 
     // Config warnings
@@ -125,10 +133,13 @@ pub async fn run_doctor(
         return Ok(());
     }
 
-    // Detect which languages have files in the workspace
-    let configured_keys: std::collections::HashSet<&str> =
-        config.language.keys().map(String::as_str).collect();
-    let detected = lsp::detect_workspace_languages(&resolved_roots, &configured_keys);
+    // Detect which languages have files in the workspace (only when roots provided)
+    let detected: Option<std::collections::HashSet<String>> =
+        resolved_roots.as_ref().map(|roots| {
+            let configured_keys: std::collections::HashSet<&str> =
+                config.language.keys().map(String::as_str).collect();
+            lsp::detect_workspace_languages(roots, &configured_keys)
+        });
 
     // Sort servers alphabetically — skip inherit-only entries without a command
     let mut servers: Vec<(&String, &crate::config::LanguageConfig)> = config
@@ -153,8 +164,10 @@ pub async fn run_doctor(
         let lang_display = format!("{lang:<max_lang_width$}");
         let cmd_display = format!("{command:<max_cmd_width$}");
 
-        // Check if any files for this language exist
-        if !detected.contains(lang.as_str()) {
+        // Check if any files for this language exist (only when roots provided)
+        if let Some(ref det) = detected
+            && !det.contains(lang.as_str())
+        {
             println!(
                 "{}  {}  {}",
                 colors.dim(&lang_display),
@@ -197,8 +210,9 @@ pub async fn run_doctor(
             }
         };
 
+        let init_roots = resolved_roots.as_deref().unwrap_or(&[]);
         match client
-            .initialize(&resolved_roots, lang_config.initialization_options.clone())
+            .initialize(init_roots, lang_config.initialization_options.clone())
             .await
         {
             Ok(result) => {
