@@ -39,11 +39,6 @@ struct Args {
     /// Path to configuration file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-
-    /// Document idle timeout in seconds before auto-close (0 to disable).
-    /// Overrides config file if set (default in config is 300).
-    #[arg(long, global = true)]
-    idle_timeout: Option<u64>,
 }
 
 /// Subcommands supported by Catenary.
@@ -323,12 +318,7 @@ async fn run_server(args: Args) -> Result<()> {
         .init();
 
     // Load configuration
-    let mut config = catenary_mcp::config::Config::load(args.config.clone())?;
-
-    // Override idle_timeout if provided on CLI
-    if let Some(timeout) = args.idle_timeout {
-        config.idle_timeout = timeout;
-    }
+    let config = catenary_mcp::config::Config::load(args.config.clone())?;
 
     // Bootstrap roots from CATENARY_ROOTS env var (path-separated) or default to cwd.
     // MCP client overrides via initialize params.

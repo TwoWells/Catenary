@@ -137,7 +137,7 @@ fn test_config_override() -> Result<()> {
         "CATENARY_SERVERS",
         format!("{MOCK_LANG_B}:{mockls_bin} {MOCK_LANG_B}"),
     );
-    cmd.arg("--idle-timeout").arg("10");
+    cmd.env("CATENARY_IDLE_TIMEOUT", "10");
     // Isolate from user-level config and state
     cmd.env("CATENARY_ROOTS", &root_dir);
     cmd.env("XDG_CONFIG_HOME", &root_dir);
