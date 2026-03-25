@@ -144,7 +144,7 @@ fn run_with_data_and_watcher(
     let icons = IconSet::from_config(icon_config);
 
     // Load TUI config for sessions width.
-    let tui_config = crate::config::Config::load(None)
+    let tui_config = crate::config::Config::load()
         .map(|c| c.tui)
         .unwrap_or_default();
 

@@ -35,10 +35,6 @@ struct Args {
     /// The subcommand to run.
     #[command(subcommand)]
     command: Option<Command>,
-
-    /// Path to configuration file.
-    #[arg(long, global = true)]
-    config: Option<PathBuf>,
 }
 
 /// Subcommands supported by Catenary.
@@ -203,9 +199,9 @@ async fn main() -> Result<()> {
     match args.command {
         None => {
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                run_dashboard(&args)
+                run_dashboard()
             } else {
-                run_server(args).await
+                run_server().await
             }
         }
         Some(Command::List) => cli::commands::run_list(),
@@ -222,7 +218,7 @@ async fn main() -> Result<()> {
             diff,
         }) => {
             let roots: Vec<PathBuf> = path.into_iter().collect();
-            cli::doctor::run_doctor(args.config.as_deref(), &roots, nocolor, diff).await
+            cli::doctor::run_doctor(&roots, nocolor, diff).await
         }
         Some(Command::Install { spec, list, remove }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
@@ -285,8 +281,8 @@ async fn main() -> Result<()> {
 ///
 /// Returns an error if configuration loading, session pruning, or TUI
 /// initialisation fails.
-fn run_dashboard(args: &Args) -> Result<()> {
-    let config = catenary_mcp::config::Config::load(args.config.clone())?;
+fn run_dashboard() -> Result<()> {
+    let config = catenary_mcp::config::Config::load()?;
 
     let conn = catenary_mcp::db::open_and_migrate()?;
     if let Err(e) = session::prune_sessions_with_conn(&conn, config.log_retention_days) {
@@ -305,7 +301,7 @@ fn run_dashboard(args: &Args) -> Result<()> {
     clippy::too_many_lines,
     reason = "Server setup requires sequential initialization steps"
 )]
-async fn run_server(args: Args) -> Result<()> {
+async fn run_server() -> Result<()> {
     let (error_layer, error_layer_handle) = catenary_mcp::error_layer::ErrorLayer::new();
 
     tracing_subscriber::registry()
@@ -318,7 +314,7 @@ async fn run_server(args: Args) -> Result<()> {
         .init();
 
     // Load configuration
-    let config = catenary_mcp::config::Config::load(args.config.clone())?;
+    let config = catenary_mcp::config::Config::load()?;
 
     // Bootstrap roots from CATENARY_ROOTS env var (path-separated) or default to cwd.
     // MCP client overrides via initialize params.

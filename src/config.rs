@@ -236,7 +236,7 @@ impl Config {
     /// - A file uses both `[server.*]` and `[language.*]`.
     /// - `inherit` targets are missing, chained, or cyclic.
     /// - A concrete language entry is missing `command`.
-    pub fn load(explicit_file: Option<PathBuf>) -> Result<Self> {
+    pub fn load() -> Result<Self> {
         let mut sources: Vec<PathBuf> = Vec::new();
 
         // 1. User config directory (~/.config/catenary/config.toml)
@@ -260,9 +260,9 @@ impl Config {
             }
         }
 
-        // 3. Explicit file
-        if let Some(path) = explicit_file {
-            sources.push(path);
+        // 3. Explicit file from CATENARY_CONFIG env var
+        if let Ok(path) = std::env::var("CATENARY_CONFIG") {
+            sources.push(PathBuf::from(path));
         }
 
         Self::load_from_sources(&sources)

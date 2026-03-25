@@ -41,7 +41,7 @@ fn test_config_loading() -> Result<()> {
     // Spawn catenary using ONLY the config file (no CATENARY_SERVERS)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     let state_dir = tempfile::tempdir()?;
-    cmd.arg("--config").arg(config_path);
+    cmd.env("CATENARY_CONFIG", &config_path);
     // Isolate from user-level config and state
     cmd.env("CATENARY_ROOTS", &root_dir);
     cmd.env("XDG_CONFIG_HOME", &root_dir);
@@ -131,7 +131,7 @@ fn test_config_override() -> Result<()> {
     // Config provides MOCK_LANG_A (mockls), env provides MOCK_LANG_B (also mockls)
     // CLI also overrides idle_timeout to 10 (config has 60)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-    cmd.arg("--config").arg(config_path);
+    cmd.env("CATENARY_CONFIG", &config_path);
     let state_dir = tempfile::tempdir()?;
     cmd.env(
         "CATENARY_SERVERS",

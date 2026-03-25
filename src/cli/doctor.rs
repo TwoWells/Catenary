@@ -37,12 +37,7 @@ const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../../scripts/constrained_
     clippy::too_many_lines,
     reason = "Doctor command has sequential output logic"
 )]
-pub async fn run_doctor(
-    config_path: Option<&Path>,
-    roots: &[PathBuf],
-    nocolor: bool,
-    show_diff: bool,
-) -> Result<()> {
+pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Result<()> {
     let colors = ColorConfig::new(nocolor);
 
     // Print version header
@@ -50,7 +45,7 @@ pub async fn run_doctor(
     println!();
 
     // Load configuration — report errors inline instead of bailing
-    let config = match crate::config::Config::load(config_path.map(Path::to_path_buf)) {
+    let config = match crate::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
             println!("{}", colors.red(&format!("✗ Config error: {e:#}")));
@@ -72,8 +67,9 @@ pub async fn run_doctor(
     };
 
     // Print config header
-    let config_source =
-        config_path.map_or_else(|| "default paths".to_string(), |p| p.display().to_string());
+    let config_source = std::env::var("CATENARY_CONFIG")
+        .ok()
+        .unwrap_or_else(|| "default paths".to_string());
     println!("{} {}", colors.bold("Config:"), config_source);
     if let Some(ref resolved) = resolved_roots {
         println!(
