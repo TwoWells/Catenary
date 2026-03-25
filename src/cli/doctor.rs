@@ -46,8 +46,15 @@ pub async fn run_doctor(
     println!("Catenary {}", env!("CATENARY_VERSION"));
     println!();
 
-    // Load configuration (same as run_server)
-    let mut config = crate::config::Config::load(config_path.map(Path::to_path_buf))?;
+    // Load configuration — report errors inline instead of bailing
+    let mut config = match crate::config::Config::load(config_path.map(Path::to_path_buf)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{}", colors.red(&format!("✗ Config error: {e:#}")));
+            println!();
+            return Ok(());
+        }
+    };
     for lsp_spec in lsps {
         let (lang, command_str) = lsp_spec.split_once(':').ok_or_else(|| {
             anyhow::anyhow!("Invalid LSP spec: {lsp_spec}. Expected 'lang:command'")
@@ -98,12 +105,18 @@ pub async fn run_doctor(
     );
     println!();
 
-    // Deprecation warning
+    // Config warnings
     if config.deprecated_server_key {
         println!(
             "{}",
             colors.yellow("⚠  Config uses deprecated [server.*] key — rename to [language.*]"),
         );
+    }
+    let validation_errors = config.validate();
+    for err in &validation_errors {
+        println!("{}", colors.red(&format!("✗  {err}")));
+    }
+    if config.deprecated_server_key || !validation_errors.is_empty() {
         println!();
     }
 

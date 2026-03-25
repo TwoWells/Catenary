@@ -288,7 +288,11 @@ impl Config {
 
         config.apply_env_overrides();
         config.apply_default_inherits();
-        config.validate()?;
+
+        let errors = config.validate();
+        if !errors.is_empty() {
+            bail!("Configuration errors:\n{}", errors.join("\n"));
+        }
 
         Ok(config)
     }
@@ -381,37 +385,39 @@ impl Config {
         }
     }
 
-    /// Validate the merged config.
-    fn validate(&self) -> Result<()> {
+    /// Validate the merged config, returning all errors found.
+    ///
+    /// Returns an empty vec when the config is valid.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
         for (key, lang_config) in &self.language {
             if let Some(ref target) = lang_config.inherit {
-                // Target must exist
-                let target_config = self.language.get(target).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Language '{key}' inherits from '{target}', \
+                match self.language.get(target) {
+                    None => {
+                        errors.push(format!(
+                            "Language '{key}' inherits from '{target}', \
                              but '{target}' is not configured"
-                    )
-                })?;
-
-                // No chains: target must not itself inherit
-                if target_config.inherit.is_some() {
-                    bail!(
-                        "Language '{key}' inherits from '{target}', \
-                         but '{target}' also inherits — chains are not allowed"
-                    );
+                        ));
+                    }
+                    Some(target_config) if target_config.inherit.is_some() => {
+                        errors.push(format!(
+                            "Language '{key}' inherits from '{target}', \
+                             but '{target}' also inherits — chains are not allowed"
+                        ));
+                    }
+                    _ => {}
                 }
-            } else {
-                // Concrete entry must have a command
-                if lang_config.command.is_none() {
-                    bail!(
-                        "Language '{key}' has no `command` and no `inherit` — \
-                         concrete entries must specify a command"
-                    );
-                }
+            } else if lang_config.command.is_none() {
+                errors.push(format!(
+                    "Language '{key}' has no `command` and no `inherit` — \
+                     concrete entries must specify a command"
+                ));
             }
         }
 
-        Ok(())
+        errors
     }
 
     /// Resolve `inherit` for a language key, returning the canonical key
