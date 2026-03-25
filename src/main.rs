@@ -36,11 +36,6 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// LSP servers to spawn in "lang:command" format (e.g., "rust:rust-analyzer").
-    /// Can be specified multiple times. These override/append to the config file.
-    #[arg(short, long = "lsp", global = true)]
-    lsps: Vec<String>,
-
     /// Path to configuration file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -232,7 +227,7 @@ async fn main() -> Result<()> {
             diff,
         }) => {
             let roots: Vec<PathBuf> = path.into_iter().collect();
-            cli::doctor::run_doctor(args.config.as_deref(), &args.lsps, &roots, nocolor, diff).await
+            cli::doctor::run_doctor(args.config.as_deref(), &roots, nocolor, diff).await
         }
         Some(Command::Install { spec, list, remove }) => {
             let conn = catenary_mcp::db::open_and_migrate()?;
@@ -333,36 +328,6 @@ async fn run_server(args: Args) -> Result<()> {
     // Override idle_timeout if provided on CLI
     if let Some(timeout) = args.idle_timeout {
         config.idle_timeout = timeout;
-    }
-
-    // Merge CLI LSPs into config
-    for lsp_spec in args.lsps {
-        let (lang, command_str) = lsp_spec.split_once(':').ok_or_else(|| {
-            anyhow::anyhow!("Invalid LSP spec: {lsp_spec}. Expected 'lang:command'")
-        })?;
-
-        let lang = lang.trim().to_string();
-        let command_str = command_str.trim();
-
-        // Parse command into program and arguments
-        let mut parts = command_str.split_whitespace();
-        let program = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?
-            .to_string();
-        let cmd_args: Vec<String> = parts.map(std::string::ToString::to_string).collect();
-
-        config.language.insert(
-            lang,
-            catenary_mcp::config::LanguageConfig {
-                command: Some(program),
-                args: cmd_args,
-                initialization_options: None,
-                min_severity: None,
-                settings: None,
-                inherit: None,
-            },
-        );
     }
 
     // Bootstrap roots from CATENARY_ROOTS env var (path-separated) or default to cwd.

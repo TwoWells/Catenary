@@ -38,7 +38,7 @@ fn test_config_loading() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let config_path = write_mockls_config(tmp.path())?;
 
-    // Spawn catenary using ONLY the config file (no --lsp args)
+    // Spawn catenary using ONLY the config file (no CATENARY_SERVERS)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     let state_dir = tempfile::tempdir()?;
     cmd.arg("--config").arg(config_path);
@@ -127,14 +127,16 @@ fn test_config_override() -> Result<()> {
     let config_path = write_mockls_config(tmp.path())?;
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
 
-    // Spawn catenary with config AND CLI override
-    // Config provides MOCK_LANG_A (mockls), CLI provides MOCK_LANG_B (also mockls)
+    // Spawn catenary with config AND env override
+    // Config provides MOCK_LANG_A (mockls), env provides MOCK_LANG_B (also mockls)
     // CLI also overrides idle_timeout to 10 (config has 60)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.arg("--config").arg(config_path);
     let state_dir = tempfile::tempdir()?;
-    cmd.arg("--lsp")
-        .arg(format!("{MOCK_LANG_B}:{mockls_bin} {MOCK_LANG_B}"));
+    cmd.env(
+        "CATENARY_SERVERS",
+        format!("{MOCK_LANG_B}:{mockls_bin} {MOCK_LANG_B}"),
+    );
     cmd.arg("--idle-timeout").arg("10");
     // Isolate from user-level config and state
     cmd.env("CATENARY_ROOTS", &root_dir);

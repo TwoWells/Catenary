@@ -362,6 +362,36 @@ impl Config {
         {
             self.log_retention_days = v;
         }
+
+        // CATENARY_SERVERS: semicolon-separated "lang:command args" specs
+        if let Ok(val) = std::env::var("CATENARY_SERVERS") {
+            for spec in val.split(';') {
+                let spec = spec.trim();
+                if spec.is_empty() {
+                    continue;
+                }
+                if let Some((lang, command_str)) = spec.split_once(':') {
+                    let lang = lang.trim();
+                    let command_str = command_str.trim();
+                    let mut parts = command_str.split_whitespace();
+                    if let Some(program) = parts.next() {
+                        let cmd_args: Vec<String> =
+                            parts.map(std::string::ToString::to_string).collect();
+                        self.language.insert(
+                            lang.to_string(),
+                            LanguageConfig {
+                                command: Some(program.to_string()),
+                                args: cmd_args,
+                                initialization_options: None,
+                                min_severity: None,
+                                settings: None,
+                                inherit: None,
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Apply default inherit entries for known language variants.

@@ -36,8 +36,7 @@ struct BridgeProcess {
 impl BridgeProcess {
     fn spawn(lsp: &str, root: &str) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.arg("--lsp")
-            .arg(lsp)
+        cmd.env("CATENARY_SERVERS", lsp)
             .env("CATENARY_ROOTS", root)
             .env("XDG_CONFIG_HOME", root)
             .env("XDG_STATE_HOME", root)
@@ -179,7 +178,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     let mockc_bin = env!("CARGO_BIN_EXE_mockc");
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     // mockc defaults to --ticks 10 (~100ms CPU). No extra args needed,
-    // avoiding quoting issues with Catenary's whitespace-split --lsp parser.
+    // avoiding quoting issues with Catenary's whitespace-split CATENARY_SERVERS parser.
     let lsp = format!(
         "{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A} --publish-version --advertise-save \
          --flycheck-command {mockc_bin}"

@@ -30,13 +30,14 @@ impl BridgeProcess {
 
     fn spawn_multi_root(roots: &[&str], lsp_args: Option<&str>) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        if let Some(arg) = lsp_args {
-            cmd.arg("--lsp").arg(arg);
-        } else {
-            let bin = env!("CARGO_BIN_EXE_mockls");
-            cmd.arg("--lsp")
-                .arg(format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}"));
-        }
+        let servers = lsp_args.map_or_else(
+            || {
+                let bin = env!("CARGO_BIN_EXE_mockls");
+                format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}")
+            },
+            str::to_string,
+        );
+        cmd.env("CATENARY_SERVERS", &servers);
 
         // Set roots via env var
         let roots_val = std::env::join_paths(roots).unwrap_or_default();

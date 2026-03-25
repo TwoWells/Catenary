@@ -39,7 +39,6 @@ const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../../scripts/constrained_
 )]
 pub async fn run_doctor(
     config_path: Option<&Path>,
-    lsps: &[String],
     roots: &[PathBuf],
     nocolor: bool,
     show_diff: bool,
@@ -51,7 +50,7 @@ pub async fn run_doctor(
     println!();
 
     // Load configuration — report errors inline instead of bailing
-    let mut config = match crate::config::Config::load(config_path.map(Path::to_path_buf)) {
+    let config = match crate::config::Config::load(config_path.map(Path::to_path_buf)) {
         Ok(c) => c,
         Err(e) => {
             println!("{}", colors.red(&format!("✗ Config error: {e:#}")));
@@ -59,30 +58,6 @@ pub async fn run_doctor(
             return Ok(());
         }
     };
-    for lsp_spec in lsps {
-        let (lang, command_str) = lsp_spec.split_once(':').ok_or_else(|| {
-            anyhow::anyhow!("Invalid LSP spec: {lsp_spec}. Expected 'lang:command'")
-        })?;
-        let lang = lang.trim().to_string();
-        let command_str = command_str.trim();
-        let mut parts = command_str.split_whitespace();
-        let program = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?
-            .to_string();
-        let cmd_args: Vec<String> = parts.map(std::string::ToString::to_string).collect();
-        config.language.insert(
-            lang,
-            crate::config::LanguageConfig {
-                command: Some(program),
-                args: cmd_args,
-                initialization_options: None,
-                min_severity: None,
-                settings: None,
-                inherit: None,
-            },
-        );
-    }
 
     // Resolve workspace roots (if provided)
     let resolved_roots: Option<Vec<PathBuf>> = if roots.is_empty() {

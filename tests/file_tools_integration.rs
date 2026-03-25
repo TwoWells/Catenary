@@ -50,7 +50,7 @@ impl BridgeProcess {
 
     fn spawn_with_real_lsp(lsp_arg: &str, root: &str) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.arg("--lsp").arg(lsp_arg);
+        cmd.env("CATENARY_SERVERS", lsp_arg);
         cmd.env("CATENARY_ROOTS", root);
         cmd.env("XDG_CONFIG_HOME", root);
         cmd.env("XDG_STATE_HOME", root);
@@ -76,7 +76,7 @@ impl BridgeProcess {
         let lsp = format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}");
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.arg("--lsp").arg(lsp);
+        cmd.env("CATENARY_SERVERS", lsp);
         cmd.env("CATENARY_ROOTS", root);
         cmd.env("XDG_CONFIG_HOME", root);
         cmd.env("XDG_STATE_HOME", root);

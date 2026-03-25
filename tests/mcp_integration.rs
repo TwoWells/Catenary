@@ -38,9 +38,8 @@ impl BridgeProcess {
     fn spawn_multi_root(lsp_commands: &[&str], roots: &[&str]) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
 
-        for lsp in lsp_commands {
-            cmd.arg("--lsp").arg(lsp);
-        }
+        // Set servers via env var (semicolon-separated)
+        cmd.env("CATENARY_SERVERS", lsp_commands.join(";"));
 
         // Set roots via env var
         let roots_val = std::env::join_paths(roots).unwrap_or_default();
@@ -392,8 +391,7 @@ fn test_client_info_stored_in_session() -> Result<()> {
 
     // Spawn bridge with isolated state dir so `catenary list` only sees this session
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-    cmd.arg("--lsp")
-        .arg(&lsp)
+    cmd.env("CATENARY_SERVERS", &lsp)
         .env("CATENARY_ROOTS", "/tmp")
         .env("XDG_CONFIG_HOME", "/tmp")
         .env("XDG_STATE_HOME", state_dir.path())
@@ -848,7 +846,7 @@ fn test_no_roots_request_without_capability() -> Result<()> {
 // These tests use mockls instead of real language servers, so they always
 // run regardless of installed toolchains.
 
-/// Build an `--lsp` argument for `BridgeProcess::spawn` using mockls.
+/// Build a `CATENARY_SERVERS` spec for `BridgeProcess::spawn` using mockls.
 fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_mockls");
     if flags.is_empty() {
