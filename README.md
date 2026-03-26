@@ -12,7 +12,7 @@ Internal planning and tracking for the Catenary project.
 | 4 | [SEARCHv2](#4-searchv2) | **In progress** | `tickets/searchv2/README.md` |
 | 5 | [Misc](#5-misc) | **Open** | `tickets/misc/README.md` |
 | 6 | [Wait model redesign](#6-wait-model-redesign) | **Reverted → v2 design** | `tickets/wait/DESIGN.md` |
-| 7 | [Wait model v2](#7-wait-model-v2) | **1b ready** | `tickets/waitv2/README.md` |
+| 7 | [Wait model v2](#7-wait-model-v2) | **1b-00 complete** | `tickets/waitv2/README.md` |
 | 8 | [Monitoring](#8-monitoring) | **Complete** | `tickets/monitoring/README.md` |
 | 9 | [Filtering](#9-filtering) | **Design complete** | `tickets/filtering/DESIGN.md` |
 | 10 | [Collapse](#10-collapse) | **Complete** | `tickets/collapse/README.md` |
@@ -24,17 +24,13 @@ Internal planning and tracking for the Catenary project.
 
 ## Current priority
 
-**1. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
-Unblocks `didChangeConfiguration` dynamic registration for misc 28a.
-Just 1b-00 — the rest of the 1b pipeline follows after misc 28a.
-
-**2. Misc 28a (multi-root / workspace folders, tiers 1–2).**
+**1. Misc 28a (multi-root / workspace folders, tiers 1–2).**
 Project-scoped servers, user-scoped workspace servers, per-root
 instances for legacy servers, three-tier routing, `scopeUri`
-resolution. Blocked on 1b-00. Management dependency satisfied.
+resolution. 1b-00 dependency satisfied. Management dependency satisfied.
 Subsumes misc 13. Misc 28b (single-file tier) follows after waitv2.
 
-**3. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
+**2. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
 tickets (1b-01 through 1b-08, including 02a/02b split). Critical
 path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
 (OnceLock), 05 (dm utils). Full design:
