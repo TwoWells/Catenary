@@ -22,7 +22,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The URL to the CLA document
-          CLA_DOCUMENT_URL: 'https://github.com/MarkWells-Dev/Catenary/blob/main/.github/CLA.md'
+          CLA_DOCUMENT_URL: 'https://github.com/TwoWells/Catenary/blob/main/.github/CLA.md'
           # The path to the file where signatures will be stored (relative to repository root)
           # We store it in .github to keep the root clean
           PATH_TO_SIGNATURES: '.github/cla-signatures.json'
