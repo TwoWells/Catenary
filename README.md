@@ -20,27 +20,21 @@ Internal planning and tracking for the Catenary project.
 | 12 | [Summarize](#12-summarize) | **Complete** | `tickets/summarize/README.md` |
 | 13 | [Diagnostic batching](#13-diagnostic-batching) | **v1 followup complete** | `tickets/acquire/DESIGN.md` |
 | 14 | [Recommend](#14-recommend) | **Design complete** | `tickets/recommend/DESIGN.md` |
-| 15 | [Management](#15-management) | **In progress** | `tickets/management/README.md` |
+| 15 | [Management](#15-management) | **Complete** | `tickets/management/README.md` |
 
 ## Current priority
 
-**1. Workstream 15 (Management).** 6 tickets (00–05). 00–01 done.
-`FilesystemManager` (done), `LspClientManager` (done — absorbs
-`DocumentManager`, `get_client(path)`, `Toolbox` as application
-container, `McpRouter` rename), `inherit` config model, root
-resolution, `HookRouter` extraction. Unblocks misc 28a.
-
-**2. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
+**1. Workstream 7 (Wait model v2) 1b-00 (registration storage).**
 Unblocks `didChangeConfiguration` dynamic registration for misc 28a.
 Just 1b-00 — the rest of the 1b pipeline follows after misc 28a.
 
-**3. Misc 28a (multi-root / workspace folders, tiers 1–2).**
+**2. Misc 28a (multi-root / workspace folders, tiers 1–2).**
 Project-scoped servers, user-scoped workspace servers, per-root
 instances for legacy servers, three-tier routing, `scopeUri`
-resolution. Blocked on management 02, management 03, and 1b-00.
+resolution. Blocked on 1b-00. Management dependency satisfied.
 Subsumes misc 13. Misc 28b (single-file tier) follows after waitv2.
 
-**4. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
+**3. Workstream 7 (Wait model v2) 1b-01+.** Remaining 1b pipeline
 tickets (1b-01 through 1b-08, including 02a/02b split). Critical
 path: 01 → 02a → 02b → 03 → {06, 07} → 08. Independent: 04
 (OnceLock), 05 (dm utils). Full design:
@@ -350,17 +344,17 @@ Design: `tickets/recommend/DESIGN.md`.
 
 ## 15. Management
 
-**Status: In progress.** 6 tickets (00–05). 00–01 done.
+**Status: Complete.** All 6 tickets (00–05) done.
 
-Rearchitects the file classification, client lookup, and application
-container layers. `FilesystemCache` → `FilesystemManager` (done: single
+Rearchitected the file classification, client lookup, and application
+container layers. `FilesystemCache` → `FilesystemManager` (single
 authority for file metadata). `ClientManager` → `LspClientManager`
-(done: absorbs `DocumentManager`, `get_client(path)`, `FilesystemManager`
-injection). `Toolbox` as application container (done: creates all
-internal dependencies, exposes `sync_roots`/`shutdown`).
-`LspBridgeHandler` → `McpRouter` (done). Config keys unified with LSP
+(absorbs `DocumentManager`, `get_client(path)`, `FilesystemManager`
+injection). `Toolbox` as application container (creates all internal
+dependencies, exposes `sync_roots`/`shutdown`).
+`LspBridgeHandler` → `McpRouter`. Config keys unified with LSP
 language IDs via `inherit`. `HookRouter` extraction (mirrors `McpRouter`
-pattern). Cleanup pass deletes dead code paths.
+pattern). Cleanup pass deleted dead code paths.
 
 Foundation for workstream 7 phase 1b and misc 28a (multi-root).
 

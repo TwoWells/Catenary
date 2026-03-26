@@ -18,15 +18,15 @@ use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
+use crate::bridge::HookRouter;
 use crate::bridge::toolbox::Toolbox;
-use crate::db;
 use crate::session::MessageLog;
 
 /// IPC request from the CLI hook process to the hook server.
@@ -35,7 +35,7 @@ use crate::session::MessageLog;
 /// five host CLI hooks.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "method")]
-enum HookRequest {
+pub(crate) enum HookRequest {
     /// Refresh workspace roots via MCP `roots/list`.
     #[serde(rename = "pre-agent/roots-sync")]
     PreAgentRootsSync {},
@@ -119,58 +119,22 @@ pub enum HookResult {
     Cleared(usize),
 }
 
-// ── Tool classification helpers ─────────────────────────────────────────
-
-/// Returns `true` if the tool is an edit tool that requires `start_editing`.
-///
-/// Checks all known edit tool names across host CLIs (Claude Code and Gemini CLI).
-fn is_edit_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "Edit" | "Write" | "NotebookEdit" | "write_file" | "replace"
-    )
-}
-
-/// Returns `true` if the tool is a read tool (always allowed during editing).
-///
-/// Checks all known read tool names across host CLIs.
-fn is_read_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "Read" | "NotebookRead" | "read_file")
-}
-
-/// Returns `true` if the tool is always allowed during editing mode.
-///
-/// Catenary editing tools (`start_editing`, `done_editing`) must be allowed
-/// so the agent can manage editing state. `ToolSearch` must be allowed
-/// because both editing tools are deferred in Claude Code — blocking
-/// `ToolSearch` while editing creates an unrecoverable state if the agent
-/// loaded `start_editing` but not `done_editing` before entering editing mode.
-fn is_allowed_during_editing(tool_name: &str) -> bool {
-    tool_name.contains("start_editing")
-        || tool_name.contains("done_editing")
-        || tool_name == "ToolSearch"
-}
-
 // ── HookServer ──────────────────────────────────────────────────────────
 
 /// Listens on an IPC endpoint for hook requests from the host CLI.
 ///
-/// Protocol boundary for all hook traffic. Dispatches on caller-supplied
-/// method names, runs editing state logic, diagnostics, and root sync
-/// server-side, and logs all hook messages for monitor visibility.
+/// Protocol boundary for all hook traffic. Parses IPC messages, logs
+/// request/response pairs for monitor visibility, and delegates application
+/// dispatch to [`HookRouter`].
 pub struct HookServer {
-    toolbox: Arc<Toolbox>,
-    refresh_roots: Arc<AtomicBool>,
+    router: Arc<HookRouter>,
     message_log: Arc<MessageLog>,
-    conn: Arc<Mutex<Connection>>,
-    session_id: String,
-    client_name: String,
 }
 
 impl HookServer {
     /// Creates a new `HookServer`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         toolbox: Arc<Toolbox>,
         refresh_roots: Arc<AtomicBool>,
         message_log: Arc<MessageLog>,
@@ -178,13 +142,16 @@ impl HookServer {
         session_id: String,
         client_name: String,
     ) -> Self {
-        Self {
+        let router = Arc::new(HookRouter::new(
             toolbox,
             refresh_roots,
-            message_log,
             conn,
             session_id,
             client_name,
+        ));
+        Self {
+            router,
+            message_log,
         }
     }
 
@@ -310,7 +277,7 @@ impl HookServer {
             "hook",
             &method,
             "catenary",
-            &self.client_name,
+            &self.router.client_name,
             None,
             None,
             &raw,
@@ -319,41 +286,7 @@ impl HookServer {
         let request: HookRequest =
             serde_json::from_value(raw).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
-        let result = match request {
-            HookRequest::PreAgentRootsSync {} => {
-                debug!("Hook: refresh roots requested");
-                self.refresh_roots.store(true, Ordering::Release);
-                None
-            }
-            HookRequest::PreToolEnforceEditing {
-                tool_name,
-                file_path: _,
-                agent_id,
-                session_id,
-            } => {
-                self.store_client_session_id(session_id.as_deref());
-                self.handle_enforce_editing(&tool_name, &agent_id)
-            }
-            HookRequest::PostToolDiagnostics {
-                file,
-                tool,
-                agent_id,
-                session_id,
-            } => {
-                self.store_client_session_id(session_id.as_deref());
-                debug!("Hook: processing file {file}");
-                self.handle_diagnostics(&file, &agent_id, tool.as_deref(), entry_id)
-                    .await
-            }
-            HookRequest::PostAgentRequireRelease {
-                agent_id,
-                stop_hook_active,
-            } => self.handle_require_release(&agent_id, stop_hook_active),
-            HookRequest::SessionStartClearEditing { session_id } => {
-                self.store_client_session_id(session_id.as_deref());
-                self.handle_clear_editing()
-            }
-        };
+        let result = self.router.dispatch(request, entry_id).await;
 
         let response = result
             .as_ref()
@@ -365,7 +298,7 @@ impl HookServer {
             "hook",
             &method,
             "catenary",
-            &self.client_name,
+            &self.router.client_name,
             Some(entry_id),
             None,
             &serde_json::from_str::<Value>(&response).unwrap_or_default(),
@@ -376,154 +309,6 @@ impl HookServer {
         writer.shutdown().await?;
 
         Ok(())
-    }
-
-    // ── Hook handlers ───────────────────────────────────────────────────
-
-    /// Editing state enforcement: deny or allow a tool call.
-    ///
-    /// If the agent is in editing mode, only Edit/Read/Write and Catenary
-    /// editing tools are allowed. If the agent is not in editing mode,
-    /// Edit/Write requires `start_editing` first.
-    fn handle_enforce_editing(&self, tool_name: &str, agent_id: &str) -> Option<HookResult> {
-        let agent_editing = self
-            .conn
-            .lock()
-            .ok()
-            .and_then(|c| db::is_agent_editing(&c, &self.session_id, agent_id).ok())
-            .unwrap_or(false);
-
-        if agent_editing {
-            if is_allowed_during_editing(tool_name)
-                || is_read_tool(tool_name)
-                || is_edit_tool(tool_name)
-            {
-                None
-            } else {
-                Some(HookResult::Deny(
-                    "call done_editing to get diagnostics".into(),
-                ))
-            }
-        } else if is_edit_tool(tool_name) {
-            Some(HookResult::Deny("call start_editing before editing".into()))
-        } else {
-            None
-        }
-    }
-
-    /// LSP diagnostics for a changed file, with editing state checks.
-    ///
-    /// When the agent is in editing mode: accumulates edit-tool file paths
-    /// and suppresses diagnostics (returns `None`). Adds a courtesy flag
-    /// when another agent has the file in their accumulated files.
-    async fn handle_diagnostics(
-        &self,
-        file_path: &str,
-        agent_id: &str,
-        tool_name: Option<&str>,
-        entry_id: i64,
-    ) -> Option<HookResult> {
-        // Check editing state before running diagnostics
-        let (agent_editing, other_editing) = {
-            let conn = self.conn.lock().ok();
-            let self_ed = conn
-                .as_ref()
-                .and_then(|c| db::is_agent_editing(c, &self.session_id, agent_id).ok())
-                .unwrap_or(false);
-            let other_ed = conn
-                .as_ref()
-                .and_then(|c| {
-                    db::is_file_edited_by_others(c, file_path, &self.session_id, agent_id).ok()
-                })
-                .unwrap_or(false);
-            drop(conn);
-            (self_ed, other_ed)
-        };
-
-        if agent_editing {
-            // Accumulate edit-tool file paths for done_editing
-            if tool_name.is_some_and(is_edit_tool)
-                && let Ok(conn) = self.conn.lock()
-            {
-                let _ = db::add_editing_file(&conn, &self.session_id, agent_id, file_path);
-            }
-            return None;
-        }
-
-        match self
-            .toolbox
-            .diagnostics
-            .process_file(file_path, entry_id)
-            .await
-        {
-            Ok(diag_result) => {
-                if other_editing {
-                    Some(HookResult::Courtesy(diag_result.content))
-                } else {
-                    Some(HookResult::Content(diag_result.content))
-                }
-            }
-            Err(e) => {
-                warn!("Notify error for {file_path}: {e}");
-                Some(HookResult::Error(e.to_string()))
-            }
-        }
-    }
-
-    /// Force `done_editing` before the agent stops.
-    ///
-    /// If `stop_hook_active` is true (retry), allows unconditionally.
-    /// Otherwise blocks if the agent is in editing mode.
-    fn handle_require_release(&self, agent_id: &str, stop_hook_active: bool) -> Option<HookResult> {
-        if stop_hook_active {
-            return None;
-        }
-
-        let agent_editing = self
-            .conn
-            .lock()
-            .ok()
-            .and_then(|c| db::is_agent_editing(&c, &self.session_id, agent_id).ok())
-            .unwrap_or(false);
-
-        if agent_editing {
-            Some(HookResult::Block(
-                "call done_editing to get diagnostics before finishing".into(),
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Clear stale editing state on session start/resume.
-    ///
-    /// Returns the count of cleared entries, or `None` if nothing was cleared.
-    fn handle_clear_editing(&self) -> Option<HookResult> {
-        let count = self
-            .conn
-            .lock()
-            .ok()
-            .and_then(|c| db::clear_session_editing(&c, &self.session_id).ok())
-            .unwrap_or(0);
-
-        if count > 0 {
-            Some(HookResult::Cleared(count))
-        } else {
-            None
-        }
-    }
-
-    /// Store the host CLI's session ID (idempotent — first write wins).
-    fn store_client_session_id(&self, client_session_id: Option<&str>) {
-        if let Some(client_sid) = client_session_id
-            && let Ok(c) = self.conn.lock()
-        {
-            let _ = c.execute(
-                "UPDATE sessions SET client_session_id = ?1 \
-                 WHERE id = ?2 AND client_session_id IS NULL",
-                rusqlite::params![client_sid, &self.session_id],
-            );
-        }
     }
 }
 
@@ -784,169 +569,6 @@ mod tests {
         assert_eq!(r_method, "pre-agent/roots-sync");
     }
 
-    // ── Tool classification tests ───────────────────────────────────────
-
-    #[test]
-    fn test_is_edit_tool() {
-        // Claude Code edit tools
-        assert!(is_edit_tool("Edit"));
-        assert!(is_edit_tool("Write"));
-        assert!(is_edit_tool("NotebookEdit"));
-        // Gemini CLI edit tools
-        assert!(is_edit_tool("write_file"));
-        assert!(is_edit_tool("replace"));
-        // Non-edit tools
-        assert!(!is_edit_tool("Read"));
-        assert!(!is_edit_tool("Bash"));
-        assert!(!is_edit_tool("grep"));
-    }
-
-    #[test]
-    fn test_is_read_tool() {
-        assert!(is_read_tool("Read"));
-        assert!(is_read_tool("NotebookRead"));
-        assert!(is_read_tool("read_file"));
-        assert!(!is_read_tool("Edit"));
-        assert!(!is_read_tool("Bash"));
-    }
-
-    #[test]
-    fn test_is_allowed_during_editing() {
-        assert!(is_allowed_during_editing("start_editing"));
-        assert!(is_allowed_during_editing("done_editing"));
-        assert!(is_allowed_during_editing("ToolSearch"));
-        // MCP qualified names
-        assert!(is_allowed_during_editing("mcp__catenary__start_editing"));
-        assert!(is_allowed_during_editing("mcp__catenary__done_editing"));
-        assert!(!is_allowed_during_editing("Edit"));
-        assert!(!is_allowed_during_editing("Bash"));
-    }
-
-    // ── Handler tests ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_hook_enforce_editing_deny() {
-        let server = test_server();
-        // No editing state — Edit should be denied
-        let result = server.handle_enforce_editing("Edit", "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny, got {result:?}");
-        };
-        assert!(reason.contains("start_editing"));
-    }
-
-    #[test]
-    fn test_hook_enforce_editing_allow() {
-        let server = test_server();
-        // Enter editing mode
-        server
-            .conn
-            .lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO editing_state (session_id, agent_id, started_at) \
-                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert editing state");
-
-        // Edit tool — should allow during editing mode
-        let result = server.handle_enforce_editing("Edit", "");
-        assert!(result.is_none(), "expected allow, got {result:?}");
-
-        // Read tool — always allowed during editing
-        let result = server.handle_enforce_editing("Read", "");
-        assert!(result.is_none(), "expected allow for Read, got {result:?}");
-
-        // Non-edit, non-read tool while editing — should deny
-        let result = server.handle_enforce_editing("Bash", "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny for Bash, got {result:?}");
-        };
-        assert!(reason.contains("done_editing"));
-    }
-
-    #[test]
-    fn test_hook_require_release_block() {
-        let server = test_server();
-        // Enter editing mode
-        server
-            .conn
-            .lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO editing_state (session_id, agent_id, started_at) \
-                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert editing state");
-
-        let result = server.handle_require_release("", false);
-        let Some(HookResult::Block(reason)) = result else {
-            unreachable!("expected Block, got {result:?}");
-        };
-        assert!(reason.contains("done_editing"));
-    }
-
-    #[test]
-    fn test_hook_require_release_allow() {
-        let server = test_server();
-        // No editing state — should allow
-        let result = server.handle_require_release("", false);
-        assert!(result.is_none(), "expected allow, got {result:?}");
-    }
-
-    #[test]
-    fn test_hook_require_release_retry() {
-        let server = test_server();
-        // Enter editing mode
-        server
-            .conn
-            .lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO editing_state (session_id, agent_id, started_at) \
-                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert editing state");
-
-        // stop_hook_active = true → always allow regardless of state
-        let result = server.handle_require_release("", true);
-        assert!(result.is_none(), "expected allow on retry, got {result:?}");
-    }
-
-    #[test]
-    fn test_hook_clear_editing() {
-        let server = test_server();
-        // Enter editing mode for two agents
-        {
-            let c = server.conn.lock().expect("lock");
-            c.execute(
-                "INSERT INTO editing_state (session_id, agent_id, started_at) \
-                 VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert agent a");
-            c.execute(
-                "INSERT INTO editing_state (session_id, agent_id, started_at) \
-                 VALUES ('test-session', 'agent-b', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert agent b");
-        }
-
-        let result = server.handle_clear_editing();
-        assert_eq!(result, Some(HookResult::Cleared(2)));
-
-        // Second call should return None (nothing to clear)
-        let result = server.handle_clear_editing();
-        assert!(
-            result.is_none(),
-            "expected None after clear, got {result:?}"
-        );
-    }
-
     // ── Test helpers ────────────────────────────────────────────────────
 
     /// Open an isolated test database in a tempdir.
@@ -955,69 +577,5 @@ mod tests {
         let path = dir.path().join("catenary").join("catenary.db");
         let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
         (dir, path, conn)
-    }
-
-    /// Create a `HookServer` with a test database for handler unit tests.
-    ///
-    /// Uses noop `MessageLog` and minimal dependencies — only `conn` and
-    /// `session_id` are exercised by editing state handlers.
-    fn test_server() -> TestHookServer {
-        let (dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-
-        // Insert a session for FK constraints.
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
-
-        let message_log = Arc::new(MessageLog::noop());
-        let config: crate::config::Config = serde_json::from_str("{}").expect("empty config");
-
-        // Toolbox requires a tokio runtime handle for async dispatch.
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let handle = runtime.handle().clone();
-
-        let toolbox = Arc::new(Toolbox::new(
-            config,
-            vec![],
-            message_log.clone(),
-            String::new(),
-            handle,
-        ));
-        let refresh_roots = Arc::new(AtomicBool::new(false));
-
-        let server = HookServer::new(
-            toolbox,
-            refresh_roots,
-            message_log,
-            conn,
-            "test-session".to_string(),
-            "test".to_string(),
-        );
-
-        TestHookServer {
-            _dir: dir,
-            _runtime: runtime,
-            server,
-        }
-    }
-
-    /// Wrapper that keeps the tempdir and runtime alive for the lifetime of the server.
-    struct TestHookServer {
-        _dir: tempfile::TempDir,
-        _runtime: tokio::runtime::Runtime,
-        server: HookServer,
-    }
-
-    impl std::ops::Deref for TestHookServer {
-        type Target = HookServer;
-        fn deref(&self) -> &Self::Target {
-            &self.server
-        }
     }
 }

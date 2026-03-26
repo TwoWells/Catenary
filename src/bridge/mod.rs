@@ -13,6 +13,8 @@ pub mod filesystem_manager;
 mod grep_server;
 /// Maps MCP tool calls to LSP requests.
 mod handler;
+/// Application dispatch for hook requests.
+mod hook_router;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
 /// Shared symbol types and helpers for handler and file_tools.
@@ -25,5 +27,6 @@ pub mod toolbox;
 pub use diagnostics_server::DiagnosticsServer;
 pub use document_manager::{DocumentManager, DocumentNotification};
 pub use handler::McpRouter;
+pub use hook_router::HookRouter;
 pub use path_security::PathValidator;
 pub use tool_server::ToolServer;
