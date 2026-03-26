@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -192,6 +192,14 @@ impl LspClient {
     /// until it is changed or cleared.
     pub const fn set_parent_id(&mut self, parent_id: Option<i64>) {
         self.parent_id = parent_id;
+    }
+
+    /// Returns an error if the server does not support the given capability.
+    fn require_capability(&self, method: &str, check: fn(&LspServer) -> bool) -> Result<()> {
+        if !self.lsp_server.as_deref().is_some_and(check) {
+            return Err(anyhow!("server does not support {method}"));
+        }
+        Ok(())
     }
 
     /// Sends a request and waits for the response.
@@ -430,6 +438,7 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.require_capability("textDocument/hover", LspServer::supports_hover)?;
         self.request("textDocument/hover", params::hover(uri, line, character))
             .await
     }
@@ -444,6 +453,7 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn prepare_rename(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.require_capability("textDocument/prepareRename", LspServer::supports_rename)?;
         self.request(
             "textDocument/prepareRename",
             params::prepare_rename(uri, line, character),
@@ -457,6 +467,7 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn definition(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.require_capability("textDocument/definition", LspServer::supports_definition)?;
         self.request(
             "textDocument/definition",
             params::definition(uri, line, character),
@@ -470,6 +481,10 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn type_definition(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.require_capability(
+            "textDocument/typeDefinition",
+            LspServer::supports_type_definition,
+        )?;
         self.request(
             "textDocument/typeDefinition",
             params::type_definition(uri, line, character),
@@ -483,6 +498,10 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn implementation(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        self.require_capability(
+            "textDocument/implementation",
+            LspServer::supports_implementation,
+        )?;
         self.request(
             "textDocument/implementation",
             params::implementation(uri, line, character),
@@ -502,6 +521,7 @@ impl LspClient {
         character: u32,
         include_declaration: bool,
     ) -> Result<Value> {
+        self.require_capability("textDocument/references", LspServer::supports_references)?;
         self.request(
             "textDocument/references",
             params::references(uri, line, character, include_declaration),
@@ -515,6 +535,10 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn document_symbols(&self, uri: &str) -> Result<Value> {
+        self.require_capability(
+            "textDocument/documentSymbol",
+            LspServer::supports_document_symbols,
+        )?;
         self.request("textDocument/documentSymbol", params::document_symbols(uri))
             .await
     }
@@ -525,6 +549,7 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn workspace_symbols(&self, query: &str) -> Result<Value> {
+        self.require_capability("workspace/symbol", LspServer::supports_workspace_symbols)?;
         self.request("workspace/symbol", params::workspace_symbols(query))
             .await
     }
@@ -553,7 +578,9 @@ impl LspClient {
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
     pub fn supports_type_hierarchy(&self) -> bool {
-        super::extract::has_type_hierarchy_provider(self.capabilities())
+        self.lsp_server
+            .as_ref()
+            .is_some_and(|s| s.supports_type_hierarchy())
     }
 
     /// Prepares call hierarchy for a position.
@@ -567,6 +594,10 @@ impl LspClient {
         line: u32,
         character: u32,
     ) -> Result<Value> {
+        self.require_capability(
+            "textDocument/prepareCallHierarchy",
+            LspServer::supports_call_hierarchy,
+        )?;
         self.request(
             "textDocument/prepareCallHierarchy",
             params::prepare_call_hierarchy(uri, line, character),
@@ -605,6 +636,10 @@ impl LspClient {
         line: u32,
         character: u32,
     ) -> Result<Value> {
+        self.require_capability(
+            "textDocument/prepareTypeHierarchy",
+            LspServer::supports_type_hierarchy,
+        )?;
         self.request(
             "textDocument/prepareTypeHierarchy",
             params::prepare_type_hierarchy(uri, line, character),
@@ -649,6 +684,7 @@ impl LspClient {
         end_char: u32,
         diagnostics: &[Value],
     ) -> Result<Value> {
+        self.require_capability("textDocument/codeAction", LspServer::supports_code_action)?;
         let params = json!({
             "textDocument": { "uri": uri },
             "range": {
@@ -672,6 +708,7 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn pull_diagnostics(&self, uri: &str) -> Result<Vec<Value>> {
+        self.require_capability("textDocument/diagnostic", LspServer::pulls_diagnostics)?;
         let result = self
             .request(
                 "textDocument/diagnostic",

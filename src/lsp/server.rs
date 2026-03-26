@@ -56,9 +56,72 @@ impl LspServer {
         &self.capabilities
     }
 
+    /// Returns whether a capability key is present and non-null.
+    ///
+    /// LSP capabilities can be `true`, `{}`, or a detailed options object —
+    /// all are truthy. Only absent or `null` means unsupported.
+    fn has_capability(&self, key: &str) -> bool {
+        self.capabilities.get(key).is_some_and(|v| !v.is_null())
+    }
+
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
     pub const fn pulls_diagnostics(&self) -> bool {
         self.pulls_diagnostics
+    }
+
+    /// Returns whether the server advertises `hoverProvider`.
+    pub fn supports_hover(&self) -> bool {
+        self.has_capability("hoverProvider")
+    }
+
+    /// Returns whether the server advertises `definitionProvider`.
+    pub fn supports_definition(&self) -> bool {
+        self.has_capability("definitionProvider")
+    }
+
+    /// Returns whether the server advertises `referencesProvider`.
+    pub fn supports_references(&self) -> bool {
+        self.has_capability("referencesProvider")
+    }
+
+    /// Returns whether the server advertises `documentSymbolProvider`.
+    pub fn supports_document_symbols(&self) -> bool {
+        self.has_capability("documentSymbolProvider")
+    }
+
+    /// Returns whether the server advertises `workspaceSymbolProvider`.
+    pub fn supports_workspace_symbols(&self) -> bool {
+        self.has_capability("workspaceSymbolProvider")
+    }
+
+    /// Returns whether the server advertises `renameProvider`.
+    pub fn supports_rename(&self) -> bool {
+        self.has_capability("renameProvider")
+    }
+
+    /// Returns whether the server advertises `typeDefinitionProvider`.
+    pub fn supports_type_definition(&self) -> bool {
+        self.has_capability("typeDefinitionProvider")
+    }
+
+    /// Returns whether the server advertises `implementationProvider`.
+    pub fn supports_implementation(&self) -> bool {
+        self.has_capability("implementationProvider")
+    }
+
+    /// Returns whether the server advertises `callHierarchyProvider`.
+    pub fn supports_call_hierarchy(&self) -> bool {
+        self.has_capability("callHierarchyProvider")
+    }
+
+    /// Returns whether the server advertises `typeHierarchyProvider`.
+    pub fn supports_type_hierarchy(&self) -> bool {
+        self.has_capability("typeHierarchyProvider")
+    }
+
+    /// Returns whether the server advertises `codeActionProvider`.
+    pub fn supports_code_action(&self) -> bool {
+        self.has_capability("codeActionProvider")
     }
 
     /// Returns whether the server has ever sent `textDocument/publishDiagnostics`.
@@ -175,5 +238,83 @@ mod tests {
         server.on_progress_end();
         server.on_progress_end();
         assert_eq!(server.in_progress_count(), 0);
+    }
+
+    // ── Capability checks ──────────────────────────────────────────
+
+    #[test]
+    fn supports_capability_true() {
+        let server = LspServer::new(json!({ "workspaceSymbolProvider": true }));
+        assert!(server.supports_workspace_symbols());
+    }
+
+    #[test]
+    fn supports_capability_options_object() {
+        let server = LspServer::new(json!({ "workspaceSymbolProvider": {} }));
+        assert!(server.supports_workspace_symbols());
+    }
+
+    #[test]
+    fn supports_capability_detailed_options() {
+        let server = LspServer::new(json!({
+            "workspaceSymbolProvider": { "resolveProvider": true }
+        }));
+        assert!(server.supports_workspace_symbols());
+    }
+
+    #[test]
+    fn supports_capability_missing() {
+        let server = LspServer::new(json!({}));
+        assert!(!server.supports_workspace_symbols());
+    }
+
+    #[test]
+    fn supports_capability_null() {
+        let server = LspServer::new(json!({ "workspaceSymbolProvider": null }));
+        assert!(!server.supports_workspace_symbols());
+    }
+
+    #[test]
+    fn empty_capabilities_nothing_supported() {
+        let server = LspServer::new(json!({}));
+        assert!(!server.supports_hover());
+        assert!(!server.supports_definition());
+        assert!(!server.supports_references());
+        assert!(!server.supports_document_symbols());
+        assert!(!server.supports_workspace_symbols());
+        assert!(!server.supports_rename());
+        assert!(!server.supports_type_definition());
+        assert!(!server.supports_implementation());
+        assert!(!server.supports_call_hierarchy());
+        assert!(!server.supports_type_hierarchy());
+        assert!(!server.supports_code_action());
+    }
+
+    #[test]
+    fn supports_all_capabilities() {
+        let server = LspServer::new(json!({
+            "hoverProvider": true,
+            "definitionProvider": true,
+            "referencesProvider": true,
+            "documentSymbolProvider": true,
+            "workspaceSymbolProvider": true,
+            "renameProvider": true,
+            "typeDefinitionProvider": true,
+            "implementationProvider": true,
+            "callHierarchyProvider": true,
+            "typeHierarchyProvider": true,
+            "codeActionProvider": true,
+        }));
+        assert!(server.supports_hover());
+        assert!(server.supports_definition());
+        assert!(server.supports_references());
+        assert!(server.supports_document_symbols());
+        assert!(server.supports_workspace_symbols());
+        assert!(server.supports_rename());
+        assert!(server.supports_type_definition());
+        assert!(server.supports_implementation());
+        assert!(server.supports_call_hierarchy());
+        assert!(server.supports_type_hierarchy());
+        assert!(server.supports_code_action());
     }
 }

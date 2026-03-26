@@ -25,13 +25,6 @@ pub fn has_diagnostic_provider(caps: &Value) -> bool {
     caps.get("diagnosticProvider").is_some_and(|v| !v.is_null())
 }
 
-/// Returns whether the server advertises `typeHierarchyProvider`.
-#[must_use]
-pub fn has_type_hierarchy_provider(caps: &Value) -> bool {
-    caps.get("typeHierarchyProvider")
-        .is_some_and(|v| !v.is_null())
-}
-
 /// Returns whether the server supports dynamic workspace folder changes.
 ///
 /// Requires both `workspace.workspaceFolders.supported: true` and
@@ -231,29 +224,6 @@ mod tests {
     #[test]
     fn has_diagnostic_provider_missing() {
         assert!(!has_diagnostic_provider(&json!({})));
-    }
-
-    #[test]
-    fn has_type_hierarchy_provider_true() {
-        let caps = json!({ "typeHierarchyProvider": true });
-        assert!(has_type_hierarchy_provider(&caps));
-    }
-
-    #[test]
-    fn has_type_hierarchy_provider_object() {
-        let caps = json!({ "typeHierarchyProvider": {} });
-        assert!(has_type_hierarchy_provider(&caps));
-    }
-
-    #[test]
-    fn has_type_hierarchy_provider_null() {
-        let caps = json!({ "typeHierarchyProvider": null });
-        assert!(!has_type_hierarchy_provider(&caps));
-    }
-
-    #[test]
-    fn has_type_hierarchy_provider_missing() {
-        assert!(!has_type_hierarchy_provider(&json!({})));
     }
 
     // ── supports_workspace_folders ──────────────────────────────────
