@@ -27,6 +27,7 @@ struct BridgeProcess {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     stdout: Option<BufReader<std::process::ChildStdout>>,
+    stderr: Option<std::process::ChildStderr>,
     state_home: Option<String>,
 }
 
@@ -52,12 +53,13 @@ impl BridgeProcess {
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().context("Failed to spawn bridge")?;
 
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+        let stderr = child.stderr.take();
 
         let state_home = roots.first().map(std::string::ToString::to_string);
 
@@ -65,6 +67,7 @@ impl BridgeProcess {
             child,
             stdin: Some(stdin),
             stdout: Some(stdout),
+            stderr,
             state_home,
         })
     }
@@ -80,9 +83,20 @@ impl BridgeProcess {
     fn recv(&mut self) -> Result<Value> {
         let mut line = String::new();
         let stdout = self.stdout.as_mut().context("Stdout already closed")?;
-        stdout
+        let n = stdout
             .read_line(&mut line)
             .context("Failed to read from stdout")?;
+        if n == 0 {
+            // EOF — bridge process died. Capture stderr and exit status.
+            let mut stderr_buf = String::new();
+            if let Some(ref mut stderr) = self.stderr {
+                let _ = stderr.read_to_string(&mut stderr_buf);
+            }
+            let status = self.child.try_wait().ok().flatten();
+            bail!(
+                "bridge process closed stdout (EOF). exit status: {status:?}, stderr:\n{stderr_buf}"
+            );
+        }
         serde_json::from_str(&line).context("Failed to parse JSON response")
     }
 
@@ -262,8 +276,9 @@ impl Drop for BridgeProcess {
 
 #[test]
 fn test_mcp_initialize() -> Result<()> {
+    let dir = tempfile::tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
 
     bridge.send(&json!({
         "jsonrpc": "2.0",
@@ -294,8 +309,9 @@ fn test_mcp_initialize() -> Result<()> {
 
 #[test]
 fn test_mcp_tools_list() -> Result<()> {
+    let dir = tempfile::tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -342,8 +358,9 @@ fn test_mcp_tools_list() -> Result<()> {
 
 #[test]
 fn test_mcp_tool_call_unknown_tool() -> Result<()> {
+    let dir = tempfile::tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -367,8 +384,9 @@ fn test_mcp_tool_call_unknown_tool() -> Result<()> {
 
 #[test]
 fn test_mcp_ping() -> Result<()> {
+    let dir = tempfile::tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -392,20 +410,22 @@ fn test_client_info_stored_in_session() -> Result<()> {
     // Spawn bridge with isolated state dir so `catenary list` only sees this session
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.env("CATENARY_SERVERS", &lsp)
-        .env("CATENARY_ROOTS", "/tmp")
-        .env("XDG_CONFIG_HOME", "/tmp")
+        .env("CATENARY_ROOTS", state_dir.path())
+        .env("XDG_CONFIG_HOME", state_dir.path())
         .env("XDG_STATE_HOME", state_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().context("Failed to spawn bridge")?;
     let stdin = child.stdin.take().context("Failed to get stdin")?;
     let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+    let stderr = child.stderr.take();
     let mut bridge = BridgeProcess {
         child,
         stdin: Some(stdin),
         stdout: Some(stdout),
+        stderr,
         state_home: Some(state_dir.path().to_string_lossy().into_owned()),
     };
 
@@ -732,13 +752,15 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
 
 #[test]
 fn test_roots_list_after_initialize() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("dir")?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
 
     // Initialize with roots capability — this validates the full round-trip:
     // initialize → notifications/initialized → server sends roots/list →
     // client responds → server applies roots
-    bridge.initialize_with_roots(&["/tmp"])?;
+    bridge.initialize_with_roots(&[root])?;
 
     // Verify the server is still functional after roots exchange
     bridge.send(&json!({
@@ -758,11 +780,13 @@ fn test_roots_list_after_initialize() -> Result<()> {
 
 #[test]
 fn test_roots_list_changed_notification() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("dir")?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
 
     // Initialize with roots capability
-    bridge.initialize_with_roots(&["/tmp"])?;
+    bridge.initialize_with_roots(&[root])?;
 
     // Send roots/list_changed notification — server should send another roots/list request
     bridge.send(&json!({
@@ -815,8 +839,9 @@ fn test_roots_list_changed_notification() -> Result<()> {
 
 #[test]
 fn test_no_roots_request_without_capability() -> Result<()> {
+    let dir = tempfile::tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], "/tmp")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
 
     // Initialize WITHOUT roots capability
     bridge.initialize()?;
