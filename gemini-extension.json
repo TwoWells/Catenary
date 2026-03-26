@@ -3,7 +3,7 @@
   "name": "Catenary",
   "version": "1.5.0",
   "description": "High-performance multiplexing bridge between MCP and LSP servers.",
-  "publisher": "MarkWells-Dev",
+  "publisher": "TwoWells",
   "mcpServers": {
     "catenary": {
       "command": "catenary"

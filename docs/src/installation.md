@@ -8,7 +8,7 @@
 ## Install Catenary
 
 ```bash
-cargo install --git https://github.com/MarkWells-Dev/Catenary catenary-mcp
+cargo install --git https://github.com/TwoWells/Catenary catenary-mcp
 ```
 
 ## Connect to Your AI CLI
@@ -20,7 +20,7 @@ cargo install --git https://github.com/MarkWells-Dev/Catenary catenary-mcp
 ### Claude Code (recommended: plugin)
 
 ```bash
-claude plugin marketplace add MarkWells-Dev/Catenary
+claude plugin marketplace add TwoWells/Catenary
 claude plugin install catenary@catenary
 ```
 
@@ -30,7 +30,7 @@ editing state enforcement, root sync, agent lifecycle).
 ### Gemini CLI (recommended: extension)
 
 ```bash
-gemini extensions install https://github.com/MarkWells-Dev/Catenary
+gemini extensions install https://github.com/TwoWells/Catenary
 ```
 
 The extension registers the MCP server and all hooks.

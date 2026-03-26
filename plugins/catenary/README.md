@@ -17,7 +17,7 @@ missing, hooks will silently do nothing.
 ### 2. Install the plugin
 
 ```
-/plugin marketplace add MarkWells-Dev/Catenary
+/plugin marketplace add TwoWells/Catenary
 /plugin install catenary@catenary
 ```
 
@@ -26,8 +26,8 @@ and workspace root sync.
 
 ## Configuration
 
-See `config.example.toml` in this directory or the [Official Configuration Guide](https://markwells-dev.github.io/catenary/configuration.html).
+See `config.example.toml` in this directory or the [Official Configuration Guide](https://twowells.github.io/catenary/configuration.html).
 
 ## Documentation
 
-For full features, tool lists, and troubleshooting, please visit the **[Main Repository](https://github.com/MarkWells-Dev/Catenary)**.
+For full features, tool lists, and troubleshooting, please visit the **[Main Repository](https://github.com/TwoWells/Catenary)**.

@@ -524,7 +524,7 @@ fn format_diagnostics(content: &str, format: HostFormat, hook_event: &str) -> St
 }
 
 /// GitHub issues URL for user-facing bug report suggestions.
-const BUG_REPORT_URL: &str = "https://github.com/MarkWells-Dev/Catenary/issues";
+const BUG_REPORT_URL: &str = "https://github.com/TwoWells/Catenary/issues";
 
 /// Format an internal error for the user via `systemMessage`, with a bug
 /// report link appended.

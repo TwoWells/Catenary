@@ -1,7 +1,7 @@
 # Catenary
 
-[![CI](https://github.com/MarkWells-Dev/Catenary/actions/workflows/ci.yml/badge.svg)](https://github.com/MarkWells-Dev/Catenary/actions/workflows/ci.yml)
-[![CD](https://github.com/MarkWells-Dev/Catenary/actions/workflows/cd.yml/badge.svg)](https://github.com/MarkWells-Dev/Catenary/actions/workflows/cd.yml)
+[![CI](https://github.com/TwoWells/Catenary/actions/workflows/ci.yml/badge.svg)](https://github.com/TwoWells/Catenary/actions/workflows/ci.yml)
+[![CD](https://github.com/TwoWells/Catenary/actions/workflows/cd.yml/badge.svg)](https://github.com/TwoWells/Catenary/actions/workflows/cd.yml)
 
 **Stop wasting context on redundant file reads.**
 
@@ -39,7 +39,7 @@ diagnostics — all through a single MCP server.
 ### 1. Install
 
 ```bash
-cargo install --git https://github.com/MarkWells-Dev/Catenary catenary-mcp
+cargo install --git https://github.com/TwoWells/Catenary catenary-mcp
 ```
 
 ### 2. Configure language servers
@@ -62,7 +62,7 @@ args = ["--stdio"]
 
 **Claude Code**
 ```
-/plugin marketplace add MarkWells-Dev/Catenary
+/plugin marketplace add TwoWells/Catenary
 /plugin install catenary@catenary
 ```
 
@@ -71,7 +71,7 @@ diagnostics, editing state management, and workspace root sync.
 
 **Gemini CLI**
 ```bash
-gemini extensions install https://github.com/MarkWells-Dev/Catenary
+gemini extensions install https://github.com/TwoWells/Catenary
 ```
 
 The extension registers the MCP server and adds hooks for post-edit
@@ -160,11 +160,11 @@ Catenary provides diagnostics via the `PostToolUse` hook.
 
 ## Documentation
 
-Full documentation at **[markwells-dev.github.io/catenary](https://markwells-dev.github.io/catenary/)**
+Full documentation at **[twowells.github.io/catenary](https://twowells.github.io/catenary/)**
 
-- **[Installation](https://markwells-dev.github.io/catenary/installation.html)** — Setup for Claude Code, Gemini CLI, and other clients
-- **[Configuration](https://markwells-dev.github.io/catenary/configuration.html)** — Language servers, settings, icons
-- **[CLI & Dashboard](https://markwells-dev.github.io/catenary/cli.html)** — TUI dashboard and CLI commands
+- **[Installation](https://twowells.github.io/catenary/installation.html)** — Setup for Claude Code, Gemini CLI, and other clients
+- **[Configuration](https://twowells.github.io/catenary/configuration.html)** — Language servers, settings, icons
+- **[CLI & Dashboard](https://twowells.github.io/catenary/cli.html)** — TUI dashboard and CLI commands
 
 ## License
 

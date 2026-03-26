@@ -2,7 +2,7 @@
 # Catenary installer — downloads the latest release binary for your platform.
 set -e
 
-REPO="MarkWells-Dev/Catenary"
+REPO="TwoWells/Catenary"
 INSTALL_DIR="${CATENARY_INSTALL_DIR:-/usr/local/bin}"
 
 detect_platform() {
