@@ -1,5 +1,5 @@
 # cargo-deny configuration
-# Protects PolyForm Noncommercial licensing
+# Protects AGPL-3.0-or-later licensing
 
 [advisories]
 version = 2
@@ -25,13 +25,13 @@ allow = [
     "Unicode-DFS-2016",
 ]
 
-# Denied by omission: GPL, AGPL, LGPL, SSPL, proprietary, unknown
+# Denied by omission: GPL, LGPL, SSPL, proprietary, unknown
+# AGPL-3.0-or-later is allowed for Catenary's own crates via exceptions.
 
-# Catenary crates use PolyForm Noncommercial (not in SPDX registry)
 exceptions = [
-    { name = "catenary-mcp", allow = ["PolyForm-Noncommercial-1.0.0"] },
-    { name = "catenary-proc", allow = ["PolyForm-Noncommercial-1.0.0"] },
-    { name = "catenary-ts", allow = ["PolyForm-Noncommercial-1.0.0"] },
+    { name = "catenary-mcp", allow = ["AGPL-3.0-or-later"] },
+    { name = "catenary-proc", allow = ["AGPL-3.0-or-later"] },
+    { name = "catenary-ts", allow = ["AGPL-3.0-or-later"] },
 ]
 
 [licenses.private]

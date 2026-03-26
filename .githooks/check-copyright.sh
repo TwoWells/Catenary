@@ -2,7 +2,7 @@
 # Checks that every file passed as an argument starts with the SPDX header.
 set -euo pipefail
 
-EXPECTED_LINE1="// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0"
+EXPECTED_LINE1="// SPDX-License-Identifier: AGPL-3.0-or-later"
 EXPECTED_LINE2="// Copyright (C) 2026 Mark Wells <contact@markwells.dev>"
 
 rc=0

@@ -1,0 +1,14 @@
+[book]
+title = "Catenary"
+description = "LSP-powered tools for AI coding assistants"
+authors = ["Mark Wells"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/MarkWells-Dev/Catenary"
+edit-url-template = "https://github.com/MarkWells-Dev/Catenary/edit/main/docs/src/{path}"
+no-section-label = true
