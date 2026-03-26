@@ -19,12 +19,6 @@ fn as_u32(v: &Value) -> Option<u32> {
 
 // ── Server capabilities (from InitializeResult.capabilities) ────────
 
-/// Returns whether the server advertises `diagnosticProvider` (pull model).
-#[must_use]
-pub fn has_diagnostic_provider(caps: &Value) -> bool {
-    caps.get("diagnosticProvider").is_some_and(|v| !v.is_null())
-}
-
 /// Returns whether the server supports dynamic workspace folder changes.
 ///
 /// Requires both `workspace.workspaceFolders.supported: true` and
@@ -200,31 +194,6 @@ pub fn diagnostic_range(diag: &Value) -> Option<Range> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    // ── Server capabilities ─────────────────────────────────────────
-
-    #[test]
-    fn has_diagnostic_provider_true() {
-        let caps = json!({ "diagnosticProvider": { "interFileDependencies": true } });
-        assert!(has_diagnostic_provider(&caps));
-    }
-
-    #[test]
-    fn has_diagnostic_provider_bool() {
-        let caps = json!({ "diagnosticProvider": true });
-        assert!(has_diagnostic_provider(&caps));
-    }
-
-    #[test]
-    fn has_diagnostic_provider_null() {
-        let caps = json!({ "diagnosticProvider": null });
-        assert!(!has_diagnostic_provider(&caps));
-    }
-
-    #[test]
-    fn has_diagnostic_provider_missing() {
-        assert!(!has_diagnostic_provider(&json!({})));
-    }
 
     // ── supports_workspace_folders ──────────────────────────────────
 

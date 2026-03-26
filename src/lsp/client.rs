@@ -570,10 +570,10 @@ impl LspClient {
     }
 
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
-    pub fn pulls_diagnostics(&self) -> bool {
+    pub fn supports_pull_diagnostics(&self) -> bool {
         self.lsp_server
             .as_ref()
-            .is_some_and(|s| s.pulls_diagnostics())
+            .is_some_and(|s| s.supports_pull_diagnostics())
     }
 
     /// Returns whether the server advertises `renameProvider`.
@@ -715,7 +715,10 @@ impl LspClient {
     ///
     /// Returns an error if the request fails or times out.
     pub async fn pull_diagnostics(&self, uri: &str) -> Result<Vec<Value>> {
-        self.require_capability("textDocument/diagnostic", LspServer::pulls_diagnostics)?;
+        self.require_capability(
+            "textDocument/diagnostic",
+            LspServer::supports_pull_diagnostics,
+        )?;
         let result = self
             .request(
                 "textDocument/diagnostic",

@@ -12,8 +12,6 @@ use serde_json::Value;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::extract;
-
 /// Server profile capturing init-time capabilities and runtime observations.
 ///
 /// Shared via `Arc<LspServer>` between [`super::LspClient`] and
@@ -28,7 +26,7 @@ pub struct LspServer {
     capabilities: Value,
 
     // ── Init-time capability flags (immutable after construction) ───
-    pulls_diagnostics: bool,
+    supports_pull_diagnostics: bool,
     supports_hover: bool,
     supports_definition: bool,
     supports_references: bool,
@@ -58,7 +56,7 @@ impl LspServer {
     pub fn new(capabilities: Value) -> Self {
         let has = |key: &str| capabilities.get(key).is_some_and(|v| !v.is_null());
         Self {
-            pulls_diagnostics: extract::has_diagnostic_provider(&capabilities),
+            supports_pull_diagnostics: has("diagnosticProvider"),
             supports_hover: has("hoverProvider"),
             supports_definition: has("definitionProvider"),
             supports_references: has("referencesProvider"),
@@ -83,8 +81,8 @@ impl LspServer {
     }
 
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
-    pub const fn pulls_diagnostics(&self) -> bool {
-        self.pulls_diagnostics
+    pub const fn supports_pull_diagnostics(&self) -> bool {
+        self.supports_pull_diagnostics
     }
 
     /// Returns whether the server advertises `hoverProvider`.
@@ -194,16 +192,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn new_extracts_pulls_diagnostics() {
+    fn new_extracts_supports_pull_diagnostics() {
         let caps = json!({ "diagnosticProvider": { "interFileDependencies": true } });
         let server = LspServer::new(caps);
-        assert!(server.pulls_diagnostics());
+        assert!(server.supports_pull_diagnostics());
     }
 
     #[test]
     fn new_no_diagnostic_provider() {
         let server = LspServer::new(json!({}));
-        assert!(!server.pulls_diagnostics());
+        assert!(!server.supports_pull_diagnostics());
     }
 
     #[test]

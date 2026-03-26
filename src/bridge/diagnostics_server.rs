@@ -120,7 +120,7 @@ impl DiagnosticsServer {
 
             drop(doc_manager);
 
-            let pulls = client.pulls_diagnostics();
+            let pulls = client.supports_pull_diagnostics();
 
             if !pulls
                 && client.wait_for_diagnostics_update(&uri, snapshot).await
@@ -138,7 +138,7 @@ impl DiagnosticsServer {
 
         // Pull path: if the server advertises diagnosticProvider, pull
         // diagnostics directly instead of reading the push cache.
-        let pulls = client.pulls_diagnostics();
+        let pulls = client.supports_pull_diagnostics();
 
         let diagnostics = if pulls {
             client
