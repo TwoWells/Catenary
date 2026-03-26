@@ -576,6 +576,13 @@ impl LspClient {
             .is_some_and(|s| s.pulls_diagnostics())
     }
 
+    /// Returns whether the server advertises `renameProvider`.
+    pub fn supports_rename(&self) -> bool {
+        self.lsp_server
+            .as_ref()
+            .is_some_and(|s| s.supports_rename())
+    }
+
     /// Returns whether the server advertises `typeHierarchyProvider`.
     pub fn supports_type_hierarchy(&self) -> bool {
         self.lsp_server

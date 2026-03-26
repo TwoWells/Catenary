@@ -162,11 +162,6 @@ pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
     )
 }
 
-/// Returns `true` if a capability key is present and non-null.
-pub(super) fn has_cap(caps: &Value, key: &str) -> bool {
-    caps.get(key).is_some_and(|v| !v.is_null())
-}
-
 impl ToolHandler for McpRouter {
     fn list_tools(&self) -> Vec<Tool> {
         vec![

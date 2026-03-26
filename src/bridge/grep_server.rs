@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use super::filesystem_manager::FilesystemManager;
-use super::handler::{check_server_health, display_path, has_cap};
+use super::handler::{check_server_health, display_path};
 use super::symbols::{
     self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
 };
@@ -444,19 +444,14 @@ impl GrepServer {
 
         let mut client = client_mutex.lock().await;
         client.set_parent_id(parent_id);
-        let caps = client.capabilities();
 
         // Hover — signature + docs
-        if has_cap(caps, "hoverProvider")
-            && let Ok(hover) = client.hover(&uri_str, line_0, col).await
-        {
+        if let Ok(hover) = client.hover(&uri_str, line_0, col).await {
             enrichment.hover = extract_hover_text_from_value(&hover);
         }
 
         // References — collect line numbers for dedup
-        if has_cap(caps, "referencesProvider")
-            && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
-        {
+        if let Ok(refs) = client.references(&uri_str, line_0, col, true).await {
             for (file, line, _char) in extract_locations(&refs) {
                 enrichment
                     .ref_lines
@@ -470,8 +465,7 @@ impl GrepServer {
         match kind {
             // Functions/methods/constructors → incoming calls
             symbols::SK_FUNCTION | symbols::SK_METHOD | symbols::SK_CONSTRUCTOR => {
-                if has_cap(caps, "callHierarchyProvider")
-                    && let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
+                if let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
                     && let Some(items) = response.as_array()
                 {
                     for item in items {
@@ -484,9 +478,7 @@ impl GrepServer {
 
             // Structs/classes/enums → implementations
             symbols::SK_STRUCT | symbols::SK_CLASS | symbols::SK_ENUM => {
-                if has_cap(caps, "implementationProvider")
-                    && let Ok(response) = client.implementation(&uri_str, line_0, col).await
-                {
+                if let Ok(response) = client.implementation(&uri_str, line_0, col).await {
                     for (file, line, _char) in extract_locations(&response) {
                         enrichment.implementations.push((file, line + 1));
                     }
@@ -495,8 +487,7 @@ impl GrepServer {
 
             // Interfaces/traits → subtypes
             symbols::SK_INTERFACE => {
-                if client.supports_type_hierarchy()
-                    && let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
+                if let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
                     && let Some(items) = response.as_array()
                 {
                     for item in items {
@@ -541,19 +532,14 @@ impl GrepServer {
 
         let mut client = client_mutex.lock().await;
         client.set_parent_id(parent_id);
-        let caps = client.capabilities();
 
         // Hover — signature + docs
-        if has_cap(caps, "hoverProvider")
-            && let Ok(hover) = client.hover(&uri_str, line_0, col).await
-        {
+        if let Ok(hover) = client.hover(&uri_str, line_0, col).await {
             enrichment.hover = extract_hover_text_from_value(&hover);
         }
 
         // References — collect line numbers for dedup
-        if has_cap(caps, "referencesProvider")
-            && let Ok(refs) = client.references(&uri_str, line_0, col, true).await
-        {
+        if let Ok(refs) = client.references(&uri_str, line_0, col, true).await {
             for (file, line, _char) in extract_locations(&refs) {
                 enrichment
                     .ref_lines
@@ -566,8 +552,7 @@ impl GrepServer {
         // Try all kind-specific enrichments — infer kind from results
 
         // Call hierarchy → FUNCTION
-        if has_cap(caps, "callHierarchyProvider")
-            && let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
+        if let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
             && let Some(items) = response.as_array()
             && !items.is_empty()
         {
@@ -587,7 +572,6 @@ impl GrepServer {
 
         // Implementation → STRUCT (only if not already identified as function)
         if inferred_kind == symbols::SK_VARIABLE
-            && has_cap(caps, "implementationProvider")
             && let Ok(response) = client.implementation(&uri_str, line_0, col).await
         {
             let locs = extract_locations(&response);
@@ -601,7 +585,6 @@ impl GrepServer {
 
         // Type hierarchy → INTERFACE (only if not already identified)
         if inferred_kind == symbols::SK_VARIABLE
-            && client.supports_type_hierarchy()
             && let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
             && let Some(items) = response.as_array()
             && !items.is_empty()
@@ -718,8 +701,8 @@ impl GrepServer {
                 // Column = match start on line + token offset within match text
                 let col = match_col + u32::try_from(m.start()).unwrap_or(0);
 
-                // prepareRename distinguishes symbols from keywords:
-                // symbol → range, keyword → null. Cheaper than full enrichment.
+                // prepareRename: Ok(non-null) → symbol, Ok(null) → keyword.
+                // No renameProvider → skip the check, assume symbol.
                 let is_symbol = {
                     let open_result = self
                         .client_manager
@@ -728,7 +711,7 @@ impl GrepServer {
                     if let Ok((uri_str, client_mutex)) = open_result {
                         let mut client = client_mutex.lock().await;
                         client.set_parent_id(parent_id);
-                        if has_cap(client.capabilities(), "renameProvider") {
+                        if client.supports_rename() {
                             let response = client.prepare_rename(&uri_str, line_0, col).await;
                             drop(client);
                             matches!(response, Ok(ref v) if !v.is_null())
