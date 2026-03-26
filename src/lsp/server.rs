@@ -19,12 +19,27 @@ use super::extract;
 /// Shared via `Arc<LspServer>` between [`super::LspClient`] and
 /// `ServerInbox`. All runtime fields use interior mutability
 /// so readers never need a lock.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent capability flags from LSP init"
+)]
 pub struct LspServer {
     /// Raw server capabilities from the `initialize` response.
     capabilities: Value,
 
-    /// Whether the server advertises `diagnosticProvider` (pull model).
+    // ── Init-time capability flags (immutable after construction) ───
     pulls_diagnostics: bool,
+    supports_hover: bool,
+    supports_definition: bool,
+    supports_references: bool,
+    supports_document_symbols: bool,
+    supports_workspace_symbols: bool,
+    supports_rename: bool,
+    supports_type_definition: bool,
+    supports_implementation: bool,
+    supports_call_hierarchy: bool,
+    supports_type_hierarchy: bool,
+    supports_code_action: bool,
 
     /// Set on first `textDocument/publishDiagnostics` notification.
     pushes_diagnostics: OnceLock<()>,
@@ -41,10 +56,21 @@ impl LspServer {
     /// the `initialize` handshake.
     #[must_use]
     pub fn new(capabilities: Value) -> Self {
-        let pulls_diagnostics = extract::has_diagnostic_provider(&capabilities);
+        let has = |key: &str| capabilities.get(key).is_some_and(|v| !v.is_null());
         Self {
+            pulls_diagnostics: extract::has_diagnostic_provider(&capabilities),
+            supports_hover: has("hoverProvider"),
+            supports_definition: has("definitionProvider"),
+            supports_references: has("referencesProvider"),
+            supports_document_symbols: has("documentSymbolProvider"),
+            supports_workspace_symbols: has("workspaceSymbolProvider"),
+            supports_rename: has("renameProvider"),
+            supports_type_definition: has("typeDefinitionProvider"),
+            supports_implementation: has("implementationProvider"),
+            supports_call_hierarchy: has("callHierarchyProvider"),
+            supports_type_hierarchy: has("typeHierarchyProvider"),
+            supports_code_action: has("codeActionProvider"),
             capabilities,
-            pulls_diagnostics,
             pushes_diagnostics: OnceLock::new(),
             sends_progress: OnceLock::new(),
             in_progress_count: AtomicU32::new(0),
@@ -56,72 +82,64 @@ impl LspServer {
         &self.capabilities
     }
 
-    /// Returns whether a capability key is present and non-null.
-    ///
-    /// LSP capabilities can be `true`, `{}`, or a detailed options object —
-    /// all are truthy. Only absent or `null` means unsupported.
-    fn has_capability(&self, key: &str) -> bool {
-        self.capabilities.get(key).is_some_and(|v| !v.is_null())
-    }
-
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
     pub const fn pulls_diagnostics(&self) -> bool {
         self.pulls_diagnostics
     }
 
     /// Returns whether the server advertises `hoverProvider`.
-    pub fn supports_hover(&self) -> bool {
-        self.has_capability("hoverProvider")
+    pub const fn supports_hover(&self) -> bool {
+        self.supports_hover
     }
 
     /// Returns whether the server advertises `definitionProvider`.
-    pub fn supports_definition(&self) -> bool {
-        self.has_capability("definitionProvider")
+    pub const fn supports_definition(&self) -> bool {
+        self.supports_definition
     }
 
     /// Returns whether the server advertises `referencesProvider`.
-    pub fn supports_references(&self) -> bool {
-        self.has_capability("referencesProvider")
+    pub const fn supports_references(&self) -> bool {
+        self.supports_references
     }
 
     /// Returns whether the server advertises `documentSymbolProvider`.
-    pub fn supports_document_symbols(&self) -> bool {
-        self.has_capability("documentSymbolProvider")
+    pub const fn supports_document_symbols(&self) -> bool {
+        self.supports_document_symbols
     }
 
     /// Returns whether the server advertises `workspaceSymbolProvider`.
-    pub fn supports_workspace_symbols(&self) -> bool {
-        self.has_capability("workspaceSymbolProvider")
+    pub const fn supports_workspace_symbols(&self) -> bool {
+        self.supports_workspace_symbols
     }
 
     /// Returns whether the server advertises `renameProvider`.
-    pub fn supports_rename(&self) -> bool {
-        self.has_capability("renameProvider")
+    pub const fn supports_rename(&self) -> bool {
+        self.supports_rename
     }
 
     /// Returns whether the server advertises `typeDefinitionProvider`.
-    pub fn supports_type_definition(&self) -> bool {
-        self.has_capability("typeDefinitionProvider")
+    pub const fn supports_type_definition(&self) -> bool {
+        self.supports_type_definition
     }
 
     /// Returns whether the server advertises `implementationProvider`.
-    pub fn supports_implementation(&self) -> bool {
-        self.has_capability("implementationProvider")
+    pub const fn supports_implementation(&self) -> bool {
+        self.supports_implementation
     }
 
     /// Returns whether the server advertises `callHierarchyProvider`.
-    pub fn supports_call_hierarchy(&self) -> bool {
-        self.has_capability("callHierarchyProvider")
+    pub const fn supports_call_hierarchy(&self) -> bool {
+        self.supports_call_hierarchy
     }
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
-    pub fn supports_type_hierarchy(&self) -> bool {
-        self.has_capability("typeHierarchyProvider")
+    pub const fn supports_type_hierarchy(&self) -> bool {
+        self.supports_type_hierarchy
     }
 
     /// Returns whether the server advertises `codeActionProvider`.
-    pub fn supports_code_action(&self) -> bool {
-        self.has_capability("codeActionProvider")
+    pub const fn supports_code_action(&self) -> bool {
+        self.supports_code_action
     }
 
     /// Returns whether the server has ever sent `textDocument/publishDiagnostics`.
