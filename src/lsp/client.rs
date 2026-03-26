@@ -564,9 +564,11 @@ impl LspClient {
             .await
     }
 
-    /// Returns whether the server advertises `workspaceSymbol/resolve` support.
+    /// Returns whether the server advertises `workspaceSymbolProvider.resolveProvider`.
     pub fn supports_workspace_symbol_resolve(&self) -> bool {
-        super::extract::workspace_symbol_resolve_provider(self.capabilities())
+        self.lsp_server
+            .as_ref()
+            .is_some_and(|s| s.supports_workspace_symbol_resolve())
     }
 
     /// Returns whether the server advertises `diagnosticProvider` (pull model).

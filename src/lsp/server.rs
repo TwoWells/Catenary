@@ -32,6 +32,7 @@ pub struct LspServer {
     supports_references: bool,
     supports_document_symbols: bool,
     supports_workspace_symbols: bool,
+    supports_workspace_symbol_resolve: bool,
     supports_rename: bool,
     supports_type_definition: bool,
     supports_implementation: bool,
@@ -54,7 +55,13 @@ impl LspServer {
     /// the `initialize` handshake.
     #[must_use]
     pub fn new(capabilities: Value) -> Self {
-        let has = |key: &str| capabilities.get(key).is_some_and(|v| !v.is_null());
+        // LSP capabilities are `boolean | Options`. `true` or an options
+        // object means supported; `false`, `null`, or absent means not.
+        let has = |key: &str| {
+            capabilities
+                .get(key)
+                .is_some_and(|v| v.as_bool() != Some(false) && !v.is_null())
+        };
         Self {
             supports_pull_diagnostics: has("diagnosticProvider"),
             supports_hover: has("hoverProvider"),
@@ -62,6 +69,11 @@ impl LspServer {
             supports_references: has("referencesProvider"),
             supports_document_symbols: has("documentSymbolProvider"),
             supports_workspace_symbols: has("workspaceSymbolProvider"),
+            supports_workspace_symbol_resolve: capabilities
+                .get("workspaceSymbolProvider")
+                .and_then(|v| v.get("resolveProvider"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             supports_rename: has("renameProvider"),
             supports_type_definition: has("typeDefinitionProvider"),
             supports_implementation: has("implementationProvider"),
@@ -108,6 +120,11 @@ impl LspServer {
     /// Returns whether the server advertises `workspaceSymbolProvider`.
     pub const fn supports_workspace_symbols(&self) -> bool {
         self.supports_workspace_symbols
+    }
+
+    /// Returns whether the server advertises `workspaceSymbolProvider.resolveProvider`.
+    pub const fn supports_workspace_symbol_resolve(&self) -> bool {
+        self.supports_workspace_symbol_resolve
     }
 
     /// Returns whether the server advertises `renameProvider`.
@@ -265,6 +282,12 @@ mod tests {
     }
 
     #[test]
+    fn supports_capability_false() {
+        let server = LspServer::new(json!({ "workspaceSymbolProvider": false }));
+        assert!(!server.supports_workspace_symbols());
+    }
+
+    #[test]
     fn supports_capability_options_object() {
         let server = LspServer::new(json!({ "workspaceSymbolProvider": {} }));
         assert!(server.supports_workspace_symbols());
@@ -291,6 +314,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_false_not_supported() {
+        let server = LspServer::new(json!({
+            "hoverProvider": false,
+            "definitionProvider": false,
+            "referencesProvider": false,
+            "documentSymbolProvider": false,
+            "workspaceSymbolProvider": false,
+            "renameProvider": false,
+            "typeDefinitionProvider": false,
+            "implementationProvider": false,
+            "callHierarchyProvider": false,
+            "typeHierarchyProvider": false,
+            "codeActionProvider": false,
+        }));
+        assert!(!server.supports_hover());
+        assert!(!server.supports_definition());
+        assert!(!server.supports_references());
+        assert!(!server.supports_document_symbols());
+        assert!(!server.supports_workspace_symbols());
+        assert!(!server.supports_rename());
+        assert!(!server.supports_type_definition());
+        assert!(!server.supports_implementation());
+        assert!(!server.supports_call_hierarchy());
+        assert!(!server.supports_type_hierarchy());
+        assert!(!server.supports_code_action());
+    }
+
+    #[test]
     fn empty_capabilities_nothing_supported() {
         let server = LspServer::new(json!({}));
         assert!(!server.supports_hover());
@@ -298,6 +349,7 @@ mod tests {
         assert!(!server.supports_references());
         assert!(!server.supports_document_symbols());
         assert!(!server.supports_workspace_symbols());
+        assert!(!server.supports_workspace_symbol_resolve());
         assert!(!server.supports_rename());
         assert!(!server.supports_type_definition());
         assert!(!server.supports_implementation());
@@ -313,7 +365,7 @@ mod tests {
             "definitionProvider": true,
             "referencesProvider": true,
             "documentSymbolProvider": true,
-            "workspaceSymbolProvider": true,
+            "workspaceSymbolProvider": { "resolveProvider": true },
             "renameProvider": true,
             "typeDefinitionProvider": true,
             "implementationProvider": true,
@@ -326,11 +378,48 @@ mod tests {
         assert!(server.supports_references());
         assert!(server.supports_document_symbols());
         assert!(server.supports_workspace_symbols());
+        assert!(server.supports_workspace_symbol_resolve());
         assert!(server.supports_rename());
         assert!(server.supports_type_definition());
         assert!(server.supports_implementation());
         assert!(server.supports_call_hierarchy());
         assert!(server.supports_type_hierarchy());
         assert!(server.supports_code_action());
+    }
+
+    // ── Workspace symbol resolve ───────────────────────────────────
+
+    #[test]
+    fn workspace_symbol_resolve_boolean_provider() {
+        // workspaceSymbolProvider: true — no resolveProvider field
+        let server = LspServer::new(json!({ "workspaceSymbolProvider": true }));
+        assert!(server.supports_workspace_symbols());
+        assert!(!server.supports_workspace_symbol_resolve());
+    }
+
+    #[test]
+    fn workspace_symbol_resolve_empty_options() {
+        // workspaceSymbolProvider: {} — supported but no resolve
+        let server = LspServer::new(json!({ "workspaceSymbolProvider": {} }));
+        assert!(server.supports_workspace_symbols());
+        assert!(!server.supports_workspace_symbol_resolve());
+    }
+
+    #[test]
+    fn workspace_symbol_resolve_false() {
+        let server = LspServer::new(json!({
+            "workspaceSymbolProvider": { "resolveProvider": false }
+        }));
+        assert!(server.supports_workspace_symbols());
+        assert!(!server.supports_workspace_symbol_resolve());
+    }
+
+    #[test]
+    fn workspace_symbol_resolve_true() {
+        let server = LspServer::new(json!({
+            "workspaceSymbolProvider": { "resolveProvider": true }
+        }));
+        assert!(server.supports_workspace_symbols());
+        assert!(server.supports_workspace_symbol_resolve());
     }
 }

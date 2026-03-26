@@ -80,15 +80,6 @@ pub fn position_encoding(caps: &Value) -> Option<&str> {
     caps.get("positionEncoding")?.as_str()
 }
 
-/// Returns whether the server advertises `workspaceSymbol/resolve` support.
-#[must_use]
-pub fn workspace_symbol_resolve_provider(caps: &Value) -> bool {
-    caps.get("workspaceSymbolProvider")
-        .and_then(|v| v.get("resolveProvider"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 // ── InitializeResult (full result, not just capabilities) ───────────
 
 /// Extracts the server version string from `serverInfo.version`.
@@ -361,32 +352,6 @@ mod tests {
     #[test]
     fn position_encoding_missing() {
         assert_eq!(position_encoding(&json!({})), None);
-    }
-
-    // ── workspace_symbol_resolve_provider ────────────────────────────
-
-    #[test]
-    fn workspace_symbol_resolve_true() {
-        let caps = json!({ "workspaceSymbolProvider": { "resolveProvider": true } });
-        assert!(workspace_symbol_resolve_provider(&caps));
-    }
-
-    #[test]
-    fn workspace_symbol_resolve_false() {
-        let caps = json!({ "workspaceSymbolProvider": { "resolveProvider": false } });
-        assert!(!workspace_symbol_resolve_provider(&caps));
-    }
-
-    #[test]
-    fn workspace_symbol_resolve_boolean_provider() {
-        // Boolean provider (true) has no resolveProvider field
-        let caps = json!({ "workspaceSymbolProvider": true });
-        assert!(!workspace_symbol_resolve_provider(&caps));
-    }
-
-    #[test]
-    fn workspace_symbol_resolve_missing() {
-        assert!(!workspace_symbol_resolve_provider(&json!({})));
     }
 
     // ── server_version ──────────────────────────────────────────────
