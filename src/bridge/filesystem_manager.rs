@@ -267,12 +267,16 @@ pub fn format_file_size(bytes: u64) -> String {
 
 /// Extension/filename detection — returns `None` for unrecognised files.
 pub(crate) fn detect_language_id_opt(path: &Path) -> Option<&'static str> {
+    // Filename-based detection (exact match).
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
         let lang = match file_name {
             "Dockerfile" => "dockerfile",
-            "Makefile" => "makefile",
+            "Makefile" | "GNUmakefile" => "makefile",
             "CMakeLists.txt" => "cmake",
             "Cargo.toml" | "Cargo.lock" => "toml",
+            "Gemfile" | "Rakefile" => "ruby",
+            "Justfile" | "justfile" => "just",
+            "PKGBUILD" => "shellscript",
             _ => "",
         };
         if !lang.is_empty() {
@@ -280,46 +284,98 @@ pub(crate) fn detect_language_id_opt(path: &Path) -> Option<&'static str> {
         }
     }
 
+    // Extension-based detection.
     match path.extension().and_then(|e| e.to_str()) {
+        // Systems
         Some("rs") => Some("rust"),
         Some("go") => Some("go"),
-        Some("py") => Some("python"),
-        Some("js") => Some("javascript"),
-        Some("ts") => Some("typescript"),
-        Some("tsx") => Some("typescriptreact"),
-        Some("jsx") => Some("javascriptreact"),
         Some("c") => Some("c"),
         Some("cpp" | "cc" | "cxx" | "h" | "hpp") => Some("cpp"),
-        Some("cs") => Some("csharp"),
+        Some("zig") => Some("zig"),
+        Some("d") => Some("d"),
+        Some("v") => Some("v"),
+        Some("nim") => Some("nim"),
+
+        // JVM
         Some("java") => Some("java"),
         Some("kt" | "kts") => Some("kotlin"),
-        Some("swift") => Some("swift"),
-        Some("rb") => Some("ruby"),
-        Some("php") => Some("php"),
-        Some("sh" | "bash" | "zsh") => Some("shellscript"),
-        Some("json") => Some("json"),
-        Some("yaml" | "yml") => Some("yaml"),
-        Some("toml") => Some("toml"),
-        Some("md") => Some("markdown"),
-        Some("html") => Some("html"),
-        Some("css") => Some("css"),
-        Some("scss") => Some("scss"),
-        Some("lua") => Some("lua"),
-        Some("sql") => Some("sql"),
-        Some("zig") => Some("zig"),
-        Some("mojo") => Some("mojo"),
-        Some("dart") => Some("dart"),
-        Some("m" | "mm") => Some("objective-c"),
-        Some("nix") => Some("nix"),
-        Some("proto") => Some("proto"),
-        Some("graphql" | "gql") => Some("graphql"),
-        Some("r" | "R") => Some("r"),
-        Some("jl") => Some("julia"),
         Some("scala" | "sc") => Some("scala"),
-        Some("hs") => Some("haskell"),
+        Some("groovy" | "gvy") => Some("groovy"),
+        Some("clj" | "cljs" | "cljc") => Some("clojure"),
+
+        // .NET
+        Some("cs") => Some("csharp"),
+        Some("fs" | "fsx" | "fsi") => Some("fsharp"),
+
+        // Apple
+        Some("swift") => Some("swift"),
+        Some("m" | "mm") => Some("objective-c"),
+
+        // Scripting
+        Some("py") => Some("python"),
+        Some("rb") => Some("ruby"),
+        Some("pl" | "pm") => Some("perl"),
+        Some("php") => Some("php"),
+        Some("lua") => Some("lua"),
+        Some("tcl") => Some("tcl"),
+        Some("cr") => Some("crystal"),
+
+        // JavaScript / TypeScript
+        Some("js" | "mjs" | "cjs") => Some("javascript"),
+        Some("ts" | "mts" | "cts") => Some("typescript"),
+        Some("tsx") => Some("typescriptreact"),
+        Some("jsx") => Some("javascriptreact"),
+
+        // Functional
+        Some("hs" | "lhs") => Some("haskell"),
+        Some("ml" | "mli") => Some("ocaml"),
+        Some("elm") => Some("elm"),
+        Some("gleam") => Some("gleam"),
         Some("ex" | "exs") => Some("elixir"),
         Some("erl" | "hrl") => Some("erlang"),
+        Some("purs") => Some("purescript"),
+
+        // Shell
+        Some("sh" | "bash" | "zsh" | "ebuild" | "eclass" | "install") => Some("shellscript"),
+        Some("fish") => Some("fish"),
+        Some("ps1" | "psm1" | "psd1") => Some("powershell"),
+
+        // Data science
+        Some("r" | "R") => Some("r"),
+        Some("jl") => Some("julia"),
+        Some("mojo") => Some("mojo"),
+
+        // Web frontend
+        Some("html" | "htm") => Some("html"),
+        Some("css") => Some("css"),
+        Some("scss") => Some("scss"),
+        Some("sass") => Some("sass"),
+        Some("less") => Some("less"),
+        Some("svelte") => Some("svelte"),
+        Some("vue") => Some("vue"),
+
+        // Data / config
+        Some("json" | "jsonc") => Some("json"),
+        Some("yaml" | "yml") => Some("yaml"),
+        Some("toml") => Some("toml"),
+        Some("xml" | "xsl" | "xslt" | "xsd") => Some("xml"),
+        Some("sql") => Some("sql"),
+        Some("graphql" | "gql") => Some("graphql"),
+        Some("proto") => Some("proto"),
+
+        // Markup / docs
+        Some("md" | "mdx") => Some("markdown"),
+        Some("rst") => Some("restructuredtext"),
+        Some("tex" | "latex") => Some("latex"),
+        Some("typ") => Some("typst"),
+
+        // Infrastructure / config languages
+        Some("nix") => Some("nix"),
+        Some("tf" | "tfvars") => Some("terraform"),
         Some("cmake") => Some("cmake"),
+        Some("dart") => Some("dart"),
+        Some("dockerfile") => Some("dockerfile"),
+
         _ => None,
     }
 }
@@ -412,10 +468,24 @@ fn parse_shebang(first_line: &[u8]) -> Option<&'static str> {
 
     match basename {
         "bash" | "sh" | "zsh" | "dash" | "ksh" => Some("shellscript"),
+        "fish" => Some("fish"),
         "python" | "python3" | "python2" => Some("python"),
         "node" | "nodejs" => Some("javascript"),
-        "ruby" => Some("ruby"),
+        "deno" => Some("typescript"),
+        "ruby" | "irb" => Some("ruby"),
         "perl" => Some("perl"),
+        "php" => Some("php"),
+        "lua" | "luajit" => Some("lua"),
+        "tclsh" | "wish" => Some("tcl"),
+        "Rscript" => Some("r"),
+        "julia" => Some("julia"),
+        "elixir" | "iex" => Some("elixir"),
+        "erl" => Some("erlang"),
+        "swift" => Some("swift"),
+        "kotlin" => Some("kotlin"),
+        "scala" => Some("scala"),
+        "groovy" => Some("groovy"),
+        "crystal" => Some("crystal"),
         _ => None,
     }
 }
@@ -528,40 +598,7 @@ mod tests {
     // --- Language detection (migrated from document_manager) ---
 
     #[test]
-    fn language_detection_extensions() {
-        assert_eq!(detect_language_id_opt(Path::new("test.rs")), Some("rust"));
-        assert_eq!(detect_language_id_opt(Path::new("test.py")), Some("python"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.js")),
-            Some("javascript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.ts")),
-            Some("typescript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.tsx")),
-            Some("typescriptreact")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.go")), Some("go"));
-        assert_eq!(detect_language_id_opt(Path::new("test.php")), Some("php"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.sh")),
-            Some("shellscript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.bash")),
-            Some("shellscript")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.cs")), Some("csharp"));
-        assert_eq!(detect_language_id_opt(Path::new("test.kt")), Some("kotlin"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.swift")),
-            Some("swift")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.html")), Some("html"));
-        assert_eq!(detect_language_id_opt(Path::new("test.css")), Some("css"));
-        assert_eq!(detect_language_id_opt(Path::new("test.scss")), Some("scss"));
+    fn language_detection_filenames() {
         assert_eq!(
             detect_language_id_opt(Path::new("Dockerfile")),
             Some("dockerfile")
@@ -571,26 +608,211 @@ mod tests {
             Some("makefile")
         );
         assert_eq!(
+            detect_language_id_opt(Path::new("GNUmakefile")),
+            Some("makefile")
+        );
+        assert_eq!(
             detect_language_id_opt(Path::new("CMakeLists.txt")),
             Some("cmake")
         );
-        assert_eq!(detect_language_id_opt(Path::new("test.zig")), Some("zig"));
-        assert_eq!(detect_language_id_opt(Path::new("test.nix")), Some("nix"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.proto")),
-            Some("proto")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.graphql")),
-            Some("graphql")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.r")), Some("r"));
-        assert_eq!(detect_language_id_opt(Path::new("test.jl")), Some("julia"));
-        assert_eq!(detect_language_id_opt(Path::new("test.ex")), Some("elixir"));
         assert_eq!(
             detect_language_id_opt(Path::new("Cargo.toml")),
             Some("toml")
         );
+        assert_eq!(detect_language_id_opt(Path::new("Gemfile")), Some("ruby"));
+        assert_eq!(detect_language_id_opt(Path::new("Rakefile")), Some("ruby"));
+        assert_eq!(detect_language_id_opt(Path::new("Justfile")), Some("just"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("PKGBUILD")),
+            Some("shellscript")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "exhaustive extension coverage")]
+    fn language_detection_extensions() {
+        // Systems
+        assert_eq!(detect_language_id_opt(Path::new("test.rs")), Some("rust"));
+        assert_eq!(detect_language_id_opt(Path::new("test.go")), Some("go"));
+        assert_eq!(detect_language_id_opt(Path::new("test.c")), Some("c"));
+        assert_eq!(detect_language_id_opt(Path::new("test.cpp")), Some("cpp"));
+        assert_eq!(detect_language_id_opt(Path::new("test.h")), Some("cpp"));
+        assert_eq!(detect_language_id_opt(Path::new("test.zig")), Some("zig"));
+        assert_eq!(detect_language_id_opt(Path::new("test.d")), Some("d"));
+        assert_eq!(detect_language_id_opt(Path::new("test.v")), Some("v"));
+        assert_eq!(detect_language_id_opt(Path::new("test.nim")), Some("nim"));
+
+        // JVM
+        assert_eq!(detect_language_id_opt(Path::new("test.java")), Some("java"));
+        assert_eq!(detect_language_id_opt(Path::new("test.kt")), Some("kotlin"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.scala")),
+            Some("scala")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.groovy")),
+            Some("groovy")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.clj")),
+            Some("clojure")
+        );
+
+        // .NET
+        assert_eq!(detect_language_id_opt(Path::new("test.cs")), Some("csharp"));
+        assert_eq!(detect_language_id_opt(Path::new("test.fs")), Some("fsharp"));
+
+        // Apple
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.swift")),
+            Some("swift")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.m")),
+            Some("objective-c")
+        );
+
+        // Scripting
+        assert_eq!(detect_language_id_opt(Path::new("test.py")), Some("python"));
+        assert_eq!(detect_language_id_opt(Path::new("test.rb")), Some("ruby"));
+        assert_eq!(detect_language_id_opt(Path::new("test.pl")), Some("perl"));
+        assert_eq!(detect_language_id_opt(Path::new("test.php")), Some("php"));
+        assert_eq!(detect_language_id_opt(Path::new("test.lua")), Some("lua"));
+        assert_eq!(detect_language_id_opt(Path::new("test.tcl")), Some("tcl"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.cr")),
+            Some("crystal")
+        );
+
+        // JavaScript / TypeScript
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.js")),
+            Some("javascript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.mjs")),
+            Some("javascript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.ts")),
+            Some("typescript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.mts")),
+            Some("typescript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.tsx")),
+            Some("typescriptreact")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.jsx")),
+            Some("javascriptreact")
+        );
+
+        // Functional
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.hs")),
+            Some("haskell")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.ml")), Some("ocaml"));
+        assert_eq!(detect_language_id_opt(Path::new("test.elm")), Some("elm"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.gleam")),
+            Some("gleam")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.ex")), Some("elixir"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.erl")),
+            Some("erlang")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.purs")),
+            Some("purescript")
+        );
+
+        // Shell
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.sh")),
+            Some("shellscript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.bash")),
+            Some("shellscript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.ebuild")),
+            Some("shellscript")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.eclass")),
+            Some("shellscript")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.fish")), Some("fish"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.ps1")),
+            Some("powershell")
+        );
+
+        // Data science
+        assert_eq!(detect_language_id_opt(Path::new("test.r")), Some("r"));
+        assert_eq!(detect_language_id_opt(Path::new("test.jl")), Some("julia"));
+
+        // Web frontend
+        assert_eq!(detect_language_id_opt(Path::new("test.html")), Some("html"));
+        assert_eq!(detect_language_id_opt(Path::new("test.css")), Some("css"));
+        assert_eq!(detect_language_id_opt(Path::new("test.scss")), Some("scss"));
+        assert_eq!(detect_language_id_opt(Path::new("test.less")), Some("less"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.svelte")),
+            Some("svelte")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.vue")), Some("vue"));
+
+        // Data / config
+        assert_eq!(detect_language_id_opt(Path::new("test.json")), Some("json"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.jsonc")),
+            Some("json")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.yaml")), Some("yaml"));
+        assert_eq!(detect_language_id_opt(Path::new("test.toml")), Some("toml"));
+        assert_eq!(detect_language_id_opt(Path::new("test.xml")), Some("xml"));
+        assert_eq!(detect_language_id_opt(Path::new("test.sql")), Some("sql"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.graphql")),
+            Some("graphql")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.proto")),
+            Some("proto")
+        );
+
+        // Markup / docs
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.md")),
+            Some("markdown")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.mdx")),
+            Some("markdown")
+        );
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.rst")),
+            Some("restructuredtext")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.tex")), Some("latex"));
+        assert_eq!(detect_language_id_opt(Path::new("test.typ")), Some("typst"));
+
+        // Infrastructure
+        assert_eq!(detect_language_id_opt(Path::new("test.nix")), Some("nix"));
+        assert_eq!(
+            detect_language_id_opt(Path::new("test.tf")),
+            Some("terraform")
+        );
+        assert_eq!(detect_language_id_opt(Path::new("test.dart")), Some("dart"));
+
+        // Unknown
         assert_eq!(detect_language_id_opt(Path::new("test.unknown")), None);
         assert_eq!(detect_language_id_opt(Path::new("noextension")), None);
     }
@@ -635,6 +857,81 @@ mod tests {
     #[test]
     fn shebang_perl() {
         assert_eq!(parse_shebang(b"#!/usr/bin/env perl"), Some("perl"));
+    }
+
+    #[test]
+    fn shebang_php() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env php"), Some("php"));
+    }
+
+    #[test]
+    fn shebang_lua() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env lua"), Some("lua"));
+    }
+
+    #[test]
+    fn shebang_luajit() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env luajit"), Some("lua"));
+    }
+
+    #[test]
+    fn shebang_tclsh() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env tclsh"), Some("tcl"));
+    }
+
+    #[test]
+    fn shebang_rscript() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env Rscript"), Some("r"));
+    }
+
+    #[test]
+    fn shebang_julia() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env julia"), Some("julia"));
+    }
+
+    #[test]
+    fn shebang_elixir() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env elixir"), Some("elixir"));
+    }
+
+    #[test]
+    fn shebang_swift() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env swift"), Some("swift"));
+    }
+
+    #[test]
+    fn shebang_kotlin() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env kotlin"), Some("kotlin"));
+    }
+
+    #[test]
+    fn shebang_groovy() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env groovy"), Some("groovy"));
+    }
+
+    #[test]
+    fn shebang_crystal() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env crystal"), Some("crystal"));
+    }
+
+    #[test]
+    fn shebang_deno() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env deno"), Some("typescript"));
+    }
+
+    #[test]
+    fn shebang_fish() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env fish"), Some("fish"));
+    }
+
+    #[test]
+    fn shebang_erl() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env erl"), Some("erlang"));
+    }
+
+    #[test]
+    fn shebang_scala() {
+        assert_eq!(parse_shebang(b"#!/usr/bin/env scala"), Some("scala"));
     }
 
     #[test]
