@@ -9,7 +9,6 @@
 //! - Glob pattern → match files across workspace roots with outlines
 
 use anyhow::{Result, anyhow};
-use globset::Glob;
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,9 +19,10 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
-use super::handler::{check_server_health, resolve_path};
+use super::handler::{check_server_health, expand_tilde, resolve_path};
 use super::symbols::{format_symbol_kind, is_outline_kind};
 use super::tool_server::ToolServer;
+use super::toolbox::ResolvedGlob;
 use crate::lsp::LspClientManager;
 
 /// Input for the `glob` tool.
@@ -103,7 +103,8 @@ impl ToolServer for GlobServer {
         let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        let path = resolve_path(&input.pattern)?;
+        let pattern = expand_tilde(&input.pattern);
+        let path = resolve_path(&pattern)?;
         let file_path = if path.is_file() {
             Some(path.clone())
         } else {
@@ -127,7 +128,7 @@ impl ToolServer for GlobServer {
             check_server_health(&self.client_manager, &touched, &self.notified_offline).await
         };
 
-        tracing::debug!("glob: {}", input.pattern);
+        tracing::debug!("glob: {pattern}");
 
         // Run pipeline
         let output = if path.is_file() {
@@ -135,7 +136,7 @@ impl ToolServer for GlobServer {
         } else if path.is_dir() {
             self.handle_glob_dir(&path, parent_id).await?
         } else {
-            self.handle_glob_pattern(&input.pattern, parent_id).await?
+            self.handle_glob_pattern(&pattern, parent_id).await?
         };
 
         // Prepend notification
@@ -335,16 +336,21 @@ impl GlobServer {
     }
 
     /// Glob pattern match across workspace roots.
+    ///
+    /// Absolute patterns (e.g. `/home/user/projects/*`) are searched from
+    /// the pattern's base directory rather than workspace roots.
     async fn handle_glob_pattern(&self, pattern: &str, parent_id: Option<i64>) -> Result<String> {
-        let matcher = Glob::new(pattern)
-            .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
-            .compile_matcher();
+        let resolved = ResolvedGlob::new(pattern)?;
 
-        let roots = self.client_manager.roots().await;
-        let search_roots = if roots.is_empty() {
-            vec![std::env::current_dir()?]
+        let search_roots = if let Some(override_root) = resolved.override_root() {
+            vec![override_root.to_path_buf()]
         } else {
-            roots
+            let roots = self.client_manager.roots().await;
+            if roots.is_empty() {
+                vec![std::env::current_dir()?]
+            } else {
+                roots
+            }
         };
 
         let mut matched_files: Vec<PathBuf> = Vec::new();
@@ -362,9 +368,7 @@ impl GlobServer {
                 }
 
                 let entry_path = entry.path();
-                let rel_path = entry_path.strip_prefix(root).unwrap_or(entry_path);
-
-                if matcher.is_match(rel_path) {
+                if resolved.is_match(entry_path, root) {
                     matched_files.push(entry_path.to_path_buf());
                 }
             }

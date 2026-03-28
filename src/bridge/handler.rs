@@ -133,9 +133,22 @@ impl McpRouter {
     }
 }
 
+/// Expands a leading `~` or `~/` to the user's home directory.
+pub(super) fn expand_tilde(path: &str) -> String {
+    if (path == "~" || path.starts_with("~/"))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}{}", &path[1..]);
+    }
+    path.to_string()
+}
+
 /// Resolves a file path, converting relative paths to absolute using the current working directory.
+///
+/// Expands a leading `~` to `$HOME` before resolution.
 pub(super) fn resolve_path(file: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(file);
+    let expanded = expand_tilde(file);
+    let path = PathBuf::from(&expanded);
     if path.is_absolute() {
         Ok(path)
     } else {

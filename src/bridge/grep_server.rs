@@ -3,8 +3,8 @@
 
 //! Grep tool: ripgrep + workspace/symbol pipeline with LSP enrichment.
 
+use super::toolbox::ResolvedGlob;
 use anyhow::{Result, anyhow};
-use globset::Glob;
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{Searcher, Sink, SinkMatch};
@@ -113,14 +113,35 @@ impl GrepServer {
 
         debug!("Grep request: pattern={}", input.pattern);
 
-        let roots = self.client_manager.roots().await;
+        let resolved_glob = input
+            .glob
+            .as_deref()
+            .map(ResolvedGlob::new)
+            .transpose()?
+            .map(Arc::new);
+        let resolved_exclude = input
+            .exclude
+            .as_deref()
+            .map(ResolvedGlob::new)
+            .transpose()?
+            .map(Arc::new);
+
+        // Determine effective search roots: absolute glob overrides workspace roots.
+        let workspace_roots = self.client_manager.roots().await;
+        let effective_roots = if let Some(ref rg) = resolved_glob
+            && let Some(override_root) = rg.override_root()
+        {
+            vec![override_root.to_path_buf()]
+        } else {
+            workspace_roots
+        };
 
         // 1. Ripgrep: get matched strings + file/line heatmap in one pass
         let rg = Self::ripgrep_matches(
             &input.pattern,
-            &roots,
-            input.glob.as_deref(),
-            input.exclude.as_deref(),
+            &effective_roots,
+            resolved_glob.as_ref(),
+            resolved_exclude.as_ref(),
             input.include_gitignored,
             input.include_hidden,
             &self.fs_manager,
@@ -158,28 +179,18 @@ impl GrepServer {
         };
 
         // Filter symbols to glob/exclude scope
-        if let Some(ref glob_pattern) = input.glob {
-            let gm = Glob::new(glob_pattern)
-                .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
-                .compile_matcher();
+        if let Some(ref rg) = resolved_glob {
             symbols.retain(|s| {
-                roots.iter().any(|root| {
-                    Path::new(&s.file_path)
-                        .strip_prefix(root)
-                        .is_ok_and(|rel| gm.is_match(rel))
-                })
+                effective_roots
+                    .iter()
+                    .any(|root| rg.is_match(Path::new(&s.file_path), root))
             });
         }
-        if let Some(ref exclude_pattern) = input.exclude {
-            let em = Glob::new(exclude_pattern)
-                .map_err(|e| anyhow!("Invalid exclude pattern: {e}"))?
-                .compile_matcher();
+        if let Some(ref rg) = resolved_exclude {
             symbols.retain(|s| {
-                !roots.iter().any(|root| {
-                    Path::new(&s.file_path)
-                        .strip_prefix(root)
-                        .is_ok_and(|rel| em.is_match(rel))
-                })
+                !effective_roots
+                    .iter()
+                    .any(|root| rg.is_match(Path::new(&s.file_path), root))
             });
         }
 
@@ -811,8 +822,8 @@ impl GrepServer {
     fn ripgrep_matches(
         pattern: &str,
         roots: &[PathBuf],
-        glob: Option<&str>,
-        exclude: Option<&str>,
+        glob: Option<&Arc<ResolvedGlob>>,
+        exclude: Option<&Arc<ResolvedGlob>>,
         include_gitignored: bool,
         include_hidden: bool,
         fs_manager: &Arc<FilesystemManager>,
@@ -824,22 +835,6 @@ impl GrepServer {
             .case_insensitive(true)
             .build(pattern)
             .map_err(|e| anyhow!("Invalid regex pattern: {e}"))?;
-
-        let glob_matcher = glob
-            .map(|pat| {
-                Glob::new(pat)
-                    .map_err(|e| anyhow!("Invalid glob pattern: {e}"))
-                    .map(|g| Arc::new(g.compile_matcher()))
-            })
-            .transpose()?;
-
-        let exclude_matcher = exclude
-            .map(|pat| {
-                Glob::new(pat)
-                    .map_err(|e| anyhow!("Invalid exclude pattern: {e}"))
-                    .map(|g| Arc::new(g.compile_matcher()))
-            })
-            .transpose()?;
 
         let collected = Arc::new(StdMutex::new(Vec::<ThreadMatches>::new()));
 
@@ -855,8 +850,8 @@ impl GrepServer {
 
             walker.run(|| {
                 let matcher = matcher.clone();
-                let glob_matcher = glob_matcher.clone();
-                let exclude_matcher = exclude_matcher.clone();
+                let glob = glob.cloned();
+                let exclude = exclude.cloned();
                 let root = root.clone();
                 let fs_manager = Arc::clone(fs_manager);
                 let mut state = CollectOnDrop {
@@ -873,17 +868,15 @@ impl GrepServer {
                         return WalkState::Continue;
                     }
 
-                    if let Some(ref gm) = glob_matcher {
-                        let rel = path.strip_prefix(&root).unwrap_or(path);
-                        if !gm.is_match(rel) {
-                            return WalkState::Continue;
-                        }
+                    if let Some(rg) = &glob
+                        && !rg.is_match(path, &root)
+                    {
+                        return WalkState::Continue;
                     }
-                    if let Some(ref em) = exclude_matcher {
-                        let rel = path.strip_prefix(&root).unwrap_or(path);
-                        if em.is_match(rel) {
-                            return WalkState::Continue;
-                        }
+                    if let Some(rg) = &exclude
+                        && rg.is_match(path, &root)
+                    {
+                        return WalkState::Continue;
                     }
 
                     // Skip binary files — no meaningful text matches

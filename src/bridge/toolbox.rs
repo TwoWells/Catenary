@@ -7,9 +7,10 @@
 //! Protocol boundaries (`LspBridgeHandler`, `HookServer`) hold `Arc<Toolbox>`
 //! and access any dependency through it.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use globset::{GlobBuilder, GlobMatcher};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -18,10 +19,91 @@ use super::diagnostics_server::DiagnosticsServer;
 use super::file_tools::GlobServer;
 use super::filesystem_manager::FilesystemManager;
 use super::grep_server::GrepServer;
+use super::handler::expand_tilde;
 use super::path_security::PathValidator;
 use crate::config::Config;
 use crate::lsp::LspClientManager;
 use crate::session::MessageLog;
+
+/// A resolved glob pattern that handles tilde expansion and absolute paths.
+///
+/// For relative patterns (e.g. `src/**/*.rs`), matches against paths relative
+/// to workspace roots. For absolute patterns (e.g. `~/other-project/*.rs`),
+/// extracts the non-glob base directory as a search root and matches against
+/// full paths.
+pub struct ResolvedGlob {
+    matcher: GlobMatcher,
+    match_full_path: bool,
+    override_root: Option<PathBuf>,
+}
+
+impl ResolvedGlob {
+    /// Resolves a glob pattern, expanding tilde and detecting absolute patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pattern is not a valid glob.
+    pub fn new(pattern: &str) -> Result<Self> {
+        let expanded = expand_tilde(pattern);
+        let matcher = GlobBuilder::new(&expanded)
+            .literal_separator(true)
+            .build()
+            .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
+            .compile_matcher();
+
+        if Path::new(&expanded).is_absolute() {
+            let base = Self::base_dir(&expanded);
+            Ok(Self {
+                matcher,
+                match_full_path: true,
+                override_root: Some(base),
+            })
+        } else {
+            Ok(Self {
+                matcher,
+                match_full_path: false,
+                override_root: None,
+            })
+        }
+    }
+
+    /// Tests whether a file path matches this glob.
+    ///
+    /// For absolute patterns, matches against the full path.
+    /// For relative patterns, strips the root prefix first.
+    #[must_use]
+    pub fn is_match(&self, path: &Path, root: &Path) -> bool {
+        if self.match_full_path {
+            self.matcher.is_match(path)
+        } else {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            self.matcher.is_match(rel)
+        }
+    }
+
+    /// Returns the override search root for absolute patterns.
+    #[must_use]
+    pub fn override_root(&self) -> Option<&Path> {
+        self.override_root.as_deref()
+    }
+
+    /// Extracts the longest directory prefix without glob metacharacters.
+    fn base_dir(pattern: &str) -> PathBuf {
+        let mut base = PathBuf::new();
+        for component in Path::new(pattern).components() {
+            let s = component.as_os_str().to_string_lossy();
+            if s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{') {
+                break;
+            }
+            base.push(component);
+        }
+        if base.as_os_str().is_empty() {
+            PathBuf::from("/")
+        } else {
+            base
+        }
+    }
+}
 
 /// Shared application container for tool servers and cross-tool infrastructure.
 ///
@@ -122,5 +204,157 @@ impl Toolbox {
     /// Shuts down all active LSP servers gracefully.
     pub async fn shutdown(&self) {
         self.client_manager.shutdown_all().await;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "test assertions")]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ── expand_tilde ──────────────────────────────────────────────
+
+    #[test]
+    fn expand_tilde_home_prefix() {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        assert_eq!(expand_tilde("~/foo/bar"), format!("{home}/foo/bar"));
+    }
+
+    #[test]
+    fn expand_tilde_bare() {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn expand_tilde_no_op_for_absolute() {
+        assert_eq!(expand_tilde("/usr/bin"), "/usr/bin");
+    }
+
+    #[test]
+    fn expand_tilde_no_op_for_relative() {
+        assert_eq!(expand_tilde("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn expand_tilde_no_op_for_mid_tilde() {
+        assert_eq!(expand_tilde("foo/~/bar"), "foo/~/bar");
+    }
+
+    // ── ResolvedGlob::base_dir ────────────────────────────────────
+
+    #[test]
+    fn base_dir_strips_at_star() {
+        let base = ResolvedGlob::base_dir("/home/user/projects/*");
+        assert_eq!(base, Path::new("/home/user/projects"));
+    }
+
+    #[test]
+    fn base_dir_strips_at_double_star() {
+        let base = ResolvedGlob::base_dir("/home/user/**/*.rs");
+        assert_eq!(base, Path::new("/home/user"));
+    }
+
+    #[test]
+    fn base_dir_strips_at_question_mark() {
+        let base = ResolvedGlob::base_dir("/tmp/foo?/bar");
+        assert_eq!(base, Path::new("/tmp"));
+    }
+
+    #[test]
+    fn base_dir_strips_at_bracket() {
+        let base = ResolvedGlob::base_dir("/tmp/[abc]/bar");
+        assert_eq!(base, Path::new("/tmp"));
+    }
+
+    #[test]
+    fn base_dir_no_metachar_returns_full_path() {
+        let base = ResolvedGlob::base_dir("/home/user/projects/src");
+        assert_eq!(base, Path::new("/home/user/projects/src"));
+    }
+
+    #[test]
+    fn base_dir_only_metachar_returns_root() {
+        let base = ResolvedGlob::base_dir("*");
+        assert_eq!(base, Path::new("/"));
+    }
+
+    // ── ResolvedGlob::new ─────────────────────────────────────────
+
+    #[test]
+    fn resolved_glob_relative_pattern() {
+        let rg = ResolvedGlob::new("src/**/*.rs").expect("valid glob");
+        assert!(rg.override_root().is_none());
+        assert!(!rg.match_full_path);
+    }
+
+    #[test]
+    fn resolved_glob_absolute_pattern() {
+        let rg = ResolvedGlob::new("/tmp/project/*.rs").expect("valid glob");
+        assert_eq!(rg.override_root(), Some(Path::new("/tmp/project")));
+        assert!(rg.match_full_path);
+    }
+
+    #[test]
+    fn resolved_glob_tilde_becomes_absolute() {
+        let rg = ResolvedGlob::new("~/projects/*.rs").expect("valid glob");
+        assert!(rg.override_root().is_some());
+        assert!(rg.match_full_path);
+    }
+
+    #[test]
+    fn resolved_glob_invalid_pattern() {
+        assert!(ResolvedGlob::new("[invalid").is_err());
+    }
+
+    // ── ResolvedGlob::is_match ────────────────────────────────────
+
+    #[test]
+    fn is_match_relative_strips_root() {
+        let rg = ResolvedGlob::new("src/**/*.rs").expect("valid glob");
+        let root = Path::new("/workspace");
+
+        assert!(rg.is_match(Path::new("/workspace/src/lib.rs"), root));
+        assert!(rg.is_match(Path::new("/workspace/src/deep/mod.rs"), root));
+        assert!(!rg.is_match(Path::new("/workspace/tests/foo.rs"), root));
+    }
+
+    #[test]
+    fn is_match_relative_star_no_cross_directory() {
+        let rg = ResolvedGlob::new("src/*.rs").expect("valid glob");
+        let root = Path::new("/workspace");
+
+        assert!(rg.is_match(Path::new("/workspace/src/lib.rs"), root));
+        assert!(!rg.is_match(Path::new("/workspace/src/deep/mod.rs"), root));
+    }
+
+    #[test]
+    fn is_match_absolute_uses_full_path() {
+        let rg = ResolvedGlob::new("/tmp/project/*.rs").expect("valid glob");
+        let root = Path::new("/tmp/project");
+
+        assert!(rg.is_match(Path::new("/tmp/project/main.rs"), root));
+        // `*` does not cross directory boundaries (shell-like)
+        assert!(!rg.is_match(Path::new("/tmp/project/sub/lib.rs"), root));
+        assert!(!rg.is_match(Path::new("/other/main.rs"), root));
+    }
+
+    #[test]
+    fn is_match_absolute_double_star() {
+        let rg = ResolvedGlob::new("/tmp/project/**/*.rs").expect("valid glob");
+        let root = Path::new("/tmp/project");
+
+        assert!(rg.is_match(Path::new("/tmp/project/main.rs"), root));
+        assert!(rg.is_match(Path::new("/tmp/project/sub/lib.rs"), root));
+        assert!(!rg.is_match(Path::new("/other/main.rs"), root));
+    }
+
+    #[test]
+    fn is_match_relative_wrong_root_still_tries() {
+        let rg = ResolvedGlob::new("*.txt").expect("valid glob");
+        // When strip_prefix fails, falls back to matching the full path.
+        // A bare filename matches *.txt.
+        assert!(rg.is_match(Path::new("notes.txt"), Path::new("/nonexistent")));
     }
 }
