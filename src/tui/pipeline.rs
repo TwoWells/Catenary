@@ -10,7 +10,7 @@
 //! 2. **Scope collapse** — entries sharing a `parent_id` group into `Scope`.
 //! 3. **Run collapse** — consecutive same-category singles merge into `Collapsed`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use super::category;
@@ -271,7 +271,7 @@ pub fn scope_collapse(
     // and output slots for root-level entries. Children are consumed by
     // their scope's builder. Root-level entries interrupt all open scopes.
     let len = entries.len();
-    let mut builders: HashMap<usize, ScopeBuilder> = HashMap::new();
+    let mut builders: BTreeMap<usize, ScopeBuilder> = BTreeMap::new();
     // Output slots: (original_index, entry_or_placeholder).
     // Root-level entries go directly into slots. Scope parents reserve
     // a slot that will be expanded into segments in final assembly.
@@ -1278,6 +1278,68 @@ mod tests {
                 );
             }
             other => panic!("expected Scope, got {other:?}"),
+        }
+    }
+
+    /// Regression test: the full pipeline (pair_merge → scope_collapse →
+    /// run_collapse) must produce identical output on repeated calls with
+    /// the same input. Non-deterministic `HashMap` iteration in
+    /// `scope_collapse` previously caused display jitter in the TUI.
+    #[test]
+    fn test_pipeline_deterministic() {
+        // Simulate a grep tool call with interleaved yaml-language-server
+        // notifications — the exact scenario that produced jitter.
+        let messages = vec![
+            // hook pre-tool
+            make_message_with_id_parent(1, "hook", "pre-tool/enforce-editing", "", None, None),
+            // MCP grep request (scope parent)
+            make_message_with_id_parent(2, "mcp", "tools/call", "", None, None),
+            // LSP children of grep
+            make_message_with_id_parent(3, "lsp", "textDocument/didOpen", "rust-analyzer", None, Some(2)),
+            make_message_with_id_parent(4, "lsp", "textDocument/hover", "rust-analyzer", None, Some(2)),
+            // yaml interruption
+            make_message_with_id_parent(5, "lsp", "workspace/configuration", "yaml-language-server", None, None),
+            make_message_with_id_parent(6, "lsp", "textDocument/publishDiagnostics", "yaml-language-server", None, None),
+            // more LSP children of grep
+            make_message_with_id_parent(7, "lsp", "textDocument/hover", "rust-analyzer", None, Some(2)),
+            make_message_with_id_parent(8, "lsp", "textDocument/hover", "rust-analyzer", None, Some(2)),
+            // another yaml interruption
+            make_message_with_id_parent(9, "lsp", "workspace/configuration", "yaml-language-server", None, None),
+            make_message_with_id_parent(10, "lsp", "textDocument/publishDiagnostics", "yaml-language-server", None, None),
+            // final LSP children
+            make_message_with_id_parent(11, "lsp", "textDocument/didClose", "rust-analyzer", None, Some(2)),
+            // hook post-tool
+            make_message_with_id_parent(12, "hook", "post-tool/diagnostics", "", None, None),
+        ];
+
+        // Run the full pipeline 20 times and assert all runs produce
+        // the same result.
+        let reference = {
+            let merged = pair_merge(&messages);
+            let scoped = scope_collapse(merged, &messages);
+            run_collapse(scoped, &messages)
+        };
+
+        for i in 1..20 {
+            let merged = pair_merge(&messages);
+            let scoped = scope_collapse(merged, &messages);
+            let result = run_collapse(scoped, &messages);
+
+            assert_eq!(
+                reference.len(),
+                result.len(),
+                "run {i}: entry count differs ({} vs {})",
+                reference.len(),
+                result.len()
+            );
+
+            for (j, (a, b)) in reference.iter().zip(result.iter()).enumerate() {
+                assert_eq!(
+                    format!("{a:?}"),
+                    format!("{b:?}"),
+                    "run {i}, entry {j}: display entries differ"
+                );
+            }
         }
     }
 }
