@@ -116,6 +116,13 @@ impl HookRouter {
                 self.handle_diagnostics(&file, &agent_id, tool.as_deref(), entry_id)
                     .await
             }
+            HookRequest::PostToolDoneEditing {
+                agent_id,
+                session_id,
+            } => {
+                self.store_client_session_id(session_id.as_deref());
+                self.handle_done_editing(&agent_id, entry_id).await
+            }
             HookRequest::PostAgentRequireRelease {
                 agent_id,
                 stop_hook_active,
@@ -134,7 +141,19 @@ impl HookRouter {
     /// If the agent is in editing mode, only Edit/Read/Write and Catenary
     /// editing tools are allowed. If the agent is not in editing mode,
     /// Edit/Write requires `start_editing` first.
+    ///
+    /// When the tool is `start_editing`, enters editing mode as a side effect
+    /// (the MCP tool is a no-op trigger — the hook owns the state transition
+    /// because it has the real `agent_id` from the host CLI).
     fn handle_enforce_editing(&self, tool_name: &str, agent_id: &str) -> Option<HookResult> {
+        // start_editing: enter editing mode and allow unconditionally.
+        if tool_name.contains("start_editing") {
+            if let Ok(c) = self.conn.lock() {
+                let _ = db::start_editing(&c, &self.session_id, agent_id);
+            }
+            return None;
+        }
+
         let agent_editing = self
             .conn
             .lock()
@@ -157,6 +176,34 @@ impl HookRouter {
             Some(HookResult::Deny("call start_editing before editing".into()))
         } else {
             None
+        }
+    }
+
+    /// Batch diagnostics on `done_editing`: exit editing mode, drain
+    /// accumulated files, and run diagnostics on all of them.
+    ///
+    /// The MCP `done_editing` tool is a no-op trigger — the hook owns the
+    /// state transition because it has the real `agent_id` from the host CLI.
+    async fn handle_done_editing(&self, agent_id: &str, entry_id: i64) -> Option<HookResult> {
+        let files = {
+            let conn = self.conn.lock().ok()?;
+            let files = db::drain_editing_files(&conn, &self.session_id, agent_id).ok()?;
+            let _ = db::done_editing(&conn, &self.session_id, agent_id);
+            drop(conn);
+            files
+        };
+
+        let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let output = self
+            .toolbox
+            .diagnostics
+            .process_files(&file_refs, entry_id)
+            .await;
+
+        if output.is_empty() {
+            Some(HookResult::Content("done editing [clean]".into()))
+        } else {
+            Some(HookResult::Content(format!("done editing\n{output}")))
         }
     }
 
@@ -221,10 +268,16 @@ impl HookRouter {
 
     /// Force `done_editing` before the agent stops.
     ///
-    /// If `stop_hook_active` is true (retry), allows unconditionally.
+    /// If `stop_hook_active` is true (retry after the agent failed to call
+    /// `done_editing`), force-clears the stale editing state and allows.
     /// Otherwise blocks if the agent is in editing mode.
     fn handle_require_release(&self, agent_id: &str, stop_hook_active: bool) -> Option<HookResult> {
         if stop_hook_active {
+            // Agent was told to call done_editing but didn't. Clear stale
+            // state rather than leaving it for SessionStart/GC cleanup.
+            if let Ok(c) = self.conn.lock() {
+                let _ = db::done_editing(&c, &self.session_id, agent_id);
+            }
             return None;
         }
 

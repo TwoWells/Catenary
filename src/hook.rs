@@ -87,6 +87,17 @@ pub(crate) enum HookRequest {
         stop_hook_active: bool,
     },
 
+    /// Batch diagnostics after `done_editing`.
+    #[serde(rename = "post-tool/done-editing")]
+    PostToolDoneEditing {
+        /// Agent ID (empty string for the main agent).
+        #[serde(default)]
+        agent_id: String,
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
     /// Clear stale editing state on session start.
     #[serde(rename = "session-start/clear-editing")]
     SessionStartClearEditing {

@@ -45,7 +45,7 @@
         ]
       },
       {
-        "matcher": "Bash(catenary restore *)",
+        "matcher": "mcp.*catenary.*done_editing",
         "hooks": [
           {
             "type": "command",

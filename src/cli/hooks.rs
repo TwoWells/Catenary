@@ -227,8 +227,8 @@ pub fn run_session_start(format: HostFormat) {
 ///
 /// If the agent has files in editing state, blocks the stop with a message
 /// directing the agent to call `done_editing`. If `stop_hook_active` is true
-/// (Claude Code) indicating a retry, allows the stop — `SessionStart` cleanup
-/// handles the stale state.
+/// (retry after agent failed to comply), force-clears the stale editing state
+/// and allows the stop.
 pub fn run_post_agent(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
@@ -277,8 +277,38 @@ pub fn run_post_agent(format: HostFormat) {
 /// connects to the IPC socket, and returns diagnostics for the model's
 /// context. Emits `systemMessage` JSON on infrastructure errors so the user
 /// sees failures in their terminal.
+///
+/// For `done_editing`, sends a `post-tool/done-editing` IPC request instead
+/// of the per-file `post-tool/diagnostics` — the server drains accumulated
+/// files and returns batch diagnostics.
 pub fn run_post_tool(format: HostFormat) {
-    let Some((file_path, hook_json)) = read_post_tool_input(format) else {
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    let tool_name = hook_json
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // done_editing: batch diagnostics (no file path needed).
+    if tool_name.contains("done_editing") {
+        run_post_tool_done_editing(&hook_json, format);
+        return;
+    }
+
+    // Per-file diagnostics: requires a file path.
+    let Some(file_path) = extract_file_path(&hook_json) else {
+        print!(
+            "{}",
+            notify_error(
+                "missing file path in hook input — diagnostics skipped",
+                format,
+            )
+        );
         return;
     };
 
@@ -310,15 +340,14 @@ pub fn run_post_tool(format: HostFormat) {
 
     let agent_id = extract_agent_id(&hook_json);
     let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
-    let tool_name = hook_json.get("tool_name").and_then(|v| v.as_str());
 
     let mut request = serde_json::json!({
         "method": "post-tool/diagnostics",
         "file": file_path,
         "agent_id": agent_id,
     });
-    if let Some(tool) = tool_name {
-        request["tool"] = serde_json::json!(tool);
+    if !tool_name.is_empty() {
+        request["tool"] = serde_json::json!(tool_name);
     }
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
@@ -326,41 +355,6 @@ pub fn run_post_tool(format: HostFormat) {
 
     let lines = ipc_exchange(stream, &request);
     format_post_tool_response(&lines, &file_path, format);
-}
-
-/// Read and validate stdin for `run_post_tool`. Returns file path and parsed JSON.
-fn read_post_tool_input(format: HostFormat) -> Option<(String, serde_json::Value)> {
-    let stdin_data = std::io::read_to_string(std::io::stdin()).ok().or_else(|| {
-        print!(
-            "{}",
-            notify_error(
-                "hook input unavailable — try restarting your session",
-                format
-            )
-        );
-        None
-    })?;
-    let hook_json: serde_json::Value = serde_json::from_str(&stdin_data).ok().or_else(|| {
-        print!(
-            "{}",
-            notify_error(
-                "unexpected hook input — try restarting your session",
-                format
-            )
-        );
-        None
-    })?;
-    let file_path = extract_file_path(&hook_json).or_else(|| {
-        print!(
-            "{}",
-            notify_error(
-                "missing file path in hook input — diagnostics skipped",
-                format
-            )
-        );
-        None
-    })?;
-    Some((file_path, hook_json))
 }
 
 /// Format and print the IPC response from `post-tool/diagnostics`.
@@ -404,6 +398,64 @@ fn format_post_tool_response(lines: &[String], file_path: &str, format: HostForm
             print!("{}", notify_error(&msg, format));
         }
         _ => {} // unexpected variant for this hook
+    }
+}
+
+/// Handle `done_editing` `PostToolUse`: send `post-tool/done-editing` IPC
+/// request to drain accumulated files and return batch diagnostics.
+fn run_post_tool_done_editing(hook_json: &serde_json::Value, format: HostFormat) {
+    let Ok(conn) = db::open_and_migrate() else {
+        print!(
+            "{}",
+            notify_error(
+                "state database unavailable — try running: catenary list",
+                format,
+            )
+        );
+        return;
+    };
+    let Some(catenary_sid) = find_session_id(hook_json, &conn) else {
+        return;
+    };
+
+    let endpoint = notify_endpoint(&catenary_sid);
+    let Some(stream) = notify_connect(&endpoint) else {
+        print!(
+            "{}",
+            notify_error(
+                &format!("session {catenary_sid} is not responding — it may have crashed"),
+                format,
+            )
+        );
+        return;
+    };
+
+    let agent_id = extract_agent_id(hook_json);
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+
+    let mut request = serde_json::json!({
+        "method": "post-tool/done-editing",
+        "agent_id": agent_id,
+    });
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
+
+    let lines = ipc_exchange(stream, &request);
+    let Some(line) = lines.first() else {
+        return;
+    };
+
+    let Ok(result) = serde_json::from_str::<crate::hook::HookResult>(line) else {
+        print!(
+            "{}",
+            format_diagnostics(line, format, "PostToolUse")
+        );
+        return;
+    };
+
+    if let crate::hook::HookResult::Content(content) = result {
+        print!("{}", format_diagnostics(&content, format, "PostToolUse"));
     }
 }
 

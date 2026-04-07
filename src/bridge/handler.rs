@@ -271,49 +271,18 @@ impl ToolHandler for McpRouter {
         arguments: Option<serde_json::Value>,
         parent_id: Option<i64>,
     ) -> Result<CallToolResult> {
-        // Editing tools: early dispatch, no LSP readiness wait.
-        // start_editing is db-only; done_editing drains files and runs diagnostics.
+        // Editing tools: no-op triggers. The PreToolUse hook enters editing
+        // mode (start_editing) and the PostToolUse hook exits + runs batch
+        // diagnostics (done_editing). The hooks own the state transitions
+        // because they have the real agent_id from the host CLI.
         if name == "start_editing" {
-            let result = {
-                let doc_manager = self
-                    .toolbox
-                    .runtime
-                    .block_on(self.toolbox.client_manager.doc_manager().lock());
-                doc_manager.start_editing("")
-            };
-            return match result {
-                Ok(true) => Ok(CallToolResult::text(
-                    "editing mode \u{2014} diagnostics deferred until done_editing",
-                )),
-                Ok(false) => Ok(CallToolResult::text("already in editing mode")),
-                Err(e) => Ok(CallToolResult::error(e.to_string())),
-            };
+            return Ok(CallToolResult::text(
+                "editing mode \u{2014} diagnostics deferred until done_editing",
+            ));
         }
 
         if name == "done_editing" {
-            let files = {
-                let doc_manager = self
-                    .toolbox
-                    .runtime
-                    .block_on(self.toolbox.client_manager.doc_manager().lock());
-                doc_manager.finish_editing("")
-            };
-            return match files {
-                Ok(files) => {
-                    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
-                    let entry_id = parent_id.unwrap_or(0);
-                    let output = self
-                        .toolbox
-                        .runtime
-                        .block_on(self.toolbox.diagnostics.process_files(&file_refs, entry_id));
-                    if output.is_empty() {
-                        Ok(CallToolResult::text("done editing [clean]"))
-                    } else {
-                        Ok(CallToolResult::text(format!("done editing\n{output}")))
-                    }
-                }
-                Err(e) => Ok(CallToolResult::error(e.to_string())),
-            };
+            return Ok(CallToolResult::text("done editing"));
         }
 
         // ToolServer dispatch: grep, glob
