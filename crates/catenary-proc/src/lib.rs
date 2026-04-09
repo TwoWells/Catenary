@@ -334,7 +334,7 @@ pub fn register_child_process(pid: u32) {
     let job = JOB.get_or_init(|| {
         // SAFETY: `CreateJobObjectW` with null name creates an anonymous job.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle == 0 {
+        if handle.is_null() {
             return None;
         }
 
@@ -367,7 +367,7 @@ pub fn register_child_process(pid: u32) {
 
     // SAFETY: `OpenProcess` with valid access flags; handle closed after use.
     let child_handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
-    if child_handle == 0 {
+    if child_handle.is_null() {
         return;
     }
     // SAFETY: both handles are valid.
@@ -713,7 +713,7 @@ mod platform {
             // Returns 0 on failure (invalid PID).
             let handle =
                 unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
-            if handle == 0 {
+            if handle.is_null() {
                 return None;
             }
             let ppid = unsafe { get_ppid(pid) };
@@ -883,7 +883,7 @@ mod platform {
         // properly closing the handle on all paths.
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
-            if handle == 0 {
+            if handle.is_null() {
                 return None;
             }
             let result = sample_handle(handle);
