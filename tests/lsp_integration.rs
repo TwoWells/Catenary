@@ -208,6 +208,83 @@ async fn test_client_capabilities() -> Result<()> {
     Ok(())
 }
 
+// ── Settle tests ─────────────────────────────────────────────────────
+
+/// Verifies that settle waits through a `Busy` → `Healthy` lifecycle
+/// transition and returns `Settled` once the tree is quiet.
+///
+/// mockls `--indexing-delay 200` sends `$/progress` begin, sleeps 200ms,
+/// then sends `$/progress` end. settle sees `Busy` → work gate satisfied,
+/// then resumes tree walking after `Healthy` and detects quiet.
+#[tokio::test]
+async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
+    use catenary_mcp::lsp::settle::{SettleResult, settle};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempdir()?;
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A, "--indexing-delay", "200"],
+        MOCK_LANG_A,
+        test_message_log(),
+        None,
+    )?;
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    // settle starts while mockls is still in its indexing delay (Busy).
+    let server = Arc::clone(client.server());
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), settle(&server, cancel))
+        .await
+        .expect("settle should complete within 5s");
+
+    assert_eq!(result, SettleResult::Settled);
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Verifies that settle detects a quiet tree after brief CPU activity.
+///
+/// mockls `--cpu-on-initialized 100` burns CPU for 100ms on the
+/// `initialized` notification. settle's tree walks catch the activity
+/// (work gate), then detect silence once the burn ends.
+#[tokio::test]
+async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
+    use catenary_mcp::lsp::settle::{SettleResult, settle};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempdir()?;
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A, "--cpu-on-initialized", "100"],
+        MOCK_LANG_A,
+        test_message_log(),
+        None,
+    )?;
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    // settle starts while mockls is burning CPU from the initialized notification.
+    let server = Arc::clone(client.server());
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), settle(&server, cancel))
+        .await
+        .expect("settle should complete within 5s");
+
+    assert_eq!(result, SettleResult::Settled);
+
+    client.shutdown().await?;
+    Ok(())
+}
+
 /// Verifies that `Connection::request` retries on `ContentModified` (-32801).
 ///
 /// mockls `--content-modified-once` returns `ContentModified` on the first

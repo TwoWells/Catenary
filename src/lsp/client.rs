@@ -1030,6 +1030,14 @@ impl LspClient {
         }
     }
 
+    /// Returns the underlying server representation.
+    ///
+    /// Used by the settle loop and diagnostics pipeline, which operate
+    /// directly on `Arc<LspServer>`.
+    pub const fn server(&self) -> &Arc<LspServer> {
+        &self.server
+    }
+
     /// Returns the command used to spawn this server (e.g., "rust-analyzer").
     pub fn server_command(&self) -> &str {
         &self.server_command
