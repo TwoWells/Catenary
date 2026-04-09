@@ -304,9 +304,6 @@ impl Connection {
     }
 
     /// Returns a shared reference to the alive flag.
-    ///
-    /// Used by `TokenMonitor` which needs an `Arc<AtomicBool>` to poll
-    /// server liveness without going through Connection.
     pub fn alive_flag(&self) -> Arc<AtomicBool> {
         self.alive.clone()
     }

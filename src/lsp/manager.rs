@@ -360,6 +360,23 @@ impl LspClientManager {
         self.get_or_spawn(ext).await
     }
 
+    /// Closes a document previously opened via [`ensure_document_open`](Self::ensure_document_open).
+    ///
+    /// Decrements the ref count and sends `didClose` when the count reaches
+    /// zero. Safe to call even if the document was already closed — the
+    /// ref-counted [`DocumentManager`] handles this gracefully.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Lock ordering: doc_manager then client — both needed for close"
+    )]
+    pub async fn close_document(&self, uri: &str, client: &Arc<Mutex<LspClient>>) {
+        let mut dm = self.doc_manager.lock().await;
+        if dm.close(uri) {
+            drop(dm);
+            let _ = client.lock().await.did_close(uri).await;
+        }
+    }
+
     /// Ensures a document is open and synced with its LSP server.
     ///
     /// Gets the client for the file's language, opens the document if not

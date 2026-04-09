@@ -5,8 +5,6 @@
 pub mod client;
 /// Transport layer: process lifecycle, reader loop, request/response correlation.
 pub(crate) mod connection;
-/// Diagnostics strategy selection and activity monitoring.
-pub(crate) mod diagnostics;
 /// Extractor functions for LSP response and notification fields.
 pub(crate) mod extract;
 /// Standalone pure functions for LSP document identity.
@@ -25,10 +23,8 @@ pub mod settle;
 pub mod state;
 /// Small local types for LSP concepts.
 pub(crate) mod types;
-/// Unified wait infrastructure for load-aware failure detection.
-pub(crate) mod wait;
 
-pub use client::{DiagnosticsWaitResult, LspClient};
+pub use client::LspClient;
 pub use manager::LspClientManager;
 pub use server::LspServer;
 pub use state::{ProgressTracker, ServerLifecycle, ServerStatus};

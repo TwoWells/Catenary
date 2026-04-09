@@ -3,52 +3,23 @@
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::params;
 use super::server::LspServer;
 use super::state::{ServerLifecycle, ServerStatus};
-use super::wait::load_aware_grace;
 use crate::session::MessageLog;
 
 /// Cached diagnostics for a file: `(version, diagnostics)`.
 ///
 /// `version` is the document version from `publishDiagnostics`, if the
-/// server includes it. Used by [`super::diagnostics::DiagnosticsStrategy::Version`] to
-/// match diagnostics to a specific document change.
-pub type DiagnosticsCache = Arc<std::sync::Mutex<HashMap<String, (Option<i32>, Vec<Value>)>>>;
-
-/// Result of waiting for diagnostics to update after a file change.
-///
-/// The agent never sees infrastructure details — only "trusted
-/// diagnostics are in the cache" or "nothing available."
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticsWaitResult {
-    /// Trusted diagnostics are in the cache — safe to read.
-    Diagnostics,
-    /// No trusted diagnostics available. Covers server death, budget
-    /// exhaustion, and servers without version/progress support.
-    Nothing,
-}
-
-/// CPU tick threshold for diagnostics wait: 1000 ticks = 10 CPU-seconds.
-const DIAGNOSTICS_THRESHOLD: u64 = 1000;
-
-/// CPU tick threshold for preamble windows (grace, discovery, progress grace).
-const PREAMBLE_THRESHOLD: u64 = 500;
-
-/// Poll interval for diagnostics wait main loops.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Wall-clock safety cap (5 minutes) for diagnostics wait.
-const SAFETY_CAP: Duration = Duration::from_secs(300);
+/// server includes it.
+pub type DiagnosticsCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<i32>, Vec<Value>)>>>;
 
 /// Manages communication with an LSP server process.
 pub struct LspClient {
@@ -62,11 +33,6 @@ pub struct LspClient {
     /// Whether the server supports dynamic workspace folder changes
     /// (both `supported` and `change_notifications` are advertised).
     supports_workspace_folders: bool,
-    /// Logged once when a server is detected as lacking diagnostics support.
-    logged_no_diagnostics_support: AtomicBool,
-    /// Last document version sent via `did_open`/`did_change` per URI.
-    /// Used to detect stale diagnostics from prior document versions.
-    last_sent_version: Arc<Mutex<HashMap<String, i32>>>,
     /// Whether the server advertised `textDocumentSync.save` support.
     wants_did_save: bool,
     /// The command used to spawn this server (e.g., "rust-analyzer").
@@ -144,31 +110,11 @@ impl LspClient {
             encoding: "utf-16".to_string(), // Default per spec
             spawn_time: Instant::now(),
             supports_workspace_folders: false,
-            logged_no_diagnostics_support: AtomicBool::new(false),
-            last_sent_version: Arc::new(Mutex::new(HashMap::new())),
             wants_did_save: false,
             server_command: program.to_string(),
             server_version: None,
             parent_id: None,
         })
-    }
-
-    /// Samples the server process via the persistent `ProcessMonitor`.
-    ///
-    /// Returns [`ProcessDelta`](catenary_proc::ProcessDelta) with per-counter
-    /// deltas since the last sample. Returns `None` if the process is gone
-    /// or monitoring is unavailable.
-    fn sample_monitor(&self) -> Option<catenary_proc::ProcessDelta> {
-        self.server.sample_monitor()
-    }
-
-    /// Returns whether the server has active `$/progress` tokens.
-    ///
-    /// Checks the actual progress tracker rather than lifecycle state,
-    /// because the failure detection budget should only pause for
-    /// explained work backed by real progress tokens.
-    fn progress_active(&self) -> bool {
-        self.server.is_progress_active()
     }
 
     /// Sets the parent message ID for causation tracking.
@@ -338,6 +284,7 @@ impl LspClient {
     }
 
     /// Returns the negotiated position encoding.
+    #[must_use]
     pub fn encoding(&self) -> &str {
         &self.encoding
     }
@@ -345,6 +292,7 @@ impl LspClient {
     /// Returns the server capabilities from the `initialize` response.
     ///
     /// Returns an empty object before `initialize()` completes.
+    #[must_use]
     pub fn capabilities(&self) -> &Value {
         self.server.capabilities()
     }
@@ -373,10 +321,6 @@ impl LspClient {
         version: i32,
         text: &str,
     ) -> Result<()> {
-        self.last_sent_version
-            .lock()
-            .await
-            .insert(uri.to_string(), version);
         self.notify(
             "textDocument/didOpen",
             params::did_open(uri, language_id, version, text),
@@ -390,10 +334,6 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_change(&self, uri: &str, version: i32, text: &str) -> Result<()> {
-        self.last_sent_version
-            .lock()
-            .await
-            .insert(uri.to_string(), version);
         self.notify(
             "textDocument/didChange",
             params::did_change(uri, version, text),
@@ -574,21 +514,25 @@ impl LspClient {
     }
 
     /// Returns whether the server advertises `workspaceSymbolProvider.resolveProvider`.
+    #[must_use]
     pub fn supports_workspace_symbol_resolve(&self) -> bool {
         self.server.supports_workspace_symbol_resolve()
     }
 
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
+    #[must_use]
     pub fn supports_pull_diagnostics(&self) -> bool {
         self.server.supports_pull_diagnostics()
     }
 
     /// Returns whether the server advertises `renameProvider`.
+    #[must_use]
     pub fn supports_rename(&self) -> bool {
         self.server.supports_rename()
     }
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
+    #[must_use]
     pub fn supports_type_hierarchy(&self) -> bool {
         self.server.supports_type_hierarchy()
     }
@@ -744,106 +688,11 @@ impl LspClient {
             .unwrap_or_default()
     }
 
-    /// Gets the cached diagnostics version for a URI.
-    ///
-    /// Returns `None` if no diagnostics have been published for this URI
-    /// or if the server doesn't include version in `publishDiagnostics`.
-    #[allow(dead_code, reason = "Used by diagnostics strategy tests")]
-    pub(crate) fn cached_diagnostics_version(&self, uri: &str) -> Option<i32> {
-        let cache = self
-            .server
-            .diagnostics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.get(uri).and_then(|(version, _)| *version)
-    }
-
-    /// Returns whether cached diagnostics match the last-sent document version.
-    ///
-    /// Returns `true` (assume current) when the server doesn't publish version
-    /// info or when no version has been tracked for this URI — we can't
-    /// distinguish stale from fresh without version data.
-    async fn is_diagnostics_version_current(&self, uri: &str) -> bool {
-        if !self.server.publishes_version.load(Ordering::SeqCst) {
-            return true;
-        }
-        let sent = self.last_sent_version.lock().await;
-        let Some(sent_v) = sent.get(uri).copied() else {
-            return true;
-        };
-        drop(sent);
-        let cached_v = self.cached_diagnostics_version(uri);
-        cached_v.is_some_and(|v| v >= sent_v)
-    }
-
-    /// Returns the current diagnostics generation for a URI.
-    ///
-    /// Callers should snapshot this *before* sending a change notification,
-    /// then pass the snapshot to [`Self::wait_for_diagnostics_update`] to ensure
-    /// the returned diagnostics reflect that specific change.
-    pub fn diagnostics_generation(&self, uri: &str) -> u64 {
-        let generations = self
-            .server
-            .diagnostics_generation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        generations.get(uri).copied().unwrap_or(0)
-    }
-
-    /// Returns the diagnostics strategy for this server, if any.
-    ///
-    /// Selected based on runtime observations: whether the server has
-    /// included `version` in `publishDiagnostics`, or sent `$/progress`
-    /// tokens. Returns `None` for servers without either signal —
-    /// they do not participate in the diagnostics lifecycle.
-    ///
-    /// When both signals are present, prefers `TokenMonitor` because
-    /// multi-round servers (rust-analyzer, clangd, gopls) publish fast
-    /// native diagnostics first (matching version), then slower flycheck
-    /// results under a progress token. The Active → Idle transition
-    /// spans the full work.
-    pub(crate) fn diagnostics_strategy(&self) -> Option<super::diagnostics::DiagnosticsStrategy> {
-        use super::diagnostics::DiagnosticsStrategy;
-
-        if self.server.sends_progress() {
-            Some(DiagnosticsStrategy::TokenMonitor)
-        } else if self.server.publishes_version.load(Ordering::SeqCst) {
-            Some(DiagnosticsStrategy::Version)
-        } else {
-            None
-        }
-    }
-
-    /// Returns whether this server supports the diagnostics wait lifecycle.
-    ///
-    /// Servers must provide at least one of:
-    /// - `version` field in `publishDiagnostics` (LSP 3.15+)
-    /// - `$/progress` tokens
-    ///
-    /// Servers without either still receive `didOpen`/`didChange` for code
-    /// intelligence but do not get `didSave` and are not waited on for
-    /// diagnostics.
-    pub fn supports_diagnostics_wait(&self) -> bool {
-        if self.server.publishes_version.load(Ordering::SeqCst) || self.server.sends_progress() {
-            return true;
-        }
-        // Log once when we determine the server lacks support
-        if !self
-            .logged_no_diagnostics_support
-            .swap(true, Ordering::SeqCst)
-        {
-            info!(
-                "[{}] server lacks version/progress support \u{2014} diagnostics disabled",
-                self.server.language
-            );
-        }
-        false
-    }
-
     /// Returns whether the server advertised `textDocumentSync.save` support.
     ///
     /// When `false`, `did_save` should not be sent — the server doesn't
     /// want it and may not run diagnostics on save.
+    #[must_use]
     pub const fn wants_did_save(&self) -> bool {
         self.wants_did_save
     }
@@ -854,263 +703,53 @@ impl LspClient {
         self.server.pid()
     }
 
-    /// Waits for fresh diagnostics after a file change, using the
-    /// appropriate strategy for this server.
-    ///
-    /// `snapshot` should be obtained via [`Self::diagnostics_generation`] **before**
-    /// sending the change that triggers new diagnostics.
-    ///
-    /// Uses CPU tick failure detection instead of wall-clock timeouts.
-    /// The failure threshold only drains when the server process is Running
-    /// with advancing ticks and no active progress — starvation, sleeping,
-    /// blocked I/O, and explained work are free waits.
-    ///
-    /// Returns [`DiagnosticsWaitResult::Diagnostics`] when trusted
-    /// diagnostics are in the cache, or [`DiagnosticsWaitResult::Nothing`]
-    /// when no trusted diagnostics are available.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Strategy dispatch requires many branches"
-    )]
-    pub async fn wait_for_diagnostics_update(
-        &self,
-        uri: &str,
-        snapshot: u64,
-    ) -> DiagnosticsWaitResult {
-        use super::diagnostics::{ActivityState, DiagnosticsStrategy, ProgressMonitor};
-
-        // ── Grace period ─────────────────────────────────────────────
-        // Wait for the first publishDiagnostics using load-aware failure
-        // detection. Servers that have already pushed will pass through
-        // immediately (the generation snapshot will already be stale).
-        {
-            let grace_ok = load_aware_grace(
-                &mut || self.sample_monitor(),
-                PREAMBLE_THRESHOLD,
-                Some(Duration::from_secs(10)),
-                &self.server.diagnostics_notify,
-                || self.progress_active(),
-                || async { self.diagnostics_generation(uri) > snapshot },
-            )
-            .await;
-
-            if !grace_ok {
-                return DiagnosticsWaitResult::Nothing;
-            }
-        }
-
-        // ── Strategy discovery ────────────────────────────────────────
-        // Allow a short window for the server to demonstrate its strategy
-        // (e.g., progress tokens sent in response to didChange).
-        // Uses a wall-clock timeout: the server may be sleeping (not
-        // consuming CPU) while deciding what capability to expose, so
-        // tick-based thresholds would wait indefinitely.
-        let strategy = if let Some(s) = self.diagnostics_strategy() {
-            s
-        } else {
-            let discovery_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Some(s) = self.diagnostics_strategy() {
-                    break s;
-                }
-                if !self.is_alive() || tokio::time::Instant::now() >= discovery_deadline {
-                    return DiagnosticsWaitResult::Nothing;
-                }
-                tokio::select! {
-                    () = self.server.capability_notify.notified() => {}
-                    () = tokio::time::sleep(POLL_INTERVAL) => {}
-                }
-            }
-        };
-        debug!(
-            "Diagnostics strategy: {:?} (sends_progress={}, publishes_version={})",
-            strategy,
-            self.server.sends_progress(),
-            self.server.publishes_version.load(Ordering::SeqCst),
-        );
-
-        let wall_deadline = tokio::time::Instant::now() + SAFETY_CAP;
-        let mut budget: i64 = i64::try_from(DIAGNOSTICS_THRESHOLD).unwrap_or(1000);
-
-        // ── Main wait loops ──────────────────────────────────────────
-        match strategy {
-            DiagnosticsStrategy::Version => {
-                // Wait for publishDiagnostics with version >= our change.
-                loop {
-                    if self.diagnostics_generation(uri) > snapshot
-                        && self.is_diagnostics_version_current(uri).await
-                    {
-                        return DiagnosticsWaitResult::Diagnostics;
-                    }
-
-                    // Event-driven wake + failure detection
-                    tokio::select! {
-                        () = self.server.diagnostics_notify.notified() => {
-                            // Check condition at top of loop
-                            continue;
-                        }
-                        () = tokio::time::sleep(POLL_INTERVAL) => {}
-                    }
-
-                    // Failure detection
-                    if let Some(d) = self.sample_monitor() {
-                        if d.state == catenary_proc::ProcessState::Dead {
-                            return DiagnosticsWaitResult::Nothing;
-                        }
-                        let delta = d.delta_utime + d.delta_stime;
-                        if d.state == catenary_proc::ProcessState::Running
-                            && delta > 0
-                            && !self.progress_active()
-                        {
-                            budget -= i64::try_from(delta).unwrap_or(budget);
-                        }
-                    } else if !self.is_alive() {
-                        return DiagnosticsWaitResult::Nothing;
-                    }
-
-                    if budget <= 0 {
-                        debug!("Version: tick budget exhausted");
-                        return DiagnosticsWaitResult::Nothing;
-                    }
-                    if tokio::time::Instant::now() >= wall_deadline {
-                        debug!("Version: safety cap reached");
-                        return DiagnosticsWaitResult::Nothing;
-                    }
-                }
-            }
-            DiagnosticsStrategy::TokenMonitor => {
-                let Some(alive_flag) = self.server.alive_flag() else {
-                    return DiagnosticsWaitResult::Nothing;
-                };
-                let mut monitor = super::diagnostics::TokenMonitor::new(
-                    self.server.lifecycle.clone(),
-                    alive_flag,
-                );
-                let mut ever_active = false;
-
-                // Progress grace: if diagnostics arrive before progress tokens,
-                // wait briefly for progress to start.
-                let mut generation_advanced_at: Option<tokio::time::Instant> = None;
-
-                loop {
-                    let gen_advanced = self.diagnostics_generation(uri) > snapshot
-                        && self.is_diagnostics_version_current(uri).await;
-
-                    if gen_advanced && generation_advanced_at.is_none() {
-                        generation_advanced_at = Some(tokio::time::Instant::now());
-                    }
-
-                    // If diagnostics arrived but no progress tokens, use
-                    // load_aware_grace for the progress grace window.
-                    if generation_advanced_at.is_some() && !ever_active {
-                        let progress_started = load_aware_grace(
-                            &mut || self.sample_monitor(),
-                            PREAMBLE_THRESHOLD,
-                            Some(Duration::from_secs(2)),
-                            &self.server.progress_notify,
-                            || self.progress_active(),
-                            || async { self.progress_active() },
-                        )
-                        .await;
-
-                        if !progress_started {
-                            // No progress tokens arrived — return what we have
-                            return DiagnosticsWaitResult::Diagnostics;
-                        }
-                        ever_active = true;
-                        continue;
-                    }
-
-                    match monitor.poll() {
-                        ActivityState::Dead => return DiagnosticsWaitResult::Nothing,
-                        ActivityState::Active => {
-                            ever_active = true;
-                        }
-                        ActivityState::Idle if ever_active => {
-                            // Active → Idle: the full progress cycle completed.
-                            // Check for diagnostics one more time.
-                            if self.diagnostics_generation(uri) > snapshot {
-                                return DiagnosticsWaitResult::Diagnostics;
-                            }
-                            debug!("TokenMonitor: Active \u{2192} Idle without new diagnostics");
-                            return DiagnosticsWaitResult::Nothing;
-                        }
-                        ActivityState::Idle => {}
-                    }
-
-                    // Event-driven wake + failure detection
-                    tokio::select! {
-                        () = self.server.diagnostics_notify.notified() => continue,
-                        () = self.server.progress_notify.notified() => continue,
-                        () = tokio::time::sleep(POLL_INTERVAL) => {}
-                    }
-
-                    // Failure detection (progress-aware)
-                    if let Some(d) = self.sample_monitor() {
-                        if d.state == catenary_proc::ProcessState::Dead {
-                            return DiagnosticsWaitResult::Nothing;
-                        }
-                        let delta = d.delta_utime + d.delta_stime;
-                        if d.state == catenary_proc::ProcessState::Running
-                            && delta > 0
-                            && !self.progress_active()
-                        {
-                            budget -= i64::try_from(delta).unwrap_or(budget);
-                        }
-                    }
-
-                    if budget <= 0 {
-                        debug!("TokenMonitor: tick budget exhausted");
-                        return DiagnosticsWaitResult::Nothing;
-                    }
-                    if tokio::time::Instant::now() >= wall_deadline {
-                        debug!("TokenMonitor: safety cap reached");
-                        return DiagnosticsWaitResult::Nothing;
-                    }
-                }
-            }
-        }
-    }
-
     /// Returns the underlying server representation.
     ///
     /// Used by the settle loop and diagnostics pipeline, which operate
     /// directly on `Arc<LspServer>`.
+    #[must_use]
     pub const fn server(&self) -> &Arc<LspServer> {
         &self.server
     }
 
     /// Returns the command used to spawn this server (e.g., "rust-analyzer").
+    #[must_use]
     pub fn server_command(&self) -> &str {
         &self.server_command
     }
 
     /// Returns the server version from the LSP `initialize` response.
+    #[must_use]
     pub fn server_version(&self) -> Option<&str> {
         self.server_version.as_deref()
     }
 
     /// Returns the language identifier for this client (e.g., "rust", "python").
+    #[must_use]
     pub fn language(&self) -> &str {
         &self.server.language
     }
 
     /// Returns whether the server supports dynamic workspace folder changes.
+    #[must_use]
     pub const fn supports_workspace_folders(&self) -> bool {
         self.supports_workspace_folders
     }
 
     /// Returns whether the LSP server process is still running.
+    #[must_use]
     pub fn is_alive(&self) -> bool {
         self.server.is_alive()
     }
 
     /// Returns the current server lifecycle state.
+    #[must_use]
     pub fn lifecycle(&self) -> ServerLifecycle {
         self.server.lifecycle()
     }
 
     /// Returns time since server spawned.
+    #[must_use]
     pub fn uptime(&self) -> Duration {
         self.spawn_time.elapsed()
     }

@@ -512,6 +512,11 @@ impl GrepServer {
             _ => {}
         }
 
+        drop(client);
+        self.client_manager
+            .close_document(&uri_str, &client_mutex)
+            .await;
+
         enrichment
     }
 
@@ -612,6 +617,11 @@ impl GrepServer {
                 }
             }
         }
+
+        drop(client);
+        self.client_manager
+            .close_document(&uri_str, &client_mutex)
+            .await;
 
         (inferred_kind, resolved_name, enrichment)
     }
@@ -722,13 +732,17 @@ impl GrepServer {
                     if let Ok((uri_str, client_mutex)) = open_result {
                         let mut client = client_mutex.lock().await;
                         client.set_parent_id(parent_id);
-                        if client.supports_rename() {
+                        let result = if client.supports_rename() {
                             let response = client.prepare_rename(&uri_str, line_0, col).await;
-                            drop(client);
                             matches!(response, Ok(ref v) if !v.is_null())
                         } else {
                             true
-                        }
+                        };
+                        drop(client);
+                        self.client_manager
+                            .close_document(&uri_str, &client_mutex)
+                            .await;
+                        result
                     } else {
                         false
                     }

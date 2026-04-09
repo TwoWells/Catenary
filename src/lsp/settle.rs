@@ -29,6 +29,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Budget: 60 seconds of server CPU time in centiseconds (100 Hz).
 const CPUTIME_BUDGET: u64 = 6000;
 
+/// Maximum wall-clock time for the work gate phase.
+///
+/// If no CPU activity is observed within this window, we assume the
+/// server processed the stimulus before we started sampling. This
+/// handles fast servers (e.g., mockls) that complete instantly.
+const WORK_GATE_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Outcome of the settle operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettleResult {
@@ -55,6 +62,8 @@ pub enum SettleResult {
 )]
 pub async fn settle(server: &Arc<LspServer>, cancel: CancellationToken) -> SettleResult {
     let mut work_gate_satisfied = false;
+    let mut work_gate_by_timeout = false;
+    let work_gate_start = Instant::now();
     let mut active_pids: HashSet<u32> = HashSet::new();
     let mut known_pids: HashSet<u32> = HashSet::new();
     let mut cumulative_cputime: u64 = 0;
@@ -122,7 +131,11 @@ pub async fn settle(server: &Arc<LspServer>, cancel: CancellationToken) -> Settl
         if !work_gate_satisfied {
             if any_nonzero {
                 work_gate_satisfied = true;
-                debug!("settle: work gate satisfied");
+                debug!("settle: work gate satisfied (activity detected)");
+            } else if work_gate_start.elapsed() > WORK_GATE_TIMEOUT {
+                work_gate_satisfied = true;
+                work_gate_by_timeout = true;
+                debug!("settle: work gate satisfied (timeout — server processed before sampling)");
             }
             // Budget does not cover the work gate phase
             continue;
@@ -135,8 +148,16 @@ pub async fn settle(server: &Arc<LspServer>, cancel: CancellationToken) -> Settl
             return SettleResult::BudgetExhausted;
         }
 
-        // Quiet: all zeros, no new PIDs, all per-child gates satisfied
+        // Quiet: all zeros, no new PIDs
         if !any_nonzero && !new_pids {
+            // Work gate by timeout: server processed before we started sampling,
+            // so no per-process activity was ever observed. Skip per-child gates.
+            if work_gate_by_timeout {
+                debug!("settle: settled (quiet after work gate timeout)");
+                return SettleResult::Settled;
+            }
+
+            // Normal path: all per-child gates must be satisfied
             let all_gates = snapshot
                 .samples
                 .iter()

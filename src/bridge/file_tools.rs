@@ -427,9 +427,14 @@ impl GlobServer {
 
         let mut client = client_mutex.lock().await;
         client.set_parent_id(parent_id);
-        let response = client.document_symbols(&uri_str).await?;
+        let response = client.document_symbols(&uri_str).await;
         drop(client);
 
+        self.client_manager
+            .close_document(&uri_str, &client_mutex)
+            .await;
+
+        let response = response?;
         if response.is_null() {
             return Ok(Vec::new());
         }

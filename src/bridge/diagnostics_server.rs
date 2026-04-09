@@ -4,18 +4,23 @@
 //! Diagnostics pipeline for PostToolUse hook requests.
 //!
 //! Handles file-change notifications: path resolution, LSP client lookup,
-//! document open/change, diagnostics wait, severity filtering, noise
-//! filtering, quick-fix collection, and compact formatting.
+//! document open/change, settle, diagnostics retrieval (push cache first,
+//! pull fallback), severity filtering, noise filtering, quick-fix
+//! collection, and compact formatting.
 
 use super::path_security::PathValidator;
 use super::tool_server::ToolServer;
+use crate::lsp::lang::path_to_uri;
+use crate::lsp::settle::{SettleResult, settle};
 use crate::lsp::state::ServerLifecycle;
-use crate::lsp::{DiagnosticsWaitResult, LspClient, LspClientManager};
+use crate::lsp::{LspClient, LspClientManager};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 /// Result of processing a file change through the diagnostics pipeline.
 pub struct DiagnosticsResult {
@@ -46,6 +51,9 @@ impl DiagnosticsServer {
 
     /// Processes a file change and returns diagnostics.
     ///
+    /// Pipeline: lifecycle check → probe → didOpen → didSave → settle →
+    /// retrieve (push cache first, `[clean]` semantics) → format → didClose.
+    ///
     /// # Errors
     ///
     /// Returns an error if path resolution, LSP client lookup, or document
@@ -56,7 +64,7 @@ impl DiagnosticsServer {
     )]
     #[allow(
         clippy::too_many_lines,
-        reason = "Diagnostics wait loop adds necessary branches"
+        reason = "Pipeline steps are sequential and cannot be split"
     )]
     pub async fn process_file(&self, file_path: &str, entry_id: i64) -> Result<DiagnosticsResult> {
         let path = resolve_path(file_path)?;
@@ -66,63 +74,21 @@ impl DiagnosticsServer {
         let canonical = self.path_validator.read().await.validate_read(&path)?;
 
         // Try to get the LSP client for this file's language
-        let client_mutex: Arc<Mutex<LspClient>> =
-            match self.client_manager.get_client(&canonical).await {
-                Ok(c) => c,
-                Err(_) => {
-                    return Ok(DiagnosticsResult {
-                        content: "[no language server]".into(),
-                        count: 0,
-                    });
-                }
-            };
+        let Ok(client_mutex) = self.client_manager.get_client(&canonical).await else {
+            return Ok(DiagnosticsResult {
+                content: "[no language server]".into(),
+                count: 0,
+            });
+        };
 
-        let mut doc_manager = self.client_manager.doc_manager().lock().await;
         let mut client = client_mutex.lock().await;
         let lang_id = client.language().to_string();
 
         // Thread parent_id so LSP requests are correlated with this hook
         client.set_parent_id(Some(entry_id));
 
-        if !client.is_alive() {
-            client.set_parent_id(None);
-            return Ok(DiagnosticsResult {
-                content: "[no language server]".into(),
-                count: 0,
-            });
-        }
-
-        let uri = doc_manager.uri_for_path(&canonical)?;
-        let text = tokio::fs::read_to_string(&canonical).await?;
-
-        // Snapshot generation *before* sending the change
-        let snapshot = client.diagnostics_generation(&uri);
-
-        let (first_open, version) = doc_manager.open(&uri);
-        if first_open {
-            client.did_open(&uri, &lang_id, version, &text).await?;
-        } else {
-            client.did_change(&uri, version, &text).await?;
-        }
-
-        // Trigger flycheck on servers that only run diagnostics on save
-        if client.wants_did_save() {
-            client.did_save(&uri).await?;
-        }
-
-        drop(doc_manager);
-
-        // Health probe: verify the server can respond before settling
+        // Check lifecycle before opening the document
         match client.lifecycle() {
-            ServerLifecycle::Probing => {
-                if !client.run_health_probe(&uri).await {
-                    client.set_parent_id(None);
-                    return Ok(DiagnosticsResult {
-                        content: "[no language server]".into(),
-                        count: 0,
-                    });
-                }
-            }
             ServerLifecycle::Failed | ServerLifecycle::Dead => {
                 client.set_parent_id(None);
                 return Ok(DiagnosticsResult {
@@ -133,33 +99,133 @@ impl DiagnosticsServer {
             _ => {}
         }
 
-        let pulls = client.supports_pull_diagnostics();
+        let uri = path_to_uri(&canonical);
+        let text = tokio::fs::read_to_string(&canonical).await?;
 
-        if !pulls
-            && client.wait_for_diagnostics_update(&uri, snapshot).await
-                == DiagnosticsWaitResult::Nothing
-        {
-            client.set_parent_id(None);
+        let mut doc_manager = self.client_manager.doc_manager().lock().await;
+        let (first_open, version) = doc_manager.open(&uri);
+        drop(doc_manager);
+
+        // From here, must close document on all paths
+        let result = self
+            .process_file_inner(&client, &uri, &lang_id, first_open, version, &text)
+            .await;
+
+        // Always close the document
+        let mut doc_manager = self.client_manager.doc_manager().lock().await;
+        if doc_manager.close(&uri) {
+            let _ = client.did_close(&uri).await;
+        }
+        drop(doc_manager);
+
+        client.set_parent_id(None);
+        drop(client);
+
+        result
+    }
+
+    /// Inner pipeline after document open — extracted to ensure the outer
+    /// function always runs the close path.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Pipeline steps are sequential and cannot be split"
+    )]
+    async fn process_file_inner(
+        &self,
+        client: &LspClient,
+        uri: &str,
+        lang_id: &str,
+        first_open: bool,
+        version: i32,
+        text: &str,
+    ) -> Result<DiagnosticsResult> {
+        // Snapshot diagnostics generation before sending change
+        let server = client.server().clone();
+        let gen_before = diagnostics_generation(&server, uri);
+
+        // Send didOpen or didChange
+        if first_open {
+            client.did_open(uri, lang_id, version, text).await?;
+        } else {
+            client.did_change(uri, version, text).await?;
+        }
+
+        // Health probe: verify the server can respond before settling
+        if client.lifecycle() == ServerLifecycle::Probing && !client.run_health_probe(uri).await {
             return Ok(DiagnosticsResult {
-                content: "[diagnostics unavailable]".into(),
+                content: "[no language server]".into(),
                 count: 0,
             });
         }
 
-        // Pull path: if the server advertises diagnosticProvider, pull
-        // diagnostics directly instead of reading the push cache.
-        let pulls = client.supports_pull_diagnostics();
+        // Trigger flycheck on servers that only run diagnostics on save
+        if client.wants_did_save() {
+            client.did_save(uri).await?;
+        }
 
-        let diagnostics = if pulls {
-            client
-                .pull_diagnostics(&uri)
-                .await
-                .unwrap_or_else(|_| client.get_diagnostics(&uri))
+        // Settle: wait for the server process tree to go quiet.
+        // Skip if the push cache already has data (fast server processed
+        // the stimulus before we started polling).
+        let settle_result = if client.get_diagnostics(uri).is_empty() {
+            let cancel = CancellationToken::new();
+            let result = settle(&server, cancel).await;
+            debug!("settle result: {result:?}");
+            Some(result)
         } else {
-            client.get_diagnostics(&uri)
+            debug!("settle skipped: push cache already populated");
+            None
         };
 
-        // Extract filter context before dropping the client lock
+        // Check lifecycle after settle — server may have died during settle
+        if matches!(settle_result, Some(SettleResult::RootDied))
+            || matches!(
+                client.lifecycle(),
+                ServerLifecycle::Failed | ServerLifecycle::Dead
+            )
+        {
+            return Ok(DiagnosticsResult {
+                content: "[no language server]".into(),
+                count: 0,
+            });
+        }
+
+        // Post-settle: wait for diagnostics if they haven't arrived yet.
+        // Two cases:
+        // 1. Push cache empty — server publishes asynchronously (delayed).
+        // 2. Push cache has stale version — concurrent consumer's diagnostics
+        //    arrived but ours haven't yet (version mismatch).
+        if !diagnostics_current(&server, uri, gen_before, version) {
+            debug!("waiting for diagnostics after settle");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if diagnostics_current(&server, uri, gen_before, version) {
+                    debug!("diagnostics arrived");
+                    break;
+                }
+                tokio::select! {
+                    () = server.diagnostics_notify.notified() => {}
+                    () = tokio::time::sleep_until(deadline) => {
+                        debug!("no current diagnostics within 10s post-settle");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Retrieve diagnostics: push cache first, pull fallback
+        let diagnostics = {
+            let cached = client.get_diagnostics(uri);
+            if !cached.is_empty() {
+                cached
+            } else if client.supports_pull_diagnostics() {
+                client.pull_diagnostics(uri).await.unwrap_or_default()
+            } else {
+                // Healthy server settled with nothing to report
+                Vec::new()
+            }
+        };
+
+        // Extract filter context
         let server_command = client.server_command().to_string();
         let server_version = client.server_version().map(str::to_string);
 
@@ -170,19 +236,16 @@ impl DiagnosticsServer {
                 .get("codeActionProvider")
                 .is_some_and(|v| !v.is_null())
         {
-            collect_quick_fixes(&client, &uri, &diagnostics).await
+            collect_quick_fixes(client, uri, &diagnostics).await
         } else {
             Vec::new()
         };
-
-        client.set_parent_id(None);
-        drop(client);
 
         // Apply severity threshold from config
         let min_severity_str = self
             .client_manager
             .config()
-            .resolve_language(&lang_id)
+            .resolve_language(lang_id)
             .and_then(|(_, lc)| lc.min_severity);
         let min_severity = min_severity_str
             .as_deref()
@@ -223,7 +286,7 @@ impl DiagnosticsServer {
                 filter,
                 &server_command,
                 server_version.as_deref(),
-                &lang_id,
+                lang_id,
             )
         };
 
@@ -232,10 +295,10 @@ impl DiagnosticsServer {
 
     /// Processes multiple file changes and returns a combined diagnostics string.
     ///
-    /// Runs the full pipeline for each file (document sync, wait, severity
+    /// Runs the full pipeline for each file (document sync, settle, severity
     /// filtering, noise filtering, quick-fixes). Files with `[clean]` or
-    /// `[diagnostics unavailable]` results are omitted. Errors are
-    /// best-effort skipped.
+    /// `[no language server]` results are omitted. Errors are best-effort
+    /// skipped.
     pub async fn process_files(&self, files: &[&str], entry_id: i64) -> String {
         use std::fmt::Write;
 
@@ -248,7 +311,6 @@ impl DiagnosticsServer {
 
             if result.content.is_empty()
                 || result.content == "[clean]"
-                || result.content == "[diagnostics unavailable]"
                 || result.content == "[no language server]"
             {
                 continue;
@@ -286,6 +348,53 @@ impl ToolServer for DiagnosticsServer {
             "count": result.count,
         }))
     }
+}
+
+/// Returns the current diagnostics generation for a URI.
+fn diagnostics_generation(server: &crate::lsp::LspServer, uri: &str) -> u64 {
+    server
+        .diagnostics_generation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(uri)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Checks whether diagnostics in the push cache are current.
+///
+/// Diagnostics are current if:
+/// - The generation advanced (new diagnostics arrived since stimulus), AND
+/// - The cached version matches or exceeds the version we sent (for
+///   servers that include version in `publishDiagnostics`).
+///
+/// For servers that don't publish version, the generation check alone
+/// is sufficient.
+fn diagnostics_current(
+    server: &crate::lsp::LspServer,
+    uri: &str,
+    gen_before: u64,
+    sent_version: i32,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    // Generation must have advanced
+    if diagnostics_generation(server, uri) <= gen_before {
+        return false;
+    }
+
+    // If the server publishes version, verify the cached version matches
+    if server.publishes_version.load(Ordering::SeqCst) {
+        let cache = server
+            .diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((Some(cached_version), _)) = cache.get(uri) {
+            return *cached_version >= sent_version;
+        }
+    }
+
+    true
 }
 
 /// Resolves a file path to an absolute path.

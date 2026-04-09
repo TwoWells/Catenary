@@ -6,12 +6,13 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for the diagnostics strategy redesign.
+//! Integration tests for the diagnostics pipeline.
 //!
-//! Uses mockls with various flags to exercise each strategy path:
+//! Uses mockls with various flags to exercise pipeline behavior:
+//! - Default (settle + push cache)
 //! - Version matching (`--publish-version`)
-//! - Token monitoring (`--progress-on-change`)
-//! - Process monitoring (default — no progress, no version)
+//! - Progress tokens (`--progress-on-change`)
+//! - Pull-only (`--pull-diagnostics --no-push-diagnostics`)
 //! - Server death (`--drop-after`)
 
 use std::io::{BufRead, BufReader, Write};
@@ -162,10 +163,11 @@ impl Drop for BridgeProcess {
 }
 
 /// Default mockls: publishes diagnostics on didOpen/didChange without
-/// version or progress tokens. In the new model, servers without either
-/// signal do not participate in diagnostics — no didSave, no wait.
+/// version or progress tokens. With settle-based pipeline, diagnostics
+/// are retrieved after the server process tree goes quiet — no strategy
+/// discovery needed.
 #[test]
-fn test_diagnostics_degraded_mode() -> Result<()> {
+fn test_diagnostics_default_mockls() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
@@ -175,9 +177,9 @@ fn test_diagnostics_degraded_mode() -> Result<()> {
 
     let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
-    assert_eq!(
-        text, "[diagnostics unavailable]",
-        "Degraded mode (no version/progress) should return diagnostics unavailable. Got: {text}"
+    assert!(
+        text.contains("mock diagnostic"),
+        "Default mockls should return diagnostics via settle + push cache. Got: {text}"
     );
 
     Ok(())
@@ -260,7 +262,6 @@ fn test_diagnostics_server_death() -> Result<()> {
     // Should either get diagnostics (if server published before dying),
     // a status message, or a notify error. No raw infrastructure messages to agent.
     let is_acceptable = text.contains("mock diagnostic")
-        || text == "[diagnostics unavailable]"
         || text == "[no language server]"
         || text == "[clean]"
         || text.contains("Notify error");
@@ -268,101 +269,6 @@ fn test_diagnostics_server_death() -> Result<()> {
     assert!(
         is_acceptable,
         "Server death should be handled gracefully. Got: {text}"
-    );
-
-    Ok(())
-}
-
-/// Reproduces a cross-change stale diagnostics leak at the `LspClient` level.
-///
-/// Directly exercises `wait_for_diagnostics_update` with controlled timing.
-/// The race: v1's delayed diagnostics arrive during v2's wait, satisfy the
-/// generation check (Phase 1), and Phase 2 settles before v2's own diagnostics
-/// arrive. The cache holds stale v1 data returned for v2's content.
-///
-/// Timeline (5s diagnostics delay):
-/// - t=0: didOpen(v1) + didSave → diagnostics queued (arrive at t=5s)
-/// - t=4s: didChange(v2) + didSave → snapshot gen=0, diagnostics queued (arrive at t=9s)
-/// - t=5s: v1 diagnostics arrive → gen=1 > 0 → Phase 1 exits
-/// - t=7s: Phase 2 settle (2s silence) → returns. Cache has v1 data.
-/// - t=9s: v2 diagnostics arrive — too late.
-#[tokio::test]
-async fn test_diagnostics_stale_lsp_client_level() -> Result<()> {
-    use catenary_mcp::lsp::{DiagnosticsWaitResult, LspClient};
-    let dir = tempfile::tempdir()?;
-    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-
-    // Content v1: 1 line
-    let v1 = "echo v1\n";
-    std::fs::write(&file, v1)?;
-
-    let uri = format!("file://{}", file.display());
-
-    // Spawn LspClient directly with mockls --diagnostics-delay 5000
-    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let message_log = std::sync::Arc::new(catenary_mcp::session::MessageLog::noop());
-    let mut client = LspClient::spawn(
-        mockls_bin,
-        &[
-            MOCK_LANG_A,
-            "--diagnostics-delay",
-            "5000",
-            "--publish-version",
-        ],
-        MOCK_LANG_A,
-        message_log,
-        None,
-    )
-    .context("spawn LspClient")?;
-
-    // Initialize with the temp dir as workspace root
-    client.initialize(&[dir.path().to_path_buf()], None).await?;
-
-    // Wait for server to be ready
-    client.wait_ready().await;
-
-    // didOpen(v1) + didSave at t=0
-    client.did_open(&uri, MOCK_LANG_A, 1, v1).await?;
-    client.did_save(&uri).await?;
-
-    // Sleep 4s — v1 diagnostics haven't arrived yet (5s delay > 4s)
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
-    // Snapshot generation before v2 change
-    let snapshot = client.diagnostics_generation(&uri);
-    assert_eq!(snapshot, 0, "No diagnostics should have arrived yet");
-
-    // Content v2: 4 lines
-    let v2 = "echo v2\necho line3\necho line4\necho line5\n";
-    std::fs::write(&file, v2)?;
-
-    // didChange(v2) + didSave at t≈4s
-    client.did_change(&uri, 2, v2).await?;
-    client.did_save(&uri).await?;
-
-    // Wait for diagnostics with snapshot=0
-    let result = client.wait_for_diagnostics_update(&uri, snapshot).await;
-
-    assert_eq!(result, DiagnosticsWaitResult::Diagnostics);
-
-    // Check what diagnostics we got
-    let diagnostics = client.get_diagnostics(&uri);
-    assert!(
-        !diagnostics.is_empty(),
-        "Should have some diagnostics. Got none."
-    );
-
-    let msg = diagnostics[0]
-        .get("message")
-        .and_then(Value::as_str)
-        .expect("diagnostic should have message");
-
-    // BUG DEMONSTRATION: the diagnostics should reflect v2 (4 lines) but
-    // due to the stale leak, they reflect v1 (1 line).
-    assert!(
-        msg.contains("(4 lines)"),
-        "Diagnostics should reflect current content (4 lines), \
-         not stale content from previous version. Got: {msg}"
     );
 
     Ok(())
@@ -693,11 +599,11 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     Ok(())
 }
 
-/// mockls with `--progress-on-change --no-diagnostics`: server sends
-/// progress tokens but never publishes diagnostics. The `TokenMonitor`
-/// should detect Active → Idle and return cached (empty) diagnostics.
+/// mockls with `--progress-on-change --no-push-diagnostics`: server sends
+/// progress tokens but never publishes diagnostics. After settle, the push
+/// cache is empty and pull is not supported → `[clean]`.
 #[test]
-fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
+fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
@@ -710,11 +616,9 @@ fn test_diagnostics_token_monitor_no_diagnostics() -> Result<()> {
 
     let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
 
-    // Token monitor sends didChange but server publishes nothing —
-    // wait times out, which is "checked, inconclusive".
     assert_eq!(
-        text, "[diagnostics unavailable]",
-        "TokenMonitor with no diagnostics should return diagnostics unavailable. Got: {text}"
+        text, "[clean]",
+        "Server with no push and no pull should return [clean] after settle. Got: {text}"
     );
 
     Ok(())
