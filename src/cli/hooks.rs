@@ -180,7 +180,19 @@ fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
 /// Called on session start, resume, `/clear`, and `/compact`. The agent's
 /// context is gone, so stale editing state must be cleared. No diagnostics
 /// are delivered.
+///
+/// Also validates the configuration at session start. If the config is
+/// invalid, emits a `systemMessage` directing the user to `catenary doctor`.
 pub fn run_session_start(format: HostFormat) {
+    // Config validation — runs before anything else, no session needed.
+    if let Err(e) = crate::config::Config::check() {
+        let msg =
+            format!("Catenary configuration error: {e:#}. Run `catenary doctor` for details.");
+        let output = format_session_message(&msg, format);
+        print!("{output}");
+        return;
+    }
+
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
     };
@@ -213,12 +225,17 @@ pub fn run_session_start(format: HostFormat) {
             serde_json::from_str::<crate::hook::HookResult>(line)
     {
         let msg = format!("Catenary: cleared {count} stale editing state entries");
-        let output = match format {
-            HostFormat::Claude | HostFormat::Gemini => {
-                serde_json::json!({ "systemMessage": msg })
-            }
-        };
+        let output = format_session_message(&msg, format);
         print!("{output}");
+    }
+}
+
+/// Format a `systemMessage` for session-start hooks.
+fn format_session_message(msg: &str, format: HostFormat) -> String {
+    match format {
+        HostFormat::Claude | HostFormat::Gemini => {
+            serde_json::json!({ "systemMessage": msg }).to_string()
+        }
     }
 }
 

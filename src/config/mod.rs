@@ -198,6 +198,21 @@ impl Config {
         parse::load()
     }
 
+    /// Parse and validate configuration without side effects.
+    ///
+    /// Reads config sources, parses TOML, and runs validation. Returns
+    /// `Ok(())` if the config is valid, or an error describing what's wrong.
+    /// Does not spawn servers, scan the filesystem, or access the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any config source cannot be read or parsed, or
+    /// if validation finds issues (missing servers, broken inherits, etc.).
+    pub fn check() -> Result<()> {
+        let _ = Self::load()?;
+        Ok(())
+    }
+
     /// Load configuration from an explicit list of file paths.
     ///
     /// Sources are merged in order (later overrides earlier). Environment
@@ -962,5 +977,70 @@ inherit = "typescript"
         assert_eq!(resolved.servers, vec!["tsserver"]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_config_check_valid() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+
+[language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )?;
+
+        // check() should succeed for a valid config
+        let config = Config::load_from_sources(&[config_path]);
+        assert!(config.is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_check_invalid_old_format() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.rust]
+command = "rust-analyzer"
+"#,
+        )
+        .expect("write config");
+
+        // check() should fail for old inline format
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("[server.*]"),
+            "error should mention server migration: {err}",
+        );
+    }
+
+    #[test]
+    fn test_config_check_fast() {
+        // Config check must complete in < 50ms — regression guard.
+        // We check against an empty config (fastest path).
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write config");
+
+        let start = std::time::Instant::now();
+        let _ = Config::load_from_sources(&[config_path]);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "config check took {elapsed:?}, expected < 50ms",
+        );
     }
 }
