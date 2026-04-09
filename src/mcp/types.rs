@@ -210,6 +210,9 @@ pub struct ServerInfo {
 pub struct Tool {
     /// The unique name of the tool.
     pub name: String,
+    /// Human-readable display name (MCP 2025-11-25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// A human-readable description of the tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -348,6 +351,7 @@ mod tests {
     fn test_serialize_tool() -> Result<()> {
         let tool = Tool {
             name: "hover".to_string(),
+            title: Some("Hover".to_string()),
             description: Some("Get hover info".to_string()),
             input_schema: serde_json::json!({
                 "type": "object",

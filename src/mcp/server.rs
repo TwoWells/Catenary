@@ -617,6 +617,7 @@ mod tests {
         fn list_tools(&self) -> Vec<Tool> {
             vec![Tool {
                 name: "test_tool".to_string(),
+                title: Some("Test Tool".to_string()),
                 description: Some("A test tool".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",

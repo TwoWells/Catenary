@@ -180,6 +180,7 @@ impl ToolHandler for McpRouter {
         vec![
             Tool {
                 name: "grep".to_string(),
+                title: Some("Grep".to_string()),
                 description: Some(format!("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Scope with `glob` and `exclude` to narrow the file set. Returns per-symbol sections with definitions, hover docs, and references (\u{2264}{GREP_HOVER_THRESHOLD} symbols) or name+kind+location (>{GREP_HOVER_THRESHOLD}).")),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -216,6 +217,7 @@ impl ToolHandler for McpRouter {
             },
             Tool {
                 name: "glob".to_string(),
+                title: Some("Glob".to_string()),
                 description: Some("Browse the workspace. Auto-detects intent: file path → symbol outline, directory path → listing with symbols, glob pattern → matching files with symbols. Always shows outline-level symbols (structs, classes, enums, interfaces, modules, constants).".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -236,6 +238,7 @@ impl ToolHandler for McpRouter {
             },
             Tool {
                 name: "start_editing".to_string(),
+                title: Some("Start Editing".to_string()),
                 description: Some("Enter editing mode. Diagnostics are suppressed on all subsequent Edit/Write calls until done_editing is called. Call this before using Edit.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -250,6 +253,7 @@ impl ToolHandler for McpRouter {
             },
             Tool {
                 name: "done_editing".to_string(),
+                title: Some("Done Editing".to_string()),
                 description: Some("Exit editing mode and return LSP diagnostics for all modified files. Must be called after start_editing before using non-Edit tools.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
