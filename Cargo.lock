@@ -174,9 +174,10 @@ dependencies = [
 
 [[package]]
 name = "catenary-proc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
+ "mach2",
  "windows-sys 0.59.0",
 ]
 
@@ -1133,6 +1134,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
 dependencies = [
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
