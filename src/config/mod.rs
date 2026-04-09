@@ -193,7 +193,7 @@ impl Config {
     /// - A configuration file exists but cannot be read or parsed.
     /// - A file uses the deprecated `[server.*]` key without `[language.*]`.
     /// - `inherit` targets are missing, chained, or cyclic.
-    /// - A concrete language entry is missing `command`.
+    /// - A concrete language entry has no `servers` list.
     pub fn load() -> Result<Self> {
         parse::load()
     }

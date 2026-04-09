@@ -22,7 +22,7 @@ use super::{Config, LanguageConfig, ServerDef, default_idle_timeout, default_log
 /// - A configuration file exists but cannot be read or parsed.
 /// - A file uses the deprecated `[server.*]` key without `[language.*]`.
 /// - `inherit` targets are missing, chained, or cyclic.
-/// - A concrete language entry is missing `command`.
+/// - A concrete language entry has no `servers` list.
 pub fn load() -> Result<Config> {
     let sources = config_sources();
     load_from_sources(&sources)
