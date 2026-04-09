@@ -159,9 +159,6 @@ impl Inbox for ServerInbox {
                     uri,
                     version,
                 );
-                if let Some(server) = self.lsp_server.get() {
-                    server.on_publish_diagnostics();
-                }
 
                 // Track whether server provides version in diagnostics
                 if version.is_some() && !self.publishes_version.swap(true, Ordering::SeqCst) {
@@ -459,25 +456,9 @@ mod tests {
     /// Helper that creates a test inbox with an `LspServer` profile attached.
     fn test_inbox_with_server() -> ServerInbox {
         let inbox = test_inbox();
-        let server = Arc::new(LspServer::new(json!({})));
+        let server = Arc::new(LspServer::new());
         inbox.set_lsp_server(server);
         inbox
-    }
-
-    #[test]
-    fn publish_diagnostics_sets_pushes_diagnostics() {
-        let inbox = test_inbox_with_server();
-        let server = inbox.lsp_server().expect("server should be set");
-        assert!(!server.pushes_diagnostics());
-
-        inbox.on_notification(
-            "textDocument/publishDiagnostics",
-            &json!({
-                "uri": "file:///test.rs",
-                "diagnostics": []
-            }),
-        );
-        assert!(server.pushes_diagnostics());
     }
 
     #[test]

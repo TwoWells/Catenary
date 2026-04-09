@@ -4,9 +4,11 @@
 //! Server profile: what Catenary learned from the init handshake and
 //! observes at runtime.
 //!
-//! `LspServer` is the single source of truth for server behavior.
-//! Init-time fields are immutable; runtime fields use interior mutability
-//! (`OnceLock`, `AtomicU32`) for lock-free reads from any thread.
+//! `LspServer` is created at spawn time (before `initialize`) and is
+//! the single source of truth for server behavior. Capabilities are
+//! set once via [`LspServer::set_capabilities`] after the init handshake.
+//! All fields use interior mutability (`OnceLock`, `AtomicU32`) for
+//! lock-free reads from any thread.
 
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -14,18 +16,34 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Server profile capturing init-time capabilities and runtime observations.
 ///
-/// Shared via `Arc<LspServer>` between [`super::LspClient`] and
-/// `ServerInbox`. All runtime fields use interior mutability
-/// so readers never need a lock.
+/// Created at spawn time with empty `OnceLock` fields. Capabilities are
+/// populated once via [`Self::set_capabilities`] after the `initialize`
+/// handshake completes. Shared via `Arc<LspServer>` between
+/// [`super::LspClient`] and `ServerInbox`. All runtime fields use
+/// interior mutability so readers never need a lock.
+pub struct LspServer {
+    /// Raw server capabilities from the `initialize` response.
+    /// Set once via [`Self::set_capabilities`].
+    capabilities: OnceLock<Value>,
+
+    // ── Init-time capability flags (set once via set_capabilities) ──
+    capability_flags: OnceLock<CapabilityFlags>,
+
+    /// Set on first `$/progress` begin.
+    sends_progress: OnceLock<()>,
+
+    /// Count of in-flight progress tokens (begin increments, end decrements).
+    in_progress_count: AtomicU32,
+}
+
+/// Capability flags extracted from the `initialize` response.
+///
+/// All fields are immutable after construction.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent capability flags from LSP init"
 )]
-pub struct LspServer {
-    /// Raw server capabilities from the `initialize` response.
-    capabilities: Value,
-
-    // ── Init-time capability flags (immutable after construction) ───
+struct CapabilityFlags {
     supports_pull_diagnostics: bool,
     supports_hover: bool,
     supports_definition: bool,
@@ -39,22 +57,11 @@ pub struct LspServer {
     supports_call_hierarchy: bool,
     supports_type_hierarchy: bool,
     supports_code_action: bool,
-
-    /// Set on first `textDocument/publishDiagnostics` notification.
-    pushes_diagnostics: OnceLock<()>,
-
-    /// Set on first `$/progress` begin.
-    sends_progress: OnceLock<()>,
-
-    /// Count of in-flight progress tokens (begin increments, end decrements).
-    in_progress_count: AtomicU32,
 }
 
-impl LspServer {
-    /// Creates a new server profile from the capabilities extracted during
-    /// the `initialize` handshake.
-    #[must_use]
-    pub fn new(capabilities: Value) -> Self {
+impl CapabilityFlags {
+    /// Extracts capability flags from the raw `initialize` response capabilities.
+    fn from_capabilities(capabilities: &Value) -> Self {
         // LSP capabilities are `boolean | Options`. `true` or an options
         // object means supported; `false`, `null`, or absent means not.
         let has = |key: &str| {
@@ -80,86 +87,136 @@ impl LspServer {
             supports_call_hierarchy: has("callHierarchyProvider"),
             supports_type_hierarchy: has("typeHierarchyProvider"),
             supports_code_action: has("codeActionProvider"),
-            capabilities,
-            pushes_diagnostics: OnceLock::new(),
+        }
+    }
+}
+
+/// Default flags: nothing supported.
+const NO_CAPABILITIES: CapabilityFlags = CapabilityFlags {
+    supports_pull_diagnostics: false,
+    supports_hover: false,
+    supports_definition: false,
+    supports_references: false,
+    supports_document_symbols: false,
+    supports_workspace_symbols: false,
+    supports_workspace_symbol_resolve: false,
+    supports_rename: false,
+    supports_type_definition: false,
+    supports_implementation: false,
+    supports_call_hierarchy: false,
+    supports_type_hierarchy: false,
+    supports_code_action: false,
+};
+
+impl Default for LspServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LspServer {
+    /// Creates a new server profile with no capabilities.
+    ///
+    /// Call [`Self::set_capabilities`] after the `initialize` handshake
+    /// to populate capability fields.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            capabilities: OnceLock::new(),
+            capability_flags: OnceLock::new(),
             sends_progress: OnceLock::new(),
             in_progress_count: AtomicU32::new(0),
         }
     }
 
+    /// Sets capabilities from the `initialize` response. Called once.
+    ///
+    /// Extracts all capability flags and stores the raw capabilities.
+    /// Subsequent calls are no-ops (the `OnceLock` ignores them).
+    pub fn set_capabilities(&self, capabilities: Value) {
+        let flags = CapabilityFlags::from_capabilities(&capabilities);
+        let _ = self.capabilities.set(capabilities);
+        let _ = self.capability_flags.set(flags);
+    }
+
     /// Returns the raw server capabilities.
-    pub const fn capabilities(&self) -> &Value {
-        &self.capabilities
+    ///
+    /// Returns an empty object before [`Self::set_capabilities`] is called.
+    pub fn capabilities(&self) -> &Value {
+        static EMPTY: OnceLock<Value> = OnceLock::new();
+        self.capabilities
+            .get()
+            .unwrap_or_else(|| EMPTY.get_or_init(|| Value::Object(serde_json::Map::new())))
+    }
+
+    /// Returns the capability flags, defaulting to none before init.
+    fn flags(&self) -> &CapabilityFlags {
+        self.capability_flags.get().unwrap_or(&NO_CAPABILITIES)
     }
 
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
-    pub const fn supports_pull_diagnostics(&self) -> bool {
-        self.supports_pull_diagnostics
+    pub fn supports_pull_diagnostics(&self) -> bool {
+        self.flags().supports_pull_diagnostics
     }
 
     /// Returns whether the server advertises `hoverProvider`.
-    pub const fn supports_hover(&self) -> bool {
-        self.supports_hover
+    pub fn supports_hover(&self) -> bool {
+        self.flags().supports_hover
     }
 
     /// Returns whether the server advertises `definitionProvider`.
-    pub const fn supports_definition(&self) -> bool {
-        self.supports_definition
+    pub fn supports_definition(&self) -> bool {
+        self.flags().supports_definition
     }
 
     /// Returns whether the server advertises `referencesProvider`.
-    pub const fn supports_references(&self) -> bool {
-        self.supports_references
+    pub fn supports_references(&self) -> bool {
+        self.flags().supports_references
     }
 
     /// Returns whether the server advertises `documentSymbolProvider`.
-    pub const fn supports_document_symbols(&self) -> bool {
-        self.supports_document_symbols
+    pub fn supports_document_symbols(&self) -> bool {
+        self.flags().supports_document_symbols
     }
 
     /// Returns whether the server advertises `workspaceSymbolProvider`.
-    pub const fn supports_workspace_symbols(&self) -> bool {
-        self.supports_workspace_symbols
+    pub fn supports_workspace_symbols(&self) -> bool {
+        self.flags().supports_workspace_symbols
     }
 
     /// Returns whether the server advertises `workspaceSymbolProvider.resolveProvider`.
-    pub const fn supports_workspace_symbol_resolve(&self) -> bool {
-        self.supports_workspace_symbol_resolve
+    pub fn supports_workspace_symbol_resolve(&self) -> bool {
+        self.flags().supports_workspace_symbol_resolve
     }
 
     /// Returns whether the server advertises `renameProvider`.
-    pub const fn supports_rename(&self) -> bool {
-        self.supports_rename
+    pub fn supports_rename(&self) -> bool {
+        self.flags().supports_rename
     }
 
     /// Returns whether the server advertises `typeDefinitionProvider`.
-    pub const fn supports_type_definition(&self) -> bool {
-        self.supports_type_definition
+    pub fn supports_type_definition(&self) -> bool {
+        self.flags().supports_type_definition
     }
 
     /// Returns whether the server advertises `implementationProvider`.
-    pub const fn supports_implementation(&self) -> bool {
-        self.supports_implementation
+    pub fn supports_implementation(&self) -> bool {
+        self.flags().supports_implementation
     }
 
     /// Returns whether the server advertises `callHierarchyProvider`.
-    pub const fn supports_call_hierarchy(&self) -> bool {
-        self.supports_call_hierarchy
+    pub fn supports_call_hierarchy(&self) -> bool {
+        self.flags().supports_call_hierarchy
     }
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
-    pub const fn supports_type_hierarchy(&self) -> bool {
-        self.supports_type_hierarchy
+    pub fn supports_type_hierarchy(&self) -> bool {
+        self.flags().supports_type_hierarchy
     }
 
     /// Returns whether the server advertises `codeActionProvider`.
-    pub const fn supports_code_action(&self) -> bool {
-        self.supports_code_action
-    }
-
-    /// Returns whether the server has ever sent `textDocument/publishDiagnostics`.
-    pub fn pushes_diagnostics(&self) -> bool {
-        self.pushes_diagnostics.get().is_some()
+    pub fn supports_code_action(&self) -> bool {
+        self.flags().supports_code_action
     }
 
     /// Returns whether the server has ever sent a `$/progress` begin.
@@ -192,11 +249,6 @@ impl LspServer {
             })
             .ok();
     }
-
-    /// Records the first `textDocument/publishDiagnostics` notification.
-    pub fn on_publish_diagnostics(&self) {
-        let _ = self.pushes_diagnostics.set(());
-    }
 }
 
 #[cfg(test)]
@@ -208,35 +260,39 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Helper: creates an `LspServer` with capabilities already set.
+    fn server_with_caps(caps: Value) -> LspServer {
+        let server = LspServer::new();
+        server.set_capabilities(caps);
+        server
+    }
+
     #[test]
-    fn new_extracts_supports_pull_diagnostics() {
-        let caps = json!({ "diagnosticProvider": { "interFileDependencies": true } });
-        let server = LspServer::new(caps);
+    fn set_capabilities_extracts_pull_diagnostics() {
+        let server =
+            server_with_caps(json!({ "diagnosticProvider": { "interFileDependencies": true } }));
         assert!(server.supports_pull_diagnostics());
     }
 
     #[test]
-    fn new_no_diagnostic_provider() {
-        let server = LspServer::new(json!({}));
+    fn no_diagnostic_provider() {
+        let server = server_with_caps(json!({}));
         assert!(!server.supports_pull_diagnostics());
     }
 
     #[test]
-    fn on_publish_diagnostics_sets_flag() {
-        let server = LspServer::new(json!({}));
-        assert!(!server.pushes_diagnostics());
-
-        server.on_publish_diagnostics();
-        assert!(server.pushes_diagnostics());
-
-        // Idempotent
-        server.on_publish_diagnostics();
-        assert!(server.pushes_diagnostics());
+    fn before_set_capabilities_nothing_supported() {
+        let server = LspServer::new();
+        assert!(!server.supports_pull_diagnostics());
+        assert!(!server.supports_hover());
+        assert!(!server.supports_workspace_symbols());
+        // capabilities() returns empty object
+        assert_eq!(server.capabilities(), &json!({}));
     }
 
     #[test]
     fn on_progress_begin_end_count() {
-        let server = LspServer::new(json!({}));
+        let server = LspServer::new();
         assert_eq!(server.in_progress_count(), 0);
 
         server.on_progress_begin();
@@ -252,7 +308,7 @@ mod tests {
 
     #[test]
     fn on_progress_begin_sets_sends_progress() {
-        let server = LspServer::new(json!({}));
+        let server = LspServer::new();
         assert!(!server.sends_progress());
 
         server.on_progress_begin();
@@ -261,7 +317,7 @@ mod tests {
 
     #[test]
     fn in_progress_count_saturates() {
-        let server = LspServer::new(json!({}));
+        let server = LspServer::new();
         assert_eq!(server.in_progress_count(), 0);
 
         server.on_progress_end();
@@ -277,25 +333,25 @@ mod tests {
 
     #[test]
     fn supports_capability_true() {
-        let server = LspServer::new(json!({ "workspaceSymbolProvider": true }));
+        let server = server_with_caps(json!({ "workspaceSymbolProvider": true }));
         assert!(server.supports_workspace_symbols());
     }
 
     #[test]
     fn supports_capability_false() {
-        let server = LspServer::new(json!({ "workspaceSymbolProvider": false }));
+        let server = server_with_caps(json!({ "workspaceSymbolProvider": false }));
         assert!(!server.supports_workspace_symbols());
     }
 
     #[test]
     fn supports_capability_options_object() {
-        let server = LspServer::new(json!({ "workspaceSymbolProvider": {} }));
+        let server = server_with_caps(json!({ "workspaceSymbolProvider": {} }));
         assert!(server.supports_workspace_symbols());
     }
 
     #[test]
     fn supports_capability_detailed_options() {
-        let server = LspServer::new(json!({
+        let server = server_with_caps(json!({
             "workspaceSymbolProvider": { "resolveProvider": true }
         }));
         assert!(server.supports_workspace_symbols());
@@ -303,19 +359,19 @@ mod tests {
 
     #[test]
     fn supports_capability_missing() {
-        let server = LspServer::new(json!({}));
+        let server = server_with_caps(json!({}));
         assert!(!server.supports_workspace_symbols());
     }
 
     #[test]
     fn supports_capability_null() {
-        let server = LspServer::new(json!({ "workspaceSymbolProvider": null }));
+        let server = server_with_caps(json!({ "workspaceSymbolProvider": null }));
         assert!(!server.supports_workspace_symbols());
     }
 
     #[test]
     fn explicit_false_not_supported() {
-        let server = LspServer::new(json!({
+        let server = server_with_caps(json!({
             "hoverProvider": false,
             "definitionProvider": false,
             "referencesProvider": false,
@@ -343,7 +399,7 @@ mod tests {
 
     #[test]
     fn empty_capabilities_nothing_supported() {
-        let server = LspServer::new(json!({}));
+        let server = server_with_caps(json!({}));
         assert!(!server.supports_hover());
         assert!(!server.supports_definition());
         assert!(!server.supports_references());
@@ -360,7 +416,7 @@ mod tests {
 
     #[test]
     fn supports_all_capabilities() {
-        let server = LspServer::new(json!({
+        let server = server_with_caps(json!({
             "hoverProvider": true,
             "definitionProvider": true,
             "referencesProvider": true,
@@ -392,7 +448,7 @@ mod tests {
     #[test]
     fn workspace_symbol_resolve_boolean_provider() {
         // workspaceSymbolProvider: true — no resolveProvider field
-        let server = LspServer::new(json!({ "workspaceSymbolProvider": true }));
+        let server = server_with_caps(json!({ "workspaceSymbolProvider": true }));
         assert!(server.supports_workspace_symbols());
         assert!(!server.supports_workspace_symbol_resolve());
     }
@@ -400,14 +456,14 @@ mod tests {
     #[test]
     fn workspace_symbol_resolve_empty_options() {
         // workspaceSymbolProvider: {} — supported but no resolve
-        let server = LspServer::new(json!({ "workspaceSymbolProvider": {} }));
+        let server = server_with_caps(json!({ "workspaceSymbolProvider": {} }));
         assert!(server.supports_workspace_symbols());
         assert!(!server.supports_workspace_symbol_resolve());
     }
 
     #[test]
     fn workspace_symbol_resolve_false() {
-        let server = LspServer::new(json!({
+        let server = server_with_caps(json!({
             "workspaceSymbolProvider": { "resolveProvider": false }
         }));
         assert!(server.supports_workspace_symbols());
@@ -416,7 +472,7 @@ mod tests {
 
     #[test]
     fn workspace_symbol_resolve_true() {
-        let server = LspServer::new(json!({
+        let server = server_with_caps(json!({
             "workspaceSymbolProvider": { "resolveProvider": true }
         }));
         assert!(server.supports_workspace_symbols());

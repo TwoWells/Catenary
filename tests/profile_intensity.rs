@@ -653,7 +653,8 @@ async fn profile_intensity() -> Result<()> {
             }
         };
 
-        let server = Arc::new(LspServer::new(capabilities));
+        let server = Arc::new(LspServer::new());
+        server.set_capabilities(capabilities);
 
         let pid = child
             .id()
@@ -866,7 +867,8 @@ async fn profile_intensity_large() -> Result<()> {
         .context("Initialize failed")?
     };
 
-    let server = Arc::new(LspServer::new(capabilities));
+    let server = Arc::new(LspServer::new());
+    server.set_capabilities(capabilities);
 
     let pid = child.id().context("No PID after spawn")?;
     let mut tree_monitor =

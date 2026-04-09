@@ -139,7 +139,9 @@ impl LspClient {
         stderr: Stdio,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
+        let server = Arc::new(LspServer::new());
         let inbox = Arc::new(ServerInbox::new(language.to_string(), settings));
+        inbox.set_lsp_server(Arc::clone(&server));
 
         let connection = Connection::new(
             program,
@@ -162,7 +164,7 @@ impl LspClient {
             wants_did_save: false,
             server_command: program.to_string(),
             server_version: None,
-            lsp_server: None,
+            lsp_server: Some(server),
             parent_id: None,
         })
     }
@@ -283,11 +285,11 @@ impl LspClient {
             self.inbox.language, self.wants_did_save
         );
 
-        // Store server info and construct server profile
+        // Store server info and set capabilities on existing server profile
         self.server_version = super::extract::server_version(&raw).map(str::to_string);
-        let server = Arc::new(LspServer::new(caps));
-        self.inbox.set_lsp_server(Arc::clone(&server));
-        self.lsp_server = Some(server);
+        if let Some(server) = &self.lsp_server {
+            server.set_capabilities(caps);
+        }
 
         // Send initialized notification
         self.notify("initialized", json!({})).await?;
@@ -882,13 +884,10 @@ impl LspClient {
         use super::diagnostics::{ActivityState, DiagnosticsStrategy, ProgressMonitor};
 
         // ── Grace period ─────────────────────────────────────────────
-        // For servers that haven't published diagnostics yet, wait for
-        // the first publishDiagnostics using load-aware failure detection.
-        let pushes_diagnostics = self
-            .lsp_server
-            .as_ref()
-            .is_some_and(|s| s.pushes_diagnostics());
-        if !pushes_diagnostics {
+        // Wait for the first publishDiagnostics using load-aware failure
+        // detection. Servers that have already pushed will pass through
+        // immediately (the generation snapshot will already be stale).
+        {
             let grace_ok = load_aware_grace(
                 &mut || self.sample_monitor(),
                 PREAMBLE_THRESHOLD,

@@ -1281,11 +1281,15 @@ mod tests {
         }
     }
 
-    /// Regression test: the full pipeline (pair_merge → scope_collapse →
-    /// run_collapse) must produce identical output on repeated calls with
+    /// Regression test: the full pipeline (`pair_merge` → `scope_collapse` →
+    /// `run_collapse`) must produce identical output on repeated calls with
     /// the same input. Non-deterministic `HashMap` iteration in
     /// `scope_collapse` previously caused display jitter in the TUI.
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "test builds 12 messages for full pipeline coverage"
+    )]
     fn test_pipeline_deterministic() {
         // Simulate a grep tool call with interleaved yaml-language-server
         // notifications — the exact scenario that produced jitter.
