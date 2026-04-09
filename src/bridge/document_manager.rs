@@ -6,15 +6,27 @@ use std::path::Path;
 
 use crate::lsp::lang::path_to_uri;
 
+/// Per-URI open state: ref count and document version.
+struct OpenState {
+    refs: usize,
+    version: i32,
+}
+
 /// Ref-counted document lifecycle owner.
 ///
 /// Tracks which documents are open by URI and serializes
 /// `didOpen`/`didClose` across concurrent consumers. Multiple agents
 /// may have overlapping files open — this manager tracks ref counts
 /// per URI, sends `didOpen` on first open and `didClose` on last close.
+///
+/// Also tracks the document version per URI. The version starts at 1
+/// on first open and increments on each subsequent content sync
+/// (`didChange`). This monotonically increasing counter is required by
+/// the LSP protocol and used by the diagnostics wait logic to match
+/// pushed diagnostics to a specific document change.
 pub struct DocumentManager {
-    /// Open document ref counts, keyed by URI.
-    open_counts: HashMap<String, usize>,
+    /// Open document state, keyed by URI.
+    documents: HashMap<String, OpenState>,
 }
 
 impl Default for DocumentManager {
@@ -28,19 +40,29 @@ impl DocumentManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            open_counts: HashMap::new(),
+            documents: HashMap::new(),
         }
     }
 
     /// Registers an open for a URI.
     ///
-    /// Returns `true` if this is the first open (caller should send
-    /// `didOpen`). Returns `false` if already open (no protocol message
-    /// needed — just a ref-count bump).
-    pub fn open(&mut self, uri: &str) -> bool {
-        let count = self.open_counts.entry(uri.to_string()).or_insert(0);
-        *count += 1;
-        *count == 1
+    /// Returns `(is_first, version)`. When `is_first` is `true`, the
+    /// caller should send `didOpen` with the returned version (always 1).
+    /// When `false`, the document is already open — the caller should
+    /// send `didChange` with the returned (incremented) version.
+    pub fn open(&mut self, uri: &str) -> (bool, i32) {
+        let state = self.documents.entry(uri.to_string()).or_insert(OpenState {
+            refs: 0,
+            version: 0,
+        });
+        state.refs += 1;
+        if state.refs == 1 {
+            state.version = 1;
+            (true, 1)
+        } else {
+            state.version += 1;
+            (false, state.version)
+        }
     }
 
     /// Registers a close for a URI.
@@ -49,12 +71,12 @@ impl DocumentManager {
     /// `didClose`). Returns `false` if other consumers still hold it
     /// open, or if the URI was not open.
     pub fn close(&mut self, uri: &str) -> bool {
-        let Some(count) = self.open_counts.get_mut(uri) else {
+        let Some(state) = self.documents.get_mut(uri) else {
             return false;
         };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            self.open_counts.remove(uri);
+        state.refs = state.refs.saturating_sub(1);
+        if state.refs == 0 {
+            self.documents.remove(uri);
             true
         } else {
             false
@@ -64,7 +86,7 @@ impl DocumentManager {
     /// Returns whether a URI is currently open (ref count > 0).
     #[must_use]
     pub fn is_open(&self, uri: &str) -> bool {
-        self.open_counts.get(uri).is_some_and(|&c| c > 0)
+        self.documents.get(uri).is_some_and(|s| s.refs > 0)
     }
 
     /// Returns the `file://` URI for a path after canonicalization.
@@ -82,16 +104,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_open_returns_true() {
+    fn first_open_returns_true_version_1() {
         let mut dm = DocumentManager::new();
-        assert!(dm.open("file:///test.rs"));
+        assert_eq!(dm.open("file:///test.rs"), (true, 1));
     }
 
     #[test]
-    fn second_open_returns_false() {
+    fn second_open_returns_false_with_incremented_version() {
         let mut dm = DocumentManager::new();
-        assert!(dm.open("file:///test.rs"));
-        assert!(!dm.open("file:///test.rs"));
+        assert_eq!(dm.open("file:///test.rs"), (true, 1));
+        assert_eq!(dm.open("file:///test.rs"), (false, 2));
     }
 
     #[test]
@@ -125,6 +147,14 @@ mod tests {
     }
 
     #[test]
+    fn reopen_after_close_resets_version() {
+        let mut dm = DocumentManager::new();
+        assert_eq!(dm.open("file:///test.rs"), (true, 1));
+        dm.close("file:///test.rs");
+        assert_eq!(dm.open("file:///test.rs"), (true, 1));
+    }
+
+    #[test]
     fn is_open_tracks_state() {
         let mut dm = DocumentManager::new();
         assert!(!dm.is_open("file:///test.rs"));
@@ -140,11 +170,11 @@ mod tests {
         let uri = "file:///shared.rs";
 
         // Agent A opens
-        assert!(dm.open(uri));
+        assert_eq!(dm.open(uri), (true, 1));
         assert!(dm.is_open(uri));
 
-        // Agent B opens (already open)
-        assert!(!dm.open(uri));
+        // Agent B opens (already open, version bumps)
+        assert_eq!(dm.open(uri), (false, 2));
 
         // Agent A closes (B still holds)
         assert!(!dm.close(uri));

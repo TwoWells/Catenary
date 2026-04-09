@@ -398,11 +398,12 @@ impl LspClientManager {
         let canonical = path.canonicalize()?;
         let text = tokio::fs::read_to_string(&canonical).await?;
 
-        if doc_manager.open(&uri) {
+        let (first_open, version) = doc_manager.open(&uri);
+        if first_open {
             let language_id = self.fs.language_id(path).unwrap_or("plaintext").to_string();
-            client.did_open(&uri, &language_id, 1, &text).await?;
+            client.did_open(&uri, &language_id, version, &text).await?;
         } else {
-            client.did_change(&uri, 1, &text).await?;
+            client.did_change(&uri, version, &text).await?;
         }
 
         drop(doc_manager);

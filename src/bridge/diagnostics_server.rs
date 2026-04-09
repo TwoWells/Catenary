@@ -97,10 +97,11 @@ impl DiagnosticsServer {
         // Snapshot generation *before* sending the change
         let snapshot = client.diagnostics_generation(&uri);
 
-        if doc_manager.open(&uri) {
-            client.did_open(&uri, &lang_id, 1, &text).await?;
+        let (first_open, version) = doc_manager.open(&uri);
+        if first_open {
+            client.did_open(&uri, &lang_id, version, &text).await?;
         } else {
-            client.did_change(&uri, 1, &text).await?;
+            client.did_change(&uri, version, &text).await?;
         }
 
         // Trigger flycheck on servers that only run diagnostics on save
