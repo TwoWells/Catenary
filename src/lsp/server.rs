@@ -1,36 +1,42 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Server profile: what Catenary learned from the init handshake and
-//! observes at runtime.
+//! LSP server representation: capabilities, shared state, and dispatch.
 //!
 //! `LspServer` is created at spawn time (before `initialize`) and is
-//! the single source of truth for server behavior. Capabilities are
-//! set once via [`LspServer::set_capabilities`] after the init handshake.
-//! All fields use interior mutability (`OnceLock`, `AtomicU32`) for
-//! lock-free reads from any thread.
+//! the single source of truth for server behavior and state. Capabilities
+//! are set once via [`LspServer::set_capabilities`] after the init
+//! handshake. Notification dispatch (`on_notification`, `on_request`,
+//! `on_shutdown`) updates diagnostics cache, progress, and server state.
 
 use serde_json::Value;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::Notify;
+use tracing::{debug, trace, warn};
 
-/// Server profile capturing init-time capabilities and runtime observations.
+use super::client::DiagnosticsCache;
+use super::extract;
+use super::protocol::RpcError;
+use super::state::{ProgressTracker, ServerState};
+
+/// Complete representation of a remote LSP server.
 ///
 /// Created at spawn time with empty `OnceLock` fields. Capabilities are
 /// populated once via [`Self::set_capabilities`] after the `initialize`
 /// handshake completes. Shared via `Arc<LspServer>` between
-/// [`super::LspClient`] and `ServerInbox`. All runtime fields use
-/// interior mutability so readers never need a lock.
+/// [`super::LspClient`] and [`super::connection::Connection`]. All
+/// runtime fields use interior mutability so readers never need a lock.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent capability flags from LSP init"
 )]
 pub struct LspServer {
+    // ── Capabilities (set once via set_capabilities) ──────────────
     /// Raw server capabilities from the `initialize` response.
-    /// Set once via [`Self::set_capabilities`].
     capabilities: OnceLock<Value>,
 
-    // ── Init-time capability flags (set once via set_capabilities) ──
     supports_pull_diagnostics: OnceLock<bool>,
     supports_hover: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
@@ -50,21 +56,39 @@ pub struct LspServer {
 
     /// Count of in-flight progress tokens (begin increments, end decrements).
     in_progress_count: AtomicU32,
-}
 
-impl Default for LspServer {
-    fn default() -> Self {
-        Self::new()
-    }
+    // ── Diagnostics ───────────────────────────────────────────────
+    pub(crate) diagnostics: DiagnosticsCache,
+    pub(crate) diagnostics_generation: Arc<Mutex<HashMap<String, u64>>>,
+    pub(crate) diagnostics_notify: Arc<Notify>,
+
+    // ── Capability discovery ──────────────────────────────────────
+    pub(crate) capability_notify: Arc<Notify>,
+
+    // ── Progress ──────────────────────────────────────────────────
+    pub(crate) progress: Arc<Mutex<ProgressTracker>>,
+    pub(crate) progress_notify: Arc<Notify>,
+
+    // ── Server state ──────────────────────────────────────────────
+    pub(crate) state: Arc<AtomicU8>,
+    pub(crate) state_notify: Arc<Notify>,
+
+    // ── Observation flags ─────────────────────────────────────────
+    pub(crate) publishes_version: Arc<AtomicBool>,
+
+    // ── Identity ──────────────────────────────────────────────────
+    pub(crate) language: String,
+
+    // ── Configuration ─────────────────────────────────────────────
+    settings: Option<Value>,
 }
 
 impl LspServer {
-    /// Creates a new server profile with no capabilities.
+    /// Creates a new `LspServer` with default state.
     ///
     /// Call [`Self::set_capabilities`] after the `initialize` handshake
     /// to populate capability fields.
-    #[must_use]
-    pub const fn new() -> Self {
+    pub fn new(language: String, settings: Option<Value>) -> Self {
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: OnceLock::new(),
@@ -82,7 +106,23 @@ impl LspServer {
             supports_code_action: OnceLock::new(),
             sends_progress: OnceLock::new(),
             in_progress_count: AtomicU32::new(0),
+            diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            diagnostics_generation: Arc::new(Mutex::new(HashMap::new())),
+            diagnostics_notify: Arc::new(Notify::new()),
+            capability_notify: Arc::new(Notify::new()),
+            progress: Arc::new(Mutex::new(ProgressTracker::new())),
+            progress_notify: Arc::new(Notify::new()),
+            state: Arc::new(AtomicU8::new(ServerState::Initializing.as_u8())),
+            state_notify: Arc::new(Notify::new()),
+            publishes_version: Arc::new(AtomicBool::new(false)),
+            language,
+            settings,
         }
+    }
+
+    /// Returns the server settings, if configured.
+    pub(crate) const fn settings(&self) -> Option<&Value> {
+        self.settings.as_ref()
     }
 
     /// Sets capabilities from the `initialize` response. Called once.
@@ -253,6 +293,194 @@ impl LspServer {
             })
             .ok();
     }
+
+    // ── Dispatch methods (moved from ServerInbox) ─────────────────
+
+    /// Handles a server notification (no response needed).
+    #[allow(clippy::too_many_lines, reason = "match dispatcher with per-arm logic")]
+    pub fn on_notification(&self, method: &str, params: &Value) {
+        match method {
+            "textDocument/publishDiagnostics" => {
+                let Some(uri) = extract::publish_diagnostics_uri(params) else {
+                    warn!("publishDiagnostics missing uri");
+                    return;
+                };
+                let version = extract::publish_diagnostics_version(params);
+                let diagnostics = extract::publish_diagnostics_diagnostics(params);
+
+                debug!(
+                    "Received {} diagnostics for {:?} (version={:?})",
+                    diagnostics.len(),
+                    uri,
+                    version,
+                );
+
+                // Track whether server provides version in diagnostics
+                if version.is_some() && !self.publishes_version.swap(true, Ordering::SeqCst) {
+                    self.capability_notify.notify_waiters();
+                }
+
+                let mut cache = self
+                    .diagnostics
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.insert(uri.to_string(), (version, diagnostics));
+                drop(cache);
+
+                // Bump generation counter and wake waiters
+                let mut generations = self
+                    .diagnostics_generation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let counter = generations.entry(uri.to_string()).or_insert(0);
+                *counter += 1;
+                drop(generations);
+                self.diagnostics_notify.notify_waiters();
+            }
+            "$/progress" => {
+                let Some(token_value) = extract::progress_token(params) else {
+                    warn!("$/progress missing token");
+                    return;
+                };
+                let token_str = token_value
+                    .as_str()
+                    .map_or_else(|| token_value.to_string(), str::to_string);
+
+                let mut tracker = self
+                    .progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tracker.update(&token_str, &params["value"]);
+
+                // Update server profile based on progress kind
+                let kind = params["value"]["kind"].as_str();
+                match kind {
+                    Some("begin") => {
+                        if self.on_progress_begin() {
+                            self.capability_notify.notify_waiters();
+                        }
+                    }
+                    Some("end") => {
+                        self.on_progress_end();
+                    }
+                    _ => {}
+                }
+
+                // Update state based on progress.
+                // The Dead guard is the only exclusion — Stuck servers
+                // that send progress are naturally recovered here
+                // (transitioned to Busy/Ready like any other state).
+                let current_state = ServerState::from_u8(self.state.load(Ordering::SeqCst));
+                if current_state != ServerState::Dead {
+                    if tracker.is_busy() {
+                        self.state
+                            .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
+                        if tracker.broadcast_changed()
+                            && let Some(p) = tracker.primary_progress()
+                        {
+                            debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
+                        }
+                    } else {
+                        self.state
+                            .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+                        debug!("Server ready (progress completed)");
+                    }
+                    // Fire notifies after state update
+                    self.progress_notify.notify_waiters();
+                    self.state_notify.notify_waiters();
+                }
+            }
+            "window/logMessage" | "window/showMessage" => {
+                if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
+                    debug!("LSP server message: {}", message);
+                }
+            }
+            _ => {
+                trace!("Ignoring notification: {} params={}", method, params);
+            }
+        }
+    }
+
+    /// Handles a server request (response required).
+    ///
+    /// Returns `Ok(result)` for a success response or `Err(RpcError)`
+    /// for an error response. Connection builds the JSON-RPC envelope.
+    pub fn on_request(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        match method {
+            "workspace/configuration" => {
+                let items = params.get("items").and_then(Value::as_array);
+                let item_count = items.map_or(1, Vec::len);
+                let results: Vec<Value> = (0..item_count)
+                    .map(|i| {
+                        let section = items
+                            .and_then(|arr| arr.get(i))
+                            .and_then(|item| item.get("section"))
+                            .and_then(Value::as_str);
+                        resolve_section(self.settings.as_ref(), section)
+                    })
+                    .collect();
+                Ok(Value::Array(results))
+            }
+            "window/workDoneProgress/create"
+            | "client/registerCapability"
+            | "client/unregisterCapability"
+            | "window/showMessageRequest" => Ok(Value::Null),
+            _ => Err(RpcError {
+                code: -32601,
+                message: format!("Method '{method}' not supported by client"),
+            }),
+        }
+    }
+
+    /// Handles reader loop shutdown (server connection lost).
+    ///
+    /// Called after the `alive` flag is set to `false`. Updates internal
+    /// state and wakes any waiters blocked on diagnostics or state changes.
+    pub fn on_shutdown(&self) {
+        self.state
+            .store(ServerState::Dead.as_u8(), Ordering::SeqCst);
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.clear();
+        }
+        self.diagnostics_notify.notify_waiters();
+        self.state_notify.notify_waiters();
+    }
+
+    /// Whether the server is actively reporting progress.
+    ///
+    /// Used by `Connection::request` to pause failure detection budget
+    /// drain during explained work (e.g., indexing, flycheck).
+    pub fn is_progress_active(&self) -> bool {
+        self.progress
+            .try_lock()
+            .map_or(true, |tracker| tracker.is_busy())
+    }
+
+    /// Returns a reference to the state-change notifier.
+    ///
+    /// Used by `Connection::request` to wait for server settle after
+    /// `ContentModified` instead of a fixed sleep.
+    pub fn state_notify(&self) -> &Notify {
+        &self.state_notify
+    }
+}
+
+/// Resolves a `workspace/configuration` section path against settings.
+///
+/// Splits `section` on `.` and traverses the JSON object tree.
+/// Returns `{}` if settings are `None`, section is `None`, or the path
+/// doesn't match.
+fn resolve_section(settings: Option<&Value>, section: Option<&str>) -> Value {
+    let (Some(mut current), Some(section)) = (settings, section) else {
+        return Value::Object(serde_json::Map::new());
+    };
+    for key in section.split('.') {
+        match current.get(key) {
+            Some(child) => current = child,
+            None => return Value::Object(serde_json::Map::new()),
+        }
+    }
+    current.clone()
 }
 
 #[cfg(test)]
@@ -264,12 +492,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_server() -> LspServer {
+        LspServer::new("test".to_string(), None)
+    }
+
     /// Helper: creates an `LspServer` with capabilities already set.
     fn server_with_caps(caps: Value) -> LspServer {
-        let server = LspServer::new();
+        let server = test_server();
         server.set_capabilities(caps);
         server
     }
+
+    // ── Capability tests ──────────────────────────────────────────
 
     #[test]
     fn set_capabilities_extracts_pull_diagnostics() {
@@ -286,7 +520,7 @@ mod tests {
 
     #[test]
     fn before_set_capabilities_nothing_supported() {
-        let server = LspServer::new();
+        let server = test_server();
         assert!(!server.supports_pull_diagnostics());
         assert!(!server.supports_hover());
         assert!(!server.supports_workspace_symbols());
@@ -296,7 +530,7 @@ mod tests {
 
     #[test]
     fn on_progress_begin_end_count() {
-        let server = LspServer::new();
+        let server = test_server();
         assert_eq!(server.in_progress_count(), 0);
 
         server.on_progress_begin();
@@ -312,7 +546,7 @@ mod tests {
 
     #[test]
     fn on_progress_begin_sets_sends_progress() {
-        let server = LspServer::new();
+        let server = test_server();
         assert!(!server.sends_progress());
 
         server.on_progress_begin();
@@ -321,7 +555,7 @@ mod tests {
 
     #[test]
     fn in_progress_count_saturates() {
-        let server = LspServer::new();
+        let server = test_server();
         assert_eq!(server.in_progress_count(), 0);
 
         server.on_progress_end();
@@ -332,8 +566,6 @@ mod tests {
         server.on_progress_end();
         assert_eq!(server.in_progress_count(), 0);
     }
-
-    // ── Capability checks ──────────────────────────────────────────
 
     #[test]
     fn supports_capability_true() {
@@ -451,7 +683,6 @@ mod tests {
 
     #[test]
     fn workspace_symbol_resolve_boolean_provider() {
-        // workspaceSymbolProvider: true — no resolveProvider field
         let server = server_with_caps(json!({ "workspaceSymbolProvider": true }));
         assert!(server.supports_workspace_symbols());
         assert!(!server.supports_workspace_symbol_resolve());
@@ -459,7 +690,6 @@ mod tests {
 
     #[test]
     fn workspace_symbol_resolve_empty_options() {
-        // workspaceSymbolProvider: {} — supported but no resolve
         let server = server_with_caps(json!({ "workspaceSymbolProvider": {} }));
         assert!(server.supports_workspace_symbols());
         assert!(!server.supports_workspace_symbol_resolve());
@@ -481,5 +711,226 @@ mod tests {
         }));
         assert!(server.supports_workspace_symbols());
         assert!(server.supports_workspace_symbol_resolve());
+    }
+
+    // ── resolve_section tests (moved from inbox.rs) ───────────────
+
+    #[test]
+    fn resolve_section_traverses_dot_path() {
+        let settings = json!({
+            "python": {
+                "analysis": {
+                    "exclude": ["**/target"],
+                    "extraPaths": []
+                },
+                "pythonPath": "/usr/bin/python3"
+            }
+        });
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python.analysis")),
+            json!({"exclude": ["**/target"], "extraPaths": []})
+        );
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python.pythonPath")),
+            json!("/usr/bin/python3")
+        );
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python")),
+            json!({"analysis": {"exclude": ["**/target"], "extraPaths": []}, "pythonPath": "/usr/bin/python3"})
+        );
+    }
+
+    #[test]
+    fn resolve_section_missing_path_returns_empty_object() {
+        let settings = json!({"python": {"analysis": {}}});
+        assert_eq!(resolve_section(Some(&settings), Some("rust")), json!({}));
+        assert_eq!(
+            resolve_section(Some(&settings), Some("python.nonexistent")),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn resolve_section_none_settings_returns_empty_object() {
+        assert_eq!(resolve_section(None, Some("python")), json!({}));
+    }
+
+    #[test]
+    fn resolve_section_none_section_returns_empty_object() {
+        let settings = json!({"python": {}});
+        assert_eq!(resolve_section(Some(&settings), None), json!({}));
+    }
+
+    // ── on_request tests (moved from inbox.rs) ────────────────────
+
+    #[test]
+    fn configuration_request_uses_settings() {
+        let server = LspServer::new(
+            "test".to_string(),
+            Some(json!({"mockls": {"key": "value"}})),
+        );
+        let result = server
+            .on_request(
+                "workspace/configuration",
+                &json!({"items": [{"section": "mockls"}]}),
+            )
+            .expect("configuration request should succeed");
+        assert_eq!(result, json!([{"key": "value"}]));
+    }
+
+    #[test]
+    fn configuration_request_without_settings_returns_empty_objects() {
+        let server = test_server();
+        let result = server
+            .on_request(
+                "workspace/configuration",
+                &json!({"items": [{"section": "mockls"}, {"section": "other"}]}),
+            )
+            .expect("configuration request should succeed");
+        assert_eq!(result, json!([{}, {}]));
+    }
+
+    #[test]
+    fn register_capability_accepted() {
+        let server = test_server();
+        let result = server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{"id": "1", "method": "textDocument/didChangeConfiguration"}]}),
+            )
+            .expect("registerCapability should succeed");
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn unregister_capability_accepted() {
+        let server = test_server();
+        let result = server
+            .on_request(
+                "client/unregisterCapability",
+                &json!({"unregisterations": [{"id": "1", "method": "textDocument/didChangeConfiguration"}]}),
+            )
+            .expect("unregisterCapability should succeed");
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn show_message_request_accepted() {
+        let server = test_server();
+        let result = server
+            .on_request(
+                "window/showMessageRequest",
+                &json!({"type": 1, "message": "Restart?", "actions": [{"title": "Yes"}]}),
+            )
+            .expect("showMessageRequest should succeed");
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn unknown_request_rejected() {
+        let server = test_server();
+        let err = server
+            .on_request("custom/unknownMethod", &json!({}))
+            .expect_err("unknown method should be rejected");
+        assert_eq!(err.code, -32601);
+    }
+
+    // ── on_notification tests (moved from inbox.rs) ───────────────
+
+    #[test]
+    fn is_progress_active_begin_end() {
+        let server = test_server();
+        assert!(!server.is_progress_active());
+
+        // Progress begin
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "test-token",
+                "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
+            }),
+        );
+        assert!(server.is_progress_active());
+
+        // Progress end
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "test-token",
+                "value": { "kind": "end" }
+            }),
+        );
+        assert!(!server.is_progress_active());
+    }
+
+    #[test]
+    fn publish_diagnostics_updates_cache_and_generation() {
+        let server = test_server();
+
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": "file:///test.rs",
+                "diagnostics": [{"message": "unused variable", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}}]
+            }),
+        );
+
+        let cache = server.diagnostics.lock().expect("lock");
+        assert!(cache.contains_key("file:///test.rs"));
+        let (version, diags) = cache.get("file:///test.rs").expect("entry");
+        assert!(version.is_none());
+        assert_eq!(diags.len(), 1);
+        drop(cache);
+
+        let gen = server.diagnostics_generation.lock().expect("lock");
+        assert_eq!(gen.get("file:///test.rs").copied(), Some(1));
+    }
+
+    #[test]
+    fn progress_begin_end_updates_server_profile() {
+        let server = test_server();
+        assert!(!server.sends_progress());
+        assert_eq!(server.in_progress_count(), 0);
+
+        // Begin
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-1",
+                "value": { "kind": "begin", "title": "Checking", "percentage": 0 }
+            }),
+        );
+        assert!(server.sends_progress());
+        assert_eq!(server.in_progress_count(), 1);
+
+        // Second begin (overlapping token)
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-2",
+                "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
+            }),
+        );
+        assert_eq!(server.in_progress_count(), 2);
+
+        // End first
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-1",
+                "value": { "kind": "end" }
+            }),
+        );
+        assert_eq!(server.in_progress_count(), 1);
+
+        // End second
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-2",
+                "value": { "kind": "end" }
+            }),
+        );
+        assert_eq!(server.in_progress_count(), 0);
     }
 }
