@@ -447,10 +447,7 @@ fn run_post_tool_done_editing(hook_json: &serde_json::Value, format: HostFormat)
     };
 
     let Ok(result) = serde_json::from_str::<crate::hook::HookResult>(line) else {
-        print!(
-            "{}",
-            format_diagnostics(line, format, "PostToolUse")
-        );
+        print!("{}", format_diagnostics(line, format, "PostToolUse"));
         return;
     };
 

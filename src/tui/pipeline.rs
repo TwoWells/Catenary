@@ -1295,19 +1295,82 @@ mod tests {
             // MCP grep request (scope parent)
             make_message_with_id_parent(2, "mcp", "tools/call", "", None, None),
             // LSP children of grep
-            make_message_with_id_parent(3, "lsp", "textDocument/didOpen", "rust-analyzer", None, Some(2)),
-            make_message_with_id_parent(4, "lsp", "textDocument/hover", "rust-analyzer", None, Some(2)),
+            make_message_with_id_parent(
+                3,
+                "lsp",
+                "textDocument/didOpen",
+                "rust-analyzer",
+                None,
+                Some(2),
+            ),
+            make_message_with_id_parent(
+                4,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                Some(2),
+            ),
             // yaml interruption
-            make_message_with_id_parent(5, "lsp", "workspace/configuration", "yaml-language-server", None, None),
-            make_message_with_id_parent(6, "lsp", "textDocument/publishDiagnostics", "yaml-language-server", None, None),
+            make_message_with_id_parent(
+                5,
+                "lsp",
+                "workspace/configuration",
+                "yaml-language-server",
+                None,
+                None,
+            ),
+            make_message_with_id_parent(
+                6,
+                "lsp",
+                "textDocument/publishDiagnostics",
+                "yaml-language-server",
+                None,
+                None,
+            ),
             // more LSP children of grep
-            make_message_with_id_parent(7, "lsp", "textDocument/hover", "rust-analyzer", None, Some(2)),
-            make_message_with_id_parent(8, "lsp", "textDocument/hover", "rust-analyzer", None, Some(2)),
+            make_message_with_id_parent(
+                7,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                Some(2),
+            ),
+            make_message_with_id_parent(
+                8,
+                "lsp",
+                "textDocument/hover",
+                "rust-analyzer",
+                None,
+                Some(2),
+            ),
             // another yaml interruption
-            make_message_with_id_parent(9, "lsp", "workspace/configuration", "yaml-language-server", None, None),
-            make_message_with_id_parent(10, "lsp", "textDocument/publishDiagnostics", "yaml-language-server", None, None),
+            make_message_with_id_parent(
+                9,
+                "lsp",
+                "workspace/configuration",
+                "yaml-language-server",
+                None,
+                None,
+            ),
+            make_message_with_id_parent(
+                10,
+                "lsp",
+                "textDocument/publishDiagnostics",
+                "yaml-language-server",
+                None,
+                None,
+            ),
             // final LSP children
-            make_message_with_id_parent(11, "lsp", "textDocument/didClose", "rust-analyzer", None, Some(2)),
+            make_message_with_id_parent(
+                11,
+                "lsp",
+                "textDocument/didClose",
+                "rust-analyzer",
+                None,
+                Some(2),
+            ),
             // hook post-tool
             make_message_with_id_parent(12, "hook", "post-tool/diagnostics", "", None, None),
         ];
