@@ -39,7 +39,7 @@ diagnostics — all through a single MCP server.
 ### 1. Install
 
 ```bash
-cargo install --git https://github.com/TwoWells/Catenary catenary-mcp
+cargo install catenary-mcp
 ```
 
 ### 2. Configure language servers
