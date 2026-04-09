@@ -33,28 +33,26 @@ npm install -g pyright
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.python]
+[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
+
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
+
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+
+[language.python]
+servers = ["python"]
 ```
 
 ## Settings
 
 Pyright requests configuration via `workspace/configuration`. Use the `settings`
-table to provide Python interpreter paths, analysis exclusions, and other options:
-
-```toml
-[language.python]
-command = "pyright-langserver"
-args = ["--stdio"]
-
-[language.python.settings.python]
-pythonPath = "/usr/bin/python3"
-
-[language.python.settings.python.analysis]
-exclude = ["**/target", "**/node_modules"]
-extraPaths = []
-```
+table on the `[server.*]` entry to provide Python interpreter paths, analysis
+exclusions, and other options (shown above).
 
 Without these settings, pyright may fall back to scanning the entire workspace
 (including large directories like `target/` or `node_modules/`), which can
@@ -80,8 +78,11 @@ pip install python-lsp-server
 ```
 
 ```toml
-[language.python]
+[server.pylsp]
 command = "pylsp"
+
+[language.python]
+servers = ["pylsp"]
 ```
 
 ### Jedi Language Server
@@ -93,8 +94,11 @@ pip install jedi-language-server
 ```
 
 ```toml
-[language.python]
+[server.jedi]
 command = "jedi-language-server"
+
+[language.python]
+servers = ["jedi"]
 ```
 
 ## Links

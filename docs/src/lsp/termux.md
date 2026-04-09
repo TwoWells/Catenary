@@ -27,53 +27,45 @@ pip install termux-language-server
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.termux]
+[server.termux-ls]
 command = "termux-language-server"
 args = ["--stdio"]
+
+[language.termux]
+servers = ["termux-ls"]
 
 [language.pkgbuild]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.ebuild]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.eclass]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.makepkg]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.devscripts]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.mdd]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.subpackage]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.install]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.gentoo-make-conf]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language."make.conf"]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language."color.map"]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 ```
 
 ## Notes

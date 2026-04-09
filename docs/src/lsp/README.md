@@ -57,9 +57,12 @@ Want to add a language?
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.yourlanguage]
+[server.your-language-server]
 command = "your-language-server"
 args = ["--stdio"]
+
+[language.yourlanguage]
+servers = ["your-language-server"]
 ```
 
 ## Notes

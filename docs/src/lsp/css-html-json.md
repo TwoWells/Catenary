@@ -27,21 +27,29 @@ npm install -g vscode-langservers-extracted
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.css]
+[server.vscode-css]
 command = "vscode-css-language-server"
 args = ["--stdio"]
 
-[language.scss]
-command = "vscode-css-language-server"
-args = ["--stdio"]
-
-[language.html]
+[server.vscode-html]
 command = "vscode-html-language-server"
 args = ["--stdio"]
 
-[language.json]
+[server.vscode-json]
 command = "vscode-json-language-server"
 args = ["--stdio"]
+
+[language.css]
+servers = ["vscode-css"]
+
+[language.scss]
+servers = ["vscode-css"]
+
+[language.html]
+servers = ["vscode-html"]
+
+[language.json]
+servers = ["vscode-json"]
 ```
 
 ## What's Included

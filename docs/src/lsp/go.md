@@ -31,8 +31,11 @@ go install golang.org/x/tools/gopls@latest
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.go]
+[server.gopls]
 command = "gopls"
+
+[language.go]
+servers = ["gopls"]
 ```
 
 ## Notes

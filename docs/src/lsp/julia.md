@@ -16,9 +16,12 @@ Pkg.add("LanguageServer")
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.julia]
+[server.julia-ls]
 command = "julia"
 args = ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"]
+
+[language.julia]
+servers = ["julia-ls"]
 ```
 
 ## Notes
@@ -40,9 +43,12 @@ create_sysimage([:LanguageServer], sysimage_path="languageserver.so")
 Then use:
 
 ```toml
-[language.julia]
+[server.julia-ls]
 command = "julia"
 args = ["--sysimage=/path/to/languageserver.so", "-e", "using LanguageServer; runserver()"]
+
+[language.julia]
+servers = ["julia-ls"]
 ```
 
 ## Links

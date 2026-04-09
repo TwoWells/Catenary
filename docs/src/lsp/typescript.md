@@ -25,9 +25,12 @@ npm install -g typescript typescript-language-server
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.typescript]
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
+
+[language.typescript]
+servers = ["tsserver"]
 ```
 
 ## Notes

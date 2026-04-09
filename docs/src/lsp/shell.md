@@ -25,9 +25,12 @@ npm install -g bash-language-server
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.shellscript]
+[server.bash-ls]
 command = "bash-language-server"
 args = ["start"]
+
+[language.shellscript]
+servers = ["bash-ls"]
 ```
 
 ## Notes

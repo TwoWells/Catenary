@@ -11,10 +11,16 @@ Catenary loads configuration from multiple sources, in order of priority
 
 ## Language Servers
 
+Configuration uses two sections: `[server.*]` defines how to run a
+language server, and `[language.*]` binds languages to servers.
+
 ```toml
-[language.<language-id>]
+[server.<name>]
 command = "server-binary"
 args = ["arg1", "arg2"]
+
+[language.<language-id>]
+servers = ["<name>"]
 ```
 
 ### Example
@@ -22,33 +28,52 @@ args = ["arg1", "arg2"]
 ```toml
 idle_timeout = 300
 
-[language.rust]
+[server.rust]
 command = "rust-analyzer"
 
-[language.rust.initialization_options]
+[server.rust.initialization_options]
 check.command = "clippy"
+cargo.features = "all"
+diagnostics.disabled = ["inactive-code"]
 
-[language.python]
+[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[language.python.settings.python.analysis]
-exclude = ["**/target", "**/node_modules"]
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
 
-[language.typescript]
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
 
-[language.go]
+[server.gopls]
 command = "gopls"
+
+[language.rust]
+servers = ["rust"]
+
+[language.python]
+servers = ["python"]
+
+[language.typescript]
+servers = ["tsserver"]
+
+[language.go]
+servers = ["gopls"]
 ```
 
 ### Initialization Options
 
-Server-specific options passed during the LSP `initialize` request:
+Server-specific options passed during the LSP `initialize` request.
+These go on the `[server.*]` entry:
 
 ```toml
-[language.rust.initialization_options]
+[server.rust.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 ```
@@ -58,20 +83,20 @@ Refer to your language server's documentation for available options.
 ### Server Settings
 
 Some language servers request configuration from the client via
-`workspace/configuration`. The `settings` table provides these values.
-The TOML nesting mirrors the JSON object the server expects — Catenary
-matches the `section` path from each request and returns the
-corresponding subtree.
+`workspace/configuration`. The `settings` table provides these values
+on the `[server.*]` entry. The TOML nesting mirrors the JSON object
+the server expects — Catenary matches the `section` path from each
+request and returns the corresponding subtree.
 
 ```toml
-[language.python]
+[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[language.python.settings.python]
+[server.python.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[language.python.settings.python.analysis]
+[server.python.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
@@ -84,7 +109,7 @@ Items with no matching path receive `{}`.
 
 ## Language IDs
 
-The `[language.<language-id>]` key must match the LSP language identifier.
+The `[language.<language-id>]` key in the language section must match the LSP language identifier.
 Catenary auto-detects languages from file extensions, filenames, and
 shebangs (`#!` lines in extensionless scripts). Any language with an LSP
 server works — this table covers what Catenary recognises automatically.

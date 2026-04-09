@@ -25,8 +25,16 @@ rustup component add rust-analyzer
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.rust]
+[server.rust]
 command = "rust-analyzer"
+
+[server.rust.initialization_options]
+check.command = "clippy"
+cargo.features = "all"
+diagnostics.disabled = ["inactive-code"]
+
+[language.rust]
+servers = ["rust"]
 ```
 
 ## Notes

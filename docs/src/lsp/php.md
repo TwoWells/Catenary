@@ -27,9 +27,12 @@ npm install -g intelephense
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.php]
+[server.intelephense]
 command = "intelephense"
 args = ["--stdio"]
+
+[language.php]
+servers = ["intelephense"]
 ```
 
 ## Notes
@@ -51,9 +54,12 @@ composer global require phpactor/phpactor
 ```
 
 ```toml
-[language.php]
+[server.phpactor]
 command = "phpactor"
 args = ["language-server"]
+
+[language.php]
+servers = ["phpactor"]
 ```
 
 ## Links
