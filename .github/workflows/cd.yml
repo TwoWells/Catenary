@@ -91,4 +91,4 @@ jobs:
           cargo publish -p catenary-ts || echo "catenary-ts: already published, skipping"
           # Wait for crates.io index to propagate
           sleep 30
-          cargo publish
+          cargo publish --allow-dirty
