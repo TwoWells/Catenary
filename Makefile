@@ -18,6 +18,7 @@ build-release:
 	@cargo build --release
 
 check:
+	@cargo update --quiet
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
 	@cargo clippy --tests --features mockls --quiet -- -D warnings
 	@cargo deny --log-level error check
