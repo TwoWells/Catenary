@@ -15,8 +15,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, error, warn};
 
-use super::inbox::Inbox;
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
+use super::server::LspServer;
 use crate::session::MessageLog;
 
 /// Tracks an in-flight request so we can annotate the response with
@@ -42,7 +42,7 @@ pub struct Connection {
     pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     alive: Arc<AtomicBool>,
     next_id: AtomicI64,
-    inbox: Arc<dyn Inbox>,
+    server: Arc<LspServer>,
     language: String,
     message_log: Arc<MessageLog>,
     server_name: String,
@@ -62,7 +62,7 @@ impl Connection {
         program: &str,
         args: &[&str],
         stderr: Stdio,
-        inbox: Arc<dyn Inbox>,
+        server: Arc<LspServer>,
         language: String,
         message_log: Arc<MessageLog>,
         server_name: &str,
@@ -101,7 +101,7 @@ impl Connection {
             stdin.clone(),
             pending.clone(),
             alive.clone(),
-            inbox.clone(),
+            server.clone(),
             stdout,
             message_log.clone(),
             server_name.to_string(),
@@ -113,7 +113,7 @@ impl Connection {
             pending,
             alive,
             next_id: AtomicI64::new(1),
-            inbox,
+            server,
             language,
             message_log,
             server_name: server_name.to_string(),
@@ -205,7 +205,7 @@ impl Connection {
                                 let delta = d.delta_utime + d.delta_stime;
                                 if d.state == catenary_proc::ProcessState::Running
                                     && delta > 0
-                                    && !self.inbox.is_progress_active()
+                                    && !self.server.is_progress_active()
                                 {
                                     budget -= i64::try_from(delta)
                                         .unwrap_or(budget);
@@ -243,7 +243,7 @@ impl Connection {
                 if error.code == -32801 || error.code == -32800 {
                     debug!("LSP request '{}' cancelled/modified, retrying...", method,);
                     tokio::select! {
-                        () = self.inbox.state_notify().notified() => {}
+                        () = self.server.state_notify().notified() => {}
                         () = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                     continue;
@@ -341,7 +341,7 @@ impl Connection {
         stdin: Arc<Mutex<ChildStdin>>,
         pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
         alive: Arc<AtomicBool>,
-        inbox: Arc<dyn Inbox>,
+        server: Arc<LspServer>,
         stdout: tokio::process::ChildStdout,
         message_log: Arc<MessageLog>,
         server_name: String,
@@ -397,7 +397,7 @@ impl Connection {
 
                         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
 
-                        let response = match inbox.on_request(method, params) {
+                        let response = match server.on_request(method, params) {
                             Ok(result) => ResponseMessage {
                                 jsonrpc: "2.0".to_string(),
                                 id: Some(request_id),
@@ -452,7 +452,7 @@ impl Connection {
                             &value,
                         );
                         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
-                        inbox.on_notification(method, params);
+                        server.on_notification(method, params);
                     }
                 } else if value.get("id").is_some() {
                     // Response — log with method from pending map
@@ -481,9 +481,9 @@ impl Connection {
             }
         }
 
-        // Mark server as dead and trigger inbox cleanup
+        // Mark server as dead and trigger shutdown cleanup
         alive.store(false, Ordering::SeqCst);
-        inbox.on_shutdown();
+        server.on_shutdown();
         warn!("LSP reader task exiting - server connection lost");
     }
 }

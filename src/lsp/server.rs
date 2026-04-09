@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
@@ -88,6 +88,7 @@ impl LspServer {
     ///
     /// Call [`Self::set_capabilities`] after the `initialize` handshake
     /// to populate capability fields.
+    #[must_use]
     pub fn new(language: String, settings: Option<Value>) -> Self {
         Self {
             capabilities: OnceLock::new(),
@@ -405,6 +406,10 @@ impl LspServer {
     ///
     /// Returns `Ok(result)` for a success response or `Err(RpcError)`
     /// for an error response. Connection builds the JSON-RPC envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError`] for unsupported methods.
     pub fn on_request(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
         match method {
             "workspace/configuration" => {
@@ -882,8 +887,9 @@ mod tests {
         assert_eq!(diags.len(), 1);
         drop(cache);
 
-        let gen = server.diagnostics_generation.lock().expect("lock");
-        assert_eq!(gen.get("file:///test.rs").copied(), Some(1));
+        let generations = server.diagnostics_generation.lock().expect("lock");
+        assert_eq!(generations.get("file:///test.rs").copied(), Some(1));
+        drop(generations);
     }
 
     #[test]

@@ -13,7 +13,6 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::connection::Connection;
-use super::inbox::{Inbox, ServerInbox};
 use super::params;
 use super::server::LspServer;
 use super::state::{ServerState, ServerStatus};
@@ -62,8 +61,8 @@ const SAFETY_CAP: Duration = Duration::from_secs(300);
 pub struct LspClient {
     connection: Connection,
 
-    // Grouped server state
-    inbox: Arc<ServerInbox>,
+    // Server representation (capabilities, state, dispatch)
+    server: Arc<LspServer>,
 
     // Client-local state (not shared with reader)
     encoding: String,
@@ -85,9 +84,6 @@ pub struct LspClient {
     /// Populated after `initialize()` completes; `None` if the server
     /// did not report a version.
     server_version: Option<String>,
-    /// Server profile constructed during `initialize()`.
-    /// `None` before `initialize()` completes.
-    lsp_server: Option<Arc<LspServer>>,
     /// Parent message ID for causation tracking (set before tool dispatch).
     parent_id: Option<i64>,
 }
@@ -139,15 +135,13 @@ impl LspClient {
         stderr: Stdio,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
-        let server = Arc::new(LspServer::new());
-        let inbox = Arc::new(ServerInbox::new(language.to_string(), settings));
-        inbox.set_lsp_server(Arc::clone(&server));
+        let server = Arc::new(LspServer::new(language.to_string(), settings));
 
         let connection = Connection::new(
             program,
             args,
             stderr,
-            inbox.clone(),
+            server.clone(),
             language.to_string(),
             message_log,
             program,
@@ -155,7 +149,7 @@ impl LspClient {
 
         Ok(Self {
             connection,
-            inbox,
+            server,
             encoding: "utf-16".to_string(), // Default per spec
             spawn_time: Instant::now(),
             supports_workspace_folders: false,
@@ -164,7 +158,6 @@ impl LspClient {
             wants_did_save: false,
             server_command: program.to_string(),
             server_version: None,
-            lsp_server: Some(server),
             parent_id: None,
         })
     }
@@ -185,7 +178,7 @@ impl LspClient {
     /// `workspace/didChangeWorkspaceFolders`) without actual `$/progress`
     /// tokens, which would prevent the failure threshold from draining.
     fn progress_active(&self) -> bool {
-        self.inbox.is_progress_active()
+        self.server.is_progress_active()
     }
 
     /// Sets the parent message ID for causation tracking.
@@ -198,7 +191,7 @@ impl LspClient {
 
     /// Returns an error if the server does not support the given capability.
     fn require_capability(&self, method: &str, check: fn(&LspServer) -> bool) -> Result<()> {
-        if !self.lsp_server.as_deref().is_some_and(check) {
+        if !check(&self.server) {
             return Err(anyhow!("server does not support {method}"));
         }
         Ok(())
@@ -282,14 +275,12 @@ impl LspClient {
         self.wants_did_save = super::extract::wants_did_save(&caps);
         debug!(
             "[{}] server wants didSave: {}",
-            self.inbox.language, self.wants_did_save
+            self.server.language, self.wants_did_save
         );
 
         // Store server info and set capabilities on existing server profile
         self.server_version = super::extract::server_version(&raw).map(str::to_string);
-        if let Some(server) = &self.lsp_server {
-            server.set_capabilities(caps);
-        }
+        self.server.set_capabilities(caps);
 
         // Send initialized notification
         self.notify("initialized", json!({})).await?;
@@ -298,7 +289,7 @@ impl LspClient {
         // workspace/configuration requests, but the push is harmless
         // and required by legacy servers that don't use the pull model.
         let settings = self
-            .inbox
+            .server
             .settings()
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
@@ -309,7 +300,7 @@ impl LspClient {
         .await?;
 
         // Mark as ready (server may later report progress if indexing)
-        self.inbox
+        self.server
             .state
             .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
 
@@ -325,11 +316,7 @@ impl LspClient {
     ///
     /// Returns an empty object before `initialize()` completes.
     pub fn capabilities(&self) -> &Value {
-        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-        self.lsp_server.as_ref().map_or_else(
-            || EMPTY.get_or_init(|| Value::Object(serde_json::Map::new())),
-            |s| s.capabilities(),
-        )
+        self.server.capabilities()
     }
 
     /// Sends shutdown request and exit notification.
@@ -422,7 +409,7 @@ impl LspClient {
         removed: &[(&str, &str)],
     ) -> Result<()> {
         if !added.is_empty() && self.server_state() == ServerState::Ready {
-            self.inbox
+            self.server
                 .state
                 .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
         }
@@ -568,30 +555,22 @@ impl LspClient {
 
     /// Returns whether the server advertises `workspaceSymbolProvider.resolveProvider`.
     pub fn supports_workspace_symbol_resolve(&self) -> bool {
-        self.lsp_server
-            .as_ref()
-            .is_some_and(|s| s.supports_workspace_symbol_resolve())
+        self.server.supports_workspace_symbol_resolve()
     }
 
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
     pub fn supports_pull_diagnostics(&self) -> bool {
-        self.lsp_server
-            .as_ref()
-            .is_some_and(|s| s.supports_pull_diagnostics())
+        self.server.supports_pull_diagnostics()
     }
 
     /// Returns whether the server advertises `renameProvider`.
     pub fn supports_rename(&self) -> bool {
-        self.lsp_server
-            .as_ref()
-            .is_some_and(|s| s.supports_rename())
+        self.server.supports_rename()
     }
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
     pub fn supports_type_hierarchy(&self) -> bool {
-        self.lsp_server
-            .as_ref()
-            .is_some_and(|s| s.supports_type_hierarchy())
+        self.server.supports_type_hierarchy()
     }
 
     /// Prepares call hierarchy for a position.
@@ -735,7 +714,7 @@ impl LspClient {
     /// Gets cached diagnostics for a specific URI.
     pub fn get_diagnostics(&self, uri: &str) -> Vec<Value> {
         let cache = self
-            .inbox
+            .server
             .diagnostics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -752,7 +731,7 @@ impl LspClient {
     #[allow(dead_code, reason = "Used by diagnostics strategy tests")]
     pub(crate) fn cached_diagnostics_version(&self, uri: &str) -> Option<i32> {
         let cache = self
-            .inbox
+            .server
             .diagnostics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -765,7 +744,7 @@ impl LspClient {
     /// info or when no version has been tracked for this URI — we can't
     /// distinguish stale from fresh without version data.
     async fn is_diagnostics_version_current(&self, uri: &str) -> bool {
-        if !self.inbox.publishes_version.load(Ordering::SeqCst) {
+        if !self.server.publishes_version.load(Ordering::SeqCst) {
             return true;
         }
         let sent = self.last_sent_version.lock().await;
@@ -784,7 +763,7 @@ impl LspClient {
     /// the returned diagnostics reflect that specific change.
     pub fn diagnostics_generation(&self, uri: &str) -> u64 {
         let generations = self
-            .inbox
+            .server
             .diagnostics_generation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -806,10 +785,9 @@ impl LspClient {
     pub(crate) fn diagnostics_strategy(&self) -> Option<super::diagnostics::DiagnosticsStrategy> {
         use super::diagnostics::DiagnosticsStrategy;
 
-        let sends_progress = self.lsp_server.as_ref().is_some_and(|s| s.sends_progress());
-        if sends_progress {
+        if self.server.sends_progress() {
             Some(DiagnosticsStrategy::TokenMonitor)
-        } else if self.inbox.publishes_version.load(Ordering::SeqCst) {
+        } else if self.server.publishes_version.load(Ordering::SeqCst) {
             Some(DiagnosticsStrategy::Version)
         } else {
             None
@@ -826,8 +804,7 @@ impl LspClient {
     /// intelligence but do not get `didSave` and are not waited on for
     /// diagnostics.
     pub fn supports_diagnostics_wait(&self) -> bool {
-        let sends_progress = self.lsp_server.as_ref().is_some_and(|s| s.sends_progress());
-        if self.inbox.publishes_version.load(Ordering::SeqCst) || sends_progress {
+        if self.server.publishes_version.load(Ordering::SeqCst) || self.server.sends_progress() {
             return true;
         }
         // Log once when we determine the server lacks support (after warmup)
@@ -838,7 +815,7 @@ impl LspClient {
         {
             info!(
                 "[{}] server lacks version/progress support \u{2014} diagnostics disabled",
-                self.inbox.language
+                self.server.language
             );
         }
         false
@@ -892,7 +869,7 @@ impl LspClient {
                 &mut || self.sample_monitor(),
                 PREAMBLE_THRESHOLD,
                 Some(Duration::from_secs(10)),
-                &self.inbox.diagnostics_notify,
+                &self.server.diagnostics_notify,
                 || self.progress_active(),
                 || async { self.diagnostics_generation(uri) > snapshot },
             )
@@ -921,7 +898,7 @@ impl LspClient {
                     return DiagnosticsWaitResult::Nothing;
                 }
                 tokio::select! {
-                    () = self.inbox.capability_notify.notified() => {}
+                    () = self.server.capability_notify.notified() => {}
                     () = tokio::time::sleep(POLL_INTERVAL) => {}
                 }
             }
@@ -929,8 +906,8 @@ impl LspClient {
         debug!(
             "Diagnostics strategy: {:?} (sends_progress={}, publishes_version={})",
             strategy,
-            self.lsp_server.as_ref().is_some_and(|s| s.sends_progress()),
-            self.inbox.publishes_version.load(Ordering::SeqCst),
+            self.server.sends_progress(),
+            self.server.publishes_version.load(Ordering::SeqCst),
         );
 
         let wall_deadline = tokio::time::Instant::now() + SAFETY_CAP;
@@ -949,7 +926,7 @@ impl LspClient {
 
                     // Event-driven wake + failure detection
                     tokio::select! {
-                        () = self.inbox.diagnostics_notify.notified() => {
+                        () = self.server.diagnostics_notify.notified() => {
                             // Check condition at top of loop
                             continue;
                         }
@@ -984,7 +961,7 @@ impl LspClient {
             }
             DiagnosticsStrategy::TokenMonitor => {
                 let mut monitor = super::diagnostics::TokenMonitor::new(
-                    self.inbox.state.clone(),
+                    self.server.state.clone(),
                     self.connection.alive_flag(),
                 );
                 let mut ever_active = false;
@@ -1008,7 +985,7 @@ impl LspClient {
                             &mut || self.sample_monitor(),
                             PREAMBLE_THRESHOLD,
                             Some(Duration::from_secs(2)),
-                            &self.inbox.progress_notify,
+                            &self.server.progress_notify,
                             || self.progress_active(),
                             || async { self.progress_active() },
                         )
@@ -1041,8 +1018,8 @@ impl LspClient {
 
                     // Event-driven wake + failure detection
                     tokio::select! {
-                        () = self.inbox.diagnostics_notify.notified() => continue,
-                        () = self.inbox.progress_notify.notified() => continue,
+                        () = self.server.diagnostics_notify.notified() => continue,
+                        () = self.server.progress_notify.notified() => continue,
                         () = tokio::time::sleep(POLL_INTERVAL) => {}
                     }
 
@@ -1085,7 +1062,7 @@ impl LspClient {
 
     /// Returns the language identifier for this client (e.g., "rust", "python").
     pub fn language(&self) -> &str {
-        &self.inbox.language
+        &self.server.language
     }
 
     /// Returns whether the server supports dynamic workspace folder changes.
@@ -1100,7 +1077,7 @@ impl LspClient {
 
     /// Returns the current server state.
     pub fn server_state(&self) -> ServerState {
-        ServerState::from_u8(self.inbox.state.load(Ordering::SeqCst))
+        ServerState::from_u8(self.server.state.load(Ordering::SeqCst))
     }
 
     /// Returns time since server spawned.
@@ -1142,7 +1119,7 @@ impl LspClient {
     pub fn status(&self, language: String) -> ServerStatus {
         let (title, message, percentage) = {
             let progress = self
-                .inbox
+                .server
                 .progress
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1195,7 +1172,7 @@ impl LspClient {
             &mut || self.sample_monitor(),
             READY_THRESHOLD,
             None, // Use default 5-minute safety cap
-            &self.inbox.state_notify,
+            &self.server.state_notify,
             || self.progress_active(),
             || async {
                 if self.is_ready() {
@@ -1216,10 +1193,10 @@ impl LspClient {
                                     "wait_ready: activity settle — non-progress server \
                                      idle for {count} samples, transitioning to Ready"
                                 );
-                                self.inbox
+                                self.server
                                     .state
                                     .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-                                self.inbox.state_notify.notify_waiters();
+                                self.server.state_notify.notify_waiters();
                                 return true;
                             }
                         } else {
@@ -1239,10 +1216,10 @@ impl LspClient {
         // so future calls skip the full wait.
         if !ready && self.is_alive() {
             debug!("wait_ready: patience exhausted, server still alive — marking as Stuck");
-            self.inbox
+            self.server
                 .state
                 .store(ServerState::Stuck.as_u8(), Ordering::SeqCst);
-            self.inbox.state_notify.notify_waiters();
+            self.server.state_notify.notify_waiters();
         }
 
         ready
@@ -1263,10 +1240,10 @@ impl LspClient {
             && d.delta_utime + d.delta_stime == 0
         {
             debug!("try_idle_recover: stuck server is idle — transitioning to Ready");
-            self.inbox
+            self.server
                 .state
                 .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-            self.inbox.state_notify.notify_waiters();
+            self.server.state_notify.notify_waiters();
             return true;
         }
 

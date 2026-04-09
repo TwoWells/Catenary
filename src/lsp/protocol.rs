@@ -72,11 +72,11 @@ pub struct ResponseError {
     pub data: Option<serde_json::Value>,
 }
 
-/// Error returned by [`Inbox::on_request`](super::inbox::Inbox::on_request())
+/// Error returned by [`LspServer::on_request`](super::server::LspServer::on_request())
 /// for server requests the client cannot handle.
 ///
 /// Connection translates this into a JSON-RPC error response.
-/// The inbox implementor never constructs the response envelope.
+/// `LspServer` never constructs the response envelope.
 #[derive(Debug)]
 pub struct RpcError {
     /// JSON-RPC error code (e.g., -32601 for `MethodNotFound`).
