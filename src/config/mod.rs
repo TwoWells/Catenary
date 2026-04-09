@@ -14,6 +14,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 pub use language::LanguageConfig;
+pub use parse::{SERVER_DEF_KEYS, config_sources};
 pub use server::ServerDef;
 
 /// Overall configuration for Catenary.
@@ -44,10 +45,6 @@ pub struct Config {
     /// TUI configuration.
     #[serde(default)]
     pub tui: TuiConfig,
-
-    /// True if any config source used the deprecated `[server.*]` key.
-    #[serde(skip)]
-    pub deprecated_server_key: bool,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -255,7 +252,6 @@ impl Default for Config {
             server: HashMap::new(),
             icons: IconConfig::default(),
             tui: TuiConfig::default(),
-            deprecated_server_key: false,
         }
     }
 }

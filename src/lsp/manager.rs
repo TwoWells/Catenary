@@ -553,7 +553,6 @@ mod tests {
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
-            deprecated_server_key: false,
         }
     }
 
@@ -598,7 +597,6 @@ mod tests {
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
-            deprecated_server_key: false,
         }
     }
 
@@ -631,7 +629,6 @@ mod tests {
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
-            deprecated_server_key: false,
         }
     }
 
@@ -801,7 +798,6 @@ mod tests {
             log_retention_days: 7,
             icons: IconConfig::default(),
             tui: crate::config::TuiConfig::default(),
-            deprecated_server_key: false,
         };
 
         let manager = LspClientManager::new(

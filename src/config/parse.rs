@@ -24,6 +24,18 @@ use super::{Config, LanguageConfig, ServerDef, default_idle_timeout, default_log
 /// - `inherit` targets are missing, chained, or cyclic.
 /// - A concrete language entry is missing `command`.
 pub fn load() -> Result<Config> {
+    let sources = config_sources();
+    load_from_sources(&sources)
+}
+
+/// Discover configuration file paths in standard order.
+///
+/// Returns the list of paths that would be loaded (later overrides earlier):
+/// 1. User config (`~/.config/catenary/config.toml`)
+/// 2. Project-local config (`.catenary.toml`, searching upward from cwd)
+/// 3. Explicit file from `CATENARY_CONFIG` env var
+#[must_use]
+pub fn config_sources() -> Vec<PathBuf> {
     let mut sources: Vec<PathBuf> = Vec::new();
 
     // 1. User config directory (~/.config/catenary/config.toml)
@@ -52,7 +64,7 @@ pub fn load() -> Result<Config> {
         sources.push(PathBuf::from(path));
     }
 
-    load_from_sources(&sources)
+    sources
 }
 
 /// Load configuration from an explicit list of file paths.
@@ -82,7 +94,7 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
 }
 
 /// Keys that belong on `ServerDef`, not `LanguageConfig`.
-const SERVER_DEF_KEYS: &[&str] = &["command", "args", "initialization_options", "settings"];
+pub const SERVER_DEF_KEYS: &[&str] = &["command", "args", "initialization_options", "settings"];
 
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`
 /// disambiguation.

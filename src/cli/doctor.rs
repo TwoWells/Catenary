@@ -46,6 +46,9 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     println!("Catenary {}", env!("CATENARY_VERSION"));
     println!();
 
+    // Check config sources for old-format entries before loading
+    doctor_check_config(&colors);
+
     // Load configuration — report errors inline instead of bailing
     let config = match crate::config::Config::load() {
         Ok(c) => c,
@@ -86,22 +89,39 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     }
     println!();
 
-    // Config warnings
-    if config.deprecated_server_key {
-        println!(
-            "{}",
-            colors.yellow("⚠  Config uses deprecated [server.*] key — rename to [language.*]"),
-        );
-    }
+    // Validation errors
     let validation_errors = config.validate();
     for err in &validation_errors {
         println!("{}", colors.red(&format!("✗  {err}")));
     }
-    if config.deprecated_server_key || !validation_errors.is_empty() {
+
+    // Unreferenced server warnings
+    let referenced: HashSet<&str> = config
+        .language
+        .values()
+        .flat_map(|lc| lc.servers.iter().map(String::as_str))
+        .collect();
+    let mut unreferenced: Vec<&str> = config
+        .server
+        .keys()
+        .filter(|name| !referenced.contains(name.as_str()))
+        .map(String::as_str)
+        .collect();
+    unreferenced.sort_unstable();
+    for name in &unreferenced {
+        println!(
+            "{}",
+            colors.yellow(&format!(
+                "⚠  Server '{name}' is defined but not referenced by any [language.*] entry"
+            )),
+        );
+    }
+
+    if !validation_errors.is_empty() || !unreferenced.is_empty() {
         println!();
     }
 
-    if config.language.is_empty() {
+    if config.language.is_empty() && config.server.is_empty() {
         println!("No language servers configured.");
         return Ok(());
     }
@@ -113,64 +133,34 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
         fs.detect_workspace_languages(roots, &configured_keys)
     });
 
-    // Collect (language, first server def) pairs for concrete entries.
-    // Skip inherit-only entries and languages with no servers.
-    let mut entries: Vec<(&String, &crate::config::ServerDef)> = Vec::new();
-    for (lang, lc) in &config.language {
-        if lc.inherit.is_some() || lc.servers.is_empty() {
-            continue;
-        }
-        if let Some(server_name) = lc.servers.first()
-            && let Some(server_def) = config.server.get(server_name)
-        {
-            entries.push((lang, server_def));
-        }
-    }
-    entries.sort_by_key(|(lang, _)| *lang);
+    // ── Servers section ──────────────────────────────────────────────
+    // Spawn each unique server once, collect capabilities.
+    let mut server_names: Vec<&str> = config.server.keys().map(String::as_str).collect();
+    server_names.sort_unstable();
 
-    // Determine column width for language name
-    let max_lang_width = entries.iter().map(|(l, _)| l.len()).max().unwrap_or(10);
-    let max_cmd_width = entries
-        .iter()
-        .map(|(_, s)| s.command.len())
-        .max()
-        .unwrap_or(10);
+    let max_server_width = server_names.iter().map(|n| n.len()).max().unwrap_or(10);
 
-    for (lang, server_def) in &entries {
+    println!("{}:", colors.bold("Servers"));
+    let mut server_capabilities: std::collections::HashMap<&str, Vec<&'static str>> =
+        std::collections::HashMap::new();
+    for name in &server_names {
+        let server_def = &config.server[*name];
         let command = server_def.command.as_str();
-        let lang_display = format!("{lang:<max_lang_width$}");
-        let cmd_display = format!("{command:<max_cmd_width$}");
+        let name_display = format!("  {name:<max_server_width$}");
 
-        // Check if any files for this language exist (only when roots provided)
-        if let Some(ref det) = detected
-            && !det.contains(lang.as_str())
-        {
-            println!(
-                "{}  {}  {}",
-                colors.dim(&lang_display),
-                colors.dim(&cmd_display),
-                colors.dim("- skipped (no matching files)"),
-            );
-            continue;
-        }
-
-        // Check if binary exists on PATH
         if !binary_exists(command) {
             println!(
-                "{}  {}  {}",
-                lang_display,
-                cmd_display,
-                colors.red("✗ command not found"),
+                "{name_display}  {}",
+                colors.red(&format!("✗ {command}: command not found")),
             );
             continue;
         }
 
-        // Spawn and initialize the server
         let args_refs: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
         let spawn_result = lsp::LspClient::spawn_quiet(
             command,
             &args_refs,
-            lang,
+            name,
             Arc::new(crate::session::MessageLog::noop()),
         );
 
@@ -178,9 +168,7 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
             Ok(client) => client,
             Err(e) => {
                 println!(
-                    "{}  {}  {}",
-                    lang_display,
-                    cmd_display,
+                    "{name_display}  {}",
                     colors.red(&format!("✗ spawn failed: {e}")),
                 );
                 continue;
@@ -195,32 +183,80 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
             Ok(result) => {
                 let tools =
                     extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
-                println!(
-                    "{}  {}  {}",
-                    lang_display,
-                    cmd_display,
-                    colors.green("✓ ready"),
-                );
-                if !tools.is_empty() {
-                    println!(
-                        "{}  {}",
-                        " ".repeat(max_lang_width + max_cmd_width + 4),
-                        colors.dim(&tools.join(" ")),
-                    );
-                }
+                println!("{name_display}  {}", colors.green("✓ ready"));
+                server_capabilities.insert(name, tools);
             }
             Err(e) => {
                 println!(
-                    "{}  {}  {}",
-                    lang_display,
-                    cmd_display,
+                    "{name_display}  {}",
                     colors.red(&format!("✗ initialize failed: {e}")),
                 );
             }
         }
 
-        // Shutdown cleanly
         let _ = client.shutdown().await;
+    }
+
+    // ── Languages section ────────────────────────────────────────────
+    println!();
+    println!("{}:", colors.bold("Languages"));
+
+    // Build sorted list of (language, server_name) pairs
+    let mut lang_entries: Vec<(&str, &str)> = Vec::new();
+    for (lang, lc) in &config.language {
+        if let Some(ref target) = lc.inherit {
+            lang_entries.push((lang.as_str(), target.as_str()));
+        } else if let Some(server_name) = lc.servers.first() {
+            lang_entries.push((lang.as_str(), server_name.as_str()));
+        }
+    }
+    lang_entries.sort_by_key(|(lang, _)| *lang);
+
+    let max_lang_width = lang_entries
+        .iter()
+        .map(|(l, _)| l.len())
+        .max()
+        .unwrap_or(10);
+
+    for (lang, target) in &lang_entries {
+        let lang_display = format!("  {lang:<max_lang_width$}");
+        let is_inherit = config
+            .language
+            .get(*lang)
+            .is_some_and(|lc| lc.inherit.is_some());
+
+        // Check if any files for this language exist (only when roots provided)
+        if let Some(ref det) = detected
+            && !det.contains(*lang)
+        {
+            let arrow = if is_inherit {
+                format!("inherits {target}")
+            } else {
+                format!("→ {target}")
+            };
+            println!(
+                "{}  {}",
+                colors.dim(&lang_display),
+                colors.dim(&format!("{arrow}  - skipped (no matching files)")),
+            );
+            continue;
+        }
+
+        if is_inherit {
+            println!("{lang_display}  inherits {target}");
+        } else {
+            println!("{lang_display}  → {target}");
+            // Show capabilities from the server, indented
+            if let Some(tools) = server_capabilities.get(target)
+                && !tools.is_empty()
+            {
+                println!(
+                    "{}    {}",
+                    " ".repeat(max_lang_width + 2),
+                    colors.dim(&tools.join(" ")),
+                );
+            }
+        }
     }
 
     // Hooks health section
@@ -242,6 +278,125 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     check_grammars(&colors);
 
     Ok(())
+}
+
+/// Check config source files for old-format entries and print migration guidance.
+///
+/// Reads each config file as raw TOML (independent of `Config::load`) to detect:
+/// - `[server.*]` with no `[language.*]` (old deprecated format)
+/// - `[language.*]` entries containing `command`/`args` etc. (intermediate format)
+///
+/// Prints the equivalent new-format config for each detected old entry.
+fn doctor_check_config(colors: &ColorConfig) {
+    let sources = crate::config::config_sources();
+    let mut found_issues = false;
+
+    for source in &sources {
+        let Ok(contents) = std::fs::read_to_string(source) else {
+            continue;
+        };
+        let Ok(raw) = contents.parse::<toml::Value>() else {
+            continue;
+        };
+
+        let has_server = raw.get("server").is_some();
+        let has_language = raw.get("language").is_some();
+
+        // Old deprecated format: [server.*] with command fields and no [language.*]
+        if has_server
+            && !has_language
+            && let Some(table) = raw.get("server").and_then(toml::Value::as_table)
+        {
+            for (key, entry) in table {
+                if let Some(entry_table) = entry.as_table()
+                    && entry_table.contains_key("command")
+                {
+                    found_issues = true;
+                    print_migration(colors, source, key, entry_table, true);
+                }
+            }
+        }
+
+        // Intermediate format: [language.*] entries with inline server fields
+        if let Some(table) = raw.get("language").and_then(toml::Value::as_table) {
+            for (key, entry) in table {
+                if let Some(entry_table) = entry.as_table() {
+                    let has_server_fields = crate::config::SERVER_DEF_KEYS
+                        .iter()
+                        .any(|k| entry_table.contains_key(*k));
+                    if has_server_fields {
+                        found_issues = true;
+                        print_migration(colors, source, key, entry_table, false);
+                    }
+                }
+            }
+        }
+    }
+
+    if found_issues {
+        println!();
+    }
+}
+
+/// Print migration guidance for a single old-format entry.
+fn print_migration(
+    colors: &ColorConfig,
+    source: &Path,
+    key: &str,
+    entry: &toml::map::Map<String, toml::Value>,
+    is_server_section: bool,
+) {
+    let section = if is_server_section {
+        "server"
+    } else {
+        "language"
+    };
+    println!(
+        "{}",
+        colors.yellow(&format!(
+            "⚠  {}: [{section}.{key}] uses old format — migrate to [language.*] + [server.*]:",
+            source.display(),
+        )),
+    );
+
+    // Determine server name from command, falling back to the key
+    let server_name = entry
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .unwrap_or(key);
+
+    // Build old-format display
+    println!();
+    println!("  Old:");
+    println!("    [{section}.{key}]");
+    for (k, v) in entry {
+        println!("    {k} = {v}");
+    }
+
+    // Build new-format display
+    let server_fields: Vec<(&str, &toml::Value)> = crate::config::SERVER_DEF_KEYS
+        .iter()
+        .filter_map(|k| entry.get(*k).map(|v| (*k, v)))
+        .collect();
+    let lang_fields: Vec<(&str, &toml::Value)> = entry
+        .iter()
+        .filter(|(k, _)| !crate::config::SERVER_DEF_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+
+    println!();
+    println!("  New:");
+    println!("    [language.{key}]");
+    println!("    servers = [\"{server_name}\"]");
+    for (k, v) in &lang_fields {
+        println!("    {k} = {v}");
+    }
+    println!();
+    println!("    [server.{server_name}]");
+    for (k, v) in &server_fields {
+        println!("    {k} = {v}");
+    }
+    println!();
 }
 
 /// Checks whether a binary can be found on `$PATH`.
