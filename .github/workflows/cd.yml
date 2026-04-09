@@ -86,8 +86,9 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
-          cargo publish -p catenary-proc
-          cargo publish -p catenary-ts
+          # Subcrates: skip if version already published
+          cargo publish -p catenary-proc || echo "catenary-proc: already published, skipping"
+          cargo publish -p catenary-ts || echo "catenary-ts: already published, skipping"
           # Wait for crates.io index to propagate
           sleep 30
           cargo publish
