@@ -892,45 +892,42 @@ servers = ["tsserver"]
         );
     }
 
-    /// Verify that `apply_env_overrides` creates both a `ServerDef` and a
-    /// `LanguageConfig` for each `CATENARY_SERVERS` spec. We test the
-    /// internal function directly on a default config to avoid `set_var`
-    /// (unsafe in Rust 2024).
     #[test]
-    fn test_env_var_creates_both() {
-        let mut config = Config::default();
+    fn test_parse_server_specs_single() {
+        let results = parse::parse_server_specs("rust:rust-analyzer --log-level info");
+        assert_eq!(results.len(), 1);
 
-        // Simulate what apply_env_overrides does for "rust:rust-analyzer --log-level info"
-        let server_name = "rust".to_string();
-        config.server.insert(
-            server_name.clone(),
-            ServerDef {
-                command: "rust-analyzer".to_string(),
-                args: vec!["--log-level".to_string(), "info".to_string()],
-                initialization_options: None,
-                settings: None,
-            },
-        );
-        config.language.insert(
-            "rust".to_string(),
-            LanguageConfig {
-                servers: vec![server_name],
-                min_severity: None,
-                inherit: None,
-            },
-        );
+        let (lang, server_def, lang_config) = &results[0];
+        assert_eq!(lang, "rust");
+        assert_eq!(server_def.command, "rust-analyzer");
+        assert_eq!(server_def.args, vec!["--log-level", "info"]);
+        assert_eq!(lang_config.servers, vec!["rust"]);
+    }
 
-        // Verify both entries are correct
-        let server = config.server.get("rust").expect("rust server def");
-        assert_eq!(server.command, "rust-analyzer");
-        assert_eq!(server.args, vec!["--log-level", "info"]);
+    #[test]
+    fn test_parse_server_specs_multiple() {
+        let results =
+            parse::parse_server_specs("rust:rust-analyzer;python:pyright --stdio;c:clangd");
+        assert_eq!(results.len(), 3);
 
-        let lang = config.language.get("rust").expect("rust language config");
-        assert_eq!(lang.servers, vec!["rust"]);
+        assert_eq!(results[0].0, "rust");
+        assert_eq!(results[0].1.command, "rust-analyzer");
+        assert!(results[0].1.args.is_empty());
 
-        // Config should validate
-        let errors = config.validate();
-        assert!(errors.is_empty(), "should be valid: {errors:?}");
+        assert_eq!(results[1].0, "python");
+        assert_eq!(results[1].1.command, "pyright");
+        assert_eq!(results[1].1.args, vec!["--stdio"]);
+
+        assert_eq!(results[2].0, "c");
+        assert_eq!(results[2].1.command, "clangd");
+    }
+
+    #[test]
+    fn test_parse_server_specs_empty_and_whitespace() {
+        let results = parse::parse_server_specs("  ; ;rust:ra;  ");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "rust");
+        assert_eq!(results[0].1.command, "ra");
     }
 
     #[test]

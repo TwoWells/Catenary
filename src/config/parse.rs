@@ -193,42 +193,49 @@ pub(super) fn apply_env_overrides(config: &mut Config) {
 
     // CATENARY_SERVERS: semicolon-separated "lang:command args" specs
     if let Ok(val) = std::env::var("CATENARY_SERVERS") {
-        for spec in val.split(';') {
-            let spec = spec.trim();
-            if spec.is_empty() {
-                continue;
-            }
-            if let Some((lang, command_str)) = spec.split_once(':') {
-                let lang = lang.trim();
-                let command_str = command_str.trim();
-                let mut parts = command_str.split_whitespace();
-                if let Some(program) = parts.next() {
-                    let cmd_args: Vec<String> =
-                        parts.map(std::string::ToString::to_string).collect();
+        for (lang, server_def, lang_config) in parse_server_specs(&val) {
+            config.server.insert(lang.clone(), server_def);
+            config.language.insert(lang, lang_config);
+        }
+    }
+}
 
-                    // Use the language key as the server name for env-derived entries
-                    let server_name = lang.to_string();
-                    config.server.insert(
-                        server_name.clone(),
-                        ServerDef {
-                            command: program.to_string(),
-                            args: cmd_args,
-                            initialization_options: None,
-                            settings: None,
-                        },
-                    );
-                    config.language.insert(
-                        lang.to_string(),
-                        LanguageConfig {
-                            servers: vec![server_name],
-                            min_severity: None,
-                            inherit: None,
-                        },
-                    );
-                }
+/// Parse a `CATENARY_SERVERS` value into `(lang, ServerDef, LanguageConfig)` triples.
+///
+/// Format: semicolon-separated `"lang:command args"` specs. The language
+/// key doubles as the server name for env-derived entries.
+pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageConfig)> {
+    let mut results = Vec::new();
+    for spec in val.split(';') {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        if let Some((lang, command_str)) = spec.split_once(':') {
+            let lang = lang.trim();
+            let command_str = command_str.trim();
+            let mut parts = command_str.split_whitespace();
+            if let Some(program) = parts.next() {
+                let cmd_args: Vec<String> = parts.map(std::string::ToString::to_string).collect();
+                let server_name = lang.to_string();
+                results.push((
+                    lang.to_string(),
+                    ServerDef {
+                        command: program.to_string(),
+                        args: cmd_args,
+                        initialization_options: None,
+                        settings: None,
+                    },
+                    LanguageConfig {
+                        servers: vec![server_name],
+                        min_severity: None,
+                        inherit: None,
+                    },
+                ));
             }
         }
     }
+    results
 }
 
 /// Apply default inherit entries for known language variants.
