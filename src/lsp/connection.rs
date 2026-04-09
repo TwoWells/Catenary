@@ -7,8 +7,8 @@ use anyhow::{Context, Result, anyhow};
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -42,7 +42,7 @@ pub struct Connection {
     pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     alive: Arc<AtomicBool>,
     next_id: AtomicI64,
-    server: Arc<LspServer>,
+    server: Weak<LspServer>,
     language: String,
     message_log: Arc<MessageLog>,
     server_name: String,
@@ -62,7 +62,7 @@ impl Connection {
         program: &str,
         args: &[&str],
         stderr: Stdio,
-        server: Arc<LspServer>,
+        server: &Arc<LspServer>,
         language: String,
         message_log: Arc<MessageLog>,
         server_name: &str,
@@ -97,11 +97,13 @@ impl Connection {
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
 
+        let weak_server = Arc::downgrade(server);
+
         let reader_handle = tokio::spawn(Self::reader_loop(
             stdin.clone(),
             pending.clone(),
             alive.clone(),
-            server.clone(),
+            Arc::downgrade(server),
             stdout,
             message_log.clone(),
             server_name.to_string(),
@@ -113,7 +115,7 @@ impl Connection {
             pending,
             alive,
             next_id: AtomicI64::new(1),
-            server,
+            server: weak_server,
             language,
             message_log,
             server_name: server_name.to_string(),
@@ -138,6 +140,11 @@ impl Connection {
         params: serde_json::Value,
         parent_id: Option<i64>,
     ) -> Result<serde_json::Value> {
+        let server = self
+            .server
+            .upgrade()
+            .ok_or_else(|| anyhow!("[{}] server dropped", self.language))?;
+
         // Retry loop for ContentModified errors
         for _attempt in 0..3 {
             let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
@@ -205,7 +212,7 @@ impl Connection {
                                 let delta = d.delta_utime + d.delta_stime;
                                 if d.state == catenary_proc::ProcessState::Running
                                     && delta > 0
-                                    && !self.server.is_progress_active()
+                                    && !server.is_progress_active()
                                 {
                                     budget -= i64::try_from(delta)
                                         .unwrap_or(budget);
@@ -243,7 +250,7 @@ impl Connection {
                 if error.code == -32801 || error.code == -32800 {
                     debug!("LSP request '{}' cancelled/modified, retrying...", method,);
                     tokio::select! {
-                        () = self.server.state_notify().notified() => {}
+                        () = server.state_notify().notified() => {}
                         () = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                     continue;
@@ -341,7 +348,7 @@ impl Connection {
         stdin: Arc<Mutex<ChildStdin>>,
         pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
         alive: Arc<AtomicBool>,
-        server: Arc<LspServer>,
+        server: Weak<LspServer>,
         stdout: tokio::process::ChildStdout,
         message_log: Arc<MessageLog>,
         server_name: String,
@@ -374,6 +381,12 @@ impl Connection {
                         warn!("Failed to parse JSON: {}", e);
                         continue;
                     }
+                };
+
+                // Upgrade weak reference — if LspServer is gone, exit
+                let Some(server) = server.upgrade() else {
+                    debug!("LspServer dropped, reader loop exiting");
+                    break;
                 };
 
                 // Check message type
@@ -483,7 +496,9 @@ impl Connection {
 
         // Mark server as dead and trigger shutdown cleanup
         alive.store(false, Ordering::SeqCst);
-        server.on_shutdown();
+        if let Some(server) = server.upgrade() {
+            server.on_shutdown();
+        }
         warn!("LSP reader task exiting - server connection lost");
     }
 }

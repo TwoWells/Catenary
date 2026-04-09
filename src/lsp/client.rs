@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use super::connection::Connection;
 use super::params;
 use super::server::LspServer;
 use super::state::{ServerLifecycle, ServerStatus};
@@ -53,9 +52,7 @@ const SAFETY_CAP: Duration = Duration::from_secs(300);
 
 /// Manages communication with an LSP server process.
 pub struct LspClient {
-    connection: Connection,
-
-    // Server representation (capabilities, state, dispatch)
+    // Server representation (capabilities, state, dispatch, transport)
     server: Arc<LspServer>,
 
     // Client-local state (not shared with reader)
@@ -131,18 +128,18 @@ impl LspClient {
     ) -> Result<Self> {
         let server = Arc::new(LspServer::new(language.to_string(), settings));
 
-        let connection = Connection::new(
+        let connection = super::connection::Connection::new(
             program,
             args,
             stderr,
-            server.clone(),
+            &server,
             language.to_string(),
             message_log,
             program,
         )?;
+        server.set_connection(connection);
 
         Ok(Self {
-            connection,
             server,
             encoding: "utf-16".to_string(), // Default per spec
             spawn_time: Instant::now(),
@@ -162,7 +159,7 @@ impl LspClient {
     /// deltas since the last sample. Returns `None` if the process is gone
     /// or monitoring is unavailable.
     fn sample_monitor(&self) -> Option<catenary_proc::ProcessDelta> {
-        self.connection.sample_monitor()
+        self.server.sample_monitor()
     }
 
     /// Returns whether the server has active `$/progress` tokens.
@@ -192,17 +189,15 @@ impl LspClient {
 
     /// Sends a request and waits for the response.
     ///
-    /// Delegates to [`Connection::request`] for transport and failure
+    /// Delegates to [`LspServer::request`] for transport and failure
     /// detection, returning the raw JSON response.
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.connection
-            .request(method, params, self.parent_id)
-            .await
+        self.server.request(method, params, self.parent_id).await
     }
 
     /// Sends a notification (no response expected).
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        self.connection.notify(method, params, self.parent_id).await
+        self.server.notify(method, params, self.parent_id).await
     }
 
     /// Performs the LSP initialize handshake.
@@ -814,7 +809,7 @@ impl LspClient {
     /// Returns the PID of the server process, if available.
     #[allow(dead_code, reason = "Used by diagnostics tests and session status")]
     pub(crate) fn pid(&self) -> Option<u32> {
-        self.connection.pid()
+        self.server.pid()
     }
 
     /// Waits for fresh diagnostics after a file change, using the
@@ -942,9 +937,12 @@ impl LspClient {
                 }
             }
             DiagnosticsStrategy::TokenMonitor => {
+                let Some(alive_flag) = self.server.alive_flag() else {
+                    return DiagnosticsWaitResult::Nothing;
+                };
                 let mut monitor = super::diagnostics::TokenMonitor::new(
                     self.server.lifecycle.clone(),
-                    self.connection.alive_flag(),
+                    alive_flag,
                 );
                 let mut ever_active = false;
 
@@ -1054,7 +1052,7 @@ impl LspClient {
 
     /// Returns whether the LSP server process is still running.
     pub fn is_alive(&self) -> bool {
-        self.connection.is_alive()
+        self.server.is_alive()
     }
 
     /// Returns the current server lifecycle state.

@@ -9,6 +9,7 @@
 //! handshake. Notification dispatch (`on_notification`, `on_request`,
 //! `on_shutdown`) updates diagnostics cache, progress, and server state.
 
+use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,7 @@ use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
 
 use super::client::DiagnosticsCache;
+use super::connection::Connection;
 use super::extract;
 use super::protocol::RpcError;
 use super::state::{ProgressTracker, ServerLifecycle};
@@ -79,6 +81,9 @@ pub struct LspServer {
 
     // ── Configuration ─────────────────────────────────────────────
     settings: Option<Value>,
+
+    // ── Transport ───────────────────────────────────────────────
+    connection: OnceLock<Connection>,
 }
 
 impl LspServer {
@@ -115,6 +120,7 @@ impl LspServer {
             publishes_version: Arc::new(AtomicBool::new(false)),
             language,
             settings,
+            connection: OnceLock::new(),
         }
     }
 
@@ -294,6 +300,75 @@ impl LspServer {
         *lifecycle = state;
         drop(lifecycle);
         self.state_notify.notify_waiters();
+    }
+
+    // ── Transport ────────────────────────────────────────────────
+
+    /// Sets the connection after two-phase construction.
+    ///
+    /// Called once after `Connection::new()` with the `Arc<LspServer>`
+    /// already wrapped. Subsequent calls are no-ops.
+    pub fn set_connection(&self, connection: Connection) {
+        let _ = self.connection.set(connection);
+    }
+
+    /// Returns a reference to the connection, if set.
+    fn connection(&self) -> Option<&Connection> {
+        self.connection.get()
+    }
+
+    /// Sends a request and waits for the response.
+    ///
+    /// Delegates to [`Connection::request`] for transport and failure
+    /// detection. Returns an error if the connection has not been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is not established or the
+    /// request fails.
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        parent_id: Option<i64>,
+    ) -> Result<Value> {
+        self.connection()
+            .ok_or_else(|| anyhow::anyhow!("connection not established"))?
+            .request(method, params, parent_id)
+            .await
+    }
+
+    /// Sends a notification (no response expected).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is not established or the
+    /// notification fails.
+    pub async fn notify(&self, method: &str, params: Value, parent_id: Option<i64>) -> Result<()> {
+        self.connection()
+            .ok_or_else(|| anyhow::anyhow!("connection not established"))?
+            .notify(method, params, parent_id)
+            .await
+    }
+
+    /// Returns whether the server process is alive.
+    pub fn is_alive(&self) -> bool {
+        self.connection().is_some_and(Connection::is_alive)
+    }
+
+    /// Returns the PID of the server process.
+    pub fn pid(&self) -> Option<u32> {
+        self.connection().and_then(Connection::pid)
+    }
+
+    /// Samples the process monitor for CPU-tick failure detection.
+    pub fn sample_monitor(&self) -> Option<catenary_proc::ProcessDelta> {
+        self.connection()?.sample_monitor()
+    }
+
+    /// Returns a shared reference to the alive flag.
+    pub fn alive_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.connection().map(Connection::alive_flag)
     }
 
     // ── Dispatch methods (moved from ServerInbox) ─────────────────
