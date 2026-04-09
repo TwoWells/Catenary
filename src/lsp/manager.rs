@@ -542,6 +542,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             language: HashMap::new(),
+            server: HashMap::new(),
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
@@ -578,6 +579,7 @@ mod tests {
         );
         Config {
             language,
+            server: HashMap::new(),
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
@@ -602,6 +604,7 @@ mod tests {
         );
         Config {
             language,
+            server: HashMap::new(),
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
@@ -763,6 +766,7 @@ mod tests {
         );
         let config = Config {
             language,
+            server: HashMap::new(),
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
