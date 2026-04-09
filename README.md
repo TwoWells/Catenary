@@ -3,7 +3,7 @@
 [![CI](https://github.com/TwoWells/Catenary/actions/workflows/ci.yml/badge.svg)](https://github.com/TwoWells/Catenary/actions/workflows/ci.yml)
 [![CD](https://github.com/TwoWells/Catenary/actions/workflows/cd.yml/badge.svg)](https://github.com/TwoWells/Catenary/actions/workflows/cd.yml)
 
-**Stop wasting context on redundant file reads.**
+## Stop wasting context on redundant file reads.
 
 AI coding agents are smart. The bottleneck isn't intelligence — it's I/O.
 Every file an agent reads goes into an append-only context window. Every edit
