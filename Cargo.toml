@@ -3,7 +3,7 @@ members = ["crates/catenary-proc", "crates/catenary-ts"]
 
 [package]
 name = "catenary-mcp"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 default-run = "catenary"
