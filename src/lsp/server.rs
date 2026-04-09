@@ -21,13 +21,29 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// handshake completes. Shared via `Arc<LspServer>` between
 /// [`super::LspClient`] and `ServerInbox`. All runtime fields use
 /// interior mutability so readers never need a lock.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent capability flags from LSP init"
+)]
 pub struct LspServer {
     /// Raw server capabilities from the `initialize` response.
     /// Set once via [`Self::set_capabilities`].
     capabilities: OnceLock<Value>,
 
     // ── Init-time capability flags (set once via set_capabilities) ──
-    capability_flags: OnceLock<CapabilityFlags>,
+    supports_pull_diagnostics: OnceLock<bool>,
+    supports_hover: OnceLock<bool>,
+    supports_definition: OnceLock<bool>,
+    supports_references: OnceLock<bool>,
+    supports_document_symbols: OnceLock<bool>,
+    supports_workspace_symbols: OnceLock<bool>,
+    supports_workspace_symbol_resolve: OnceLock<bool>,
+    supports_rename: OnceLock<bool>,
+    supports_type_definition: OnceLock<bool>,
+    supports_implementation: OnceLock<bool>,
+    supports_call_hierarchy: OnceLock<bool>,
+    supports_type_hierarchy: OnceLock<bool>,
+    supports_code_action: OnceLock<bool>,
 
     /// Set on first `$/progress` begin.
     sends_progress: OnceLock<()>,
@@ -35,78 +51,6 @@ pub struct LspServer {
     /// Count of in-flight progress tokens (begin increments, end decrements).
     in_progress_count: AtomicU32,
 }
-
-/// Capability flags extracted from the `initialize` response.
-///
-/// All fields are immutable after construction.
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent capability flags from LSP init"
-)]
-struct CapabilityFlags {
-    supports_pull_diagnostics: bool,
-    supports_hover: bool,
-    supports_definition: bool,
-    supports_references: bool,
-    supports_document_symbols: bool,
-    supports_workspace_symbols: bool,
-    supports_workspace_symbol_resolve: bool,
-    supports_rename: bool,
-    supports_type_definition: bool,
-    supports_implementation: bool,
-    supports_call_hierarchy: bool,
-    supports_type_hierarchy: bool,
-    supports_code_action: bool,
-}
-
-impl CapabilityFlags {
-    /// Extracts capability flags from the raw `initialize` response capabilities.
-    fn from_capabilities(capabilities: &Value) -> Self {
-        // LSP capabilities are `boolean | Options`. `true` or an options
-        // object means supported; `false`, `null`, or absent means not.
-        let has = |key: &str| {
-            capabilities
-                .get(key)
-                .is_some_and(|v| v.as_bool() != Some(false) && !v.is_null())
-        };
-        Self {
-            supports_pull_diagnostics: has("diagnosticProvider"),
-            supports_hover: has("hoverProvider"),
-            supports_definition: has("definitionProvider"),
-            supports_references: has("referencesProvider"),
-            supports_document_symbols: has("documentSymbolProvider"),
-            supports_workspace_symbols: has("workspaceSymbolProvider"),
-            supports_workspace_symbol_resolve: capabilities
-                .get("workspaceSymbolProvider")
-                .and_then(|v| v.get("resolveProvider"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            supports_rename: has("renameProvider"),
-            supports_type_definition: has("typeDefinitionProvider"),
-            supports_implementation: has("implementationProvider"),
-            supports_call_hierarchy: has("callHierarchyProvider"),
-            supports_type_hierarchy: has("typeHierarchyProvider"),
-            supports_code_action: has("codeActionProvider"),
-        }
-    }
-}
-
-/// Default flags: nothing supported.
-const NO_CAPABILITIES: CapabilityFlags = CapabilityFlags {
-    supports_pull_diagnostics: false,
-    supports_hover: false,
-    supports_definition: false,
-    supports_references: false,
-    supports_document_symbols: false,
-    supports_workspace_symbols: false,
-    supports_workspace_symbol_resolve: false,
-    supports_rename: false,
-    supports_type_definition: false,
-    supports_implementation: false,
-    supports_call_hierarchy: false,
-    supports_type_hierarchy: false,
-    supports_code_action: false,
-};
 
 impl Default for LspServer {
     fn default() -> Self {
@@ -123,7 +67,19 @@ impl LspServer {
     pub const fn new() -> Self {
         Self {
             capabilities: OnceLock::new(),
-            capability_flags: OnceLock::new(),
+            supports_pull_diagnostics: OnceLock::new(),
+            supports_hover: OnceLock::new(),
+            supports_definition: OnceLock::new(),
+            supports_references: OnceLock::new(),
+            supports_document_symbols: OnceLock::new(),
+            supports_workspace_symbols: OnceLock::new(),
+            supports_workspace_symbol_resolve: OnceLock::new(),
+            supports_rename: OnceLock::new(),
+            supports_type_definition: OnceLock::new(),
+            supports_implementation: OnceLock::new(),
+            supports_call_hierarchy: OnceLock::new(),
+            supports_type_hierarchy: OnceLock::new(),
+            supports_code_action: OnceLock::new(),
             sends_progress: OnceLock::new(),
             in_progress_count: AtomicU32::new(0),
         }
@@ -134,9 +90,47 @@ impl LspServer {
     /// Extracts all capability flags and stores the raw capabilities.
     /// Subsequent calls are no-ops (the `OnceLock` ignores them).
     pub fn set_capabilities(&self, capabilities: Value) {
-        let flags = CapabilityFlags::from_capabilities(&capabilities);
+        // LSP capabilities are `boolean | Options`. `true` or an options
+        // object means supported; `false`, `null`, or absent means not.
+        let has = |key: &str| {
+            capabilities
+                .get(key)
+                .is_some_and(|v| v.as_bool() != Some(false) && !v.is_null())
+        };
+        let _ = self
+            .supports_pull_diagnostics
+            .set(has("diagnosticProvider"));
+        let _ = self.supports_hover.set(has("hoverProvider"));
+        let _ = self.supports_definition.set(has("definitionProvider"));
+        let _ = self.supports_references.set(has("referencesProvider"));
+        let _ = self
+            .supports_document_symbols
+            .set(has("documentSymbolProvider"));
+        let _ = self
+            .supports_workspace_symbols
+            .set(has("workspaceSymbolProvider"));
+        let _ = self.supports_workspace_symbol_resolve.set(
+            capabilities
+                .get("workspaceSymbolProvider")
+                .and_then(|v| v.get("resolveProvider"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        );
+        let _ = self.supports_rename.set(has("renameProvider"));
+        let _ = self
+            .supports_type_definition
+            .set(has("typeDefinitionProvider"));
+        let _ = self
+            .supports_implementation
+            .set(has("implementationProvider"));
+        let _ = self
+            .supports_call_hierarchy
+            .set(has("callHierarchyProvider"));
+        let _ = self
+            .supports_type_hierarchy
+            .set(has("typeHierarchyProvider"));
+        let _ = self.supports_code_action.set(has("codeActionProvider"));
         let _ = self.capabilities.set(capabilities);
-        let _ = self.capability_flags.set(flags);
     }
 
     /// Returns the raw server capabilities.
@@ -149,74 +143,84 @@ impl LspServer {
             .unwrap_or_else(|| EMPTY.get_or_init(|| Value::Object(serde_json::Map::new())))
     }
 
-    /// Returns the capability flags, defaulting to none before init.
-    fn flags(&self) -> &CapabilityFlags {
-        self.capability_flags.get().unwrap_or(&NO_CAPABILITIES)
-    }
-
     /// Returns whether the server advertises `diagnosticProvider` (pull model).
     pub fn supports_pull_diagnostics(&self) -> bool {
-        self.flags().supports_pull_diagnostics
+        self.supports_pull_diagnostics
+            .get()
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Returns whether the server advertises `hoverProvider`.
     pub fn supports_hover(&self) -> bool {
-        self.flags().supports_hover
+        self.supports_hover.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `definitionProvider`.
     pub fn supports_definition(&self) -> bool {
-        self.flags().supports_definition
+        self.supports_definition.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `referencesProvider`.
     pub fn supports_references(&self) -> bool {
-        self.flags().supports_references
+        self.supports_references.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `documentSymbolProvider`.
     pub fn supports_document_symbols(&self) -> bool {
-        self.flags().supports_document_symbols
+        self.supports_document_symbols
+            .get()
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Returns whether the server advertises `workspaceSymbolProvider`.
     pub fn supports_workspace_symbols(&self) -> bool {
-        self.flags().supports_workspace_symbols
+        self.supports_workspace_symbols
+            .get()
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Returns whether the server advertises `workspaceSymbolProvider.resolveProvider`.
     pub fn supports_workspace_symbol_resolve(&self) -> bool {
-        self.flags().supports_workspace_symbol_resolve
+        self.supports_workspace_symbol_resolve
+            .get()
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Returns whether the server advertises `renameProvider`.
     pub fn supports_rename(&self) -> bool {
-        self.flags().supports_rename
+        self.supports_rename.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `typeDefinitionProvider`.
     pub fn supports_type_definition(&self) -> bool {
-        self.flags().supports_type_definition
+        self.supports_type_definition
+            .get()
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Returns whether the server advertises `implementationProvider`.
     pub fn supports_implementation(&self) -> bool {
-        self.flags().supports_implementation
+        self.supports_implementation.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `callHierarchyProvider`.
     pub fn supports_call_hierarchy(&self) -> bool {
-        self.flags().supports_call_hierarchy
+        self.supports_call_hierarchy.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `typeHierarchyProvider`.
     pub fn supports_type_hierarchy(&self) -> bool {
-        self.flags().supports_type_hierarchy
+        self.supports_type_hierarchy.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `codeActionProvider`.
     pub fn supports_code_action(&self) -> bool {
-        self.flags().supports_code_action
+        self.supports_code_action.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server has ever sent a `$/progress` begin.
