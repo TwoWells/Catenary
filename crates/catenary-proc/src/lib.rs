@@ -530,12 +530,13 @@ mod platform {
     /// # Safety
     ///
     /// Calls `libc::proc_pidinfo` (`PROC_PIDTASKINFO`) and
-    /// `libc::mach_timebase_info` with correctly sized and zeroed buffers.
+    /// `mach2::mach_time::mach_timebase_info` with correctly sized and zeroed
+    /// buffers.
     unsafe fn sample_task_inner(pid: u32) -> Option<(u64, u64, u64, ProcessState)> {
-        let (info, state) = read_task_info(pid)?;
+        let (info, state) = unsafe { read_task_info(pid) }?;
 
-        let mut timebase = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
-        libc::mach_timebase_info(&mut timebase);
+        let mut timebase = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
+        unsafe { mach2::mach_time::mach_timebase_info(&mut timebase) };
 
         let numer = u64::from(timebase.numer);
         let denom = u64::from(timebase.denom);
@@ -563,19 +564,21 @@ mod platform {
     /// `PROC_PIDTBSDINFO`) and `libc::mach_timebase_info` with correctly
     /// sized and zeroed buffers.
     unsafe fn sample_raw_inner(pid: u32) -> Option<(u64, u64, u64, u32, ProcessState)> {
-        let (utime, stime, pfc, state) = sample_task_inner(pid)?;
+        let (utime, stime, pfc, state) = unsafe { sample_task_inner(pid) }?;
 
         // BSD info for parent PID
-        let mut bsd_info: libc::proc_bsdinfo = std::mem::zeroed();
+        let mut bsd_info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let bsd_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
 
-        let bsd_ret = libc::proc_pidinfo(
-            i32::try_from(pid).ok()?,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            std::ptr::addr_of_mut!(bsd_info).cast(),
-            bsd_size,
-        );
+        let bsd_ret = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::addr_of_mut!(bsd_info).cast(),
+                bsd_size,
+            )
+        };
         let ppid = if bsd_ret > 0 { bsd_info.pbi_ppid } else { 0 };
 
         Some((utime, stime, pfc, ppid, state))
@@ -588,16 +591,18 @@ mod platform {
     /// Calls `libc::proc_pidinfo` with `PROC_PIDTASKINFO` and a correctly
     /// sized and zeroed buffer.
     unsafe fn read_task_info(pid: u32) -> Option<(libc::proc_taskinfo, ProcessState)> {
-        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
 
-        let ret = libc::proc_pidinfo(
-            i32::try_from(pid).ok()?,
-            libc::PROC_PIDTASKINFO,
-            0,
-            std::ptr::addr_of_mut!(info).cast(),
-            size,
-        );
+        let ret = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDTASKINFO,
+                0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size,
+            )
+        };
 
         if ret <= 0 {
             return None;

@@ -1,6 +1,6 @@
 [package]
 name = "catenary-proc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Single-process CPU sampling for tick-budget diagnostics waits"
@@ -34,6 +34,9 @@ missing_safety_doc = "warn"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
