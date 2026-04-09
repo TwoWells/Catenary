@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -15,7 +15,7 @@ use tracing::{debug, info};
 use super::connection::Connection;
 use super::params;
 use super::server::LspServer;
-use super::state::{ServerState, ServerStatus};
+use super::state::{ServerLifecycle, ServerStatus};
 use super::wait::load_aware_grace;
 use crate::session::MessageLog;
 
@@ -39,17 +39,11 @@ pub enum DiagnosticsWaitResult {
     Nothing,
 }
 
-/// Time after spawn during which we consider the server to be "warming up".
-pub const WARMUP_PERIOD: Duration = Duration::from_secs(10);
-
 /// CPU tick threshold for diagnostics wait: 1000 ticks = 10 CPU-seconds.
 const DIAGNOSTICS_THRESHOLD: u64 = 1000;
 
 /// CPU tick threshold for preamble windows (grace, discovery, progress grace).
 const PREAMBLE_THRESHOLD: u64 = 500;
-
-/// CPU tick threshold for `wait_ready`: 1000 ticks = 10 CPU-seconds.
-const READY_THRESHOLD: u64 = 1000;
 
 /// Poll interval for diagnostics wait main loops.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -173,10 +167,9 @@ impl LspClient {
 
     /// Returns whether the server has active `$/progress` tokens.
     ///
-    /// Checks the actual progress tracker instead of using `ServerState`
-    /// as a proxy. `ServerState::Busy` can be set proactively (e.g., after
-    /// `workspace/didChangeWorkspaceFolders`) without actual `$/progress`
-    /// tokens, which would prevent the failure threshold from draining.
+    /// Checks the actual progress tracker rather than lifecycle state,
+    /// because the failure detection budget should only pause for
+    /// explained work backed by real progress tokens.
     fn progress_active(&self) -> bool {
         self.server.is_progress_active()
     }
@@ -299,10 +292,10 @@ impl LspClient {
         )
         .await?;
 
-        // Mark as ready (server may later report progress if indexing)
-        self.server
-            .state
-            .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
+        // Mark as healthy (server may later report progress if indexing).
+        // Health probe (1b-07) will add a Probing → Healthy transition;
+        // until then, go directly to Healthy.
+        self.server.set_lifecycle(ServerLifecycle::Healthy);
 
         Ok(raw)
     }
@@ -396,10 +389,6 @@ impl LspClient {
 
     /// Notifies the LSP server that workspace folders changed.
     ///
-    /// When folders are added, proactively marks the server as
-    /// [`ServerState::Busy`] so that [`wait_ready`](Self::wait_ready)
-    /// blocks queries until the server is ready again.
-    ///
     /// # Errors
     ///
     /// Returns an error if the notification fails.
@@ -408,12 +397,6 @@ impl LspClient {
         added: &[(&str, &str)],
         removed: &[(&str, &str)],
     ) -> Result<()> {
-        if !added.is_empty() && self.server_state() == ServerState::Ready {
-            self.server
-                .state
-                .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
-        }
-
         self.notify(
             "workspace/didChangeWorkspaceFolders",
             params::did_change_workspace_folders(added, removed),
@@ -807,11 +790,10 @@ impl LspClient {
         if self.server.publishes_version.load(Ordering::SeqCst) || self.server.sends_progress() {
             return true;
         }
-        // Log once when we determine the server lacks support (after warmup)
-        if !self.is_warming_up()
-            && !self
-                .logged_no_diagnostics_support
-                .swap(true, Ordering::SeqCst)
+        // Log once when we determine the server lacks support
+        if !self
+            .logged_no_diagnostics_support
+            .swap(true, Ordering::SeqCst)
         {
             info!(
                 "[{}] server lacks version/progress support \u{2014} diagnostics disabled",
@@ -961,7 +943,7 @@ impl LspClient {
             }
             DiagnosticsStrategy::TokenMonitor => {
                 let mut monitor = super::diagnostics::TokenMonitor::new(
-                    self.server.state.clone(),
+                    self.server.lifecycle.clone(),
                     self.connection.alive_flag(),
                 );
                 let mut ever_active = false;
@@ -1075,44 +1057,14 @@ impl LspClient {
         self.connection.is_alive()
     }
 
-    /// Returns the current server state.
-    pub fn server_state(&self) -> ServerState {
-        ServerState::from_u8(self.server.state.load(Ordering::SeqCst))
+    /// Returns the current server lifecycle state.
+    pub fn lifecycle(&self) -> ServerLifecycle {
+        self.server.lifecycle()
     }
 
     /// Returns time since server spawned.
     pub fn uptime(&self) -> Duration {
         self.spawn_time.elapsed()
-    }
-
-    /// Returns true if server is in warmup period (recently spawned).
-    pub fn is_warming_up(&self) -> bool {
-        self.spawn_time.elapsed() < WARMUP_PERIOD
-    }
-
-    /// Returns true if server is ready to handle requests.
-    ///
-    /// Checks `ServerState::Ready` and confirms the process is idle
-    /// via `ProcessMonitor`. A server that is Ready and Sleeping has
-    /// finished initialization and is waiting for requests.
-    ///
-    /// During warmup (first 3 seconds), requires the process to be
-    /// Sleeping to avoid premature readiness before indexing starts.
-    /// After warmup, Ready state alone is sufficient.
-    pub fn is_ready(&self) -> bool {
-        if self.server_state() != ServerState::Ready || !self.is_alive() {
-            return false;
-        }
-
-        // During warmup, verify the server is actually idle
-        if self.spawn_time.elapsed() < Duration::from_secs(3) {
-            let Some(d) = self.sample_monitor() else {
-                return false;
-            };
-            return d.state == catenary_proc::ProcessState::Sleeping;
-        }
-
-        true
     }
 
     /// Returns detailed status for this server.
@@ -1133,7 +1085,7 @@ impl LspClient {
 
         ServerStatus {
             language,
-            state: self.server_state(),
+            state: self.lifecycle(),
             progress_title: title,
             progress_message: message,
             progress_percentage: percentage,
@@ -1141,112 +1093,23 @@ impl LspClient {
         }
     }
 
-    /// Waits until server is ready (not indexing).
+    /// Waits until server is healthy (not initializing or busy).
     ///
-    /// Uses load-aware failure detection instead of wall-clock timeouts.
-    /// For servers with `$/progress`, wakes on progress state transitions.
-    /// The failure threshold only counts unexplained CPU consumption.
+    /// Watches the lifecycle enum — wakes on every lifecycle transition.
+    /// No budget, no tick counting, no process sampling. Servers that
+    /// pass health are waited for patiently. `Connection::request`
+    /// catches individual stuck requests with its own failure detection.
     ///
-    /// For non-progress servers that get set to `Busy` (e.g. after a
-    /// workspace folder change), detects activity settle: if the server is
-    /// `Busy`, `Sleeping`, and has flat ticks for consecutive samples,
-    /// it has finished processing the notification and is transitioned back
-    /// to `Ready`.
-    ///
-    /// Returns `true` if ready, `false` if server died or is stuck.
+    /// Returns `true` if healthy, `false` if server failed or died.
     pub async fn wait_ready(&self) -> bool {
-        /// Consecutive flat+sleeping samples required to settle back to Ready.
-        const SETTLE_SAMPLES: u32 = 3;
-
-        // Stuck servers have already exhausted patience — don't wait again.
-        // Take an opportunistic sample to keep the baseline fresh for
-        // try_idle_recover() on the next check_server_health() call.
-        if self.server_state() == ServerState::Stuck {
-            let _ = self.sample_monitor();
-            return false;
+        loop {
+            let lifecycle = self.server.lifecycle();
+            match lifecycle {
+                ServerLifecycle::Healthy => return true,
+                ServerLifecycle::Failed | ServerLifecycle::Dead => return false,
+                _ => {} // Initializing, Probing, Busy — keep waiting
+            }
+            self.server.state_notify.notified().await;
         }
-
-        let flat_count = AtomicU32::new(0);
-
-        let ready = load_aware_grace(
-            &mut || self.sample_monitor(),
-            READY_THRESHOLD,
-            None, // Use default 5-minute safety cap
-            &self.server.state_notify,
-            || self.progress_active(),
-            || async {
-                if self.is_ready() {
-                    return true;
-                }
-
-                // Activity settle for non-progress servers: if state is
-                // Busy and the process is sleeping with flat ticks,
-                // the server accepted the notification and went idle.
-                if self.server_state() == ServerState::Busy && self.is_alive() {
-                    if let Some(d) = self.sample_monitor() {
-                        if d.state == catenary_proc::ProcessState::Sleeping
-                            && d.delta_utime + d.delta_stime == 0
-                        {
-                            let count = flat_count.fetch_add(1, Ordering::SeqCst) + 1;
-                            if count >= SETTLE_SAMPLES {
-                                tracing::debug!(
-                                    "wait_ready: activity settle — non-progress server \
-                                     idle for {count} samples, transitioning to Ready"
-                                );
-                                self.server
-                                    .state
-                                    .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-                                self.server.state_notify.notify_waiters();
-                                return true;
-                            }
-                        } else {
-                            flat_count.store(0, Ordering::SeqCst);
-                        }
-                    }
-                } else {
-                    flat_count.store(0, Ordering::SeqCst);
-                }
-
-                false
-            },
-        )
-        .await;
-
-        // Patience exhausted but process is still alive — mark as stuck
-        // so future calls skip the full wait.
-        if !ready && self.is_alive() {
-            debug!("wait_ready: patience exhausted, server still alive — marking as Stuck");
-            self.server
-                .state
-                .store(ServerState::Stuck.as_u8(), Ordering::SeqCst);
-            self.server.state_notify.notify_waiters();
-        }
-
-        ready
-    }
-
-    /// Lightweight idle probe for `Stuck` servers.
-    ///
-    /// If the server is `Stuck`, alive, and the process is sleeping with
-    /// flat CPU ticks, transitions to `Ready` and returns `true`.
-    /// Returns `false` in all other cases. Costs one process sample (~1ms).
-    pub fn try_idle_recover(&self) -> bool {
-        if self.server_state() != ServerState::Stuck || !self.is_alive() {
-            return false;
-        }
-
-        if let Some(d) = self.sample_monitor()
-            && d.state == catenary_proc::ProcessState::Sleeping
-            && d.delta_utime + d.delta_stime == 0
-        {
-            debug!("try_idle_recover: stuck server is idle — transitioning to Ready");
-            self.server
-                .state
-                .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-            self.server.state_notify.notify_waiters();
-            return true;
-        }
-
-        false
     }
 }

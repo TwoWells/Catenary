@@ -106,7 +106,8 @@ fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
     // During this time the LSP is running but has no open files,
     // so it never publishes diagnostics. After warmup expires,
     // has_published_diagnostics is still false.
-    std::thread::sleep(catenary_mcp::lsp::WARMUP_PERIOD + Duration::from_secs(1));
+    // Wait long enough that the server is past any early-spawn window.
+    std::thread::sleep(Duration::from_secs(11));
 
     // 5. Request diagnostics via the notify socket.
     //

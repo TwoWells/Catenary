@@ -25,45 +25,50 @@ pub struct ProgressState {
     pub started: Instant,
 }
 
-/// Overall server readiness state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServerState {
-    /// Server just spawned, may be initializing.
+/// Server lifecycle state.
+///
+/// A single enum that tracks the server from spawn through shutdown.
+/// Carries data where needed (`Busy` holds the in-flight progress count).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerLifecycle {
+    /// Spawned, init handshake not complete.
     Initializing,
-    /// Server is busy (processing progress, workspace changes, etc.).
-    Busy,
-    /// Server ready to handle requests.
-    Ready,
-    /// Server connection lost.
+    /// Init complete, server unproven. Diagnostics path blocks,
+    /// tool requests proceed (self-testing).
+    Probing,
+    /// Proven healthy, idle, accepts requests.
+    Healthy,
+    /// Server declared active via progress tokens. Carries
+    /// `in_progress_count` (always >= 1).
+    Busy(u32),
+    /// Health probe failed or init error. Shut down.
+    Failed,
+    /// Connection lost / process died.
     Dead,
-    /// Server exhausted patience threshold but process is still alive.
-    Stuck,
 }
 
-impl ServerState {
-    /// Create from atomic u8 value.
+impl ServerLifecycle {
+    /// Returns whether the server is in a terminal state.
     #[must_use]
-    pub const fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Initializing,
-            1 => Self::Busy,
-            2 => Self::Ready,
-            4 => Self::Stuck,
-            _ => Self::Dead,
-        }
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Failed | Self::Dead)
     }
 
-    /// Convert to atomic u8 value.
+    /// Returns the display state string for TUI/CLI.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn display_state(&self) -> &str {
         match self {
-            Self::Initializing => 0,
-            Self::Busy => 1,
-            Self::Ready => 2,
-            Self::Dead => 3,
-            Self::Stuck => 4,
+            Self::Initializing | Self::Probing => "initializing",
+            Self::Healthy => "ready",
+            Self::Busy(_) => "busy",
+            Self::Failed | Self::Dead => "dead",
         }
+    }
+}
+
+impl Serialize for ServerLifecycle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.display_state())
     }
 }
 
@@ -72,8 +77,8 @@ impl ServerState {
 pub struct ServerStatus {
     /// The language ID this server handles.
     pub language: String,
-    /// Current server readiness state.
-    pub state: ServerState,
+    /// Current server lifecycle state.
+    pub state: ServerLifecycle,
     /// Active progress title, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_title: Option<String>,
@@ -267,18 +272,38 @@ mod tests {
     }
 
     #[test]
-    fn test_server_state_conversion() {
-        assert_eq!(ServerState::from_u8(0), ServerState::Initializing);
-        assert_eq!(ServerState::from_u8(1), ServerState::Busy);
-        assert_eq!(ServerState::from_u8(2), ServerState::Ready);
-        assert_eq!(ServerState::from_u8(3), ServerState::Dead);
-        assert_eq!(ServerState::from_u8(4), ServerState::Stuck);
-        assert_eq!(ServerState::from_u8(99), ServerState::Dead);
+    fn lifecycle_display_state() {
+        assert_eq!(
+            ServerLifecycle::Initializing.display_state(),
+            "initializing"
+        );
+        assert_eq!(ServerLifecycle::Probing.display_state(), "initializing");
+        assert_eq!(ServerLifecycle::Healthy.display_state(), "ready");
+        assert_eq!(ServerLifecycle::Busy(1).display_state(), "busy");
+        assert_eq!(ServerLifecycle::Busy(3).display_state(), "busy");
+        assert_eq!(ServerLifecycle::Failed.display_state(), "dead");
+        assert_eq!(ServerLifecycle::Dead.display_state(), "dead");
+    }
 
-        assert_eq!(ServerState::Initializing.as_u8(), 0);
-        assert_eq!(ServerState::Busy.as_u8(), 1);
-        assert_eq!(ServerState::Ready.as_u8(), 2);
-        assert_eq!(ServerState::Dead.as_u8(), 3);
-        assert_eq!(ServerState::Stuck.as_u8(), 4);
+    #[test]
+    fn lifecycle_is_terminal() {
+        assert!(!ServerLifecycle::Initializing.is_terminal());
+        assert!(!ServerLifecycle::Probing.is_terminal());
+        assert!(!ServerLifecycle::Healthy.is_terminal());
+        assert!(!ServerLifecycle::Busy(1).is_terminal());
+        assert!(ServerLifecycle::Failed.is_terminal());
+        assert!(ServerLifecycle::Dead.is_terminal());
+    }
+
+    #[test]
+    fn lifecycle_serializes_to_display_state() {
+        let json = serde_json::to_string(&ServerLifecycle::Healthy).expect("serialize");
+        assert_eq!(json, "\"ready\"");
+
+        let json = serde_json::to_string(&ServerLifecycle::Busy(2)).expect("serialize");
+        assert_eq!(json, "\"busy\"");
+
+        let json = serde_json::to_string(&ServerLifecycle::Dead).expect("serialize");
+        assert_eq!(json, "\"dead\"");
     }
 }

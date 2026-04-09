@@ -26,8 +26,7 @@ pub(crate) mod types;
 /// Unified wait infrastructure for load-aware failure detection.
 pub(crate) mod wait;
 
-pub use client::DiagnosticsWaitResult;
-pub use client::{LspClient, WARMUP_PERIOD};
+pub use client::{DiagnosticsWaitResult, LspClient};
 pub use manager::LspClientManager;
 pub use server::LspServer;
-pub use state::{ProgressTracker, ServerState, ServerStatus};
+pub use state::{ProgressTracker, ServerLifecycle, ServerStatus};

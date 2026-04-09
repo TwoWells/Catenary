@@ -347,14 +347,8 @@ async fn reader_loop(
                     .get("value")
                     .and_then(|v| v.get("kind"))
                     .and_then(Value::as_str);
-                match kind {
-                    Some("begin") => {
-                        server.on_progress_begin();
-                    }
-                    Some("end") => {
-                        server.on_progress_end();
-                    }
-                    _ => {}
+                if matches!(kind, Some("begin" | "end")) {
+                    server.on_notification("$/progress", params);
                 }
             }
             Some("window/workDoneProgress/create") if has_id => {

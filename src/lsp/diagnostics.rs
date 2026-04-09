@@ -49,13 +49,15 @@ pub trait ProgressMonitor {
     fn poll(&mut self) -> ActivityState;
 }
 
-/// Monitors server activity via `$/progress` token state.
+/// Monitors server activity via lifecycle state.
 ///
-/// Reads the server's state atomic to determine whether any progress
-/// tokens are active. No timeout — the signal is authoritative.
+/// Reads the server's lifecycle mutex to determine whether the server
+/// is busy. No timeout — the signal is authoritative.
+///
+/// Note: Old wait machinery — deleted in 1b-08.
 pub struct TokenMonitor {
-    /// Server state atomic (0=Initializing, 1=Busy, 2=Ready, 3=Dead).
-    state: Arc<std::sync::atomic::AtomicU8>,
+    /// Server lifecycle mutex.
+    lifecycle: Arc<std::sync::Mutex<crate::lsp::state::ServerLifecycle>>,
     /// Whether the server process is alive.
     alive: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -63,10 +65,10 @@ pub struct TokenMonitor {
 impl TokenMonitor {
     /// Creates a new `TokenMonitor` from the server's shared state.
     pub const fn new(
-        state: Arc<std::sync::atomic::AtomicU8>,
+        lifecycle: Arc<std::sync::Mutex<crate::lsp::state::ServerLifecycle>>,
         alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        Self { state, alive }
+        Self { lifecycle, alive }
     }
 }
 
@@ -78,11 +80,14 @@ impl ProgressMonitor for TokenMonitor {
             return ActivityState::Dead;
         }
 
-        let state = crate::lsp::state::ServerState::from_u8(self.state.load(Ordering::SeqCst));
-        match state {
-            crate::lsp::state::ServerState::Busy => ActivityState::Active,
-            crate::lsp::state::ServerState::Dead => ActivityState::Dead,
-            // Ready or Initializing — treat as idle for diagnostics purposes
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *lifecycle {
+            crate::lsp::state::ServerLifecycle::Busy(_) => ActivityState::Active,
+            crate::lsp::state::ServerLifecycle::Failed
+            | crate::lsp::state::ServerLifecycle::Dead => ActivityState::Dead,
             _ => ActivityState::Idle,
         }
     }
@@ -95,40 +100,50 @@ impl ProgressMonitor for TokenMonitor {
 )]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU8};
+    use crate::lsp::state::ServerLifecycle;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
-    fn token_monitor_idle_when_ready() {
-        let state = Arc::new(AtomicU8::new(crate::lsp::state::ServerState::Ready.as_u8()));
+    fn token_monitor_idle_when_healthy() {
+        let lifecycle = Arc::new(std::sync::Mutex::new(ServerLifecycle::Healthy));
         let alive = Arc::new(AtomicBool::new(true));
-        let mut monitor = TokenMonitor::new(state, alive);
+        let mut monitor = TokenMonitor::new(lifecycle, alive);
 
         assert_eq!(monitor.poll(), ActivityState::Idle);
     }
 
     #[test]
     fn token_monitor_active_when_busy() {
-        let state = Arc::new(AtomicU8::new(crate::lsp::state::ServerState::Busy.as_u8()));
+        let lifecycle = Arc::new(std::sync::Mutex::new(ServerLifecycle::Busy(1)));
         let alive = Arc::new(AtomicBool::new(true));
-        let mut monitor = TokenMonitor::new(state, alive);
+        let mut monitor = TokenMonitor::new(lifecycle, alive);
 
         assert_eq!(monitor.poll(), ActivityState::Active);
     }
 
     #[test]
-    fn token_monitor_idle_when_stuck() {
-        let state = Arc::new(AtomicU8::new(crate::lsp::state::ServerState::Stuck.as_u8()));
+    fn token_monitor_idle_when_initializing() {
+        let lifecycle = Arc::new(std::sync::Mutex::new(ServerLifecycle::Initializing));
         let alive = Arc::new(AtomicBool::new(true));
-        let mut monitor = TokenMonitor::new(state, alive);
+        let mut monitor = TokenMonitor::new(lifecycle, alive);
 
         assert_eq!(monitor.poll(), ActivityState::Idle);
     }
 
     #[test]
     fn token_monitor_dead_when_not_alive() {
-        let state = Arc::new(AtomicU8::new(crate::lsp::state::ServerState::Ready.as_u8()));
+        let lifecycle = Arc::new(std::sync::Mutex::new(ServerLifecycle::Healthy));
         let alive = Arc::new(AtomicBool::new(false));
-        let mut monitor = TokenMonitor::new(state, alive);
+        let mut monitor = TokenMonitor::new(lifecycle, alive);
+
+        assert_eq!(monitor.poll(), ActivityState::Dead);
+    }
+
+    #[test]
+    fn token_monitor_dead_when_failed() {
+        let lifecycle = Arc::new(std::sync::Mutex::new(ServerLifecycle::Failed));
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut monitor = TokenMonitor::new(lifecycle, alive);
 
         assert_eq!(monitor.poll(), ActivityState::Dead);
     }

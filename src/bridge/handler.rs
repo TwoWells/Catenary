@@ -49,10 +49,10 @@ pub(super) async fn check_server_health(
     for lang in touched_servers {
         let ready = if let Some(c) = clients.get(lang) {
             let client = c.lock().await;
-            // Lightweight idle probe: if a stuck server has gone idle,
-            // recover it to Ready before checking readiness.
-            client.try_idle_recover();
-            client.is_ready()
+            matches!(
+                client.lifecycle(),
+                crate::lsp::state::ServerLifecycle::Healthy
+            )
         } else {
             false
         };

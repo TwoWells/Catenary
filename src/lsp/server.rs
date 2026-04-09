@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
@@ -19,7 +19,7 @@ use tracing::{debug, trace, warn};
 use super::client::DiagnosticsCache;
 use super::extract;
 use super::protocol::RpcError;
-use super::state::{ProgressTracker, ServerState};
+use super::state::{ProgressTracker, ServerLifecycle};
 
 /// Complete representation of a remote LSP server.
 ///
@@ -51,12 +51,6 @@ pub struct LspServer {
     supports_type_hierarchy: OnceLock<bool>,
     supports_code_action: OnceLock<bool>,
 
-    /// Set on first `$/progress` begin.
-    sends_progress: OnceLock<()>,
-
-    /// Count of in-flight progress tokens (begin increments, end decrements).
-    in_progress_count: AtomicU32,
-
     // ── Diagnostics ───────────────────────────────────────────────
     pub(crate) diagnostics: DiagnosticsCache,
     pub(crate) diagnostics_generation: Arc<Mutex<HashMap<String, u64>>>,
@@ -69,9 +63,13 @@ pub struct LspServer {
     pub(crate) progress: Arc<Mutex<ProgressTracker>>,
     pub(crate) progress_notify: Arc<Notify>,
 
-    // ── Server state ──────────────────────────────────────────────
-    pub(crate) state: Arc<AtomicU8>,
+    // ── Lifecycle ─────────────────────────────────────────────────
+    /// Unified server lifecycle state. See [`ServerLifecycle`].
+    pub(crate) lifecycle: Arc<Mutex<ServerLifecycle>>,
+    /// Wakes waiters on lifecycle transitions.
     pub(crate) state_notify: Arc<Notify>,
+    /// Set on first `Busy` transition (runtime capability discovery).
+    pub(crate) ever_busy: AtomicBool,
 
     // ── Observation flags ─────────────────────────────────────────
     pub(crate) publishes_version: Arc<AtomicBool>,
@@ -105,16 +103,15 @@ impl LspServer {
             supports_call_hierarchy: OnceLock::new(),
             supports_type_hierarchy: OnceLock::new(),
             supports_code_action: OnceLock::new(),
-            sends_progress: OnceLock::new(),
-            in_progress_count: AtomicU32::new(0),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_generation: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_notify: Arc::new(Notify::new()),
             capability_notify: Arc::new(Notify::new()),
             progress: Arc::new(Mutex::new(ProgressTracker::new())),
             progress_notify: Arc::new(Notify::new()),
-            state: Arc::new(AtomicU8::new(ServerState::Initializing.as_u8())),
+            lifecycle: Arc::new(Mutex::new(ServerLifecycle::Initializing)),
             state_notify: Arc::new(Notify::new()),
+            ever_busy: AtomicBool::new(false),
             publishes_version: Arc::new(AtomicBool::new(false)),
             language,
             settings,
@@ -264,35 +261,39 @@ impl LspServer {
         self.supports_code_action.get().copied().unwrap_or(false)
     }
 
-    /// Returns whether the server has ever sent a `$/progress` begin.
+    /// Returns whether the server has ever been in `Busy` state
+    /// (i.e., has ever sent `$/progress` begin).
     pub fn sends_progress(&self) -> bool {
-        self.sends_progress.get().is_some()
+        self.ever_busy.load(Ordering::SeqCst)
     }
 
     /// Returns the number of in-flight progress tokens.
-    pub fn in_progress_count(&self) -> u32 {
-        self.in_progress_count.load(Ordering::SeqCst)
-    }
-
-    /// Records a `$/progress` begin: sets `sends_progress` (once) and
-    /// increments the in-flight count.
     ///
-    /// Returns `true` if this was the first progress begin (capability
-    /// discovery moment).
-    pub fn on_progress_begin(&self) -> bool {
-        let first = self.sends_progress.set(()).is_ok();
-        self.in_progress_count.fetch_add(1, Ordering::SeqCst);
-        first
+    /// Derived from the lifecycle enum: `Busy(n)` → `n`, all others → `0`.
+    pub fn in_progress_count(&self) -> u32 {
+        match self.lifecycle() {
+            ServerLifecycle::Busy(n) => n,
+            _ => 0,
+        }
     }
 
-    /// Records a `$/progress` end: decrements the in-flight count
-    /// (saturating at zero).
-    pub fn on_progress_end(&self) {
-        self.in_progress_count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                Some(n.saturating_sub(1))
-            })
-            .ok();
+    /// Returns the current lifecycle state.
+    pub fn lifecycle(&self) -> ServerLifecycle {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Sets the lifecycle state and wakes waiters.
+    pub(crate) fn set_lifecycle(&self, state: ServerLifecycle) {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lifecycle = state;
+        drop(lifecycle);
+        self.state_notify.notify_waiters();
     }
 
     // ── Dispatch methods (moved from ServerInbox) ─────────────────
@@ -353,43 +354,54 @@ impl LspServer {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 tracker.update(&token_str, &params["value"]);
 
-                // Update server profile based on progress kind
+                if tracker.broadcast_changed()
+                    && let Some(p) = tracker.primary_progress()
+                {
+                    debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
+                }
+                drop(tracker);
+
+                // Update lifecycle based on progress kind
                 let kind = params["value"]["kind"].as_str();
+                let mut lifecycle = self
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                if lifecycle.is_terminal() {
+                    return;
+                }
+
                 match kind {
                     Some("begin") => {
-                        if self.on_progress_begin() {
+                        let first = !self.ever_busy.swap(true, Ordering::SeqCst);
+                        *lifecycle = match *lifecycle {
+                            ServerLifecycle::Busy(n) => ServerLifecycle::Busy(n + 1),
+                            _ => ServerLifecycle::Busy(1),
+                        };
+                        drop(lifecycle);
+                        if first {
                             self.capability_notify.notify_waiters();
                         }
                     }
                     Some("end") => {
-                        self.on_progress_end();
+                        *lifecycle = match *lifecycle {
+                            ServerLifecycle::Busy(n) if n > 1 => ServerLifecycle::Busy(n - 1),
+                            ServerLifecycle::Busy(1) => {
+                                debug!("Server ready (progress completed)");
+                                ServerLifecycle::Healthy
+                            }
+                            ref other => other.clone(),
+                        };
+                        drop(lifecycle);
                     }
-                    _ => {}
+                    _ => {
+                        drop(lifecycle);
+                    }
                 }
 
-                // Update state based on progress.
-                // The Dead guard is the only exclusion — Stuck servers
-                // that send progress are naturally recovered here
-                // (transitioned to Busy/Ready like any other state).
-                let current_state = ServerState::from_u8(self.state.load(Ordering::SeqCst));
-                if current_state != ServerState::Dead {
-                    if tracker.is_busy() {
-                        self.state
-                            .store(ServerState::Busy.as_u8(), Ordering::SeqCst);
-                        if tracker.broadcast_changed()
-                            && let Some(p) = tracker.primary_progress()
-                        {
-                            debug!("Progress: {} {}%", p.title, p.percentage.unwrap_or(0));
-                        }
-                    } else {
-                        self.state
-                            .store(ServerState::Ready.as_u8(), Ordering::SeqCst);
-                        debug!("Server ready (progress completed)");
-                    }
-                    // Fire notifies after state update
-                    self.progress_notify.notify_waiters();
-                    self.state_notify.notify_waiters();
-                }
+                self.progress_notify.notify_waiters();
+                self.state_notify.notify_waiters();
             }
             "window/logMessage" | "window/showMessage" => {
                 if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
@@ -442,13 +454,11 @@ impl LspServer {
     /// Called after the `alive` flag is set to `false`. Updates internal
     /// state and wakes any waiters blocked on diagnostics or state changes.
     pub fn on_shutdown(&self) {
-        self.state
-            .store(ServerState::Dead.as_u8(), Ordering::SeqCst);
+        self.set_lifecycle(ServerLifecycle::Dead);
         if let Ok(mut progress) = self.progress.lock() {
             progress.clear();
         }
         self.diagnostics_notify.notify_waiters();
-        self.state_notify.notify_waiters();
     }
 
     /// Whether the server is actively reporting progress.
@@ -534,42 +544,20 @@ mod tests {
     }
 
     #[test]
-    fn on_progress_begin_end_count() {
+    fn lifecycle_starts_initializing() {
         let server = test_server();
-        assert_eq!(server.in_progress_count(), 0);
-
-        server.on_progress_begin();
-        server.on_progress_begin();
-        assert_eq!(server.in_progress_count(), 2);
-
-        server.on_progress_end();
-        assert_eq!(server.in_progress_count(), 1);
-
-        server.on_progress_end();
-        assert_eq!(server.in_progress_count(), 0);
-    }
-
-    #[test]
-    fn on_progress_begin_sets_sends_progress() {
-        let server = test_server();
+        assert_eq!(server.lifecycle(), ServerLifecycle::Initializing);
         assert!(!server.sends_progress());
-
-        server.on_progress_begin();
-        assert!(server.sends_progress());
     }
 
     #[test]
-    fn in_progress_count_saturates() {
+    fn set_lifecycle_transitions_and_notifies() {
         let server = test_server();
-        assert_eq!(server.in_progress_count(), 0);
+        server.set_lifecycle(ServerLifecycle::Healthy);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Healthy);
 
-        server.on_progress_end();
-        assert_eq!(server.in_progress_count(), 0);
-
-        // Multiple underflow attempts stay at zero
-        server.on_progress_end();
-        server.on_progress_end();
-        assert_eq!(server.in_progress_count(), 0);
+        server.set_lifecycle(ServerLifecycle::Dead);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
     }
 
     #[test]
@@ -893,10 +881,10 @@ mod tests {
     }
 
     #[test]
-    fn progress_begin_end_updates_server_profile() {
+    fn progress_begin_end_updates_lifecycle() {
         let server = test_server();
         assert!(!server.sends_progress());
-        assert_eq!(server.in_progress_count(), 0);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Initializing);
 
         // Begin
         server.on_notification(
@@ -907,7 +895,7 @@ mod tests {
             }),
         );
         assert!(server.sends_progress());
-        assert_eq!(server.in_progress_count(), 1);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Busy(1));
 
         // Second begin (overlapping token)
         server.on_notification(
@@ -917,7 +905,7 @@ mod tests {
                 "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
             }),
         );
-        assert_eq!(server.in_progress_count(), 2);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Busy(2));
 
         // End first
         server.on_notification(
@@ -927,9 +915,9 @@ mod tests {
                 "value": { "kind": "end" }
             }),
         );
-        assert_eq!(server.in_progress_count(), 1);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Busy(1));
 
-        // End second
+        // End second — transitions to Healthy
         server.on_notification(
             "$/progress",
             &json!({
@@ -937,6 +925,21 @@ mod tests {
                 "value": { "kind": "end" }
             }),
         );
-        assert_eq!(server.in_progress_count(), 0);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Healthy);
+    }
+
+    #[test]
+    fn progress_ignored_in_terminal_state() {
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Dead);
+
+        server.on_notification(
+            "$/progress",
+            &json!({
+                "token": "tok-1",
+                "value": { "kind": "begin", "title": "Checking", "percentage": 0 }
+            }),
+        );
+        assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
     }
 }

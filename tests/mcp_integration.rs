@@ -1278,14 +1278,15 @@ fn test_search_graceful_degradation() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that `wait_ready` detects failure when the server burns CPU
-/// without progress tokens after a workspace folder change (Gap 3).
+/// Verifies that a server burning CPU after a workspace folder change
+/// does not block `wait_ready` — lifecycle-based readiness returns
+/// immediately since the server is already `Healthy`.
 ///
-/// mockls `--cpu-on-workspace-change 15000` burns 15s of CPU (1500 ticks)
-/// on `workspace/didChangeWorkspaceFolders`. Catenary sets the server to
-/// Busy, but `progress_active()` returns false (no actual `$/progress`
-/// tokens in the tracker). The failure threshold (1000 ticks) drains and
-/// `wait_ready` returns false, producing an error.
+/// mockls `--cpu-on-workspace-change 15000` burns 15s of CPU on
+/// `workspace/didChangeWorkspaceFolders`. The server is already `Healthy`
+/// (init completed), so `wait_ready` returns `true` immediately.
+/// Individual LSP requests may time out via `Connection::request`'s
+/// failure detection, but grep degrades gracefully via ripgrep.
 #[test]
 fn test_wait_ready_failure_detection() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1337,7 +1338,8 @@ fn test_wait_ready_failure_detection() -> Result<()> {
     // Small delay for the workspace folder change to be sent to mockls
     std::thread::sleep(Duration::from_millis(200));
 
-    // Send a search request — wait_ready should detect failure
+    // Send a search request — wait_ready returns true (server is Healthy),
+    // but individual LSP requests may time out during the CPU burn.
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 10,
@@ -1351,32 +1353,31 @@ fn test_wait_ready_failure_detection() -> Result<()> {
     let response = bridge.recv()?;
     let result = &response["result"];
 
-    // Dead servers are non-fatal — search degrades gracefully with ripgrep results
+    // Search degrades gracefully — ripgrep results still present
     assert!(
         result.get("isError").is_none() || result["isError"] == false,
-        "Dead server should degrade gracefully, not error. Got: {response:?}"
+        "Search should degrade gracefully, not error. Got: {response:?}"
     );
 
-    // Unavailable notification should be included in the result text
     let content = result["content"]
         .as_array()
         .context("Missing content array")?;
     let text = content[0]["text"].as_str().context("Missing result text")?;
     assert!(
-        text.contains("server") && text.contains("unavailable"),
-        "Expected unavailable notification in result. Got: {text}"
+        text.contains("hello"),
+        "Ripgrep results should still contain the match. Got: {text}"
     );
 
     Ok(())
 }
 
-/// Verifies warmup observation: `is_ready()` waits for the server to
-/// become Sleeping before declaring it ready (Gap 6).
+/// Verifies that a server burning CPU on `initialized` does not prevent
+/// search from succeeding.
 ///
 /// mockls `--cpu-on-initialized 3000` burns 3s of CPU on `initialized`.
-/// During warmup (<3s from spawn), the server is Running, so `is_ready()`
-/// returns false. After the burn completes, the server goes Sleeping,
-/// `is_ready()` returns true, and the search request succeeds.
+/// The server is set to `Healthy` after init completes, so `wait_ready`
+/// returns `true` immediately. The search request succeeds because the
+/// server responds to requests after the CPU burn finishes.
 #[test]
 fn test_warmup_observation() -> Result<()> {
     let dir = tempfile::tempdir()?;
