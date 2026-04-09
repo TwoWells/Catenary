@@ -9,8 +9,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::bridge::DocumentManager;
 use crate::bridge::filesystem_manager::FilesystemManager;
-use crate::bridge::{DocumentManager, DocumentNotification};
 use crate::config::Config;
 use crate::lsp::LspClient;
 use crate::lsp::state::ServerStatus;
@@ -38,7 +38,6 @@ impl LspClientManager {
         roots: Vec<PathBuf>,
         message_log: Arc<MessageLog>,
         fs: Arc<FilesystemManager>,
-        session_id: String,
     ) -> Self {
         Self {
             config,
@@ -46,7 +45,7 @@ impl LspClientManager {
             clients: Mutex::new(HashMap::new()),
             message_log,
             fs,
-            doc_manager: Mutex::new(DocumentManager::new(session_id)),
+            doc_manager: Mutex::new(DocumentManager::new()),
         }
     }
 
@@ -396,21 +395,14 @@ impl LspClientManager {
         }
 
         let uri = doc_manager.uri_for_path(path)?;
+        let canonical = path.canonicalize()?;
+        let text = tokio::fs::read_to_string(&canonical).await?;
 
-        if let Some(notification) = doc_manager.ensure_open(path).await? {
-            match notification {
-                DocumentNotification::Open {
-                    language_id,
-                    version,
-                    text,
-                    ..
-                } => {
-                    client.did_open(&uri, &language_id, version, &text).await?;
-                }
-                DocumentNotification::Change { version, text, .. } => {
-                    client.did_change(&uri, version, &text).await?;
-                }
-            }
+        if doc_manager.open(&uri) {
+            let language_id = self.fs.language_id(path).unwrap_or("plaintext").to_string();
+            client.did_open(&uri, &language_id, 1, &text).await?;
+        } else {
+            client.did_change(&uri, 1, &text).await?;
         }
 
         drop(doc_manager);
@@ -639,7 +631,6 @@ mod tests {
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         let roots = manager.roots().await;
@@ -651,13 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_empty_initial() -> Result<()> {
-        let manager = LspClientManager::new(
-            test_config(),
-            vec![],
-            test_message_log(),
-            test_fs(),
-            String::new(),
-        );
+        let manager = LspClientManager::new(test_config(), vec![], test_message_log(), test_fs());
 
         assert!(manager.roots().await.is_empty());
         Ok(())
@@ -670,7 +655,6 @@ mod tests {
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         assert_eq!(manager.roots().await.len(), 2);
@@ -690,7 +674,6 @@ mod tests {
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         // Sync: remove /tmp/root_a, keep /tmp/root_b, add /tmp/root_c
@@ -715,7 +698,6 @@ mod tests {
             vec![PathBuf::from("/tmp/root_a")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         manager
@@ -737,7 +719,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         let client = manager.get_or_spawn(MOCK_LANG_A).await?;
@@ -805,7 +786,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         // get_client spawns + initializes; mockls sends workspace/configuration
@@ -825,7 +805,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         let client = manager.get_or_spawn(MOCK_LANG_A).await?;
@@ -858,7 +837,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         assert!(manager.clients().await.is_empty());
@@ -881,7 +859,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         // Pre-spawn the server
@@ -907,7 +884,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         // .xyz has no configured server — should be silently skipped
@@ -928,7 +904,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         // A file with the mock language extension should resolve to the mock server
@@ -945,7 +920,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         // A file with an unknown extension and no config key should error
@@ -960,7 +934,6 @@ mod tests {
             vec![PathBuf::from("/tmp")],
             test_message_log(),
             test_fs(),
-            String::new(),
         );
 
         let dir = tempfile::tempdir().expect("tempdir");

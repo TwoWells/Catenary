@@ -7,7 +7,6 @@
 //! document open/change, diagnostics wait, severity filtering, noise
 //! filtering, quick-fix collection, and compact formatting.
 
-use super::DocumentNotification;
 use super::path_security::PathValidator;
 use super::tool_server::ToolServer;
 use crate::lsp::{DiagnosticsWaitResult, LspClient, LspClientManager};
@@ -93,47 +92,35 @@ impl DiagnosticsServer {
         }
 
         let uri = doc_manager.uri_for_path(&canonical)?;
+        let text = tokio::fs::read_to_string(&canonical).await?;
 
-        // ensure_open detects disk changes and returns didOpen/didChange
-        if let Some(notification) = doc_manager.ensure_open(&canonical).await? {
-            // Snapshot generation *before* sending the change
-            let snapshot = client.diagnostics_generation(&uri);
+        // Snapshot generation *before* sending the change
+        let snapshot = client.diagnostics_generation(&uri);
 
-            match notification {
-                DocumentNotification::Open {
-                    language_id,
-                    version,
-                    text,
-                    ..
-                } => {
-                    client.did_open(&uri, &language_id, version, &text).await?;
-                }
-                DocumentNotification::Change { version, text, .. } => {
-                    client.did_change(&uri, version, &text).await?;
-                }
-            }
-
-            // Trigger flycheck on servers that only run diagnostics on save
-            if client.wants_did_save() {
-                client.did_save(&uri).await?;
-            }
-
-            drop(doc_manager);
-
-            let pulls = client.supports_pull_diagnostics();
-
-            if !pulls
-                && client.wait_for_diagnostics_update(&uri, snapshot).await
-                    == DiagnosticsWaitResult::Nothing
-            {
-                client.set_parent_id(None);
-                return Ok(DiagnosticsResult {
-                    content: "[diagnostics unavailable]".into(),
-                    count: 0,
-                });
-            }
+        if doc_manager.open(&uri) {
+            client.did_open(&uri, &lang_id, 1, &text).await?;
         } else {
-            drop(doc_manager);
+            client.did_change(&uri, 1, &text).await?;
+        }
+
+        // Trigger flycheck on servers that only run diagnostics on save
+        if client.wants_did_save() {
+            client.did_save(&uri).await?;
+        }
+
+        drop(doc_manager);
+
+        let pulls = client.supports_pull_diagnostics();
+
+        if !pulls
+            && client.wait_for_diagnostics_update(&uri, snapshot).await
+                == DiagnosticsWaitResult::Nothing
+        {
+            client.set_parent_id(None);
+            return Ok(DiagnosticsResult {
+                content: "[diagnostics unavailable]".into(),
+                count: 0,
+            });
         }
 
         // Pull path: if the server advertises diagnosticProvider, pull

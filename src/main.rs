@@ -364,7 +364,6 @@ async fn run_server() -> Result<()> {
         config.clone(),
         roots,
         message_log.clone(),
-        session_id.clone(),
         tokio::runtime::Handle::current(),
     ));
     toolbox.spawn_all().await;

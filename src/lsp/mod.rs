@@ -9,6 +9,8 @@ pub(crate) mod connection;
 pub(crate) mod diagnostics;
 /// Extractor functions for LSP response and notification fields.
 pub(crate) mod extract;
+/// Standalone pure functions for LSP document identity.
+pub mod lang;
 /// High-level manager for lazy-spawning and caching LSP clients.
 pub mod manager;
 /// Builder functions for LSP request and notification parameters.

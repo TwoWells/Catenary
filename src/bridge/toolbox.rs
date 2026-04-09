@@ -134,7 +134,6 @@ impl Toolbox {
         config: Config,
         roots: Vec<PathBuf>,
         message_log: Arc<MessageLog>,
-        session_id: String,
         runtime: Handle,
     ) -> Self {
         let fs_manager = Arc::new(FilesystemManager::new());
@@ -145,7 +144,6 @@ impl Toolbox {
             roots,
             message_log,
             fs_manager.clone(),
-            session_id,
         ));
         let diagnostics = Arc::new(DiagnosticsServer::new(
             client_manager.clone(),

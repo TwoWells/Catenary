@@ -25,7 +25,7 @@ pub mod tool_server;
 pub mod toolbox;
 
 pub use diagnostics_server::DiagnosticsServer;
-pub use document_manager::{DocumentManager, DocumentNotification};
+pub use document_manager::DocumentManager;
 pub use handler::McpRouter;
 pub use hook_router::HookRouter;
 pub use path_security::PathValidator;

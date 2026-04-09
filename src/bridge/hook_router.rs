@@ -538,13 +538,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
 
-        let toolbox = Arc::new(Toolbox::new(
-            config,
-            vec![],
-            message_log,
-            String::new(),
-            handle,
-        ));
+        let toolbox = Arc::new(Toolbox::new(config, vec![], message_log, handle));
         let refresh_roots = Arc::new(AtomicBool::new(false));
 
         let router = HookRouter::new(
