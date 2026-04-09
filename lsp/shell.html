@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d246a364.js";
+            window.path_to_searchindex_js = "../searchindex-af2e23ea.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-08107c56.js"></script>
@@ -193,9 +193,12 @@
 </code></pre>
 <h2 id="config"><a class="header" href="#config">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.shellscript]
+<pre><code class="language-toml">[server.bash-ls]
 command = "bash-language-server"
 args = ["start"]
+
+[language.shellscript]
+servers = ["bash-ls"]
 </code></pre>
 <h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
 <ul>

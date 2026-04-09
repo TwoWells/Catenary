@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d246a364.js";
+            window.path_to_searchindex_js = "../searchindex-af2e23ea.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-08107c56.js"></script>
@@ -197,24 +197,24 @@
 </code></pre>
 <h2 id="config"><a class="header" href="#config">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.python]
+<pre><code class="language-toml">[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
+
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
+
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+
+[language.python]
+servers = ["python"]
 </code></pre>
 <h2 id="settings"><a class="header" href="#settings">Settings</a></h2>
 <p>Pyright requests configuration via <code>workspace/configuration</code>. Use the <code>settings</code>
-table to provide Python interpreter paths, analysis exclusions, and other options:</p>
-<pre><code class="language-toml">[language.python]
-command = "pyright-langserver"
-args = ["--stdio"]
-
-[language.python.settings.python]
-pythonPath = "/usr/bin/python3"
-
-[language.python.settings.python.analysis]
-exclude = ["**/target", "**/node_modules"]
-extraPaths = []
-</code></pre>
+table on the <code>[server.*]</code> entry to provide Python interpreter paths, analysis
+exclusions, and other options (shown above).</p>
 <p>Without these settings, pyright may fall back to scanning the entire workspace
 (including large directories like <code>target/</code> or <code>node_modules/</code>), which can
 cause extremely slow initialization.</p>
@@ -231,15 +231,21 @@ for the full list of available settings.</p>
 <p>A community-maintained server with plugin support:</p>
 <pre><code class="language-bash">pip install python-lsp-server
 </code></pre>
-<pre><code class="language-toml">[language.python]
+<pre><code class="language-toml">[server.pylsp]
 command = "pylsp"
+
+[language.python]
+servers = ["pylsp"]
 </code></pre>
 <h3 id="jedi-language-server"><a class="header" href="#jedi-language-server">Jedi Language Server</a></h3>
 <p>Lightweight, uses Jedi for completions:</p>
 <pre><code class="language-bash">pip install jedi-language-server
 </code></pre>
-<pre><code class="language-toml">[language.python]
+<pre><code class="language-toml">[server.jedi]
 command = "jedi-language-server"
+
+[language.python]
+servers = ["jedi"]
 </code></pre>
 <h2 id="links"><a class="header" href="#links">Links</a></h2>
 <ul>

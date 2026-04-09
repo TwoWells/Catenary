@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d246a364.js";
+            window.path_to_searchindex_js = "searchindex-af2e23ea.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-08107c56.js"></script>
@@ -267,54 +267,78 @@ will not get post-edit diagnostics or editing state enforcement.</p>
 <li><strong>Environment variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_IDLE_TIMEOUT=600</code>). Use <code>__</code> for nested keys (e.g., <code>CATENARY_ICONS__PRESET=nerd</code>).</li>
 </ol>
 <h2 id="language-servers"><a class="header" href="#language-servers">Language Servers</a></h2>
-<pre><code class="language-toml">[language.&lt;language-id&gt;]
+<p>Configuration uses two sections: <code>[server.*]</code> defines how to run a
+language server, and <code>[language.*]</code> binds languages to servers.</p>
+<pre><code class="language-toml">[server.&lt;name&gt;]
 command = "server-binary"
 args = ["arg1", "arg2"]
+
+[language.&lt;language-id&gt;]
+servers = ["&lt;name&gt;"]
 </code></pre>
 <h3 id="example"><a class="header" href="#example">Example</a></h3>
 <pre><code class="language-toml">idle_timeout = 300
 
-[language.rust]
+[server.rust]
 command = "rust-analyzer"
 
-[language.rust.initialization_options]
+[server.rust.initialization_options]
 check.command = "clippy"
+cargo.features = "all"
+diagnostics.disabled = ["inactive-code"]
 
-[language.python]
+[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[language.python.settings.python.analysis]
-exclude = ["**/target", "**/node_modules"]
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
 
-[language.typescript]
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
 
-[language.go]
+[server.gopls]
 command = "gopls"
+
+[language.rust]
+servers = ["rust"]
+
+[language.python]
+servers = ["python"]
+
+[language.typescript]
+servers = ["tsserver"]
+
+[language.go]
+servers = ["gopls"]
 </code></pre>
 <h3 id="initialization-options"><a class="header" href="#initialization-options">Initialization Options</a></h3>
-<p>Server-specific options passed during the LSP <code>initialize</code> request:</p>
-<pre><code class="language-toml">[language.rust.initialization_options]
+<p>Server-specific options passed during the LSP <code>initialize</code> request.
+These go on the <code>[server.*]</code> entry:</p>
+<pre><code class="language-toml">[server.rust.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 </code></pre>
 <p>Refer to your language server’s documentation for available options.</p>
 <h3 id="server-settings"><a class="header" href="#server-settings">Server Settings</a></h3>
 <p>Some language servers request configuration from the client via
-<code>workspace/configuration</code>. The <code>settings</code> table provides these values.
-The TOML nesting mirrors the JSON object the server expects — Catenary
-matches the <code>section</code> path from each request and returns the
-corresponding subtree.</p>
-<pre><code class="language-toml">[language.python]
+<code>workspace/configuration</code>. The <code>settings</code> table provides these values
+on the <code>[server.*]</code> entry. The TOML nesting mirrors the JSON object
+the server expects — Catenary matches the <code>section</code> path from each
+request and returns the corresponding subtree.</p>
+<pre><code class="language-toml">[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[language.python.settings.python]
+[server.python.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[language.python.settings.python.analysis]
+[server.python.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 </code></pre>
@@ -323,7 +347,7 @@ extraPaths = []
 <code>{ "exclude": ["**/target", ...], "extraPaths": [] }</code>.</p>
 <p>Items with no matching path receive <code>{}</code>.</p>
 <h2 id="language-ids"><a class="header" href="#language-ids">Language IDs</a></h2>
-<p>The <code>[language.&lt;language-id&gt;]</code> key must match the LSP language identifier.
+<p>The <code>[language.&lt;language-id&gt;]</code> key in the language section must match the LSP language identifier.
 Catenary auto-detects languages from file extensions, filenames, and
 shebangs (<code>#!</code> lines in extensionless scripts). Any language with an LSP
 server works — this table covers what Catenary recognises automatically.</p>
@@ -623,9 +647,12 @@ Catenary configuration.</p>
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.yourlanguage]
+[server.your-language-server]
 command = "your-language-server"
 args = ["--stdio"]
+
+[language.yourlanguage]
+servers = ["your-language-server"]
 ```
 
 ## Notes
@@ -647,21 +674,29 @@ Any gotchas, tips, or links to official docs.
 </code></pre>
 <h2 id="config"><a class="header" href="#config">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.css]
+<pre><code class="language-toml">[server.vscode-css]
 command = "vscode-css-language-server"
 args = ["--stdio"]
 
-[language.scss]
-command = "vscode-css-language-server"
-args = ["--stdio"]
-
-[language.html]
+[server.vscode-html]
 command = "vscode-html-language-server"
 args = ["--stdio"]
 
-[language.json]
+[server.vscode-json]
 command = "vscode-json-language-server"
 args = ["--stdio"]
+
+[language.css]
+servers = ["vscode-css"]
+
+[language.scss]
+servers = ["vscode-css"]
+
+[language.html]
+servers = ["vscode-html"]
+
+[language.json]
+servers = ["vscode-json"]
 </code></pre>
 <h2 id="whats-included"><a class="header" href="#whats-included">What’s Included</a></h2>
 <p>The <code>vscode-langservers-extracted</code> package provides:</p>
@@ -706,8 +741,11 @@ args = ["--stdio"]
 </code></pre>
 <h2 id="config-1"><a class="header" href="#config-1">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.go]
+<pre><code class="language-toml">[server.gopls]
 command = "gopls"
+
+[language.go]
+servers = ["gopls"]
 </code></pre>
 <h2 id="notes-1"><a class="header" href="#notes-1">Notes</a></h2>
 <ul>
@@ -736,9 +774,12 @@ command = "gopls"
 </code></pre>
 <h2 id="config-2"><a class="header" href="#config-2">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.javascript]
+<pre><code class="language-toml">[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
+
+[language.javascript]
+servers = ["tsserver"]
 </code></pre>
 <h2 id="notes-2"><a class="header" href="#notes-2">Notes</a></h2>
 <ul>
@@ -769,9 +810,12 @@ Pkg.add("LanguageServer")
 </code></pre>
 <h2 id="config-3"><a class="header" href="#config-3">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.julia]
+<pre><code class="language-toml">[server.julia-ls]
 command = "julia"
 args = ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"]
+
+[language.julia]
+servers = ["julia-ls"]
 </code></pre>
 <h2 id="notes-3"><a class="header" href="#notes-3">Notes</a></h2>
 <ul>
@@ -786,9 +830,12 @@ args = ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; r
 create_sysimage([:LanguageServer], sysimage_path="languageserver.so")
 </code></pre>
 <p>Then use:</p>
-<pre><code class="language-toml">[language.julia]
+<pre><code class="language-toml">[server.julia-ls]
 command = "julia"
 args = ["--sysimage=/path/to/languageserver.so", "-e", "using LanguageServer; runserver()"]
+
+[language.julia]
+servers = ["julia-ls"]
 </code></pre>
 <h2 id="links-3"><a class="header" href="#links-3">Links</a></h2>
 <ul>
@@ -818,9 +865,12 @@ choco install marksman
 </code></pre>
 <h2 id="config-4"><a class="header" href="#config-4">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.markdown]
+<pre><code class="language-toml">[server.marksman]
 command = "marksman"
 args = ["server"]
+
+[language.markdown]
+servers = ["marksman"]
 </code></pre>
 <h2 id="notes-4"><a class="header" href="#notes-4">Notes</a></h2>
 <ul>
@@ -848,9 +898,12 @@ wiki-links, and references</li>
 </code></pre>
 <h2 id="config-5"><a class="header" href="#config-5">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.php]
+<pre><code class="language-toml">[server.intelephense]
 command = "intelephense"
 args = ["--stdio"]
+
+[language.php]
+servers = ["intelephense"]
 </code></pre>
 <h2 id="notes-5"><a class="header" href="#notes-5">Notes</a></h2>
 <ul>
@@ -865,9 +918,12 @@ args = ["--stdio"]
 <pre><code class="language-bash"># Install via composer
 composer global require phpactor/phpactor
 </code></pre>
-<pre><code class="language-toml">[language.php]
+<pre><code class="language-toml">[server.phpactor]
 command = "phpactor"
 args = ["language-server"]
+
+[language.php]
+servers = ["phpactor"]
 </code></pre>
 <h2 id="links-5"><a class="header" href="#links-5">Links</a></h2>
 <ul>
@@ -893,24 +949,24 @@ args = ["language-server"]
 </code></pre>
 <h2 id="config-6"><a class="header" href="#config-6">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.python]
+<pre><code class="language-toml">[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
+
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
+
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+
+[language.python]
+servers = ["python"]
 </code></pre>
 <h2 id="settings"><a class="header" href="#settings">Settings</a></h2>
 <p>Pyright requests configuration via <code>workspace/configuration</code>. Use the <code>settings</code>
-table to provide Python interpreter paths, analysis exclusions, and other options:</p>
-<pre><code class="language-toml">[language.python]
-command = "pyright-langserver"
-args = ["--stdio"]
-
-[language.python.settings.python]
-pythonPath = "/usr/bin/python3"
-
-[language.python.settings.python.analysis]
-exclude = ["**/target", "**/node_modules"]
-extraPaths = []
-</code></pre>
+table on the <code>[server.*]</code> entry to provide Python interpreter paths, analysis
+exclusions, and other options (shown above).</p>
 <p>Without these settings, pyright may fall back to scanning the entire workspace
 (including large directories like <code>target/</code> or <code>node_modules/</code>), which can
 cause extremely slow initialization.</p>
@@ -927,15 +983,21 @@ for the full list of available settings.</p>
 <p>A community-maintained server with plugin support:</p>
 <pre><code class="language-bash">pip install python-lsp-server
 </code></pre>
-<pre><code class="language-toml">[language.python]
+<pre><code class="language-toml">[server.pylsp]
 command = "pylsp"
+
+[language.python]
+servers = ["pylsp"]
 </code></pre>
 <h3 id="jedi-language-server"><a class="header" href="#jedi-language-server">Jedi Language Server</a></h3>
 <p>Lightweight, uses Jedi for completions:</p>
 <pre><code class="language-bash">pip install jedi-language-server
 </code></pre>
-<pre><code class="language-toml">[language.python]
+<pre><code class="language-toml">[server.jedi]
 command = "jedi-language-server"
+
+[language.python]
+servers = ["jedi"]
 </code></pre>
 <h2 id="links-6"><a class="header" href="#links-6">Links</a></h2>
 <ul>
@@ -956,8 +1018,16 @@ command = "jedi-language-server"
 </code></pre>
 <h2 id="config-7"><a class="header" href="#config-7">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.rust]
+<pre><code class="language-toml">[server.rust]
 command = "rust-analyzer"
+
+[server.rust.initialization_options]
+check.command = "clippy"
+cargo.features = "all"
+diagnostics.disabled = ["inactive-code"]
+
+[language.rust]
+servers = ["rust"]
 </code></pre>
 <h2 id="notes-7"><a class="header" href="#notes-7">Notes</a></h2>
 <ul>
@@ -984,9 +1054,12 @@ command = "rust-analyzer"
 </code></pre>
 <h2 id="config-8"><a class="header" href="#config-8">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.shellscript]
+<pre><code class="language-toml">[server.bash-ls]
 command = "bash-language-server"
 args = ["start"]
+
+[language.shellscript]
+servers = ["bash-ls"]
 </code></pre>
 <h2 id="notes-8"><a class="header" href="#notes-8">Notes</a></h2>
 <ul>
@@ -1027,53 +1100,45 @@ pacman -S shellcheck
 </code></pre>
 <h2 id="config-9"><a class="header" href="#config-9">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.termux]
+<pre><code class="language-toml">[server.termux-ls]
 command = "termux-language-server"
 args = ["--stdio"]
+
+[language.termux]
+servers = ["termux-ls"]
 
 [language.pkgbuild]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.ebuild]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.eclass]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.makepkg]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.devscripts]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.mdd]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.subpackage]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.install]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language.gentoo-make-conf]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language."make.conf"]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 
 [language."color.map"]
-command = "termux-language-server"
-args = ["--stdio"]
+servers = ["termux-ls"]
 </code></pre>
 <h2 id="notes-9"><a class="header" href="#notes-9">Notes</a></h2>
 <ul>
@@ -1099,9 +1164,12 @@ args = ["--stdio"]
 </code></pre>
 <h2 id="config-10"><a class="header" href="#config-10">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.typescript]
+<pre><code class="language-toml">[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
+
+[language.typescript]
+servers = ["tsserver"]
 </code></pre>
 <h2 id="notes-10"><a class="header" href="#notes-10">Notes</a></h2>
 <ul>

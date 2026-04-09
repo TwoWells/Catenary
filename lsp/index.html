@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d246a364.js";
+            window.path_to_searchindex_js = "../searchindex-af2e23ea.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-08107c56.js"></script>
@@ -239,9 +239,12 @@ Catenary configuration.</p>
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[language.yourlanguage]
+[server.your-language-server]
 command = "your-language-server"
 args = ["--stdio"]
+
+[language.yourlanguage]
+servers = ["your-language-server"]
 ```
 
 ## Notes

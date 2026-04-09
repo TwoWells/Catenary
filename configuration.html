@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d246a364.js";
+            window.path_to_searchindex_js = "searchindex-af2e23ea.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-08107c56.js"></script>
@@ -191,54 +191,78 @@
 <li><strong>Environment variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_IDLE_TIMEOUT=600</code>). Use <code>__</code> for nested keys (e.g., <code>CATENARY_ICONS__PRESET=nerd</code>).</li>
 </ol>
 <h2 id="language-servers"><a class="header" href="#language-servers">Language Servers</a></h2>
-<pre><code class="language-toml">[language.&lt;language-id&gt;]
+<p>Configuration uses two sections: <code>[server.*]</code> defines how to run a
+language server, and <code>[language.*]</code> binds languages to servers.</p>
+<pre><code class="language-toml">[server.&lt;name&gt;]
 command = "server-binary"
 args = ["arg1", "arg2"]
+
+[language.&lt;language-id&gt;]
+servers = ["&lt;name&gt;"]
 </code></pre>
 <h3 id="example"><a class="header" href="#example">Example</a></h3>
 <pre><code class="language-toml">idle_timeout = 300
 
-[language.rust]
+[server.rust]
 command = "rust-analyzer"
 
-[language.rust.initialization_options]
+[server.rust.initialization_options]
 check.command = "clippy"
+cargo.features = "all"
+diagnostics.disabled = ["inactive-code"]
 
-[language.python]
+[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[language.python.settings.python.analysis]
-exclude = ["**/target", "**/node_modules"]
+[server.python.settings.python]
+pythonPath = "/usr/bin/python3"
 
-[language.typescript]
+[server.python.settings.python.analysis]
+exclude = ["**/target", "**/node_modules"]
+extraPaths = []
+
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
 
-[language.go]
+[server.gopls]
 command = "gopls"
+
+[language.rust]
+servers = ["rust"]
+
+[language.python]
+servers = ["python"]
+
+[language.typescript]
+servers = ["tsserver"]
+
+[language.go]
+servers = ["gopls"]
 </code></pre>
 <h3 id="initialization-options"><a class="header" href="#initialization-options">Initialization Options</a></h3>
-<p>Server-specific options passed during the LSP <code>initialize</code> request:</p>
-<pre><code class="language-toml">[language.rust.initialization_options]
+<p>Server-specific options passed during the LSP <code>initialize</code> request.
+These go on the <code>[server.*]</code> entry:</p>
+<pre><code class="language-toml">[server.rust.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 </code></pre>
 <p>Refer to your language server’s documentation for available options.</p>
 <h3 id="server-settings"><a class="header" href="#server-settings">Server Settings</a></h3>
 <p>Some language servers request configuration from the client via
-<code>workspace/configuration</code>. The <code>settings</code> table provides these values.
-The TOML nesting mirrors the JSON object the server expects — Catenary
-matches the <code>section</code> path from each request and returns the
-corresponding subtree.</p>
-<pre><code class="language-toml">[language.python]
+<code>workspace/configuration</code>. The <code>settings</code> table provides these values
+on the <code>[server.*]</code> entry. The TOML nesting mirrors the JSON object
+the server expects — Catenary matches the <code>section</code> path from each
+request and returns the corresponding subtree.</p>
+<pre><code class="language-toml">[server.python]
 command = "pyright-langserver"
 args = ["--stdio"]
 
-[language.python.settings.python]
+[server.python.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[language.python.settings.python.analysis]
+[server.python.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 </code></pre>
@@ -247,7 +271,7 @@ extraPaths = []
 <code>{ "exclude": ["**/target", ...], "extraPaths": [] }</code>.</p>
 <p>Items with no matching path receive <code>{}</code>.</p>
 <h2 id="language-ids"><a class="header" href="#language-ids">Language IDs</a></h2>
-<p>The <code>[language.&lt;language-id&gt;]</code> key must match the LSP language identifier.
+<p>The <code>[language.&lt;language-id&gt;]</code> key in the language section must match the LSP language identifier.
 Catenary auto-detects languages from file extensions, filenames, and
 shebangs (<code>#!</code> lines in extensionless scripts). Any language with an LSP
 server works — this table covers what Catenary recognises automatically.</p>

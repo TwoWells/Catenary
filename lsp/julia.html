@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d246a364.js";
+            window.path_to_searchindex_js = "../searchindex-af2e23ea.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-08107c56.js"></script>
@@ -189,9 +189,12 @@ Pkg.add("LanguageServer")
 </code></pre>
 <h2 id="config"><a class="header" href="#config">Config</a></h2>
 <p>Add to <code>~/.config/catenary/config.toml</code>:</p>
-<pre><code class="language-toml">[language.julia]
+<pre><code class="language-toml">[server.julia-ls]
 command = "julia"
 args = ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"]
+
+[language.julia]
+servers = ["julia-ls"]
 </code></pre>
 <h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
 <ul>
@@ -206,9 +209,12 @@ args = ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; r
 create_sysimage([:LanguageServer], sysimage_path="languageserver.so")
 </code></pre>
 <p>Then use:</p>
-<pre><code class="language-toml">[language.julia]
+<pre><code class="language-toml">[server.julia-ls]
 command = "julia"
 args = ["--sysimage=/path/to/languageserver.so", "-e", "using LanguageServer; runserver()"]
+
+[language.julia]
+servers = ["julia-ls"]
 </code></pre>
 <h2 id="links"><a class="header" href="#links">Links</a></h2>
 <ul>
