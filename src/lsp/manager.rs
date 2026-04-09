@@ -290,35 +290,41 @@ impl LspClientManager {
             anyhow::bail!("LSP server for '{canonical}' is dead");
         }
 
-        let command = lang_config
-            .command
-            .as_deref()
-            .ok_or_else(|| anyhow!("No command configured for language '{canonical}'"))?;
+        let server_name = lang_config
+            .servers
+            .first()
+            .ok_or_else(|| anyhow!("No servers configured for language '{canonical}'"))?;
+
+        let server_def = self
+            .config
+            .server
+            .get(server_name)
+            .ok_or_else(|| anyhow!("Server '{server_name}' not found in [server.*] config"))?;
 
         info!(
             "Spawning LSP server for {}: {} {}",
             canonical,
-            command,
-            lang_config.args.join(" ")
+            server_def.command,
+            server_def.args.join(" ")
         );
 
-        let args: Vec<&str> = lang_config
+        let args: Vec<&str> = server_def
             .args
             .iter()
             .map(|s: &String| s.as_str())
             .collect();
         let mut client = LspClient::spawn(
-            command,
+            &server_def.command,
             &args,
             canonical,
             self.message_log.clone(),
-            lang_config.settings.clone(),
+            server_def.settings.clone(),
         )?;
 
         // Initialize
         let roots = self.roots.lock().await.clone();
         client
-            .initialize(&roots, lang_config.initialization_options.clone())
+            .initialize(&roots, server_def.initialization_options.clone())
             .await?;
 
         let client_mutex = Arc::new(Mutex::new(client));
@@ -525,7 +531,7 @@ impl LspClientManager {
 )]
 mod tests {
     use super::*;
-    use crate::config::{IconConfig, LanguageConfig};
+    use crate::config::{IconConfig, LanguageConfig, ServerDef};
     use crate::session::MessageLog;
     use anyhow::Result;
 
@@ -565,21 +571,29 @@ mod tests {
 
     fn mockls_config() -> Config {
         let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                initialization_options: None,
+                settings: None,
+            },
+        );
         let mut language = HashMap::new();
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                command: Some(bin.to_string_lossy().to_string()),
-                args: vec![MOCK_LANG_A.to_string()],
-                initialization_options: None,
+                servers: vec![server_name],
                 min_severity: None,
-                settings: None,
                 inherit: None,
             },
         );
         Config {
             language,
-            server: HashMap::new(),
+            server,
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
@@ -590,21 +604,29 @@ mod tests {
 
     fn mockls_workspace_folders_config() -> Config {
         let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-wf");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
+                initialization_options: None,
+                settings: None,
+            },
+        );
         let mut language = HashMap::new();
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                command: Some(bin.to_string_lossy().to_string()),
-                args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
-                initialization_options: None,
+                servers: vec![server_name],
                 min_severity: None,
-                settings: None,
                 inherit: None,
             },
         );
         Config {
             language,
-            server: HashMap::new(),
+            server,
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),
@@ -749,24 +771,32 @@ mod tests {
     #[tokio::test]
     async fn test_configuration_returns_settings() -> Result<()> {
         let bin = mockls_bin();
-        let mut language = HashMap::new();
-        language.insert(
-            MOCK_LANG_A.to_string(),
-            LanguageConfig {
-                command: Some(bin.to_string_lossy().to_string()),
+        let server_name = format!("mockls-{MOCK_LANG_A}-cfg");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
                 args: vec![
                     MOCK_LANG_A.to_string(),
                     "--send-configuration-request".to_string(),
                 ],
                 initialization_options: None,
-                min_severity: None,
                 settings: Some(serde_json::json!({"mockls": {"key": "value"}})),
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![server_name],
+                min_severity: None,
                 inherit: None,
             },
         );
         let config = Config {
             language,
-            server: HashMap::new(),
+            server,
             idle_timeout: 300,
             log_retention_days: 7,
             icons: IconConfig::default(),

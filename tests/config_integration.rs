@@ -26,7 +26,12 @@ fn write_mockls_config(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "idle_timeout = 60\n\n[language.{MOCK_LANG_A}]\ncommand = \"{mockls_bin}\"\nargs = [\"{MOCK_LANG_A}\"]\n"
+            "idle_timeout = 60\n\n\
+             [server.mockls-{MOCK_LANG_A}]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [language.{MOCK_LANG_A}]\n\
+             servers = [\"mockls-{MOCK_LANG_A}\"]\n"
         ),
     )?;
     Ok(config_path)

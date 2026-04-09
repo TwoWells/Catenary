@@ -113,26 +113,31 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
         fs.detect_workspace_languages(roots, &configured_keys)
     });
 
-    // Sort servers alphabetically — skip inherit-only entries without a command
-    let mut servers: Vec<(&String, &crate::config::LanguageConfig)> = config
-        .language
-        .iter()
-        .filter(|(_, lc)| lc.command.is_some())
-        .collect();
-    servers.sort_by_key(|(lang, _)| *lang);
+    // Collect (language, first server def) pairs for concrete entries.
+    // Skip inherit-only entries and languages with no servers.
+    let mut entries: Vec<(&String, &crate::config::ServerDef)> = Vec::new();
+    for (lang, lc) in &config.language {
+        if lc.inherit.is_some() || lc.servers.is_empty() {
+            continue;
+        }
+        if let Some(server_name) = lc.servers.first()
+            && let Some(server_def) = config.server.get(server_name)
+        {
+            entries.push((lang, server_def));
+        }
+    }
+    entries.sort_by_key(|(lang, _)| *lang);
 
     // Determine column width for language name
-    let max_lang_width = servers.iter().map(|(l, _)| l.len()).max().unwrap_or(10);
-    let max_cmd_width = servers
+    let max_lang_width = entries.iter().map(|(l, _)| l.len()).max().unwrap_or(10);
+    let max_cmd_width = entries
         .iter()
-        .filter_map(|(_, s)| s.command.as_ref())
-        .map(String::len)
+        .map(|(_, s)| s.command.len())
         .max()
         .unwrap_or(10);
 
-    for (lang, lang_config) in &servers {
-        // command is guaranteed Some by the filter above
-        let command = lang_config.command.as_deref().unwrap_or_default();
+    for (lang, server_def) in &entries {
+        let command = server_def.command.as_str();
         let lang_display = format!("{lang:<max_lang_width$}");
         let cmd_display = format!("{command:<max_cmd_width$}");
 
@@ -161,7 +166,7 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
         }
 
         // Spawn and initialize the server
-        let args_refs: Vec<&str> = lang_config.args.iter().map(String::as_str).collect();
+        let args_refs: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
         let spawn_result = lsp::LspClient::spawn_quiet(
             command,
             &args_refs,
@@ -184,7 +189,7 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
 
         let init_roots = resolved_roots.as_deref().unwrap_or(&[]);
         match client
-            .initialize(init_roots, lang_config.initialization_options.clone())
+            .initialize(init_roots, server_def.initialization_options.clone())
             .await
         {
             Ok(result) => {

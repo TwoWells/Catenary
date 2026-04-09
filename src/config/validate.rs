@@ -15,6 +15,13 @@ pub fn validate(config: &Config) -> Vec<String> {
     // Validate language entries
     for (key, lang_config) in &config.language {
         if let Some(ref target) = lang_config.inherit {
+            // Inherit entries must not have their own servers list
+            if !lang_config.servers.is_empty() {
+                errors.push(format!(
+                    "Language '{key}' has both `inherit` and `servers` — \
+                     inherit entries must not specify servers"
+                ));
+            }
             match config.language.get(target) {
                 None => {
                     errors.push(format!(
@@ -30,11 +37,21 @@ pub fn validate(config: &Config) -> Vec<String> {
                 }
                 _ => {}
             }
-        } else if lang_config.command.is_none() {
+        } else if lang_config.servers.is_empty() {
             errors.push(format!(
-                "Language '{key}' has no `command` and no `inherit` — \
-                 concrete entries must specify a command"
+                "Language '{key}' has no `servers` and no `inherit` — \
+                 concrete entries must specify a servers list"
             ));
+        }
+
+        // Validate server references
+        for server_name in &lang_config.servers {
+            if !config.server.contains_key(server_name) {
+                errors.push(format!(
+                    "Language '{key}' references server '{server_name}', \
+                     but no [server.{server_name}] is defined"
+                ));
+            }
         }
     }
 

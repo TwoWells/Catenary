@@ -280,8 +280,11 @@ mod tests {
             r#"
 idle_timeout = 42
 
-[language.rust]
+[server.rust-analyzer]
 command = "rust-analyzer-local"
+
+[language.rust]
+servers = ["rust-analyzer"]
 "#,
         )?;
 
@@ -293,9 +296,8 @@ command = "rust-analyzer-local"
                 .language
                 .get("rust")
                 .expect("rust language config")
-                .command
-                .as_deref(),
-            Some("rust-analyzer-local"),
+                .servers,
+            vec!["rust-analyzer"],
         );
 
         Ok(())
@@ -332,9 +334,6 @@ command = "rust-analyzer"
         fs::write(
             &config_path,
             r#"
-[language.rust]
-command = "rust-analyzer"
-
 [server.rust-analyzer]
 command = "rust-analyzer"
 args = ["--log-level", "info"]
@@ -343,6 +342,12 @@ args = ["--log-level", "info"]
 command = "clangd"
 args = ["--background-index"]
 settings = { checkOnSave = true }
+
+[language.rust]
+servers = ["rust-analyzer"]
+
+[language.c]
+servers = ["clangd"]
 "#,
         )?;
 
@@ -378,7 +383,7 @@ settings = { checkOnSave = true }
 command = "rust-analyzer"
 
 [language.rust]
-command = "rust-analyzer"
+servers = ["rust-analyzer"]
 "#,
         )?;
 
@@ -398,12 +403,15 @@ command = "rust-analyzer"
         fs::write(
             &source1,
             r#"
-[language.rust]
+[server.rust-analyzer]
 command = "rust-analyzer"
 
 [server.clangd]
 command = "clangd"
 args = ["--background-index"]
+
+[language.rust]
+servers = ["rust-analyzer"]
 "#,
         )?;
 
@@ -411,13 +419,16 @@ args = ["--background-index"]
         fs::write(
             &source2,
             r#"
-[language.rust]
+[server.rust-analyzer]
 command = "rust-analyzer"
 
 [server.clangd]
 command = "clangd"
 args = ["--background-index", "--clang-tidy"]
 settings = { checkOnSave = true }
+
+[language.rust]
+servers = ["rust-analyzer"]
 "#,
         )?;
 
@@ -438,11 +449,14 @@ settings = { checkOnSave = true }
         fs::write(
             &config_path,
             r#"
-[language.rust]
+[server.rust-analyzer]
 command = "rust-analyzer"
 
 [server.bad-server]
 command = ""
+
+[language.rust]
+servers = ["rust-analyzer"]
 "#,
         )
         .expect("write config");
@@ -464,9 +478,12 @@ command = ""
         fs::write(
             &config_path,
             r#"
-[language.typescript]
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
+
+[language.typescript]
+servers = ["tsserver"]
 
 [language.typescriptreact]
 inherit = "typescript"
@@ -479,11 +496,7 @@ inherit = "typescript"
             .resolve_language("typescriptreact")
             .expect("should resolve");
         assert_eq!(canonical, "typescript");
-        assert_eq!(
-            resolved.command.as_deref(),
-            Some("typescript-language-server")
-        );
-        assert_eq!(resolved.args, vec!["--stdio"]);
+        assert_eq!(resolved.servers, vec!["tsserver"]);
 
         Ok(())
     }
@@ -496,9 +509,12 @@ inherit = "typescript"
         fs::write(
             &config_path,
             r#"
-[language.typescript]
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
+
+[language.typescript]
+servers = ["tsserver"]
 min_severity = "warning"
 
 [language.typescriptreact]
@@ -513,10 +529,7 @@ min_severity = "error"
             .resolve_language("typescriptreact")
             .expect("should resolve");
         assert_eq!(resolved.min_severity.as_deref(), Some("error"));
-        assert_eq!(
-            resolved.command.as_deref(),
-            Some("typescript-language-server")
-        );
+        assert_eq!(resolved.servers, vec!["tsserver"]);
 
         Ok(())
     }
@@ -547,8 +560,11 @@ inherit = "typescript"
         fs::write(
             &config_path,
             r#"
-[language.a]
+[server.server-a]
 command = "server-a"
+
+[language.a]
+servers = ["server-a"]
 
 [language.b]
 inherit = "a"
@@ -587,7 +603,7 @@ inherit = "a"
     }
 
     #[test]
-    fn test_concrete_without_command_rejected() {
+    fn test_concrete_without_servers_rejected() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
 
@@ -595,7 +611,7 @@ inherit = "a"
             &config_path,
             r#"
 [language.rust]
-args = ["--stdio"]
+min_severity = "warning"
 "#,
         )
         .expect("write config");
@@ -604,8 +620,8 @@ args = ["--stdio"]
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("command"),
-            "error should mention command: {err}",
+            err.contains("servers"),
+            "error should mention servers: {err}",
         );
     }
 
@@ -617,9 +633,12 @@ args = ["--stdio"]
         fs::write(
             &config_path,
             r#"
-[language.typescript]
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
+
+[language.typescript]
+servers = ["tsserver"]
 "#,
         )?;
 
@@ -643,12 +662,18 @@ args = ["--stdio"]
         fs::write(
             &config_path,
             r#"
-[language.typescript]
+[server.tsserver]
 command = "typescript-language-server"
 args = ["--stdio"]
 
-[language.typescriptreact]
+[server.custom-tsx]
 command = "custom-tsx-server"
+
+[language.typescript]
+servers = ["tsserver"]
+
+[language.typescriptreact]
+servers = ["custom-tsx"]
 "#,
         )?;
 
@@ -660,7 +685,7 @@ command = "custom-tsx-server"
             .get("typescriptreact")
             .expect("typescriptreact config");
         assert!(tsx.inherit.is_none());
-        assert_eq!(tsx.command.as_deref(), Some("custom-tsx-server"));
+        assert_eq!(tsx.servers, vec!["custom-tsx"]);
 
         Ok(())
     }
@@ -690,8 +715,11 @@ command = "custom-tsx-server"
             r#"
 idle_timeout = 42
 
-[language.rust]
+[server.rust-analyzer]
 command = "rust-analyzer-local"
+
+[language.rust]
+servers = ["rust-analyzer"]
 "#,
         )?;
 
@@ -707,6 +735,238 @@ idle_timeout = 99
 
         assert_eq!(config.idle_timeout, 99);
         assert!(config.language.contains_key("rust"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_format_roundtrip() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+args = ["--log-level", "info"]
+
+[server.clangd]
+command = "clangd"
+args = ["--background-index"]
+
+[language.rust]
+servers = ["rust-analyzer"]
+min_severity = "warning"
+
+[language.c]
+servers = ["clangd"]
+
+[language.cpp]
+inherit = "c"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        // Server defs
+        let ra = config
+            .server
+            .get("rust-analyzer")
+            .expect("rust-analyzer server def");
+        assert_eq!(ra.command, "rust-analyzer");
+        assert_eq!(ra.args, vec!["--log-level", "info"]);
+
+        // Language entries
+        let rust = config.language.get("rust").expect("rust config");
+        assert_eq!(rust.servers, vec!["rust-analyzer"]);
+        assert_eq!(rust.min_severity.as_deref(), Some("warning"));
+
+        let c = config.language.get("c").expect("c config");
+        assert_eq!(c.servers, vec!["clangd"]);
+
+        // Inherit resolves correctly
+        let (canonical, resolved) = config.resolve_language("cpp").expect("should resolve");
+        assert_eq!(canonical, "c");
+        assert_eq!(resolved.servers, vec!["clangd"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inline_command_hard_error() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.rust]
+command = "rust-analyzer"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("command") && err.contains("[server.*]"),
+            "error should mention server definition migration: {err}",
+        );
+    }
+
+    #[test]
+    fn test_undefined_server_ref() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[language.rust]
+servers = ["nonexistent-server"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("nonexistent-server"),
+            "error should mention the undefined server: {err}",
+        );
+    }
+
+    #[test]
+    fn test_concrete_empty_servers() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r"
+[language.rust]
+servers = []
+",
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("servers"),
+            "error should mention servers: {err}",
+        );
+    }
+
+    #[test]
+    fn test_inherit_with_servers_error() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.tsserver]
+command = "typescript-language-server"
+
+[language.typescript]
+servers = ["tsserver"]
+
+[language.typescriptreact]
+inherit = "typescript"
+servers = ["tsserver"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("inherit") && err.contains("servers"),
+            "error should mention inherit + servers conflict: {err}",
+        );
+    }
+
+    /// Verify that `apply_env_overrides` creates both a `ServerDef` and a
+    /// `LanguageConfig` for each `CATENARY_SERVERS` spec. We test the
+    /// internal function directly on a default config to avoid `set_var`
+    /// (unsafe in Rust 2024).
+    #[test]
+    fn test_env_var_creates_both() {
+        let mut config = Config::default();
+
+        // Simulate what apply_env_overrides does for "rust:rust-analyzer --log-level info"
+        let server_name = "rust".to_string();
+        config.server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                args: vec!["--log-level".to_string(), "info".to_string()],
+                initialization_options: None,
+                settings: None,
+            },
+        );
+        config.language.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                servers: vec![server_name],
+                min_severity: None,
+                inherit: None,
+            },
+        );
+
+        // Verify both entries are correct
+        let server = config.server.get("rust").expect("rust server def");
+        assert_eq!(server.command, "rust-analyzer");
+        assert_eq!(server.args, vec!["--log-level", "info"]);
+
+        let lang = config.language.get("rust").expect("rust language config");
+        assert_eq!(lang.servers, vec!["rust"]);
+
+        // Config should validate
+        let errors = config.validate();
+        assert!(errors.is_empty(), "should be valid: {errors:?}");
+    }
+
+    #[test]
+    fn test_resolve_language_servers() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[server.tsserver]
+command = "typescript-language-server"
+
+[language.typescript]
+servers = ["tsserver"]
+
+[language.typescriptreact]
+inherit = "typescript"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        // Direct resolution
+        let (key, resolved) = config
+            .resolve_language("typescript")
+            .expect("should resolve");
+        assert_eq!(key, "typescript");
+        assert_eq!(resolved.servers, vec!["tsserver"]);
+
+        // Inherit resolution
+        let (key, resolved) = config
+            .resolve_language("typescriptreact")
+            .expect("should resolve");
+        assert_eq!(key, "typescript");
+        assert_eq!(resolved.servers, vec!["tsserver"]);
 
         Ok(())
     }

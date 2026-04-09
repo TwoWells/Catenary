@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-use super::{Config, LanguageConfig, default_idle_timeout, default_log_retention_days};
+use super::{Config, LanguageConfig, ServerDef, default_idle_timeout, default_log_retention_days};
 
 /// Load configuration from standard paths or a specific file.
 ///
@@ -81,6 +81,9 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     Ok(config)
 }
 
+/// Keys that belong on `ServerDef`, not `LanguageConfig`.
+const SERVER_DEF_KEYS: &[&str] = &["command", "args", "initialization_options", "settings"];
+
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`
 /// disambiguation.
 ///
@@ -90,6 +93,10 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
 /// - Both `[server.*]` and `[language.*]` → new format. `[server.*]` entries
 ///   are parsed as `ServerDef`.
 /// - Only `[language.*]` (or neither) → intermediate/new format, parsed directly.
+///
+/// Additionally, `[language.*]` entries containing inline server definition
+/// fields (`command`, `args`, `initialization_options`, `settings`) are
+/// rejected with a migration message — these fields now live in `[server.*]`.
 fn deserialize_source(contents: &str) -> Result<Config> {
     let raw: toml::Value = toml::from_str(contents).context("Failed to parse TOML")?;
 
@@ -116,6 +123,29 @@ fn deserialize_source(contents: &str) -> Result<Config> {
                  rename [server.*] entries to [language.*] and define servers \
                  in [server.*] with the new format. Run `catenary doctor` for guidance."
             );
+        }
+    }
+
+    // Reject [language.*] entries that contain inline server definition fields.
+    // These fields now belong in [server.*].
+    if let Some(lang_table) = raw.get("language").and_then(toml::Value::as_table) {
+        for (lang_key, entry) in lang_table {
+            if let Some(entry_table) = entry.as_table() {
+                let stale: Vec<&str> = SERVER_DEF_KEYS
+                    .iter()
+                    .copied()
+                    .filter(|k| entry_table.contains_key(*k))
+                    .collect();
+                if !stale.is_empty() {
+                    bail!(
+                        "[language.{lang_key}] contains server definition fields ({}) — \
+                         these now belong in [server.*]. Move them to a [server.*] \
+                         entry and reference it via `servers = [\"...\"]` in \
+                         [language.{lang_key}]. Run `catenary doctor` for guidance.",
+                        stale.join(", "),
+                    );
+                }
+            }
         }
     }
 
@@ -175,14 +205,23 @@ pub(super) fn apply_env_overrides(config: &mut Config) {
                 if let Some(program) = parts.next() {
                     let cmd_args: Vec<String> =
                         parts.map(std::string::ToString::to_string).collect();
+
+                    // Use the language key as the server name for env-derived entries
+                    let server_name = lang.to_string();
+                    config.server.insert(
+                        server_name.clone(),
+                        ServerDef {
+                            command: program.to_string(),
+                            args: cmd_args,
+                            initialization_options: None,
+                            settings: None,
+                        },
+                    );
                     config.language.insert(
                         lang.to_string(),
                         LanguageConfig {
-                            command: Some(program.to_string()),
-                            args: cmd_args,
-                            initialization_options: None,
+                            servers: vec![server_name],
                             min_severity: None,
-                            settings: None,
                             inherit: None,
                         },
                     );
@@ -201,11 +240,8 @@ pub(super) fn apply_default_inherits(config: &mut Config) {
             config.language.insert(
                 variant.to_string(),
                 LanguageConfig {
-                    command: None,
-                    args: Vec::new(),
-                    initialization_options: None,
+                    servers: Vec::new(),
                     min_severity: None,
-                    settings: None,
                     inherit: Some(base.to_string()),
                 },
             );
