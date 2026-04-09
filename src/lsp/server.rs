@@ -82,6 +82,11 @@ pub struct LspServer {
     // ── Configuration ─────────────────────────────────────────────
     settings: Option<Value>,
 
+    // ── Process tree ──────────────────────────────────────────
+    /// Tree monitor for settle loop. Created when the connection is set.
+    /// Sole owner is the settle loop; all access via [`Self::sample_tree`].
+    tree_monitor: Mutex<Option<catenary_proc::TreeMonitor>>,
+
     // ── Transport ───────────────────────────────────────────────
     connection: OnceLock<Connection>,
 }
@@ -120,6 +125,7 @@ impl LspServer {
             publishes_version: Arc::new(AtomicBool::new(false)),
             language,
             settings,
+            tree_monitor: Mutex::new(None),
             connection: OnceLock::new(),
         }
     }
@@ -307,9 +313,19 @@ impl LspServer {
     /// Sets the connection after two-phase construction.
     ///
     /// Called once after `Connection::new()` with the `Arc<LspServer>`
-    /// already wrapped. Subsequent calls are no-ops.
+    /// already wrapped. Also creates the [`catenary_proc::TreeMonitor`]
+    /// for the server's process tree. Subsequent calls are no-ops.
     pub fn set_connection(&self, connection: Connection) {
+        let pid = connection.pid();
         let _ = self.connection.set(connection);
+        if let Some(pid) = pid
+            && let Some(tm) = catenary_proc::TreeMonitor::new(pid)
+        {
+            *self
+                .tree_monitor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tm);
+        }
     }
 
     /// Returns a reference to the connection, if set.
@@ -369,6 +385,20 @@ impl LspServer {
     /// Returns a shared reference to the alive flag.
     pub fn alive_flag(&self) -> Option<Arc<AtomicBool>> {
         self.connection().map(Connection::alive_flag)
+    }
+
+    // ── Process tree ─────────────────────────────────────────────
+
+    /// Samples the process tree via the tree monitor.
+    ///
+    /// Returns `None` if the tree monitor has not been initialized
+    /// (connection not set) or the root process is gone.
+    pub(crate) fn sample_tree(&self) -> Option<catenary_proc::TreeSnapshot> {
+        self.tree_monitor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .map(catenary_proc::TreeMonitor::sample)
     }
 
     // ── Dispatch methods (moved from ServerInbox) ─────────────────
