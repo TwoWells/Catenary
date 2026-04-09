@@ -566,6 +566,22 @@ impl LspServer {
         self.diagnostics_notify.notify_waiters();
     }
 
+    /// Transitions from `Probing` to `Healthy` if currently probing.
+    ///
+    /// No-op if the server is in any other state. Used by tool request
+    /// success and the health probe to mark the server as proven.
+    pub fn try_transition_probing_to_healthy(&self) {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *lifecycle == ServerLifecycle::Probing {
+            *lifecycle = ServerLifecycle::Healthy;
+            drop(lifecycle);
+            self.state_notify.notify_waiters();
+        }
+    }
+
     /// Whether the server is actively reporting progress.
     ///
     /// Used by `Connection::request` to pause failure detection budget
@@ -1045,6 +1061,51 @@ mod tests {
                 "value": { "kind": "begin", "title": "Checking", "percentage": 0 }
             }),
         );
+        assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
+    }
+
+    // ── try_transition_probing_to_healthy tests ─────────────────────
+
+    #[test]
+    fn try_transition_probing_to_healthy_from_probing() {
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Probing);
+        server.try_transition_probing_to_healthy();
+        assert_eq!(server.lifecycle(), ServerLifecycle::Healthy);
+    }
+
+    #[test]
+    fn try_transition_probing_to_healthy_idempotent_from_healthy() {
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Healthy);
+        server.try_transition_probing_to_healthy();
+        assert_eq!(server.lifecycle(), ServerLifecycle::Healthy);
+    }
+
+    #[test]
+    fn try_transition_probing_to_healthy_noop_from_busy() {
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Busy(2));
+        server.try_transition_probing_to_healthy();
+        assert_eq!(server.lifecycle(), ServerLifecycle::Busy(2));
+    }
+
+    #[test]
+    fn try_transition_probing_to_healthy_noop_from_initializing() {
+        let server = test_server();
+        server.try_transition_probing_to_healthy();
+        assert_eq!(server.lifecycle(), ServerLifecycle::Initializing);
+    }
+
+    #[test]
+    fn try_transition_probing_to_healthy_noop_from_terminal() {
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Failed);
+        server.try_transition_probing_to_healthy();
+        assert_eq!(server.lifecycle(), ServerLifecycle::Failed);
+
+        server.set_lifecycle(ServerLifecycle::Dead);
+        server.try_transition_probing_to_healthy();
         assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
     }
 }

@@ -190,14 +190,57 @@ impl LspClient {
     /// Sends a request and waits for the response.
     ///
     /// Delegates to [`LspServer::request`] for transport and failure
-    /// detection, returning the raw JSON response.
+    /// detection, returning the raw JSON response. On success, transitions
+    /// `Probing` → `Healthy` (any successful response proves the server works).
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.server.request(method, params, self.parent_id).await
+        let result = self.server.request(method, params, self.parent_id).await?;
+        self.server.try_transition_probing_to_healthy();
+        Ok(result)
     }
 
     /// Sends a notification (no response expected).
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.server.notify(method, params, self.parent_id).await
+    }
+
+    /// Runs the health probe: sends `documentSymbol` to verify the server
+    /// can respond. Transitions `Probing` → `Healthy` on success, `Probing` →
+    /// `Failed` on error/timeout.
+    ///
+    /// Uses the same file the diagnostics pipeline is processing — the
+    /// `didOpen` that the pipeline sends serves as the probe's `didOpen`.
+    ///
+    /// Returns `true` if the server is now `Healthy`.
+    pub async fn run_health_probe(&self, uri: &str) -> bool {
+        if self.server.lifecycle() != ServerLifecycle::Probing {
+            return !self.server.lifecycle().is_terminal();
+        }
+
+        debug!("Running health probe on {uri}");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            self.request("textDocument/documentSymbol", params::document_symbols(uri)),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => {
+                // request() already called try_transition_probing_to_healthy
+                debug!("Health probe succeeded — server is Healthy");
+                true
+            }
+            Ok(Err(e)) => {
+                debug!("Health probe failed: {e}");
+                self.server.set_lifecycle(ServerLifecycle::Failed);
+                false
+            }
+            Err(_) => {
+                debug!("Health probe timed out (60s)");
+                self.server.set_lifecycle(ServerLifecycle::Failed);
+                false
+            }
+        }
     }
 
     /// Performs the LSP initialize handshake.
@@ -287,10 +330,9 @@ impl LspClient {
         )
         .await?;
 
-        // Mark as healthy (server may later report progress if indexing).
-        // Health probe (1b-07) will add a Probing → Healthy transition;
-        // until then, go directly to Healthy.
-        self.server.set_lifecycle(ServerLifecycle::Healthy);
+        // Mark as probing — server unproven until health probe or
+        // first successful tool request transitions to Healthy.
+        self.server.set_lifecycle(ServerLifecycle::Probing);
 
         Ok(raw)
     }
@@ -1099,21 +1141,26 @@ impl LspClient {
         }
     }
 
-    /// Waits until server is healthy (not initializing or busy).
+    /// Waits until server is ready to accept requests.
+    ///
+    /// Returns `true` for `Healthy` and `Probing` — both states accept
+    /// requests. `Probing` allows tool requests to be self-testing: a
+    /// successful response transitions `Probing` → `Healthy` via
+    /// [`LspServer::try_transition_probing_to_healthy`].
     ///
     /// Watches the lifecycle enum — wakes on every lifecycle transition.
     /// No budget, no tick counting, no process sampling. Servers that
     /// pass health are waited for patiently. `Connection::request`
     /// catches individual stuck requests with its own failure detection.
     ///
-    /// Returns `true` if healthy, `false` if server failed or died.
+    /// Returns `true` if ready, `false` if server failed or died.
     pub async fn wait_ready(&self) -> bool {
         loop {
             let lifecycle = self.server.lifecycle();
             match lifecycle {
-                ServerLifecycle::Healthy => return true,
+                ServerLifecycle::Healthy | ServerLifecycle::Probing => return true,
                 ServerLifecycle::Failed | ServerLifecycle::Dead => return false,
-                _ => {} // Initializing, Probing, Busy — keep waiting
+                _ => {} // Initializing, Busy — keep waiting
             }
             self.server.state_notify.notified().await;
         }

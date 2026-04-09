@@ -322,3 +322,81 @@ async fn test_content_modified_retry() -> Result<()> {
     client.shutdown().await?;
     Ok(())
 }
+
+/// Verifies lifecycle transitions: Initializing → Probing → Healthy.
+///
+/// After `initialize()`, server is `Probing`. The first successful tool
+/// request transitions it to `Healthy`.
+#[tokio::test]
+async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
+    use catenary_mcp::lsp::state::ServerLifecycle;
+
+    let dir = tempdir()?;
+    let script_path = dir.path().join(format!("probe.{MOCK_LANG_A}"));
+    std::fs::write(&script_path, "fn hello\nhello\n")?;
+
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A],
+        MOCK_LANG_A,
+        test_message_log(),
+        None,
+    )?;
+
+    // Before init: Initializing
+    assert_eq!(client.lifecycle(), ServerLifecycle::Initializing);
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    // After init: Probing
+    assert_eq!(client.lifecycle(), ServerLifecycle::Probing);
+
+    let uri = format!("file://{}", script_path.display());
+    client
+        .did_open(&uri, MOCK_LANG_A, 1, "fn hello\nhello\n")
+        .await?;
+
+    // Tool request succeeds → Probing → Healthy
+    let _result = client.definition(&uri, 1, 0).await?;
+    assert_eq!(client.lifecycle(), ServerLifecycle::Healthy);
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Verifies the health probe transitions Probing → Healthy.
+#[tokio::test]
+async fn test_health_probe_transitions_to_healthy() -> Result<()> {
+    use catenary_mcp::lsp::state::ServerLifecycle;
+
+    let dir = tempdir()?;
+    let script_path = dir.path().join(format!("probe.{MOCK_LANG_A}"));
+    std::fs::write(&script_path, "fn hello\nhello\n")?;
+
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A],
+        MOCK_LANG_A,
+        test_message_log(),
+        None,
+    )?;
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+    assert_eq!(client.lifecycle(), ServerLifecycle::Probing);
+
+    let uri = format!("file://{}", script_path.display());
+    client
+        .did_open(&uri, MOCK_LANG_A, 1, "fn hello\nhello\n")
+        .await?;
+
+    // Health probe sends documentSymbol → Probing → Healthy
+    assert!(client.run_health_probe(&uri).await);
+    assert_eq!(client.lifecycle(), ServerLifecycle::Healthy);
+
+    client.shutdown().await?;
+    Ok(())
+}

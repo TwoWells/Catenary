@@ -9,6 +9,7 @@
 
 use super::path_security::PathValidator;
 use super::tool_server::ToolServer;
+use crate::lsp::state::ServerLifecycle;
 use crate::lsp::{DiagnosticsWaitResult, LspClient, LspClientManager};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
@@ -110,6 +111,27 @@ impl DiagnosticsServer {
         }
 
         drop(doc_manager);
+
+        // Health probe: verify the server can respond before settling
+        match client.lifecycle() {
+            ServerLifecycle::Probing => {
+                if !client.run_health_probe(&uri).await {
+                    client.set_parent_id(None);
+                    return Ok(DiagnosticsResult {
+                        content: "[no language server]".into(),
+                        count: 0,
+                    });
+                }
+            }
+            ServerLifecycle::Failed | ServerLifecycle::Dead => {
+                client.set_parent_id(None);
+                return Ok(DiagnosticsResult {
+                    content: "[no language server]".into(),
+                    count: 0,
+                });
+            }
+            _ => {}
+        }
 
         let pulls = client.supports_pull_diagnostics();
 
