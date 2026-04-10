@@ -38,7 +38,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
 
 use catenary_mcp::lsp::LspServer;
-use catenary_mcp::lsp::settle::{SettleSample, SettleSink, settle_loop};
+use catenary_mcp::lsp::settle::{ProfileSample, ProfileSink, profile_loop};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -165,8 +165,8 @@ impl RecordingSink {
     }
 }
 
-impl SettleSink for RecordingSink {
-    fn record(&mut self, sample: &SettleSample) -> bool {
+impl ProfileSink for RecordingSink {
+    fn record(&mut self, sample: &ProfileSample) -> bool {
         let elapsed_ms = sample.timestamp.duration_since(self.start).as_millis();
 
         #[allow(
@@ -678,7 +678,7 @@ async fn profile_intensity() -> Result<()> {
         let settle_server = Arc::clone(&server);
         let server_name = def.name.to_string();
         let settle_handle = tokio::spawn(async move {
-            settle_loop(
+            profile_loop(
                 &mut tree_monitor,
                 &settle_server,
                 &server_name,
@@ -883,7 +883,7 @@ async fn profile_intensity_large() -> Result<()> {
     let settle_cancel = cancel.clone();
     let settle_server = Arc::clone(&server);
     let settle_handle = tokio::spawn(async move {
-        settle_loop(
+        profile_loop(
             &mut tree_monitor,
             &settle_server,
             "rust-analyzer-large",

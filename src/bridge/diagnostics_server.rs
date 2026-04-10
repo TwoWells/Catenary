@@ -4,14 +4,14 @@
 //! Diagnostics pipeline for PostToolUse hook requests.
 //!
 //! Handles file-change notifications: path resolution, LSP client lookup,
-//! document open/change, settle, diagnostics retrieval (push cache first,
-//! pull fallback), severity filtering, noise filtering, quick-fix
+//! document open/change, idle detection, diagnostics retrieval (push cache
+//! first, pull fallback), severity filtering, noise filtering, quick-fix
 //! collection, and compact formatting.
 
 use super::path_security::PathValidator;
 use super::tool_server::ToolServer;
 use crate::lsp::lang::path_to_uri;
-use crate::lsp::settle::{SettleResult, settle};
+use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::ServerLifecycle;
 use crate::lsp::{LspClient, LspClientManager};
 use anyhow::{Result, anyhow};
@@ -51,8 +51,9 @@ impl DiagnosticsServer {
 
     /// Processes a file change and returns diagnostics.
     ///
-    /// Pipeline: lifecycle check → probe → didOpen → didSave → settle →
-    /// retrieve (push cache first, `[clean]` semantics) → format → didClose.
+    /// Pipeline: lifecycle check → pre-idle → didOpen → probe → didSave →
+    /// post-idle → retrieve (push cache first, `[clean]` semantics) →
+    /// format → didClose.
     ///
     /// # Errors
     ///
@@ -139,18 +140,45 @@ impl DiagnosticsServer {
         version: i32,
         text: &str,
     ) -> Result<DiagnosticsResult> {
-        // Snapshot diagnostics generation before sending change
         let server = client.server().clone();
-        let gen_before = diagnostics_generation(&server, uri);
+        let cancel = CancellationToken::new();
 
-        // Send didOpen or didChange
+        // Pre-stimulus idle wait: ensure clean starting state
+        let pre_detector = IdleDetector::unconditional();
+        let pre_result = await_idle(&server, pre_detector, cancel.clone()).await;
+        debug!("pre-stimulus idle result: {pre_result:?}");
+
+        if pre_result == SettleResult::RootDied
+            || matches!(
+                client.lifecycle(),
+                ServerLifecycle::Failed | ServerLifecycle::Dead
+            )
+        {
+            return Ok(DiagnosticsResult {
+                content: "[no language server]".into(),
+                count: 0,
+            });
+        }
+
+        // Pre-stimulus baseline: prime the tree monitor's counters so the
+        // first post-stimulus sample captures any activity from processing.
+        let baseline_ticks = {
+            let s = Arc::clone(&server);
+            tokio::task::spawn_blocking(move || {
+                s.sample_tree().map_or(0, |snap| snap.cumulative_ticks)
+            })
+            .await
+            .unwrap_or(0)
+        };
+
+        // Send stimulus: didOpen or didChange
         if first_open {
             client.did_open(uri, lang_id, version, text).await?;
         } else {
             client.did_change(uri, version, text).await?;
         }
 
-        // Health probe: verify the server can respond before settling
+        // Health probe: verify the server can respond before waiting
         if client.lifecycle() == ServerLifecycle::Probing && !client.run_health_probe(uri).await {
             return Ok(DiagnosticsResult {
                 content: "[no language server]".into(),
@@ -163,21 +191,15 @@ impl DiagnosticsServer {
             client.did_save(uri).await?;
         }
 
-        // Settle: wait for the server process tree to go quiet.
-        // Skip if the push cache already has data (fast server processed
-        // the stimulus before we started polling).
-        let settle_result = if client.get_diagnostics(uri).is_empty() {
-            let cancel = CancellationToken::new();
-            let result = settle(&server, cancel).await;
-            debug!("settle result: {result:?}");
-            Some(result)
-        } else {
-            debug!("settle skipped: push cache already populated");
-            None
-        };
+        // Post-stimulus idle wait: wait for server to finish processing.
+        // Uses the pre-stimulus baseline so that even sub-delta-resolution
+        // activity (e.g., a single context switch) satisfies the work gate.
+        let post_detector = IdleDetector::after_activity(baseline_ticks);
+        let post_result = await_idle(&server, post_detector, cancel).await;
+        debug!("post-stimulus idle result: {post_result:?}");
 
-        // Check lifecycle after settle — server may have died during settle
-        if matches!(settle_result, Some(SettleResult::RootDied))
+        // Check lifecycle after idle wait — server may have died
+        if post_result == SettleResult::RootDied
             || matches!(
                 client.lifecycle(),
                 ServerLifecycle::Failed | ServerLifecycle::Dead
@@ -187,29 +209,6 @@ impl DiagnosticsServer {
                 content: "[no language server]".into(),
                 count: 0,
             });
-        }
-
-        // Post-settle: wait for diagnostics if they haven't arrived yet.
-        // Two cases:
-        // 1. Push cache empty — server publishes asynchronously (delayed).
-        // 2. Push cache has stale version — concurrent consumer's diagnostics
-        //    arrived but ours haven't yet (version mismatch).
-        if !diagnostics_current(&server, uri, gen_before, version) {
-            debug!("waiting for diagnostics after settle");
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                if diagnostics_current(&server, uri, gen_before, version) {
-                    debug!("diagnostics arrived");
-                    break;
-                }
-                tokio::select! {
-                    () = server.diagnostics_notify.notified() => {}
-                    () = tokio::time::sleep_until(deadline) => {
-                        debug!("no current diagnostics within 10s post-settle");
-                        break;
-                    }
-                }
-            }
         }
 
         // Retrieve diagnostics: push cache first, pull fallback
@@ -348,53 +347,6 @@ impl ToolServer for DiagnosticsServer {
             "count": result.count,
         }))
     }
-}
-
-/// Returns the current diagnostics generation for a URI.
-fn diagnostics_generation(server: &crate::lsp::LspServer, uri: &str) -> u64 {
-    server
-        .diagnostics_generation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(uri)
-        .copied()
-        .unwrap_or(0)
-}
-
-/// Checks whether diagnostics in the push cache are current.
-///
-/// Diagnostics are current if:
-/// - The generation advanced (new diagnostics arrived since stimulus), AND
-/// - The cached version matches or exceeds the version we sent (for
-///   servers that include version in `publishDiagnostics`).
-///
-/// For servers that don't publish version, the generation check alone
-/// is sufficient.
-fn diagnostics_current(
-    server: &crate::lsp::LspServer,
-    uri: &str,
-    gen_before: u64,
-    sent_version: i32,
-) -> bool {
-    use std::sync::atomic::Ordering;
-
-    // Generation must have advanced
-    if diagnostics_generation(server, uri) <= gen_before {
-        return false;
-    }
-
-    // If the server publishes version, verify the cached version matches
-    if server.publishes_version.load(Ordering::SeqCst) {
-        let cache = server
-            .diagnostics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((Some(cached_version), _)) = cache.get(uri) {
-            return *cached_version >= sent_version;
-        }
-    }
-
-    true
 }
 
 /// Resolves a file path to an absolute path.

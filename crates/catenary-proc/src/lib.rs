@@ -79,6 +79,7 @@ pub struct ProcessMonitor {
     prev_utime: Option<u64>,
     prev_stime: Option<u64>,
     prev_pfc: Option<u64>,
+    prev_csw: Option<u64>,
     inner: platform::MonitorInner,
 }
 
@@ -93,6 +94,7 @@ impl ProcessMonitor {
             prev_utime: None,
             prev_stime: None,
             prev_pfc: None,
+            prev_csw: None,
             inner: platform::MonitorInner::new(pid)?,
         })
     }
@@ -107,12 +109,14 @@ impl ProcessMonitor {
     )]
     pub fn sample(&mut self) -> Option<ProcessDelta> {
         let (utime, stime, pfc, ppid, state) = self.inner.sample()?;
+        let csw = self.inner.context_switches();
         let delta_utime = self.prev_utime.map_or(0, |prev| utime.saturating_sub(prev));
         let delta_stime = self.prev_stime.map_or(0, |prev| stime.saturating_sub(prev));
         let delta_pfc = self.prev_pfc.map_or(0, |prev| pfc.saturating_sub(prev));
         self.prev_utime = Some(utime);
         self.prev_stime = Some(stime);
         self.prev_pfc = Some(pfc);
+        self.prev_csw = Some(csw);
         Some(ProcessDelta {
             delta_utime,
             delta_stime,
@@ -120,6 +124,21 @@ impl ProcessMonitor {
             ppid,
             state,
         })
+    }
+
+    /// Returns the sum of cumulative counters from the most recent sample.
+    ///
+    /// Returns 0 before the first [`Self::sample`] call. After sampling,
+    /// this is `utime + stime + pfc + csw` — a monotonically increasing
+    /// value that advances whenever the process is scheduled. The context
+    /// switch count (`csw`) ensures detection of sub-centisecond processing
+    /// that would otherwise round to zero in the time-based counters.
+    #[must_use]
+    pub fn cumulative_ticks(&self) -> u64 {
+        self.prev_utime.unwrap_or(0)
+            + self.prev_stime.unwrap_or(0)
+            + self.prev_pfc.unwrap_or(0)
+            + self.prev_csw.unwrap_or(0)
     }
 }
 
@@ -147,6 +166,12 @@ pub struct TreeSnapshot {
     pub samples: Vec<TreeSample>,
     /// Total processes discovered (root + children).
     pub process_count: usize,
+    /// Sum of cumulative `utime + stime + pfc + csw` across all sampled processes.
+    ///
+    /// Monotonically increasing. Useful for pre/post-stimulus comparison:
+    /// if `cumulative_ticks` advanced between two snapshots, at least one
+    /// process in the tree was scheduled.
+    pub cumulative_ticks: u64,
 }
 
 /// Monitors a root process and all its descendants.
@@ -208,11 +233,13 @@ impl TreeMonitor {
             return TreeSnapshot {
                 samples: Vec::new(),
                 process_count: 0,
+                cumulative_ticks: 0,
             };
         }
 
         // Sample every monitor.
         let mut samples = Vec::with_capacity(self.monitors.len());
+        let mut cumulative_ticks: u64 = 0;
         for (&pid, monitor) in &mut self.monitors {
             if let Some(delta) = monitor.sample() {
                 samples.push(TreeSample {
@@ -224,11 +251,13 @@ impl TreeMonitor {
                     state: delta.state,
                 });
             }
+            cumulative_ticks += monitor.cumulative_ticks();
         }
 
         TreeSnapshot {
             samples,
             process_count,
+            cumulative_ticks,
         }
     }
 
@@ -389,20 +418,27 @@ mod platform {
     use super::{ProcessSample, ProcessState};
     use std::io::{Read, Seek, SeekFrom};
 
-    /// Persistent handle for Linux `/proc/<pid>/stat`.
+    /// Persistent handles for Linux `/proc/<pid>/stat` and `/proc/<pid>/status`.
     pub struct MonitorInner {
         file: std::fs::File,
+        status_file: Option<std::fs::File>,
         buf: String,
+        status_buf: String,
     }
 
     impl MonitorInner {
-        /// Opens `/proc/<pid>/stat` and returns a persistent monitor.
+        /// Opens `/proc/<pid>/stat` and `/proc/<pid>/status` and returns a
+        /// persistent monitor.
         pub fn new(pid: u32) -> Option<Self> {
             let path = format!("/proc/{pid}/stat");
             let file = std::fs::File::open(path).ok()?;
+            let status_path = format!("/proc/{pid}/status");
+            let status_file = std::fs::File::open(status_path).ok();
             Some(Self {
                 file,
+                status_file,
                 buf: String::with_capacity(256),
+                status_buf: String::with_capacity(1024),
             })
         }
 
@@ -415,6 +451,33 @@ mod platform {
             self.file.read_to_string(&mut self.buf).ok()?;
             parse_stat(&self.buf)
         }
+
+        /// Returns cumulative voluntary context switches from `/proc/<pid>/status`.
+        ///
+        /// Returns 0 if the status file is unavailable or the field cannot be parsed.
+        pub fn context_switches(&mut self) -> u64 {
+            let Some(ref mut f) = self.status_file else {
+                return 0;
+            };
+            self.status_buf.clear();
+            if f.seek(SeekFrom::Start(0)).is_err() {
+                return 0;
+            }
+            if f.read_to_string(&mut self.status_buf).is_err() {
+                return 0;
+            }
+            parse_voluntary_ctxt_switches(&self.status_buf)
+        }
+    }
+
+    /// Parse `voluntary_ctxt_switches` from `/proc/<pid>/status` contents.
+    fn parse_voluntary_ctxt_switches(contents: &str) -> u64 {
+        for line in contents.lines() {
+            if let Some(val) = line.strip_prefix("voluntary_ctxt_switches:\t") {
+                return val.trim().parse().unwrap_or(0);
+            }
+        }
+        0
     }
 
     /// Parse `/proc/<pid>/stat` contents.
@@ -502,27 +565,38 @@ mod platform {
     pub struct MonitorInner {
         pid: u32,
         ppid: u32,
+        last_csw: u64,
     }
 
     impl MonitorInner {
         /// Verifies the process exists and returns a monitor.
         pub fn new(pid: u32) -> Option<Self> {
             let (_, _, _, ppid, _) = sample_raw(pid)?;
-            Some(Self { pid, ppid })
+            Some(Self {
+                pid,
+                ppid,
+                last_csw: 0,
+            })
         }
 
         /// Samples via `proc_pidinfo` (task info only — ppid is cached).
         ///
         /// Returns `(utime, stime, pfc, ppid, state)`.
         pub fn sample(&mut self) -> Option<(u64, u64, u64, u32, ProcessState)> {
-            let (utime, stime, pfc, state) = sample_task(self.pid)?;
+            let (utime, stime, pfc, csw, state) = sample_task(self.pid)?;
+            self.last_csw = csw;
             Some((utime, stime, pfc, self.ppid, state))
+        }
+
+        /// Returns cumulative context switches from the most recent sample.
+        pub fn context_switches(&mut self) -> u64 {
+            self.last_csw
         }
     }
 
     /// Task-info-only sampling (no ppid). Used by [`MonitorInner::sample`]
     /// which caches ppid at construction.
-    fn sample_task(pid: u32) -> Option<(u64, u64, u64, ProcessState)> {
+    fn sample_task(pid: u32) -> Option<(u64, u64, u64, u64, ProcessState)> {
         // Safety: calling POSIX and Mach APIs with correctly sized buffers.
         unsafe { sample_task_inner(pid) }
     }
@@ -532,7 +606,7 @@ mod platform {
     /// Calls `libc::proc_pidinfo` (`PROC_PIDTASKINFO`) and
     /// `mach2::mach_time::mach_timebase_info` with correctly sized and zeroed
     /// buffers.
-    unsafe fn sample_task_inner(pid: u32) -> Option<(u64, u64, u64, ProcessState)> {
+    unsafe fn sample_task_inner(pid: u32) -> Option<(u64, u64, u64, u64, ProcessState)> {
         let (info, state) = unsafe { read_task_info(pid) }?;
 
         let mut timebase = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
@@ -545,11 +619,17 @@ mod platform {
 
         #[allow(
             clippy::cast_sign_loss,
-            reason = "page fault count is always non-negative"
+            reason = "page fault and context switch counts are always non-negative"
         )]
         let pfc = info.pti_faults as u64;
 
-        Some((utime, stime, pfc, state))
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "page fault and context switch counts are always non-negative"
+        )]
+        let csw = info.pti_csw as u64;
+
+        Some((utime, stime, pfc, csw, state))
     }
 
     /// Full sampling including ppid. Used by the stateless [`sample`] function.
@@ -564,7 +644,7 @@ mod platform {
     /// `PROC_PIDTBSDINFO`) and `libc::mach_timebase_info` with correctly
     /// sized and zeroed buffers.
     unsafe fn sample_raw_inner(pid: u32) -> Option<(u64, u64, u64, u32, ProcessState)> {
-        let (utime, stime, pfc, state) = unsafe { sample_task_inner(pid) }?;
+        let (utime, stime, pfc, _csw, state) = unsafe { sample_task_inner(pid) }?;
 
         // BSD info for parent PID
         let mut bsd_info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -701,8 +781,8 @@ mod platform {
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION,
-        PROCESS_VM_READ,
+        GetExitCodeProcess, GetProcessIoCounters, GetProcessTimes, OpenProcess,
+        PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
 
     /// Windows monitor — persistent `HANDLE`, closed in `Drop`.
@@ -732,6 +812,17 @@ mod platform {
             // Safety: `self.handle` is valid (opened in `new`, closed in `Drop`).
             let (utime, stime, pfc, state) = unsafe { sample_handle(self.handle) }?;
             Some((utime, stime, pfc, self.ppid, state))
+        }
+
+        /// Returns cumulative I/O operation count as a proxy for context switches.
+        ///
+        /// Uses `GetProcessIoCounters` to read `ReadOperationCount` — a
+        /// count-based signal that increments on every `ReadFile()` call.
+        /// The server must read from stdin to receive notifications, so
+        /// this is guaranteed to advance on any processed stimulus.
+        pub fn context_switches(&mut self) -> u64 {
+            // Safety: `self.handle` is valid (opened in `new`, closed in `Drop`).
+            unsafe { io_operation_count(self.handle) }
         }
     }
 
@@ -797,6 +888,24 @@ mod platform {
         };
 
         Some((utime, stime, pfc, state))
+    }
+
+    /// Read cumulative I/O read operation count via `GetProcessIoCounters`.
+    ///
+    /// Returns 0 on failure.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `handle` is a valid process handle with
+    /// `PROCESS_QUERY_INFORMATION` access.
+    unsafe fn io_operation_count(handle: HANDLE) -> u64 {
+        let mut counters: windows_sys::Win32::System::Threading::IO_COUNTERS =
+            unsafe { std::mem::zeroed() };
+        if unsafe { GetProcessIoCounters(handle, &mut counters) } != 0 {
+            counters.ReadOperationCount
+        } else {
+            0
+        }
     }
 
     /// Get parent PID via a toolhelp snapshot.
@@ -922,6 +1031,10 @@ mod platform {
 
         pub fn sample(&mut self) -> Option<(u64, u64, u64, u32, ProcessState)> {
             None
+        }
+
+        pub fn context_switches(&mut self) -> u64 {
+            0
         }
     }
 

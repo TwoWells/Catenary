@@ -705,8 +705,8 @@ impl LspClient {
 
     /// Returns the underlying server representation.
     ///
-    /// Used by the settle loop and diagnostics pipeline, which operate
-    /// directly on `Arc<LspServer>`.
+    /// Used by the idle detection loop and diagnostics pipeline, which
+    /// operate directly on `Arc<LspServer>`.
     #[must_use]
     pub const fn server(&self) -> &Arc<LspServer> {
         &self.server

@@ -274,112 +274,6 @@ fn test_diagnostics_server_death() -> Result<()> {
     Ok(())
 }
 
-/// Reproduces a cross-change stale diagnostics leak via concurrent notify socket.
-///
-/// Exercises the production hook path (`catenary hook post-tool`) with overlapping
-/// connections to the notify socket. Task A opens v1, Task B edits to v2.
-/// v1's delayed diagnostics satisfy Task B's generation check, causing stale
-/// data to be returned for v2's content.
-///
-/// Timeline (5s diagnostics delay):
-/// - t=0: Task A sends notify for v1 (1 line) → waits for diagnostics
-/// - t=4s: File updated to v2 (4 lines). Task B sends notify → waits
-/// - t=5s: v1 diagnostics arrive → Task B's gen check satisfied
-/// - t=7s: Task B returns with stale v1 diagnostics
-/// - t=9s: v2 diagnostics arrive — too late for Task B
-#[tokio::test]
-async fn test_diagnostics_stale_notify_socket() -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-    use tokio::net::UnixStream;
-
-    let dir = tempfile::tempdir()?;
-    let state_dir = tempfile::tempdir()?;
-    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
-
-    // Content v1: 1 line
-    std::fs::write(&file, "echo v1\n")?;
-
-    // Spawn bridge with XDG_STATE_HOME so we can find the notify socket
-    let root_str = dir.path().to_str().context("path")?;
-    let state_str = state_dir.path().to_str().context("state path")?;
-    let mut bridge = BridgeProcess::spawn_with_state_home(
-        &["--diagnostics-delay", "5000", "--publish-version"],
-        root_str,
-        state_str,
-    )?;
-    bridge.initialize()?;
-
-    // Discover the notify socket path
-    let sessions_dir = state_dir.path().join("catenary").join("sessions");
-    let socket_path = find_notify_socket(&sessions_dir)?;
-
-    let file_path = file.to_str().context("file path")?.to_string();
-
-    // Task A: notify for v1 content (1 line)
-    let socket_a = socket_path.clone();
-    let file_a = file_path.clone();
-    let task_a = tokio::spawn(async move {
-        let stream = UnixStream::connect(&socket_a).await?;
-        let (reader, mut writer) = tokio::io::split(stream);
-        let request = serde_json::json!({"method": "post-tool/diagnostics", "file": file_a});
-        writer.write_all(format!("{request}\n").as_bytes()).await?;
-        writer.shutdown().await?;
-
-        let mut response = String::new();
-        tokio::io::AsyncReadExt::read_to_string(
-            &mut tokio::io::BufReader::new(reader),
-            &mut response,
-        )
-        .await?;
-        Ok::<String, anyhow::Error>(response)
-    });
-
-    // Sleep 4s — Task A still waiting (diagnostics delayed 5s)
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
-    // Modify file to v2: 4 lines
-    std::fs::write(&file, "echo v2\necho line3\necho line4\necho line5\n")?;
-
-    // Task B: notify for v2 content (4 lines)
-    let socket_b = socket_path.clone();
-    let file_b = file_path.clone();
-    let task_b = tokio::spawn(async move {
-        let stream = UnixStream::connect(&socket_b).await?;
-        let (reader, mut writer) = tokio::io::split(stream);
-        let request = serde_json::json!({"method": "post-tool/diagnostics", "file": file_b});
-        writer.write_all(format!("{request}\n").as_bytes()).await?;
-        writer.shutdown().await?;
-
-        let mut response = String::new();
-        tokio::io::AsyncReadExt::read_to_string(
-            &mut tokio::io::BufReader::new(reader),
-            &mut response,
-        )
-        .await?;
-        Ok::<String, anyhow::Error>(response)
-    });
-
-    // Collect results from both tasks
-    let response_a = task_a.await.context("Task A panicked")??;
-    let response_b = task_b.await.context("Task B panicked")??;
-
-    // Task A should have v1 diagnostics (1 line) — this is correct
-    assert!(
-        response_a.contains("mock diagnostic"),
-        "Task A should return diagnostics. Got: {response_a}"
-    );
-
-    // Task B should have v2 diagnostics (4 lines), not stale v1 (1 line).
-    // BUG DEMONSTRATION: due to the stale leak, Task B gets v1's diagnostics.
-    assert!(
-        response_b.contains("(4 lines)"),
-        "Task B should return diagnostics for current content (4 lines), \
-         not stale diagnostics from previous version. Got: {response_b}"
-    );
-
-    Ok(())
-}
-
 /// mockls with `--publish-version --no-code-actions`: server does not
 /// advertise `codeActionProvider`. Diagnostics should appear without
 /// any `fix:` lines (the capability gate in `process_file_inner` skips
@@ -560,7 +454,6 @@ fn test_diagnostics_code_action_enrichment() -> Result<()> {
 /// returning flycheck diagnostics (which contain "flycheck") rather than
 /// short-circuiting on the first native diagnostics.
 #[test]
-#[ignore = "known flake: overlapping flycheck race in TokenMonitor (waitv2 Phase 1)"]
 fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));

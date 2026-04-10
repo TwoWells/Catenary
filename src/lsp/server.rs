@@ -83,8 +83,8 @@ pub struct LspServer {
     settings: Option<Value>,
 
     // ── Process tree ──────────────────────────────────────────
-    /// Tree monitor for settle loop. Created when the connection is set.
-    /// Sole owner is the settle loop; all access via [`Self::sample_tree`].
+    /// Tree monitor for idle detection. Created when the connection is set.
+    /// Sole owner is the idle detection loop; all access via [`Self::sample_tree`].
     tree_monitor: Mutex<Option<catenary_proc::TreeMonitor>>,
 
     // ── Transport ───────────────────────────────────────────────

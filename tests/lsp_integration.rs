@@ -210,15 +210,15 @@ async fn test_client_capabilities() -> Result<()> {
 
 // ── Settle tests ─────────────────────────────────────────────────────
 
-/// Verifies that settle waits through a `Busy` → `Healthy` lifecycle
+/// Verifies that `await_idle` waits through a `Busy` → `Healthy` lifecycle
 /// transition and returns `Settled` once the tree is quiet.
 ///
 /// mockls `--indexing-delay 200` sends `$/progress` begin, sleeps 200ms,
-/// then sends `$/progress` end. settle sees `Busy` → work gate satisfied,
-/// then resumes tree walking after `Healthy` and detects quiet.
+/// then sends `$/progress` end. `await_idle` sees `Busy` → skips tree
+/// walking, then resumes after `Healthy` and detects quiet.
 #[tokio::test]
 async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
-    use catenary_mcp::lsp::settle::{SettleResult, settle};
+    use catenary_mcp::lsp::settle::{IdleDetector, SettleResult, await_idle};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -235,12 +235,16 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
 
-    // settle starts while mockls is still in its indexing delay (Busy).
+    // await_idle starts while mockls is still in its indexing delay (Busy).
     let server = Arc::clone(client.server());
     let cancel = CancellationToken::new();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), settle(&server, cancel))
-        .await
-        .expect("settle should complete within 5s");
+    let detector = IdleDetector::after_activity(0);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        await_idle(&server, detector, cancel),
+    )
+    .await
+    .expect("await_idle should complete within 5s");
 
     assert_eq!(result, SettleResult::Settled);
 
@@ -248,14 +252,14 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that settle detects a quiet tree after brief CPU activity.
+/// Verifies that `await_idle` detects a quiet tree after brief CPU activity.
 ///
 /// mockls `--cpu-on-initialized 100` burns CPU for 100ms on the
-/// `initialized` notification. settle's tree walks catch the activity
-/// (work gate), then detect silence once the burn ends.
+/// `initialized` notification. `await_idle`'s tree walks catch the activity,
+/// then detect silence once the burn ends.
 #[tokio::test]
 async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
-    use catenary_mcp::lsp::settle::{SettleResult, settle};
+    use catenary_mcp::lsp::settle::{IdleDetector, SettleResult, await_idle};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -272,12 +276,16 @@ async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
 
-    // settle starts while mockls is burning CPU from the initialized notification.
+    // await_idle starts while mockls is burning CPU from initialized.
     let server = Arc::clone(client.server());
     let cancel = CancellationToken::new();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), settle(&server, cancel))
-        .await
-        .expect("settle should complete within 5s");
+    let detector = IdleDetector::after_activity(0);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        await_idle(&server, detector, cancel),
+    )
+    .await
+    .expect("await_idle should complete within 5s");
 
     assert_eq!(result, SettleResult::Settled);
 
