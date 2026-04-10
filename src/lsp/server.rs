@@ -39,7 +39,7 @@ pub struct LspServer {
     /// Raw server capabilities from the `initialize` response.
     capabilities: OnceLock<Value>,
 
-    supports_pull_diagnostics: OnceLock<bool>,
+    supports_pull_diagnostics: AtomicBool,
     supports_hover: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
     supports_references: OnceLock<bool>,
@@ -100,7 +100,7 @@ impl LspServer {
     pub fn new(language: String, settings: Option<Value>) -> Self {
         Self {
             capabilities: OnceLock::new(),
-            supports_pull_diagnostics: OnceLock::new(),
+            supports_pull_diagnostics: AtomicBool::new(false),
             supports_hover: OnceLock::new(),
             supports_definition: OnceLock::new(),
             supports_references: OnceLock::new(),
@@ -147,9 +147,8 @@ impl LspServer {
                 .get(key)
                 .is_some_and(|v| v.as_bool() != Some(false) && !v.is_null())
         };
-        let _ = self
-            .supports_pull_diagnostics
-            .set(has("diagnosticProvider"));
+        self.supports_pull_diagnostics
+            .store(has("diagnosticProvider"), Ordering::SeqCst);
         let _ = self.supports_hover.set(has("hoverProvider"));
         let _ = self.supports_definition.set(has("definitionProvider"));
         let _ = self.supports_references.set(has("referencesProvider"));
@@ -193,12 +192,24 @@ impl LspServer {
             .unwrap_or_else(|| EMPTY.get_or_init(|| Value::Object(serde_json::Map::new())))
     }
 
-    /// Returns whether the server advertises `diagnosticProvider` (pull model).
+    /// Returns whether the server supports pull diagnostics.
+    ///
+    /// Initially set from the `diagnosticProvider` capability. Can be
+    /// downgraded to `false` at runtime via [`Self::downgrade_pull_diagnostics`]
+    /// if the server fails the actual request.
     pub fn supports_pull_diagnostics(&self) -> bool {
+        self.supports_pull_diagnostics.load(Ordering::SeqCst)
+    }
+
+    /// Permanently disables pull diagnostics for this server.
+    ///
+    /// Called when `textDocument/diagnostic` fails on a server that
+    /// advertised `diagnosticProvider`. Subsequent calls to
+    /// [`Self::supports_pull_diagnostics`] return `false`.
+    pub fn downgrade_pull_diagnostics(&self) {
         self.supports_pull_diagnostics
-            .get()
-            .copied()
-            .unwrap_or(false)
+            .store(false, Ordering::SeqCst);
+        warn!("pull diagnostics downgraded to push-only");
     }
 
     /// Returns whether the server advertises `hoverProvider`.

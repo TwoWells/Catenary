@@ -59,6 +59,11 @@ struct Args {
     #[arg(long)]
     pull_diagnostics: bool,
 
+    /// Return an error for `textDocument/diagnostic` pull requests.
+    /// Used with `--pull-diagnostics` to test runtime downgrade behavior.
+    #[arg(long)]
+    fail_pull: bool,
+
     /// Only publish diagnostics on `didSave`, not `didOpen`/`didChange`.
     #[arg(long)]
     diagnostics_on_save: bool,
@@ -455,7 +460,21 @@ impl MockServer {
                 self.handle_type_hierarchy_prepare(&request.params)
             }
             "typeHierarchy/subtypes" => self.handle_type_hierarchy_subtypes(&request.params),
-            "textDocument/diagnostic" => Some(self.handle_pull_diagnostics(&request.params)),
+            "textDocument/diagnostic" => {
+                if self.args.fail_pull {
+                    self.send_response(&Response {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32603,
+                            message: "mockls: pull diagnostics failure (--fail-pull)".to_string(),
+                        }),
+                    });
+                    return;
+                }
+                Some(self.handle_pull_diagnostics(&request.params))
+            }
             "textDocument/codeAction" => Some(self.handle_code_action(&request.params)),
             "textDocument/prepareRename" => self.handle_prepare_rename(&request.params),
             "callHierarchy/outgoingCalls" | "typeHierarchy/supertypes" => {
@@ -1870,6 +1889,7 @@ mod tests {
             diagnostics_delay: 0,
             no_push_diagnostics: false,
             pull_diagnostics: false,
+            fail_pull: false,
             diagnostics_on_save: false,
             drop_after: None,
             hang_on: vec![],

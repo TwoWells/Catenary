@@ -563,3 +563,61 @@ fn test_near_threshold_flycheck() -> Result<()> {
 
     Ok(())
 }
+
+/// mockls with `--pull-diagnostics --fail-pull --no-push-diagnostics`:
+/// pull fails on first call → downgrade to push-only → `[clean]`.
+/// Second call skips pull (downgraded) → `[clean]`.
+#[test]
+fn test_pull_downgrade_no_push() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = BridgeProcess::spawn(
+        &["--pull-diagnostics", "--fail-pull", "--no-push-diagnostics"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    // First call: pull fails → downgrade → [clean]
+    let text1 = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    assert!(
+        text1.contains("[clean]"),
+        "Failed pull with no push should return [clean]. Got: {text1}"
+    );
+
+    // Second call: pull skipped (downgraded) → [clean]
+    let text2 = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    assert!(
+        text2.contains("[clean]"),
+        "Downgraded server should return [clean] without retrying pull. Got: {text2}"
+    );
+
+    Ok(())
+}
+
+/// mockls with `--pull-diagnostics --fail-pull --publish-version`:
+/// push is working, pull fails → downgrade → push cache has data →
+/// returns diagnostics.
+#[test]
+fn test_pull_downgrade_with_push() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = BridgeProcess::spawn(
+        &["--pull-diagnostics", "--fail-pull", "--publish-version"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    // Push cache is populated (push works), pull fails but push data
+    // is returned before pull is attempted.
+    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("mock diagnostic"),
+        "Server with working push should return diagnostics even with broken pull. Got: {text}"
+    );
+
+    Ok(())
+}

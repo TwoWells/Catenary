@@ -217,7 +217,14 @@ impl DiagnosticsServer {
             if !cached.is_empty() {
                 cached
             } else if client.supports_pull_diagnostics() {
-                client.pull_diagnostics(uri).await.unwrap_or_default()
+                match client.pull_diagnostics(uri).await {
+                    Ok(diags) => diags,
+                    Err(e) => {
+                        client.server().downgrade_pull_diagnostics();
+                        debug!("pull diagnostics failed, downgraded to push-only: {e}");
+                        Vec::new()
+                    }
+                }
             } else {
                 // Healthy server settled with nothing to report
                 Vec::new()
