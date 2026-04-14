@@ -234,7 +234,13 @@ fn normalize_stem(message: &str) -> String {
 }
 
 /// Default buffer capacity for bootstrap events before activation.
-const DEFAULT_BUFFER_CAP: usize = 256;
+///
+/// Sized for ~16× headroom over realistic bootstrap traffic (5–20 events
+/// of config load + DB migration). At ~200–500 bytes per [`OwnedEvent`],
+/// the cap bounds worst-case memory under a megabyte — small enough to
+/// ignore, large enough that a runaway logging bug during bootstrap is
+/// the only way to hit it.
+const DEFAULT_BUFFER_CAP: usize = 4096;
 
 /// Multi-sink tracing dispatcher. Catenary's telemetry port/adapter.
 ///
@@ -383,37 +389,31 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for LoggingServer {
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
 
-        // Always produce an OwnedEvent. In Buffering we move it into the
-        // buffer; in Active we dispatch via `as_log_event` (a borrowed
-        // view). Unifying here sidesteps partial-move complications from
-        // branching on the visitor.
-        let owned = visitor.finish_owned(severity, target.to_string());
-
-        // Decide under the mode lock. Clone sinks then drop the guard so
-        // sink work runs without holding the hot lock.
-        let sinks: Option<Vec<Arc<dyn Sink>>> = {
+        // Decide under the mode lock. The Buffering arm consumes
+        // `visitor` (into an OwnedEvent) and exits via `return`, so the
+        // post-match path is only reached on the Active branch where
+        // `visitor` is still intact — no OwnedEvent/target allocation on
+        // the hot path.
+        let sinks: Vec<Arc<dyn Sink>> = {
             let mut mode = lock_mode(&self.inner.mode);
             match &mut *mode {
-                Mode::Active(sinks) => Some(sinks.clone()),
+                Mode::Active(sinks) => sinks.clone(),
                 Mode::Buffering(bs) => {
+                    let owned = visitor.finish_owned(severity, target.to_string());
                     if bs.buffer.len() >= bs.cap {
                         let _ = bs.buffer.pop_front();
                         bs.dropped = bs.dropped.saturating_add(1);
                     }
-                    // Move `owned` into the buffer. The post-match
-                    // dispatch path is unreachable for this branch because
-                    // `sinks` is `None`.
                     bs.buffer.push_back(owned);
                     return;
                 }
             }
         };
 
-        if let Some(sinks) = sinks {
-            let log_event = owned.as_log_event();
-            for sink in &sinks {
-                sink.handle(&log_event);
-            }
+        // Active path: borrow target directly, no allocation.
+        let log_event = visitor.finish(severity, target);
+        for sink in &sinks {
+            sink.handle(&log_event);
         }
     }
 }
@@ -453,6 +453,24 @@ impl FieldVisitor {
                 self.fields
                     .insert(name.to_string(), serde_json::Value::String(value));
             }
+        }
+    }
+
+    fn finish(self, severity: Severity, target: &str) -> LogEvent<'_> {
+        LogEvent {
+            severity,
+            target,
+            message: self.message,
+            kind: self.kind,
+            method: self.method,
+            server: self.server,
+            client: self.client,
+            request_id: self.request_id,
+            parent_id: self.parent_id,
+            source: self.source,
+            language: self.language,
+            payload: self.payload,
+            fields: self.fields,
         }
     }
 
@@ -897,13 +915,17 @@ mod tests {
         });
 
         let events = recorder.snapshot();
-        // 20 buffered + 10 live + 1 final. (No dropped sentinel since
-        // buffer cap is the default 256.)
-        let total = events.iter().filter(|e| !e.message.is_empty()).count();
-        assert!(
-            total >= 31,
-            "expected at least 31 events, got {total}: {events:?}"
-        );
+        // Count is deterministic: 20 "buf" + 10 "live" + 1 "final" = 31.
+        // No drops (well under the 4096 cap), one-way mode transition
+        // means every emit path reaches a sink exactly once, and
+        // thread.join() guarantees all live events fire before we check.
+        let buf = events.iter().filter(|e| e.message == "buf").count();
+        let live = events.iter().filter(|e| e.message == "live").count();
+        let final_count = events.iter().filter(|e| e.message == "final").count();
+        assert_eq!(buf, 20, "buffered events: {events:?}");
+        assert_eq!(live, 10, "live events: {events:?}");
+        assert_eq!(final_count, 1, "final events: {events:?}");
+        assert_eq!(events.len(), 31);
     }
 
     #[test]
