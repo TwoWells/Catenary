@@ -22,6 +22,8 @@ pub mod filter;
 pub mod hook;
 /// Grammar installation, listing, and removal for tree-sitter integration.
 pub mod install;
+/// Multi-sink tracing dispatcher for Catenary telemetry.
+pub mod logging;
 /// LSP client implementation and server management.
 pub mod lsp;
 /// MCP server implementation and type definitions.
