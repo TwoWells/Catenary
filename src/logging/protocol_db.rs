@@ -50,12 +50,6 @@ impl ProtocolDbSink {
         });
         (sink, tx)
     }
-
-    /// Subscribe to ROWID notifications for newly inserted messages.
-    #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<i64> {
-        self.broadcast.subscribe()
-    }
 }
 
 impl Sink for ProtocolDbSink {
@@ -70,10 +64,13 @@ impl Sink for ProtocolDbSink {
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let payload = event.payload.as_deref().unwrap_or("");
 
-        let conn = self
-            .conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = match self.conn.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::trace!("protocol_db: mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
 
         let insert_result = conn.execute(
             "INSERT INTO messages \
@@ -349,8 +346,8 @@ mod tests {
     #[test]
     fn broadcasts_rowid_on_successful_insert() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db, "sess-1".into());
-        let mut rx = sink.subscribe();
+        let (sink, tx) = ProtocolDbSink::new(db, "sess-1".into());
+        let mut rx = tx.subscribe();
 
         sink.handle(&make_event(
             Some("lsp"),
@@ -368,8 +365,8 @@ mod tests {
     #[test]
     fn broadcast_skipped_on_insert_failure() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
-        let mut rx = sink.subscribe();
+        let (sink, tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let mut rx = tx.subscribe();
 
         db.lock()
             .expect("lock db")
