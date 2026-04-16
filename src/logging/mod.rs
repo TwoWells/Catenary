@@ -24,6 +24,7 @@
 
 pub mod notification_queue;
 pub mod protocol_db;
+pub mod trace_db;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
