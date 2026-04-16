@@ -17,6 +17,7 @@ use globset::{GlobBuilder, GlobMatcher};
 ///
 /// Wraps a [`GlobMatcher`] compiled with `literal_separator(true)` so that
 /// `*` does not cross path segment boundaries, matching LSP 3.17 semantics.
+#[derive(Clone)]
 pub struct LspGlob {
     matcher: GlobMatcher,
 }
@@ -47,6 +48,7 @@ impl LspGlob {
 }
 
 /// Parsed glob pattern — plain string or `RelativePattern`.
+#[derive(Clone)]
 pub enum GlobPattern {
     /// Plain glob — matched relative to workspace roots.
     Plain(LspGlob),
@@ -187,6 +189,20 @@ pub struct FileChange {
     pub path: PathBuf,
     /// The type of change.
     pub change_type: FileChangeType,
+}
+
+/// A set of file watchers from a single `client/registerCapability` registration.
+pub struct FileWatcherRegistration {
+    /// The parsed watchers in this registration.
+    pub watchers: Vec<ParsedWatcher>,
+}
+
+/// A single file watcher: a glob pattern and the event kinds to watch for.
+pub struct ParsedWatcher {
+    /// The compiled glob pattern.
+    pub pattern: GlobPattern,
+    /// Which event kinds this watcher is interested in.
+    pub kind: WatchKind,
 }
 
 #[cfg(test)]
