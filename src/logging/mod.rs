@@ -22,6 +22,8 @@
 //! This module provides the scaffolding — types, field extraction, and the
 //! Layer impl. Concrete sinks are added in subsequent tickets.
 
+pub mod notification_queue;
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
