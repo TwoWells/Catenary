@@ -7,8 +7,7 @@
 //! Protocol boundaries (`LspBridgeHandler`, `HookServer`) hold `Arc<Toolbox>`
 //! and access any dependency through it.
 
-use anyhow::{Result, anyhow};
-use globset::{GlobBuilder, GlobMatcher};
+use anyhow::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +22,7 @@ use super::handler::expand_tilde;
 use super::path_security::PathValidator;
 use crate::config::Config;
 use crate::lsp::LspClientManager;
+use crate::lsp::glob::LspGlob;
 use crate::session::MessageLog;
 
 /// A resolved glob pattern that handles tilde expansion and absolute paths.
@@ -32,7 +32,7 @@ use crate::session::MessageLog;
 /// extracts the non-glob base directory as a search root and matches against
 /// full paths.
 pub struct ResolvedGlob {
-    matcher: GlobMatcher,
+    glob: LspGlob,
     match_full_path: bool,
     override_root: Option<PathBuf>,
 }
@@ -45,22 +45,18 @@ impl ResolvedGlob {
     /// Returns an error if the pattern is not a valid glob.
     pub fn new(pattern: &str) -> Result<Self> {
         let expanded = expand_tilde(pattern);
-        let matcher = GlobBuilder::new(&expanded)
-            .literal_separator(true)
-            .build()
-            .map_err(|e| anyhow!("Invalid glob pattern: {e}"))?
-            .compile_matcher();
+        let glob = LspGlob::new(&expanded)?;
 
         if Path::new(&expanded).is_absolute() {
             let base = Self::base_dir(&expanded);
             Ok(Self {
-                matcher,
+                glob,
                 match_full_path: true,
                 override_root: Some(base),
             })
         } else {
             Ok(Self {
-                matcher,
+                glob,
                 match_full_path: false,
                 override_root: None,
             })
@@ -74,10 +70,10 @@ impl ResolvedGlob {
     #[must_use]
     pub fn is_match(&self, path: &Path, root: &Path) -> bool {
         if self.match_full_path {
-            self.matcher.is_match(path)
+            self.glob.is_match(path)
         } else {
             let rel = path.strip_prefix(root).unwrap_or(path);
-            self.matcher.is_match(rel)
+            self.glob.is_match(rel)
         }
     }
 
