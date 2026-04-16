@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
+use crate::lsp::glob::{FileChange, FileChangeType};
+
 /// Files above this size are assumed binary without reading.
 const BINARY_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
 
@@ -37,12 +39,12 @@ impl FileInfo {
     pub const fn language_id(&self) -> Option<&'static str> {
         match self.kind {
             FileKind::Text { language_id, .. } => language_id,
-            FileKind::Binary => None,
+            FileKind::Binary | FileKind::Folder => None,
         }
     }
 }
 
-/// File classification: binary or text.
+/// File classification: binary, text, or folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     /// Binary file (contains null bytes or exceeds size threshold).
@@ -55,6 +57,10 @@ pub enum FileKind {
         /// no known extension, filename, or shebang.
         language_id: Option<&'static str>,
     },
+    /// Directory entry. Used by [`FilesystemManager::seed`] and
+    /// [`FilesystemManager::diff`] for tracking directory creation and
+    /// deletion.
+    Folder,
 }
 
 /// Cross-tool filesystem classification cache.
@@ -70,9 +76,12 @@ pub struct FilesystemManager {
 }
 
 /// Cache entry storing classification results keyed by mtime.
+///
+/// `kind` is `None` for seed-only entries (stat-only, no classification).
+/// [`FilesystemManager::classify`] overwrites these on first access.
 struct CachedEntry {
     mtime: u64,
-    kind: FileKind,
+    kind: Option<FileKind>,
 }
 
 impl Default for FilesystemManager {
@@ -101,16 +110,17 @@ impl FilesystemManager {
         let size = metadata.len();
         let root = self.resolve_root(path);
 
-        // Check cache
+        // Check cache — skip unclassified (seed-only) entries.
         if let Ok(cache) = self.cache.lock()
             && let Some(entry) = cache.get(path)
             && entry.mtime == mtime
+            && let Some(kind) = entry.kind
         {
             return FileInfo {
                 mtime,
                 size,
                 root,
-                kind: entry.kind,
+                kind,
             };
         }
 
@@ -128,7 +138,13 @@ impl FilesystemManager {
 
         // Update cache
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(path.to_path_buf(), CachedEntry { mtime, kind });
+            cache.insert(
+                path.to_path_buf(),
+                CachedEntry {
+                    mtime,
+                    kind: Some(kind),
+                },
+            );
         }
 
         FileInfo {
@@ -144,10 +160,10 @@ impl FilesystemManager {
         matches!(self.classify(path, metadata).kind, FileKind::Binary)
     }
 
-    /// Returns the line count if the file is text, or `None` if binary.
+    /// Returns the line count if the file is text, or `None` if binary or folder.
     pub fn line_count(&self, path: &Path, metadata: &std::fs::Metadata) -> Option<usize> {
         match self.classify(path, metadata).kind {
-            FileKind::Binary => None,
+            FileKind::Binary | FileKind::Folder => None,
             FileKind::Text { lines, .. } => Some(lines),
         }
     }
@@ -244,6 +260,164 @@ impl FilesystemManager {
         }
 
         detected
+    }
+
+    /// Populates the cache with `(path, mtime)` for every file and directory
+    /// in the known roots. Stat-only — no content read, no classification.
+    /// Respects `.gitignore` via the `ignore` crate.
+    ///
+    /// Called once at session start during `LspClientManager` init. Subsequent
+    /// root additions use `add_root` which already walks the new root.
+    pub fn seed(&self) {
+        let roots = {
+            let Ok(roots) = self.roots.lock() else {
+                return;
+            };
+            roots.clone()
+        };
+
+        let mut entries = HashMap::new();
+        for root in &roots {
+            if !root.exists() {
+                continue;
+            }
+            let walker = WalkBuilder::new(root).git_ignore(true).hidden(true).build();
+            for entry in walker.flatten() {
+                let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+                let path = entry.into_path();
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let kind = if is_dir { Some(FileKind::Folder) } else { None };
+                    entries.insert(
+                        path,
+                        CachedEntry {
+                            mtime: mtime_secs(&meta),
+                            kind,
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = entries;
+        }
+    }
+
+    /// Diffs current disk state against the cache.
+    ///
+    /// Returns creates, changes, and deletes since last diff (or since seed
+    /// for the first call). Updates the cache to reflect current disk state.
+    ///
+    /// The cache lock is held for the full duration (walk + compare + update).
+    /// This is acceptable because `diff()` runs synchronously at tool
+    /// boundaries, the critical section is stat-bound, and no other code path
+    /// contends on the cache lock for long.
+    pub fn diff(&self) -> Vec<FileChange> {
+        let Ok(roots) = self.roots.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut cache) = self.cache.lock() else {
+            return Vec::new();
+        };
+
+        // Walk all roots, collecting current (path, mtime, is_dir) tuples.
+        let mut current: HashMap<PathBuf, (u64, bool)> = HashMap::new();
+        for root in roots.iter() {
+            if !root.exists() {
+                continue;
+            }
+            let walker = WalkBuilder::new(root).git_ignore(true).hidden(true).build();
+            for entry in walker.flatten() {
+                let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+                let path = entry.into_path();
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    current.insert(path, (mtime_secs(&meta), is_dir));
+                }
+            }
+        }
+        drop(roots);
+
+        let mut changes = Vec::new();
+
+        // Detect created and changed.
+        for (path, (mtime, _)) in &current {
+            match cache.get(path) {
+                None => changes.push(FileChange {
+                    path: path.clone(),
+                    change_type: FileChangeType::Created,
+                }),
+                Some(entry) if entry.mtime != *mtime => changes.push(FileChange {
+                    path: path.clone(),
+                    change_type: FileChangeType::Changed,
+                }),
+                _ => {}
+            }
+        }
+
+        // Detect deleted.
+        let deleted: Vec<PathBuf> = cache
+            .keys()
+            .filter(|p| !current.contains_key(*p))
+            .cloned()
+            .collect();
+        for path in &deleted {
+            changes.push(FileChange {
+                path: path.clone(),
+                change_type: FileChangeType::Deleted,
+            });
+            cache.remove(path);
+        }
+
+        // Update cache for created and changed entries.
+        for change in &changes {
+            match change.change_type {
+                FileChangeType::Created => {
+                    if let Some(&(mtime, is_dir)) = current.get(&change.path) {
+                        let kind = if is_dir { Some(FileKind::Folder) } else { None };
+                        cache.insert(change.path.clone(), CachedEntry { mtime, kind });
+                    }
+                }
+                FileChangeType::Changed => {
+                    if let Some(entry) = cache.get_mut(&change.path)
+                        && let Some(&(mtime, is_dir)) = current.get(&change.path)
+                    {
+                        entry.mtime = mtime;
+                        entry.kind = if is_dir { Some(FileKind::Folder) } else { None };
+                    }
+                }
+                FileChangeType::Deleted => {} // Already removed above.
+            }
+        }
+
+        changes
+    }
+
+    /// Refreshes cache entries for specific paths.
+    ///
+    /// Re-stats each path and updates its mtime in the cache. If a path no
+    /// longer exists, removes it from the cache.
+    ///
+    /// Used by `done_editing` to prevent the next [`diff`](Self::diff) from
+    /// reporting edited files as `Changed`.
+    pub fn mark_current(&self, paths: &[PathBuf]) {
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        for path in paths {
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    let mtime = mtime_secs(&meta);
+                    if let Some(entry) = cache.get_mut(path) {
+                        entry.mtime = mtime;
+                    } else {
+                        cache.insert(path.clone(), CachedEntry { mtime, kind: None });
+                    }
+                }
+                Err(_) => {
+                    cache.remove(path);
+                }
+            }
+        }
     }
 }
 
@@ -1120,5 +1294,322 @@ mod tests {
         let metadata = std::fs::metadata(&path).expect("metadata");
         let info = mgr.classify(&path, &metadata);
         assert_eq!(info.root, None);
+    }
+
+    // --- Seed / Diff / Mark current ---
+
+    /// Helper: set a file's mtime to a specific epoch second.
+    fn set_mtime(path: &Path, epoch_secs: u64) {
+        let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs);
+        let times = std::fs::FileTimes::new().set_modified(time);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for set_mtime");
+        file.set_times(times).expect("set_times");
+    }
+
+    #[test]
+    fn seed_populates_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write");
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        let changes = mgr.diff();
+        assert!(changes.is_empty(), "diff after seed should be empty");
+    }
+
+    #[test]
+    fn diff_detects_created_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("existing.rs"), "fn e() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        std::fs::write(dir.path().join("new.rs"), "fn n() {}\n").expect("write");
+
+        let changes = mgr.diff();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].path.ends_with("new.rs"));
+        assert_eq!(changes[0].change_type, FileChangeType::Created);
+    }
+
+    #[test]
+    fn diff_detects_changed_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("code.rs");
+        std::fs::write(&path, "fn original() {}\n").expect("write");
+        set_mtime(&path, 1_000_000);
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        // Change content and bump mtime.
+        std::fs::write(&path, "fn modified() {}\n").expect("write");
+        set_mtime(&path, 2_000_000);
+
+        let changes = mgr.diff();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].path.ends_with("code.rs"));
+        assert_eq!(changes[0].change_type, FileChangeType::Changed);
+    }
+
+    #[test]
+    fn diff_detects_deleted_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gone.rs");
+        std::fs::write(&path, "fn gone() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        std::fs::remove_file(&path).expect("remove");
+
+        let changes = mgr.diff();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].path.ends_with("gone.rs"));
+        assert_eq!(changes[0].change_type, FileChangeType::Deleted);
+    }
+
+    #[test]
+    fn diff_detects_created_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        std::fs::create_dir(dir.path().join("subdir")).expect("mkdir");
+
+        let changes = mgr.diff();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("subdir") && c.change_type == FileChangeType::Created),
+            "expected Created for new directory, got: {changes:?}",
+        );
+    }
+
+    #[test]
+    fn diff_detects_deleted_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("subdir")).expect("mkdir");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        std::fs::remove_dir(dir.path().join("subdir")).expect("rmdir");
+
+        let changes = mgr.diff();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("subdir") && c.change_type == FileChangeType::Deleted),
+            "expected Deleted for removed directory, got: {changes:?}",
+        );
+    }
+
+    #[test]
+    fn diff_updates_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("file.rs");
+        std::fs::write(&path, "fn f() {}\n").expect("write");
+        set_mtime(&path, 1_000_000);
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        // Trigger a change.
+        std::fs::write(&path, "fn changed() {}\n").expect("write");
+        set_mtime(&path, 2_000_000);
+
+        let first = mgr.diff();
+        assert_eq!(first.len(), 1);
+
+        // Second diff should be empty — cache was updated.
+        let second = mgr.diff();
+        assert!(
+            second.is_empty(),
+            "second diff should be empty after cache update"
+        );
+    }
+
+    #[test]
+    fn diff_multiple_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modify_path = dir.path().join("modify.rs");
+        let delete_path = dir.path().join("delete.rs");
+        std::fs::write(&modify_path, "fn m() {}\n").expect("write");
+        set_mtime(&modify_path, 1_000_000);
+        std::fs::write(&delete_path, "fn d() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        // Create, modify, and delete in one pass.
+        std::fs::write(dir.path().join("create.rs"), "fn c() {}\n").expect("write");
+        std::fs::write(&modify_path, "fn modified() {}\n").expect("write");
+        set_mtime(&modify_path, 2_000_000);
+        std::fs::remove_file(&delete_path).expect("remove");
+
+        let changes = mgr.diff();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("create.rs") && c.change_type == FileChangeType::Created),
+            "missing Created, got: {changes:?}",
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("modify.rs") && c.change_type == FileChangeType::Changed),
+            "missing Changed, got: {changes:?}",
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("delete.rs") && c.change_type == FileChangeType::Deleted),
+            "missing Deleted, got: {changes:?}",
+        );
+    }
+
+    #[test]
+    fn mark_current_refreshes_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edited.rs");
+        std::fs::write(&path, "fn e() {}\n").expect("write");
+        set_mtime(&path, 1_000_000);
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        // Simulate an edit — change content and mtime.
+        std::fs::write(&path, "fn edited() {}\n").expect("write");
+        set_mtime(&path, 2_000_000);
+
+        // mark_current refreshes the cache entry.
+        mgr.mark_current(std::slice::from_ref(&path));
+
+        // diff should see no changes for this file.
+        let changes = mgr.diff();
+        assert!(
+            !changes.iter().any(|c| c.path == path),
+            "mark_current should have prevented diff from reporting this file",
+        );
+    }
+
+    #[test]
+    fn mark_current_removes_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("doomed.rs");
+        std::fs::write(&path, "fn d() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        std::fs::remove_file(&path).expect("remove");
+        mgr.mark_current(std::slice::from_ref(&path));
+
+        // File should be gone from cache — diff should not report it.
+        let changes = mgr.diff();
+        assert!(
+            !changes.iter().any(|c| c.path == path),
+            "mark_current should have removed deleted file from cache",
+        );
+    }
+
+    #[test]
+    fn seed_respects_gitignore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Initialize a git repo so .gitignore is respected.
+        std::fs::create_dir(dir.path().join(".git")).expect("mkdir .git");
+        std::fs::write(dir.path().join(".gitignore"), "ignored/\n").expect("write gitignore");
+        std::fs::create_dir(dir.path().join("ignored")).expect("mkdir ignored");
+        std::fs::write(dir.path().join("ignored/secret.rs"), "fn s() {}\n").expect("write");
+        std::fs::write(dir.path().join("visible.rs"), "fn v() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        let cache = mgr.cache.lock().expect("lock");
+        let has_secret = cache
+            .keys()
+            .any(|p| p.to_string_lossy().contains("secret.rs"));
+        let has_visible = cache
+            .keys()
+            .any(|p| p.to_string_lossy().contains("visible.rs"));
+        drop(cache);
+        assert!(!has_secret, "gitignored file should not be in cache");
+        assert!(has_visible, "visible file should be in cache");
+    }
+
+    #[test]
+    fn diff_respects_gitignore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(".git")).expect("mkdir .git");
+        std::fs::write(dir.path().join(".gitignore"), "ignored/\n").expect("write gitignore");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+        mgr.seed();
+
+        // Create files in both ignored and visible locations.
+        std::fs::create_dir(dir.path().join("ignored")).expect("mkdir ignored");
+        std::fs::write(dir.path().join("ignored/new.rs"), "fn n() {}\n").expect("write");
+        std::fs::write(dir.path().join("visible.rs"), "fn v() {}\n").expect("write");
+
+        let changes = mgr.diff();
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.path.to_string_lossy().contains("ignored")),
+            "gitignored file should not appear in diff, got: {changes:?}",
+        );
+        assert!(
+            changes.iter().any(|c| c.path.ends_with("visible.rs")),
+            "visible file should appear in diff, got: {changes:?}",
+        );
+    }
+
+    #[test]
+    fn add_root_then_diff_reports_new_files() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        std::fs::write(dir_a.path().join("a.rs"), "fn a() {}\n").expect("write");
+        std::fs::write(dir_b.path().join("b.rs"), "fn b() {}\n").expect("write");
+
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![dir_a.path().to_path_buf()]);
+        mgr.seed();
+
+        // Add a second root.
+        mgr.set_roots(vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]);
+
+        let changes = mgr.diff();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("b.rs") && c.change_type == FileChangeType::Created),
+            "new root's files should appear as Created, got: {changes:?}",
+        );
+        // Existing root should have no changes.
+        assert!(
+            !changes.iter().any(|c| c.path.ends_with("a.rs")),
+            "existing root files should not appear, got: {changes:?}",
+        );
     }
 }
