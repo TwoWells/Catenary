@@ -23,6 +23,7 @@
 //! Layer impl. Concrete sinks are added in subsequent tickets.
 
 pub mod notification_queue;
+pub mod protocol_db;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
