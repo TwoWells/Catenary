@@ -6,9 +6,18 @@
 //! [`LoggingServer`] is a [`tracing_subscriber::Layer`] that subscribes to every
 //! tracing event in the process and dispatches structured events to registered
 //! sinks (notification queue, protocol-message DB, trace DB). It supports
-//! two-phase construction: the Layer is installed at binary entry in a
-//! `Buffering` state, and [`LoggingServer::activate`] transitions to `Active`
-//! once sinks are ready, draining any buffered events through the new sinks.
+//! two-phase construction: the Layer is installed at binary entry in a buffering
+//! state, and [`LoggingServer::activate`] transitions to active once sinks are
+//! ready, draining any buffered events through the new sinks.
+//!
+//! Post-activation, the hot path is lock-free: a single atomic load
+//! ([`OnceLock::get`]) reads the sinks slice and dispatches directly. No Mutex,
+//! no `Vec` clone, no refcount bumps per event.
+//!
+//! Each sink call is wrapped in [`std::panic::catch_unwind`]. A panicking sink
+//! does not prevent other sinks from receiving the event or crash the caller.
+//! The last panic message is stored and retrievable via
+//! [`LoggingServer::take_sink_panic`] for surfacing through `systemMessage`.
 //!
 //! This module provides the scaffolding — types, field extraction, and the
 //! Layer impl. Concrete sinks are added in subsequent tickets.
@@ -16,6 +25,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 
 use chrono::DateTime;
@@ -248,13 +258,21 @@ const DEFAULT_BUFFER_CAP: usize = 4096;
 /// handles share the same sinks and buffer. Install one clone as the
 /// tracing Layer and keep another on [`crate::bridge::Toolbox`] (or
 /// equivalent) for post-startup [`LoggingServer::activate`] calls.
+///
+/// Post-activation, the hot path is a single [`OnceLock::get`] (atomic
+/// load) — no Mutex, no cloning.
 #[derive(Clone)]
 pub struct LoggingServer {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    mode: Mutex<Mode>,
+    /// Sinks, set once at activation. Lock-free reads via `OnceLock::get`.
+    sinks: OnceLock<Arc<[Arc<dyn Sink>]>>,
+    /// Bootstrap buffer, `Some` until activation takes it.
+    buffer: Mutex<Option<BufferingState>>,
+    /// Last sink panic message, retrievable via [`LoggingServer::take_sink_panic`].
+    sink_panic: Mutex<Option<String>>,
     // Placeholder for ticket 04: in-process monotonic correlation ID
     // counter. Kept here so the Layer's ownership stays simple.
     #[allow(
@@ -264,11 +282,6 @@ struct Inner {
     next_id: AtomicI64,
 }
 
-enum Mode {
-    Buffering(BufferingState),
-    Active(Vec<Arc<dyn Sink>>),
-}
-
 struct BufferingState {
     buffer: VecDeque<OwnedEvent>,
     cap: usize,
@@ -276,91 +289,97 @@ struct BufferingState {
 }
 
 impl LoggingServer {
-    /// Construct in `Buffering` state with the default buffer cap (256).
+    /// Construct in buffering state with the default buffer cap (4096).
     #[must_use]
     pub fn new() -> Self {
         Self::with_buffer_cap(DEFAULT_BUFFER_CAP)
     }
 
-    /// Construct in `Buffering` state with a custom buffer cap.
+    /// Construct in buffering state with a custom buffer cap.
     #[must_use]
     pub fn with_buffer_cap(cap: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
-                mode: Mutex::new(Mode::Buffering(BufferingState {
+                sinks: OnceLock::new(),
+                buffer: Mutex::new(Some(BufferingState {
                     buffer: VecDeque::new(),
                     cap,
                     dropped: 0,
                 })),
+                sink_panic: Mutex::new(None),
                 next_id: AtomicI64::new(0),
             }),
         }
     }
 
-    /// Transition to `Active`, draining buffered events through `sinks`
-    /// in FIFO order. Subsequent events dispatch directly to `sinks`.
-    /// Idempotent: calling `activate` on an already-`Active` server is a
+    /// Transition to active, draining buffered events through `sinks` in
+    /// FIFO order. Subsequent events dispatch directly to `sinks`.
+    /// Idempotent: calling `activate` on an already-active server is a
     /// no-op.
     ///
     /// If bootstrap events were dropped due to buffer overflow, a
     /// `warn!()` is emitted after the drain describing the loss. That
     /// event flows through the now-active sinks like any other.
     pub fn activate(&self, sinks: Vec<Arc<dyn Sink>>) {
-        // Snapshot for drain — one Arc-ref-count bump per sink. The
-        // original `sinks` moves into `Mode::Active` below, so we need
-        // a separate handle for the post-lock drain loop.
-        let drain_sinks: Vec<Arc<dyn Sink>> = sinks.iter().map(Arc::clone).collect();
+        let sinks_arc: Arc<[Arc<dyn Sink>]> = sinks.into();
 
-        let buffered = {
-            let mut mode = lock_mode(&self.inner.mode);
-            if matches!(&*mode, Mode::Active(_)) {
-                return;
-            }
-            let taken = std::mem::replace(&mut *mode, Mode::Active(sinks));
-            drop(mode);
-            match taken {
-                Mode::Buffering(bs) => bs,
-                // Unreachable: we just verified the current mode was
-                // Buffering while holding the lock.
-                Mode::Active(_) => return,
-            }
+        // Set sinks first — enables the fast path in on_event. OnceLock
+        // returns Err if already set (idempotent activate).
+        if self.inner.sinks.set(sinks_arc).is_err() {
+            return;
+        }
+
+        // Re-read from OnceLock for the drain. (We just set it — this
+        // cannot be None.)
+        let Some(sinks) = self.inner.sinks.get() else {
+            return;
         };
 
-        // Lock released — drain buffered events through the new sinks.
-        for owned in &buffered.buffer {
-            let log_event = owned.as_log_event();
-            for sink in &drain_sinks {
-                sink.handle(&log_event);
+        // Take the buffer. Events arriving after sinks.set() use the
+        // fast path. Events already holding the buffer lock finish their
+        // push; we take the accumulated contents here.
+        let buffered = lock_recover(&self.inner.buffer).take();
+
+        if let Some(bs) = buffered {
+            for owned in &bs.buffer {
+                let log_event = owned.as_log_event();
+                dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
+            }
+
+            if bs.dropped > 0 {
+                tracing::warn!(
+                    source = "logging.bootstrap",
+                    dropped = i64::from(bs.dropped),
+                    "{} bootstrap events dropped (buffer overflow)",
+                    bs.dropped,
+                );
             }
         }
-
-        if buffered.dropped > 0 {
-            tracing::warn!(
-                source = "logging.bootstrap",
-                dropped = i64::from(buffered.dropped),
-                "{} bootstrap events dropped (buffer overflow)",
-                buffered.dropped,
-            );
-        }
     }
 
-    /// Number of registered sinks. Returns 0 in `Buffering` state.
+    /// Number of registered sinks. Returns 0 before activation.
     #[must_use]
     pub fn sink_count(&self) -> usize {
-        match &*lock_mode(&self.inner.mode) {
-            Mode::Active(sinks) => sinks.len(),
-            Mode::Buffering(_) => 0,
-        }
+        self.inner.sinks.get().map_or(0, |s| s.len())
     }
 
-    /// Buffered event count (test/diagnostic accessor). Returns 0 in
-    /// `Active` state.
+    /// Buffered event count (test/diagnostic accessor). Returns 0 after
+    /// activation.
     #[must_use]
     pub fn buffered_len(&self) -> usize {
-        match &*lock_mode(&self.inner.mode) {
-            Mode::Buffering(bs) => bs.buffer.len(),
-            Mode::Active(_) => 0,
-        }
+        lock_recover(&self.inner.buffer)
+            .as_ref()
+            .map_or(0, |bs| bs.buffer.len())
+    }
+
+    /// Take the last sink panic message, if any. Clears the stored value
+    /// so subsequent calls return `None` until another panic occurs.
+    ///
+    /// Used by the hook drain path (ticket 06) to surface sink panics
+    /// in `systemMessage`.
+    #[must_use]
+    pub fn take_sink_panic(&self) -> Option<String> {
+        lock_recover(&self.inner.sink_panic).take()
     }
 }
 
@@ -372,12 +391,38 @@ impl Default for LoggingServer {
 
 /// Recover from Mutex poisoning by taking the inner guard.
 ///
-/// Sinks may panic (e.g., closed DB connection). A poisoned mode Mutex must
-/// still be usable so logging continues for subsequent events. The Layer
-/// only mutates small state (push to `VecDeque`, swap Mode variant); any
-/// partially-applied change is tolerable.
-fn lock_mode(m: &Mutex<Mode>) -> std::sync::MutexGuard<'_, Mode> {
+/// A poisoned Mutex must still be usable so logging continues for
+/// subsequent events. The guarded state is small (bootstrap buffer,
+/// panic slot); partially-applied changes are tolerable.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Dispatch an event to sinks with per-sink panic isolation.
+///
+/// Each sink call is wrapped in [`std::panic::catch_unwind`]. A panicking
+/// sink stores its message in `panic_slot` (overwriting any previous value)
+/// and does not prevent other sinks from receiving the event. The panic
+/// message is recoverable via [`LoggingServer::take_sink_panic`].
+fn dispatch_to_sinks(
+    sinks: &[Arc<dyn Sink>],
+    event: &LogEvent<'_>,
+    panic_slot: &Mutex<Option<String>>,
+) {
+    for sink in sinks {
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.handle(event)))
+        {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            if let Ok(mut guard) = panic_slot.lock() {
+                *guard = Some(msg.to_string());
+            }
+        }
+    }
 }
 
 impl<S: Subscriber> tracing_subscriber::Layer<S> for LoggingServer {
@@ -389,31 +434,33 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for LoggingServer {
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
 
-        // Decide under the mode lock. The Buffering arm consumes
-        // `visitor` (into an OwnedEvent) and exits via `return`, so the
-        // post-match path is only reached on the Active branch where
-        // `visitor` is still intact — no OwnedEvent/target allocation on
-        // the hot path.
-        let sinks: Vec<Arc<dyn Sink>> = {
-            let mut mode = lock_mode(&self.inner.mode);
-            match &mut *mode {
-                Mode::Active(sinks) => sinks.clone(),
-                Mode::Buffering(bs) => {
-                    let owned = visitor.finish_owned(severity, target.to_string());
-                    if bs.buffer.len() >= bs.cap {
-                        let _ = bs.buffer.pop_front();
-                        bs.dropped = bs.dropped.saturating_add(1);
-                    }
-                    bs.buffer.push_back(owned);
-                    return;
-                }
-            }
-        };
+        // Fast path: sinks set (post-activate). Single atomic load — no
+        // Mutex, no Vec clone, no refcount bumps.
+        if let Some(sinks) = self.inner.sinks.get() {
+            let log_event = visitor.finish(severity, target);
+            dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
+            return;
+        }
 
-        // Active path: borrow target directly, no allocation.
-        let log_event = visitor.finish(severity, target);
-        for sink in &sinks {
-            sink.handle(&log_event);
+        // Slow path: buffer (pre-activate bootstrap).
+        let mut guard = lock_recover(&self.inner.buffer);
+
+        // Double-check: activate may have run between OnceLock check
+        // and lock acquisition.
+        if let Some(sinks) = self.inner.sinks.get() {
+            drop(guard);
+            let log_event = visitor.finish(severity, target);
+            dispatch_to_sinks(sinks, &log_event, &self.inner.sink_panic);
+            return;
+        }
+
+        if let Some(bs) = guard.as_mut() {
+            let owned = visitor.finish_owned(severity, target.to_string());
+            if bs.buffer.len() >= bs.cap {
+                let _ = bs.buffer.pop_front();
+                bs.dropped = bs.dropped.saturating_add(1);
+            }
+            bs.buffer.push_back(owned);
         }
     }
 }
@@ -544,7 +591,8 @@ impl tracing::field::Visit for FieldVisitor {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    clippy::panic,
+    reason = "tests use expect for assertions and panic for deliberate test sinks"
 )]
 mod tests {
     use super::LogEvent;
@@ -916,7 +964,7 @@ mod tests {
 
         let events = recorder.snapshot();
         // Count is deterministic: 20 "buf" + 10 "live" + 1 "final" = 31.
-        // No drops (well under the 4096 cap), one-way mode transition
+        // No drops (well under the 4096 cap), one-way sinks transition
         // means every emit path reaches a sink exactly once, and
         // thread.join() guarantees all live events fire before we check.
         let buf = events.iter().filter(|e| e.message == "buf").count();
@@ -941,5 +989,68 @@ mod tests {
             assert_eq!(server.sink_count(), 1);
             assert_eq!(server.buffered_len(), 0);
         });
+    }
+
+    #[test]
+    fn panicking_sink_does_not_block_other_sinks() {
+        struct PanicSink;
+        impl Sink for PanicSink {
+            fn handle(&self, _event: &LogEvent<'_>) {
+                panic!("sink exploded");
+            }
+        }
+
+        let server = LoggingServer::new();
+        let panic_sink: Arc<dyn Sink> = Arc::new(PanicSink);
+        let recorder = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            server.activate(vec![panic_sink, recorder.clone()]);
+            tracing::warn!("survives");
+        });
+        let events = recorder.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message, "survives");
+    }
+
+    #[test]
+    fn sink_panic_message_captured() {
+        struct PanicSink;
+        impl Sink for PanicSink {
+            fn handle(&self, _event: &LogEvent<'_>) {
+                panic!("connection closed");
+            }
+        }
+
+        let server = LoggingServer::new();
+        let panic_sink: Arc<dyn Sink> = Arc::new(PanicSink);
+        with_subscriber(server.clone(), || {
+            server.activate(vec![panic_sink]);
+            tracing::warn!("trigger");
+        });
+        let msg = server.take_sink_panic();
+        assert_eq!(msg.as_deref(), Some("connection closed"));
+        // take() clears the slot
+        assert!(server.take_sink_panic().is_none());
+    }
+
+    #[test]
+    fn sink_panic_during_buffer_drain_captured() {
+        struct PanicSink;
+        impl Sink for PanicSink {
+            fn handle(&self, _event: &LogEvent<'_>) {
+                panic!("drain boom");
+            }
+        }
+
+        let server = LoggingServer::new();
+        let panic_sink: Arc<dyn Sink> = Arc::new(PanicSink);
+        let recorder = Arc::new(RecorderSink::default());
+        with_subscriber(server.clone(), || {
+            tracing::warn!("buffered event");
+            server.activate(vec![panic_sink, recorder.clone()]);
+        });
+        // PanicSink panicked on the buffered event; recorder still got it
+        assert_eq!(recorder.snapshot().len(), 1);
+        assert_eq!(server.take_sink_panic().as_deref(), Some("drain boom"));
     }
 }
