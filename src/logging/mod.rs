@@ -31,11 +31,20 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 
 use chrono::DateTime;
 use chrono::Utc;
 use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
+
+/// In-process monotonic correlation ID.
+///
+/// Thin newtype over `i64` to prevent accidental conflation with DB ROWIDs
+/// during the migration period (tickets 07–10). The inner value is `pub` for
+/// ergonomic field access in `tracing` macros.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CorrelationId(pub i64);
 
 /// Severity of a logging event.
 ///
@@ -277,12 +286,9 @@ struct Inner {
     buffer: Mutex<Option<BufferingState>>,
     /// Last sink panic message, retrievable via [`LoggingServer::take_sink_panic`].
     sink_panic: Mutex<Option<String>>,
-    // Placeholder for ticket 04: in-process monotonic correlation ID
-    // counter. Kept here so the Layer's ownership stays simple.
-    #[allow(
-        dead_code,
-        reason = "ticket 04 wires next_id() accessor; field reserved now"
-    )]
+    /// In-process monotonic correlation ID counter. Session-scoped, starts
+    /// at 0. `Relaxed` ordering suffices — monotonicity per thread, no
+    /// inter-field synchronization.
     next_id: AtomicI64,
 }
 
@@ -384,6 +390,17 @@ impl LoggingServer {
     #[must_use]
     pub fn take_sink_panic(&self) -> Option<String> {
         lock_recover(&self.inner.sink_panic).take()
+    }
+
+    /// Mint a new correlation ID. Values are monotonically increasing,
+    /// session-scoped, and unique across threads.
+    ///
+    /// Used by protocol-boundary components (tickets 07–09) to pair
+    /// requests with responses (`request_id`) and build causation chains
+    /// (`parent_id`).
+    #[must_use]
+    pub fn next_id(&self) -> CorrelationId {
+        CorrelationId(self.inner.next_id.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -1056,5 +1073,38 @@ mod tests {
         // PanicSink panicked on the buffered event; recorder still got it
         assert_eq!(recorder.snapshot().len(), 1);
         assert_eq!(server.take_sink_panic().as_deref(), Some("drain boom"));
+    }
+
+    #[test]
+    fn correlation_next_id_is_monotonic() {
+        let server = LoggingServer::new();
+        assert_eq!(server.next_id(), super::CorrelationId(0));
+        assert_eq!(server.next_id(), super::CorrelationId(1));
+        assert_eq!(server.next_id(), super::CorrelationId(2));
+    }
+
+    #[test]
+    fn correlation_next_id_is_thread_safe() {
+        let server = LoggingServer::new();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..1000 {
+                        let _ = server.next_id();
+                    }
+                });
+            }
+        });
+        assert_eq!(server.next_id(), super::CorrelationId(4000));
+    }
+
+    #[test]
+    fn correlation_counter_survives_activation() {
+        let server = LoggingServer::new();
+        let _ = server.next_id(); // 0
+        let _ = server.next_id(); // 1
+        let sink = Arc::new(RecorderSink::default());
+        server.activate(vec![sink]);
+        assert_eq!(server.next_id(), super::CorrelationId(2));
     }
 }
