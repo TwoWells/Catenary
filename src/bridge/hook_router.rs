@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::debug;
 
 use super::toolbox::Toolbox;
+use crate::hook::response::SystemMessageBuilder;
 use crate::hook::{HookRequest, HookResult};
 
 // ── Tool classification helpers ─────────────────────────────────────────
@@ -46,6 +47,15 @@ fn is_allowed_during_editing(tool_name: &str) -> bool {
     tool_name.contains("start_editing")
         || tool_name.contains("done_editing")
         || tool_name == "ToolSearch"
+}
+
+/// Result of hook dispatch: the handler's result plus an optional
+/// `systemMessage` from the notification queue drain.
+pub struct DispatchResult {
+    /// Handler result (`None` = allow / no actionable data).
+    pub result: Option<HookResult>,
+    /// Composed `systemMessage` content (direct + background drain).
+    pub system_message: Option<String>,
 }
 
 // ── HookRouter ──────────────────────────────────────────────────────────
@@ -86,14 +96,18 @@ impl HookRouter {
 
     /// Dispatches a parsed hook request to the appropriate handler.
     ///
-    /// Returns `None` for "allow" (empty response — CLI outputs nothing).
-    /// Returns `Some(HookResult)` with actionable data for the CLI.
-    pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> Option<HookResult> {
+    /// Returns a [`DispatchResult`] with the handler's result and an optional
+    /// `systemMessage` from the notification queue drain. The queue is drained
+    /// only at stationary points (`SessionStart`, `Stop`/`AfterAgent` when allowing).
+    pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
         match request {
             HookRequest::PreAgentRootsSync {} => {
                 debug!("Hook: refresh roots requested");
                 self.refresh_roots.store(true, Ordering::Release);
-                None
+                DispatchResult {
+                    result: None,
+                    system_message: None,
+                }
             }
             HookRequest::PreToolEnforceEditing {
                 tool_name,
@@ -102,7 +116,10 @@ impl HookRouter {
                 session_id,
             } => {
                 self.store_client_session_id(session_id.as_deref());
-                self.handle_enforce_editing(&tool_name, &agent_id)
+                DispatchResult {
+                    result: self.handle_enforce_editing(&tool_name, &agent_id),
+                    system_message: None,
+                }
             }
             HookRequest::PostToolDiagnostics {
                 file,
@@ -112,17 +129,47 @@ impl HookRouter {
             } => {
                 self.store_client_session_id(session_id.as_deref());
                 debug!("Hook: processing file {file}");
-                self.handle_file_accumulation(&file, &agent_id, tool.as_deref())
+                DispatchResult {
+                    result: self.handle_file_accumulation(&file, &agent_id, tool.as_deref()),
+                    system_message: None,
+                }
             }
             HookRequest::PostAgentRequireRelease {
                 agent_id,
                 stop_hook_active,
-            } => self.handle_require_release(&agent_id, stop_hook_active),
+            } => {
+                let result = self.handle_require_release(&agent_id, stop_hook_active);
+                // Drain at stationary point: only when allowing the stop.
+                let system_message = if matches!(result, Some(HookResult::Block(_))) {
+                    None
+                } else {
+                    self.drain_notifications()
+                };
+                DispatchResult {
+                    result,
+                    system_message,
+                }
+            }
             HookRequest::SessionStartClearEditing { session_id } => {
                 self.store_client_session_id(session_id.as_deref());
-                self.handle_clear_editing()
+                let result = self.handle_clear_editing();
+                // Drain at stationary point: session start.
+                let system_message = self.drain_notifications();
+                DispatchResult {
+                    result,
+                    system_message,
+                }
             }
         }
+    }
+
+    /// Drain the notification queue into a `systemMessage` string.
+    ///
+    /// Returns `None` if the queue is empty and no sink panics occurred.
+    fn drain_notifications(&self) -> Option<String> {
+        let mut builder = SystemMessageBuilder::new();
+        builder.drain_background(&self.toolbox.notifications, &self.toolbox.logging);
+        builder.finish()
     }
 
     // ── Hook handlers ───────────────────────────────────────────────────
@@ -477,5 +524,187 @@ mod tests {
         fn deref(&self) -> &Self::Target {
             &self.router
         }
+    }
+
+    // ── Dispatch-level drain tests ─────────────────────────────────────
+
+    #[test]
+    fn dispatch_session_start_drains_notifications() {
+        let router = test_router();
+        // Populate the notification queue.
+        let event = crate::logging::LogEvent {
+            severity: crate::logging::Severity::Warn,
+            target: "test",
+            message: "server offline".to_string(),
+            kind: None,
+            method: None,
+            server: Some("ra".to_string()),
+            client: None,
+            request_id: None,
+            parent_id: None,
+            source: None,
+            language: None,
+            payload: None,
+            fields: serde_json::Map::new(),
+        };
+        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+        assert_eq!(router.toolbox.notifications.len(), 1);
+
+        let result = router.dispatch(
+            crate::hook::HookRequest::SessionStartClearEditing { session_id: None },
+            0,
+        );
+        assert!(
+            result.system_message.is_some(),
+            "session start should drain notifications"
+        );
+        assert!(router.toolbox.notifications.is_empty());
+    }
+
+    #[test]
+    fn dispatch_stop_allow_drains_notifications() {
+        let router = test_router();
+        let event = crate::logging::LogEvent {
+            severity: crate::logging::Severity::Warn,
+            target: "test",
+            message: "server offline".to_string(),
+            kind: None,
+            method: None,
+            server: Some("ra".to_string()),
+            client: None,
+            request_id: None,
+            parent_id: None,
+            source: None,
+            language: None,
+            payload: None,
+            fields: serde_json::Map::new(),
+        };
+        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+
+        // Not editing → allow → should drain.
+        let result = router.dispatch(
+            crate::hook::HookRequest::PostAgentRequireRelease {
+                agent_id: String::new(),
+                stop_hook_active: false,
+            },
+            0,
+        );
+        assert!(result.result.is_none(), "should allow");
+        assert!(
+            result.system_message.is_some(),
+            "allow should drain notifications"
+        );
+        assert!(router.toolbox.notifications.is_empty());
+    }
+
+    #[test]
+    fn dispatch_stop_block_preserves_notifications() {
+        let router = test_router();
+        // Enter editing mode so stop blocks.
+        router.handle_enforce_editing("start_editing", "");
+
+        let event = crate::logging::LogEvent {
+            severity: crate::logging::Severity::Warn,
+            target: "test",
+            message: "server offline".to_string(),
+            kind: None,
+            method: None,
+            server: Some("ra".to_string()),
+            client: None,
+            request_id: None,
+            parent_id: None,
+            source: None,
+            language: None,
+            payload: None,
+            fields: serde_json::Map::new(),
+        };
+        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+
+        let result = router.dispatch(
+            crate::hook::HookRequest::PostAgentRequireRelease {
+                agent_id: String::new(),
+                stop_hook_active: false,
+            },
+            0,
+        );
+        assert!(
+            matches!(result.result, Some(HookResult::Block(_))),
+            "should block"
+        );
+        assert!(result.system_message.is_none(), "block should not drain");
+        assert_eq!(
+            router.toolbox.notifications.len(),
+            1,
+            "queue should be preserved"
+        );
+    }
+
+    #[test]
+    fn dispatch_pre_tool_does_not_drain() {
+        let router = test_router();
+        let event = crate::logging::LogEvent {
+            severity: crate::logging::Severity::Warn,
+            target: "test",
+            message: "server offline".to_string(),
+            kind: None,
+            method: None,
+            server: Some("ra".to_string()),
+            client: None,
+            request_id: None,
+            parent_id: None,
+            source: None,
+            language: None,
+            payload: None,
+            fields: serde_json::Map::new(),
+        };
+        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+
+        let result = router.dispatch(
+            crate::hook::HookRequest::PreToolEnforceEditing {
+                tool_name: "Read".to_string(),
+                file_path: None,
+                agent_id: String::new(),
+                session_id: None,
+            },
+            0,
+        );
+        assert!(result.system_message.is_none(), "pre-tool should not drain");
+        assert_eq!(router.toolbox.notifications.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_post_tool_does_not_drain() {
+        let router = test_router();
+        let event = crate::logging::LogEvent {
+            severity: crate::logging::Severity::Warn,
+            target: "test",
+            message: "server offline".to_string(),
+            kind: None,
+            method: None,
+            server: Some("ra".to_string()),
+            client: None,
+            request_id: None,
+            parent_id: None,
+            source: None,
+            language: None,
+            payload: None,
+            fields: serde_json::Map::new(),
+        };
+        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+
+        let result = router.dispatch(
+            crate::hook::HookRequest::PostToolDiagnostics {
+                file: "/tmp/test.rs".to_string(),
+                tool: Some("Edit".to_string()),
+                agent_id: String::new(),
+                session_id: None,
+            },
+            0,
+        );
+        assert!(
+            result.system_message.is_none(),
+            "post-tool should not drain"
+        );
+        assert_eq!(router.toolbox.notifications.len(), 1);
     }
 }

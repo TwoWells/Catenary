@@ -182,33 +182,44 @@ fn extract_file_path(hook_json: &serde_json::Value) -> Option<String> {
 /// are delivered.
 ///
 /// Also validates the configuration at session start. If the config is
-/// invalid, emits a `systemMessage` directing the user to `catenary doctor`.
+/// invalid, surfaces a `systemMessage` directing the user to
+/// `catenary doctor`, combined with any background notifications from the
+/// notification queue drain.
 pub fn run_session_start(format: HostFormat) {
-    // Config validation — runs before anything else, no session needed.
+    use crate::hook::response::SystemMessageBuilder;
+    use crate::logging::Severity;
+
+    let mut builder = SystemMessageBuilder::new();
+
+    // Config validation — runs before IPC, no session needed.
     if let Err(e) = crate::config::Config::check() {
-        let msg =
-            format!("Catenary configuration error: {e:#}. Run `catenary doctor` for details.");
-        let output = format_session_message(&msg, format);
-        print!("{output}");
-        return;
+        builder.push_direct(
+            Severity::Error,
+            &format!("Catenary configuration error: {e:#}. Run `catenary doctor` for details."),
+        );
     }
 
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        emit_system_message(builder, format);
         return;
     };
     let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        emit_system_message(builder, format);
         return;
     };
 
     let Ok(conn) = db::open_and_migrate() else {
+        emit_system_message(builder, format);
         return;
     };
     let Some(catenary_sid) = find_session_id(&hook_json, &conn) else {
+        emit_system_message(builder, format);
         return;
     };
 
     let endpoint = notify_endpoint(&catenary_sid);
     let Some(stream) = notify_connect(&endpoint) else {
+        emit_system_message(builder, format);
         return;
     };
 
@@ -221,17 +232,39 @@ pub fn run_session_start(format: HostFormat) {
     let lines = ipc_exchange(stream, &request);
 
     if let Some(line) = lines.first()
-        && let Ok(crate::hook::HookResult::Cleared(count)) =
-            serde_json::from_str::<crate::hook::HookResult>(line)
+        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
     {
-        let msg = format!("Catenary: cleared {count} stale editing state entries");
-        let output = format_session_message(&msg, format);
-        print!("{output}");
+        if let Some(crate::hook::HookResult::Cleared(count)) = &envelope.result {
+            builder.push_direct(
+                Severity::Info,
+                &format!("Catenary: cleared {count} stale editing state entries"),
+            );
+        }
+        if let Some(bg) = envelope.system_message {
+            // Server-side background drain content: each line is a
+            // pre-rendered notification. Add them as background lines.
+            for bg_line in bg.lines() {
+                // Skip the header — the builder adds its own.
+                if !bg_line.starts_with("───") {
+                    builder.push_background(bg_line.to_string());
+                }
+            }
+        }
+    }
+
+    emit_system_message(builder, format);
+}
+
+/// Finalize a [`SystemMessageBuilder`] and print the `systemMessage` JSON
+/// if there is content.
+fn emit_system_message(builder: crate::hook::response::SystemMessageBuilder, format: HostFormat) {
+    if let Some(msg) = builder.finish() {
+        print!("{}", format_system_message(&msg, format));
     }
 }
 
-/// Format a `systemMessage` for session-start hooks.
-fn format_session_message(msg: &str, format: HostFormat) -> String {
+/// Format a `systemMessage` for hook responses.
+fn format_system_message(msg: &str, format: HostFormat) -> String {
     match format {
         HostFormat::Claude | HostFormat::Gemini => {
             serde_json::json!({ "systemMessage": msg }).to_string()
@@ -281,10 +314,15 @@ pub fn run_post_agent(format: HostFormat) {
     let lines = ipc_exchange(stream, &request);
 
     if let Some(line) = lines.first()
-        && let Ok(crate::hook::HookResult::Block(reason)) =
-            serde_json::from_str::<crate::hook::HookResult>(line)
+        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
     {
-        print!("{}", format_stop_block(&reason, format));
+        if let Some(crate::hook::HookResult::Block(reason)) = &envelope.result {
+            // Blocking: notifications stay queued (server didn't drain).
+            print!("{}", format_stop_block(reason, format));
+        } else if let Some(sys_msg) = &envelope.system_message {
+            // Allowing with background notifications.
+            print!("{}", format_system_message(sys_msg, format));
+        }
     }
 }
 
@@ -379,7 +417,14 @@ fn format_post_tool_response(lines: &[String], file_path: &str, format: HostForm
         .and_then(|n| n.to_str())
         .unwrap_or(file_path);
 
-    let Ok(result) = serde_json::from_str::<crate::hook::HookResult>(line) else {
+    // Parse as envelope (new format) or fall back to bare HookResult
+    // for compatibility during the migration window.
+    let result = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+        .ok()
+        .and_then(|env| env.result)
+        .or_else(|| serde_json::from_str::<crate::hook::HookResult>(line).ok());
+
+    let Some(result) = result else {
         print!(
             "{}",
             format_diagnostics(&format!("{filename}\n\t{line}"), format, "PostToolUse")
@@ -493,10 +538,10 @@ pub fn run_pre_tool(format: HostFormat) {
     let lines = ipc_exchange(stream, &request);
 
     if let Some(line) = lines.first()
-        && let Ok(crate::hook::HookResult::Deny(reason)) =
-            serde_json::from_str::<crate::hook::HookResult>(line)
+        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+        && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
     {
-        print!("{}", format_deny(&reason, format));
+        print!("{}", format_deny(reason, format));
     }
 }
 
@@ -654,6 +699,34 @@ mod tests {
         assert_eq!(parsed["systemMessage"], "Catenary: database unavailable");
         assert!(parsed["hookSpecificOutput"]["hookEventName"].is_null());
         assert!(parsed["hookSpecificOutput"]["additionalContext"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_system_message_claude() -> Result<()> {
+        let output =
+            format_system_message("─── background ───\n[warn] ra offline", HostFormat::Claude);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(
+            parsed["systemMessage"].as_str(),
+            Some("─── background ───\n[warn] ra offline"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_system_message_gemini() -> Result<()> {
+        let output = format_system_message(
+            "─── background ───\n[err] pylsp crashed",
+            HostFormat::Gemini,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(
+            parsed["systemMessage"].as_str(),
+            Some("─── background ───\n[err] pylsp crashed"),
+        );
         Ok(())
     }
 }

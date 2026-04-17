@@ -14,6 +14,8 @@
 //!
 //! Transport: Unix domain sockets on Unix, named pipes on Windows.
 
+pub mod response;
+
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -117,6 +119,24 @@ pub enum HookResult {
     Courtesy(String),
     /// Cleared editing state entries.
     Cleared(usize),
+}
+
+/// IPC response envelope carrying both the handler result and an optional
+/// `systemMessage` for the user.
+///
+/// The notification queue is drained at stationary hook points (`SessionStart`,
+/// `Stop`/`AfterAgent` when allowing) and delivered as `system_message`. The CLI
+/// hook process embeds this string in the host-specific `systemMessage` JSON
+/// field.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct HookResponseEnvelope {
+    /// Handler result (`None` = allow / no actionable data).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<HookResult>,
+    /// Composed `systemMessage` content from direct messages and background
+    /// notification drain. `None` = no `systemMessage` field in host output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
 }
 
 // ── HookServer ──────────────────────────────────────────────────────────
@@ -288,10 +308,15 @@ impl HookServer {
 
         let result = self.router.dispatch(request, entry_id);
 
-        let response = result
-            .as_ref()
-            .map(|r| serde_json::to_string(r).unwrap_or_default())
-            .unwrap_or_default();
+        let envelope = HookResponseEnvelope {
+            result: result.result,
+            system_message: result.system_message,
+        };
+        let response = if envelope.result.is_some() || envelope.system_message.is_some() {
+            serde_json::to_string(&envelope).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // Log outgoing hook response
         self.message_log.log(
@@ -567,6 +592,99 @@ mod tests {
             )
             .expect("query");
         assert_eq!(r_method, "pre-agent/roots-sync");
+    }
+
+    // ── Envelope serialization tests ──────────────────────────────────
+
+    #[test]
+    fn envelope_result_only() {
+        let env = HookResponseEnvelope {
+            result: Some(HookResult::Content("[clean]".into())),
+            system_message: None,
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.result, Some(HookResult::Content("[clean]".into())));
+        assert!(parsed.system_message.is_none());
+        // system_message should be absent from JSON (skip_serializing_if)
+        let raw: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(raw.get("system_message").is_none());
+    }
+
+    #[test]
+    fn envelope_system_message_only() {
+        let env = HookResponseEnvelope {
+            result: None,
+            system_message: Some("[warn] server offline".into()),
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.result.is_none());
+        assert_eq!(
+            parsed.system_message.as_deref(),
+            Some("[warn] server offline")
+        );
+        let raw: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(raw.get("result").is_none());
+    }
+
+    #[test]
+    fn envelope_both_fields() {
+        let env = HookResponseEnvelope {
+            result: Some(HookResult::Cleared(2)),
+            system_message: Some("─── background ───\n[warn] offline".into()),
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.result, Some(HookResult::Cleared(2)));
+        assert!(
+            parsed
+                .system_message
+                .as_ref()
+                .is_some_and(|m| m.contains("offline"))
+        );
+    }
+
+    #[test]
+    fn envelope_empty_is_default() {
+        let env = HookResponseEnvelope::default();
+        assert!(env.result.is_none());
+        assert!(env.system_message.is_none());
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert_eq!(json, "{}");
+    }
+
+    // ── Per-host response shape tests ──────────────────────────────────
+
+    #[test]
+    fn claude_code_response_shape() {
+        // Stop hook allow with background drain.
+        let env = HookResponseEnvelope {
+            result: None,
+            system_message: Some("─── background ───\n[warn] ra offline".into()),
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        // Claude Code reads systemMessage from the hook response.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(
+            parsed["system_message"].as_str(),
+            Some("─── background ───\n[warn] ra offline"),
+        );
+    }
+
+    #[test]
+    fn gemini_cli_response_shape() {
+        // AfterAgent hook allow with background drain.
+        let env = HookResponseEnvelope {
+            result: None,
+            system_message: Some("─── background ───\n[err] pylsp crashed".into()),
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(
+            parsed["system_message"].as_str(),
+            Some("─── background ───\n[err] pylsp crashed"),
+        );
     }
 
     // ── Test helpers ────────────────────────────────────────────────────
