@@ -176,6 +176,23 @@ struct Args {
     /// hovering on `fn` returns keyword docs, not the function's signature.
     #[arg(long)]
     literal_keyword_hover: bool,
+
+    /// Send `client/registerCapability` after `initialized` to register a
+    /// file watcher. The glob pattern defaults to `**/*`; override with
+    /// `--watcher-glob`.
+    #[arg(long)]
+    register_file_watchers: bool,
+
+    /// Glob pattern for the file watcher registration (default `**/*`).
+    /// Only meaningful with `--register-file-watchers`.
+    #[arg(long, default_value = "**/*")]
+    watcher_glob: String,
+
+    /// Restrict the registered file watcher to a specific `WatchKind` bitmask
+    /// (1=Create, 2=Change, 4=Delete; default 7=all). Only meaningful with
+    /// `--register-file-watchers`.
+    #[arg(long)]
+    watcher_kind: Option<u8>,
 }
 
 /// A JSON-RPC request.
@@ -513,12 +530,20 @@ impl MockServer {
     fn handle_notification(&mut self, method: &str, params: &Value) {
         // Log notification if configured
         if let Some(ref mut log) = self.notification_log {
-            let uri = params
-                .get("textDocument")
-                .and_then(|td| td.get("uri"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let entry = serde_json::json!({"method": method, "uri": uri});
+            let entry = if method == "workspace/didChangeWatchedFiles" {
+                let changes = params
+                    .get("changes")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new()));
+                serde_json::json!({"method": method, "changes": changes})
+            } else {
+                let uri = params
+                    .get("textDocument")
+                    .and_then(|td| td.get("uri"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                serde_json::json!({"method": method, "uri": uri})
+            };
             let _ = writeln!(log, "{entry}");
         }
 
@@ -529,6 +554,9 @@ impl MockServer {
                     while start.elapsed() < Duration::from_millis(busy_ms) {
                         std::hint::spin_loop();
                     }
+                }
+                if self.args.register_file_watchers {
+                    self.send_register_file_watchers();
                 }
                 if self.args.indexing_delay > 0 {
                     self.start_indexing_simulation();
@@ -1490,6 +1518,32 @@ impl MockServer {
         });
     }
 
+    fn send_register_file_watchers(&self) {
+        let mut watcher = serde_json::json!({ "globPattern": &self.args.watcher_glob });
+        if let Some(kind) = self.args.watcher_kind {
+            watcher["kind"] = serde_json::json!(kind);
+        }
+
+        let req_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        send_message(
+            &self.writer,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "client/registerCapability",
+                "params": {
+                    "registrations": [{
+                        "id": "mockls-file-watcher",
+                        "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": {
+                            "watchers": [watcher]
+                        }
+                    }]
+                }
+            }),
+        );
+    }
+
     fn send_configuration_request(&self) {
         let req_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
         send_message(
@@ -1913,6 +1967,9 @@ mod tests {
             no_empty_query: false,
             symbol_limit: None,
             literal_keyword_hover: false,
+            register_file_watchers: false,
+            watcher_glob: "**/*".to_string(),
+            watcher_kind: None,
         }
     }
 
