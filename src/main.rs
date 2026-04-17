@@ -401,12 +401,7 @@ async fn run_server() -> Result<()> {
     // Run MCP server (blocking - reads from stdin)
     let session_for_callback = session.clone();
     let runtime_for_roots = tokio::runtime::Handle::current();
-    let message_log = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .message_log()
-        .clone();
-    let mut mcp_server = McpServer::new(handler, message_log)
+    let mut mcp_server = McpServer::new(handler, toolbox_for_roots.logging.clone())
         .with_refresh_roots(refresh_roots_flag)
         .on_client_info(Box::new(move |name: &str, version: &str| {
             if let Ok(mut session) = session_for_callback.lock() {

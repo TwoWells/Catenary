@@ -2667,27 +2667,31 @@ fn test_grep_parent_id_threading() -> Result<()> {
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open test database")?;
 
-    // Find the tools/call MCP request message
-    let tool_call_id: i64 = conn
+    // Find the correlation ID of the tools/call MCP request.
+    // MCP events now use in-process monotonic correlation IDs stored in
+    // the `request_id` column (not the DB autoincrement `id`).
+    let tool_call_corr_id: i64 = conn
         .query_row(
-            "SELECT id FROM messages WHERE type = 'mcp' AND method = 'tools/call' LIMIT 1",
+            "SELECT request_id FROM messages \
+             WHERE type = 'mcp' AND method = 'tools/call' \
+             AND request_id IS NOT NULL LIMIT 1",
             [],
             |row| row.get(0),
         )
-        .context("find tools/call message")?;
+        .context("find tools/call correlation ID")?;
 
     // LSP messages from the grep pipeline should carry this parent_id
     let lsp_with_parent: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE type = 'lsp' AND parent_id = ?1",
-            [tool_call_id],
+            [tool_call_corr_id],
             |row| row.get(0),
         )
         .context("count LSP messages with parent_id")?;
 
     assert!(
         lsp_with_parent > 0,
-        "Expected LSP messages with parent_id={tool_call_id} from grep, found 0"
+        "Expected LSP messages with parent_id={tool_call_corr_id} from grep, found 0"
     );
 
     Ok(())
@@ -2723,27 +2727,29 @@ fn test_glob_parent_id_threading() -> Result<()> {
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open test database")?;
 
-    // Find the tools/call MCP request message
-    let tool_call_id: i64 = conn
+    // Find the correlation ID of the tools/call MCP request.
+    let tool_call_corr_id: i64 = conn
         .query_row(
-            "SELECT id FROM messages WHERE type = 'mcp' AND method = 'tools/call' LIMIT 1",
+            "SELECT request_id FROM messages \
+             WHERE type = 'mcp' AND method = 'tools/call' \
+             AND request_id IS NOT NULL LIMIT 1",
             [],
             |row| row.get(0),
         )
-        .context("find tools/call message")?;
+        .context("find tools/call correlation ID")?;
 
     // LSP messages from the glob pipeline should carry this parent_id
     let lsp_with_parent: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE type = 'lsp' AND parent_id = ?1",
-            [tool_call_id],
+            [tool_call_corr_id],
             |row| row.get(0),
         )
         .context("count LSP messages with parent_id")?;
 
     assert!(
         lsp_with_parent > 0,
-        "Expected LSP messages with parent_id={tool_call_id} from glob, found 0"
+        "Expected LSP messages with parent_id={tool_call_corr_id} from glob, found 0"
     );
 
     Ok(())

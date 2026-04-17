@@ -14,10 +14,49 @@ use super::types::{
     ListToolsResult, METHOD_NOT_FOUND, Notification, Request, RequestId, Response, Root,
     RootsListResult, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
-use crate::session::MessageLog;
+use crate::logging::LoggingServer;
 
 /// MCP protocol versions this server supports (newest first).
 const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
+
+/// Emit an MCP protocol event via `tracing::info!`.
+///
+/// Protocol routing is by `kind` field — `ProtocolDbSink` matches
+/// `kind in {lsp, mcp, hook}` regardless of tracing level.
+///
+/// Handles the optional `parent_id` field by branching into two macro
+/// invocations (tracing macros require static field sets).
+fn emit_mcp_event(
+    client_name: &str,
+    method: &str,
+    request_id: i64,
+    parent_id: Option<i64>,
+    payload: &str,
+    msg: &str,
+) {
+    if let Some(pid) = parent_id {
+        info!(
+            kind = "mcp",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            parent_id = pid,
+            payload = payload,
+            "{msg}"
+        );
+    } else {
+        info!(
+            kind = "mcp",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            payload = payload,
+            "{msg}"
+        );
+    }
+}
 
 /// Trait for handling MCP tool calls.
 pub trait ToolHandler: Send + Sync {
@@ -58,7 +97,7 @@ pub type RootsChangedCallback = Box<dyn Fn(Vec<Root>) -> Result<()> + Send + Syn
 pub struct McpServer<H: ToolHandler> {
     handler: H,
     initialized: bool,
-    message_log: Arc<MessageLog>,
+    logging: LoggingServer,
     /// Name of the connected MCP client (learned during initialize).
     client_name: String,
     on_client_info: Option<ClientInfoCallback>,
@@ -74,18 +113,18 @@ pub struct McpServer<H: ToolHandler> {
     on_roots_changed: Option<RootsChangedCallback>,
     /// Shared flag set by `HookServer` when a `PreToolUse` hook fires.
     refresh_roots: Arc<AtomicBool>,
-    /// Database ID of the current incoming message, set per `dispatch_message`.
+    /// Correlation ID of the current incoming message, set per `dispatch_message`.
     /// Read by `handle_tools_call` to supply `parent_id` to the tool handler.
-    current_entry_id: i64,
+    current_correlation_id: i64,
 }
 
 impl<H: ToolHandler> McpServer<H> {
     /// Creates a new `McpServer`.
-    pub fn new(handler: H, message_log: Arc<MessageLog>) -> Self {
+    pub fn new(handler: H, logging: LoggingServer) -> Self {
         Self {
             handler,
             initialized: false,
-            message_log,
+            logging,
             client_name: "unknown".to_string(),
             on_client_info: None,
             client_has_roots: false,
@@ -94,7 +133,7 @@ impl<H: ToolHandler> McpServer<H> {
             next_outbound_id: 0,
             on_roots_changed: None,
             refresh_roots: Arc::new(AtomicBool::new(false)),
-            current_entry_id: 0,
+            current_correlation_id: 0,
         }
     }
 
@@ -154,29 +193,29 @@ impl<H: ToolHandler> McpServer<H> {
             trace!("Received: {}", trimmed);
 
             // Log incoming message
-            let (entry_id, method) =
+            let (correlation_id, method) =
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     let method = json
                         .get("method")
                         .and_then(|m| m.as_str())
                         .unwrap_or("response")
                         .to_string();
-                    let id = self.message_log.log(
-                        "mcp",
-                        &method,
-                        "catenary",
+                    let id = self.logging.next_id();
+                    emit_mcp_event(
                         &self.client_name,
+                        &method,
+                        id.0,
                         None,
-                        None,
-                        &json,
+                        &json.to_string(),
+                        "incoming",
                     );
-                    (id, method)
+                    (id.0, method)
                 } else {
                     (0, String::new())
                 };
 
-            self.current_entry_id = entry_id;
-            self.dispatch_message(trimmed, &mut writer, entry_id, &method)?;
+            self.current_correlation_id = correlation_id;
+            self.dispatch_message(trimmed, &mut writer, correlation_id, &method)?;
 
             // Check if the hook server requested a roots refresh
             if self.refresh_roots.swap(false, Ordering::Acquire) {
@@ -200,12 +239,12 @@ impl<H: ToolHandler> McpServer<H> {
         &mut self,
         line: &str,
         writer: &mut impl Write,
-        entry_id: i64,
+        correlation_id: i64,
         method: &str,
     ) -> Result<()> {
         match self.handle_message(line) {
             Ok(Some(response)) => {
-                self.write_response(&response, writer, Some(entry_id), method)?;
+                self.write_response(&response, writer, Some(correlation_id), method)?;
             }
             Ok(None) => {
                 // Notification, no response needed
@@ -215,7 +254,7 @@ impl<H: ToolHandler> McpServer<H> {
                 // Try to send error response if we can parse the id
                 if let Ok(req) = serde_json::from_str::<Request>(line) {
                     let response = Response::error(req.id, INTERNAL_ERROR, e.to_string());
-                    self.write_response(&response, writer, Some(entry_id), method)?;
+                    self.write_response(&response, writer, Some(correlation_id), method)?;
                 }
             }
         }
@@ -234,15 +273,14 @@ impl<H: ToolHandler> McpServer<H> {
             serde_json::to_string(response).context("Failed to serialize response")?;
         trace!("Sending: {}", response_json);
 
-        if let Ok(json) = serde_json::to_value(response) {
-            self.message_log.log(
-                "mcp",
-                method,
-                "catenary",
+        if let Some(rid) = request_id {
+            emit_mcp_event(
                 &self.client_name,
-                request_id,
-                request_id,
-                &json,
+                method,
+                rid,
+                Some(rid),
+                &response_json,
+                "outgoing response",
             );
         }
 
@@ -398,7 +436,7 @@ impl<H: ToolHandler> McpServer<H> {
 
         debug!("Calling tool: {}", params.name);
 
-        let parent_id = Some(self.current_entry_id);
+        let parent_id = Some(self.current_correlation_id);
         match self
             .handler
             .call_tool(&params.name, params.arguments, parent_id)
@@ -458,19 +496,17 @@ impl<H: ToolHandler> McpServer<H> {
         trace!("Sending roots/list request: {}", request_json);
 
         // Log outbound request
-        let outbound_entry_id = if let Ok(json) = serde_json::to_value(&request) {
-            self.message_log.log(
-                "mcp",
-                "roots/list",
-                "catenary",
+        let outbound_id = self.logging.next_id();
+        if let Ok(json) = serde_json::to_value(&request) {
+            emit_mcp_event(
                 &self.client_name,
+                "roots/list",
+                outbound_id.0,
                 None,
-                None,
-                &json,
-            )
-        } else {
-            0
-        };
+                &json.to_string(),
+                "outgoing request",
+            );
+        }
 
         writeln!(writer, "{request_json}")?;
         writer.flush()?;
@@ -514,20 +550,19 @@ impl<H: ToolHandler> McpServer<H> {
                 if response.id == request_id {
                     // Log the response with request_id pointing to the outbound request
                     if let Ok(resp_json) = serde_json::to_value(&response) {
-                        self.message_log.log(
-                            "mcp",
-                            "roots/list",
-                            "catenary",
+                        emit_mcp_event(
                             &self.client_name,
-                            Some(outbound_entry_id),
-                            None,
-                            &resp_json,
+                            "roots/list",
+                            outbound_id.0,
+                            Some(outbound_id.0),
+                            &resp_json.to_string(),
+                            "incoming response",
                         );
                     }
                     let result = self.handle_roots_response(response);
                     // Replay buffered requests against the updated roots
-                    for (msg, buf_entry_id, buf_method) in &buffered {
-                        self.dispatch_message(msg, writer, *buf_entry_id, buf_method)?;
+                    for (msg, buf_correlation_id, buf_method) in &buffered {
+                        self.dispatch_message(msg, writer, *buf_correlation_id, buf_method)?;
                     }
                     return result;
                 }
@@ -544,22 +579,22 @@ impl<H: ToolHandler> McpServer<H> {
                 .and_then(|m| m.as_str())
                 .unwrap_or("response")
                 .to_string();
-            let entry_id = self.message_log.log(
-                "mcp",
-                &method,
-                "catenary",
+            let interleaved_id = self.logging.next_id();
+            emit_mcp_event(
                 &self.client_name,
+                &method,
+                interleaved_id.0,
                 None,
-                None,
-                &json,
+                &json.to_string(),
+                "incoming",
             );
 
             // Requests (id + method) are buffered until roots are applied.
             // Notifications dispatch immediately.
             if json.get("id").is_some() && json.get("method").is_some() {
-                buffered.push((trimmed.to_string(), entry_id, method));
+                buffered.push((trimmed.to_string(), interleaved_id.0, method));
             } else {
-                self.dispatch_message(trimmed, writer, entry_id, &method)?;
+                self.dispatch_message(trimmed, writer, interleaved_id.0, &method)?;
             }
         }
     }
@@ -643,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_handle_initialize() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -673,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_list() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -694,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_success() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -717,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_handle_tools_call_error() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -739,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_handle_unknown_method() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -759,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_handle_ping() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -797,7 +832,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_stored_when_present() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         assert!(!server.client_has_roots);
 
         initialize_server(&mut server, true)?;
@@ -807,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_absent_by_default() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
         Ok(())
@@ -815,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_after_initialized() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -832,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_should_fetch_roots_on_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let notification = Notification {
@@ -848,7 +883,7 @@ mod tests {
 
     #[test]
     fn test_no_fetch_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, false)?;
 
         let notification = Notification {
@@ -867,7 +902,7 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -918,7 +953,7 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
@@ -980,7 +1015,7 @@ mod tests {
     fn test_fetch_roots_handles_error_response() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -1002,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_list_changed_honored_without_capability() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         // Initialize WITHOUT roots capability
         initialize_server(&mut server, false)?;
         assert!(!server.client_has_roots);
@@ -1021,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_roots_capability_without_list_changed() -> Result<()> {
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
 
         // Initialize with `roots: {}` (no listChanged field)
         let request = Request {
@@ -1045,7 +1080,7 @@ mod tests {
     fn test_fetching_roots_reset_on_error() -> Result<()> {
         use std::io::Cursor;
 
-        let mut server = McpServer::new(TestHandler, Arc::new(MessageLog::noop()));
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
@@ -1060,55 +1095,120 @@ mod tests {
         Ok(())
     }
 
-    // ── MessageLog integration tests ─────────────────────────────────
+    // ── Protocol logging integration tests ────────────────────────────
 
     /// Row from the messages table for test assertions.
     struct MsgRow {
+        r#type: String,
         method: String,
         client: String,
         request_id: Option<i64>,
+        parent_id: Option<i64>,
     }
 
-    /// Create a test DB and return a `MessageLog` backed by it.
-    fn test_message_log() -> (Arc<MessageLog>, Arc<std::sync::Mutex<rusqlite::Connection>>) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let conn = crate::db::open_and_migrate_at(&dir.keep().join("catenary").join("catenary.db"))
-            .expect("open test db");
-        conn.execute(
-            "INSERT INTO sessions (id, pid, display_name, started_at) \
-             VALUES ('test', 1, 'test', '2026-01-01T00:00:00Z')",
-            [],
-        )
-        .expect("insert session");
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-        let log = Arc::new(MessageLog::new(conn.clone(), "test".to_string()));
-        (log, conn)
+    /// Set up a `LoggingServer` with `ProtocolDbSink` backed by an
+    /// in-memory DB, installed as the thread-local tracing subscriber.
+    fn setup_logging() -> (
+        LoggingServer,
+        Arc<std::sync::Mutex<rusqlite::Connection>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let conn = Arc::new(std::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().expect("open in-memory db"),
+        ));
+        conn.lock()
+            .expect("lock")
+            .execute_batch(
+                "CREATE TABLE sessions (
+                     id           TEXT PRIMARY KEY,
+                     pid          INTEGER NOT NULL,
+                     display_name TEXT NOT NULL,
+                     started_at   TEXT NOT NULL
+                 );
+                 INSERT INTO sessions (id, pid, display_name, started_at)
+                     VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
+                 CREATE TABLE messages (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id  TEXT NOT NULL,
+                     timestamp   TEXT NOT NULL,
+                     type        TEXT NOT NULL,
+                     method      TEXT NOT NULL,
+                     server      TEXT NOT NULL,
+                     client      TEXT NOT NULL,
+                     request_id  INTEGER,
+                     parent_id   INTEGER,
+                     payload     TEXT NOT NULL
+                 );",
+            )
+            .expect("create schema");
+
+        let logging = LoggingServer::new();
+        let (protocol_db, _tx) =
+            crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), "s1".into());
+        logging.activate(vec![protocol_db]);
+
+        let subscriber = tracing_subscriber::registry().with(logging.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        (logging, conn, guard)
     }
 
     /// Query all messages from the test DB, ordered by id.
     fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
         let c = conn.lock().expect("lock");
-        let rows: Vec<MsgRow> = c
-            .prepare("SELECT method, client, request_id FROM messages ORDER BY id")
-            .expect("prepare")
-            .query_map([], |row| {
-                Ok(MsgRow {
-                    method: row.get(0)?,
-                    client: row.get(1)?,
-                    request_id: row.get(2)?,
-                })
+        c.prepare(
+            "SELECT type, method, client, request_id, parent_id \
+             FROM messages ORDER BY id",
+        )
+        .expect("prepare")
+        .query_map([], |row| {
+            Ok(MsgRow {
+                r#type: row.get(0)?,
+                method: row.get(1)?,
+                client: row.get(2)?,
+                request_id: row.get(3)?,
+                parent_id: row.get(4)?,
             })
-            .expect("query")
-            .filter_map(std::result::Result::ok)
-            .collect();
-        drop(c);
-        rows
+        })
+        .expect("query")
+        .filter_map(std::result::Result::ok)
+        .collect()
+    }
+
+    /// Simulate the `run()` loop for a single message: mint a correlation
+    /// ID, emit the incoming MCP event, set `current_correlation_id`, and
+    /// dispatch.
+    fn simulate_incoming(
+        server: &mut McpServer<TestHandler>,
+        line: &str,
+        writer: &mut Vec<u8>,
+    ) -> Result<i64> {
+        let json: serde_json::Value = serde_json::from_str(line).context("invalid JSON in test")?;
+        let method = json
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("response")
+            .to_string();
+        let id = server.logging.next_id();
+        emit_mcp_event(
+            &server.client_name,
+            &method,
+            id.0,
+            None,
+            &json.to_string(),
+            "incoming",
+        );
+        server.current_correlation_id = id.0;
+        server.dispatch_message(line, writer, id.0, &method)?;
+        Ok(id.0)
     }
 
     #[test]
     fn test_mcp_log_initialize() -> Result<()> {
-        let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, log);
+        let (logging, conn, _guard) = setup_logging();
+        let mut server = McpServer::new(TestHandler, logging);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1123,42 +1223,31 @@ mod tests {
 
         let line = serde_json::to_string(&request)?;
         let mut writer: Vec<u8> = Vec::new();
-
-        // Parse and log the incoming message (simulating run loop)
-        let json: serde_json::Value = serde_json::from_str(&line)?;
-        let method = json
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("response")
-            .to_string();
-        let entry_id = server.message_log.log(
-            "mcp",
-            &method,
-            "catenary",
-            &server.client_name,
-            None,
-            None,
-            &json,
-        );
-        server.dispatch_message(&line, &mut writer, entry_id, &method)?;
+        let correlation_id = simulate_incoming(&mut server, &line, &mut writer)?;
 
         let msgs = query_messages(&conn);
         assert_eq!(msgs.len(), 2, "should have request + response");
+        assert_eq!(msgs[0].r#type, "mcp");
         assert_eq!(msgs[0].method, "initialize");
-        assert!(msgs[0].request_id.is_none());
+        assert!(msgs[0].parent_id.is_none());
         assert_eq!(msgs[1].method, "initialize");
         assert_eq!(
             msgs[1].request_id,
-            Some(entry_id),
+            Some(correlation_id),
             "response request_id should point to the incoming request"
+        );
+        assert_eq!(
+            msgs[1].parent_id,
+            Some(correlation_id),
+            "response parent_id should match request_id"
         );
         Ok(())
     }
 
     #[test]
     fn test_mcp_log_tools_call() -> Result<()> {
-        let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, log);
+        let (logging, conn, _guard) = setup_logging();
+        let mut server = McpServer::new(TestHandler, logging);
 
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1172,27 +1261,16 @@ mod tests {
 
         let line = serde_json::to_string(&request)?;
         let mut writer: Vec<u8> = Vec::new();
-
-        let json: serde_json::Value = serde_json::from_str(&line)?;
-        let method = "tools/call".to_string();
-        let entry_id = server.message_log.log(
-            "mcp",
-            &method,
-            "catenary",
-            &server.client_name,
-            None,
-            None,
-            &json,
-        );
-        server.dispatch_message(&line, &mut writer, entry_id, &method)?;
+        let correlation_id = simulate_incoming(&mut server, &line, &mut writer)?;
 
         let msgs = query_messages(&conn);
         assert_eq!(msgs.len(), 2, "should have request + response");
+        assert_eq!(msgs[0].r#type, "mcp");
         assert_eq!(msgs[0].method, "tools/call");
         assert_eq!(msgs[1].method, "tools/call");
         assert_eq!(
             msgs[1].request_id,
-            Some(entry_id),
+            Some(correlation_id),
             "response request_id should point to the incoming request"
         );
         Ok(())
@@ -1200,8 +1278,8 @@ mod tests {
 
     #[test]
     fn test_mcp_log_notification() -> Result<()> {
-        let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, log);
+        let (logging, conn, _guard) = setup_logging();
+        let mut server = McpServer::new(TestHandler, logging);
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
@@ -1211,31 +1289,21 @@ mod tests {
 
         let line = serde_json::to_string(&notification)?;
         let mut writer: Vec<u8> = Vec::new();
-
-        let json: serde_json::Value = serde_json::from_str(&line)?;
-        let method = "notifications/initialized".to_string();
-        let entry_id = server.message_log.log(
-            "mcp",
-            &method,
-            "catenary",
-            &server.client_name,
-            None,
-            None,
-            &json,
-        );
-        server.dispatch_message(&line, &mut writer, entry_id, &method)?;
+        simulate_incoming(&mut server, &line, &mut writer)?;
 
         let msgs = query_messages(&conn);
         assert_eq!(msgs.len(), 1, "notification has no response");
+        assert_eq!(msgs[0].r#type, "mcp");
         assert_eq!(msgs[0].method, "notifications/initialized");
-        assert!(msgs[0].request_id.is_none());
+        assert!(msgs[0].request_id.is_some(), "should have a correlation ID");
+        assert!(msgs[0].parent_id.is_none());
         Ok(())
     }
 
     #[test]
     fn test_mcp_log_client_name() -> Result<()> {
-        let (log, conn) = test_message_log();
-        let mut server = McpServer::new(TestHandler, log);
+        let (logging, conn, _guard) = setup_logging();
+        let mut server = McpServer::new(TestHandler, logging);
 
         // Initialize to set client_name
         let init_request = Request {
@@ -1251,17 +1319,7 @@ mod tests {
 
         let line = serde_json::to_string(&init_request)?;
         let mut writer: Vec<u8> = Vec::new();
-        let json: serde_json::Value = serde_json::from_str(&line)?;
-        let entry_id = server.message_log.log(
-            "mcp",
-            "initialize",
-            "catenary",
-            &server.client_name,
-            None,
-            None,
-            &json,
-        );
-        server.dispatch_message(&line, &mut writer, entry_id, "initialize")?;
+        simulate_incoming(&mut server, &line, &mut writer)?;
 
         // Now send a second request — client_name should be "claude-code"
         let ping = Request {
@@ -1272,17 +1330,7 @@ mod tests {
         };
 
         let line = serde_json::to_string(&ping)?;
-        let json: serde_json::Value = serde_json::from_str(&line)?;
-        let entry_id = server.message_log.log(
-            "mcp",
-            "ping",
-            "catenary",
-            &server.client_name,
-            None,
-            None,
-            &json,
-        );
-        server.dispatch_message(&line, &mut writer, entry_id, "ping")?;
+        simulate_incoming(&mut server, &line, &mut writer)?;
 
         let msgs = query_messages(&conn);
         // Messages: init req, init resp, ping req, ping resp = 4
