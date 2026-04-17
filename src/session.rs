@@ -52,9 +52,14 @@ pub struct SessionMessage {
     pub server: String,
     /// Client endpoint name.
     pub client: String,
-    /// "I am the response to this message." Pair merge.
+    /// In-process correlation ID ([`crate::logging::CorrelationId`]).
+    /// Request and response share the same value; pair merge matches
+    /// adjacent messages with equal non-`None` `request_id`. Not a
+    /// foreign key into this table's `id` column.
     pub request_id: Option<i64>,
-    /// "I was caused by this message." Scope/causation.
+    /// Causation link. References the `request_id` of the message that
+    /// caused this one (e.g., an LSP request's `parent_id` is the MCP
+    /// tool call's `request_id`). Not a foreign key into `id`.
     pub parent_id: Option<i64>,
     /// When the message was logged.
     pub timestamp: DateTime<Utc>,
