@@ -145,7 +145,8 @@ fn run_with_data_and_watcher(
 
     // Load TUI config for sessions width.
     let tui_config = crate::config::Config::load()
-        .map(|c| c.tui)
+        .ok()
+        .and_then(|c| c.tui)
         .unwrap_or_default();
 
     let mut app = App::new(&theme, &icons, data, tui_config.sessions_width)?;

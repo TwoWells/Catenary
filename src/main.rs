@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 
 use catenary_mcp::bridge::McpRouter;
 use catenary_mcp::cli::{self, HostFormat, QueryFormat};
+use catenary_mcp::logging::LoggingServer;
 use catenary_mcp::mcp::McpServer;
 use catenary_mcp::session::{self, Session};
 
@@ -289,7 +290,7 @@ fn run_dashboard() -> Result<()> {
         warn!("session pruning failed: {e}");
     }
 
-    catenary_mcp::tui::run(config.icons)
+    catenary_mcp::tui::run(config.icons.unwrap_or_default())
 }
 
 /// Runs the MCP server.
@@ -302,7 +303,7 @@ fn run_dashboard() -> Result<()> {
     reason = "Server setup requires sequential initialization steps"
 )]
 async fn run_server() -> Result<()> {
-    let (error_layer, error_layer_handle) = catenary_mcp::error_layer::ErrorLayer::new();
+    let logging = LoggingServer::new();
 
     tracing_subscriber::registry()
         .with(
@@ -310,7 +311,7 @@ async fn run_server() -> Result<()> {
                 .with_writer(std::io::stderr)
                 .with_filter(EnvFilter::from_default_env().add_directive("catenary=info".parse()?)),
         )
-        .with(error_layer.with_filter(tracing_subscriber::filter::LevelFilter::WARN))
+        .with(logging.clone())
         .init();
 
     // Load configuration
@@ -351,7 +352,6 @@ async fn run_server() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .message_log()
         .clone();
-    error_layer_handle.activate(message_log.clone());
 
     let session_id = session
         .lock()
@@ -360,10 +360,19 @@ async fn run_server() -> Result<()> {
         .id
         .clone();
 
+    let session_conn = session
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
+        .conn()
+        .clone();
+
     let toolbox = Arc::new(catenary_mcp::bridge::toolbox::Toolbox::new(
         config.clone(),
         roots,
         message_log.clone(),
+        logging,
+        session_conn,
+        session_id.clone(),
         tokio::runtime::Handle::current(),
     ));
     toolbox.spawn_all().await;

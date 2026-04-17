@@ -169,6 +169,23 @@ fn deserialize_source(contents: &str) -> Result<Config> {
 }
 
 /// Merge another config layer into this one. Later values override.
+///
+/// # Merge strategies
+///
+/// **Scalars** (`idle_timeout`, `log_retention_days`): override only when
+/// the later source differs from the default. Cannot distinguish "user
+/// explicitly set the default" from "absent", but acceptable for simple
+/// numeric knobs.
+///
+/// **Maps** (`language`, `server`): key-level merge. Later source wins
+/// per-key; keys absent from the later source are preserved.
+///
+/// **Structured sections** (`notifications`, `icons`, `tui`): `Option<T>`
+/// on `Config`. `None` means the source did not mention the section;
+/// `Some` means it was present (even if all values match defaults). Merge
+/// only overwrites when the later source is `Some`, so an earlier source's
+/// explicit setting survives an unrelated later source. **All config
+/// sections should follow this pattern.**
 pub(super) fn merge(config: &mut Config, other: Config) {
     if other.idle_timeout != default_idle_timeout() {
         config.idle_timeout = other.idle_timeout;
@@ -182,12 +199,15 @@ pub(super) fn merge(config: &mut Config, other: Config) {
     for (key, value) in other.server {
         config.server.insert(key, value);
     }
-    // Icons and TUI: override if the source provided them.
-    // Since we can't distinguish "user set default" from "absent",
-    // we always take the later source's values for structured sections.
-    // This matches the previous config crate behavior.
-    config.icons = other.icons;
-    config.tui = other.tui;
+    if other.notifications.is_some() {
+        config.notifications = other.notifications;
+    }
+    if other.icons.is_some() {
+        config.icons = other.icons;
+    }
+    if other.tui.is_some() {
+        config.tui = other.tui;
+    }
 }
 
 /// Apply environment variable overrides for supported keys.

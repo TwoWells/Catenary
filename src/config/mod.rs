@@ -17,6 +17,54 @@ pub use language::LanguageConfig;
 pub use parse::{SERVER_DEF_KEYS, config_sources};
 pub use server::ServerDef;
 
+/// Notification delivery configuration.
+///
+/// Controls which tracing events are promoted to user-facing notifications
+/// via `systemMessage`. Events below the threshold are silently dropped by
+/// the notification queue sink.
+///
+/// # Examples
+///
+/// ```toml
+/// [notifications]
+/// threshold = "warn"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationConfig {
+    /// Minimum severity for notification delivery.
+    pub threshold: SeverityConfig,
+}
+
+/// Severity level for notification threshold configuration.
+///
+/// Deserialized from lowercase TOML strings (`"debug"`, `"info"`, `"warn"`,
+/// `"error"`). Defaults to `Warn`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SeverityConfig {
+    /// Include debug-level events (most verbose).
+    Debug,
+    /// Include info-level and above.
+    Info,
+    /// Include warn-level and above (default).
+    #[default]
+    Warn,
+    /// Only error-level events.
+    Error,
+}
+
+impl From<SeverityConfig> for crate::logging::Severity {
+    fn from(sc: SeverityConfig) -> Self {
+        match sc {
+            SeverityConfig::Debug => Self::Debug,
+            SeverityConfig::Info => Self::Info,
+            SeverityConfig::Warn => Self::Warn,
+            SeverityConfig::Error => Self::Error,
+        }
+    }
+}
+
 /// Overall configuration for Catenary.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -38,13 +86,28 @@ pub struct Config {
     #[serde(default)]
     pub server: HashMap<String, ServerDef>,
 
-    /// Icon theme configuration.
+    /// Notification delivery configuration.
+    ///
+    /// `None` when no source specified `[notifications]`. Use
+    /// `unwrap_or_default()` at consumption sites to get the default
+    /// threshold (`warn`). Kept as `Option` so layered merge can
+    /// distinguish "absent" from "explicitly set to default".
     #[serde(default)]
-    pub icons: IconConfig,
+    pub notifications: Option<NotificationConfig>,
+
+    /// Icon theme configuration.
+    ///
+    /// `None` when no source specified `[icons]`. Absent sections fall
+    /// through to the earlier config layer.
+    #[serde(default)]
+    pub icons: Option<IconConfig>,
 
     /// TUI configuration.
+    ///
+    /// `None` when no source specified `[tui]`. Absent sections fall
+    /// through to the earlier config layer.
     #[serde(default)]
-    pub tui: TuiConfig,
+    pub tui: Option<TuiConfig>,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -265,8 +328,9 @@ impl Default for Config {
             log_retention_days: default_log_retention_days(),
             language: HashMap::new(),
             server: HashMap::new(),
-            icons: IconConfig::default(),
-            tui: TuiConfig::default(),
+            notifications: None,
+            icons: None,
+            tui: None,
         }
     }
 }
@@ -1042,5 +1106,104 @@ command = "rust-analyzer"
             elapsed < std::time::Duration::from_millis(50),
             "config check took {elapsed:?}, expected < 50ms",
         );
+    }
+
+    #[test]
+    fn notification_config_default() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "")?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+        assert!(config.notifications.is_none());
+        assert_eq!(
+            config.notifications.unwrap_or_default().threshold,
+            SeverityConfig::Warn,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn notification_config_parses_all_levels() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        for (toml_val, expected) in [
+            ("debug", SeverityConfig::Debug),
+            ("info", SeverityConfig::Info),
+            ("warn", SeverityConfig::Warn),
+            ("error", SeverityConfig::Error),
+        ] {
+            let path = dir.path().join(format!("{toml_val}.toml"));
+            fs::write(
+                &path,
+                format!("[notifications]\nthreshold = \"{toml_val}\"\n"),
+            )?;
+            let config = Config::load_from_sources(&[path])?;
+            assert_eq!(
+                config.notifications.expect("should be Some").threshold,
+                expected,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn notification_config_rejects_unknown_key() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[notifications]\nfoo = \"bar\"\n").expect("write");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn notification_config_project_overrides_user() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+
+        let user = dir.path().join("user.toml");
+        fs::write(&user, "[notifications]\nthreshold = \"warn\"\n")?;
+
+        let project = dir.path().join("project.toml");
+        fs::write(&project, "[notifications]\nthreshold = \"info\"\n")?;
+
+        let config = Config::load_from_sources(&[user, project])?;
+        assert_eq!(
+            config.notifications.expect("should be Some").threshold,
+            SeverityConfig::Info,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn notification_config_project_absent_falls_through() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+
+        let user = dir.path().join("user.toml");
+        fs::write(&user, "[notifications]\nthreshold = \"error\"\n")?;
+
+        let project = dir.path().join("project.toml");
+        fs::write(&project, "")?;
+
+        let config = Config::load_from_sources(&[user, project])?;
+        // Project omits [notifications] entirely — user's value is preserved.
+        assert_eq!(
+            config.notifications.unwrap_or_default().threshold,
+            SeverityConfig::Error,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn severity_config_converts_to_logging_severity() {
+        use crate::logging::Severity;
+
+        assert_eq!(Severity::from(SeverityConfig::Debug), Severity::Debug);
+        assert_eq!(Severity::from(SeverityConfig::Info), Severity::Info);
+        assert_eq!(Severity::from(SeverityConfig::Warn), Severity::Warn);
+        assert_eq!(Severity::from(SeverityConfig::Error), Severity::Error);
     }
 }

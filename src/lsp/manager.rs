@@ -613,7 +613,7 @@ impl LspClientManager {
 )]
 mod tests {
     use super::*;
-    use crate::config::{IconConfig, LanguageConfig, ServerDef};
+    use crate::config::{LanguageConfig, ServerDef};
     use crate::session::MessageLog;
     use anyhow::Result;
 
@@ -633,8 +633,9 @@ mod tests {
             server: HashMap::new(),
             idle_timeout: 300,
             log_retention_days: 7,
-            icons: IconConfig::default(),
-            tui: crate::config::TuiConfig::default(),
+            notifications: None,
+            icons: None,
+            tui: None,
         }
     }
 
@@ -677,8 +678,9 @@ mod tests {
             server,
             idle_timeout: 300,
             log_retention_days: 7,
-            icons: IconConfig::default(),
-            tui: crate::config::TuiConfig::default(),
+            notifications: None,
+            icons: None,
+            tui: None,
         }
     }
 
@@ -709,8 +711,9 @@ mod tests {
             server,
             idle_timeout: 300,
             log_retention_days: 7,
-            icons: IconConfig::default(),
-            tui: crate::config::TuiConfig::default(),
+            notifications: None,
+            icons: None,
+            tui: None,
         }
     }
 
@@ -867,8 +870,9 @@ mod tests {
             server,
             idle_timeout: 300,
             log_retention_days: 7,
-            icons: IconConfig::default(),
-            tui: crate::config::TuiConfig::default(),
+            notifications: None,
+            icons: None,
+            tui: None,
         };
 
         let manager = LspClientManager::new(

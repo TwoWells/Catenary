@@ -536,12 +536,21 @@ mod tests {
 
         let message_log = Arc::new(MessageLog::noop());
         let config: Config = serde_json::from_str("{}").expect("empty config");
+        let logging = crate::logging::LoggingServer::new();
 
         // Toolbox requires a tokio runtime handle for async dispatch.
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
 
-        let toolbox = Arc::new(Toolbox::new(config, vec![], message_log, handle));
+        let toolbox = Arc::new(Toolbox::new(
+            config,
+            vec![],
+            message_log,
+            logging,
+            conn.clone(),
+            "test-session".to_string(),
+            handle,
+        ));
         let refresh_roots = Arc::new(AtomicBool::new(false));
 
         let router = HookRouter::new(

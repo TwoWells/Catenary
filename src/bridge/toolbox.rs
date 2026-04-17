@@ -21,6 +21,9 @@ use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
 use super::path_security::PathValidator;
 use crate::config::Config;
+use crate::config::SeverityConfig;
+use crate::logging::LoggingServer;
+use crate::logging::notification_queue::NotificationQueueSink;
 use crate::lsp::LspClientManager;
 use crate::lsp::glob::LspGlob;
 use crate::session::MessageLog;
@@ -119,19 +122,46 @@ pub struct Toolbox {
     fs_manager: Arc<FilesystemManager>,
     /// Path validation for LSP-aware operations.
     path_validator: Arc<RwLock<PathValidator>>,
+    /// Multi-sink tracing dispatcher.
+    pub logging: LoggingServer,
+    /// Notification queue for draining into `systemMessage`.
+    pub notifications: Arc<NotificationQueueSink>,
+    /// Broadcast sender for `SqliteMessageTail` (protocol DB sink).
+    pub broadcast_tx: tokio::sync::broadcast::Sender<i64>,
     /// Tokio runtime handle for blocking dispatch.
     pub runtime: Handle,
 }
 
 impl Toolbox {
     /// Creates a new `Toolbox`, constructing all internal dependencies.
+    ///
+    /// Constructs the logging sinks and activates the `LoggingServer`,
+    /// draining any bootstrap-buffered events. After this call, all
+    /// `tracing` events flow through the logging pipeline.
     #[must_use]
     pub fn new(
         config: Config,
         roots: Vec<PathBuf>,
         message_log: Arc<MessageLog>,
+        logging: LoggingServer,
+        conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        session_id: String,
         runtime: Handle,
     ) -> Self {
+        // Construct logging sinks.
+        let threshold = config
+            .notifications
+            .as_ref()
+            .map_or_else(SeverityConfig::default, |n| n.threshold)
+            .into();
+        let notifications = NotificationQueueSink::new(threshold);
+        let (protocol_db, broadcast_tx) =
+            crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), session_id.clone());
+        let trace_db = crate::logging::trace_db::TraceDbSink::new(conn, session_id);
+
+        // Activate — drains bootstrap buffer, enables direct dispatch.
+        logging.activate(vec![notifications.clone(), protocol_db, trace_db]);
+
         let fs_manager = Arc::new(FilesystemManager::new());
         fs_manager.set_roots(roots.clone());
         fs_manager.seed();
@@ -164,6 +194,9 @@ impl Toolbox {
             client_manager,
             fs_manager,
             path_validator,
+            logging,
+            notifications,
+            broadcast_tx,
             runtime,
         }
     }
