@@ -28,7 +28,7 @@ use super::Sink;
 /// `into_inner` so the sink keeps working after a panic elsewhere.
 pub struct ProtocolDbSink {
     conn: Arc<Mutex<Connection>>,
-    instance_id: String,
+    instance_id: Arc<str>,
     broadcast: broadcast::Sender<i64>,
 }
 
@@ -40,7 +40,7 @@ impl ProtocolDbSink {
     #[must_use]
     pub fn new(
         conn: Arc<Mutex<Connection>>,
-        instance_id: String,
+        instance_id: Arc<str>,
     ) -> (Arc<Self>, broadcast::Sender<i64>) {
         let (tx, _) = broadcast::channel(256);
         let sink = Arc::new(Self {
@@ -78,7 +78,7 @@ impl Sink for ProtocolDbSink {
               request_id, parent_id, payload) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
-                self.instance_id,
+                &*self.instance_id,
                 timestamp,
                 kind,
                 event.method.as_deref().unwrap_or(""),

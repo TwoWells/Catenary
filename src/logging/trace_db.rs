@@ -30,13 +30,13 @@ use super::Sink;
 /// `into_inner` so the sink keeps working after a panic elsewhere.
 pub struct TraceDbSink {
     conn: Arc<Mutex<Connection>>,
-    instance_id: String,
+    instance_id: Arc<str>,
 }
 
 impl TraceDbSink {
     /// Create a new trace DB sink.
     #[must_use]
-    pub fn new(conn: Arc<Mutex<Connection>>, instance_id: String) -> Arc<Self> {
+    pub fn new(conn: Arc<Mutex<Connection>>, instance_id: Arc<str>) -> Arc<Self> {
         Arc::new(Self { conn, instance_id })
     }
 }
@@ -71,7 +71,7 @@ impl Sink for TraceDbSink {
               request_id, parent_id, payload) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
-                self.instance_id,
+                &*self.instance_id,
                 timestamp,
                 type_str,
                 event.target, // `method` column gets the tracing target

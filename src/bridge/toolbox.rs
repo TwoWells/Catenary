@@ -104,24 +104,6 @@ impl ResolvedGlob {
     }
 }
 
-/// Immutable session metadata, set once at startup.
-///
-/// Provides a stable accessor for the instance ID (and eventually client
-/// session info). Lives on [`Toolbox`] so any component with `Arc<Toolbox>`
-/// can retrieve the ID without storing its own copy.
-pub struct SessionCache {
-    /// Catenary instance ID (unique per process invocation).
-    instance_id: String,
-}
-
-impl SessionCache {
-    /// Returns the Catenary instance ID.
-    #[must_use]
-    pub fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-}
-
 /// Shared application container for tool servers and cross-tool infrastructure.
 ///
 /// Creates and owns all internal servers and shared dependencies.
@@ -148,8 +130,8 @@ pub struct Toolbox {
     pub notifications: Arc<NotificationQueueSink>,
     /// Broadcast sender for `SqliteMessageTail` (protocol DB sink).
     pub broadcast_tx: tokio::sync::broadcast::Sender<i64>,
-    /// Immutable session metadata.
-    pub session_cache: SessionCache,
+    /// Catenary instance ID (unique per process invocation).
+    pub instance_id: Arc<str>,
     /// Tokio runtime handle for blocking dispatch.
     pub runtime: Handle,
 }
@@ -166,7 +148,7 @@ impl Toolbox {
         roots: Vec<PathBuf>,
         logging: LoggingServer,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-        instance_id: String,
+        instance_id: Arc<str>,
         runtime: Handle,
     ) -> Self {
         // Construct logging sinks.
@@ -219,7 +201,7 @@ impl Toolbox {
             logging,
             notifications,
             broadcast_tx,
-            session_cache: SessionCache { instance_id },
+            instance_id,
             runtime,
         }
     }

@@ -159,7 +159,7 @@ impl HookServer {
         refresh_roots: Arc<AtomicBool>,
         message_log: Arc<MessageLog>,
         conn: Arc<Mutex<Connection>>,
-        instance_id: String,
+        instance_id: Arc<str>,
         client_name: String,
     ) -> Self {
         let router = Arc::new(HookRouter::new(

@@ -83,7 +83,7 @@ pub struct HookRouter {
     toolbox: Arc<Toolbox>,
     refresh_roots: Arc<AtomicBool>,
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    instance_id: String,
+    instance_id: Arc<str>,
     /// Host CLI client name (e.g., `"host"`, `"claude-code"`).
     pub(crate) client_name: String,
 }
@@ -95,7 +95,7 @@ impl HookRouter {
         toolbox: Arc<Toolbox>,
         refresh_roots: Arc<AtomicBool>,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-        instance_id: String,
+        instance_id: Arc<str>,
         client_name: String,
     ) -> Self {
         Self {
@@ -306,7 +306,7 @@ impl HookRouter {
             let _ = c.execute(
                 "UPDATE sessions SET client_session_id = ?1 \
                  WHERE id = ?2 AND client_session_id IS NULL",
-                rusqlite::params![client_sid, &self.instance_id],
+                rusqlite::params![client_sid, &*self.instance_id],
             );
         }
     }
@@ -624,12 +624,13 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
 
+        let instance_id: Arc<str> = "test-session".into();
         let toolbox = Arc::new(Toolbox::new(
             config,
             vec![],
             logging,
             conn.clone(),
-            "test-session".to_string(),
+            instance_id.clone(),
             handle,
         ));
         let refresh_roots = Arc::new(AtomicBool::new(false));
@@ -638,7 +639,7 @@ mod tests {
             toolbox,
             refresh_roots,
             conn,
-            "test-session".to_string(),
+            instance_id,
             "test".to_string(),
         );
 
@@ -663,7 +664,6 @@ mod tests {
             )
             .expect("insert session");
 
-        let message_log = Arc::new(MessageLog::noop());
         let config: Config = serde_json::from_str("{}").expect("empty config");
         let logging = crate::logging::LoggingServer::new();
 
@@ -673,13 +673,13 @@ mod tests {
         let root = dir.path().join("workspace");
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
+        let instance_id: Arc<str> = "test-session".into();
         let toolbox = Arc::new(Toolbox::new(
             config,
             vec![root.clone()],
-            message_log,
             logging,
             conn.clone(),
-            "test-session".to_string(),
+            instance_id.clone(),
             handle,
         ));
         let refresh_roots = Arc::new(AtomicBool::new(false));
@@ -688,7 +688,7 @@ mod tests {
             toolbox,
             refresh_roots,
             conn,
-            "test-session".to_string(),
+            instance_id,
             "test".to_string(),
         );
 

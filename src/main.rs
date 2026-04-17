@@ -345,12 +345,13 @@ async fn run_server() -> Result<()> {
         .message_log()
         .clone();
 
-    let instance_id = session
+    let instance_id: Arc<str> = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .info
         .id
-        .clone();
+        .as_str()
+        .into();
 
     let session_conn = session
         .lock()
