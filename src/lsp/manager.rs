@@ -12,10 +12,10 @@ use tracing::{debug, info, warn};
 use crate::bridge::DocumentManager;
 use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::config::Config;
+use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{FileChange, GlobPattern, WatchKind};
 use crate::lsp::state::ServerStatus;
-use crate::session::MessageLog;
 
 /// Filters filesystem changes against a server's watcher registrations.
 ///
@@ -51,7 +51,7 @@ pub struct LspClientManager {
     config: Config,
     roots: Mutex<Vec<PathBuf>>,
     clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
-    message_log: Arc<MessageLog>,
+    logging: LoggingServer,
     fs: Arc<FilesystemManager>,
     doc_manager: Mutex<DocumentManager>,
 }
@@ -62,14 +62,14 @@ impl LspClientManager {
     pub fn new(
         config: Config,
         roots: Vec<PathBuf>,
-        message_log: Arc<MessageLog>,
+        logging: LoggingServer,
         fs: Arc<FilesystemManager>,
     ) -> Self {
         Self {
             config,
             roots: Mutex::new(roots),
             clients: Mutex::new(HashMap::new()),
-            message_log,
+            logging,
             fs,
             doc_manager: Mutex::new(DocumentManager::new()),
         }
@@ -342,7 +342,7 @@ impl LspClientManager {
             &server_def.command,
             &args,
             canonical,
-            self.message_log.clone(),
+            self.logging.clone(),
             server_def.settings.clone(),
         )?;
 
@@ -614,13 +614,12 @@ impl LspClientManager {
 mod tests {
     use super::*;
     use crate::config::{LanguageConfig, ServerDef};
-    use crate::session::MessageLog;
     use anyhow::Result;
 
     const MOCK_LANG_A: &str = "yX4Za";
 
-    fn test_message_log() -> Arc<MessageLog> {
-        Arc::new(MessageLog::noop())
+    fn test_logging() -> LoggingServer {
+        LoggingServer::new()
     }
 
     fn test_fs() -> Arc<FilesystemManager> {
@@ -722,7 +721,7 @@ mod tests {
         let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -735,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_empty_initial() -> Result<()> {
-        let manager = LspClientManager::new(test_config(), vec![], test_message_log(), test_fs());
+        let manager = LspClientManager::new(test_config(), vec![], test_logging(), test_fs());
 
         assert!(manager.roots().await.is_empty());
         Ok(())
@@ -746,7 +745,7 @@ mod tests {
         let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -765,7 +764,7 @@ mod tests {
         let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -789,7 +788,7 @@ mod tests {
         let manager = LspClientManager::new(
             test_config(),
             vec![PathBuf::from("/tmp/root_a")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -810,7 +809,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -878,7 +877,7 @@ mod tests {
         let manager = LspClientManager::new(
             config,
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -897,7 +896,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -929,7 +928,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -951,7 +950,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -976,7 +975,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -996,7 +995,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -1012,7 +1011,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 
@@ -1026,7 +1025,7 @@ mod tests {
         let manager = LspClientManager::new(
             mockls_config(),
             vec![PathBuf::from("/tmp")],
-            test_message_log(),
+            test_logging(),
             test_fs(),
         );
 

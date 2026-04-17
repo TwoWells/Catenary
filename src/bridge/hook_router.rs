@@ -321,7 +321,6 @@ mod tests {
     use super::*;
 
     use crate::config::Config;
-    use crate::session::MessageLog;
 
     /// MCP-qualified `start_editing` name for test calls.
     const START_EDITING: &str = "mcp_catenary_start_editing";
@@ -618,7 +617,6 @@ mod tests {
             )
             .expect("insert session");
 
-        let message_log = Arc::new(MessageLog::noop());
         let config: Config = serde_json::from_str("{}").expect("empty config");
         let logging = crate::logging::LoggingServer::new();
 
@@ -629,7 +627,6 @@ mod tests {
         let toolbox = Arc::new(Toolbox::new(
             config,
             vec![],
-            message_log,
             logging,
             conn.clone(),
             "test-session".to_string(),

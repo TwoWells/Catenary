@@ -12,7 +12,7 @@ use tracing::debug;
 use super::params;
 use super::server::LspServer;
 use super::state::{ServerLifecycle, ServerStatus};
-use crate::session::MessageLog;
+use crate::logging::LoggingServer;
 
 /// Cached diagnostics for a file: `(version, diagnostics)`.
 ///
@@ -57,17 +57,10 @@ impl LspClient {
         program: &str,
         args: &[&str],
         language: &str,
-        message_log: Arc<MessageLog>,
+        logging: LoggingServer,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
-        Self::spawn_inner(
-            program,
-            args,
-            language,
-            message_log,
-            Stdio::inherit(),
-            settings,
-        )
+        Self::spawn_inner(program, args, language, logging, Stdio::inherit(), settings)
     }
 
     /// Spawns the LSP server with stderr suppressed (for `catenary doctor`).
@@ -79,16 +72,16 @@ impl LspClient {
         program: &str,
         args: &[&str],
         language: &str,
-        message_log: Arc<MessageLog>,
+        logging: LoggingServer,
     ) -> Result<Self> {
-        Self::spawn_inner(program, args, language, message_log, Stdio::null(), None)
+        Self::spawn_inner(program, args, language, logging, Stdio::null(), None)
     }
 
     fn spawn_inner(
         program: &str,
         args: &[&str],
         language: &str,
-        message_log: Arc<MessageLog>,
+        logging: LoggingServer,
         stderr: Stdio,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
@@ -100,7 +93,7 @@ impl LspClient {
             stderr,
             &server,
             language.to_string(),
-            message_log,
+            logging,
             program,
         )?;
         server.set_connection(connection);

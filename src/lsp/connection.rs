@@ -17,14 +17,56 @@ use tracing::{debug, error, warn};
 
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
 use super::server::LspServer;
-use crate::session::MessageLog;
+use crate::logging::LoggingServer;
 
 /// Tracks an in-flight request so we can annotate the response with
 /// the original method name and causation chain.
 struct PendingRequest {
     method: String,
-    message_id: i64,
+    correlation_id: i64,
     sender: oneshot::Sender<ResponseMessage>,
+}
+
+/// Emit an LSP protocol event via `tracing::debug!`.
+///
+/// Uses `debug` level so protocol messages stay below the stderr
+/// `fmt::layer` threshold (`catenary=info`) while still reaching
+/// `LoggingServer` (no per-layer filter). Protocol routing is by
+/// `kind` field, not by level — `ProtocolDbSink` matches
+/// `kind in {lsp, mcp, hook}` regardless of tracing level.
+///
+/// Handles the optional `parent_id` field by branching into two macro
+/// invocations (tracing macros require static field sets).
+fn emit_lsp_event(
+    server_name: &str,
+    method: &str,
+    request_id: i64,
+    parent_id: Option<i64>,
+    payload: &str,
+    msg: &str,
+) {
+    if let Some(pid) = parent_id {
+        debug!(
+            kind = "lsp",
+            method = method,
+            server = server_name,
+            client = "catenary",
+            request_id = request_id,
+            parent_id = pid,
+            payload = payload,
+            "{msg}"
+        );
+    } else {
+        debug!(
+            kind = "lsp",
+            method = method,
+            server = server_name,
+            client = "catenary",
+            request_id = request_id,
+            payload = payload,
+            "{msg}"
+        );
+    }
 }
 
 /// Poll interval for failure detection sampling.
@@ -44,7 +86,7 @@ pub struct Connection {
     next_id: AtomicI64,
     server: Weak<LspServer>,
     language: String,
-    message_log: Arc<MessageLog>,
+    logging: LoggingServer,
     server_name: String,
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
     _reader_handle: tokio::task::JoinHandle<()>,
@@ -64,7 +106,7 @@ impl Connection {
         stderr: Stdio,
         server: &Arc<LspServer>,
         language: String,
-        message_log: Arc<MessageLog>,
+        logging: LoggingServer,
         server_name: &str,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
@@ -105,7 +147,7 @@ impl Connection {
             alive.clone(),
             Arc::downgrade(server),
             stdout,
-            message_log.clone(),
+            logging.clone(),
             server_name.to_string(),
         ));
 
@@ -117,7 +159,7 @@ impl Connection {
             next_id: AtomicI64::new(1),
             server: weak_server,
             language,
-            message_log,
+            logging,
             server_name: server_name.to_string(),
             monitor: std::sync::Mutex::new(monitor),
             _reader_handle: reader_handle,
@@ -156,17 +198,17 @@ impl Connection {
                 params: params.clone(),
             };
 
-            let message_id = serde_json::to_value(&request).map_or(0, |payload| {
-                self.message_log.log(
-                    "lsp",
-                    method,
+            let correlation_id = self.logging.next_id();
+            if let Ok(payload) = serde_json::to_value(&request) {
+                emit_lsp_event(
                     &self.server_name,
-                    "catenary",
-                    None,
+                    method,
+                    correlation_id.0,
                     parent_id,
-                    &payload,
-                )
-            });
+                    &payload.to_string(),
+                    "outgoing request",
+                );
+            }
 
             let (tx, rx) = oneshot::channel();
             {
@@ -175,7 +217,7 @@ impl Connection {
                     id.clone(),
                     PendingRequest {
                         method: method.to_string(),
-                        message_id,
+                        correlation_id: correlation_id.0,
                         sender: tx,
                     },
                 );
@@ -284,15 +326,15 @@ impl Connection {
             method: method.to_string(),
             params,
         };
+        let correlation_id = self.logging.next_id();
         if let Ok(payload) = serde_json::to_value(&notification) {
-            self.message_log.log(
-                "lsp",
-                method,
+            emit_lsp_event(
                 &self.server_name,
-                "catenary",
-                None,
+                method,
+                correlation_id.0,
                 parent_id,
-                &payload,
+                &payload.to_string(),
+                "outgoing notification",
             );
         }
         self.send_message(&notification).await
@@ -347,7 +389,7 @@ impl Connection {
         alive: Arc<AtomicBool>,
         server: Weak<LspServer>,
         stdout: tokio::process::ChildStdout,
-        message_log: Arc<MessageLog>,
+        logging: LoggingServer,
         server_name: String,
     ) {
         let mut reader = BufReader::new(stdout);
@@ -392,14 +434,14 @@ impl Connection {
                     if let Some(id) = value.get("id") {
                         // Server Request — log inbound
                         debug!("Received server request: {} (id: {})", method, id);
-                        let inbound_id = message_log.log(
-                            "lsp",
-                            method,
+                        let inbound_id = logging.next_id();
+                        emit_lsp_event(
                             &server_name,
-                            "catenary",
+                            method,
+                            inbound_id.0,
                             None,
-                            None,
-                            &value,
+                            &value.to_string(),
+                            "incoming server request",
                         );
 
                         let request_id =
@@ -428,14 +470,13 @@ impl Connection {
 
                         // Log outbound response
                         if let Ok(response_json) = serde_json::to_value(&response) {
-                            message_log.log(
-                                "lsp",
-                                method,
+                            emit_lsp_event(
                                 &server_name,
-                                "catenary",
-                                Some(inbound_id),
-                                Some(inbound_id),
-                                &response_json,
+                                method,
+                                inbound_id.0,
+                                Some(inbound_id.0),
+                                &response_json.to_string(),
+                                "outgoing server response",
                             );
                         }
 
@@ -452,14 +493,14 @@ impl Connection {
                         }
                     } else {
                         // Notification — log inbound
-                        message_log.log(
-                            "lsp",
-                            method,
+                        let notif_id = logging.next_id();
+                        emit_lsp_event(
                             &server_name,
-                            "catenary",
+                            method,
+                            notif_id.0,
                             None,
-                            None,
-                            &value,
+                            &value.to_string(),
+                            "incoming notification",
                         );
                         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
                         server.on_notification(method, params);
@@ -471,14 +512,13 @@ impl Connection {
                     {
                         let mut pending = pending.lock().await;
                         if let Some(req) = pending.remove(id) {
-                            message_log.log(
-                                "lsp",
-                                &req.method,
+                            emit_lsp_event(
                                 &server_name,
-                                "catenary",
-                                Some(req.message_id),
-                                Some(req.message_id),
-                                &value,
+                                &req.method,
+                                req.correlation_id,
+                                Some(req.correlation_id),
+                                &value.to_string(),
+                                "incoming response",
                             );
                             let _ = req.sender.send(response);
                         } else {

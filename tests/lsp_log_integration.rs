@@ -6,58 +6,86 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for LSP message logging via `MessageLog`.
+//! Integration tests for LSP message logging via `LoggingServer` + `ProtocolDbSink`.
 
 use anyhow::Result;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tracing_subscriber::layer::SubscriberExt;
 
-use catenary_mcp::session::MessageLog;
+use catenary_mcp::logging::LoggingServer;
+use catenary_mcp::logging::protocol_db::ProtocolDbSink;
 
 const MOCK_LANG_A: &str = "yX4Za";
 
 /// Row from the `messages` table with the fields we care about.
 struct MsgRow {
-    id: i64,
     r#type: String,
     method: String,
     request_id: Option<i64>,
     parent_id: Option<i64>,
 }
 
-/// Create a test DB and return a `MessageLog` backed by it, plus the
-/// connection for querying.
-fn test_message_log() -> (
-    tempfile::TempDir,
-    Arc<MessageLog>,
+/// Create a test DB with a `LoggingServer` backed by a `ProtocolDbSink`,
+/// installed as the thread-local tracing subscriber.
+///
+/// Returns the `LoggingServer` (for `LspClient::spawn`), the DB connection
+/// (for querying), and a guard that restores the previous subscriber on drop.
+fn setup_logging() -> (
+    LoggingServer,
     Arc<std::sync::Mutex<rusqlite::Connection>>,
+    tracing::subscriber::DefaultGuard,
 ) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("catenary").join("catenary.db");
-    let conn = catenary_mcp::db::open_and_migrate_at(&path).expect("open test db");
-    conn.execute(
-        "INSERT INTO sessions (id, pid, display_name, started_at) \
-         VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
-        [],
-    )
-    .expect("insert session");
-    let conn = Arc::new(std::sync::Mutex::new(conn));
-    let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
-    (dir, log, conn)
+    let conn = Arc::new(std::sync::Mutex::new(
+        rusqlite::Connection::open_in_memory().expect("open in-memory db"),
+    ));
+    conn.lock()
+        .expect("lock")
+        .execute_batch(
+            "CREATE TABLE sessions (
+                 id           TEXT PRIMARY KEY,
+                 pid          INTEGER NOT NULL,
+                 display_name TEXT NOT NULL,
+                 started_at   TEXT NOT NULL
+             );
+             INSERT INTO sessions (id, pid, display_name, started_at)
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
+             CREATE TABLE messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  TEXT NOT NULL,
+                 timestamp   TEXT NOT NULL,
+                 type        TEXT NOT NULL,
+                 method      TEXT NOT NULL,
+                 server      TEXT NOT NULL,
+                 client      TEXT NOT NULL,
+                 request_id  INTEGER,
+                 parent_id   INTEGER,
+                 payload     TEXT NOT NULL
+             );",
+        )
+        .expect("create schema");
+
+    let logging = LoggingServer::new();
+    let (protocol_db, _tx) = ProtocolDbSink::new(conn.clone(), "s1".into());
+    logging.activate(vec![protocol_db]);
+
+    let subscriber = tracing_subscriber::registry().with(logging.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    (logging, conn, guard)
 }
 
 /// Query all messages from the test DB, ordered by id.
 fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
     let c = conn.lock().expect("lock");
-    c.prepare("SELECT id, type, method, request_id, parent_id FROM messages ORDER BY id")
+    c.prepare("SELECT type, method, request_id, parent_id FROM messages ORDER BY id")
         .expect("prepare")
         .query_map([], |row| {
             Ok(MsgRow {
-                id: row.get(0)?,
-                r#type: row.get(1)?,
-                method: row.get(2)?,
-                request_id: row.get(3)?,
-                parent_id: row.get(4)?,
+                r#type: row.get(0)?,
+                method: row.get(1)?,
+                request_id: row.get(2)?,
+                parent_id: row.get(3)?,
             })
         })
         .expect("query")
@@ -65,26 +93,26 @@ fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<Msg
         .collect()
 }
 
-/// Spawn mockls with a live `MessageLog` and initialize it.
+/// Spawn mockls with a `LoggingServer` and initialize it.
 async fn spawn_initialized_client(
-    message_log: Arc<MessageLog>,
+    logging: LoggingServer,
 ) -> Result<(catenary_mcp::lsp::LspClient, tempfile::TempDir)> {
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
 
     let mut client =
-        catenary_mcp::lsp::LspClient::spawn(bin, &[MOCK_LANG_A], MOCK_LANG_A, message_log, None)?;
+        catenary_mcp::lsp::LspClient::spawn(bin, &[MOCK_LANG_A], MOCK_LANG_A, logging, None)?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
     Ok((client, dir))
 }
 
 /// Verify that a hover request/response pair is logged with correct
-/// `request_id` linking.
+/// correlation ID linking (both rows share the same `request_id`).
 #[tokio::test]
 async fn test_lsp_log_request_response() -> Result<()> {
-    let (_db_dir, log, conn) = test_message_log();
-    let (client, dir) = spawn_initialized_client(log).await?;
+    let (logging, conn, _guard) = setup_logging();
+    let (client, dir) = spawn_initialized_client(logging).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let MY_VAR\n")?;
@@ -112,17 +140,16 @@ async fn test_lsp_log_request_response() -> Result<()> {
         assert_eq!(m.r#type, "lsp");
     }
 
-    // The response should have request_id pointing to the request
+    // Both request and response carry the same correlation ID as request_id
     let request = hover_msgs[0];
     let response = hover_msgs[1];
     assert!(
-        request.request_id.is_none(),
-        "request should have no request_id"
+        request.request_id.is_some(),
+        "request should have a correlation ID as request_id"
     );
     assert_eq!(
-        response.request_id,
-        Some(request.id),
-        "response request_id should point to the request row"
+        response.request_id, request.request_id,
+        "response request_id should match request (pair-merge via correlation ID)"
     );
 
     Ok(())
@@ -131,8 +158,8 @@ async fn test_lsp_log_request_response() -> Result<()> {
 /// Verify that an outbound notification is logged.
 #[tokio::test]
 async fn test_lsp_log_notification() -> Result<()> {
-    let (_db_dir, log, conn) = test_message_log();
-    let (client, dir) = spawn_initialized_client(log).await?;
+    let (logging, conn, _guard) = setup_logging();
+    let (client, dir) = spawn_initialized_client(logging).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let X\n")?;
@@ -159,8 +186,8 @@ async fn test_lsp_log_notification() -> Result<()> {
 /// are logged.
 #[tokio::test]
 async fn test_lsp_log_inbound_notification() -> Result<()> {
-    let (_db_dir, log, conn) = test_message_log();
-    let (client, dir) = spawn_initialized_client(log).await?;
+    let (logging, conn, _guard) = setup_logging();
+    let (client, dir) = spawn_initialized_client(logging).await?;
 
     // mockls publishes diagnostics for files with "error" in the content
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
@@ -189,13 +216,11 @@ async fn test_lsp_log_inbound_notification() -> Result<()> {
     Ok(())
 }
 
-/// Verify that `set_parent_id` propagates to both request and response
-/// messages.
+/// Verify that `set_parent_id` propagates to request and response messages.
 #[tokio::test]
 async fn test_lsp_log_parent_id() -> Result<()> {
-    // Identical to test_lsp_log_request_response except for set_parent_id
-    let (_db_dir, log, conn) = test_message_log();
-    let (mut client, dir) = spawn_initialized_client(log).await?;
+    let (logging, conn, _guard) = setup_logging();
+    let (mut client, dir) = spawn_initialized_client(logging).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let MY_VAR\n")?;
@@ -205,18 +230,8 @@ async fn test_lsp_log_parent_id() -> Result<()> {
         .did_open(&uri, MOCK_LANG_A, 1, "let MY_VAR\n")
         .await?;
 
-    // Insert a synthetic parent message to satisfy the FK constraint
-    let parent_id = {
-        let c = conn.lock().expect("lock");
-        c.execute(
-            "INSERT INTO messages (session_id, timestamp, type, method, server, client, payload) \
-             VALUES ('s1', '2026-01-01T00:00:00Z', 'mcp', 'tools/call', 'catenary', 'claude', '{}')",
-            [],
-        )
-        .expect("insert parent");
-        c.last_insert_rowid()
-    };
-
+    // Use a correlation ID value as parent (simulating an MCP tool call context)
+    let parent_id = 42_i64;
     client.set_parent_id(Some(parent_id));
 
     let _hover = client.hover(&uri, 0, 4).await?;
@@ -229,20 +244,14 @@ async fn test_lsp_log_parent_id() -> Result<()> {
 
     assert!(
         hover_msgs.len() >= 2,
-        "expected at least 2 hover messages (request + response), got {}. all: {:?}",
+        "expected at least 2 hover messages (request + response), got {}",
         hover_msgs.len(),
-        msgs.iter()
-            .map(|m| format!(
-                "{}(id={},req={:?},par={:?})",
-                m.method, m.id, m.request_id, m.parent_id
-            ))
-            .collect::<Vec<_>>()
     );
 
-    // Request carries the MCP parent_id; response points to the request.
-    let request_id = hover_msgs[0].id;
+    // Request carries the MCP parent_id
     assert_eq!(hover_msgs[0].parent_id, Some(parent_id));
-    assert_eq!(hover_msgs[1].parent_id, Some(request_id));
+    // Response parent_id is the correlation ID (self-referential pair)
+    assert_eq!(hover_msgs[1].parent_id, hover_msgs[1].request_id);
 
     Ok(())
 }
@@ -251,8 +260,8 @@ async fn test_lsp_log_parent_id() -> Result<()> {
 /// pending map (not from the raw JSON-RPC response, which has no method).
 #[tokio::test]
 async fn test_lsp_log_pending_method_annotation() -> Result<()> {
-    let (_db_dir, log, conn) = test_message_log();
-    let (client, dir) = spawn_initialized_client(log).await?;
+    let (logging, conn, _guard) = setup_logging();
+    let (client, dir) = spawn_initialized_client(logging).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let MY_VAR\n")?;

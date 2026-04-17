@@ -369,7 +369,6 @@ async fn run_server() -> Result<()> {
     let toolbox = Arc::new(catenary_mcp::bridge::toolbox::Toolbox::new(
         config.clone(),
         roots,
-        message_log.clone(),
         logging,
         session_conn,
         session_id.clone(),

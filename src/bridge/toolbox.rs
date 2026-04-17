@@ -27,7 +27,6 @@ use crate::logging::LoggingServer;
 use crate::logging::notification_queue::NotificationQueueSink;
 use crate::lsp::LspClientManager;
 use crate::lsp::glob::LspGlob;
-use crate::session::MessageLog;
 
 /// A resolved glob pattern that handles tilde expansion and absolute paths.
 ///
@@ -145,7 +144,6 @@ impl Toolbox {
     pub fn new(
         config: Config,
         roots: Vec<PathBuf>,
-        message_log: Arc<MessageLog>,
         logging: LoggingServer,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
         session_id: String,
@@ -172,7 +170,7 @@ impl Toolbox {
         let client_manager = Arc::new(LspClientManager::new(
             config,
             roots,
-            message_log,
+            logging.clone(),
             fs_manager.clone(),
         ));
         let diagnostics = Arc::new(DiagnosticsServer::new(

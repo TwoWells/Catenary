@@ -8,7 +8,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -161,7 +160,7 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
             command,
             &args_refs,
             name,
-            Arc::new(crate::session::MessageLog::noop()),
+            crate::logging::LoggingServer::new(),
         );
 
         let mut client = match spawn_result {

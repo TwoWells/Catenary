@@ -9,11 +9,11 @@
 //! Integration tests for LSP client functionality using mockls.
 
 use anyhow::Result;
-use std::sync::Arc;
+use catenary_mcp::logging::LoggingServer;
 use tempfile::tempdir;
 
-fn test_message_log() -> Arc<catenary_mcp::session::MessageLog> {
-    Arc::new(catenary_mcp::session::MessageLog::noop())
+fn test_logging() -> LoggingServer {
+    LoggingServer::new()
 }
 
 const MOCK_LANG_A: &str = "yX4Za";
@@ -27,7 +27,7 @@ async fn test_mockls_initialize() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -50,7 +50,7 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--workspace-folders"],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -79,7 +79,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -117,7 +117,7 @@ async fn test_client_capabilities() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--log-init-params", log_path],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -229,7 +229,7 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--indexing-delay", "200"],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -270,7 +270,7 @@ async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--cpu-on-initialized", "100"],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -309,7 +309,7 @@ async fn test_content_modified_retry() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--content-modified-once"],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -349,7 +349,7 @@ async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
@@ -389,7 +389,7 @@ async fn test_health_probe_transitions_to_healthy() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
-        test_message_log(),
+        test_logging(),
         None,
     )?;
 
