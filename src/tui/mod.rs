@@ -272,15 +272,22 @@ fn handle_mouse(app: &mut App<'_>, mouse: event::MouseEvent) {
     match mouse.kind {
         MouseEventKind::Down(event::MouseButton::Left) => {
             let Some(layout) = layout else { return };
+            let panel_scroll_offsets: Vec<usize> =
+                app.grid.panels.iter().map(|p| p.scroll_offset).collect();
             let overflow_counts: Vec<scrollbar::OverflowCounts> = app
                 .grid
                 .panels
                 .iter()
                 .map(|p| {
                     let flat_len = p.flat_lines().len();
+                    let viewport = if p.viewport_height > 0 {
+                        p.viewport_height
+                    } else {
+                        20
+                    };
                     let metrics = scrollbar::ScrollMetrics {
                         content_length: flat_len,
-                        viewport_length: 20, // approximate
+                        viewport_length: viewport,
                         position: p.scroll_offset,
                     };
                     scrollbar::compute_overflow(&metrics)
@@ -294,7 +301,8 @@ fn handle_mouse(app: &mut App<'_>, mouse: event::MouseEvent) {
                 app.tree_area,
                 layout,
                 border_x,
-                0,
+                app.tree.scroll_offset,
+                &panel_scroll_offsets,
                 &overflow_counts,
             );
 
@@ -312,7 +320,15 @@ fn handle_mouse(app: &mut App<'_>, mouse: event::MouseEvent) {
         }
         MouseEventKind::Drag(event::MouseButton::Left) => {
             let Some(layout) = layout else { return };
-            let action = mouse::resolve_drag(mouse.column, mouse.row, &app.drag_state, layout);
+            let panel_scroll_offsets: Vec<usize> =
+                app.grid.panels.iter().map(|p| p.scroll_offset).collect();
+            let action = mouse::resolve_drag(
+                mouse.column,
+                mouse.row,
+                &app.drag_state,
+                layout,
+                &panel_scroll_offsets,
+            );
             dispatch_mouse_action(app, &action);
         }
         MouseEventKind::Up(event::MouseButton::Left) => {
@@ -411,7 +427,12 @@ fn dispatch_mouse_action(app: &mut App<'_>, action: &MouseAction) {
                     p.scroll_offset = 0;
                 } else {
                     let total = p.flat_lines().len();
-                    p.scroll_offset = total.saturating_sub(20);
+                    let viewport = if p.viewport_height > 0 {
+                        p.viewport_height
+                    } else {
+                        20
+                    };
+                    p.scroll_offset = total.saturating_sub(viewport);
                 }
                 p.tail_attached = false;
             }

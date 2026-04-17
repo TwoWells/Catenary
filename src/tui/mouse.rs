@@ -128,6 +128,7 @@ pub enum DragState {
 /// panel scrollbar (right column), panel content interior (with overflow
 /// indicator check), and falls through to `None`.
 #[must_use]
+#[allow(clippy::too_many_arguments, reason = "hit-test context is naturally wide")]
 pub fn resolve_click(
     x: u16,
     y: u16,
@@ -135,6 +136,7 @@ pub fn resolve_click(
     grid_layout: &PanelLayout,
     sessions_events_border_x: u16,
     tree_scroll_offset: usize,
+    panel_scroll_offsets: &[usize],
     overflow_counts: &[OverflowCounts],
 ) -> MouseAction {
     // Check tree area.
@@ -182,7 +184,9 @@ pub fn resolve_click(
                     };
                 }
                 // Regular content click — compute flat-line index.
-                let line = compute_line_from_click(y, panel_rect, 0);
+                let scroll_offset =
+                    panel_scroll_offsets.get(panel_idx).copied().unwrap_or(0);
+                let line = compute_line_from_click(y, panel_rect, scroll_offset);
                 MouseAction::ToggleExpansion {
                     panel: panel_idx,
                     line,
@@ -237,6 +241,7 @@ pub fn resolve_drag(
     y: u16,
     drag_state: &DragState,
     grid_layout: &PanelLayout,
+    panel_scroll_offsets: &[usize],
 ) -> MouseAction {
     match drag_state {
         DragState::BorderResize { .. } => MouseAction::ContinueBorderDrag { x },
@@ -246,7 +251,9 @@ pub fn resolve_drag(
                 .panels
                 .get(*panel)
                 .map_or(MouseAction::None, |panel_rect| {
-                    let line = compute_line_from_click(y, panel_rect, 0);
+                    let scroll_offset =
+                        panel_scroll_offsets.get(*panel).copied().unwrap_or(0);
+                    let line = compute_line_from_click(y, panel_rect, scroll_offset);
                     MouseAction::ContinueDragSelect {
                         panel: *panel,
                         line,
@@ -356,7 +363,7 @@ mod tests {
         let grid_area = Rect::new(31, 0, 49, 20);
         let layout = single_panel_layout(grid_area);
 
-        let action = resolve_click(5, 3, tree_area, &layout, 30, 0, &no_overflow());
+        let action = resolve_click(5, 3, tree_area, &layout, 30, 0, &[], &no_overflow());
         // y=3, content_y=1, so item = 3 - 1 + 0 = 2
         assert_eq!(action, MouseAction::SelectSession { item: 2 });
     }
@@ -372,8 +379,41 @@ mod tests {
         let cx = panel_r.x + 5;
         let cy = panel_r.y + 3; // below title row
 
-        let action = resolve_click(cx, cy, tree_area, &layout, 31, 0, &no_overflow());
+        let action = resolve_click(cx, cy, tree_area, &layout, 31, 0, &[0], &no_overflow());
         assert_eq!(action, MouseAction::ToggleExpansion { panel: 0, line: 2 });
+    }
+
+    #[test]
+    fn test_click_in_scrolled_panel() {
+        let tree_area = Rect::new(0, 0, 30, 20);
+        let grid_area = Rect::new(32, 0, 48, 20);
+        let layout = single_panel_layout(grid_area);
+
+        let panel_r = &layout.panels[0].rect;
+        let cx = panel_r.x + 5;
+        let cy = panel_r.y + 3; // below title row → viewport row 2
+
+        // Panel scrolled down by 50 lines — click should resolve to line 52.
+        let action = resolve_click(cx, cy, tree_area, &layout, 31, 0, &[50], &no_overflow());
+        assert_eq!(
+            action,
+            MouseAction::ToggleExpansion {
+                panel: 0,
+                line: 52
+            }
+        );
+    }
+
+    #[test]
+    fn test_click_in_scrolled_tree() {
+        let tree_area = Rect::new(0, 0, 30, 20);
+        let grid_area = Rect::new(31, 0, 49, 20);
+        let layout = single_panel_layout(grid_area);
+
+        // Tree scrolled down by 10 — click at y=3 should resolve to item 12.
+        let action = resolve_click(5, 3, tree_area, &layout, 30, 10, &[], &no_overflow());
+        // y=3, content_y=1, so item = (3 - 1) + 10 = 12
+        assert_eq!(action, MouseAction::SelectSession { item: 12 });
     }
 
     #[test]
@@ -387,7 +427,7 @@ mod tests {
         let cx = panel1_r.x + 3;
         let cy = panel1_r.y;
 
-        let action = resolve_click(cx, cy, tree_area, &layout, 31, 0, &no_overflow_n(2));
+        let action = resolve_click(cx, cy, tree_area, &layout, 31, 0, &[0, 0], &no_overflow_n(2));
         assert_eq!(action, MouseAction::TogglePin(1));
     }
 
@@ -398,7 +438,7 @@ mod tests {
         let layout = single_panel_layout(grid_area);
         let border_x = 30u16;
 
-        let action = resolve_click(30, 5, tree_area, &layout, border_x, 0, &no_overflow());
+        let action = resolve_click(30, 5, tree_area, &layout, border_x, 0, &[], &no_overflow());
         assert_eq!(action, MouseAction::StartBorderDrag { x: 30 });
     }
 
@@ -412,7 +452,7 @@ mod tests {
         // Click at (12, 5) — between tree and grid, not on border either.
         // Border at x=11, so ±1 is 10..=12. Let's use border_x=11.
         // Actually, let's make border far away to test a true miss.
-        let action = resolve_click(80, 80, tree_area, &layout, 11, 0, &no_overflow());
+        let action = resolve_click(80, 80, tree_area, &layout, 11, 0, &[], &no_overflow());
         assert_eq!(action, MouseAction::None);
     }
 
@@ -468,7 +508,7 @@ mod tests {
         let layout = single_panel_layout(grid_area);
 
         let drag = DragState::BorderResize { initial_x: 30 };
-        let action = resolve_drag(20, 5, &drag, &layout);
+        let action = resolve_drag(20, 5, &drag, &layout, &[]);
         assert_eq!(action, MouseAction::ContinueBorderDrag { x: 20 });
     }
 
@@ -520,7 +560,7 @@ mod tests {
         let label_x = right - 3; // "15▲" is 3 wide
         let cy = content.y; // first content row = top indicator row
 
-        let action = resolve_click(label_x, cy, tree_area, &layout, 31, 0, &counts);
+        let action = resolve_click(label_x, cy, tree_area, &layout, 31, 0, &[0], &counts);
         assert_eq!(
             action,
             MouseAction::JumpOverflow {
@@ -548,7 +588,7 @@ mod tests {
         let label_x = right - 3; // "10▼" is 3 wide
         let cy = content.y + content.height - 1; // last content row
 
-        let action = resolve_click(label_x, cy, tree_area, &layout, 31, 0, &counts);
+        let action = resolve_click(label_x, cy, tree_area, &layout, 31, 0, &[0], &counts);
         assert_eq!(
             action,
             MouseAction::JumpOverflow {
@@ -578,7 +618,7 @@ mod tests {
         let space_x = right - 4; // the leading space
         let cy = content.y;
 
-        let action = resolve_click(space_x, cy, tree_area, &layout, 31, 0, &counts);
+        let action = resolve_click(space_x, cy, tree_area, &layout, 31, 0, &[0], &counts);
         // Should NOT be JumpOverflow — falls through to ToggleExpansion.
         assert!(
             !matches!(action, MouseAction::JumpOverflow { .. }),
