@@ -308,6 +308,9 @@ impl DiagnosticsServer {
     pub async fn process_files(&self, files: &[&str], entry_id: i64) -> String {
         use std::fmt::Write;
 
+        // Notify servers about filesystem changes once before the batch.
+        self.client_manager.notify_file_changes().await;
+
         let mut output = String::new();
 
         for &file in files {

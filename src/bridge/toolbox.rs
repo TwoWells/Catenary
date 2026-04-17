@@ -134,6 +134,7 @@ impl Toolbox {
     ) -> Self {
         let fs_manager = Arc::new(FilesystemManager::new());
         fs_manager.set_roots(roots.clone());
+        fs_manager.seed();
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots.clone())));
         let client_manager = Arc::new(LspClientManager::new(
             config,
@@ -165,6 +166,12 @@ impl Toolbox {
             path_validator,
             runtime,
         }
+    }
+
+    /// Diffs the filesystem and notifies servers with matching file watcher
+    /// registrations. Delegates to [`LspClientManager::notify_file_changes`].
+    pub async fn notify_file_changes(&self) {
+        self.client_manager.notify_file_changes().await;
     }
 
     /// Spawns LSP servers for languages detected in the workspace.

@@ -246,6 +246,9 @@ impl HookRouter {
             return None;
         }
 
+        // Notify servers about filesystem changes before LSP interaction.
+        self.toolbox.notify_file_changes().await;
+
         match self
             .toolbox
             .diagnostics

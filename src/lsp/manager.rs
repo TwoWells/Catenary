@@ -7,14 +7,40 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bridge::DocumentManager;
 use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::config::Config;
 use crate::lsp::LspClient;
+use crate::lsp::glob::{FileChange, GlobPattern, WatchKind};
 use crate::lsp::state::ServerStatus;
 use crate::session::MessageLog;
+
+/// Filters filesystem changes against a server's watcher registrations.
+///
+/// Returns `(uri, FileChangeType as u8)` pairs for changes that match at
+/// least one watcher's glob pattern and watch kind.
+fn match_file_changes(
+    changes: &[FileChange],
+    watchers: &[(GlobPattern, WatchKind)],
+    roots: &[PathBuf],
+) -> Vec<(String, u8)> {
+    changes
+        .iter()
+        .filter(|change| {
+            watchers.iter().any(|(pattern, kind)| {
+                pattern.is_match(&change.path, roots) && kind.matches(change.change_type)
+            })
+        })
+        .map(|change| {
+            (
+                format!("file://{}", change.path.display()),
+                change.change_type as u8,
+            )
+        })
+        .collect()
+}
 
 /// Manages the lifecycle of LSP clients, document state, and language detection.
 ///
@@ -505,6 +531,52 @@ impl LspClientManager {
         }
     }
 
+    /// Diffs the filesystem and notifies servers with matching file watcher
+    /// registrations.
+    ///
+    /// Called before each LSP interaction (tool call, diagnostics pipeline).
+    /// No-op if no changes are detected or no servers have registrations.
+    pub async fn notify_file_changes(&self) {
+        let changes = self.fs.diff();
+        if changes.is_empty() {
+            return;
+        }
+
+        let roots = self.roots.lock().await.clone();
+        let clients = self.clients.lock().await.clone();
+
+        let mut notified = 0u32;
+        for (lang, client_mutex) in &clients {
+            let client = client_mutex.lock().await;
+            if !client.is_alive() {
+                continue;
+            }
+
+            let watchers = client.server().file_watcher_snapshot();
+            if watchers.is_empty() {
+                continue;
+            }
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            if matched.is_empty() {
+                continue;
+            }
+
+            let refs: Vec<(&str, u8)> = matched.iter().map(|(u, t)| (u.as_str(), *t)).collect();
+            if let Err(e) = client.did_change_watched_files(&refs).await {
+                warn!("Failed to send didChangeWatchedFiles to {lang}: {e}");
+            }
+            drop(client);
+            notified += 1;
+        }
+
+        debug!(
+            "{} filesystem changes, {} servers notified",
+            changes.len(),
+            notified
+        );
+    }
+
     /// Shuts down all active clients.
     ///
     /// Each server gets 5 seconds to respond to the graceful
@@ -962,5 +1034,170 @@ mod tests {
         assert!(uri.starts_with("file://"));
         assert!(client_mutex.lock().await.is_alive());
         Ok(())
+    }
+
+    // --- match_file_changes ---
+
+    mod file_change_matching {
+        use super::*;
+        use crate::lsp::glob::{FileChange, FileChangeType, GlobPattern, WatchKind};
+
+        fn plain_glob(pattern: &str) -> GlobPattern {
+            GlobPattern::from_value(&serde_json::json!(pattern)).expect("valid glob")
+        }
+
+        #[test]
+        fn matches_created_file() {
+            let changes = vec![FileChange {
+                path: PathBuf::from("/project/src/new.rs"),
+                change_type: FileChangeType::Created,
+            }];
+            let watchers = vec![(plain_glob("**/*.rs"), WatchKind::from_value(None))];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            assert_eq!(matched.len(), 1);
+            assert_eq!(matched[0].0, "file:///project/src/new.rs");
+            assert_eq!(matched[0].1, FileChangeType::Created as u8);
+        }
+
+        #[test]
+        fn skips_non_matching_extension() {
+            let changes = vec![FileChange {
+                path: PathBuf::from("/project/src/file.rs"),
+                change_type: FileChangeType::Created,
+            }];
+            let watchers = vec![(plain_glob("**/*.ts"), WatchKind::from_value(None))];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            assert!(matched.is_empty());
+        }
+
+        #[test]
+        fn empty_changes_returns_empty() {
+            let watchers = vec![(plain_glob("**/*.rs"), WatchKind::from_value(None))];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&[], &watchers, &roots);
+            assert!(matched.is_empty());
+        }
+
+        #[test]
+        fn empty_watchers_returns_empty() {
+            let changes = vec![FileChange {
+                path: PathBuf::from("/project/src/file.rs"),
+                change_type: FileChangeType::Created,
+            }];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &[], &roots);
+            assert!(matched.is_empty());
+        }
+
+        #[test]
+        fn batches_multiple_events() {
+            let changes = vec![
+                FileChange {
+                    path: PathBuf::from("/project/src/a.rs"),
+                    change_type: FileChangeType::Created,
+                },
+                FileChange {
+                    path: PathBuf::from("/project/src/b.rs"),
+                    change_type: FileChangeType::Changed,
+                },
+                FileChange {
+                    path: PathBuf::from("/project/src/c.rs"),
+                    change_type: FileChangeType::Deleted,
+                },
+            ];
+            let watchers = vec![(plain_glob("**/*.rs"), WatchKind::from_value(None))];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            assert_eq!(matched.len(), 3);
+            assert_eq!(matched[0].1, FileChangeType::Created as u8);
+            assert_eq!(matched[1].1, FileChangeType::Changed as u8);
+            assert_eq!(matched[2].1, FileChangeType::Deleted as u8);
+        }
+
+        #[test]
+        fn respects_watch_kind_create_only() {
+            let changes = vec![
+                FileChange {
+                    path: PathBuf::from("/project/src/new.rs"),
+                    change_type: FileChangeType::Created,
+                },
+                FileChange {
+                    path: PathBuf::from("/project/src/mod.rs"),
+                    change_type: FileChangeType::Changed,
+                },
+                FileChange {
+                    path: PathBuf::from("/project/src/old.rs"),
+                    change_type: FileChangeType::Deleted,
+                },
+            ];
+            let watchers = vec![(
+                plain_glob("**/*.rs"),
+                WatchKind::from_value(Some(WatchKind::CREATE)),
+            )];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            assert_eq!(matched.len(), 1);
+            assert_eq!(matched[0].1, FileChangeType::Created as u8);
+        }
+
+        #[test]
+        fn respects_watch_kind_delete_only() {
+            let changes = vec![
+                FileChange {
+                    path: PathBuf::from("/project/src/new.rs"),
+                    change_type: FileChangeType::Created,
+                },
+                FileChange {
+                    path: PathBuf::from("/project/src/old.rs"),
+                    change_type: FileChangeType::Deleted,
+                },
+            ];
+            let watchers = vec![(
+                plain_glob("**/*.rs"),
+                WatchKind::from_value(Some(WatchKind::DELETE)),
+            )];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            assert_eq!(matched.len(), 1);
+            assert_eq!(matched[0].0, "file:///project/src/old.rs");
+        }
+
+        #[test]
+        fn path_outside_root_not_matched() {
+            let changes = vec![FileChange {
+                path: PathBuf::from("/other/src/file.rs"),
+                change_type: FileChangeType::Created,
+            }];
+            let watchers = vec![(plain_glob("**/*.rs"), WatchKind::from_value(None))];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            assert!(matched.is_empty());
+        }
+
+        #[test]
+        fn multiple_watchers_any_match() {
+            let changes = vec![FileChange {
+                path: PathBuf::from("/project/Cargo.toml"),
+                change_type: FileChangeType::Changed,
+            }];
+            let watchers = vec![
+                (plain_glob("**/*.rs"), WatchKind::from_value(None)),
+                (plain_glob("**/*.toml"), WatchKind::from_value(None)),
+            ];
+            let roots = vec![PathBuf::from("/project")];
+
+            let matched = match_file_changes(&changes, &watchers, &roots);
+            assert_eq!(matched.len(), 1);
+        }
     }
 }

@@ -105,6 +105,10 @@ pub fn initialize(
                 "configuration": true,
                 "didChangeConfiguration": {
                     "dynamicRegistration": false
+                },
+                "didChangeWatchedFiles": {
+                    "dynamicRegistration": true,
+                    "relativePatternSupport": true
                 }
             },
             "window": {
@@ -173,6 +177,18 @@ pub fn did_change_workspace_folders(added: &[(&str, &str)], removed: &[(&str, &s
             "added": folder_array(added),
             "removed": folder_array(removed)
         }
+    })
+}
+
+/// Builds `DidChangeWatchedFilesParams`.
+///
+/// `changes` is a slice of `(uri, FileChangeType as u8)` pairs.
+#[must_use]
+pub fn did_change_watched_files(changes: &[(&str, u8)]) -> Value {
+    json!({
+        "changes": changes.iter().map(|(uri, typ)| {
+            json!({ "uri": uri, "type": typ })
+        }).collect::<Vec<_>>()
     })
 }
 
@@ -365,6 +381,10 @@ mod tests {
                     "configuration": true,
                     "didChangeConfiguration": {
                         "dynamicRegistration": false
+                    },
+                    "didChangeWatchedFiles": {
+                        "dynamicRegistration": true,
+                        "relativePatternSupport": true
                     }
                 },
                 "window": {
@@ -377,6 +397,14 @@ mod tests {
         });
 
         assert_eq!(ours, expected);
+    }
+
+    #[test]
+    fn initialize_capabilities_advertise_did_change_watched_files() {
+        let ours = initialize(1, &[("file:///ws", "ws")], None);
+        let dcwf = &ours["capabilities"]["workspace"]["didChangeWatchedFiles"];
+        assert_eq!(dcwf["dynamicRegistration"], json!(true));
+        assert_eq!(dcwf["relativePatternSupport"], json!(true));
     }
 
     #[test]
@@ -472,6 +500,30 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn did_change_watched_files_golden() {
+        let ours = did_change_watched_files(&[
+            ("file:///project/src/new.rs", 1),
+            ("file:///project/src/old.rs", 3),
+        ]);
+
+        assert_eq!(
+            ours,
+            json!({
+                "changes": [
+                    { "uri": "file:///project/src/new.rs", "type": 1 },
+                    { "uri": "file:///project/src/old.rs", "type": 3 }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn did_change_watched_files_empty() {
+        let ours = did_change_watched_files(&[]);
+        assert_eq!(ours, json!({ "changes": [] }));
     }
 
     #[test]

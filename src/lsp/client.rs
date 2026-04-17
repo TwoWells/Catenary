@@ -364,6 +364,21 @@ impl LspClient {
             .await
     }
 
+    /// Notifies the server about filesystem changes for watched files.
+    ///
+    /// `changes` is a slice of `(uri, FileChangeType as u8)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
+    pub async fn did_change_watched_files(&self, changes: &[(&str, u8)]) -> Result<()> {
+        self.notify(
+            "workspace/didChangeWatchedFiles",
+            params::did_change_watched_files(changes),
+        )
+        .await
+    }
+
     /// Notifies the LSP server that workspace folders changed.
     ///
     /// # Errors

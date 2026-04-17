@@ -289,6 +289,11 @@ impl ToolHandler for McpRouter {
             return Ok(CallToolResult::text("done editing"));
         }
 
+        // Notify servers about filesystem changes before any LSP interaction.
+        self.toolbox
+            .runtime
+            .block_on(self.toolbox.notify_file_changes());
+
         // ToolServer dispatch: grep, glob
         let params = arguments.unwrap_or(Value::Null);
         let result = match name {
