@@ -36,16 +36,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit|Read",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "catenary hook post-tool --format=claude"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp.*catenary.*done_editing",
+        "matcher": "Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",

@@ -286,7 +286,28 @@ impl ToolHandler for McpRouter {
         }
 
         if name == "done_editing" {
-            return Ok(CallToolResult::text("done editing"));
+            if let Some(agent_id) = self.toolbox.editing.active_agent() {
+                let files = self.toolbox.editing.drain_files(&agent_id);
+                self.toolbox.editing.done_editing(&agent_id);
+
+                if !files.is_empty() {
+                    let file_strs: Vec<String> = files
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    let file_refs: Vec<&str> = file_strs.iter().map(String::as_str).collect();
+                    let entry_id = parent_id.unwrap_or(0);
+                    let output = self
+                        .toolbox
+                        .runtime
+                        .block_on(self.toolbox.diagnostics.process_files(&file_refs, entry_id));
+
+                    if !output.is_empty() {
+                        return Ok(CallToolResult::text(output));
+                    }
+                }
+            }
+            return Ok(CallToolResult::text("[clean]"));
         }
 
         // Notify servers about filesystem changes before any LSP interaction.

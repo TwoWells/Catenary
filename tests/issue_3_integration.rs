@@ -93,42 +93,54 @@ impl BridgeProcess {
         Ok(())
     }
 
-    /// Sends a file-change notification via the notify socket and returns
-    /// the diagnostics text.
-    fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
+    /// Enters editing mode, accumulates a file, then calls `done_editing`
+    /// via MCP to retrieve diagnostics from the tool result.
+    fn call_diagnostics(&mut self, file: &str) -> Result<String> {
         let sessions_dir = PathBuf::from(&self.state_home)
             .join("catenary")
             .join("sessions");
         let socket_path = find_notify_socket(&sessions_dir)?;
 
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
-            .context("connect to notify socket")?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .context("set read timeout")?;
+        // Enter editing mode via IPC
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/enforce-editing",
+                "tool_name": "start_editing",
+                "agent_id": ""
+            }),
+        )?;
 
-        let request = json!({"method": "post-tool/diagnostics", "file": file});
-        writeln!(stream, "{request}").context("write to notify socket")?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .context("shutdown write")?;
+        // Accumulate file via IPC
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "post-tool/diagnostics",
+                "file": file,
+                "tool": "Edit",
+                "agent_id": ""
+            }),
+        )?;
 
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .context("read from notify socket")?;
+        // Call done_editing via MCP
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 9000,
+            "method": "tools/call",
+            "params": {
+                "name": "done_editing",
+                "arguments": {}
+            }
+        }))?;
 
-        // Unwrap HookResult wire protocol — return the content string
-        let trimmed = response.trim();
-        serde_json::from_str::<catenary_mcp::hook::HookResult>(trimmed).map_or_else(
-            |_| Ok(trimmed.to_string()),
-            |result| match result {
-                catenary_mcp::hook::HookResult::Content(s)
-                | catenary_mcp::hook::HookResult::Courtesy(s) => Ok(s),
-                catenary_mcp::hook::HookResult::Error(e) => Ok(format!("Notify error: {e}")),
-                other => Ok(format!("{other:?}")),
-            },
-        )
+        let response = self.recv()?;
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        Ok(text)
     }
 }
 
@@ -137,6 +149,18 @@ impl Drop for BridgeProcess {
         self.stdin.take();
         let _ = self.child.wait();
     }
+}
+
+/// Sends a one-shot IPC request to the hook server. Ignores the response.
+fn ipc_request(socket_path: &std::path::Path, request: &serde_json::Value) -> Result<()> {
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(stream, "{request}").context("write to notify socket")?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    Ok(())
 }
 
 /// Scans the sessions directory for a `notify.sock` file.
@@ -189,7 +213,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     bridge.initialize()?;
 
     // First diagnostics call — opens the file, triggers didOpen diagnostics
-    let text = bridge.call_diagnostics_via_notify(file_path.to_str().context("file path")?)?;
+    let text = bridge.call_diagnostics(file_path.to_str().context("file path")?)?;
     assert!(
         text.contains("mock diagnostic"),
         "Initial diagnostics should contain mock diagnostic, got: {text}"
@@ -202,7 +226,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     // This triggers didChange + didSave. The flycheck subprocess (mockc)
     // runs under a progress bracket. Catenary should wait for the full
     // Active→Idle cycle before returning diagnostics.
-    let text = bridge.call_diagnostics_via_notify(file_path.to_str().context("file path")?)?;
+    let text = bridge.call_diagnostics(file_path.to_str().context("file path")?)?;
     assert!(
         text.contains("mock diagnostic"),
         "Post-change diagnostics should contain mock diagnostic (after flycheck), got: {text}"

@@ -113,44 +113,58 @@ impl BridgeProcess {
         Ok(())
     }
 
-    /// Sends a file-change notification via the hook socket and returns
-    /// the diagnostics text. This exercises the production hook path
-    /// (`catenary hook post-tool`) rather than the (removed) MCP `diagnostics` tool.
-    fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
-        use std::io::Read as _;
-
-        let state_home = self.state_home.as_ref().context("state_home not set")?;
-        let sessions_dir = PathBuf::from(state_home).join("catenary").join("sessions");
+    /// Enters editing mode, accumulates a file, then calls `done_editing`
+    /// via MCP to retrieve diagnostics from the tool result. Exercises the
+    /// full diagnostics pipeline through the MCP tool path.
+    fn call_diagnostics(&mut self, file: &str) -> Result<String> {
+        let state_home = self
+            .state_home
+            .as_ref()
+            .context("state_home not set")?
+            .clone();
+        let sessions_dir = PathBuf::from(&state_home).join("catenary").join("sessions");
         let socket_path = find_notify_socket(&sessions_dir)?;
 
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
-            .context("connect to notify socket")?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .context("set read timeout")?;
+        // Enter editing mode via IPC
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/enforce-editing",
+                "tool_name": "start_editing",
+                "agent_id": ""
+            }),
+        )?;
 
-        let request = json!({"method": "post-tool/diagnostics", "file": file});
-        writeln!(stream, "{request}").context("write to notify socket")?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .context("shutdown write")?;
+        // Accumulate file via IPC
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "post-tool/diagnostics",
+                "file": file,
+                "tool": "Edit",
+                "agent_id": ""
+            }),
+        )?;
 
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .context("read from notify socket")?;
+        // Call done_editing via MCP
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 9000,
+            "method": "tools/call",
+            "params": {
+                "name": "done_editing",
+                "arguments": {}
+            }
+        }))?;
 
-        // Unwrap HookResult wire protocol — return the content string
-        let trimmed = response.trim();
-        serde_json::from_str::<catenary_mcp::hook::HookResult>(trimmed).map_or_else(
-            |_| Ok(trimmed.to_string()),
-            |result| match result {
-                catenary_mcp::hook::HookResult::Content(s)
-                | catenary_mcp::hook::HookResult::Courtesy(s) => Ok(s),
-                catenary_mcp::hook::HookResult::Error(e) => Ok(format!("Notify error: {e}")),
-                other => Ok(format!("{other:?}")),
-            },
-        )
+        let response = self.recv()?;
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        Ok(text)
     }
 }
 
@@ -175,7 +189,7 @@ fn test_diagnostics_default_mockls() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -197,7 +211,7 @@ fn test_diagnostics_version_path() -> Result<()> {
         BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -226,13 +240,13 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
     bridge.initialize()?;
 
     // First call: opens the file via didOpen (no progress tokens sent)
-    let _ = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // Modify file to trigger didChange on next call
     std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange → progress tokens → TokenMonitor
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -256,14 +270,14 @@ fn test_diagnostics_server_death() -> Result<()> {
 
     // Server will die during or before diagnostics processing
     let text = bridge
-        .call_diagnostics_via_notify(file.to_str().context("path")?)
+        .call_diagnostics(file.to_str().context("path")?)
         .unwrap_or_default();
 
     // Should either get diagnostics (if server published before dying),
     // a status message, or a notify error. No raw infrastructure messages to agent.
     let is_acceptable = text.contains("mock diagnostic")
-        || text == "[no language server]"
-        || text == "[clean]"
+        || text.contains("[no language server]")
+        || text.contains("[clean]")
         || text.contains("Notify error");
 
     assert!(
@@ -290,7 +304,7 @@ fn test_diagnostics_no_code_actions() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -319,7 +333,7 @@ fn test_diagnostics_multi_fix() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -353,7 +367,7 @@ fn test_diagnostics_refactor_filtered() -> Result<()> {
         BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("fix:"),
@@ -382,13 +396,26 @@ fn test_diagnostics_pull_only() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
         "Pull-only server should return diagnostics via pull path. Got: {text}"
     );
 
+    Ok(())
+}
+
+/// Sends a one-shot IPC request to the hook server. Ignores the response.
+fn ipc_request(socket_path: &std::path::Path, request: &Value) -> Result<()> {
+    use std::io::Read as _;
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(stream, "{request}").context("write to notify socket")?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
     Ok(())
 }
 
@@ -430,7 +457,7 @@ fn test_diagnostics_code_action_enrichment() -> Result<()> {
         BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // mockls publishes diagnostics with source "mockls" and returns
     // quickfix code actions with title "fix: <message>" for those.
@@ -472,13 +499,13 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     bridge.initialize()?;
 
     // First call: opens the file (native diagnostics only, no flycheck)
-    let _ = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // Modify file to trigger didChange + didSave on next call
     std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange + didSave → flycheck subprocess
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     // Should contain diagnostics reflecting the modified file (2 lines).
     // The flycheck subprocess runs under a progress bracket; Catenary must
@@ -507,10 +534,10 @@ fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
-    assert_eq!(
-        text, "[clean]",
+    assert!(
+        text.contains("[clean]"),
         "Server with no push and no pull should return [clean] after settle. Got: {text}"
     );
 
@@ -543,7 +570,7 @@ fn test_near_threshold_flycheck() -> Result<()> {
     bridge.initialize()?;
 
     // First call opens the file and gets initial diagnostics
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
         text.contains("mock diagnostic"),
         "Initial diagnostics should arrive. Got: {text}"
@@ -553,7 +580,7 @@ fn test_near_threshold_flycheck() -> Result<()> {
     std::fs::write(&file, "echo changed\necho line3\n")?;
 
     // Second call: triggers didChange + didSave → flycheck with 900-tick mockc
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
         text.contains("mock diagnostic"),
@@ -580,14 +607,14 @@ fn test_pull_downgrade_no_push() -> Result<()> {
     bridge.initialize()?;
 
     // First call: pull fails → downgrade → [clean]
-    let text1 = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text1 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
         text1.contains("[clean]"),
         "Failed pull with no push should return [clean]. Got: {text1}"
     );
 
     // Second call: pull skipped (downgraded) → [clean]
-    let text2 = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text2 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
         text2.contains("[clean]"),
         "Downgraded server should return [clean] without retrying pull. Got: {text2}"
@@ -613,7 +640,7 @@ fn test_pull_downgrade_with_push() -> Result<()> {
 
     // Push cache is populated (push works), pull fails but push data
     // is returned before pull is attempted.
-    let text = bridge.call_diagnostics_via_notify(file.to_str().context("path")?)?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
         text.contains("mock diagnostic"),
         "Server with working push should return diagnostics even with broken pull. Got: {text}"

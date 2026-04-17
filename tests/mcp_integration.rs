@@ -194,43 +194,71 @@ impl BridgeProcess {
         Ok(())
     }
 
-    /// Sends a file-change notification via the hook socket and returns
-    /// the diagnostics text. This exercises the production hook path
-    /// (`catenary hook post-tool`) rather than the (removed) MCP `diagnostics` tool.
-    fn call_diagnostics_via_notify(&self, file: &str) -> Result<String> {
-        let state_home = self.state_home.as_ref().context("state_home not set")?;
-        let sessions_dir = PathBuf::from(state_home).join("catenary").join("sessions");
+    /// Enters editing mode, accumulates a file, then calls `done_editing`
+    /// via MCP to retrieve diagnostics from the tool result.
+    fn call_diagnostics(&mut self, file: &str) -> Result<String> {
+        let state_home = self
+            .state_home
+            .as_ref()
+            .context("state_home not set")?
+            .clone();
+        let sessions_dir = PathBuf::from(&state_home).join("catenary").join("sessions");
         let socket_path = find_notify_socket(&sessions_dir)?;
 
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
-            .context("connect to notify socket")?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .context("set read timeout")?;
+        // Enter editing mode via IPC
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/enforce-editing",
+                "tool_name": "start_editing",
+                "agent_id": ""
+            }),
+        )?;
 
-        let request = json!({"method": "post-tool/diagnostics", "file": file});
-        writeln!(stream, "{request}").context("write to notify socket")?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .context("shutdown write")?;
+        // Accumulate file via IPC
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "post-tool/diagnostics",
+                "file": file,
+                "tool": "Edit",
+                "agent_id": ""
+            }),
+        )?;
 
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .context("read from notify socket")?;
+        // Call done_editing via MCP
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 9000,
+            "method": "tools/call",
+            "params": {
+                "name": "done_editing",
+                "arguments": {}
+            }
+        }))?;
 
-        // Unwrap HookResult wire protocol — return the content string
-        let trimmed = response.trim();
-        serde_json::from_str::<catenary_mcp::hook::HookResult>(trimmed).map_or_else(
-            |_| Ok(trimmed.to_string()),
-            |result| match result {
-                catenary_mcp::hook::HookResult::Content(s)
-                | catenary_mcp::hook::HookResult::Courtesy(s) => Ok(s),
-                catenary_mcp::hook::HookResult::Error(e) => Ok(format!("Notify error: {e}")),
-                other => Ok(format!("{other:?}")),
-            },
-        )
+        let response = self.recv()?;
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        Ok(text)
     }
+}
+
+/// Sends a one-shot IPC request to the hook server. Ignores the response.
+fn ipc_request(socket_path: &std::path::Path, request: &Value) -> Result<()> {
+    use std::io::Read as _;
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(stream, "{request}").context("write to notify socket")?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    Ok(())
 }
 
 /// Scans the sessions directory for a `notify.sock` file.
@@ -1182,7 +1210,7 @@ fn test_mockls_did_save_not_sent_without_capability() -> Result<()> {
     bridge.initialize()?;
 
     // Notify via socket — this triggers didOpen + (possibly) didSave
-    let _ = bridge.call_diagnostics_via_notify(test_file.to_str().context("file path")?)?;
+    let _ = bridge.call_diagnostics(test_file.to_str().context("file path")?)?;
 
     // Shut down to flush the log
     drop(bridge);
@@ -1215,7 +1243,7 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    let _ = bridge.call_diagnostics_via_notify(test_file.to_str().context("file path")?)?;
+    let _ = bridge.call_diagnostics(test_file.to_str().context("file path")?)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));

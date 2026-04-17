@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// Resolve the Catenary state directory.
 ///
@@ -127,6 +127,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 6 {
                 migrate_v5_to_v6(&conn)?;
             }
+            if version < 7 {
+                migrate_v6_to_v7(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -162,7 +165,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '6');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '7');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -255,20 +258,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
              file_path   TEXT PRIMARY KEY,
              mtime_ns    INTEGER NOT NULL,
              grammar     TEXT NOT NULL REFERENCES grammars(scope)
-         );
-
-         CREATE TABLE IF NOT EXISTS editing_state (
-             session_id  TEXT NOT NULL,
-             agent_id    TEXT NOT NULL DEFAULT '',
-             started_at  TEXT NOT NULL,
-             PRIMARY KEY (session_id, agent_id)
-         );
-
-         CREATE TABLE IF NOT EXISTS editing_files (
-             session_id  TEXT NOT NULL,
-             agent_id    TEXT NOT NULL DEFAULT '',
-             file_path   TEXT NOT NULL,
-             PRIMARY KEY (session_id, agent_id, file_path)
          );
 
          COMMIT;",
@@ -456,6 +445,30 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 6 to 7.
+///
+/// Drops the `editing_state` and `editing_files` tables. Editing state
+/// is now managed in-memory by `EditingManager` on `Toolbox`.
+///
+/// # Errors
+///
+/// Returns an error if the table drop or version update fails.
+fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         DROP TABLE IF EXISTS editing_files;
+         DROP TABLE IF EXISTS editing_state;
+
+         UPDATE meta SET value = '7' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v6 to v7")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -474,205 +487,6 @@ fn current_schema_version(conn: &Connection) -> Result<u32> {
     version_str
         .parse::<u32>()
         .with_context(|| format!("invalid schema_version: {version_str}"))
-}
-
-/// Enters editing mode for an agent. Diagnostics are suppressed until
-/// [`done_editing`] is called.
-///
-/// Returns `Ok(true)` if editing mode was entered, `Ok(false)` if the agent
-/// is already in editing mode (no-op).
-///
-/// # Errors
-///
-/// Returns an error if a database operation fails.
-pub fn start_editing(conn: &Connection, session_id: &str, agent_id: &str) -> Result<bool> {
-    let count = conn
-        .execute(
-            "INSERT OR IGNORE INTO editing_state (session_id, agent_id, started_at)
-             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-            rusqlite::params![session_id, agent_id],
-        )
-        .context("failed to insert editing state")?;
-
-    Ok(count > 0)
-}
-
-/// Exits editing mode for an agent. Diagnostics should be requested for
-/// accumulated files after calling this function.
-///
-/// # Errors
-///
-/// Returns an error if the agent is not in editing mode, or if a database
-/// operation fails.
-pub fn done_editing(conn: &Connection, session_id: &str, agent_id: &str) -> Result<()> {
-    let count = conn
-        .execute(
-            "DELETE FROM editing_state
-             WHERE session_id = ?1 AND agent_id = ?2",
-            rusqlite::params![session_id, agent_id],
-        )
-        .context("failed to delete editing state")?;
-
-    anyhow::ensure!(count > 0, "agent is not in editing mode");
-    Ok(())
-}
-
-/// Checks if an agent is in editing mode.
-///
-/// # Errors
-///
-/// Returns an error if a database operation fails.
-pub fn is_agent_editing(conn: &Connection, session_id: &str, agent_id: &str) -> Result<bool> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM editing_state
-             WHERE session_id = ?1 AND agent_id = ?2",
-            rusqlite::params![session_id, agent_id],
-            |row| row.get(0),
-        )
-        .context("failed to check editing state")?;
-
-    Ok(count > 0)
-}
-
-/// Accumulates a modified file path for an agent in editing mode.
-///
-/// Idempotent — duplicate paths are ignored.
-///
-/// # Errors
-///
-/// Returns an error if a database operation fails.
-pub fn add_editing_file(
-    conn: &Connection,
-    session_id: &str,
-    agent_id: &str,
-    file_path: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO editing_files (session_id, agent_id, file_path)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![session_id, agent_id, file_path],
-    )
-    .context("failed to insert editing file")?;
-
-    Ok(())
-}
-
-/// Drains all accumulated file paths for an agent. Returns the file paths
-/// and deletes them from the table.
-///
-/// # Errors
-///
-/// Returns an error if a database operation fails.
-pub fn drain_editing_files(
-    conn: &Connection,
-    session_id: &str,
-    agent_id: &str,
-) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT file_path FROM editing_files
-             WHERE session_id = ?1 AND agent_id = ?2",
-        )
-        .context("failed to prepare drain_editing_files query")?;
-
-    let files = stmt
-        .query_map(rusqlite::params![session_id, agent_id], |row| row.get(0))
-        .context("failed to query editing files")?
-        .collect::<Result<Vec<String>, _>>()
-        .context("failed to collect editing files")?;
-
-    conn.execute(
-        "DELETE FROM editing_files WHERE session_id = ?1 AND agent_id = ?2",
-        rusqlite::params![session_id, agent_id],
-    )
-    .context("failed to delete editing files")?;
-
-    Ok(files)
-}
-
-/// Checks if a file is in another agent's accumulated editing files.
-/// Used for courtesy messages, not blocking.
-///
-/// # Errors
-///
-/// Returns an error if a database operation fails.
-pub fn is_file_edited_by_others(
-    conn: &Connection,
-    file_path: &str,
-    session_id: &str,
-    agent_id: &str,
-) -> Result<bool> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM editing_files
-             WHERE file_path = ?1
-               AND NOT (session_id = ?2 AND agent_id = ?3)",
-            rusqlite::params![file_path, session_id, agent_id],
-            |row| row.get(0),
-        )
-        .context("failed to check if file is edited by others")?;
-
-    Ok(count > 0)
-}
-
-/// Clears all editing state and accumulated files for a session. Returns
-/// the number of editing state rows removed.
-///
-/// Used by `SessionStart` cleanup to clear stale state when the agent's
-/// context is reset.
-///
-/// # Errors
-///
-/// Returns an error if a database operation fails.
-pub fn clear_session_editing(conn: &Connection, session_id: &str) -> Result<usize> {
-    conn.execute(
-        "DELETE FROM editing_files WHERE session_id = ?1",
-        [session_id],
-    )
-    .context("failed to clear session editing files")?;
-
-    let count = conn
-        .execute(
-            "DELETE FROM editing_state WHERE session_id = ?1",
-            [session_id],
-        )
-        .context("failed to clear session editing state")?;
-
-    Ok(count)
-}
-
-/// Deletes editing state and accumulated files for dead sessions. Returns
-/// the number of editing state rows deleted.
-///
-/// Keeps state for sessions whose IDs are in `live_session_ids` and deletes
-/// the rest. Used by `catenary gc`.
-///
-/// # Errors
-///
-/// Returns an error if a database operation fails.
-pub fn gc_editing_state(conn: &Connection, live_session_ids: &[&str]) -> Result<usize> {
-    if live_session_ids.is_empty() {
-        conn.execute("DELETE FROM editing_files", [])
-            .context("failed to gc editing files")?;
-        let count = conn
-            .execute("DELETE FROM editing_state", [])
-            .context("failed to gc editing state")?;
-        return Ok(count);
-    }
-
-    let placeholders = vec!["?"; live_session_ids.len()].join(", ");
-
-    let files_sql = format!("DELETE FROM editing_files WHERE session_id NOT IN ({placeholders})");
-    conn.execute(&files_sql, rusqlite::params_from_iter(live_session_ids))
-        .context("failed to gc editing files")?;
-
-    let state_sql = format!("DELETE FROM editing_state WHERE session_id NOT IN ({placeholders})");
-    let count = conn
-        .execute(&state_sql, rusqlite::params_from_iter(live_session_ids))
-        .context("failed to gc editing state")?;
-
-    Ok(count)
 }
 
 #[cfg(test)]
@@ -708,8 +522,6 @@ mod tests {
             "grammars",
             "symbols",
             "file_parse_state",
-            "editing_state",
-            "editing_files",
         ];
 
         for table in &expected_tables {
@@ -746,7 +558,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 6, "schema version should be 6");
+        assert_eq!(version, 7, "schema version should be 7");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -983,7 +795,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 6, "schema version should be 6 after migration");
+        assert_eq!(version, 7, "schema version should be 7 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
@@ -1024,7 +836,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 6, "schema version should be 6 after migration");
+        assert_eq!(version, 7, "schema version should be 7 after migration");
 
         // Verify client_session_id column exists by inserting a row that uses it.
         conn.execute(
@@ -1076,7 +888,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 6, "schema version should be 6 after migration");
+        assert_eq!(version, 7, "schema version should be 7 after migration");
 
         assert!(
             table_exists(&conn, "messages"),
@@ -1103,7 +915,7 @@ mod tests {
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
-    fn test_schema_migration_v4_to_v5_to_v6() {
+    fn test_schema_migration_v4_to_v7() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let path = dir.path().join("test.db");
 
@@ -1120,313 +932,64 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 6, "schema version should be 6 after migration");
+        assert_eq!(version, 7, "schema version should be 7 after migration");
 
+        // Editing tables should be dropped by v6→v7
         assert!(
-            table_exists(&conn, "editing_state"),
-            "editing_state table should exist after migration"
+            !table_exists(&conn, "editing_state"),
+            "editing_state should not exist after v7 migration"
         );
         assert!(
-            table_exists(&conn, "editing_files"),
-            "editing_files table should exist after migration"
+            !table_exists(&conn, "editing_files"),
+            "editing_files should not exist after v7 migration"
         );
-
-        // editing_state no longer has file_path column
-        conn.execute(
-            "INSERT INTO editing_state (session_id, agent_id, started_at)
-             VALUES ('test-session', '', '2026-01-01T00:00:00Z')",
-            [],
-        )
-        .expect("insert into editing_state should succeed after migration");
-
-        conn.execute(
-            "INSERT INTO editing_files (session_id, agent_id, file_path)
-             VALUES ('test-session', '', '/src/main.rs')",
-            [],
-        )
-        .expect("insert into editing_files should succeed after migration");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
-    fn test_schema_migration_v5_to_v6() {
+    fn test_schema_migration_v6_to_v7() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let path = dir.path().join("test.db");
 
-        // Create a v5 database with old per-file editing_state
+        // Create a v6 database with editing tables
         let conn = open_at(&path).expect("open_at failed");
         conn.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '5');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '6');
              CREATE TABLE editing_state (
-                 file_path   TEXT NOT NULL,
                  session_id  TEXT NOT NULL,
                  agent_id    TEXT NOT NULL DEFAULT '',
                  started_at  TEXT NOT NULL,
-                 PRIMARY KEY (file_path, session_id, agent_id)
+                 PRIMARY KEY (session_id, agent_id)
              );
-             INSERT INTO editing_state (file_path, session_id, agent_id, started_at)
-             VALUES ('/src/main.rs', 's1', '', '2026-01-01T00:00:00Z');
+             CREATE TABLE editing_files (
+                 session_id  TEXT NOT NULL,
+                 agent_id    TEXT NOT NULL DEFAULT '',
+                 file_path   TEXT NOT NULL,
+                 PRIMARY KEY (session_id, agent_id, file_path)
+             );
+             INSERT INTO editing_state (session_id, agent_id, started_at)
+             VALUES ('s1', '', '2026-01-01T00:00:00Z');
+             INSERT INTO editing_files (session_id, agent_id, file_path)
+             VALUES ('s1', '', '/src/main.rs');
              COMMIT;",
         )
-        .expect("failed to create v5 schema");
+        .expect("failed to create v6 schema");
         drop(conn);
 
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 6, "schema version should be 6 after migration");
-
-        // Old data is dropped (stale editing state from pre-migration)
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM editing_state", [], |row| row.get(0))
-            .expect("count editing_state");
-        assert_eq!(
-            count, 0,
-            "old editing state should be dropped during migration"
-        );
+        assert_eq!(version, 7, "schema version should be 7 after migration");
 
         assert!(
-            table_exists(&conn, "editing_files"),
-            "editing_files table should exist after v5→v6 migration"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_start_editing_enters_mode() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        let created = start_editing(&conn, "s1", "").expect("start_editing failed");
-        assert!(created, "start_editing should return true on first call");
-
-        assert!(
-            is_agent_editing(&conn, "s1", "").expect("is_agent_editing failed"),
-            "agent should be in editing mode"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_start_editing_noop_when_already_editing() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        let first = start_editing(&conn, "s1", "").expect("first start_editing failed");
-        assert!(first, "first start_editing should return true");
-
-        let second = start_editing(&conn, "s1", "").expect("second start_editing failed");
-        assert!(
-            !second,
-            "second start_editing should return false (already editing)"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_done_editing_exits_mode() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        start_editing(&conn, "s1", "").expect("start_editing failed");
-        done_editing(&conn, "s1", "").expect("done_editing failed");
-
-        assert!(
-            !is_agent_editing(&conn, "s1", "").expect("is_agent_editing failed"),
-            "agent should not be in editing mode after done_editing"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_done_editing_not_editing_error() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        let err =
-            done_editing(&conn, "s1", "").expect_err("done_editing when not editing should error");
-        assert!(
-            err.to_string().contains("agent is not in editing mode"),
-            "error should mention not in editing mode, got: {err}"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_is_agent_editing() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        assert!(
-            !is_agent_editing(&conn, "s1", "").expect("is_agent_editing failed"),
-            "agent should not be in editing mode initially"
-        );
-
-        start_editing(&conn, "s1", "").expect("start_editing failed");
-
-        assert!(
-            is_agent_editing(&conn, "s1", "").expect("is_agent_editing failed"),
-            "agent should be in editing mode"
-        );
-
-        assert!(
-            !is_agent_editing(&conn, "s1", "agent-2").expect("is_agent_editing failed"),
-            "different agent should not be in editing mode"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_add_and_drain_editing_files() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        let empty = drain_editing_files(&conn, "s1", "").expect("drain_editing_files failed");
-        assert!(empty.is_empty(), "should return empty vec when no files");
-
-        add_editing_file(&conn, "s1", "", "/src/main.rs").expect("add_editing_file failed");
-        add_editing_file(&conn, "s1", "", "/src/lib.rs").expect("add_editing_file failed");
-        // Duplicate should be ignored
-        add_editing_file(&conn, "s1", "", "/src/main.rs").expect("duplicate add should succeed");
-
-        let mut files = drain_editing_files(&conn, "s1", "").expect("drain_editing_files failed");
-        files.sort();
-        assert_eq!(files, vec!["/src/lib.rs", "/src/main.rs"]);
-
-        // Drain should have deleted the rows
-        let after = drain_editing_files(&conn, "s1", "").expect("second drain failed");
-        assert!(after.is_empty(), "drain should delete all files");
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_is_file_edited_by_others_true() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        add_editing_file(&conn, "s1", "agent-b", "/src/main.rs").expect("add_editing_file failed");
-
-        let edited = is_file_edited_by_others(&conn, "/src/main.rs", "s1", "agent-a")
-            .expect("is_file_edited_by_others failed");
-        assert!(edited, "file should be edited by another agent");
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_is_file_edited_by_others_false_own() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        add_editing_file(&conn, "s1", "agent-a", "/src/main.rs").expect("add_editing_file failed");
-
-        let edited = is_file_edited_by_others(&conn, "/src/main.rs", "s1", "agent-a")
-            .expect("is_file_edited_by_others failed");
-        assert!(
-            !edited,
-            "own editing files should not count as edited by others"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_is_file_edited_by_others_cross_session() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        add_editing_file(&conn, "s1", "", "/src/main.rs").expect("add_editing_file failed");
-
-        let edited = is_file_edited_by_others(&conn, "/src/main.rs", "s2", "")
-            .expect("is_file_edited_by_others failed");
-        assert!(
-            edited,
-            "editing in another session should count as edited by others"
-        );
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_clear_session_editing() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        start_editing(&conn, "s1", "agent-a").expect("start_editing a failed");
-        start_editing(&conn, "s1", "agent-b").expect("start_editing b failed");
-        start_editing(&conn, "s2", "").expect("start_editing s2 failed");
-        add_editing_file(&conn, "s1", "agent-a", "/src/main.rs").expect("add file failed");
-        add_editing_file(&conn, "s2", "", "/src/other.rs").expect("add file failed");
-
-        let count = clear_session_editing(&conn, "s1").expect("clear_session_editing failed");
-        assert_eq!(
-            count, 2,
-            "should clear 2 editing state entries for session s1"
-        );
-
-        assert!(
-            !is_agent_editing(&conn, "s1", "agent-a").expect("is_agent_editing failed"),
-            "s1 agent-a should be cleared"
+            !table_exists(&conn, "editing_state"),
+            "editing_state should be dropped after v6→v7 migration"
         );
         assert!(
-            !is_agent_editing(&conn, "s1", "agent-b").expect("is_agent_editing failed"),
-            "s1 agent-b should be cleared"
+            !table_exists(&conn, "editing_files"),
+            "editing_files should be dropped after v6→v7 migration"
         );
-        assert!(
-            is_agent_editing(&conn, "s2", "").expect("is_agent_editing failed"),
-            "s2 should still be editing"
-        );
-
-        // Files should also be cleared for s1
-        let s1_files = drain_editing_files(&conn, "s1", "agent-a").expect("drain failed");
-        assert!(s1_files.is_empty(), "s1 files should be cleared");
-
-        // s2 files should still exist
-        let s2_files = drain_editing_files(&conn, "s2", "").expect("drain failed");
-        assert_eq!(s2_files, vec!["/src/other.rs"]);
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_gc_editing_state() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        start_editing(&conn, "live-session", "").expect("start_editing live failed");
-        start_editing(&conn, "dead-session", "").expect("start_editing dead failed");
-        add_editing_file(&conn, "live-session", "", "/src/main.rs").expect("add file failed");
-        add_editing_file(&conn, "dead-session", "", "/src/lib.rs").expect("add file failed");
-
-        let count = gc_editing_state(&conn, &["live-session"]).expect("gc_editing_state failed");
-        assert_eq!(
-            count, 1,
-            "should delete 1 editing state entry for dead session"
-        );
-
-        assert!(
-            is_agent_editing(&conn, "live-session", "").expect("is_agent_editing failed"),
-            "live session should still be editing"
-        );
-        assert!(
-            !is_agent_editing(&conn, "dead-session", "").expect("is_agent_editing failed"),
-            "dead session should be cleared"
-        );
-
-        // Files should also be gc'd
-        let dead_files = drain_editing_files(&conn, "dead-session", "").expect("drain failed");
-        assert!(dead_files.is_empty(), "dead session files should be gc'd");
-
-        let live_files = drain_editing_files(&conn, "live-session", "").expect("drain failed");
-        assert_eq!(live_files, vec!["/src/main.rs"]);
     }
 }

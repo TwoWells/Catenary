@@ -15,6 +15,7 @@ use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
 use super::diagnostics_server::DiagnosticsServer;
+use super::editing_manager::EditingManager;
 use super::file_tools::GlobServer;
 use super::filesystem_manager::FilesystemManager;
 use super::grep_server::GrepServer;
@@ -116,6 +117,8 @@ pub struct Toolbox {
     pub glob: GlobServer,
     /// Diagnostics pipeline for `PostToolUse` hook requests.
     pub diagnostics: Arc<DiagnosticsServer>,
+    /// In-memory editing state (`start_editing`/`done_editing` lifecycle).
+    pub editing: EditingManager,
     /// LSP client manager (also owns document manager).
     pub(super) client_manager: Arc<LspClientManager>,
     /// File classification and root resolution.
@@ -191,6 +194,7 @@ impl Toolbox {
             grep,
             glob,
             diagnostics,
+            editing: EditingManager::new(),
             client_manager,
             fs_manager,
             path_validator,

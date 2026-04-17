@@ -5,6 +5,8 @@
 pub mod diagnostics_server;
 /// Manages document lifecycle and sync between disk and LSP servers.
 mod document_manager;
+/// In-memory editing state manager.
+pub mod editing_manager;
 /// Glob tool handler: unified file/directory/pattern browsing.
 mod file_tools;
 /// Single authority for file classification (binary, language ID, shebang).
@@ -26,6 +28,7 @@ pub mod toolbox;
 
 pub use diagnostics_server::DiagnosticsServer;
 pub use document_manager::DocumentManager;
+pub use editing_manager::EditingManager;
 pub use handler::McpRouter;
 pub use hook_router::HookRouter;
 pub use path_security::PathValidator;

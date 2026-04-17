@@ -311,12 +311,6 @@ pub fn run_post_tool(format: HostFormat) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // done_editing: batch diagnostics (no file path needed).
-    if tool_name.contains("done_editing") {
-        run_post_tool_done_editing(&hook_json, format);
-        return;
-    }
-
     // Per-file diagnostics: requires a file path.
     let Some(file_path) = extract_file_path(&hook_json) else {
         print!(
@@ -415,61 +409,6 @@ fn format_post_tool_response(lines: &[String], file_path: &str, format: HostForm
             print!("{}", notify_error(&msg, format));
         }
         _ => {} // unexpected variant for this hook
-    }
-}
-
-/// Handle `done_editing` `PostToolUse`: send `post-tool/done-editing` IPC
-/// request to drain accumulated files and return batch diagnostics.
-fn run_post_tool_done_editing(hook_json: &serde_json::Value, format: HostFormat) {
-    let Ok(conn) = db::open_and_migrate() else {
-        print!(
-            "{}",
-            notify_error(
-                "state database unavailable — try running: catenary list",
-                format,
-            )
-        );
-        return;
-    };
-    let Some(catenary_sid) = find_session_id(hook_json, &conn) else {
-        return;
-    };
-
-    let endpoint = notify_endpoint(&catenary_sid);
-    let Some(stream) = notify_connect(&endpoint) else {
-        print!(
-            "{}",
-            notify_error(
-                &format!("session {catenary_sid} is not responding — it may have crashed"),
-                format,
-            )
-        );
-        return;
-    };
-
-    let agent_id = extract_agent_id(hook_json);
-    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
-
-    let mut request = serde_json::json!({
-        "method": "post-tool/done-editing",
-        "agent_id": agent_id,
-    });
-    if let Some(sid) = session_id {
-        request["session_id"] = serde_json::json!(sid);
-    }
-
-    let lines = ipc_exchange(stream, &request);
-    let Some(line) = lines.first() else {
-        return;
-    };
-
-    let Ok(result) = serde_json::from_str::<crate::hook::HookResult>(line) else {
-        print!("{}", format_diagnostics(line, format, "PostToolUse"));
-        return;
-    };
-
-    if let crate::hook::HookResult::Content(content) = result {
-        print!("{}", format_diagnostics(&content, format, "PostToolUse"));
     }
 }
 
