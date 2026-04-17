@@ -47,10 +47,10 @@ pub(crate) enum HookRequest {
     PreToolEnforceEditing {
         /// Host CLI tool name (e.g., "Edit", "Write", `"write_file"`).
         tool_name: String,
-        /// Absolute path to the target file (unused in stateless API but
-        /// preserved for backwards compatibility with hook callers).
+        /// Absolute path to the target file. Used for scope boundary
+        /// checks — edits on files outside workspace roots skip the
+        /// `start_editing` gate.
         #[serde(default)]
-        #[allow(dead_code, reason = "kept for IPC backwards compatibility")]
         file_path: Option<String>,
         /// Agent ID (empty string for the main agent).
         #[serde(default)]

@@ -205,6 +205,16 @@ impl Toolbox {
         }
     }
 
+    /// Returns `true` if the path is within any known workspace root.
+    ///
+    /// Simple prefix check against known roots — no canonicalization or
+    /// symlink resolution. Used for hook scope gating where approximate
+    /// checking is sufficient.
+    #[must_use]
+    pub fn is_within_roots(&self, path: &Path) -> bool {
+        self.fs_manager.resolve_root(path).is_some()
+    }
+
     /// Diffs the filesystem and notifies servers with matching file watcher
     /// registrations. Delegates to [`LspClientManager::notify_file_changes`].
     pub async fn notify_file_changes(&self) {
