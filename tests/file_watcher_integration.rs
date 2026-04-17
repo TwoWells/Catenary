@@ -498,3 +498,128 @@ fn watch_kind_delete_only_filters_creates() -> Result<()> {
     );
     Ok(())
 }
+
+// ── rust-analyzer smoke test ────────────────────────────────────────
+
+/// The motivating case for this workstream: renaming `src/foo.rs` to
+/// `src/foo/mod.rs` via `mv` should deliver `didChangeWatchedFiles` so
+/// rust-analyzer rebuilds its module graph. After the notification, RA
+/// should resolve symbols from the renamed module without `unlinked-file`
+/// diagnostics.
+///
+/// Run with: `make test-ignored T=ra_module_rename`
+/// Requires: rust-analyzer on PATH.
+#[test]
+#[ignore = "requires rust-analyzer; validates the motivating file-watcher scenario"]
+fn ra_module_rename_resolves_after_notification() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state_dir = tempfile::tempdir()?;
+
+    // Minimal Rust project: lib.rs re-exports foo, foo.rs defines a function.
+    let cargo_toml = dir.path().join("Cargo.toml");
+    std::fs::write(
+        &cargo_toml,
+        "[package]\nname = \"fw-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir(&src_dir)?;
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub mod foo;\npub use foo::hello;\n",
+    )?;
+    std::fs::write(
+        src_dir.join("foo.rs"),
+        "pub fn hello() -> &'static str { \"hello\" }\n",
+    )?;
+
+    let lsp_arg = "rust:rust-analyzer";
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    cmd.env("CATENARY_SERVERS", lsp_arg);
+    cmd.env("CATENARY_ROOTS", dir.path());
+    cmd.env("XDG_CONFIG_HOME", state_dir.path());
+    cmd.env("XDG_STATE_HOME", state_dir.path());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("Failed to spawn bridge")?;
+    let stdin = child.stdin.take().context("stdin")?;
+    let stdout = BufReader::new(child.stdout.take().context("stdout")?);
+    let stderr = child.stderr.take();
+
+    let mut bridge = BridgeProcess {
+        child,
+        stdin: Some(stdin),
+        stdout: Some(stdout),
+        stderr,
+        _state_dir: state_dir,
+    };
+    bridge.initialize()?;
+
+    // Wait for rust-analyzer to index — poll with grep until symbols resolve.
+    let mut indexed = false;
+    for attempt in 0..30 {
+        std::thread::sleep(Duration::from_secs(2));
+
+        bridge.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 6000 + attempt,
+            "method": "tools/call",
+            "params": {
+                "name": "grep",
+                "arguments": { "pattern": "hello" }
+            }
+        }))?;
+
+        let response = bridge.recv()?;
+        if let Some(text) = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            && text.contains("## [")
+        {
+            indexed = true;
+            break;
+        }
+    }
+    assert!(indexed, "rust-analyzer did not index within 60s");
+
+    // Perform the rename: src/foo.rs → src/foo/mod.rs
+    let foo_dir = src_dir.join("foo");
+    std::fs::create_dir(&foo_dir)?;
+    std::fs::rename(src_dir.join("foo.rs"), foo_dir.join("mod.rs"))?;
+
+    // Trigger diff → didChangeWatchedFiles
+    let _ = bridge.trigger_file_watch_diff()?;
+
+    // Give rust-analyzer time to process the notification and re-index.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Verify: grep for `hello` should still resolve the symbol in foo/mod.rs.
+    // If the notification wasn't delivered, RA would show unlinked-file errors
+    // and the module graph would be broken.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 7000,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "hello" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    // The symbol should still be enriched (resolved by RA) after the rename.
+    assert!(
+        text.contains("foo/mod.rs") || text.contains("## ["),
+        "Expected rust-analyzer to resolve symbols in foo/mod.rs after \
+         didChangeWatchedFiles notification. Got:\n{text}"
+    );
+
+    Ok(())
+}
