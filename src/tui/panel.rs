@@ -1441,8 +1441,8 @@ mod tests {
         use super::super::pipeline::pair_merge;
 
         let messages = vec![
-            make_message_with_id(1, "mcp", "tools/call", "catenary", None),
-            make_message_with_id(2, "mcp", "notifications/cancelled", "catenary", Some(1)),
+            make_message_with_id(1, "mcp", "tools/call", "catenary", Some(100)),
+            make_message_with_id(2, "mcp", "notifications/cancelled", "catenary", Some(100)),
         ];
         let entries = pair_merge(&messages);
         assert_eq!(entries.len(), 1);
@@ -1595,16 +1595,16 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
             make_message_with_id_parent(
                 2,
                 "lsp",
                 "workspace/symbol",
                 "rust-analyzer",
                 None,
-                Some(1),
+                Some(500),
             ),
-            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(500)),
         ];
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
         panel.load_messages(messages);
@@ -1652,8 +1652,14 @@ mod tests {
         let icons = test_icons();
         let messages = vec![
             {
-                let mut m =
-                    make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+                let mut m = make_message_with_id_parent(
+                    1,
+                    "mcp",
+                    "tools/call",
+                    "catenary",
+                    Some(500),
+                    None,
+                );
                 m.payload = serde_json::json!({"params": {"name": "grep"}});
                 m
             },
@@ -1663,9 +1669,9 @@ mod tests {
                 "workspace/symbol",
                 "rust-analyzer",
                 None,
-                Some(1),
+                Some(500),
             ),
-            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(500)),
         ];
 
         let mut panel = PanelState::new("test1234".to_string(), &theme, &icons);
@@ -1702,7 +1708,8 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let make_tool_call = || {
-            let mut m = make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+            let mut m =
+                make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None);
             m.payload = serde_json::json!({"params": {"name": "grep"}});
             m
         };
@@ -1786,7 +1793,7 @@ mod tests {
         let theme = test_theme();
         let icons = test_icons();
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
             // Segment 1 children
             make_message_with_id_parent(
                 2,
@@ -1794,9 +1801,9 @@ mod tests {
                 "workspace/symbol",
                 "rust-analyzer",
                 None,
-                Some(1),
+                Some(500),
             ),
-            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(500)),
             // Root interruption
             make_message_with_id_parent(4, "lsp", "$/progress", "rust-analyzer", None, None),
             // Segment 2 child
@@ -1806,7 +1813,7 @@ mod tests {
                 "textDocument/references",
                 "rust-analyzer",
                 None,
-                Some(1),
+                Some(500),
             ),
         ];
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
@@ -1850,8 +1857,14 @@ mod tests {
         let icons = test_icons();
         let messages = vec![
             {
-                let mut m =
-                    make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+                let mut m = make_message_with_id_parent(
+                    1,
+                    "mcp",
+                    "tools/call",
+                    "catenary",
+                    Some(500),
+                    None,
+                );
                 m.payload = serde_json::json!({"params": {"name": "grep"}});
                 m
             },
@@ -1862,7 +1875,7 @@ mod tests {
                 "workspace/symbol",
                 "rust-analyzer",
                 None,
-                Some(1),
+                Some(500),
             ),
             // Root interruption — progress with a distinct method for filtering
             make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, None),
@@ -1873,7 +1886,7 @@ mod tests {
                 "textDocument/references",
                 "rust-analyzer",
                 None,
-                Some(1),
+                Some(500),
             ),
         ];
         let mut panel = PanelState::new("test".to_string(), &theme, &icons);
@@ -1903,7 +1916,8 @@ mod tests {
     fn test_segmented_scope_plain_format() {
         // Verify plain text output includes the ellipsis convention.
         let make_tool_call = || {
-            let mut m = make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None);
+            let mut m =
+                make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None);
             m.payload = serde_json::json!({"params": {"name": "grep"}});
             m
         };
@@ -1973,7 +1987,7 @@ mod tests {
                 "mcp",
                 "tools/call",
                 "catenary",
-                None,
+                Some(500),
                 None,
                 serde_json::json!({"params": {"name": "grep"}}),
             ),
@@ -1983,7 +1997,7 @@ mod tests {
                 "workspace/symbol",
                 "rust-analyzer",
                 None,
-                Some(1),
+                Some(500),
             ),
         ];
         let fm_count = frontmatter_lines(&messages[0], &theme).len();

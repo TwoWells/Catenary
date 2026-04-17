@@ -93,19 +93,18 @@ impl DisplayEntry {
         }
     }
 
-    /// Return the database message `id` for this entry's primary message.
+    /// Return the correlation ID for this entry's primary message.
     ///
-    /// - Single: `messages[index].id`
-    /// - Paired: `messages[request_index].id`
-    /// - Collapsed: `messages[start_index].id`
-    /// - Scope: delegates to parent
+    /// Returns `None` if the primary message has no `request_id`.
+    /// Used by scope collapse to match children's `parent_id` to
+    /// their parent's correlation ID.
     #[must_use]
-    pub fn message_id(&self, messages: &[SessionMessage]) -> i64 {
+    pub fn correlation_id(&self, messages: &[SessionMessage]) -> Option<i64> {
         match self {
-            Self::Single { index, .. } => messages[*index].id,
-            Self::Paired { request_index, .. } => messages[*request_index].id,
-            Self::Collapsed { start_index, .. } => messages[*start_index].id,
-            Self::Scope { parent, .. } => parent.message_id(messages),
+            Self::Single { index, .. } => messages[*index].request_id,
+            Self::Paired { request_index, .. } => messages[*request_index].request_id,
+            Self::Collapsed { start_index, .. } => messages[*start_index].request_id,
+            Self::Scope { parent, .. } => parent.correlation_id(messages),
         }
     }
 
@@ -139,15 +138,18 @@ impl DisplayEntry {
 
 /// Run pair merge on a message list.
 ///
-/// If a message has `request_id` set and the value equals the `id` of
-/// the immediately preceding message, both merge into a single `Paired`
-/// entry. Non-adjacent pairs remain as separate `Single` entries.
+/// Adjacent messages that share the same non-`None` `request_id`
+/// (correlation ID) merge into a single `Paired` entry. Non-adjacent
+/// pairs remain as separate `Single` entries.
 #[must_use]
 pub fn pair_merge(messages: &[SessionMessage]) -> Vec<DisplayEntry> {
     let mut entries = Vec::with_capacity(messages.len());
     let mut i = 0;
     while i < messages.len() {
-        if i + 1 < messages.len() && messages[i + 1].request_id == Some(messages[i].id) {
+        if i + 1 < messages.len()
+            && messages[i].request_id.is_some()
+            && messages[i].request_id == messages[i + 1].request_id
+        {
             entries.push(DisplayEntry::Paired {
                 request_index: i,
                 response_index: i + 1,
@@ -248,23 +250,25 @@ pub fn scope_collapse(
     }
 
     // First pass: collect the set of parent_id values referenced by any entry,
-    // and map each entry's message ID to its index.
+    // and map each entry's correlation ID to its index. First entry with a
+    // given correlation ID wins (the request, not the response).
     let mut referenced_parents: HashSet<i64> = HashSet::new();
-    let mut msg_id_to_idx: HashMap<i64, usize> = HashMap::new();
+    let mut corr_id_to_idx: HashMap<i64, usize> = HashMap::new();
 
     for (i, entry) in entries.iter().enumerate() {
-        let mid = entry.message_id(messages);
-        msg_id_to_idx.insert(mid, i);
+        if let Some(cid) = entry.correlation_id(messages) {
+            corr_id_to_idx.entry(cid).or_insert(i);
+        }
         if let Some(pid) = entry.parent_id() {
             referenced_parents.insert(pid);
         }
     }
 
-    // Identify which entry indices are scope parents (their message ID is
-    // referenced as a parent_id by another entry in the list).
+    // Identify which entry indices are scope parents (their correlation ID
+    // is referenced as a parent_id by another entry in the list).
     let scope_parent_indices: HashSet<usize> = referenced_parents
         .iter()
-        .filter_map(|pid| msg_id_to_idx.get(pid).copied())
+        .filter_map(|pid| corr_id_to_idx.get(pid).copied())
         .collect();
 
     // Second pass: stateful left-to-right scan. Track per-scope builders,
@@ -291,7 +295,7 @@ pub fn scope_collapse(
                 },
             );
         } else if let Some(pid) = entry.parent_id() {
-            if let Some(&parent_idx) = msg_id_to_idx.get(&pid)
+            if let Some(&parent_idx) = corr_id_to_idx.get(&pid)
                 && let Some(builder) = builders.get_mut(&parent_idx)
             {
                 // Child of a known scope — add to current segment.
@@ -321,7 +325,7 @@ pub fn scope_collapse(
             .filter(|&&k| {
                 let pid = builders[&k].parent.parent_id();
                 pid.is_some_and(|p| {
-                    msg_id_to_idx
+                    corr_id_to_idx
                         .get(&p)
                         .is_some_and(|&idx| idx != k && builders.contains_key(&idx))
                 })
@@ -336,7 +340,7 @@ pub fn scope_collapse(
         for key in inner_keys {
             if let Some(inner_builder) = builders.remove(&key)
                 && let Some(outer_parent_id) = inner_builder.parent.parent_id()
-                && let Some(&outer_key) = msg_id_to_idx.get(&outer_parent_id)
+                && let Some(&outer_key) = corr_id_to_idx.get(&outer_parent_id)
                 && let Some(outer_builder) = builders.get_mut(&outer_key)
             {
                 let scopes = inner_builder.into_keyed_scopes();
@@ -561,8 +565,8 @@ mod tests {
     #[test]
     fn test_pair_merge_adjacent() {
         let messages = vec![
-            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
-            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
+            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
         ];
         let entries = pair_merge(&messages);
         assert_eq!(entries.len(), 1);
@@ -579,9 +583,9 @@ mod tests {
     #[test]
     fn test_pair_merge_non_adjacent() {
         let messages = vec![
-            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
             make_message_with_id(2, "lsp", "$/progress", "rust-analyzer", None),
-            make_message_with_id(3, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
+            make_message_with_id(3, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
         ];
         let entries = pair_merge(&messages);
         assert_eq!(entries.len(), 3);
@@ -611,15 +615,21 @@ mod tests {
     #[test]
     fn test_pair_merge_consecutive_pairs() {
         let messages = vec![
-            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
-            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
-            make_message_with_id(3, "lsp", "textDocument/definition", "rust-analyzer", None),
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
+            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
+            make_message_with_id(
+                3,
+                "lsp",
+                "textDocument/definition",
+                "rust-analyzer",
+                Some(101),
+            ),
             make_message_with_id(
                 4,
                 "lsp",
                 "textDocument/definition",
                 "rust-analyzer",
-                Some(3),
+                Some(101),
             ),
         ];
         let entries = pair_merge(&messages);
@@ -734,10 +744,10 @@ mod tests {
     #[test]
     fn test_run_collapse_paired_not_collapsed() {
         let messages = vec![
-            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", None),
-            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(1)),
-            make_message_with_id(3, "lsp", "textDocument/hover", "rust-analyzer", None),
-            make_message_with_id(4, "lsp", "textDocument/hover", "rust-analyzer", Some(3)),
+            make_message_with_id(1, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
+            make_message_with_id(2, "lsp", "textDocument/hover", "rust-analyzer", Some(100)),
+            make_message_with_id(3, "lsp", "textDocument/hover", "rust-analyzer", Some(101)),
+            make_message_with_id(4, "lsp", "textDocument/hover", "rust-analyzer", Some(101)),
         ];
         let entries = pair_merge(&messages);
         assert_eq!(entries.len(), 2, "should have 2 pairs");
@@ -779,7 +789,7 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
+                Some(200),
                 Some(100),
             ),
             make_message_with_id_parent(
@@ -787,8 +797,8 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                Some(1),
-                Some(100),
+                Some(200),
+                Some(200),
             ),
         ];
         let entries = pair_merge(&messages);
@@ -811,7 +821,7 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
+                Some(200),
                 None,
             ),
             make_message_with_id_parent(
@@ -819,7 +829,7 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                Some(1),
+                Some(200),
                 None,
             ),
         ];
@@ -876,7 +886,7 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
+                Some(200),
                 Some(10),
             ),
             make_message_with_id_parent(
@@ -884,8 +894,8 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                Some(1),
-                Some(10),
+                Some(200),
+                Some(200),
             ),
         ];
         let entries = pair_merge(&messages);
@@ -905,29 +915,37 @@ mod tests {
     #[test]
     fn test_scope_collapse_basic() {
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
             make_message_with_id_parent(
                 2,
                 "lsp",
                 "workspace/symbol",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(501),
+                Some(500),
             ),
-            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            make_message_with_id_parent(
+                3,
+                "lsp",
+                "workspace/symbol",
+                "taplo",
+                Some(502),
+                Some(500),
+            ),
             make_message_with_id_parent(
                 4,
                 "lsp",
                 "textDocument/references",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(503),
+                Some(500),
             ),
-            make_message_with_id_parent(5, "mcp", "tools/call", "catenary", Some(1), None),
+            make_message_with_id_parent(5, "mcp", "tools/call", "catenary", Some(500), Some(500)),
         ];
         let merged = pair_merge(&messages);
         let scoped = scope_collapse(merged, &messages);
-        assert_eq!(scoped.len(), 2, "expected scope + MCP response: {scoped:?}");
+        // The MCP response (parent_id=500) scopes under the request (request_id=500).
+        assert_eq!(scoped.len(), 1, "expected 1 scope: {scoped:?}");
         match &scoped[0] {
             DisplayEntry::Scope {
                 parent,
@@ -938,15 +956,15 @@ mod tests {
                     matches!(*parent.as_ref(), DisplayEntry::Single { index: 0, .. }),
                     "parent should be Single(0)"
                 );
-                assert_eq!(children.len(), 3, "should have 3 children");
+                assert_eq!(
+                    children.len(),
+                    4,
+                    "should have 4 children (3 LSP + response)"
+                );
                 assert_eq!(*position, SegmentPosition::Only);
             }
             other => panic!("expected Scope, got {other:?}"),
         }
-        assert!(
-            matches!(scoped[1], DisplayEntry::Single { index: 4, .. }),
-            "MCP response should be passthrough"
-        );
     }
 
     #[test]
@@ -970,24 +988,31 @@ mod tests {
     #[test]
     fn test_scope_collapse_preserves_order() {
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
             make_message_with_id_parent(
                 2,
                 "lsp",
                 "workspace/symbol",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(501),
+                Some(500),
             ),
-            make_message_with_id_parent(3, "mcp", "tools/call", "catenary", None, None),
-            make_message_with_id_parent(4, "lsp", "workspace/symbol", "taplo", None, Some(3)),
+            make_message_with_id_parent(3, "mcp", "tools/call", "catenary", Some(510), None),
+            make_message_with_id_parent(
+                4,
+                "lsp",
+                "workspace/symbol",
+                "taplo",
+                Some(511),
+                Some(510),
+            ),
             make_message_with_id_parent(
                 5,
                 "lsp",
                 "textDocument/references",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(502),
+                Some(500),
             ),
         ];
         let merged = pair_merge(&messages);
@@ -1056,24 +1081,31 @@ mod tests {
     #[test]
     fn test_segmented_scope_one_interruption() {
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
             make_message_with_id_parent(
                 2,
                 "lsp",
                 "workspace/symbol",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(501),
+                Some(500),
             ),
-            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            make_message_with_id_parent(
+                3,
+                "lsp",
+                "workspace/symbol",
+                "taplo",
+                Some(502),
+                Some(500),
+            ),
             make_message_with_id_parent(4, "lsp", "$/progress", "rust-analyzer", None, None),
             make_message_with_id_parent(
                 5,
                 "lsp",
                 "textDocument/references",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(503),
+                Some(500),
             ),
         ];
         let merged = pair_merge(&messages);
@@ -1131,14 +1163,14 @@ mod tests {
     #[test]
     fn test_segmented_scope_two_interruptions() {
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
             make_message_with_id_parent(
                 2,
                 "lsp",
                 "workspace/symbol",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(501),
+                Some(500),
             ),
             make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, None),
             make_message_with_id_parent(
@@ -1146,8 +1178,8 @@ mod tests {
                 "lsp",
                 "textDocument/references",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(502),
+                Some(500),
             ),
             make_message_with_id_parent(5, "lsp", "$/progress", "rust-analyzer", None, None),
             make_message_with_id_parent(
@@ -1155,8 +1187,8 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(503),
+                Some(500),
             ),
         ];
         let merged = pair_merge(&messages);
@@ -1194,16 +1226,23 @@ mod tests {
     #[test]
     fn test_segmented_scope_no_interruption() {
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
             make_message_with_id_parent(
                 2,
                 "lsp",
                 "workspace/symbol",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(501),
+                Some(500),
             ),
-            make_message_with_id_parent(3, "lsp", "workspace/symbol", "taplo", None, Some(1)),
+            make_message_with_id_parent(
+                3,
+                "lsp",
+                "workspace/symbol",
+                "taplo",
+                Some(502),
+                Some(500),
+            ),
         ];
         let merged = pair_merge(&messages);
         let scoped = scope_collapse(merged, &messages);
@@ -1223,28 +1262,29 @@ mod tests {
     fn test_scope_collapse_nesting() {
         // Non-adjacent LSP req/resp under an MCP scope. The LSP request
         // is both a scope parent (response references it) and a child of
-        // the MCP scope (its parent_id references the MCP request).
+        // the MCP scope (its parent_id references the MCP correlation ID).
         let messages = vec![
-            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", None, None),
-            // LSP request — child of MCP (parent_id=1), scope parent for LSP response
+            make_message_with_id_parent(1, "mcp", "tools/call", "catenary", Some(500), None),
+            // LSP request — child of MCP (parent_id=500), scope parent for LSP response
             make_message_with_id_parent(
                 2,
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
-                Some(1),
+                Some(501),
+                Some(500),
             ),
             // Notification interrupts, preventing pair merge
-            make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, Some(1)),
-            // LSP response — parent_id=2 (its request), not adjacent so not pair-merged
+            make_message_with_id_parent(3, "lsp", "$/progress", "rust-analyzer", None, Some(500)),
+            // LSP response — parent_id=501 (its request's corr ID), not adjacent so
+            // not pair-merged
             make_message_with_id_parent(
                 4,
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                Some(2),
-                Some(2),
+                Some(501),
+                Some(501),
             ),
         ];
         let merged = pair_merge(&messages);
@@ -1295,25 +1335,25 @@ mod tests {
         // notifications — the exact scenario that produced jitter.
         let messages = vec![
             // hook pre-tool
-            make_message_with_id_parent(1, "hook", "pre-tool/enforce-editing", "", None, None),
+            make_message_with_id_parent(1, "hook", "pre-tool/enforce-editing", "", Some(800), None),
             // MCP grep request (scope parent)
-            make_message_with_id_parent(2, "mcp", "tools/call", "", None, None),
+            make_message_with_id_parent(2, "mcp", "tools/call", "", Some(900), None),
             // LSP children of grep
             make_message_with_id_parent(
                 3,
                 "lsp",
                 "textDocument/didOpen",
                 "rust-analyzer",
-                None,
-                Some(2),
+                Some(901),
+                Some(900),
             ),
             make_message_with_id_parent(
                 4,
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
-                Some(2),
+                Some(902),
+                Some(900),
             ),
             // yaml interruption
             make_message_with_id_parent(
@@ -1338,16 +1378,16 @@ mod tests {
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
-                Some(2),
+                Some(903),
+                Some(900),
             ),
             make_message_with_id_parent(
                 8,
                 "lsp",
                 "textDocument/hover",
                 "rust-analyzer",
-                None,
-                Some(2),
+                Some(904),
+                Some(900),
             ),
             // another yaml interruption
             make_message_with_id_parent(
@@ -1372,11 +1412,11 @@ mod tests {
                 "lsp",
                 "textDocument/didClose",
                 "rust-analyzer",
-                None,
-                Some(2),
+                Some(905),
+                Some(900),
             ),
             // hook post-tool
-            make_message_with_id_parent(12, "hook", "post-tool/diagnostics", "", None, None),
+            make_message_with_id_parent(12, "hook", "post-tool/diagnostics", "", Some(801), None),
         ];
 
         // Run the full pipeline 20 times and assert all runs produce
