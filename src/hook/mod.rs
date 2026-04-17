@@ -159,14 +159,14 @@ impl HookServer {
         refresh_roots: Arc<AtomicBool>,
         message_log: Arc<MessageLog>,
         conn: Arc<Mutex<Connection>>,
-        session_id: String,
+        instance_id: String,
         client_name: String,
     ) -> Self {
         let router = Arc::new(HookRouter::new(
             toolbox,
             refresh_roots,
             conn,
-            session_id,
+            instance_id,
             client_name,
         ));
         Self {

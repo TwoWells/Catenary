@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
 use super::server::LspServer;
@@ -27,13 +27,10 @@ struct PendingRequest {
     sender: oneshot::Sender<ResponseMessage>,
 }
 
-/// Emit an LSP protocol event via `tracing::debug!`.
+/// Emit an LSP protocol event via `tracing::info!`.
 ///
-/// Uses `debug` level so protocol messages stay below the stderr
-/// `fmt::layer` threshold (`catenary=info`) while still reaching
-/// `LoggingServer` (no per-layer filter). Protocol routing is by
-/// `kind` field, not by level — `ProtocolDbSink` matches
-/// `kind in {lsp, mcp, hook}` regardless of tracing level.
+/// Protocol routing is by `kind` field, not by level — `ProtocolDbSink`
+/// matches `kind in {lsp, mcp, hook}` regardless of tracing level.
 ///
 /// Handles the optional `parent_id` field by branching into two macro
 /// invocations (tracing macros require static field sets).
@@ -46,7 +43,7 @@ fn emit_lsp_event(
     msg: &str,
 ) {
     if let Some(pid) = parent_id {
-        debug!(
+        info!(
             kind = "lsp",
             method = method,
             server = server_name,
@@ -57,7 +54,7 @@ fn emit_lsp_event(
             "{msg}"
         );
     } else {
-        debug!(
+        info!(
             kind = "lsp",
             method = method,
             server = server_name,

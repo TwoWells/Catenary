@@ -83,7 +83,7 @@ pub struct HookRouter {
     toolbox: Arc<Toolbox>,
     refresh_roots: Arc<AtomicBool>,
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    session_id: String,
+    instance_id: String,
     /// Host CLI client name (e.g., `"host"`, `"claude-code"`).
     pub(crate) client_name: String,
 }
@@ -95,14 +95,14 @@ impl HookRouter {
         toolbox: Arc<Toolbox>,
         refresh_roots: Arc<AtomicBool>,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-        session_id: String,
+        instance_id: String,
         client_name: String,
     ) -> Self {
         Self {
             toolbox,
             refresh_roots,
             conn,
-            session_id,
+            instance_id,
             client_name,
         }
     }
@@ -306,7 +306,7 @@ impl HookRouter {
             let _ = c.execute(
                 "UPDATE sessions SET client_session_id = ?1 \
                  WHERE id = ?2 AND client_session_id IS NULL",
-                rusqlite::params![client_sid, &self.session_id],
+                rusqlite::params![client_sid, &self.instance_id],
             );
         }
     }

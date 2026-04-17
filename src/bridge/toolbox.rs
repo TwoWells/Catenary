@@ -104,6 +104,24 @@ impl ResolvedGlob {
     }
 }
 
+/// Immutable session metadata, set once at startup.
+///
+/// Provides a stable accessor for the instance ID (and eventually client
+/// session info). Lives on [`Toolbox`] so any component with `Arc<Toolbox>`
+/// can retrieve the ID without storing its own copy.
+pub struct SessionCache {
+    /// Catenary instance ID (unique per process invocation).
+    instance_id: String,
+}
+
+impl SessionCache {
+    /// Returns the Catenary instance ID.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
+
 /// Shared application container for tool servers and cross-tool infrastructure.
 ///
 /// Creates and owns all internal servers and shared dependencies.
@@ -130,6 +148,8 @@ pub struct Toolbox {
     pub notifications: Arc<NotificationQueueSink>,
     /// Broadcast sender for `SqliteMessageTail` (protocol DB sink).
     pub broadcast_tx: tokio::sync::broadcast::Sender<i64>,
+    /// Immutable session metadata.
+    pub session_cache: SessionCache,
     /// Tokio runtime handle for blocking dispatch.
     pub runtime: Handle,
 }
@@ -146,7 +166,7 @@ impl Toolbox {
         roots: Vec<PathBuf>,
         logging: LoggingServer,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-        session_id: String,
+        instance_id: String,
         runtime: Handle,
     ) -> Self {
         // Construct logging sinks.
@@ -157,8 +177,8 @@ impl Toolbox {
             .into();
         let notifications = NotificationQueueSink::new(threshold);
         let (protocol_db, broadcast_tx) =
-            crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), session_id.clone());
-        let trace_db = crate::logging::trace_db::TraceDbSink::new(conn, session_id);
+            crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), instance_id.clone());
+        let trace_db = crate::logging::trace_db::TraceDbSink::new(conn, instance_id.clone());
 
         // Activate — drains bootstrap buffer, enables direct dispatch.
         logging.activate(vec![notifications.clone(), protocol_db, trace_db]);
@@ -199,6 +219,7 @@ impl Toolbox {
             logging,
             notifications,
             broadcast_tx,
+            session_cache: SessionCache { instance_id },
             runtime,
         }
     }

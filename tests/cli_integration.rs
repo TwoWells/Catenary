@@ -16,12 +16,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
-/// Helper to spawn the bridge and capture stderr to find session ID
+/// Helper to spawn the bridge and discover readiness via MCP initialize.
 struct ServerProcess {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
-    stderr: BufReader<std::process::ChildStderr>,
     state_dir: tempfile::TempDir,
 }
 
@@ -40,40 +39,63 @@ impl ServerProcess {
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::null());
 
         let mut child = cmd.spawn().context("Failed to spawn server")?;
 
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-        let stderr = BufReader::new(child.stderr.take().context("Failed to get stderr")?);
 
         Ok(Self {
             child,
             stdin,
             stdout,
-            stderr,
             state_dir,
         })
     }
 
-    fn get_session_id(&mut self) -> Result<String> {
-        let mut line = String::new();
-        // Read stderr line by line until we find "Session ID:"
-        for _ in 0..100 {
-            line.clear();
-            self.stderr
-                .read_line(&mut line)
-                .context("Failed to read stderr")?;
-            if line.contains("Session ID:") {
-                let id = line
-                    .split_whitespace()
-                    .last()
-                    .context("Failed to parse Session ID from line")?;
-                return Ok(id.to_string());
+    /// Sends an MCP `initialize` request and reads the response.
+    ///
+    /// Proves the server is running and the session exists in the DB.
+    /// Returns the full instance ID queried from the database.
+    fn wait_ready(&mut self) -> Result<String> {
+        let init_request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0.0.0" }
             }
-        }
-        Err(anyhow!("Failed to find Session ID in output"))
+        });
+        self.send(&init_request)?;
+        let _response = self.recv()?;
+
+        // Discover the full instance ID via raw SQL query — the isolated
+        // state dir guarantees exactly one session. The `--format json`
+        // output is untruncated, unlike `catenary list`.
+        let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
+            .arg("query")
+            .arg("--sql")
+            .arg("SELECT id FROM sessions LIMIT 1")
+            .arg("--format")
+            .arg("json")
+            .env("CATENARY_STATE_DIR", self.state_dir.path())
+            .output()
+            .context("Failed to run query command")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // JSON format outputs an array of objects: [{"id":"..."}]
+        let parsed: Vec<Value> = serde_json::from_str(stdout.trim())
+            .with_context(|| format!("Failed to parse query JSON: {stdout}"))?;
+        let id = parsed
+            .first()
+            .and_then(|obj| obj["id"].as_str())
+            .ok_or_else(|| anyhow!("No 'id' field in query output: {stdout}"))?
+            .to_string();
+
+        Ok(id)
     }
 
     fn send(&mut self, request: &Value) -> Result<()> {
@@ -103,10 +125,7 @@ impl Drop for ServerProcess {
 fn test_list_shows_row_numbers() -> Result<()> {
     // Start a server to ensure at least one session exists
     let mut server = ServerProcess::spawn()?;
-    let _session_id = server.get_session_id()?;
-
-    // Give the session time to register
-    thread::sleep(Duration::from_millis(100));
+    let _session_id = server.wait_ready()?;
 
     // Run catenary list
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
@@ -151,10 +170,7 @@ fn test_list_shows_row_numbers() -> Result<()> {
 fn test_list_shows_language_servers_line() -> Result<()> {
     // Start a server
     let mut server = ServerProcess::spawn()?;
-    let _session_id = server.get_session_id()?;
-
-    // Give the session time to register
-    thread::sleep(Duration::from_millis(100));
+    let _session_id = server.wait_ready()?;
 
     // Run catenary list
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
@@ -183,10 +199,7 @@ fn test_monitor_by_row_number_starts() -> Result<()> {
 
     // Start a server
     let mut server = ServerProcess::spawn()?;
-    let _session_id = server.get_session_id()?;
-
-    // Give the session time to register
-    thread::sleep(Duration::from_millis(500));
+    let _session_id = server.wait_ready()?;
 
     // Start monitor with row number "1" - we just verify it successfully starts
     // monitoring some session (row number resolution works)
@@ -258,7 +271,7 @@ fn test_monitor_numeric_session_id_resolves() -> Result<()> {
     // (e.g., "025586387"). resolve_session_id must not treat these as row
     // numbers and bail with "out of range".
     let mut server = ServerProcess::spawn()?;
-    let session_id = server.get_session_id()?;
+    let session_id = server.wait_ready()?;
 
     // Start monitor using the full session ID — this must work regardless
     // of whether the ID happens to be all digits.
@@ -306,7 +319,7 @@ fn test_monitor_raw_flag() -> Result<()> {
 
     // Start a server
     let mut server = ServerProcess::spawn()?;
-    let session_id = server.get_session_id()?;
+    let session_id = server.wait_ready()?;
 
     // Start monitor with --raw flag
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
@@ -371,7 +384,7 @@ fn test_monitor_nocolor_flag() -> Result<()> {
 
     // Start a server
     let mut server = ServerProcess::spawn()?;
-    let session_id = server.get_session_id()?;
+    let session_id = server.wait_ready()?;
 
     // Start monitor with --nocolor flag
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
@@ -440,7 +453,7 @@ fn test_monitor_filter_flag() -> Result<()> {
 
     // Start a server
     let mut server = ServerProcess::spawn()?;
-    let session_id = server.get_session_id()?;
+    let session_id = server.wait_ready()?;
 
     // Start monitor with filter for "ping"
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
@@ -507,7 +520,7 @@ fn test_monitor_uses_arrows() -> Result<()> {
 
     // Start a server
     let mut server = ServerProcess::spawn()?;
-    let session_id = server.get_session_id()?;
+    let session_id = server.wait_ready()?;
 
     // Start monitor (without --raw)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));

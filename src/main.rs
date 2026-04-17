@@ -17,7 +17,6 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
 
 use std::sync::atomic::AtomicBool;
 
@@ -305,14 +304,7 @@ fn run_dashboard() -> Result<()> {
 async fn run_server() -> Result<()> {
     let logging = LoggingServer::new();
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_filter(EnvFilter::from_default_env().add_directive("catenary=info".parse()?)),
-        )
-        .with(logging.clone())
-        .init();
+    tracing_subscriber::registry().with(logging.clone()).init();
 
     // Load configuration
     let config = catenary_mcp::config::Config::load()?;
@@ -353,7 +345,7 @@ async fn run_server() -> Result<()> {
         .message_log()
         .clone();
 
-    let session_id = session
+    let instance_id = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
         .info
@@ -371,7 +363,7 @@ async fn run_server() -> Result<()> {
         roots,
         logging,
         session_conn,
-        session_id.clone(),
+        instance_id.clone(),
         tokio::runtime::Handle::current(),
     ));
     toolbox.spawn_all().await;
@@ -388,7 +380,7 @@ async fn run_server() -> Result<()> {
         refresh_roots_flag.clone(),
         message_log.clone(),
         hook_conn,
-        session_id,
+        instance_id,
         "host".to_string(),
     );
     let socket_path = session
