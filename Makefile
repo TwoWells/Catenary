@@ -5,13 +5,21 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: build-release check deny docs test test-ignored test-scripts release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny docs test test-ignored test-scripts release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 
 # Files that contain the version
 VERSION_FILES := Cargo.toml .claude-plugin/marketplace.json gemini-extension.json
+
+# Run benchmarks. Pass B= to select a specific bench, e.g.: make bench B=logging_overhead
+bench:
+	@cargo bench $(if $(B),--bench $(B),) --quiet
+
+# Run benchmark tests with stdout visible. Pass T= to filter.
+bench-test:
+	@cargo nextest run --workspace --features mockls --no-capture --status-level all --cargo-quiet $(if $(T),-E 'test($(T))',)
 
 # Default target: run all checks
 build-release:
