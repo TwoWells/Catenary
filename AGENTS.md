@@ -49,6 +49,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Safety:** `unsafe` code is strictly forbidden (`forbid(unsafe_code)`).
 - **Error Handling:** Use `anyhow` for application logic and `thiserror` for library errors.
 - **Strict Denials:** Do NOT use `unwrap()`, `panic!()`, `todo!()`, `unimplemented!()`, `dbg!()`, `println!()`, or `eprintln!()`. Use proper error handling and the `tracing` crate for logging. `expect()` is denied in production code but allowed in `#[cfg(test)]` modules — prefer `expect("reason")` over `anyhow` workarounds in tests.
+- **Tracing:** `warn!()` and `error!()` events reach the user-notification queue by default. Only use these levels for user-relevant, actionable conditions. Internal diagnostics belong at `info!()` or `debug!()`. See `docs/src/tracing-conventions.md` for severity guidelines, reserved structured fields, and the `source` taxonomy.
 - **Imports:** No wildcard imports (`use crate::*`).
 - **Formatting:** Code must be formatted with `rustfmt`.
 - **Linting:** Must pass `cargo clippy` with `pedantic`, `nursery`, and `cargo` groups enabled.

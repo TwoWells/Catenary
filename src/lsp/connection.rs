@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
 use super::server::LspServer;
@@ -404,7 +404,7 @@ impl Connection {
                     buffer.extend_from_slice(&temp[..n]);
                 }
                 Err(e) => {
-                    error!("Error reading from LSP stdout: {}", e);
+                    info!("Error reading from LSP stdout: {}", e);
                     break;
                 }
             }
@@ -414,7 +414,7 @@ impl Connection {
                 let value: serde_json::Value = match serde_json::from_str(&message_str) {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("Failed to parse JSON: {}", e);
+                        debug!("Failed to parse JSON: {}", e);
                         continue;
                     }
                 };
@@ -481,11 +481,11 @@ impl Connection {
                             let header = format!("Content-Length: {}\r\n\r\n", body.len());
                             let mut stdin_guard = stdin.lock().await;
                             if let Err(e) = stdin_guard.write_all(header.as_bytes()).await {
-                                warn!("Failed to write response header: {}", e);
+                                debug!("Failed to write response header: {}", e);
                             } else if let Err(e) = stdin_guard.write_all(body.as_bytes()).await {
-                                warn!("Failed to write response body: {}", e);
+                                debug!("Failed to write response body: {}", e);
                             } else if let Err(e) = stdin_guard.flush().await {
-                                warn!("Failed to flush response: {}", e);
+                                debug!("Failed to flush response: {}", e);
                             }
                         }
                     } else {
@@ -519,11 +519,11 @@ impl Connection {
                             );
                             let _ = req.sender.send(response);
                         } else {
-                            warn!("Received response for unknown request id: {:?}", id);
+                            debug!("Received response for unknown request id: {:?}", id);
                         }
                     }
                 } else {
-                    warn!("Unknown message format: {}", message_str);
+                    debug!("Unknown message format: {}", message_str);
                 }
             }
         }
@@ -533,7 +533,7 @@ impl Connection {
         if let Some(server) = server.upgrade() {
             server.on_shutdown();
         }
-        warn!("LSP reader task exiting - server connection lost");
+        info!("LSP reader task exiting - server connection lost");
     }
 }
 

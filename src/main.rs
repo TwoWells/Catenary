@@ -286,7 +286,7 @@ fn run_dashboard() -> Result<()> {
 
     let conn = catenary_mcp::db::open_and_migrate()?;
     if let Err(e) = session::prune_sessions_with_conn(&conn, config.log_retention_days) {
-        warn!("session pruning failed: {e}");
+        info!("session pruning failed: {e}");
     }
 
     catenary_mcp::tui::run(config.icons.unwrap_or_default())
@@ -409,7 +409,7 @@ async fn run_server() -> Result<()> {
                         match path.canonicalize() {
                             Ok(canonical) => Some(canonical),
                             Err(e) => {
-                                warn!("Skipping root {p}: {e}");
+                                warn!(source = "config.validation", "Skipping root {p}: {e}",);
                                 None
                             }
                         }

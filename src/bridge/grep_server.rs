@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::filesystem_manager::FilesystemManager;
 use super::handler::{check_server_health, display_path};
@@ -75,7 +75,7 @@ impl ToolServer for GrepServer {
         let clients = self.client_manager.clients().await;
         for (lang, client_mutex) in &clients {
             if !client_mutex.lock().await.wait_ready().await {
-                warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
+                debug!("[{lang}] server died \u{2014} tool will run in degraded mode");
             }
         }
 
@@ -896,7 +896,7 @@ impl GrepServer {
                     };
 
                     if let Err(e) = Searcher::new().search_path(&matcher, path, &mut sink) {
-                        warn!("grep: skipping {path_str}: {e}");
+                        debug!("grep: skipping {path_str}: {e}");
                     }
 
                     WalkState::Continue

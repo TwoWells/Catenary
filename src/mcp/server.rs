@@ -226,7 +226,7 @@ impl<H: ToolHandler> McpServer<H> {
             if self.should_fetch_roots
                 && let Err(e) = self.fetch_roots(&mut reader, &mut writer)
             {
-                error!("Failed to fetch roots: {}", e);
+                error!(source = "mcp.dispatch", "Failed to fetch roots: {}", e,);
             }
         }
 
@@ -250,7 +250,7 @@ impl<H: ToolHandler> McpServer<H> {
                 // Notification, no response needed
             }
             Err(e) => {
-                error!("Error handling message: {}", e);
+                warn!(source = "mcp.dispatch", "Error handling message: {}", e,);
                 // Try to send error response if we can parse the id
                 if let Ok(req) = serde_json::from_str::<Request>(line) {
                     let response = Response::error(req.id, INTERNAL_ERROR, e.to_string());
@@ -316,7 +316,7 @@ impl<H: ToolHandler> McpServer<H> {
             "tools/call" => self.handle_tools_call(request),
             "ping" => Ok(Response::success(request.id, serde_json::json!({}))?),
             _ => {
-                warn!("Unknown method: {}", request.method);
+                debug!("Unknown method: {}", request.method);
                 Ok(Response::error(
                     request.id,
                     METHOD_NOT_FOUND,
@@ -443,7 +443,7 @@ impl<H: ToolHandler> McpServer<H> {
         {
             Ok(result) => Ok(Response::success(request.id, result)?),
             Err(e) => {
-                error!("Tool call failed: {}", e);
+                info!("Tool call failed: {}", e);
                 Ok(Response::success(
                     request.id,
                     CallToolResult::error(e.to_string()),
@@ -566,7 +566,7 @@ impl<H: ToolHandler> McpServer<H> {
                     }
                     return result;
                 }
-                warn!(
+                debug!(
                     "Received response with unexpected ID {:?} while waiting for roots/list",
                     response.id
                 );
@@ -603,8 +603,8 @@ impl<H: ToolHandler> McpServer<H> {
     fn handle_roots_response(&self, response: Response) -> Result<()> {
         if let Some(error) = response.error {
             warn!(
-                "roots/list request failed: {} (code {})",
-                error.message, error.code
+                source = "mcp.dispatch",
+                "roots/list request failed: {} (code {})", error.message, error.code,
             );
             return Ok(()); // Non-fatal
         }
@@ -631,7 +631,7 @@ impl<H: ToolHandler> McpServer<H> {
         if let Some(ref callback) = self.on_roots_changed
             && let Err(e) = callback(roots_result.roots)
         {
-            error!("Failed to apply roots: {}", e);
+            error!(source = "mcp.dispatch", "Failed to apply roots: {}", e,);
         }
 
         Ok(())

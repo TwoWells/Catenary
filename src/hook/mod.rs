@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bridge::HookRouter;
 use crate::bridge::toolbox::Toolbox;
@@ -239,12 +239,12 @@ impl HookServer {
                         let server = server.clone();
                         tokio::spawn(async move {
                             if let Err(e) = server.handle_connection(stream).await {
-                                error!("Notify connection error: {e}");
+                                warn!("Notify connection error: {e}");
                             }
                         });
                     }
                     Err(e) => {
-                        warn!("Notify socket accept error: {e}");
+                        debug!("Notify socket accept error: {e}");
                     }
                 }
             }
@@ -280,7 +280,7 @@ impl HookServer {
             loop {
                 // Wait for a client to connect to the current instance
                 if let Err(e) = server.connect().await {
-                    warn!("Notify pipe connect error: {e}");
+                    debug!("Notify pipe connect error: {e}");
                     continue;
                 }
 
@@ -291,7 +291,7 @@ impl HookServer {
                 server = match ServerOptions::new().create(&pipe_name) {
                     Ok(s) => s,
                     Err(e) => {
-                        warn!("Notify pipe create error: {e}");
+                        info!("Notify pipe create error: {e}");
                         break;
                     }
                 };
@@ -299,7 +299,7 @@ impl HookServer {
                 let srv = server_arc.clone();
                 tokio::spawn(async move {
                     if let Err(e) = srv.handle_connection(connected).await {
-                        error!("Notify connection error: {e}");
+                        warn!("Notify connection error: {e}");
                     }
                 });
             }

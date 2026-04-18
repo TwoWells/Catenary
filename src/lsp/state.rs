@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::warn;
+use tracing::debug;
 
 /// Token type for progress tracking.
 pub type ProgressToken = String;
@@ -154,7 +154,7 @@ impl ProgressTracker {
                 self.active_progress.remove(token);
             }
             other => {
-                warn!("Unknown progress kind: {:?}", other);
+                debug!("Unknown progress kind: {:?}", other);
             }
         }
     }

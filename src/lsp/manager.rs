@@ -113,7 +113,11 @@ impl LspClientManager {
 
         for lang in &relevant {
             if let Err(e) = self.get_or_spawn(lang).await {
-                warn!("Failed to spawn LSP server for {lang}: {e}");
+                warn!(
+                    source = "lsp.lifecycle",
+                    language = lang.as_str(),
+                    "Failed to spawn LSP server for {lang}: {e}",
+                );
             }
         }
     }
@@ -151,7 +155,7 @@ impl LspClientManager {
                     .did_change_workspace_folders(&[], &[(&uri, &name)])
                     .await
                 {
-                    warn!(
+                    info!(
                         "Failed to notify {} server about removed workspace folder: {}",
                         lang, e
                     );
@@ -255,7 +259,7 @@ impl LspClientManager {
                     .did_change_workspace_folders(&added_refs, &removed_refs)
                     .await
                 {
-                    warn!(
+                    info!(
                         "Failed to notify {} server about workspace folder changes: {}",
                         lang, e
                     );
@@ -494,7 +498,11 @@ impl LspClientManager {
 
         for lang in &to_spawn {
             if let Err(e) = self.get_or_spawn(lang).await {
-                warn!("Failed to spawn LSP server for {lang}: {e}");
+                warn!(
+                    source = "lsp.lifecycle",
+                    language = lang.as_str(),
+                    "Failed to spawn LSP server for {lang}: {e}",
+                );
             }
         }
     }
@@ -526,7 +534,7 @@ impl LspClientManager {
             if client.is_alive()
                 && let Err(e) = client.shutdown().await
             {
-                warn!("Failed to shutdown LSP server for {}: {}", lang, e);
+                info!("Failed to shutdown LSP server for {}: {}", lang, e);
             }
         }
     }
@@ -564,7 +572,7 @@ impl LspClientManager {
 
             let refs: Vec<(&str, u8)> = matched.iter().map(|(u, t)| (u.as_str(), *t)).collect();
             if let Err(e) = client.did_change_watched_files(&refs).await {
-                warn!("Failed to send didChangeWatchedFiles to {lang}: {e}");
+                info!("Failed to send didChangeWatchedFiles to {lang}: {e}");
             }
             drop(client);
             notified += 1;
@@ -591,10 +599,10 @@ impl LspClientManager {
                 drop(client);
                 match result {
                     Ok(Err(e)) => {
-                        warn!("Failed to shutdown LSP server for {}: {}", lang, e);
+                        info!("Failed to shutdown LSP server for {}: {}", lang, e);
                     }
                     Err(_) => {
-                        warn!(
+                        info!(
                             "LSP server for {} did not respond to shutdown within 5s, killing",
                             lang
                         );

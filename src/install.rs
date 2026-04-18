@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use rusqlite::Connection;
-use tracing::warn;
+use tracing::info;
 
 /// Returns the Catenary data directory.
 ///
@@ -420,10 +420,10 @@ pub fn remove_grammar(scope: &str, db: &Connection) -> Result<()> {
 
     // Delete files from disk (non-fatal if already gone)
     if let Err(e) = std::fs::remove_file(&lib_path) {
-        warn!("failed to delete {lib_path}: {e}");
+        info!("failed to delete {lib_path}: {e}");
     }
     if let Err(e) = std::fs::remove_file(&tags_path) {
-        warn!("failed to delete {tags_path}: {e}");
+        info!("failed to delete {tags_path}: {e}");
     }
 
     // Try to remove the scope directory (OK if not empty or gone)

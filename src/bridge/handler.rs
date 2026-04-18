@@ -66,7 +66,7 @@ pub(super) async fn check_server_health(
     // Recovery: previously unavailable, now alive
     for lang in &alive {
         if notified.remove(lang.as_str()) {
-            tracing::info!(
+            tracing::warn!(
                 source = "lsp.lifecycle",
                 language = lang.as_str(),
                 "Language server back online: {lang} \u{2014} \

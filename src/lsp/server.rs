@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace};
 
 use super::client::DiagnosticsCache;
 use super::connection::Connection;
@@ -216,7 +216,7 @@ impl LspServer {
     pub fn downgrade_pull_diagnostics(&self) {
         self.supports_pull_diagnostics
             .store(false, Ordering::SeqCst);
-        warn!("pull diagnostics downgraded to push-only");
+        info!("pull diagnostics downgraded to push-only");
     }
 
     /// Returns whether the server advertises `hoverProvider`.
@@ -427,7 +427,7 @@ impl LspServer {
         match method {
             "textDocument/publishDiagnostics" => {
                 let Some(uri) = extract::publish_diagnostics_uri(params) else {
-                    warn!("publishDiagnostics missing uri");
+                    debug!("publishDiagnostics missing uri");
                     return;
                 };
                 let version = extract::publish_diagnostics_version(params);
@@ -464,7 +464,7 @@ impl LspServer {
             }
             "$/progress" => {
                 let Some(token_value) = extract::progress_token(params) else {
-                    warn!("$/progress missing token");
+                    debug!("$/progress missing token");
                     return;
                 };
                 let token_str = token_value

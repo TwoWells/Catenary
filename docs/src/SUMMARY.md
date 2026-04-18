@@ -7,6 +7,7 @@
 - [Installation](installation.md)
 - [Configuration](configuration.md)
 - [CLI & Dashboard](cli.md)
+- [Tracing Conventions](tracing-conventions.md)
 - [Language Servers](lsp/README.md)
   - [CSS, HTML, JSON](lsp/css-html-json.md)
   - [Go](lsp/go.md)

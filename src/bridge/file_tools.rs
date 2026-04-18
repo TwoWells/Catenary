@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::debug;
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{check_server_health, expand_tilde, resolve_path};
@@ -163,7 +163,7 @@ impl GlobServer {
         drop(client);
 
         if !is_ready {
-            warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
+            debug!("[{lang}] server died \u{2014} tool will run in degraded mode");
         }
     }
 
@@ -173,7 +173,7 @@ impl GlobServer {
 
         for (lang, client_mutex) in clients {
             if !client_mutex.lock().await.wait_ready().await {
-                warn!("[{lang}] server died \u{2014} tool will run in degraded mode");
+                debug!("[{lang}] server died \u{2014} tool will run in degraded mode");
             }
         }
     }

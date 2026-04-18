@@ -48,7 +48,7 @@ use crossterm::terminal::{
 use notify::Watcher;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tracing::warn;
+use tracing::info;
 
 use crate::config::IconConfig;
 use crate::session;
@@ -107,7 +107,7 @@ pub fn run(icon_config: IconConfig) -> Result<()> {
     let wal_watcher = match start_wal_watcher(&db_path) {
         Ok((watcher, rx)) => Some((watcher, rx)),
         Err(e) => {
-            warn!("WAL watcher unavailable, falling back to polling: {e}");
+            info!("WAL watcher unavailable, falling back to polling: {e}");
             None
         }
     };
