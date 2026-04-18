@@ -1036,12 +1036,37 @@ mod tests {
 
     // ── query tests ─────────────────────────────────────────────────
 
+    /// Insert a test message row directly into the `messages` table.
+    fn insert_test_message(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        client: &str,
+        payload: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, method, server, client, \
+              request_id, parent_id, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
+            rusqlite::params![
+                session_id,
+                "2026-01-01T00:00:00.000Z",
+                r#type,
+                method,
+                server,
+                client,
+                payload,
+            ],
+        )
+        .expect("insert test message");
+    }
+
     #[test]
     fn test_query_with_type_filter() -> anyhow::Result<()> {
-        let (_dir, path, conn) = test_db();
-        let conn_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
-            &path,
-        )?));
+        let (_dir, _path, conn) = test_db();
 
         conn.execute(
             "INSERT INTO sessions (id, pid, display_name, started_at) \
@@ -1049,24 +1074,23 @@ mod tests {
             [],
         )?;
 
-        let log = session::MessageLog::new(conn_arc, "s1".to_string());
-        log.log(
+        insert_test_message(
+            &conn,
+            "s1",
             "mcp",
             "tools/call",
             "catenary",
             "claude-code",
-            None,
-            None,
-            &serde_json::json!({"params": {"name": "grep"}}),
+            r#"{"params":{"name":"grep"}}"#,
         );
-        log.log(
+        insert_test_message(
+            &conn,
+            "s1",
             "lsp",
             "textDocument/hover",
             "rust-analyzer",
             "catenary",
-            None,
-            None,
-            &serde_json::json!({}),
+            "{}",
         );
 
         // Query with --kind mcp should work (now --type)
@@ -1084,10 +1108,7 @@ mod tests {
 
     #[test]
     fn test_query_with_search() -> anyhow::Result<()> {
-        let (_dir, path, conn) = test_db();
-        let conn_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::db::open_and_migrate_at(
-            &path,
-        )?));
+        let (_dir, _path, conn) = test_db();
 
         conn.execute(
             "INSERT INTO sessions (id, pid, display_name, started_at) \
@@ -1095,15 +1116,14 @@ mod tests {
             [],
         )?;
 
-        let log = session::MessageLog::new(conn_arc, "s1".to_string());
-        log.log(
+        insert_test_message(
+            &conn,
+            "s1",
             "mcp",
             "tools/call",
             "catenary",
             "claude-code",
-            None,
-            None,
-            &serde_json::json!({"params": {"name": "grep"}}),
+            r#"{"params":{"name":"grep"}}"#,
         );
 
         // Search for "grep" in payload should succeed

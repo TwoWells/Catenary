@@ -5,8 +5,7 @@
 //!
 //! Writes events with `kind` in `{"lsp", "mcp", "hook"}` to the `messages`
 //! table and broadcasts the inserted ROWID so `SqliteMessageTail` stays live.
-//! Replaces `MessageLog`'s write + broadcast paths (deletion happens in
-//! ticket 10).
+//! Sole protocol message writer — `MessageLog` has been removed.
 
 use std::sync::Arc;
 use std::sync::Mutex;

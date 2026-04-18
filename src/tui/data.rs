@@ -492,6 +492,19 @@ mod tests {
         Ok(())
     }
 
+    /// Insert a test message row directly into the `messages` table.
+    fn insert_test_message(conn: &rusqlite::Connection, session_id: &str) {
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, method, server, client, \
+              request_id, parent_id, payload) \
+             VALUES (?1, ?2, 'lsp', 'textDocument/hover', 'rust-analyzer', \
+              'catenary', NULL, NULL, '{}')",
+            rusqlite::params![session_id, "2026-01-01T00:00:00.000Z"],
+        )
+        .expect("insert test message");
+    }
+
     #[test]
     fn test_sqlite_data_source_monitor_messages() -> Result<()> {
         let (_dir, path, conn) = test_db();
@@ -500,15 +513,9 @@ mod tests {
         let session = create_session(&path, "/tmp/test-ds-messages")?;
         let id = session.info.id.clone();
 
-        session.message_log().log(
-            "lsp",
-            "textDocument/hover",
-            "rust-analyzer",
-            "catenary",
-            None,
-            None,
-            &serde_json::json!({}),
-        );
+        // Insert via a separate connection (ds owns the read-only one).
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_test_message(&write_conn, &id);
 
         let messages = ds.monitor_messages(&id)?;
         assert!(!messages.is_empty(), "should have at least one message");
@@ -536,19 +543,12 @@ mod tests {
             "should have no messages initially"
         );
 
-        // Log a new message.
-        session.message_log().log(
-            "lsp",
-            "textDocument/hover",
-            "rust-analyzer",
-            "catenary",
-            None,
-            None,
-            &serde_json::json!({}),
-        );
+        // Insert a new message directly.
+        let write_conn = crate::db::open_and_migrate_at(&path)?;
+        insert_test_message(&write_conn, &id);
 
         let msg = tail.try_next_message()?;
-        assert!(msg.is_some(), "should see newly logged message");
+        assert!(msg.is_some(), "should see newly inserted message");
 
         // No more messages.
         assert!(tail.try_next_message()?.is_none());

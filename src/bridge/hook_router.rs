@@ -600,7 +600,7 @@ mod tests {
 
     /// Create a `HookRouter` with a test database for handler unit tests.
     ///
-    /// Uses noop `MessageLog` and minimal dependencies. Editing state is
+    /// Uses minimal dependencies (no live LSP servers). Editing state is
     /// managed in-memory via [`super::super::editing_manager::EditingManager`]
     /// on the `Toolbox`.
     fn test_router() -> TestHookRouter {
