@@ -722,22 +722,10 @@ mod tests {
     fn dispatch_session_start_drains_notifications() {
         let router = test_router();
         // Populate the notification queue.
-        let event = crate::logging::LogEvent {
-            severity: crate::logging::Severity::Warn,
-            target: "test",
-            message: "server offline".to_string(),
-            kind: None,
-            method: None,
-            server: Some("ra".to_string()),
-            client: None,
-            request_id: None,
-            parent_id: None,
-            source: None,
-            language: None,
-            payload: None,
-            fields: serde_json::Map::new(),
-        };
-        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
         assert_eq!(router.toolbox.notifications.len(), 1);
 
         let result = router.dispatch(
@@ -754,22 +742,10 @@ mod tests {
     #[test]
     fn dispatch_stop_allow_drains_notifications() {
         let router = test_router();
-        let event = crate::logging::LogEvent {
-            severity: crate::logging::Severity::Warn,
-            target: "test",
-            message: "server offline".to_string(),
-            kind: None,
-            method: None,
-            server: Some("ra".to_string()),
-            client: None,
-            request_id: None,
-            parent_id: None,
-            source: None,
-            language: None,
-            payload: None,
-            fields: serde_json::Map::new(),
-        };
-        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
 
         // Not editing → allow → should drain.
         let result = router.dispatch(
@@ -793,22 +769,10 @@ mod tests {
         // Enter editing mode so stop blocks.
         router.handle_enforce_editing(START_EDITING, None, "");
 
-        let event = crate::logging::LogEvent {
-            severity: crate::logging::Severity::Warn,
-            target: "test",
-            message: "server offline".to_string(),
-            kind: None,
-            method: None,
-            server: Some("ra".to_string()),
-            client: None,
-            request_id: None,
-            parent_id: None,
-            source: None,
-            language: None,
-            payload: None,
-            fields: serde_json::Map::new(),
-        };
-        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
 
         let result = router.dispatch(
             crate::hook::HookRequest::PostAgentRequireRelease {
@@ -832,22 +796,10 @@ mod tests {
     #[test]
     fn dispatch_pre_tool_does_not_drain() {
         let router = test_router();
-        let event = crate::logging::LogEvent {
-            severity: crate::logging::Severity::Warn,
-            target: "test",
-            message: "server offline".to_string(),
-            kind: None,
-            method: None,
-            server: Some("ra".to_string()),
-            client: None,
-            request_id: None,
-            parent_id: None,
-            source: None,
-            language: None,
-            payload: None,
-            fields: serde_json::Map::new(),
-        };
-        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
 
         let result = router.dispatch(
             crate::hook::HookRequest::PreToolEnforceEditing {
@@ -863,15 +815,117 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_post_tool_does_not_drain() {
+    fn dispatch_stop_block_then_allow_drains_accumulated() {
         let router = test_router();
-        let event = crate::logging::LogEvent {
+        // Enter editing mode so stop blocks.
+        router.handle_enforce_editing(START_EDITING, None, "");
+
+        // Enqueue a notification before the first stop.
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
+
+        // First stop: block (editing active) — queue preserved.
+        let result = router.dispatch(
+            crate::hook::HookRequest::PostAgentRequireRelease {
+                agent_id: String::new(),
+                stop_hook_active: false,
+            },
+            0,
+        );
+        assert!(matches!(result.result, Some(HookResult::Block(_))));
+        assert!(result.system_message.is_none());
+        assert_eq!(router.toolbox.notifications.len(), 1);
+
+        // Enqueue another notification between block and retry.
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("config error", "pylsp"),
+        );
+        assert_eq!(router.toolbox.notifications.len(), 2);
+
+        // Second stop: retry (stop_hook_active) — force-clears editing, allows, drains.
+        let result = router.dispatch(
+            crate::hook::HookRequest::PostAgentRequireRelease {
+                agent_id: String::new(),
+                stop_hook_active: true,
+            },
+            0,
+        );
+        assert!(result.result.is_none(), "retry should allow");
+        let msg = result
+            .system_message
+            .expect("retry-allow should drain accumulated notifications");
+        assert!(
+            msg.contains("server offline"),
+            "drain should include first-cycle notification"
+        );
+        assert!(
+            msg.contains("config error"),
+            "drain should include second-cycle notification"
+        );
+        assert!(router.toolbox.notifications.is_empty());
+    }
+
+    #[test]
+    fn dispatch_stop_dedup_persists_across_blocked_cycle() {
+        let router = test_router();
+        router.handle_enforce_editing(START_EDITING, None, "");
+
+        // Enqueue a notification.
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
+
+        // Block — queue preserved.
+        let result = router.dispatch(
+            crate::hook::HookRequest::PostAgentRequireRelease {
+                agent_id: String::new(),
+                stop_hook_active: false,
+            },
+            0,
+        );
+        assert!(matches!(result.result, Some(HookResult::Block(_))));
+
+        // Same notification again — dedup should reject.
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
+        assert_eq!(
+            router.toolbox.notifications.len(),
+            1,
+            "dedup should reject duplicate across blocked cycle"
+        );
+
+        // Retry-allow: drain should contain exactly one notification.
+        let result = router.dispatch(
+            crate::hook::HookRequest::PostAgentRequireRelease {
+                agent_id: String::new(),
+                stop_hook_active: true,
+            },
+            0,
+        );
+        let msg = result.system_message.expect("should drain");
+        // Background header + 1 notification = 2 lines.
+        assert_eq!(
+            msg.lines().count(),
+            2,
+            "expected header + 1 notification, got: {msg}"
+        );
+    }
+
+    /// Shorthand for constructing a notification-level `LogEvent`.
+    fn make_notify_event(message: &str, server: &str) -> crate::logging::LogEvent<'static> {
+        crate::logging::LogEvent {
             severity: crate::logging::Severity::Warn,
             target: "test",
-            message: "server offline".to_string(),
+            message: message.to_string(),
             kind: None,
             method: None,
-            server: Some("ra".to_string()),
+            server: Some(server.to_string()),
             client: None,
             request_id: None,
             parent_id: None,
@@ -879,8 +933,16 @@ mod tests {
             language: None,
             payload: None,
             fields: serde_json::Map::new(),
-        };
-        crate::logging::Sink::handle(router.toolbox.notifications.as_ref(), &event);
+        }
+    }
+
+    #[test]
+    fn dispatch_post_tool_does_not_drain() {
+        let router = test_router();
+        crate::logging::Sink::handle(
+            router.toolbox.notifications.as_ref(),
+            &make_notify_event("server offline", "ra"),
+        );
 
         let result = router.dispatch(
             crate::hook::HookRequest::PostToolDiagnostics {
