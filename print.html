@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-af2e23ea.js";
+            window.path_to_searchindex_js = "searchindex-cb30a210.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-08107c56.js"></script>
+        <script src="toc-4243c2b5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -587,6 +587,71 @@ catenary gc --session 029ba740
 </code></pre>
 <h3 id="catenary-doctor"><a class="header" href="#catenary-doctor"><code>catenary doctor</code></a></h3>
 <p>Verify language servers and hook installation. See <a href="#verify">Installation</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="tracing-conventions"><a class="header" href="#tracing-conventions">Tracing Conventions</a></h1>
+<p>Catenary uses the <code>tracing</code> crate for all logging and telemetry.
+<code>LoggingServer</code> subscribes to every <code>tracing</code> event and dispatches to
+multiple sinks: protocol-message DB, trace DB, user-notification queue,
+and TUI broadcast.</p>
+<h2 id="severity-guidelines"><a class="header" href="#severity-guidelines">Severity guidelines</a></h2>
+<p>Events at <code>warn</code> and <code>error</code> reach the user-notification queue by
+default (configurable via <code>[notifications] threshold</code>). Choose severity
+by asking:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>User cares?</th><th>Actionable?</th><th>Frequent?</th><th>Severity</th></tr>
+</thead>
+<tbody>
+<tr><td>No</td><td>—</td><td>—</td><td><code>debug!()</code></td></tr>
+<tr><td>Yes</td><td>No</td><td>—</td><td><code>info!()</code></td></tr>
+<tr><td>Yes</td><td>Yes</td><td>Very</td><td><code>warn!()</code> / <code>error!()</code> + verify dedup fields</td></tr>
+<tr><td>Yes</td><td>Yes</td><td>Rare</td><td><code>warn!()</code> / <code>error!()</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Use <code>error!()</code> only for conditions that indicate a systemic failure
+(e.g., root resolution failed, critical I/O error). Use <code>warn!()</code> for
+degradation that the user should know about but that Catenary can
+recover from (e.g., server died, roots/list failed).</p>
+<h2 id="reserved-structured-fields"><a class="header" href="#reserved-structured-fields">Reserved structured fields</a></h2>
+<pre><code>kind       — "lsp" | "mcp" | "hook" — routes to protocol DB sink
+method     — Protocol method name (LSP/MCP method)
+server     — LSP server name ("rust-analyzer", "pylsp", ...)
+client     — Client identifier ("claude-code", "gemini-cli")
+request_id — In-process correlation id (i64)
+parent_id  — Correlation id of the causing event (i64)
+source     — Subsystem that emitted the event (see taxonomy below)
+language   — Language id ("rust", "python", ...)
+payload    — Raw protocol JSON string (for kind = lsp|mcp|hook)
+</code></pre>
+<p>Notification dedup key: <code>(source, server, language, message_stem)</code>.
+Events at <code>warn</code>/<code>error</code> level should include these fields where
+applicable so notifications with the same identity collapse.</p>
+<h2 id="source-taxonomy"><a class="header" href="#source-taxonomy">Source taxonomy</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Source</th><th>Subsystem</th></tr>
+</thead>
+<tbody>
+<tr><td><code>config.parse</code></td><td>Config loading errors</td></tr>
+<tr><td><code>config.validation</code></td><td>Semantic config errors</td></tr>
+<tr><td><code>lsp.lifecycle</code></td><td>Server spawn / init / crash / recovery</td></tr>
+<tr><td><code>lsp.protocol</code></td><td>Protocol-level failures not tied to a specific server</td></tr>
+<tr><td><code>mcp.dispatch</code></td><td>MCP message dispatch and roots</td></tr>
+<tr><td><code>hook.router</code></td><td>Hook request routing</td></tr>
+<tr><td><code>bridge.routing</code></td><td>File-to-server routing errors</td></tr>
+<tr><td><code>bridge.tool</code></td><td>Tool-level diagnostics (glob, grep, etc.)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="protocol-events"><a class="header" href="#protocol-events">Protocol events</a></h2>
+<p>Protocol boundary components (<code>McpServer</code>, <code>Connection</code>/<code>LspServer</code>,
+<code>HookServer</code>) emit structured <code>tracing::info!()</code> events with <code>kind</code>,
+<code>method</code>, <code>request_id</code>, <code>parent_id</code>, and <code>payload</code> fields. These are
+routed to the protocol DB sink by the <code>kind</code> field and do not reach
+the notification queue.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="language-servers-1"><a class="header" href="#language-servers-1">Language Servers</a></h1>
 <p>Setup guides for individual language servers. Each page covers installation and
