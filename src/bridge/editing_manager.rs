@@ -103,19 +103,20 @@ impl EditingManager {
         state.remove(agent_id);
     }
 
-    /// Returns the first active agent's ID, if any.
+    /// Drains accumulated file paths from all agents and clears all
+    /// editing state. Returns the combined file list.
     ///
-    /// Used by [`super::handler::McpRouter`] to find the editing agent
-    /// when the MCP `done_editing` tool fires (the tool call does not
-    /// carry an `agent_id`).
-    #[must_use]
-    pub fn active_agent(&self) -> Option<String> {
-        self.state
+    /// Used by the MCP `done_editing` tool, which does not carry an
+    /// `agent_id` and cannot rely on [`active_agent`] to find the
+    /// correct key.
+    pub fn drain_all_and_clear(&self) -> Vec<PathBuf> {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .next()
-            .cloned()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let files: Vec<PathBuf> = state.values_mut().flat_map(std::mem::take).collect();
+        state.clear();
+        files
     }
 
     /// Clears all editing state. Returns the number of entries removed.
@@ -214,11 +215,19 @@ mod tests {
     }
 
     #[test]
-    fn active_agent_returns_first() {
+    fn drain_all_and_clear_collects_and_clears() {
         let em = EditingManager::new();
-        assert!(em.active_agent().is_none());
         em.start_editing("agent-a").expect("start");
-        assert_eq!(em.active_agent().as_deref(), Some("agent-a"));
+        em.add_file("agent-a", PathBuf::from("/src/main.rs"));
+        em.add_file("agent-a", PathBuf::from("/src/lib.rs"));
+
+        let files = em.drain_all_and_clear();
+        assert_eq!(files.len(), 2);
+        assert!(!em.is_editing("agent-a"));
+
+        // Empty when nothing is editing
+        let files = em.drain_all_and_clear();
+        assert!(files.is_empty());
     }
 
     #[test]
