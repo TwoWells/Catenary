@@ -111,11 +111,11 @@ impl ToolServer for GlobServer {
             None
         };
 
-        // Wait for readiness and check health
-        let health = if let Some(ref fp) = file_path {
+        // Wait for readiness and emit state-transition notifications.
+        if let Some(ref fp) = file_path {
             self.wait_for_server_ready(fp).await;
             let touched: Vec<String> = self.language_for_path(fp).await.into_iter().collect();
-            check_server_health(&self.client_manager, &touched, &self.notified_offline).await
+            check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
         } else {
             self.wait_for_all_servers_ready().await;
             let touched: Vec<String> = self
@@ -125,8 +125,8 @@ impl ToolServer for GlobServer {
                 .keys()
                 .cloned()
                 .collect();
-            check_server_health(&self.client_manager, &touched, &self.notified_offline).await
-        };
+            check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
+        }
 
         tracing::debug!("glob: {pattern}");
 
@@ -139,18 +139,7 @@ impl ToolServer for GlobServer {
             self.handle_glob_pattern(&pattern, parent_id).await?
         };
 
-        // Prepend notification
-        let text = if let Some(note) = health.notification {
-            if output.is_empty() {
-                note
-            } else {
-                format!("{note}\n\n{output}")
-            }
-        } else {
-            output
-        };
-
-        Ok(Value::String(text))
+        Ok(Value::String(output))
     }
 }
 

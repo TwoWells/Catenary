@@ -19,27 +19,21 @@ use crate::mcp::{CallToolResult, Tool, ToolHandler};
 /// Maximum unique LSP symbols for hover display in grep output.
 const GREP_HOVER_THRESHOLD: usize = 10;
 
-/// Result of a server health check against touched language servers.
-#[allow(dead_code, reason = "dead field available for future tool-level use")]
-pub(super) struct ServerHealth {
-    /// Languages with dead servers.
-    pub(super) dead: Vec<String>,
-    /// One-time batched notification for state transitions (offline/recovery).
-    pub(super) notification: Option<String>,
-}
-
-/// Checks server health for the given languages and generates one-time
-/// state-transition notifications.
+/// Checks server health for the given languages and emits one-time
+/// state-transition notifications via `tracing`.
 ///
 /// Queries each server's liveness, partitions into alive/dead, and
-/// compares against `notified_offline` to produce batched notifications:
-/// - Newly dead servers get a single offline message with scope of impact.
-/// - Previously-offline servers that recovered get a single recovery message.
+/// compares against `notified_offline` to emit notifications:
+/// - Newly dead servers: `warn!()` with offline message.
+/// - Previously-offline servers that recovered: `info!()` with recovery message.
+///
+/// Notifications flow through `LoggingServer` → `NotificationQueueSink` →
+/// `systemMessage` at stationary points (session start, agent stop).
 pub(super) async fn check_server_health(
     client_manager: &LspClientManager,
     touched_servers: &[String],
     notified_offline: &std::sync::Mutex<HashSet<String>>,
-) -> ServerHealth {
+) {
     let mut alive = Vec::new();
     let mut dead = Vec::new();
 
@@ -69,50 +63,32 @@ pub(super) async fn check_server_health(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let mut parts = Vec::new();
-
     // Recovery: previously unavailable, now alive
-    let recovered: Vec<String> = alive
-        .iter()
-        .filter(|lang| notified.remove(lang.as_str()))
-        .cloned()
-        .collect();
-
-    if !recovered.is_empty() {
-        let langs = recovered.join(", ");
-        parts.push(format!(
-            "Language server{} back online: {langs} \u{2014} \
-             diagnostics and language server enrichment re-enabled for \
-             {langs} files.",
-            if recovered.len() == 1 { "" } else { "s" },
-        ));
+    for lang in &alive {
+        if notified.remove(lang.as_str()) {
+            tracing::info!(
+                source = "lsp.lifecycle",
+                language = lang.as_str(),
+                "Language server back online: {lang} \u{2014} \
+                 diagnostics and language server enrichment re-enabled for \
+                 {lang} files."
+            );
+        }
     }
 
     // Unavailable: newly dead or stuck, not yet reported
-    let newly_dead: Vec<String> = dead
-        .iter()
-        .filter(|lang| notified.insert((*lang).clone()))
-        .cloned()
-        .collect();
-
-    if !newly_dead.is_empty() {
-        let langs = newly_dead.join(", ");
-        parts.push(format!(
-            "Language server{} unavailable: {langs} \u{2014} \
-             diagnostics unavailable for {langs} files. \
-             grep and glob still work but without \
-             language server enrichment.",
-            if newly_dead.len() == 1 { "" } else { "s" },
-        ));
+    for lang in &dead {
+        if notified.insert(lang.clone()) {
+            tracing::warn!(
+                source = "lsp.lifecycle",
+                language = lang.as_str(),
+                "Language server unavailable: {lang} \u{2014} \
+                 diagnostics unavailable for {lang} files. \
+                 grep and glob still work but without \
+                 language server enrichment."
+            );
+        }
     }
-
-    let notification = if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n\n"))
-    };
-
-    ServerHealth { dead, notification }
 }
 
 /// MCP tool call router.
@@ -286,25 +262,22 @@ impl ToolHandler for McpRouter {
         }
 
         if name == "done_editing" {
-            if let Some(agent_id) = self.toolbox.editing.active_agent() {
-                let files = self.toolbox.editing.drain_files(&agent_id);
-                self.toolbox.editing.done_editing(&agent_id);
+            let files = self.toolbox.editing.drain_all_and_clear();
 
-                if !files.is_empty() {
-                    let file_strs: Vec<String> = files
-                        .iter()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect();
-                    let file_refs: Vec<&str> = file_strs.iter().map(String::as_str).collect();
-                    let entry_id = parent_id.unwrap_or(0);
-                    let output = self
-                        .toolbox
-                        .runtime
-                        .block_on(self.toolbox.diagnostics.process_files(&file_refs, entry_id));
+            if !files.is_empty() {
+                let file_strs: Vec<String> = files
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+                let file_refs: Vec<&str> = file_strs.iter().map(String::as_str).collect();
+                let entry_id = parent_id.unwrap_or(0);
+                let output = self
+                    .toolbox
+                    .runtime
+                    .block_on(self.toolbox.diagnostics.process_files(&file_refs, entry_id));
 
-                    if !output.is_empty() {
-                        return Ok(CallToolResult::text(output));
-                    }
+                if !output.is_empty() {
+                    return Ok(CallToolResult::text(output));
                 }
             }
             return Ok(CallToolResult::text("[clean]"));

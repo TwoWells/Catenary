@@ -79,26 +79,14 @@ impl ToolServer for GrepServer {
             }
         }
 
-        // Check health
+        // Emit state-transition notifications.
         let touched: Vec<String> = clients.keys().cloned().collect();
-        let health =
-            check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
+        check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
 
         // Run pipeline
         let output = self.run(input, parent_id).await?;
 
-        // Prepend notification
-        let text = if let Some(note) = health.notification {
-            if output.is_empty() {
-                note
-            } else {
-                format!("{note}\n\n{output}")
-            }
-        } else {
-            output
-        };
-
-        Ok(Value::String(text))
+        Ok(Value::String(output))
     }
 }
 
