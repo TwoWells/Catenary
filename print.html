@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-cb30a210.js";
+            window.path_to_searchindex_js = "searchindex-c48aea07.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-4243c2b5.js"></script>
+        <script src="toc-fc1e27dc.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -188,7 +188,9 @@ The agent never needs to know which language server handles which file.</p>
 <ul>
 <li><a href="#installation">Installation</a> — install the binary and connect it to your CLI</li>
 <li><a href="#configuration">Configuration</a> — configure language servers and settings</li>
+<li><a href="#notifications-1">Notifications</a> — user-facing notifications via <code>systemMessage</code></li>
 <li><a href="#cli--dashboard">CLI &amp; Dashboard</a> — monitor sessions and browse events</li>
+<li><a href="#tracing-conventions">Tracing Conventions</a> — severity guidelines and structured fields</li>
 <li><a href="lsp/README.html">Language Servers</a> — per-language setup guides</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -485,6 +487,24 @@ If it starts with <code>#!</code>, the interpreter name is matched:</p>
 </tbody>
 </table>
 </div>
+<h2 id="notifications"><a class="header" href="#notifications">Notifications</a></h2>
+<p>The <code>[notifications]</code> table controls which tracing events are promoted
+to user-facing notifications via the host CLI’s <code>systemMessage</code>. See
+<a href="#notifications-1">Notifications</a> for details on delivery timing, dedup,
+and overflow.</p>
+<pre><code class="language-toml">[notifications]
+threshold = "warn"    # default
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>threshold</code></td><td><code>"warn"</code></td><td>Minimum severity for notification delivery. One of <code>"debug"</code>, <code>"info"</code>, <code>"warn"</code>, <code>"error"</code>.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="icons"><a class="header" href="#icons">Icons</a></h2>
 <p>The <code>[icons]</code> table controls icons in the TUI dashboard.</p>
 <div class="table-wrapper">
@@ -500,6 +520,79 @@ If it starts with <code>#!</code>, the interpreter name is matched:</p>
 </div>
 <pre><code class="language-toml">[icons]
 preset = "nerd"
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="notifications-1"><a class="header" href="#notifications-1">Notifications</a></h1>
+<p>Catenary routes user-facing notifications through the host CLI’s
+<code>systemMessage</code> field. This keeps operational information (server
+crashes, config errors, degradation notices) visible to <strong>you</strong> without
+polluting the agent’s tool results.</p>
+<h2 id="how-it-works"><a class="header" href="#how-it-works">How it works</a></h2>
+<p>Every <code>tracing::warn!()</code> and <code>tracing::error!()</code> call in Catenary is a
+potential notification. <code>LoggingServer</code> — Catenary’s central tracing
+subscriber — dispatches these events to a notification queue that
+accumulates entries between drain points.</p>
+<p>Notifications are delivered at <strong>stationary points</strong> — moments when
+the host CLI naturally pauses to display system information:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Hook</th><th>Drains?</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td><code>SessionStart</code></td><td>Yes</td><td>Fresh session — show startup warnings and anything from the previous cycle</td></tr>
+<tr><td><code>Stop</code> / <code>AfterAgent</code> (allow)</td><td>Yes</td><td>Agent is done — safe to surface accumulated notices</td></tr>
+<tr><td><code>Stop</code> / <code>AfterAgent</code> (block)</td><td>No</td><td>Agent must fix something first — preserve queue for next allow</td></tr>
+<tr><td><code>PreToolUse</code></td><td>No</td><td>Mid-flight — don’t interrupt</td></tr>
+<tr><td><code>PostToolUse</code></td><td>No</td><td>Mid-flight — don’t interrupt</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
+<p>The <code>[notifications]</code> section controls which events reach the queue:</p>
+<pre><code class="language-toml">[notifications]
+threshold = "warn"    # default
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Value</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>"debug"</code></td><td>Everything (very verbose)</td></tr>
+<tr><td><code>"info"</code></td><td>Informational and above</td></tr>
+<tr><td><code>"warn"</code></td><td>Warnings and errors (default)</td></tr>
+<tr><td><code>"error"</code></td><td>Errors only</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="dedup"><a class="header" href="#dedup">Dedup</a></h2>
+<p>Notifications are deduplicated within a session. Two events with the
+same identity key — <code>(source, server, language, message_stem)</code> — produce
+only one queue entry. The message stem is normalized: lowercased, digits
+stripped, whitespace collapsed. This means “server crashed 3 times” and
+“server crashed 5 times” collapse into a single notification.</p>
+<p>Dedup persists across drains. Once a notification has been shown, the
+same event won’t appear again in the same session.</p>
+<h2 id="overflow"><a class="header" href="#overflow">Overflow</a></h2>
+<p>The queue holds up to 100 notifications. When full, the oldest entry is
+evicted and a sentinel is appended on drain:</p>
+<pre><code>[info] 3 notifications dropped
+</code></pre>
+<h2 id="output-format"><a class="header" href="#output-format">Output format</a></h2>
+<p>Notifications appear in the <code>systemMessage</code> field of hook responses.
+Two content surfaces are composed:</p>
+<ul>
+<li><strong>Direct</strong> — synchronous handler messages (e.g., config validation
+warnings at session start).</li>
+<li><strong>Background</strong> — accumulated notifications from the queue.</li>
+</ul>
+<p>When both are present, they are separated by a visual header:</p>
+<pre><code>[err] config: removed `inherit` field — run `catenary doctor`
+
+--- background ---
+[warn] rust-analyzer offline
+[warn] pylsp crashed during previous teardown
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="cli--dashboard"><a class="header" href="#cli--dashboard">CLI &amp; Dashboard</a></h1>
