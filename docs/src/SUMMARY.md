@@ -6,6 +6,7 @@
 
 - [Installation](installation.md)
 - [Configuration](configuration.md)
+- [Notifications](notifications.md)
 - [CLI & Dashboard](cli.md)
 - [Tracing Conventions](tracing-conventions.md)
 - [Language Servers](lsp/README.md)

@@ -10,5 +10,7 @@ The agent never needs to know which language server handles which file.
 
 - [Installation](installation.md) — install the binary and connect it to your CLI
 - [Configuration](configuration.md) — configure language servers and settings
+- [Notifications](notifications.md) — user-facing notifications via `systemMessage`
 - [CLI & Dashboard](cli.md) — monitor sessions and browse events
+- [Tracing Conventions](tracing-conventions.md) — severity guidelines and structured fields
 - [Language Servers](lsp/README.md) — per-language setup guides

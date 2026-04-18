@@ -37,10 +37,18 @@ find-references, rename, and search without shell-based text scanning.
   stored in the SQLite database for later querying via `catenary query`.
 - **Root sync:** `catenary hook pre-tool` (PreToolUse, Claude Code only) scans
   the transcript for `/add-dir` workspace additions and forwards them to the session.
+- **Logging:** `LoggingServer` is a `tracing_subscriber::Layer` that subscribes
+  to every tracing event and dispatches to multiple sinks: notification queue
+  (user-facing `systemMessage`), protocol DB (LSP/MCP/hook messages), and trace
+  DB (non-protocol events). See `src/logging/mod.rs` and
+  `docs/src/tracing-conventions.md`.
 
 ### Key source files
 
 - `src/db.rs` — SQLite connection management, schema creation, and migrations.
+- `src/logging/mod.rs` — `LoggingServer`: multi-sink tracing Layer, the sole
+  telemetry port/adapter. Dispatches to notification queue, protocol DB, and
+  trace DB sinks.
 - `src/session.rs` — session lifecycle and event broadcasting.
 - `docs/src/` — full documentation source.
 

@@ -1107,4 +1107,50 @@ mod tests {
         server.activate(vec![sink]);
         assert_eq!(server.next_id(), super::CorrelationId(2));
     }
+
+    #[test]
+    fn multi_sink_independence_through_layer() {
+        // Verify through the tracing Layer path that a panicking sink
+        // does not prevent other sinks from receiving the event.
+        struct PanicOnceSink {
+            inner: Arc<RecorderSink>,
+            panicked: std::sync::atomic::AtomicBool,
+        }
+        impl Sink for PanicOnceSink {
+            fn handle(&self, event: &LogEvent<'_>) {
+                if !self
+                    .panicked
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    panic!("first-event panic");
+                }
+                self.inner.handle(event);
+            }
+        }
+
+        let server = LoggingServer::new();
+        let panic_recorder = Arc::new(RecorderSink::default());
+        let panic_sink: Arc<dyn Sink> = Arc::new(PanicOnceSink {
+            inner: panic_recorder.clone(),
+            panicked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let healthy = Arc::new(RecorderSink::default());
+
+        with_subscriber(server.clone(), || {
+            server.activate(vec![panic_sink, healthy.clone()]);
+            tracing::warn!("event-1"); // panicking sink panics
+            tracing::warn!("event-2"); // panicking sink records
+        });
+
+        // Healthy sink received both events regardless of the panic.
+        assert_eq!(healthy.snapshot().len(), 2);
+        // Panicking sink missed event-1 but got event-2.
+        assert_eq!(panic_recorder.snapshot().len(), 1);
+        assert_eq!(panic_recorder.snapshot()[0].message, "event-2");
+        // Panic was captured.
+        assert_eq!(
+            server.take_sink_panic().as_deref(),
+            Some("first-event panic")
+        );
+    }
 }

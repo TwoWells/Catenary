@@ -229,6 +229,22 @@ If it starts with `#!`, the interpreter name is matched:
 | `idle_timeout` | `300` | Seconds before auto-closing idle documents. `0` to disable. |
 | `log_retention_days` | `7` | Days to keep dead session data. `0` = remove on startup. `-1` = retain forever. |
 
+## Notifications
+
+The `[notifications]` table controls which tracing events are promoted
+to user-facing notifications via the host CLI's `systemMessage`. See
+[Notifications](notifications.md) for details on delivery timing, dedup,
+and overflow.
+
+```toml
+[notifications]
+threshold = "warn"    # default
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `threshold` | `"warn"` | Minimum severity for notification delivery. One of `"debug"`, `"info"`, `"warn"`, `"error"`. |
+
 ## Icons
 
 The `[icons]` table controls icons in the TUI dashboard.

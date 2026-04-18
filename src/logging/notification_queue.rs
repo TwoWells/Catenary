@@ -283,4 +283,70 @@ mod tests {
         assert!(Severity::Debug < Severity::Info);
         assert!(Severity::Info < Severity::Warn);
     }
+
+    #[test]
+    fn threshold_boundary_exact_level() {
+        // Event exactly at threshold enqueues; one level below does not.
+        for threshold in [Severity::Info, Severity::Warn, Severity::Error] {
+            let sink = NotificationQueueSink::new(threshold);
+
+            // At threshold: should enqueue.
+            sink.handle(&make_event(threshold, "at threshold", Some("a"), None));
+            assert_eq!(sink.len(), 1, "event at {threshold:?} should enqueue");
+
+            // One level below threshold: should not enqueue.
+            let below = match threshold {
+                Severity::Info => Severity::Debug,
+                Severity::Warn => Severity::Info,
+                Severity::Error => Severity::Warn,
+                Severity::Debug => unreachable!(),
+            };
+            sink.handle(&make_event(below, "below threshold", Some("b"), None));
+            assert_eq!(
+                sink.len(),
+                1,
+                "event at {below:?} should not enqueue when threshold is {threshold:?}"
+            );
+
+            // Drain for cleanup.
+            let _ = sink.drain();
+        }
+    }
+
+    #[test]
+    fn dedup_with_missing_fields() {
+        // Events with absent source/server/language still produce stable keys.
+        let sink = NotificationQueueSink::new(Severity::Warn);
+
+        // First event: all identity fields absent.
+        sink.handle(&make_event(Severity::Warn, "something broke", None, None));
+        assert_eq!(sink.len(), 1);
+
+        // Same message, still all absent: dedup rejects.
+        sink.handle(&make_event(Severity::Warn, "something broke", None, None));
+        assert_eq!(
+            sink.len(),
+            1,
+            "identical events with all-None fields should dedup"
+        );
+    }
+
+    #[test]
+    fn overflow_sentinel_format() {
+        // Verify the exact rendered format: "[info] N notifications dropped".
+        let sink = NotificationQueueSink::new(Severity::Warn);
+
+        // Overflow by 3.
+        let count = CAP + 3;
+        let servers: Vec<String> = (0..count).map(|i| format!("srv-{i}")).collect();
+        for s in &servers {
+            sink.handle(&make_event(Severity::Warn, "event", Some(s), None));
+        }
+
+        let drained = sink.drain();
+        let sentinel = drained.last().expect("should have sentinel");
+        assert_eq!(sentinel.severity, Severity::Info);
+        assert_eq!(sentinel.message, "3 notifications dropped");
+        assert_eq!(sentinel.format(), "[info] 3 notifications dropped");
+    }
 }
