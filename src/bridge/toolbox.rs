@@ -128,8 +128,6 @@ pub struct Toolbox {
     pub logging: LoggingServer,
     /// Notification queue for draining into `systemMessage`.
     pub notifications: Arc<NotificationQueueSink>,
-    /// Broadcast sender for `SqliteMessageTail` (protocol DB sink).
-    pub broadcast_tx: tokio::sync::broadcast::Sender<i64>,
     /// Catenary instance ID (unique per process invocation).
     pub instance_id: Arc<str>,
     /// Tokio runtime handle for blocking dispatch.
@@ -158,7 +156,7 @@ impl Toolbox {
             .map_or_else(SeverityConfig::default, |n| n.threshold)
             .into();
         let notifications = NotificationQueueSink::new(threshold);
-        let (protocol_db, broadcast_tx) =
+        let protocol_db =
             crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), instance_id.clone());
         let trace_db = crate::logging::trace_db::TraceDbSink::new(conn, instance_id.clone());
 
@@ -200,7 +198,6 @@ impl Toolbox {
             path_validator,
             logging,
             notifications,
-            broadcast_tx,
             instance_id,
             runtime,
         }

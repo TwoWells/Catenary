@@ -66,7 +66,7 @@ fn setup_logging() -> (
         .expect("create schema");
 
     let logging = LoggingServer::new();
-    let (protocol_db, _tx) = ProtocolDbSink::new(conn.clone(), "s1".into());
+    let protocol_db = ProtocolDbSink::new(conn.clone(), "s1".into());
     logging.activate(vec![protocol_db]);
 
     let subscriber = tracing_subscriber::registry().with(logging.clone());

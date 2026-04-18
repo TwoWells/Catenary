@@ -33,21 +33,21 @@ pub struct ProtocolDbSink {
 
 impl ProtocolDbSink {
     /// Create a new protocol DB sink.
-    ///
-    /// Returns `(sink, broadcast_sender)`. The sender is cloned into
-    /// `Toolbox` so `SqliteMessageTail` can subscribe.
     #[must_use]
-    pub fn new(
-        conn: Arc<Mutex<Connection>>,
-        instance_id: Arc<str>,
-    ) -> (Arc<Self>, broadcast::Sender<i64>) {
+    pub fn new(conn: Arc<Mutex<Connection>>, instance_id: Arc<str>) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
-        let sink = Arc::new(Self {
+        Arc::new(Self {
             conn,
             instance_id,
-            broadcast: tx.clone(),
-        });
-        (sink, tx)
+            broadcast: tx,
+        })
+    }
+
+    /// Subscribe to ROWID broadcasts (for testing).
+    #[cfg(test)]
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<i64> {
+        self.broadcast.subscribe()
     }
 }
 
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn writes_lsp_event_to_messages_table() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
         let event = make_event(
             Some("lsp"),
             Some("textDocument/hover"),
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn writes_mcp_event() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_event(
             Some("mcp"),
             Some("tools/call"),
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn writes_hook_event() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_event(
             Some("hook"),
             Some("post-tool"),
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn non_protocol_event_ignored() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_event(None, None, None, None, None, None));
         assert_eq!(row_count(&db), 0);
     }
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn unknown_kind_ignored() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_event(Some("catenary"), None, None, None, None, None));
         assert_eq!(row_count(&db), 0);
     }
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn correlation_ids_stored() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_event(
             Some("lsp"),
             Some("hover"),
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn nullable_correlation_ids() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
         sink.handle(&make_event(
             Some("lsp"),
             Some("hover"),
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn db_failure_does_not_panic() {
         let db = test_db();
-        let (sink, _tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
 
         // Drop the table to force an insert failure.
         db.lock()
@@ -345,8 +345,8 @@ mod tests {
     #[test]
     fn broadcasts_rowid_on_successful_insert() {
         let db = test_db();
-        let (sink, tx) = ProtocolDbSink::new(db, "sess-1".into());
-        let mut rx = tx.subscribe();
+        let sink = ProtocolDbSink::new(db, "sess-1".into());
+        let mut rx = sink.subscribe();
 
         sink.handle(&make_event(
             Some("lsp"),
@@ -364,8 +364,8 @@ mod tests {
     #[test]
     fn broadcast_skipped_on_insert_failure() {
         let db = test_db();
-        let (sink, tx) = ProtocolDbSink::new(db.clone(), "sess-1".into());
-        let mut rx = tx.subscribe();
+        let sink = ProtocolDbSink::new(db.clone(), "sess-1".into());
+        let mut rx = sink.subscribe();
 
         db.lock()
             .expect("lock db")

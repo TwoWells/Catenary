@@ -1145,7 +1145,7 @@ mod tests {
             .expect("create schema");
 
         let logging = LoggingServer::new();
-        let (protocol_db, _tx) =
+        let protocol_db =
             crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), "s1".into());
         logging.activate(vec![protocol_db]);
 
