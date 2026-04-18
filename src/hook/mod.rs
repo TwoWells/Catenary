@@ -25,11 +25,49 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
 
 use crate::bridge::HookRouter;
 use crate::bridge::toolbox::Toolbox;
-use crate::session::MessageLog;
+
+/// Emit a hook protocol event via `tracing::info!`.
+///
+/// Protocol routing is by `kind` field — `ProtocolDbSink` matches
+/// `kind in {lsp, mcp, hook}` regardless of tracing level.
+///
+/// Handles the optional `parent_id` field by branching into two macro
+/// invocations (tracing macros require static field sets).
+fn emit_hook_event(
+    client_name: &str,
+    method: &str,
+    request_id: i64,
+    parent_id: Option<i64>,
+    payload: &str,
+    msg: &str,
+) {
+    if let Some(pid) = parent_id {
+        info!(
+            kind = "hook",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            parent_id = pid,
+            payload = payload,
+            "{msg}"
+        );
+    } else {
+        info!(
+            kind = "hook",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            payload = payload,
+            "{msg}"
+        );
+    }
+}
 
 /// IPC request from the CLI hook process to the hook server.
 ///
@@ -148,7 +186,6 @@ pub struct HookResponseEnvelope {
 /// dispatch to [`HookRouter`].
 pub struct HookServer {
     router: Arc<HookRouter>,
-    message_log: Arc<MessageLog>,
 }
 
 impl HookServer {
@@ -157,7 +194,6 @@ impl HookServer {
     pub fn new(
         toolbox: Arc<Toolbox>,
         refresh_roots: Arc<AtomicBool>,
-        message_log: Arc<MessageLog>,
         conn: Arc<Mutex<Connection>>,
         instance_id: Arc<str>,
         client_name: String,
@@ -169,10 +205,7 @@ impl HookServer {
             instance_id,
             client_name,
         ));
-        Self {
-            router,
-            message_log,
-        }
+        Self { router }
     }
 
     /// Starts listening on the given IPC endpoint.
@@ -206,7 +239,7 @@ impl HookServer {
                         let server = server.clone();
                         tokio::spawn(async move {
                             if let Err(e) = server.handle_connection(stream).await {
-                                debug!("Notify connection error: {e}");
+                                error!("Notify connection error: {e}");
                             }
                         });
                     }
@@ -266,7 +299,7 @@ impl HookServer {
                 let srv = server_arc.clone();
                 tokio::spawn(async move {
                     if let Err(e) = srv.handle_connection(connected).await {
-                        debug!("Notify connection error: {e}");
+                        error!("Notify connection error: {e}");
                     }
                 });
             }
@@ -292,41 +325,42 @@ impl HookServer {
             .unwrap_or("unknown")
             .to_string();
 
+        // Mint a correlation ID for this request/response pair
+        let id = self.router.toolbox.logging.next_id();
+
         // Log incoming hook request
-        let entry_id = self.message_log.log(
-            "hook",
-            &method,
-            "catenary",
+        emit_hook_event(
             &self.router.client_name,
+            &method,
+            id.0,
             None,
-            None,
-            &raw,
+            &raw.to_string(),
+            "incoming hook",
         );
 
         let request: HookRequest =
             serde_json::from_value(raw).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
-        let result = self.router.dispatch(request, entry_id);
+        let result = self.router.dispatch(request, id.0);
 
         let envelope = HookResponseEnvelope {
             result: result.result,
             system_message: result.system_message,
         };
         let response = if envelope.result.is_some() || envelope.system_message.is_some() {
-            serde_json::to_string(&envelope).unwrap_or_default()
+            serde_json::to_string(&envelope)?
         } else {
             String::new()
         };
 
         // Log outgoing hook response
-        self.message_log.log(
-            "hook",
-            &method,
-            "catenary",
+        emit_hook_event(
             &self.router.client_name,
-            Some(entry_id),
-            None,
-            &serde_json::from_str::<Value>(&response).unwrap_or_default(),
+            &method,
+            id.0,
+            Some(id.0),
+            &response,
+            "outgoing hook response",
         );
 
         writer.write_all(response.as_bytes()).await?;
@@ -470,128 +504,180 @@ mod tests {
 
     // ── Logging tests ───────────────────────────────────────────────────
 
-    #[test]
-    fn test_hook_log_file_request() {
-        let (_dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
+    /// Row from the messages table for test assertions.
+    struct MsgRow {
+        r#type: String,
+        method: String,
+        client: String,
+        request_id: Option<i64>,
+        parent_id: Option<i64>,
+    }
 
-        // Insert a session for the FK.
+    /// Set up a `LoggingServer` with `ProtocolDbSink` backed by an
+    /// in-memory DB, installed as the thread-local tracing subscriber.
+    fn setup_logging() -> (
+        crate::logging::LoggingServer,
+        Arc<std::sync::Mutex<rusqlite::Connection>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let conn = Arc::new(std::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().expect("open in-memory db"),
+        ));
         conn.lock()
             .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
+            .execute_batch(
+                "CREATE TABLE sessions (
+                     id           TEXT PRIMARY KEY,
+                     pid          INTEGER NOT NULL,
+                     display_name TEXT NOT NULL,
+                     started_at   TEXT NOT NULL
+                 );
+                 INSERT INTO sessions (id, pid, display_name, started_at)
+                     VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
+                 CREATE TABLE messages (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id  TEXT NOT NULL,
+                     timestamp   TEXT NOT NULL,
+                     type        TEXT NOT NULL,
+                     method      TEXT NOT NULL,
+                     server      TEXT NOT NULL,
+                     client      TEXT NOT NULL,
+                     request_id  INTEGER,
+                     parent_id   INTEGER,
+                     payload     TEXT NOT NULL
+                 );",
             )
-            .expect("insert session");
+            .expect("create schema");
 
-        let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
+        let logging = crate::logging::LoggingServer::new();
+        let (protocol_db, _tx) =
+            crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), "s1".into());
+        logging.activate(vec![protocol_db]);
 
-        // Simulate what handle_connection does for a PostToolDiagnostics request
-        let method = "post-tool/diagnostics";
-        let request_payload = serde_json::json!({
-            "method": "post-tool/diagnostics",
-            "file": "/tmp/test.rs",
-            "tool": "Write"
-        });
-        let entry_id = log.log(
-            "hook",
-            method,
-            "catenary",
-            "claude-code",
-            None,
-            None,
-            &request_payload,
-        );
-        assert!(entry_id > 0);
+        let subscriber = tracing_subscriber::registry().with(logging.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
 
-        let response_payload = serde_json::json!({"content": "[clean]"});
-        let resp_id = log.log(
-            "hook",
-            method,
-            "catenary",
-            "claude-code",
-            Some(entry_id),
-            None,
-            &response_payload,
-        );
-        assert!(resp_id > entry_id);
+        (logging, conn, guard)
+    }
 
-        // Verify both messages in the database
-        let (r_type, r_method): (String, String) = conn
-            .lock()
-            .expect("lock")
-            .query_row(
-                "SELECT type, method FROM messages WHERE id = ?1",
-                [entry_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("query request");
-        assert_eq!(r_type, "hook");
-        assert_eq!(r_method, "post-tool/diagnostics");
-
-        let stored_req_id: Option<i64> = conn
-            .lock()
-            .expect("lock")
-            .query_row(
-                "SELECT request_id FROM messages WHERE id = ?1",
-                [resp_id],
-                |row| row.get(0),
-            )
-            .expect("query response");
-        assert_eq!(stored_req_id, Some(entry_id));
+    /// Query all messages from the test DB, ordered by id.
+    fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
+        let c = conn.lock().expect("lock");
+        c.prepare(
+            "SELECT type, method, client, request_id, parent_id \
+             FROM messages ORDER BY id",
+        )
+        .expect("prepare")
+        .query_map([], |row| {
+            Ok(MsgRow {
+                r#type: row.get(0)?,
+                method: row.get(1)?,
+                client: row.get(2)?,
+                request_id: row.get(3)?,
+                parent_id: row.get(4)?,
+            })
+        })
+        .expect("query")
+        .filter_map(std::result::Result::ok)
+        .collect()
     }
 
     #[test]
-    fn test_hook_log_refresh_roots() {
-        let (_dir, _path, conn) = test_db();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
+    fn hook_request_writes_protocol_row() {
+        let (logging, conn, _guard) = setup_logging();
 
-        conn.lock()
-            .expect("lock")
-            .execute(
-                "INSERT INTO sessions (id, pid, display_name, started_at) \
-                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .expect("insert session");
-
-        let log = Arc::new(MessageLog::new(conn.clone(), "s1".to_string()));
-
-        let method = "pre-agent/roots-sync";
-        let request_payload = serde_json::json!({"method": "pre-agent/roots-sync"});
-        let entry_id = log.log(
-            "hook",
-            method,
-            "catenary",
-            "host",
+        let id = logging.next_id();
+        emit_hook_event(
+            "claude-code",
+            "post-tool/diagnostics",
+            id.0,
             None,
-            None,
-            &request_payload,
+            &serde_json::json!({
+                "method": "post-tool/diagnostics",
+                "file": "/tmp/test.rs",
+                "tool": "Write"
+            })
+            .to_string(),
+            "incoming hook",
         );
 
-        let response_payload = serde_json::json!("");
-        log.log(
-            "hook",
-            method,
-            "catenary",
-            "host",
-            Some(entry_id),
+        let rows = query_messages(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].r#type, "hook");
+        assert_eq!(rows[0].method, "post-tool/diagnostics");
+        assert_eq!(rows[0].client, "claude-code");
+    }
+
+    #[test]
+    fn hook_pair_merges() {
+        let (logging, conn, _guard) = setup_logging();
+
+        let id = logging.next_id();
+
+        // Incoming request
+        emit_hook_event(
+            "claude-code",
+            "post-tool/diagnostics",
+            id.0,
             None,
-            &response_payload,
+            &serde_json::json!({
+                "method": "post-tool/diagnostics",
+                "file": "/tmp/test.rs"
+            })
+            .to_string(),
+            "incoming hook",
         );
 
-        // Verify method is pre-agent/roots-sync
-        let r_method: String = conn
-            .lock()
-            .expect("lock")
-            .query_row(
-                "SELECT method FROM messages WHERE id = ?1",
-                [entry_id],
-                |row| row.get(0),
-            )
-            .expect("query");
-        assert_eq!(r_method, "pre-agent/roots-sync");
+        // Outgoing response
+        emit_hook_event(
+            "claude-code",
+            "post-tool/diagnostics",
+            id.0,
+            Some(id.0),
+            &serde_json::json!({"content": "[clean]"}).to_string(),
+            "outgoing hook response",
+        );
+
+        let rows = query_messages(&conn);
+        assert_eq!(rows.len(), 2);
+        // Both share the same request_id
+        assert_eq!(rows[0].request_id, Some(id.0));
+        assert_eq!(rows[1].request_id, Some(id.0));
+        // Response has parent_id pointing back
+        assert!(rows[0].parent_id.is_none());
+        assert_eq!(rows[1].parent_id, Some(id.0));
+    }
+
+    #[test]
+    fn hook_roots_sync_writes_protocol_row() {
+        let (logging, conn, _guard) = setup_logging();
+
+        let id = logging.next_id();
+        emit_hook_event(
+            "host",
+            "pre-agent/roots-sync",
+            id.0,
+            None,
+            &serde_json::json!({"method": "pre-agent/roots-sync"}).to_string(),
+            "incoming hook",
+        );
+
+        emit_hook_event(
+            "host",
+            "pre-agent/roots-sync",
+            id.0,
+            Some(id.0),
+            "",
+            "outgoing hook response",
+        );
+
+        let rows = query_messages(&conn);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].r#type, "hook");
+        assert_eq!(rows[0].method, "pre-agent/roots-sync");
+        assert_eq!(rows[0].client, "host");
     }
 
     // ── Envelope serialization tests ──────────────────────────────────
@@ -685,15 +771,5 @@ mod tests {
             parsed["system_message"].as_str(),
             Some("─── background ───\n[err] pylsp crashed"),
         );
-    }
-
-    // ── Test helpers ────────────────────────────────────────────────────
-
-    /// Open an isolated test database in a tempdir.
-    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&path).expect("open test DB");
-        (dir, path, conn)
     }
 }

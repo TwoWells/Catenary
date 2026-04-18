@@ -338,13 +338,6 @@ async fn run_server() -> Result<()> {
             .id
     );
     info!("Workspace roots: {}", workspace_display);
-    // Create shared application container
-    let message_log = session
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
-        .message_log()
-        .clone();
-
     let instance_id: Arc<str> = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
@@ -379,7 +372,6 @@ async fn run_server() -> Result<()> {
     let hook_server = catenary_mcp::hook::HookServer::new(
         toolbox.clone(),
         refresh_roots_flag.clone(),
-        message_log.clone(),
         hook_conn,
         instance_id,
         "host".to_string(),

@@ -80,7 +80,7 @@ pub struct DispatchResult {
 /// needed by hook handlers: editing state (via [`super::editing_manager::EditingManager`]
 /// on [`Toolbox`]), and root refresh signaling.
 pub struct HookRouter {
-    toolbox: Arc<Toolbox>,
+    pub(crate) toolbox: Arc<Toolbox>,
     refresh_roots: Arc<AtomicBool>,
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     instance_id: Arc<str>,

@@ -128,7 +128,10 @@ pub enum DragState {
 /// panel scrollbar (right column), panel content interior (with overflow
 /// indicator check), and falls through to `None`.
 #[must_use]
-#[allow(clippy::too_many_arguments, reason = "hit-test context is naturally wide")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "hit-test context is naturally wide"
+)]
 pub fn resolve_click(
     x: u16,
     y: u16,
@@ -184,8 +187,7 @@ pub fn resolve_click(
                     };
                 }
                 // Regular content click — compute flat-line index.
-                let scroll_offset =
-                    panel_scroll_offsets.get(panel_idx).copied().unwrap_or(0);
+                let scroll_offset = panel_scroll_offsets.get(panel_idx).copied().unwrap_or(0);
                 let line = compute_line_from_click(y, panel_rect, scroll_offset);
                 MouseAction::ToggleExpansion {
                     panel: panel_idx,
@@ -251,8 +253,7 @@ pub fn resolve_drag(
                 .panels
                 .get(*panel)
                 .map_or(MouseAction::None, |panel_rect| {
-                    let scroll_offset =
-                        panel_scroll_offsets.get(*panel).copied().unwrap_or(0);
+                    let scroll_offset = panel_scroll_offsets.get(*panel).copied().unwrap_or(0);
                     let line = compute_line_from_click(y, panel_rect, scroll_offset);
                     MouseAction::ContinueDragSelect {
                         panel: *panel,
@@ -395,13 +396,7 @@ mod tests {
 
         // Panel scrolled down by 50 lines — click should resolve to line 52.
         let action = resolve_click(cx, cy, tree_area, &layout, 31, 0, &[50], &no_overflow());
-        assert_eq!(
-            action,
-            MouseAction::ToggleExpansion {
-                panel: 0,
-                line: 52
-            }
-        );
+        assert_eq!(action, MouseAction::ToggleExpansion { panel: 0, line: 52 });
     }
 
     #[test]
@@ -427,7 +422,16 @@ mod tests {
         let cx = panel1_r.x + 3;
         let cy = panel1_r.y;
 
-        let action = resolve_click(cx, cy, tree_area, &layout, 31, 0, &[0, 0], &no_overflow_n(2));
+        let action = resolve_click(
+            cx,
+            cy,
+            tree_area,
+            &layout,
+            31,
+            0,
+            &[0, 0],
+            &no_overflow_n(2),
+        );
         assert_eq!(action, MouseAction::TogglePin(1));
     }
 
