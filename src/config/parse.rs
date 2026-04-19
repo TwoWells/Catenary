@@ -93,7 +93,13 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
 }
 
 /// Keys that belong on `ServerDef`, not `LanguageConfig`.
-pub const SERVER_DEF_KEYS: &[&str] = &["command", "args", "initialization_options", "settings"];
+pub const SERVER_DEF_KEYS: &[&str] = &[
+    "command",
+    "args",
+    "initialization_options",
+    "settings",
+    "min_severity",
+];
 
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`
 /// disambiguation.
@@ -147,14 +153,6 @@ fn deserialize_source(contents: &str) -> Result<Config> {
                         "[language.{lang_key}] uses the removed `inherit` field — \
                          copy the base language's `servers` list into \
                          [language.{lang_key}] instead. Run `catenary doctor` for guidance.",
-                    );
-                }
-
-                if entry_table.contains_key("min_severity") {
-                    bail!(
-                        "[language.{lang_key}] contains `min_severity` — \
-                         move `min_severity` to the [server.*] entry. \
-                         Run `catenary doctor` for guidance.",
                     );
                 }
 

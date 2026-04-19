@@ -323,19 +323,6 @@ fn doctor_check_config(colors: &ColorConfig) {
                         );
                     }
 
-                    // Moved field: min_severity
-                    if entry_table.contains_key("min_severity") {
-                        found_issues = true;
-                        println!(
-                            "{}",
-                            colors.yellow(&format!(
-                                "⚠  {}: [language.{key}] contains `min_severity` — \
-                                 move to the [server.*] entry.",
-                                source.display(),
-                            )),
-                        );
-                    }
-
                     // Intermediate format: inline server definition fields
                     let has_server_fields = crate::config::SERVER_DEF_KEYS
                         .iter()
