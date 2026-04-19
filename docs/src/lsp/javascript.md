@@ -44,14 +44,12 @@ servers = ["tsserver"]
 
 ## JSX / React
 
-JSX is handled automatically. Catenary ships a default `inherit` entry
-that routes `javascriptreact` to the `javascript` server — no extra
-config needed. To customize the variant independently:
+JSX is handled automatically. Configure `javascriptreact` with the
+same server to get full coverage for `.jsx` files:
 
 ```toml
 [language.javascriptreact]
-inherit = "javascript"
-min_severity = "error"  # optional per-variant override
+servers = ["typescript-language-server"]
 ```
 
 ## Links
