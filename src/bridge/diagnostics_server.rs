@@ -247,13 +247,16 @@ impl DiagnosticsServer {
             Vec::new()
         };
 
-        // Apply severity threshold from config
-        let min_severity = self
-            .client_manager
-            .config()
-            .resolve_language(lang_id)
-            .and_then(|lc| lc.min_severity.as_deref())
-            .and_then(crate::filter::parse_severity);
+        // Apply severity threshold from server config
+        let min_severity = {
+            let config = self.client_manager.config();
+            config
+                .resolve_language(lang_id)
+                .and_then(|lc| lc.servers.first())
+                .and_then(|binding| config.server.get(&binding.name))
+                .and_then(|sd| sd.min_severity.as_deref())
+                .and_then(crate::filter::parse_severity)
+        };
 
         let (diagnostics, fixes) = if let Some(threshold) = min_severity {
             let mut filtered_diags = Vec::new();

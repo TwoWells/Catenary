@@ -547,10 +547,10 @@ inherit = "typescript"
 
         fs::write(
             &config_path,
-            r#"
+            r"
 [language.rust]
-min_severity = "warning"
-"#,
+diagnostics = false
+",
         )
         .expect("write config");
 
@@ -652,6 +652,7 @@ log_retention_days = 30
 [server.rust-analyzer]
 command = "rust-analyzer"
 args = ["--log-level", "info"]
+min_severity = "warning"
 
 [server.clangd]
 command = "clangd"
@@ -659,7 +660,6 @@ args = ["--background-index"]
 
 [language.rust]
 servers = ["rust-analyzer"]
-min_severity = "warning"
 
 [language.c]
 servers = ["clangd"]
@@ -678,11 +678,11 @@ servers = ["clangd"]
             .expect("rust-analyzer server def");
         assert_eq!(ra.command, "rust-analyzer");
         assert_eq!(ra.args, vec!["--log-level", "info"]);
+        assert_eq!(ra.min_severity.as_deref(), Some("warning"));
 
         // Language entries
         let rust = config.language.get("rust").expect("rust config");
         assert_eq!(rust.servers, vec![ServerBinding::new("rust-analyzer")]);
-        assert_eq!(rust.min_severity.as_deref(), Some("warning"));
 
         let c = config.language.get("c").expect("c config");
         assert_eq!(c.servers, vec![ServerBinding::new("clangd")]);
@@ -772,10 +772,10 @@ servers = []
             r#"
 [server.tsserver]
 command = "typescript-language-server"
+min_severity = "warning"
 
 [language.typescript]
 servers = ["tsserver"]
-min_severity = "warning"
 "#,
         )?;
 
@@ -786,7 +786,9 @@ min_severity = "warning"
             .resolve_language("typescript")
             .expect("should resolve");
         assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
-        assert_eq!(resolved.min_severity.as_deref(), Some("warning"));
+
+        let server = config.server.get("tsserver").expect("tsserver def");
+        assert_eq!(server.min_severity.as_deref(), Some("warning"));
 
         Ok(())
     }
@@ -1188,7 +1190,6 @@ diagnostics = false
         let lc = LanguageConfig {
             servers: vec![ServerBinding::new("s")],
             diagnostics: false,
-            ..LanguageConfig::default()
         };
         assert!(!lc.diagnostics_enabled("s"));
 
@@ -1209,7 +1210,6 @@ diagnostics = false
                 diagnostics: false,
             }],
             diagnostics: false,
-            ..LanguageConfig::default()
         };
         assert!(!lc.diagnostics_enabled("s"));
     }
@@ -1232,5 +1232,76 @@ diagnostics = false
         assert_eq!(lang_config.servers.len(), 1);
         assert_eq!(lang_config.servers[0].name, "rust");
         assert!(lang_config.servers[0].diagnostics);
+    }
+
+    #[test]
+    fn test_min_severity_on_server() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+min_severity = "warning"
+
+[language.test]
+servers = ["foo"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let server = config.server.get("foo").expect("foo server def");
+        assert_eq!(server.min_severity.as_deref(), Some("warning"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_severity_on_language_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.rust]
+servers = ["foo"]
+min_severity = "warning"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("min_severity") && err.contains("[server.*]"),
+            "error should mention moving min_severity to server: {err}",
+        );
+    }
+
+    #[test]
+    fn test_min_severity_absent() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.test]
+servers = ["foo"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let server = config.server.get("foo").expect("foo server def");
+        assert!(server.min_severity.is_none());
+
+        Ok(())
     }
 }

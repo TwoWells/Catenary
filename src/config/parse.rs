@@ -150,6 +150,14 @@ fn deserialize_source(contents: &str) -> Result<Config> {
                     );
                 }
 
+                if entry_table.contains_key("min_severity") {
+                    bail!(
+                        "[language.{lang_key}] contains `min_severity` — \
+                         move `min_severity` to the [server.*] entry. \
+                         Run `catenary doctor` for guidance.",
+                    );
+                }
+
                 let stale: Vec<&str> = SERVER_DEF_KEYS
                     .iter()
                     .copied()
@@ -255,6 +263,7 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                         args: cmd_args,
                         initialization_options: None,
                         settings: None,
+                        min_severity: None,
                     },
                     LanguageConfig {
                         servers: vec![ServerBinding::new(server_name)],

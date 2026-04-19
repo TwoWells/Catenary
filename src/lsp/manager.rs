@@ -668,6 +668,7 @@ mod tests {
                 args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
                 settings: None,
+                min_severity: None,
             },
         );
         let mut language = HashMap::new();
@@ -699,6 +700,7 @@ mod tests {
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 initialization_options: None,
                 settings: None,
+                min_severity: None,
             },
         );
         let mut language = HashMap::new();
@@ -856,6 +858,7 @@ mod tests {
                 ],
                 initialization_options: None,
                 settings: Some(serde_json::json!({"mockls": {"key": "value"}})),
+                min_severity: None,
             },
         );
         let mut language = HashMap::new();

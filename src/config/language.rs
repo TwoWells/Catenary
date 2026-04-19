@@ -107,11 +107,6 @@ pub struct LanguageConfig {
     /// Defaults to `true`. AND with per-binding `diagnostics`
     /// to determine effective delivery per server.
     pub diagnostics: bool,
-
-    /// Minimum diagnostic severity to deliver to agents.
-    /// Valid values: `"error"`, `"warning"`, `"information"`, `"hint"`.
-    /// When absent, all severities are delivered.
-    pub min_severity: Option<String>,
 }
 
 impl Default for LanguageConfig {
@@ -119,7 +114,6 @@ impl Default for LanguageConfig {
         Self {
             servers: Vec::new(),
             diagnostics: true,
-            min_severity: None,
         }
     }
 }
