@@ -96,6 +96,8 @@ impl<'de> Deserialize<'de> for ServerBinding {
 ///
 /// Each entry references one or more server definitions from `[server.*]`
 /// via the `servers` list and controls diagnostic severity filtering.
+/// Classification fields (`extensions`, `filenames`, `shebangs`) define
+/// how files are mapped to this language.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct LanguageConfig {
@@ -107,6 +109,22 @@ pub struct LanguageConfig {
     /// Defaults to `true`. AND with per-binding `diagnostics`
     /// to determine effective delivery per server.
     pub diagnostics: bool,
+
+    /// File extensions (without dot) that classify as this language.
+    /// Example: `["sh", "bash", "zsh"]`
+    #[serde(default)]
+    pub extensions: Option<Vec<String>>,
+
+    /// Exact filenames that classify as this language.
+    /// Example: `["PKGBUILD", "Makefile"]`
+    #[serde(default)]
+    pub filenames: Option<Vec<String>>,
+
+    /// Interpreter basenames for shebang detection.
+    /// Matches `#!/bin/X` and `#!/usr/bin/env X`.
+    /// Example: `["bash", "sh", "zsh"]`
+    #[serde(default)]
+    pub shebangs: Option<Vec<String>>,
 }
 
 impl Default for LanguageConfig {
@@ -114,7 +132,40 @@ impl Default for LanguageConfig {
         Self {
             servers: Vec::new(),
             diagnostics: true,
+            extensions: None,
+            filenames: None,
+            shebangs: None,
         }
+    }
+}
+
+impl LanguageConfig {
+    /// Merges another config layer into this one (field-level).
+    ///
+    /// - `servers`: non-empty overlay replaces, empty preserves.
+    /// - `diagnostics`: overlay always replaces (cannot distinguish
+    ///   absent from default in serde without `Option`).
+    /// - `extensions`/`filenames`/`shebangs`: `Some` replaces, `None` preserves.
+    pub fn merge(&mut self, other: Self) {
+        if !other.servers.is_empty() {
+            self.servers = other.servers;
+        }
+        self.diagnostics = other.diagnostics;
+        if other.extensions.is_some() {
+            self.extensions = other.extensions;
+        }
+        if other.filenames.is_some() {
+            self.filenames = other.filenames;
+        }
+        if other.shebangs.is_some() {
+            self.shebangs = other.shebangs;
+        }
+    }
+
+    /// Returns `true` if this entry has any classification fields set.
+    #[must_use]
+    pub const fn has_classification(&self) -> bool {
+        self.extensions.is_some() || self.filenames.is_some() || self.shebangs.is_some()
     }
 }
 

@@ -1,0 +1,255 @@
+# Default language classification rules.
+#
+# Loaded as the lowest-priority config layer. User and project configs
+# override individual fields via field-level merge. No server bindings
+# are defined here — those come from user configuration.
+#
+# Classification precedence: shebang > filename > extension.
+
+# ── Systems ─────────────────────────────────────────────────────────
+
+[language.rust]
+extensions = ["rs"]
+
+[language.go]
+extensions = ["go"]
+
+[language.c]
+extensions = ["c"]
+
+[language.cpp]
+extensions = ["cpp", "cc", "cxx", "h", "hpp"]
+
+[language.zig]
+extensions = ["zig"]
+
+[language.d]
+extensions = ["d"]
+
+[language.v]
+extensions = ["v"]
+
+[language.nim]
+extensions = ["nim"]
+
+# ── JVM ─────────────────────────────────────────────────────────────
+
+[language.java]
+extensions = ["java"]
+
+[language.kotlin]
+extensions = ["kt", "kts"]
+shebangs = ["kotlin"]
+
+[language.scala]
+extensions = ["scala", "sc"]
+shebangs = ["scala"]
+
+[language.groovy]
+extensions = ["groovy", "gvy"]
+shebangs = ["groovy"]
+
+[language.clojure]
+extensions = ["clj", "cljs", "cljc"]
+
+# ── .NET ────────────────────────────────────────────────────────────
+
+[language.csharp]
+extensions = ["cs"]
+
+[language.fsharp]
+extensions = ["fs", "fsx", "fsi"]
+
+# ── Apple ───────────────────────────────────────────────────────────
+
+[language.swift]
+extensions = ["swift"]
+shebangs = ["swift"]
+
+[language.objective-c]
+extensions = ["m", "mm"]
+
+# ── Scripting ───────────────────────────────────────────────────────
+
+[language.python]
+extensions = ["py"]
+shebangs = ["python", "python3", "python2"]
+
+[language.ruby]
+extensions = ["rb"]
+filenames = ["Gemfile", "Rakefile"]
+shebangs = ["ruby", "irb"]
+
+[language.perl]
+extensions = ["pl", "pm"]
+shebangs = ["perl"]
+
+[language.php]
+extensions = ["php"]
+shebangs = ["php"]
+
+[language.lua]
+extensions = ["lua"]
+shebangs = ["lua", "luajit"]
+
+[language.tcl]
+extensions = ["tcl"]
+shebangs = ["tclsh", "wish"]
+
+[language.crystal]
+extensions = ["cr"]
+shebangs = ["crystal"]
+
+# ── JavaScript / TypeScript ─────────────────────────────────────────
+
+[language.javascript]
+extensions = ["js", "mjs", "cjs"]
+shebangs = ["node", "nodejs"]
+
+[language.typescript]
+extensions = ["ts", "mts", "cts"]
+shebangs = ["deno"]
+
+[language.typescriptreact]
+extensions = ["tsx"]
+
+[language.javascriptreact]
+extensions = ["jsx"]
+
+# ── Functional ──────────────────────────────────────────────────────
+
+[language.haskell]
+extensions = ["hs", "lhs"]
+
+[language.ocaml]
+extensions = ["ml", "mli"]
+
+[language.elm]
+extensions = ["elm"]
+
+[language.gleam]
+extensions = ["gleam"]
+
+[language.elixir]
+extensions = ["ex", "exs"]
+shebangs = ["elixir", "iex"]
+
+[language.erlang]
+extensions = ["erl", "hrl"]
+shebangs = ["erl"]
+
+[language.purescript]
+extensions = ["purs"]
+
+# ── Shell ───────────────────────────────────────────────────────────
+
+[language.shellscript]
+extensions = ["sh", "bash", "zsh", "ebuild", "eclass", "install"]
+filenames = ["PKGBUILD"]
+shebangs = ["bash", "sh", "zsh", "dash", "ksh"]
+
+[language.fish]
+extensions = ["fish"]
+shebangs = ["fish"]
+
+[language.powershell]
+extensions = ["ps1", "psm1", "psd1"]
+
+# ── Data science ────────────────────────────────────────────────────
+
+[language.r]
+extensions = ["r", "R"]
+shebangs = ["Rscript"]
+
+[language.julia]
+extensions = ["jl"]
+shebangs = ["julia"]
+
+[language.mojo]
+extensions = ["mojo"]
+
+# ── Web frontend ────────────────────────────────────────────────────
+
+[language.html]
+extensions = ["html", "htm"]
+
+[language.css]
+extensions = ["css"]
+
+[language.scss]
+extensions = ["scss"]
+
+[language.sass]
+extensions = ["sass"]
+
+[language.less]
+extensions = ["less"]
+
+[language.svelte]
+extensions = ["svelte"]
+
+[language.vue]
+extensions = ["vue"]
+
+# ── Data / config ───────────────────────────────────────────────────
+
+[language.json]
+extensions = ["json", "jsonc"]
+
+[language.yaml]
+extensions = ["yaml", "yml"]
+
+[language.toml]
+extensions = ["toml"]
+filenames = ["Cargo.toml", "Cargo.lock"]
+
+[language.xml]
+extensions = ["xml", "xsl", "xslt", "xsd"]
+
+[language.sql]
+extensions = ["sql"]
+
+[language.graphql]
+extensions = ["graphql", "gql"]
+
+[language.proto]
+extensions = ["proto"]
+
+# ── Markup / docs ───────────────────────────────────────────────────
+
+[language.markdown]
+extensions = ["md", "mdx"]
+
+[language.restructuredtext]
+extensions = ["rst"]
+
+[language.latex]
+extensions = ["tex", "latex"]
+
+[language.typst]
+extensions = ["typ"]
+
+# ── Infrastructure / config languages ───────────────────────────────
+
+[language.nix]
+extensions = ["nix"]
+
+[language.terraform]
+extensions = ["tf", "tfvars"]
+
+[language.cmake]
+extensions = ["cmake"]
+filenames = ["CMakeLists.txt"]
+
+[language.dart]
+extensions = ["dart"]
+
+[language.dockerfile]
+extensions = ["dockerfile"]
+filenames = ["Dockerfile"]
+
+[language.makefile]
+filenames = ["Makefile", "GNUmakefile"]
+
+[language.just]
+filenames = ["Justfile", "justfile"]

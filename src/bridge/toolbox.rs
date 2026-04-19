@@ -163,7 +163,8 @@ impl Toolbox {
         // Activate — drains bootstrap buffer, enables direct dispatch.
         logging.activate(vec![notifications.clone(), protocol_db, trace_db]);
 
-        let fs_manager = Arc::new(FilesystemManager::new());
+        let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
+        let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
         fs_manager.set_roots(roots.clone());
         fs_manager.seed();
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots.clone())));

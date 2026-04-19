@@ -304,6 +304,17 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Returns a default config with the embedded classification data loaded.
+    ///
+    /// This is equivalent to loading from no sources — only the embedded
+    /// `defaults/languages.toml` is applied.
+    #[must_use]
+    pub fn default_with_classification() -> Self {
+        parse::load_from_sources(&[]).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -541,14 +552,16 @@ inherit = "typescript"
     }
 
     #[test]
-    fn test_concrete_without_servers_rejected() {
+    fn test_concrete_without_servers_or_classification_rejected() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
 
+        // Entry with only diagnostics but no servers and no classification
+        // should be rejected.
         fs::write(
             &config_path,
             r"
-[language.rust]
+[language.custom]
 diagnostics = false
 ",
         )
@@ -558,8 +571,8 @@ diagnostics = false
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("servers"),
-            "error should mention servers: {err}",
+            err.contains("servers") || err.contains("classification"),
+            "error should mention servers or classification: {err}",
         );
     }
 
@@ -587,8 +600,14 @@ servers = ["tsserver"]
             .expect("should resolve");
         assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
 
-        // Unconfigured language returns None
-        assert!(config.resolve_language("typescriptreact").is_none());
+        // typescriptreact exists from defaults (classification-only, no servers)
+        let tsx = config
+            .resolve_language("typescriptreact")
+            .expect("should exist from defaults");
+        assert!(tsx.servers.is_empty());
+
+        // Truly unconfigured language returns None
+        assert!(config.resolve_language("brainfuck").is_none());
 
         Ok(())
     }
@@ -601,7 +620,9 @@ servers = ["tsserver"]
 
         let config = Config::load_from_sources(&[config_path])?;
         assert_eq!(config.log_retention_days, 7);
-        assert!(config.language.is_empty());
+        // Default classification entries are loaded
+        assert!(!config.language.is_empty());
+        // No server definitions from defaults
         assert!(config.server.is_empty());
 
         Ok(())
@@ -740,8 +761,10 @@ servers = ["nonexistent-server"]
     }
 
     #[test]
-    fn test_concrete_empty_servers() {
-        let dir = tempdir().expect("tempdir");
+    fn test_concrete_empty_servers_with_classification_ok() -> anyhow::Result<()> {
+        // Entry with classification (from defaults merge) and empty servers
+        // is valid — classification-only entry.
+        let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
 
         fs::write(
@@ -750,16 +773,17 @@ servers = ["nonexistent-server"]
 [language.rust]
 servers = []
 ",
-        )
-        .expect("write config");
+        )?;
 
-        let result = Config::load_from_sources(&[config_path]);
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
-        assert!(
-            err.contains("servers"),
-            "error should mention servers: {err}",
-        );
+        // After merge with defaults, rust has classification from defaults
+        // and empty servers from the user config (empty preserves default's
+        // empty servers, which is fine since defaults don't have servers).
+        let config = Config::load_from_sources(&[config_path])?;
+        let rust = config.language.get("rust").expect("rust config");
+        assert!(rust.servers.is_empty());
+        assert!(rust.extensions.is_some());
+
+        Ok(())
     }
 
     #[test]
@@ -1190,6 +1214,7 @@ diagnostics = false
         let lc = LanguageConfig {
             servers: vec![ServerBinding::new("s")],
             diagnostics: false,
+            ..LanguageConfig::default()
         };
         assert!(!lc.diagnostics_enabled("s"));
 
@@ -1210,6 +1235,7 @@ diagnostics = false
                 diagnostics: false,
             }],
             diagnostics: false,
+            ..LanguageConfig::default()
         };
         assert!(!lc.diagnostics_enabled("s"));
     }
@@ -1301,6 +1327,214 @@ servers = ["foo"]
         let config = Config::load_from_sources(&[path])?;
         let server = config.server.get("foo").expect("foo server def");
         assert!(server.min_severity.is_none());
+
+        Ok(())
+    }
+
+    // --- Classification fields and default config ---
+
+    #[test]
+    fn test_user_config_inherits_defaults() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+
+[language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let rust = config.language.get("rust").expect("rust config");
+        // servers comes from user config
+        assert_eq!(rust.servers, vec![ServerBinding::new("rust-analyzer")]);
+        // extensions inherited from defaults
+        assert_eq!(
+            rust.extensions.as_deref(),
+            Some(["rs"].map(str::to_string).as_slice()),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_user_config_overrides_classification() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.bash-ls]
+command = "bash-language-server"
+
+[language.shellscript]
+servers = ["bash-ls"]
+filenames = ["PKGBUILD", "APKBUILD"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let shell = config.language.get("shellscript").expect("shellscript");
+        // filenames overridden by user
+        assert_eq!(
+            shell.filenames.as_deref(),
+            Some(["PKGBUILD", "APKBUILD"].map(str::to_string).as_slice()),
+        );
+        // extensions preserved from defaults (user didn't override)
+        assert!(shell.extensions.is_some());
+        assert!(
+            shell
+                .extensions
+                .as_ref()
+                .expect("extensions")
+                .contains(&"sh".to_string()),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_patterns_on_server() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.pkgbuild-ls]
+command = "pkgbuild-ls"
+file_patterns = ["PKGBUILD"]
+
+[language.shellscript]
+servers = ["pkgbuild-ls"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let server = config.server.get("pkgbuild-ls").expect("server def");
+        assert_eq!(server.file_patterns, vec!["PKGBUILD"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_patterns_invalid_glob() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.bad]
+command = "bad-server"
+file_patterns = ["[invalid"]
+
+[language.test]
+servers = ["bad"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("invalid") && err.contains("glob"),
+            "error should mention invalid glob: {err}",
+        );
+    }
+
+    #[test]
+    fn test_file_patterns_empty_string() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.bad]
+command = "bad-server"
+file_patterns = [""]
+
+[language.test]
+servers = ["bad"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("empty"),
+            "error should mention empty string: {err}",
+        );
+    }
+
+    #[test]
+    fn test_classification_empty_extension_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[language.custom]
+extensions = ["rs", ""]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("empty") && err.contains("extensions"),
+            "error should mention empty extensions: {err}",
+        );
+    }
+
+    #[test]
+    fn test_field_level_merge() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+
+        let base = dir.path().join("base.toml");
+        fs::write(
+            &base,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.test]
+servers = ["foo"]
+extensions = ["abc"]
+filenames = ["TestFile"]
+"#,
+        )?;
+
+        let overlay = dir.path().join("overlay.toml");
+        fs::write(
+            &overlay,
+            r#"
+[language.test]
+extensions = ["xyz"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[base, overlay])?;
+        let lc = config.language.get("test").expect("test language");
+        // extensions replaced by overlay
+        assert_eq!(
+            lc.extensions.as_deref(),
+            Some(["xyz"].map(str::to_string).as_slice()),
+        );
+        // filenames preserved (overlay didn't set them)
+        assert_eq!(
+            lc.filenames.as_deref(),
+            Some(["TestFile"].map(str::to_string).as_slice()),
+        );
+        // servers preserved (overlay had empty servers)
+        assert_eq!(lc.servers, vec![ServerBinding::new("foo")]);
 
         Ok(())
     }

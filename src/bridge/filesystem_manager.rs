@@ -36,16 +36,16 @@ pub struct FileInfo {
 impl FileInfo {
     /// Returns the LSP language identifier, if detectable.
     #[must_use]
-    pub const fn language_id(&self) -> Option<&'static str> {
-        match self.kind {
-            FileKind::Text { language_id, .. } => language_id,
+    pub fn language_id(&self) -> Option<&str> {
+        match &self.kind {
+            FileKind::Text { language_id, .. } => language_id.as_deref(),
             FileKind::Binary | FileKind::Folder => None,
         }
     }
 }
 
 /// File classification: binary, text, or folder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileKind {
     /// Binary file (contains null bytes or exceeds size threshold).
     Binary,
@@ -55,12 +55,137 @@ pub enum FileKind {
         lines: usize,
         /// LSP language identifier, if detectable. `None` for files with
         /// no known extension, filename, or shebang.
-        language_id: Option<&'static str>,
+        language_id: Option<String>,
     },
     /// Directory entry. Used by [`FilesystemManager::seed`] and
     /// [`FilesystemManager::diff`] for tracking directory creation and
     /// deletion.
     Folder,
+}
+
+/// Pre-built classification lookup tables derived from merged config.
+///
+/// Built once from `Config` and stored in [`FilesystemManager`].
+/// Classification precedence: shebang > filename > extension.
+#[derive(Debug, Default)]
+pub struct ClassificationTables {
+    /// File extension (without dot) → language ID.
+    extensions: HashMap<String, String>,
+    /// Exact filename → language ID.
+    filenames: HashMap<String, String>,
+    /// Interpreter basename → language ID.
+    shebangs: HashMap<String, String>,
+}
+
+impl ClassificationTables {
+    /// Builds classification tables from a merged config.
+    ///
+    /// Iterates language entries in sorted order for deterministic
+    /// first-insert-wins behavior when multiple languages claim the
+    /// same extension, filename, or shebang.
+    #[must_use]
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let mut tables = Self::default();
+
+        let mut keys: Vec<&str> = config.language.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        for lang_id in keys {
+            let Some(lc) = config.language.get(lang_id) else {
+                continue;
+            };
+            if let Some(ref exts) = lc.extensions {
+                for ext in exts {
+                    tables
+                        .extensions
+                        .entry(ext.clone())
+                        .or_insert_with(|| lang_id.to_string());
+                }
+            }
+            if let Some(ref fnames) = lc.filenames {
+                for fname in fnames {
+                    tables
+                        .filenames
+                        .entry(fname.clone())
+                        .or_insert_with(|| lang_id.to_string());
+                }
+            }
+            if let Some(ref shebangs) = lc.shebangs {
+                for shebang in shebangs {
+                    tables
+                        .shebangs
+                        .entry(shebang.clone())
+                        .or_insert_with(|| lang_id.to_string());
+                }
+            }
+        }
+
+        tables
+    }
+
+    /// Looks up language ID by filename (exact match).
+    fn lookup_filename(&self, filename: &str) -> Option<&str> {
+        self.filenames.get(filename).map(String::as_str)
+    }
+
+    /// Looks up language ID by file extension (without dot).
+    fn lookup_extension(&self, ext: &str) -> Option<&str> {
+        self.extensions.get(ext).map(String::as_str)
+    }
+
+    /// Looks up language ID by interpreter basename.
+    fn lookup_shebang(&self, interpreter: &str) -> Option<&str> {
+        self.shebangs.get(interpreter).map(String::as_str)
+    }
+
+    /// Resolves language ID for a path without I/O (filename + extension only).
+    fn classify_path(&self, path: &Path) -> Option<String> {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && let Some(lang) = self.lookup_filename(name)
+        {
+            return Some(lang.to_string());
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && let Some(lang) = self.lookup_extension(ext)
+        {
+            return Some(lang.to_string());
+        }
+        None
+    }
+
+    /// Returns duplicate extensions across languages (for doctor warnings).
+    #[must_use]
+    pub fn find_duplicate_extensions(
+        config: &crate::config::Config,
+    ) -> Vec<(String, String, String)> {
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        let mut keys: Vec<&str> = config.language.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        for lang_id in keys {
+            if let Some(lc) = config.language.get(lang_id)
+                && let Some(ref exts) = lc.extensions
+            {
+                for ext in exts {
+                    if let Some(&first_lang) = seen.get(ext.as_str()) {
+                        if first_lang != lang_id {
+                            duplicates.push((
+                                ext.clone(),
+                                first_lang.to_string(),
+                                lang_id.to_string(),
+                            ));
+                        }
+                    } else {
+                        seen.insert(ext.as_str(), lang_id);
+                    }
+                }
+            }
+        }
+
+        duplicates
+    }
 }
 
 /// Cross-tool filesystem classification cache.
@@ -69,10 +194,12 @@ pub enum FileKind {
 /// language ID, and shebang detection. Shared by `GrepServer` and
 /// `GlobServer` through `Toolbox`.
 ///
-/// Also owns the workspace root list for longest-prefix root resolution.
+/// Also owns the workspace root list for longest-prefix root resolution
+/// and the classification lookup tables built from config.
 pub struct FilesystemManager {
     cache: std::sync::Mutex<HashMap<PathBuf, CachedEntry>>,
     roots: std::sync::Mutex<Vec<PathBuf>>,
+    classification: ClassificationTables,
 }
 
 /// Cache entry storing classification results keyed by mtime.
@@ -89,15 +216,29 @@ impl Default for FilesystemManager {
         Self {
             cache: std::sync::Mutex::new(HashMap::new()),
             roots: std::sync::Mutex::new(Vec::new()),
+            classification: ClassificationTables::default(),
         }
     }
 }
 
 impl FilesystemManager {
-    /// Creates an empty manager.
+    /// Creates an empty manager with no classification tables.
+    ///
+    /// Use [`with_classification`](Self::with_classification) when
+    /// language detection from config is needed.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a manager with pre-built classification tables.
+    #[must_use]
+    pub fn with_classification(classification: ClassificationTables) -> Self {
+        Self {
+            cache: std::sync::Mutex::new(HashMap::new()),
+            roots: std::sync::Mutex::new(Vec::new()),
+            classification,
+        }
     }
 
     /// Classifies a file, using the cache when possible.
@@ -105,6 +246,8 @@ impl FilesystemManager {
     /// Returns a [`FileInfo`] with binary/text classification, line count,
     /// and language ID. Cache is keyed by absolute path + mtime. On mtime
     /// change the entry is re-scanned.
+    ///
+    /// Classification precedence: shebang > filename > extension.
     pub fn classify(&self, path: &Path, metadata: &std::fs::Metadata) -> FileInfo {
         let mtime = mtime_secs(metadata);
         let size = metadata.len();
@@ -114,22 +257,25 @@ impl FilesystemManager {
         if let Ok(cache) = self.cache.lock()
             && let Some(entry) = cache.get(path)
             && entry.mtime == mtime
-            && let Some(kind) = entry.kind
+            && let Some(ref kind) = entry.kind
         {
             return FileInfo {
                 mtime,
                 size,
                 root,
-                kind,
+                kind: kind.clone(),
             };
         }
 
-        // Extension/filename detection (pure, no I/O)
-        let ext_language = detect_language_id_opt(path);
-
         // Scan file for binary/text + line count + shebang
         let kind = scan_file(path, metadata).map_or(FileKind::Binary, |scan| {
-            let language_id = ext_language.or(scan.shebang_language);
+            // Precedence: shebang > filename > extension
+            let language_id = scan
+                .shebang_interpreter
+                .as_deref()
+                .and_then(|interp| self.classification.lookup_shebang(interp))
+                .map(str::to_string)
+                .or_else(|| self.classification.classify_path(path));
             FileKind::Text {
                 lines: scan.lines,
                 language_id,
@@ -142,7 +288,7 @@ impl FilesystemManager {
                 path.to_path_buf(),
                 CachedEntry {
                     mtime,
-                    kind: Some(kind),
+                    kind: Some(kind.clone()),
                 },
             );
         }
@@ -170,17 +316,19 @@ impl FilesystemManager {
 
     /// Returns the LSP language identifier for a file path, or `None` if unknown.
     ///
-    /// Tries extension/filename detection first (no I/O). If that fails
+    /// Tries filename/extension detection first (no I/O). If that fails
     /// and the file exists on disk, falls back to full classification
     /// which includes shebang detection.
-    pub fn language_id(&self, path: &Path) -> Option<&'static str> {
-        // Fast path: extension/filename (no I/O)
-        if let Some(lang) = detect_language_id_opt(path) {
+    pub fn language_id(&self, path: &Path) -> Option<String> {
+        // Fast path: filename/extension (no I/O)
+        if let Some(lang) = self.classification.classify_path(path) {
             return Some(lang);
         }
         // Slow path: full classification for shebang
         let metadata = std::fs::metadata(path).ok()?;
-        self.classify(path, &metadata).language_id()
+        self.classify(path, &metadata)
+            .language_id()
+            .map(str::to_string)
     }
 
     /// Resolves the owning workspace root for a path.
@@ -209,7 +357,7 @@ impl FilesystemManager {
     /// Scans workspace roots and returns the set of language keys that have
     /// matching files present among `configured_keys`.
     ///
-    /// Respects `.gitignore` and skips hidden files. Uses extension/filename
+    /// Respects `.gitignore` and skips hidden files. Uses filename/extension
     /// detection first, then full classification (including shebang) for
     /// files without a recognised extension. Falls back to the raw file
     /// extension for custom languages. Exits early once all configured
@@ -236,16 +384,18 @@ impl FilesystemManager {
 
                 let path = entry.path();
 
-                // Fast path: extension/filename (no I/O beyond the walk).
+                // Fast path: filename/extension (no I/O beyond the walk).
                 // Slow path: full classification (shebang detection).
-                let lang = detect_language_id_opt(path).or_else(|| {
+                let lang = self.classification.classify_path(path).or_else(|| {
                     let metadata = entry.metadata().ok()?;
-                    self.classify(path, &metadata).language_id()
+                    self.classify(path, &metadata)
+                        .language_id()
+                        .map(str::to_string)
                 });
 
-                if let Some(lang) = lang {
-                    if configured_keys.contains(lang) {
-                        detected.insert(lang.to_string());
+                if let Some(ref lang) = lang {
+                    if configured_keys.contains(lang.as_str()) {
+                        detected.insert(lang.clone());
                     }
                 } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
                     && configured_keys.contains(ext)
@@ -439,121 +589,6 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
-/// Extension/filename detection — returns `None` for unrecognised files.
-pub(crate) fn detect_language_id_opt(path: &Path) -> Option<&'static str> {
-    // Filename-based detection (exact match).
-    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-        let lang = match file_name {
-            "Dockerfile" => "dockerfile",
-            "Makefile" | "GNUmakefile" => "makefile",
-            "CMakeLists.txt" => "cmake",
-            "Cargo.toml" | "Cargo.lock" => "toml",
-            "Gemfile" | "Rakefile" => "ruby",
-            "Justfile" | "justfile" => "just",
-            "PKGBUILD" => "shellscript",
-            _ => "",
-        };
-        if !lang.is_empty() {
-            return Some(lang);
-        }
-    }
-
-    // Extension-based detection.
-    match path.extension().and_then(|e| e.to_str()) {
-        // Systems
-        Some("rs") => Some("rust"),
-        Some("go") => Some("go"),
-        Some("c") => Some("c"),
-        Some("cpp" | "cc" | "cxx" | "h" | "hpp") => Some("cpp"),
-        Some("zig") => Some("zig"),
-        Some("d") => Some("d"),
-        Some("v") => Some("v"),
-        Some("nim") => Some("nim"),
-
-        // JVM
-        Some("java") => Some("java"),
-        Some("kt" | "kts") => Some("kotlin"),
-        Some("scala" | "sc") => Some("scala"),
-        Some("groovy" | "gvy") => Some("groovy"),
-        Some("clj" | "cljs" | "cljc") => Some("clojure"),
-
-        // .NET
-        Some("cs") => Some("csharp"),
-        Some("fs" | "fsx" | "fsi") => Some("fsharp"),
-
-        // Apple
-        Some("swift") => Some("swift"),
-        Some("m" | "mm") => Some("objective-c"),
-
-        // Scripting
-        Some("py") => Some("python"),
-        Some("rb") => Some("ruby"),
-        Some("pl" | "pm") => Some("perl"),
-        Some("php") => Some("php"),
-        Some("lua") => Some("lua"),
-        Some("tcl") => Some("tcl"),
-        Some("cr") => Some("crystal"),
-
-        // JavaScript / TypeScript
-        Some("js" | "mjs" | "cjs") => Some("javascript"),
-        Some("ts" | "mts" | "cts") => Some("typescript"),
-        Some("tsx") => Some("typescriptreact"),
-        Some("jsx") => Some("javascriptreact"),
-
-        // Functional
-        Some("hs" | "lhs") => Some("haskell"),
-        Some("ml" | "mli") => Some("ocaml"),
-        Some("elm") => Some("elm"),
-        Some("gleam") => Some("gleam"),
-        Some("ex" | "exs") => Some("elixir"),
-        Some("erl" | "hrl") => Some("erlang"),
-        Some("purs") => Some("purescript"),
-
-        // Shell
-        Some("sh" | "bash" | "zsh" | "ebuild" | "eclass" | "install") => Some("shellscript"),
-        Some("fish") => Some("fish"),
-        Some("ps1" | "psm1" | "psd1") => Some("powershell"),
-
-        // Data science
-        Some("r" | "R") => Some("r"),
-        Some("jl") => Some("julia"),
-        Some("mojo") => Some("mojo"),
-
-        // Web frontend
-        Some("html" | "htm") => Some("html"),
-        Some("css") => Some("css"),
-        Some("scss") => Some("scss"),
-        Some("sass") => Some("sass"),
-        Some("less") => Some("less"),
-        Some("svelte") => Some("svelte"),
-        Some("vue") => Some("vue"),
-
-        // Data / config
-        Some("json" | "jsonc") => Some("json"),
-        Some("yaml" | "yml") => Some("yaml"),
-        Some("toml") => Some("toml"),
-        Some("xml" | "xsl" | "xslt" | "xsd") => Some("xml"),
-        Some("sql") => Some("sql"),
-        Some("graphql" | "gql") => Some("graphql"),
-        Some("proto") => Some("proto"),
-
-        // Markup / docs
-        Some("md" | "mdx") => Some("markdown"),
-        Some("rst") => Some("restructuredtext"),
-        Some("tex" | "latex") => Some("latex"),
-        Some("typ") => Some("typst"),
-
-        // Infrastructure / config languages
-        Some("nix") => Some("nix"),
-        Some("tf" | "tfvars") => Some("terraform"),
-        Some("cmake") => Some("cmake"),
-        Some("dart") => Some("dart"),
-        Some("dockerfile") => Some("dockerfile"),
-
-        _ => None,
-    }
-}
-
 /// Extracts mtime as seconds since epoch (cross-platform).
 fn mtime_secs(metadata: &std::fs::Metadata) -> u64 {
     metadata
@@ -566,7 +601,7 @@ fn mtime_secs(metadata: &std::fs::Metadata) -> u64 {
 /// Intermediate result from a single-pass file scan.
 struct ScanResult {
     lines: usize,
-    shebang_language: Option<&'static str>,
+    shebang_interpreter: Option<String>,
 }
 
 /// Scans a file for null bytes, counts lines, and extracts shebang in one pass.
@@ -581,27 +616,27 @@ fn scan_file(path: &Path, metadata: &std::fs::Metadata) -> Option<ScanResult> {
     let Ok(file) = std::fs::File::open(path) else {
         return Some(ScanResult {
             lines: 0,
-            shebang_language: None,
+            shebang_interpreter: None,
         });
     };
 
     let mut reader = std::io::BufReader::new(file);
     let mut buf = [0u8; 8192];
     let mut lines = 0;
-    let mut shebang_language = None;
+    let mut shebang_interpreter = None;
     let mut first_chunk = true;
 
     loop {
         let Ok(n) = reader.read(&mut buf) else {
             return Some(ScanResult {
                 lines,
-                shebang_language,
+                shebang_interpreter,
             });
         };
         if n == 0 {
             return Some(ScanResult {
                 lines,
-                shebang_language,
+                shebang_interpreter,
             });
         }
         if memchr::memchr(0, &buf[..n]).is_some() {
@@ -611,18 +646,21 @@ fn scan_file(path: &Path, metadata: &std::fs::Metadata) -> Option<ScanResult> {
         if first_chunk {
             first_chunk = false;
             let first_line_end = memchr::memchr(b'\n', &buf[..n]).unwrap_or(n);
-            shebang_language = parse_shebang(&buf[..first_line_end]);
+            shebang_interpreter = extract_shebang_interpreter(&buf[..first_line_end]);
         }
 
         lines += memchr::memchr_iter(b'\n', &buf[..n]).count();
     }
 }
 
-/// Parses a shebang line and returns the corresponding LSP language ID.
+/// Extracts the interpreter basename from a shebang line.
+///
+/// Returns the raw interpreter name without resolving it to a language ID.
+/// Language resolution is done by the classification tables.
 ///
 /// Handles both direct paths (`#!/bin/bash`) and `env` indirection
 /// (`#!/usr/bin/env bash`). Flags after the interpreter are ignored.
-fn parse_shebang(first_line: &[u8]) -> Option<&'static str> {
+fn extract_shebang_interpreter(first_line: &[u8]) -> Option<String> {
     let line = first_line.strip_prefix(b"#!")?;
     let line = line.trim_ascii_start();
     let line_str = std::str::from_utf8(line).ok()?;
@@ -639,29 +677,7 @@ fn parse_shebang(first_line: &[u8]) -> Option<&'static str> {
     };
 
     let basename = interpreter.rsplit('/').next()?;
-
-    match basename {
-        "bash" | "sh" | "zsh" | "dash" | "ksh" => Some("shellscript"),
-        "fish" => Some("fish"),
-        "python" | "python3" | "python2" => Some("python"),
-        "node" | "nodejs" => Some("javascript"),
-        "deno" => Some("typescript"),
-        "ruby" | "irb" => Some("ruby"),
-        "perl" => Some("perl"),
-        "php" => Some("php"),
-        "lua" | "luajit" => Some("lua"),
-        "tclsh" | "wish" => Some("tcl"),
-        "Rscript" => Some("r"),
-        "julia" => Some("julia"),
-        "elixir" | "iex" => Some("elixir"),
-        "erl" => Some("erlang"),
-        "swift" => Some("swift"),
-        "kotlin" => Some("kotlin"),
-        "scala" => Some("scala"),
-        "groovy" => Some("groovy"),
-        "crystal" => Some("crystal"),
-        _ => None,
-    }
+    Some(basename.to_string())
 }
 
 #[cfg(test)]
@@ -769,388 +785,158 @@ mod tests {
         assert_eq!(len, 1);
     }
 
-    // --- Language detection (migrated from document_manager) ---
+    // --- Default config classification ---
+
+    /// Builds a `FilesystemManager` with tables from the default config.
+    fn default_mgr() -> FilesystemManager {
+        let config = crate::config::Config::default_with_classification();
+        FilesystemManager::with_classification(ClassificationTables::from_config(&config))
+    }
 
     #[test]
-    fn language_detection_filenames() {
-        assert_eq!(
-            detect_language_id_opt(Path::new("Dockerfile")),
-            Some("dockerfile")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("Makefile")),
-            Some("makefile")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("GNUmakefile")),
-            Some("makefile")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("CMakeLists.txt")),
-            Some("cmake")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("Cargo.toml")),
-            Some("toml")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("Gemfile")), Some("ruby"));
-        assert_eq!(detect_language_id_opt(Path::new("Rakefile")), Some("ruby"));
-        assert_eq!(detect_language_id_opt(Path::new("Justfile")), Some("just"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("PKGBUILD")),
-            Some("shellscript")
+    fn test_default_config_loads() {
+        let config = crate::config::Config::default_with_classification();
+        let errors = config.validate();
+        assert!(
+            errors.is_empty(),
+            "default config should validate: {errors:?}"
         );
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, reason = "exhaustive extension coverage")]
-    fn language_detection_extensions() {
-        // Systems
-        assert_eq!(detect_language_id_opt(Path::new("test.rs")), Some("rust"));
-        assert_eq!(detect_language_id_opt(Path::new("test.go")), Some("go"));
-        assert_eq!(detect_language_id_opt(Path::new("test.c")), Some("c"));
-        assert_eq!(detect_language_id_opt(Path::new("test.cpp")), Some("cpp"));
-        assert_eq!(detect_language_id_opt(Path::new("test.h")), Some("cpp"));
-        assert_eq!(detect_language_id_opt(Path::new("test.zig")), Some("zig"));
-        assert_eq!(detect_language_id_opt(Path::new("test.d")), Some("d"));
-        assert_eq!(detect_language_id_opt(Path::new("test.v")), Some("v"));
-        assert_eq!(detect_language_id_opt(Path::new("test.nim")), Some("nim"));
-
-        // JVM
-        assert_eq!(detect_language_id_opt(Path::new("test.java")), Some("java"));
-        assert_eq!(detect_language_id_opt(Path::new("test.kt")), Some("kotlin"));
+    fn test_classification_from_config() {
+        let mgr = default_mgr();
         assert_eq!(
-            detect_language_id_opt(Path::new("test.scala")),
-            Some("scala")
+            mgr.classification.classify_path(Path::new("test.rs")),
+            Some("rust".to_string()),
         );
         assert_eq!(
-            detect_language_id_opt(Path::new("test.groovy")),
-            Some("groovy")
+            mgr.classification.classify_path(Path::new("test.py")),
+            Some("python".to_string()),
         );
         assert_eq!(
-            detect_language_id_opt(Path::new("test.clj")),
-            Some("clojure")
-        );
-
-        // .NET
-        assert_eq!(detect_language_id_opt(Path::new("test.cs")), Some("csharp"));
-        assert_eq!(detect_language_id_opt(Path::new("test.fs")), Some("fsharp"));
-
-        // Apple
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.swift")),
-            Some("swift")
+            mgr.classification.classify_path(Path::new("test.unknown")),
+            None,
         );
         assert_eq!(
-            detect_language_id_opt(Path::new("test.m")),
-            Some("objective-c")
+            mgr.classification.classify_path(Path::new("noextension")),
+            None,
         );
-
-        // Scripting
-        assert_eq!(detect_language_id_opt(Path::new("test.py")), Some("python"));
-        assert_eq!(detect_language_id_opt(Path::new("test.rb")), Some("ruby"));
-        assert_eq!(detect_language_id_opt(Path::new("test.pl")), Some("perl"));
-        assert_eq!(detect_language_id_opt(Path::new("test.php")), Some("php"));
-        assert_eq!(detect_language_id_opt(Path::new("test.lua")), Some("lua"));
-        assert_eq!(detect_language_id_opt(Path::new("test.tcl")), Some("tcl"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.cr")),
-            Some("crystal")
-        );
-
-        // JavaScript / TypeScript
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.js")),
-            Some("javascript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.mjs")),
-            Some("javascript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.ts")),
-            Some("typescript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.mts")),
-            Some("typescript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.tsx")),
-            Some("typescriptreact")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.jsx")),
-            Some("javascriptreact")
-        );
-
-        // Functional
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.hs")),
-            Some("haskell")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.ml")), Some("ocaml"));
-        assert_eq!(detect_language_id_opt(Path::new("test.elm")), Some("elm"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.gleam")),
-            Some("gleam")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.ex")), Some("elixir"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.erl")),
-            Some("erlang")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.purs")),
-            Some("purescript")
-        );
-
-        // Shell
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.sh")),
-            Some("shellscript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.bash")),
-            Some("shellscript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.ebuild")),
-            Some("shellscript")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.eclass")),
-            Some("shellscript")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.fish")), Some("fish"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.ps1")),
-            Some("powershell")
-        );
-
-        // Data science
-        assert_eq!(detect_language_id_opt(Path::new("test.r")), Some("r"));
-        assert_eq!(detect_language_id_opt(Path::new("test.jl")), Some("julia"));
-
-        // Web frontend
-        assert_eq!(detect_language_id_opt(Path::new("test.html")), Some("html"));
-        assert_eq!(detect_language_id_opt(Path::new("test.css")), Some("css"));
-        assert_eq!(detect_language_id_opt(Path::new("test.scss")), Some("scss"));
-        assert_eq!(detect_language_id_opt(Path::new("test.less")), Some("less"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.svelte")),
-            Some("svelte")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.vue")), Some("vue"));
-
-        // Data / config
-        assert_eq!(detect_language_id_opt(Path::new("test.json")), Some("json"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.jsonc")),
-            Some("json")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.yaml")), Some("yaml"));
-        assert_eq!(detect_language_id_opt(Path::new("test.toml")), Some("toml"));
-        assert_eq!(detect_language_id_opt(Path::new("test.xml")), Some("xml"));
-        assert_eq!(detect_language_id_opt(Path::new("test.sql")), Some("sql"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.graphql")),
-            Some("graphql")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.proto")),
-            Some("proto")
-        );
-
-        // Markup / docs
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.md")),
-            Some("markdown")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.mdx")),
-            Some("markdown")
-        );
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.rst")),
-            Some("restructuredtext")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.tex")), Some("latex"));
-        assert_eq!(detect_language_id_opt(Path::new("test.typ")), Some("typst"));
-
-        // Infrastructure
-        assert_eq!(detect_language_id_opt(Path::new("test.nix")), Some("nix"));
-        assert_eq!(
-            detect_language_id_opt(Path::new("test.tf")),
-            Some("terraform")
-        );
-        assert_eq!(detect_language_id_opt(Path::new("test.dart")), Some("dart"));
-
-        // Unknown
-        assert_eq!(detect_language_id_opt(Path::new("test.unknown")), None);
-        assert_eq!(detect_language_id_opt(Path::new("noextension")), None);
-    }
-
-    // --- Shebang detection ---
-
-    #[test]
-    fn shebang_bash_direct() {
-        assert_eq!(parse_shebang(b"#!/bin/bash"), Some("shellscript"));
     }
 
     #[test]
-    fn shebang_bash_env() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env bash"), Some("shellscript"));
+    fn test_filename_classification_from_config() {
+        let mgr = default_mgr();
+        assert_eq!(
+            mgr.classification.classify_path(Path::new("Dockerfile")),
+            Some("dockerfile".to_string()),
+        );
+        assert_eq!(
+            mgr.classification.classify_path(Path::new("Makefile")),
+            Some("makefile".to_string()),
+        );
+        assert_eq!(
+            mgr.classification.classify_path(Path::new("PKGBUILD")),
+            Some("shellscript".to_string()),
+        );
+        assert_eq!(
+            mgr.classification.classify_path(Path::new("Justfile")),
+            Some("just".to_string()),
+        );
     }
 
     #[test]
-    fn shebang_sh() {
-        assert_eq!(parse_shebang(b"#!/bin/sh"), Some("shellscript"));
-    }
-
-    #[test]
-    fn shebang_python_env() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env python3"), Some("python"));
-    }
-
-    #[test]
-    fn shebang_python_direct() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/python"), Some("python"));
-    }
-
-    #[test]
-    fn shebang_node() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env node"), Some("javascript"));
-    }
-
-    #[test]
-    fn shebang_ruby() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env ruby"), Some("ruby"));
-    }
-
-    #[test]
-    fn shebang_perl() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env perl"), Some("perl"));
-    }
-
-    #[test]
-    fn shebang_php() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env php"), Some("php"));
-    }
-
-    #[test]
-    fn shebang_lua() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env lua"), Some("lua"));
-    }
-
-    #[test]
-    fn shebang_luajit() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env luajit"), Some("lua"));
-    }
-
-    #[test]
-    fn shebang_tclsh() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env tclsh"), Some("tcl"));
-    }
-
-    #[test]
-    fn shebang_rscript() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env Rscript"), Some("r"));
-    }
-
-    #[test]
-    fn shebang_julia() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env julia"), Some("julia"));
-    }
-
-    #[test]
-    fn shebang_elixir() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env elixir"), Some("elixir"));
-    }
-
-    #[test]
-    fn shebang_swift() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env swift"), Some("swift"));
-    }
-
-    #[test]
-    fn shebang_kotlin() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env kotlin"), Some("kotlin"));
-    }
-
-    #[test]
-    fn shebang_groovy() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env groovy"), Some("groovy"));
-    }
-
-    #[test]
-    fn shebang_crystal() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env crystal"), Some("crystal"));
-    }
-
-    #[test]
-    fn shebang_deno() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env deno"), Some("typescript"));
-    }
-
-    #[test]
-    fn shebang_fish() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env fish"), Some("fish"));
-    }
-
-    #[test]
-    fn shebang_erl() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env erl"), Some("erlang"));
-    }
-
-    #[test]
-    fn shebang_scala() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env scala"), Some("scala"));
-    }
-
-    #[test]
-    fn shebang_with_flags() {
-        assert_eq!(parse_shebang(b"#!/bin/bash -e"), Some("shellscript"));
-    }
-
-    #[test]
-    fn shebang_space_after_hash_bang() {
-        assert_eq!(parse_shebang(b"#! /bin/bash"), Some("shellscript"));
-    }
-
-    #[test]
-    fn shebang_env_with_flags() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env -S python3"), Some("python"));
-    }
-
-    #[test]
-    fn shebang_unknown_interpreter() {
-        assert_eq!(parse_shebang(b"#!/usr/bin/env something_unknown"), None);
-    }
-
-    #[test]
-    fn no_shebang() {
-        assert_eq!(parse_shebang(b"hello world"), None);
-    }
-
-    // --- Integration: classify + shebang ---
-
-    #[test]
-    fn classify_extensionless_with_shebang() {
+    fn test_shebang_classification_from_config() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("my_script");
         std::fs::write(&path, "#!/bin/bash\necho hello\n").expect("write");
 
-        let mgr = FilesystemManager::new();
+        let mgr = default_mgr();
         let metadata = std::fs::metadata(&path).expect("metadata");
         assert_eq!(
             mgr.classify(&path, &metadata).kind,
             FileKind::Text {
                 lines: 2,
-                language_id: Some("shellscript"),
+                language_id: Some("shellscript".to_string()),
             }
         );
     }
+
+    #[test]
+    fn test_classification_precedence() {
+        // shebang > filename > extension: a file with ruby shebang and
+        // .py extension should be classified as ruby (shebang wins).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("script.py");
+        std::fs::write(&path, "#!/usr/bin/env ruby\nprint('hello')\n").expect("write");
+
+        let mgr = default_mgr();
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(
+            mgr.classify(&path, &metadata).kind,
+            FileKind::Text {
+                lines: 2,
+                language_id: Some("ruby".to_string()),
+            }
+        );
+    }
+
+    // --- Shebang interpreter extraction ---
+
+    #[test]
+    fn shebang_direct_path() {
+        assert_eq!(
+            extract_shebang_interpreter(b"#!/bin/bash"),
+            Some("bash".to_string()),
+        );
+    }
+
+    #[test]
+    fn shebang_env() {
+        assert_eq!(
+            extract_shebang_interpreter(b"#!/usr/bin/env python3"),
+            Some("python3".to_string()),
+        );
+    }
+
+    #[test]
+    fn shebang_with_flags() {
+        assert_eq!(
+            extract_shebang_interpreter(b"#!/bin/bash -e"),
+            Some("bash".to_string()),
+        );
+    }
+
+    #[test]
+    fn shebang_space_after_hash_bang() {
+        assert_eq!(
+            extract_shebang_interpreter(b"#! /bin/bash"),
+            Some("bash".to_string()),
+        );
+    }
+
+    #[test]
+    fn shebang_env_with_flags() {
+        assert_eq!(
+            extract_shebang_interpreter(b"#!/usr/bin/env -S python3"),
+            Some("python3".to_string()),
+        );
+    }
+
+    #[test]
+    fn shebang_unknown_interpreter() {
+        assert_eq!(
+            extract_shebang_interpreter(b"#!/usr/bin/env something_unknown"),
+            Some("something_unknown".to_string()),
+        );
+    }
+
+    #[test]
+    fn no_shebang() {
+        assert_eq!(extract_shebang_interpreter(b"hello world"), None);
+    }
+
+    // --- Integration: classify + shebang ---
 
     #[test]
     fn classify_extensionless_without_shebang() {
@@ -1193,23 +979,6 @@ mod tests {
         assert_eq!(format_file_size(1_048_576), "1.0 MB");
         assert_eq!(format_file_size(1_073_741_824), "1.0 GB");
         assert_eq!(format_file_size(5_368_709_120), "5.0 GB");
-    }
-
-    #[test]
-    fn classify_extension_takes_priority_over_shebang() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("script.py");
-        std::fs::write(&path, "#!/usr/bin/env ruby\nprint('hello')\n").expect("write");
-
-        let mgr = FilesystemManager::new();
-        let metadata = std::fs::metadata(&path).expect("metadata");
-        assert_eq!(
-            mgr.classify(&path, &metadata).kind,
-            FileKind::Text {
-                lines: 2,
-                language_id: Some("python"),
-            }
-        );
     }
 
     // --- Root resolution ---

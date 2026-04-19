@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 use super::{Config, LanguageConfig, ServerBinding, ServerDef, default_log_retention_days};
 
+/// Embedded default classification config (lowest-priority layer).
+const DEFAULT_LANGUAGES: &str = include_str!("../../defaults/languages.toml");
+
 /// Load configuration from standard paths or a specific file.
 ///
 /// Sources are loaded in order, with later sources overriding earlier ones:
@@ -69,11 +72,20 @@ pub fn config_sources() -> Vec<PathBuf> {
 
 /// Load configuration from an explicit list of file paths.
 ///
-/// Sources are merged in order (later overrides earlier). Environment
-/// variable overrides, default inherits, and validation are applied
-/// after merging.
+/// Sources are merged in order (later overrides earlier):
+/// 1. Embedded default config (`defaults/languages.toml`)
+/// 2. User/project/explicit files (the `sources` parameter)
+/// 3. Environment variable overrides
+///
+/// Validation is applied after merging.
 pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     let mut config = Config::default();
+
+    // Load embedded default classification config (lowest priority).
+    let defaults =
+        deserialize_source(DEFAULT_LANGUAGES).context("Failed to parse embedded default config")?;
+    config.merge(defaults);
+
     for source in sources {
         let contents = std::fs::read_to_string(source)
             .with_context(|| format!("Failed to read config file: {}", source.display()))?;
@@ -99,6 +111,7 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
     "initialization_options",
     "settings",
     "min_severity",
+    "file_patterns",
 ];
 
 /// Deserialize a TOML source, handling the `[server.*]` / `[language.*]`
@@ -203,7 +216,11 @@ pub(super) fn merge(config: &mut Config, other: Config) {
         config.log_retention_days = other.log_retention_days;
     }
     for (key, value) in other.language {
-        config.language.insert(key, value);
+        if let Some(existing) = config.language.get_mut(&key) {
+            existing.merge(value);
+        } else {
+            config.language.insert(key, value);
+        }
     }
     for (key, value) in other.server {
         config.server.insert(key, value);
@@ -262,6 +279,7 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                         initialization_options: None,
                         settings: None,
                         min_severity: None,
+                        file_patterns: Vec::new(),
                     },
                     LanguageConfig {
                         servers: vec![ServerBinding::new(server_name)],

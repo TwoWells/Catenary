@@ -33,4 +33,12 @@ pub struct ServerDef {
     /// When absent, all severities are delivered.
     #[serde(default)]
     pub min_severity: Option<String>,
+
+    /// Glob patterns to filter which files this server handles
+    /// within its language. Matched against the filename (not path).
+    /// Servers without `file_patterns` handle all files for their
+    /// language.
+    /// Example: `["PKGBUILD", "*.ebuild"]`
+    #[serde(default)]
+    pub file_patterns: Vec<String>,
 }

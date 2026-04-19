@@ -377,7 +377,7 @@ impl LspClientManager {
     pub async fn get_client(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
         // Primary: use FilesystemManager for language detection
         if let Some(lang_id) = self.fs.language_id(path)
-            && let Ok(client) = self.get_or_spawn(lang_id).await
+            && let Ok(client) = self.get_or_spawn(&lang_id).await
         {
             return Ok(client);
         }
@@ -447,7 +447,10 @@ impl LspClientManager {
 
         let (first_open, version) = doc_manager.open(&uri);
         if first_open {
-            let language_id = self.fs.language_id(path).unwrap_or("plaintext").to_string();
+            let language_id = self
+                .fs
+                .language_id(path)
+                .unwrap_or_else(|| "plaintext".to_string());
             client.did_open(&uri, &language_id, version, &text).await?;
         } else {
             client.did_change(&uri, version, &text).await?;
@@ -473,7 +476,7 @@ impl LspClientManager {
         {
             let active = self.clients.lock().await;
             for path in paths {
-                let key = self.fs.language_id(path).map(str::to_string).or_else(|| {
+                let key = self.fs.language_id(path).or_else(|| {
                     path.extension()
                         .and_then(|e| e.to_str())
                         .map(str::to_string)
@@ -669,6 +672,7 @@ mod tests {
                 initialization_options: None,
                 settings: None,
                 min_severity: None,
+                file_patterns: Vec::new(),
             },
         );
         let mut language = HashMap::new();
@@ -701,6 +705,7 @@ mod tests {
                 initialization_options: None,
                 settings: None,
                 min_severity: None,
+                file_patterns: Vec::new(),
             },
         );
         let mut language = HashMap::new();
@@ -859,6 +864,7 @@ mod tests {
                 initialization_options: None,
                 settings: Some(serde_json::json!({"mockls": {"key": "value"}})),
                 min_severity: None,
+                file_patterns: Vec::new(),
             },
         );
         let mut language = HashMap::new();

@@ -116,7 +116,20 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
         );
     }
 
-    if !validation_errors.is_empty() || !unreferenced.is_empty() {
+    // Duplicate extension warnings
+    let dup_exts =
+        crate::bridge::filesystem_manager::ClassificationTables::find_duplicate_extensions(&config);
+    for (ext, first, second) in &dup_exts {
+        println!(
+            "{}",
+            colors.yellow(&format!(
+                "⚠  Extension '.{ext}' claimed by both [language.{first}] and \
+                 [language.{second}] — first wins"
+            )),
+        );
+    }
+
+    if !validation_errors.is_empty() || !unreferenced.is_empty() || !dup_exts.is_empty() {
         println!();
     }
 
@@ -127,8 +140,15 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
 
     // Detect which languages have files in the workspace (only when roots provided)
     let detected: Option<HashSet<String>> = resolved_roots.as_ref().map(|roots| {
-        let configured_keys: HashSet<&str> = config.language.keys().map(String::as_str).collect();
-        let fs = FilesystemManager::new();
+        let configured_keys: HashSet<&str> = config
+            .language
+            .iter()
+            .filter(|(_, lc)| !lc.servers.is_empty())
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let classification =
+            crate::bridge::filesystem_manager::ClassificationTables::from_config(&config);
+        let fs = FilesystemManager::with_classification(classification);
         fs.detect_workspace_languages(roots, &configured_keys)
     });
 
@@ -182,7 +202,20 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
             Ok(result) => {
                 let tools =
                     extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
-                println!("{name_display}  {}", colors.green("✓ ready"));
+                let status = if server_def.file_patterns.is_empty() {
+                    "✓ ready".to_string()
+                } else {
+                    format!(
+                        "✓ ready  file_patterns: [{}]",
+                        server_def
+                            .file_patterns
+                            .iter()
+                            .map(|p| format!("\"{p}\""))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                };
+                println!("{name_display}  {}", colors.green(&status));
                 server_capabilities.insert(name, tools);
             }
             Err(e) => {
