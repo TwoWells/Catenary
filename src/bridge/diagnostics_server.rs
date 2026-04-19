@@ -252,7 +252,7 @@ impl DiagnosticsServer {
             .client_manager
             .config()
             .resolve_language(lang_id)
-            .and_then(|(_, lc)| lc.min_severity.as_deref())
+            .and_then(|lc| lc.min_severity.as_deref())
             .and_then(crate::filter::parse_severity);
 
         let (diagnostics, fixes) = if let Some(threshold) = min_severity {

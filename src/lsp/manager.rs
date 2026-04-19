@@ -295,34 +295,33 @@ impl LspClientManager {
     /// - The server fails to spawn.
     /// - The server fails to initialize.
     pub async fn get_or_spawn(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
-        // Resolve inherit to find the canonical key
-        let (canonical, lang_config) = self
+        let lang_config = self
             .config
             .resolve_language(lang)
             .ok_or_else(|| anyhow!("No LSP server configured for language '{lang}'"))?;
 
-        // Check if a client already exists under the canonical key
-        if let Some(client) = self.clients.lock().await.get(canonical) {
+        // Check if a client already exists
+        if let Some(client) = self.clients.lock().await.get(lang) {
             if client.lock().await.is_alive() {
                 return Ok(client.clone());
             }
-            anyhow::bail!("LSP server for '{canonical}' is dead");
+            anyhow::bail!("LSP server for '{lang}' is dead");
         }
 
         let mut clients = self.clients.lock().await;
 
         // Double-check after acquiring write lock
-        if let Some(client) = clients.get(canonical) {
+        if let Some(client) = clients.get(lang) {
             if client.lock().await.is_alive() {
                 return Ok(client.clone());
             }
-            anyhow::bail!("LSP server for '{canonical}' is dead");
+            anyhow::bail!("LSP server for '{lang}' is dead");
         }
 
         let server_name = lang_config
             .servers
             .first()
-            .ok_or_else(|| anyhow!("No servers configured for language '{canonical}'"))?;
+            .ok_or_else(|| anyhow!("No servers configured for language '{lang}'"))?;
 
         let server_def = self
             .config
@@ -332,7 +331,7 @@ impl LspClientManager {
 
         info!(
             "Spawning LSP server for {}: {} {}",
-            canonical,
+            lang,
             server_def.command,
             server_def.args.join(" ")
         );
@@ -345,7 +344,7 @@ impl LspClientManager {
         let mut client = LspClient::spawn(
             &server_def.command,
             &args,
-            canonical,
+            lang,
             self.logging.clone(),
             server_def.settings.clone(),
         )?;
@@ -357,7 +356,7 @@ impl LspClientManager {
             .await?;
 
         let client_mutex = Arc::new(Mutex::new(client));
-        clients.insert(canonical.to_string(), client_mutex.clone());
+        clients.insert(lang.to_string(), client_mutex.clone());
         drop(clients);
 
         Ok(client_mutex)

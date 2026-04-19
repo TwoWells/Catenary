@@ -303,13 +303,10 @@ impl Config {
         validate::validate(self)
     }
 
-    /// Resolve a language key, returning the canonical key and effective config.
-    ///
-    /// Direct lookup is tried first. If the key is not found, the alias
-    /// table is consulted to redirect to a base language entry.
+    /// Look up the configuration for a language key.
     #[must_use]
-    pub fn resolve_language<'a>(&'a self, key: &'a str) -> Option<(&'a str, &'a LanguageConfig)> {
-        language::resolve_language(&self.language, key)
+    pub fn resolve_language(&self, key: &str) -> Option<&LanguageConfig> {
+        self.language.get(key)
     }
 }
 
@@ -590,7 +587,7 @@ min_severity = "warning"
     }
 
     #[test]
-    fn test_alias_fallback() -> anyhow::Result<()> {
+    fn test_resolve_language_direct() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
 
@@ -608,63 +605,15 @@ servers = ["tsserver"]
 
         let config = Config::load_from_sources(&[config_path])?;
 
-        // typescriptreact is in LANGUAGE_ALIASES → resolves to typescript
-        let (canonical, resolved) = config
-            .resolve_language("typescriptreact")
-            .expect("should resolve via alias");
-        assert_eq!(canonical, "typescript");
+        let resolved = config
+            .resolve_language("typescript")
+            .expect("should resolve");
         assert_eq!(resolved.servers, vec!["tsserver"]);
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_alias_no_override() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let config_path = dir.path().join("config.toml");
-
-        fs::write(
-            &config_path,
-            r#"
-[server.tsserver]
-command = "typescript-language-server"
-args = ["--stdio"]
-
-[server.custom-tsx]
-command = "custom-tsx-server"
-
-[language.typescript]
-servers = ["tsserver"]
-
-[language.typescriptreact]
-servers = ["custom-tsx"]
-"#,
-        )?;
-
-        let config = Config::load_from_sources(&[config_path])?;
-
-        // Explicit entry takes precedence over alias
-        let (key, resolved) = config
-            .resolve_language("typescriptreact")
-            .expect("should resolve");
-        assert_eq!(key, "typescriptreact");
-        assert_eq!(resolved.servers, vec!["custom-tsx"]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_alias_base_missing() {
-        let dir = tempdir().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-
-        fs::write(&config_path, "").expect("write config");
-
-        let config = Config::load_from_sources(&[config_path]).expect("load");
-
-        // typescriptreact alias points to typescript, but typescript is
-        // not configured → None.
+        // Unconfigured language returns None
         assert!(config.resolve_language("typescriptreact").is_none());
+
+        Ok(())
     }
 
     #[test]
@@ -857,20 +806,11 @@ min_severity = "warning"
         let config = Config::load_from_sources(&[config_path])?;
 
         // Verify the returned config borrows from the map
-        let (key, resolved) = config
+        let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(key, "typescript");
         assert_eq!(resolved.servers, vec!["tsserver"]);
         assert_eq!(resolved.min_severity.as_deref(), Some("warning"));
-
-        // Alias also borrows from the map (points to the base entry)
-        let (alias_key, alias_resolved) = config
-            .resolve_language("typescriptreact")
-            .expect("alias should resolve");
-        assert_eq!(alias_key, "typescript");
-        // Same pointer — alias returns the base entry's config
-        assert!(std::ptr::eq(resolved, alias_resolved));
 
         Ok(())
     }
@@ -931,19 +871,13 @@ servers = ["tsserver"]
 
         let config = Config::load_from_sources(&[config_path])?;
 
-        // Direct resolution
-        let (key, resolved) = config
+        let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(key, "typescript");
         assert_eq!(resolved.servers, vec!["tsserver"]);
 
-        // Alias resolution (typescriptreact → typescript via LANGUAGE_ALIASES)
-        let (key, resolved) = config
-            .resolve_language("typescriptreact")
-            .expect("should resolve via alias");
-        assert_eq!(key, "typescript");
-        assert_eq!(resolved.servers, vec!["tsserver"]);
+        // Unconfigured language returns None
+        assert!(config.resolve_language("unknown").is_none());
 
         Ok(())
     }
