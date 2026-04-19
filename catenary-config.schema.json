@@ -3,11 +3,6 @@
   "title": "Catenary Configuration",
   "type": "object",
   "properties": {
-    "idle_timeout": {
-      "type": "integer",
-      "description": "Global idle timeout in seconds. LSP servers will be shut down if no documents are open for this duration.",
-      "default": 300
-    },
     "server": {
       "type": "object",
       "description": "Server definitions keyed by language ID (e.g., 'rust', 'python').",

@@ -68,10 +68,6 @@ impl From<SeverityConfig> for crate::logging::Severity {
 /// Overall configuration for Catenary.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    /// Global idle timeout in seconds (default: 300).
-    #[serde(default = "default_idle_timeout")]
-    pub idle_timeout: u64,
-
     /// Log retention in days (default: 7).
     /// 0 = no persistent logging (cleanup on exit).
     /// -1 = retain logs forever.
@@ -194,23 +190,20 @@ pub struct IconConfig {
 ///
 /// Controls the interactive monitor's layout and behavior.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct TuiConfig {
     /// Automatically add new sessions to the grid (default: true).
-    #[serde(default = "default_true")]
     pub auto_add_sessions: bool,
 
     /// Preferred width of the Sessions tree as a fraction of the terminal
-    /// (default: 0.4).
-    #[serde(default = "default_sessions_width")]
+    /// (default: 0.25).
     pub sessions_width: f64,
 
     /// Whether mouse hover changes focus (default: false).
-    #[serde(default)]
     pub focus_follows_mouse: bool,
 
     /// Capture full tool output in `ToolResult` events for TUI detail
     /// expansion (default: false). Increases database size.
-    #[serde(default)]
     pub capture_tool_output: bool,
 }
 
@@ -223,18 +216,6 @@ impl Default for TuiConfig {
             capture_tool_output: false,
         }
     }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-const fn default_sessions_width() -> f64 {
-    0.25
-}
-
-pub(crate) const fn default_idle_timeout() -> u64 {
-    300
 }
 
 pub(crate) const fn default_log_retention_days() -> i64 {
@@ -313,7 +294,6 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            idle_timeout: default_idle_timeout(),
             log_retention_days: default_log_retention_days(),
             language: HashMap::new(),
             server: HashMap::new(),
@@ -342,8 +322,6 @@ mod tests {
         fs::write(
             &config_path,
             r#"
-idle_timeout = 42
-
 [server.rust-analyzer]
 command = "rust-analyzer-local"
 
@@ -354,7 +332,6 @@ servers = ["rust-analyzer"]
 
         let config = Config::load_from_sources(&[config_path])?;
 
-        assert_eq!(config.idle_timeout, 42);
         assert_eq!(
             config
                 .language
@@ -623,7 +600,6 @@ servers = ["tsserver"]
         fs::write(&config_path, "")?;
 
         let config = Config::load_from_sources(&[config_path])?;
-        assert_eq!(config.idle_timeout, 300);
         assert_eq!(config.log_retention_days, 7);
         assert!(config.language.is_empty());
         assert!(config.server.is_empty());
@@ -639,7 +615,7 @@ servers = ["tsserver"]
         fs::write(
             &local_config_path,
             r#"
-idle_timeout = 42
+log_retention_days = 14
 
 [server.rust-analyzer]
 command = "rust-analyzer-local"
@@ -653,13 +629,13 @@ servers = ["rust-analyzer"]
         fs::write(
             &explicit_path,
             r"
-idle_timeout = 99
+log_retention_days = 30
 ",
         )?;
 
         let config = Config::load_from_sources(&[local_config_path, explicit_path])?;
 
-        assert_eq!(config.idle_timeout, 99);
+        assert_eq!(config.log_retention_days, 30);
         assert!(config.language.contains_key("rust"));
 
         Ok(())

@@ -3,11 +3,11 @@
 Catenary loads configuration from multiple sources, in order of priority
 (last wins):
 
-1. **Defaults**: `idle_timeout = 300`, `log_retention_days = 7`.
+1. **Defaults**: `log_retention_days = 7`.
 2. **User config**: `~/.config/catenary/config.toml`.
 3. **Project config**: `.catenary.toml` in the current directory or any parent (searches upward).
 4. **Explicit file**: `--config <path>`.
-5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_IDLE_TIMEOUT=600`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
+5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_LOG_RETENTION_DAYS=30`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 
 ## Language Servers
 
@@ -26,8 +26,6 @@ servers = ["<name>"]
 ### Example
 
 ```toml
-idle_timeout = 300
-
 [server.rust]
 command = "rust-analyzer"
 
@@ -226,7 +224,6 @@ If it starts with `#!`, the interpreter name is matched:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `idle_timeout` | `300` | Seconds before auto-closing idle documents. `0` to disable. |
 | `log_retention_days` | `7` | Days to keep dead session data. `0` = remove on startup. `-1` = retain forever. |
 
 ## Notifications

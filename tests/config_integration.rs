@@ -26,8 +26,7 @@ fn write_mockls_config(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "idle_timeout = 60\n\n\
-             [server.mockls-{MOCK_LANG_A}]\n\
+            "[server.mockls-{MOCK_LANG_A}]\n\
              command = \"{mockls_bin}\"\n\
              args = [\"{MOCK_LANG_A}\"]\n\n\
              [language.{MOCK_LANG_A}]\n\
@@ -134,7 +133,6 @@ fn test_config_override() -> Result<()> {
 
     // Spawn catenary with config AND env override
     // Config provides MOCK_LANG_A (mockls), env provides MOCK_LANG_B (also mockls)
-    // CLI also overrides idle_timeout to 10 (config has 60)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     cmd.env("CATENARY_CONFIG", &config_path);
     let state_dir = tempfile::tempdir()?;
@@ -142,7 +140,6 @@ fn test_config_override() -> Result<()> {
         "CATENARY_SERVERS",
         format!("{MOCK_LANG_B}:{mockls_bin} {MOCK_LANG_B}"),
     );
-    cmd.env("CATENARY_IDLE_TIMEOUT", "10");
     // Isolate from user-level config and state
     cmd.env("CATENARY_ROOTS", &root_dir);
     cmd.env("XDG_CONFIG_HOME", &root_dir);

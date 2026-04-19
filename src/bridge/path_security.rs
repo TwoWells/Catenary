@@ -328,7 +328,7 @@ mod tests {
         let (dir, _) = setup_workspace()?;
         // Create a .catenary.toml in the root
         let config_path = dir.path().join(".catenary.toml");
-        fs::write(&config_path, "idle_timeout = 300")?;
+        fs::write(&config_path, "log_retention_days = 7")?;
 
         // Recreate validator to pick up the config
         let root = dir.path().canonicalize()?;
@@ -348,7 +348,7 @@ mod tests {
     fn test_read_config_file_allowed() -> Result<()> {
         let (dir, _) = setup_workspace()?;
         let config_path = dir.path().join(".catenary.toml");
-        fs::write(&config_path, "idle_timeout = 300")?;
+        fs::write(&config_path, "log_retention_days = 7")?;
 
         let root = dir.path().canonicalize()?;
         let validator = PathValidator::new(vec![root]);

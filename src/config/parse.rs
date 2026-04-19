@@ -6,10 +6,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-use super::{
-    Config, LanguageConfig, ServerBinding, ServerDef, default_idle_timeout,
-    default_log_retention_days,
-};
+use super::{Config, LanguageConfig, ServerBinding, ServerDef, default_log_retention_days};
 
 /// Load configuration from standard paths or a specific file.
 ///
@@ -182,10 +179,9 @@ fn deserialize_source(contents: &str) -> Result<Config> {
 ///
 /// # Merge strategies
 ///
-/// **Scalars** (`idle_timeout`, `log_retention_days`): override only when
-/// the later source differs from the default. Cannot distinguish "user
-/// explicitly set the default" from "absent", but acceptable for simple
-/// numeric knobs.
+/// **Scalars** (`log_retention_days`): override only when the later
+/// source differs from the default. Cannot distinguish "user explicitly
+/// set the default" from "absent", but acceptable for simple numeric knobs.
 ///
 /// **Maps** (`language`, `server`): key-level merge. Later source wins
 /// per-key; keys absent from the later source are preserved.
@@ -197,9 +193,6 @@ fn deserialize_source(contents: &str) -> Result<Config> {
 /// explicit setting survives an unrelated later source. **All config
 /// sections should follow this pattern.**
 pub(super) fn merge(config: &mut Config, other: Config) {
-    if other.idle_timeout != default_idle_timeout() {
-        config.idle_timeout = other.idle_timeout;
-    }
     if other.log_retention_days != default_log_retention_days() {
         config.log_retention_days = other.log_retention_days;
     }
@@ -222,11 +215,6 @@ pub(super) fn merge(config: &mut Config, other: Config) {
 
 /// Apply environment variable overrides for supported keys.
 pub(super) fn apply_env_overrides(config: &mut Config) {
-    if let Ok(val) = std::env::var("CATENARY_IDLE_TIMEOUT")
-        && let Ok(v) = val.parse()
-    {
-        config.idle_timeout = v;
-    }
     if let Ok(val) = std::env::var("CATENARY_LOG_RETENTION_DAYS")
         && let Ok(v) = val.parse()
     {

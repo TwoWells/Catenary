@@ -638,7 +638,6 @@ mod tests {
         Config {
             language: HashMap::new(),
             server: HashMap::new(),
-            idle_timeout: 300,
             log_retention_days: 7,
             notifications: None,
             icons: None,
@@ -682,7 +681,6 @@ mod tests {
         Config {
             language,
             server,
-            idle_timeout: 300,
             log_retention_days: 7,
             notifications: None,
             icons: None,
@@ -714,7 +712,6 @@ mod tests {
         Config {
             language,
             server,
-            idle_timeout: 300,
             log_retention_days: 7,
             notifications: None,
             icons: None,
@@ -872,7 +869,6 @@ mod tests {
         let config = Config {
             language,
             server,
-            idle_timeout: 300,
             log_retention_days: 7,
             notifications: None,
             icons: None,
