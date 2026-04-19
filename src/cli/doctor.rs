@@ -301,34 +301,29 @@ fn doctor_check_config(colors: &ColorConfig) {
             }
         }
 
-        // Removed field: [language.*] entries with `inherit`
-        if let Some(table) = raw.get("language").and_then(toml::Value::as_table) {
-            for (key, entry) in table {
-                if let Some(entry_table) = entry.as_table()
-                    && entry_table.contains_key("inherit")
-                {
-                    found_issues = true;
-                    let target = entry_table
-                        .get("inherit")
-                        .and_then(toml::Value::as_str)
-                        .unwrap_or("?");
-                    println!(
-                        "{}",
-                        colors.yellow(&format!(
-                            "⚠  {}: [language.{key}] uses removed `inherit` field — \
-                             copy `servers` list from [language.{target}] into \
-                             [language.{key}] instead.",
-                            source.display(),
-                        )),
-                    );
-                }
-            }
-        }
-
-        // Intermediate format: [language.*] entries with inline server fields
+        // [language.*] entries with removed or stale fields
         if let Some(table) = raw.get("language").and_then(toml::Value::as_table) {
             for (key, entry) in table {
                 if let Some(entry_table) = entry.as_table() {
+                    // Removed field: inherit
+                    if entry_table.contains_key("inherit") {
+                        found_issues = true;
+                        let target = entry_table
+                            .get("inherit")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or("?");
+                        println!(
+                            "{}",
+                            colors.yellow(&format!(
+                                "⚠  {}: [language.{key}] uses removed `inherit` field — \
+                                 copy `servers` list from [language.{target}] into \
+                                 [language.{key}] instead.",
+                                source.display(),
+                            )),
+                        );
+                    }
+
+                    // Intermediate format: inline server definition fields
                     let has_server_fields = crate::config::SERVER_DEF_KEYS
                         .iter()
                         .any(|k| entry_table.contains_key(*k));
