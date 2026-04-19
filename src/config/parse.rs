@@ -6,7 +6,10 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-use super::{Config, LanguageConfig, ServerDef, default_idle_timeout, default_log_retention_days};
+use super::{
+    Config, LanguageConfig, ServerBinding, ServerDef, default_idle_timeout,
+    default_log_retention_days,
+};
 
 /// Load configuration from standard paths or a specific file.
 ///
@@ -266,8 +269,8 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                         settings: None,
                     },
                     LanguageConfig {
-                        servers: vec![server_name],
-                        min_severity: None,
+                        servers: vec![ServerBinding::new(server_name)],
+                        ..LanguageConfig::default()
                     },
                 ));
             }

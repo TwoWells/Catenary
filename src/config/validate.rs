@@ -22,11 +22,12 @@ pub fn validate(config: &Config) -> Vec<String> {
         }
 
         // Validate server references
-        for server_name in &lang_config.servers {
-            if !config.server.contains_key(server_name) {
+        for binding in &lang_config.servers {
+            if !config.server.contains_key(&binding.name) {
                 errors.push(format!(
-                    "Language '{key}' references server '{server_name}', \
-                     but no [server.{server_name}] is defined"
+                    "Language '{key}' references server '{}', \
+                     but no [server.{}] is defined",
+                    binding.name, binding.name,
                 ));
             }
         }

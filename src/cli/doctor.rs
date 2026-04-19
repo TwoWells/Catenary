@@ -98,7 +98,7 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     let referenced: HashSet<&str> = config
         .language
         .values()
-        .flat_map(|lc| lc.servers.iter().map(String::as_str))
+        .flat_map(|lc| lc.servers.iter().map(|b| b.name.as_str()))
         .collect();
     let mut unreferenced: Vec<&str> = config
         .server
@@ -203,8 +203,8 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     // Build sorted list of (language, server_name) pairs
     let mut lang_entries: Vec<(&str, &str)> = Vec::new();
     for (lang, lc) in &config.language {
-        if let Some(server_name) = lc.servers.first() {
-            lang_entries.push((lang.as_str(), server_name.as_str()));
+        if let Some(binding) = lc.servers.first() {
+            lang_entries.push((lang.as_str(), binding.name.as_str()));
         }
     }
     lang_entries.sort_by_key(|(lang, _)| *lang);

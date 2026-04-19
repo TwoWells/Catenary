@@ -318,10 +318,11 @@ impl LspClientManager {
             anyhow::bail!("LSP server for '{lang}' is dead");
         }
 
-        let server_name = lang_config
+        let server_name = &lang_config
             .servers
             .first()
-            .ok_or_else(|| anyhow!("No servers configured for language '{lang}'"))?;
+            .ok_or_else(|| anyhow!("No servers configured for language '{lang}'"))?
+            .name;
 
         let server_def = self
             .config
@@ -620,7 +621,7 @@ impl LspClientManager {
 )]
 mod tests {
     use super::*;
-    use crate::config::{LanguageConfig, ServerDef};
+    use crate::config::{LanguageConfig, ServerBinding, ServerDef};
     use anyhow::Result;
 
     const MOCK_LANG_A: &str = "yX4Za";
@@ -674,8 +675,8 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![server_name],
-                min_severity: None,
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
             },
         );
         Config {
@@ -706,8 +707,8 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![server_name],
-                min_severity: None,
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
             },
         );
         Config {
@@ -864,8 +865,8 @@ mod tests {
         language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
-                servers: vec![server_name],
-                min_severity: None,
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
             },
         );
         let config = Config {

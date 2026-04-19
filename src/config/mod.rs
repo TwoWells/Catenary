@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde::Deserialize;
 
-pub use language::LanguageConfig;
+pub use language::{LanguageConfig, ServerBinding};
 pub use parse::{SERVER_DEF_KEYS, config_sources};
 pub use server::ServerDef;
 
@@ -361,7 +361,7 @@ servers = ["rust-analyzer"]
                 .get("rust")
                 .expect("rust language config")
                 .servers,
-            vec!["rust-analyzer"],
+            vec![ServerBinding::new("rust-analyzer")],
         );
 
         Ok(())
@@ -608,7 +608,7 @@ servers = ["tsserver"]
         let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(resolved.servers, vec!["tsserver"]);
+        assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
 
         // Unconfigured language returns None
         assert!(config.resolve_language("typescriptreact").is_none());
@@ -705,14 +705,14 @@ servers = ["clangd"]
 
         // Language entries
         let rust = config.language.get("rust").expect("rust config");
-        assert_eq!(rust.servers, vec!["rust-analyzer"]);
+        assert_eq!(rust.servers, vec![ServerBinding::new("rust-analyzer")]);
         assert_eq!(rust.min_severity.as_deref(), Some("warning"));
 
         let c = config.language.get("c").expect("c config");
-        assert_eq!(c.servers, vec!["clangd"]);
+        assert_eq!(c.servers, vec![ServerBinding::new("clangd")]);
 
         let cpp = config.language.get("cpp").expect("cpp config");
-        assert_eq!(cpp.servers, vec!["clangd"]);
+        assert_eq!(cpp.servers, vec![ServerBinding::new("clangd")]);
 
         Ok(())
     }
@@ -809,7 +809,7 @@ min_severity = "warning"
         let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(resolved.servers, vec!["tsserver"]);
+        assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
         assert_eq!(resolved.min_severity.as_deref(), Some("warning"));
 
         Ok(())
@@ -824,7 +824,7 @@ min_severity = "warning"
         assert_eq!(lang, "rust");
         assert_eq!(server_def.command, "rust-analyzer");
         assert_eq!(server_def.args, vec!["--log-level", "info"]);
-        assert_eq!(lang_config.servers, vec!["rust"]);
+        assert_eq!(lang_config.servers, vec![ServerBinding::new("rust")]);
     }
 
     #[test]
@@ -874,7 +874,7 @@ servers = ["tsserver"]
         let resolved = config
             .resolve_language("typescript")
             .expect("should resolve");
-        assert_eq!(resolved.servers, vec!["tsserver"]);
+        assert_eq!(resolved.servers, vec![ServerBinding::new("tsserver")]);
 
         // Unconfigured language returns None
         assert!(config.resolve_language("unknown").is_none());
@@ -1044,5 +1044,217 @@ command = "rust-analyzer"
         assert_eq!(Severity::from(SeverityConfig::Info), Severity::Info);
         assert_eq!(Severity::from(SeverityConfig::Warn), Severity::Warn);
         assert_eq!(Severity::from(SeverityConfig::Error), Severity::Error);
+    }
+
+    #[test]
+    fn test_bare_string_binding() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.test]
+servers = ["foo"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let lc = config.language.get("test").expect("test language");
+        assert_eq!(lc.servers.len(), 1);
+        assert_eq!(lc.servers[0].name, "foo");
+        assert!(lc.servers[0].diagnostics);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inline_table_binding() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.test]
+servers = [{ name = "foo", diagnostics = false }]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let lc = config.language.get("test").expect("test language");
+        assert_eq!(lc.servers.len(), 1);
+        assert_eq!(lc.servers[0].name, "foo");
+        assert!(!lc.servers[0].diagnostics);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_mixed_binding() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.alpha]
+command = "alpha-server"
+
+[server.beta]
+command = "beta-server"
+
+[language.test]
+servers = ["alpha", { name = "beta", diagnostics = false }]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let lc = config.language.get("test").expect("test language");
+        assert_eq!(lc.servers.len(), 2);
+        assert_eq!(
+            lc.servers,
+            vec![
+                ServerBinding::new("alpha"),
+                ServerBinding {
+                    name: "beta".to_string(),
+                    diagnostics: false,
+                },
+            ],
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unknown_binding_key_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.test]
+servers = [{ name = "foo", typo = true }]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("typo"),
+            "error should mention the unknown key: {err}",
+        );
+    }
+
+    #[test]
+    fn test_language_diagnostics_default() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.foo]
+command = "foo-server"
+
+[language.test]
+servers = ["foo"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let lc = config.language.get("test").expect("test language");
+        assert!(lc.diagnostics);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_language_diagnostics_false() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server.md-server]
+command = "md-server"
+
+[language.markdown]
+servers = ["md-server"]
+diagnostics = false
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let lc = config.language.get("markdown").expect("markdown language");
+        assert!(!lc.diagnostics);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_diagnostics_enabled_and_logic() {
+        // language true, binding true → true
+        let lc = LanguageConfig {
+            servers: vec![ServerBinding::new("s")],
+            ..LanguageConfig::default()
+        };
+        assert!(lc.diagnostics_enabled("s"));
+
+        // language false, binding true → false
+        let lc = LanguageConfig {
+            servers: vec![ServerBinding::new("s")],
+            diagnostics: false,
+            ..LanguageConfig::default()
+        };
+        assert!(!lc.diagnostics_enabled("s"));
+
+        // language true, binding false → false
+        let lc = LanguageConfig {
+            servers: vec![ServerBinding {
+                name: "s".to_string(),
+                diagnostics: false,
+            }],
+            ..LanguageConfig::default()
+        };
+        assert!(!lc.diagnostics_enabled("s"));
+
+        // language false, binding false → false
+        let lc = LanguageConfig {
+            servers: vec![ServerBinding {
+                name: "s".to_string(),
+                diagnostics: false,
+            }],
+            diagnostics: false,
+            ..LanguageConfig::default()
+        };
+        assert!(!lc.diagnostics_enabled("s"));
+    }
+
+    #[test]
+    fn test_diagnostics_enabled_unknown_server() {
+        let lc = LanguageConfig {
+            servers: vec![ServerBinding::new("known")],
+            ..LanguageConfig::default()
+        };
+        assert!(!lc.diagnostics_enabled("unknown"));
+    }
+
+    #[test]
+    fn test_env_var_creates_binding() {
+        let results = parse::parse_server_specs("rust:rust-analyzer");
+        assert_eq!(results.len(), 1);
+
+        let (_, _, lang_config) = &results[0];
+        assert_eq!(lang_config.servers.len(), 1);
+        assert_eq!(lang_config.servers[0].name, "rust");
+        assert!(lang_config.servers[0].diagnostics);
     }
 }
