@@ -1334,10 +1334,15 @@ mod tests {
 
         std::fs::write(dir.path().join("new.rs"), "fn n() {}\n").expect("write");
 
+        // Creating a file may also change the parent directory's mtime,
+        // so avoid asserting an exact count.
         let changes = mgr.diff();
-        assert_eq!(changes.len(), 1);
-        assert!(changes[0].path.ends_with("new.rs"));
-        assert_eq!(changes[0].change_type, FileChangeType::Created);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("new.rs") && c.change_type == FileChangeType::Created),
+            "expected Created for new.rs, got: {changes:?}",
+        );
     }
 
     #[test]
@@ -1373,10 +1378,15 @@ mod tests {
 
         std::fs::remove_file(&path).expect("remove");
 
+        // Deleting a file may also change the parent directory's mtime,
+        // so avoid asserting an exact count.
         let changes = mgr.diff();
-        assert_eq!(changes.len(), 1);
-        assert!(changes[0].path.ends_with("gone.rs"));
-        assert_eq!(changes[0].change_type, FileChangeType::Deleted);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("gone.rs") && c.change_type == FileChangeType::Deleted),
+            "expected Deleted for gone.rs, got: {changes:?}",
+        );
     }
 
     #[test]
