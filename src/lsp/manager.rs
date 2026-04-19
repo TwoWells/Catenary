@@ -677,7 +677,6 @@ mod tests {
             LanguageConfig {
                 servers: vec![server_name],
                 min_severity: None,
-                inherit: None,
             },
         );
         Config {
@@ -710,7 +709,6 @@ mod tests {
             LanguageConfig {
                 servers: vec![server_name],
                 min_severity: None,
-                inherit: None,
             },
         );
         Config {
@@ -869,7 +867,6 @@ mod tests {
             LanguageConfig {
                 servers: vec![server_name],
                 min_severity: None,
-                inherit: None,
             },
         );
         let config = Config {

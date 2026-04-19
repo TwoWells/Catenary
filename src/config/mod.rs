@@ -255,7 +255,7 @@ impl Config {
     /// Returns an error if:
     /// - A configuration file exists but cannot be read or parsed.
     /// - A file uses the deprecated `[server.*]` key without `[language.*]`.
-    /// - `inherit` targets are missing, chained, or cyclic.
+    /// - A `[language.*]` entry uses the removed `inherit` field.
     /// - A concrete language entry has no `servers` list.
     pub fn load() -> Result<Self> {
         parse::load()
@@ -279,8 +279,7 @@ impl Config {
     /// Load configuration from an explicit list of file paths.
     ///
     /// Sources are merged in order (later overrides earlier). Environment
-    /// variable overrides, default inherits, and validation are applied
-    /// after merging.
+    /// variable overrides and validation are applied after merging.
     #[cfg(test)]
     fn load_from_sources(sources: &[std::path::PathBuf]) -> Result<Self> {
         parse::load_from_sources(sources)
@@ -296,11 +295,6 @@ impl Config {
         parse::apply_env_overrides(self);
     }
 
-    /// Apply default inherit entries for known language variants.
-    fn apply_default_inherits(&mut self) {
-        parse::apply_default_inherits(self);
-    }
-
     /// Validate the merged config, returning all errors found.
     ///
     /// Returns an empty vec when the config is valid.
@@ -309,14 +303,12 @@ impl Config {
         validate::validate(self)
     }
 
-    /// Resolve `inherit` for a language key, returning the canonical key
-    /// and the effective config.
+    /// Resolve a language key, returning the canonical key and effective config.
     ///
-    /// If the language has `inherit`, returns the target key and a merged
-    /// config (inherit-only overrides applied on top of the base). If no
-    /// `inherit`, returns the key and config as-is.
+    /// Direct lookup is tried first. If the key is not found, the alias
+    /// table is consulted to redirect to a base language entry.
     #[must_use]
-    pub fn resolve_language<'a>(&'a self, key: &'a str) -> Option<(&'a str, LanguageConfig)> {
+    pub fn resolve_language<'a>(&'a self, key: &'a str) -> Option<(&'a str, &'a LanguageConfig)> {
         language::resolve_language(&self.language, key)
     }
 }
@@ -546,8 +538,8 @@ servers = ["rust-analyzer"]
     }
 
     #[test]
-    fn test_inherit_resolves() -> anyhow::Result<()> {
-        let dir = tempdir()?;
+    fn test_inherit_field_rejected() {
+        let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
 
         fs::write(
@@ -555,97 +547,12 @@ servers = ["rust-analyzer"]
             r#"
 [server.tsserver]
 command = "typescript-language-server"
-args = ["--stdio"]
 
 [language.typescript]
 servers = ["tsserver"]
 
 [language.typescriptreact]
 inherit = "typescript"
-"#,
-        )?;
-
-        let config = Config::load_from_sources(&[config_path])?;
-
-        let (canonical, resolved) = config
-            .resolve_language("typescriptreact")
-            .expect("should resolve");
-        assert_eq!(canonical, "typescript");
-        assert_eq!(resolved.servers, vec!["tsserver"]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_inherit_with_override() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let config_path = dir.path().join("config.toml");
-
-        fs::write(
-            &config_path,
-            r#"
-[server.tsserver]
-command = "typescript-language-server"
-args = ["--stdio"]
-
-[language.typescript]
-servers = ["tsserver"]
-min_severity = "warning"
-
-[language.typescriptreact]
-inherit = "typescript"
-min_severity = "error"
-"#,
-        )?;
-
-        let config = Config::load_from_sources(&[config_path])?;
-
-        let (_, resolved) = config
-            .resolve_language("typescriptreact")
-            .expect("should resolve");
-        assert_eq!(resolved.min_severity.as_deref(), Some("error"));
-        assert_eq!(resolved.servers, vec!["tsserver"]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_inherit_missing_target() {
-        let dir = tempdir().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-
-        fs::write(
-            &config_path,
-            r#"
-[language.typescriptreact]
-inherit = "typescript"
-"#,
-        )
-        .expect("write config");
-
-        let result = Config::load_from_sources(&[config_path]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_inherit_chain_rejected() {
-        let dir = tempdir().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-
-        fs::write(
-            &config_path,
-            r#"
-[server.server-a]
-command = "server-a"
-
-[language.a]
-servers = ["server-a"]
-
-[language.b]
-inherit = "a"
-
-[language.c]
-inherit = "b"
 "#,
         )
         .expect("write config");
@@ -653,28 +560,10 @@ inherit = "b"
         let result = Config::load_from_sources(&[config_path]);
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
-        assert!(err.contains("chains"), "error should mention chains: {err}",);
-    }
-
-    #[test]
-    fn test_inherit_cycle_rejected() {
-        let dir = tempdir().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-
-        fs::write(
-            &config_path,
-            r#"
-[language.a]
-inherit = "b"
-
-[language.b]
-inherit = "a"
-"#,
-        )
-        .expect("write config");
-
-        let result = Config::load_from_sources(&[config_path]);
-        assert!(result.is_err());
+        assert!(
+            err.contains("inherit") && err.contains("removed"),
+            "error should mention removed inherit field: {err}",
+        );
     }
 
     #[test]
@@ -701,7 +590,7 @@ min_severity = "warning"
     }
 
     #[test]
-    fn test_default_inherits_applied() -> anyhow::Result<()> {
+    fn test_alias_fallback() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
 
@@ -719,18 +608,18 @@ servers = ["tsserver"]
 
         let config = Config::load_from_sources(&[config_path])?;
 
-        // Default inherit should have been applied
-        assert!(config.language.contains_key("typescriptreact"));
-        let (canonical, _) = config
+        // typescriptreact is in LANGUAGE_ALIASES → resolves to typescript
+        let (canonical, resolved) = config
             .resolve_language("typescriptreact")
-            .expect("should resolve");
+            .expect("should resolve via alias");
         assert_eq!(canonical, "typescript");
+        assert_eq!(resolved.servers, vec!["tsserver"]);
 
         Ok(())
     }
 
     #[test]
-    fn test_user_defined_overrides_default_inherit() -> anyhow::Result<()> {
+    fn test_alias_no_override() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
 
@@ -754,15 +643,28 @@ servers = ["custom-tsx"]
 
         let config = Config::load_from_sources(&[config_path])?;
 
-        // User-defined entry should win over default inherit
-        let tsx = config
-            .language
-            .get("typescriptreact")
-            .expect("typescriptreact config");
-        assert!(tsx.inherit.is_none());
-        assert_eq!(tsx.servers, vec!["custom-tsx"]);
+        // Explicit entry takes precedence over alias
+        let (key, resolved) = config
+            .resolve_language("typescriptreact")
+            .expect("should resolve");
+        assert_eq!(key, "typescriptreact");
+        assert_eq!(resolved.servers, vec!["custom-tsx"]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_alias_base_missing() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(&config_path, "").expect("write config");
+
+        let config = Config::load_from_sources(&[config_path]).expect("load");
+
+        // typescriptreact alias points to typescript, but typescript is
+        // not configured → None.
+        assert!(config.resolve_language("typescriptreact").is_none());
     }
 
     #[test]
@@ -838,7 +740,7 @@ min_severity = "warning"
 servers = ["clangd"]
 
 [language.cpp]
-inherit = "c"
+servers = ["clangd"]
 "#,
         )?;
 
@@ -860,10 +762,8 @@ inherit = "c"
         let c = config.language.get("c").expect("c config");
         assert_eq!(c.servers, vec!["clangd"]);
 
-        // Inherit resolves correctly
-        let (canonical, resolved) = config.resolve_language("cpp").expect("should resolve");
-        assert_eq!(canonical, "c");
-        assert_eq!(resolved.servers, vec!["clangd"]);
+        let cpp = config.language.get("cpp").expect("cpp config");
+        assert_eq!(cpp.servers, vec!["clangd"]);
 
         Ok(())
     }
@@ -938,8 +838,8 @@ servers = []
     }
 
     #[test]
-    fn test_inherit_with_servers_error() {
-        let dir = tempdir().expect("tempdir");
+    fn test_resolve_language_borrows() -> anyhow::Result<()> {
+        let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");
 
         fs::write(
@@ -950,21 +850,29 @@ command = "typescript-language-server"
 
 [language.typescript]
 servers = ["tsserver"]
-
-[language.typescriptreact]
-inherit = "typescript"
-servers = ["tsserver"]
+min_severity = "warning"
 "#,
-        )
-        .expect("write config");
+        )?;
 
-        let result = Config::load_from_sources(&[config_path]);
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
-        assert!(
-            err.contains("inherit") && err.contains("servers"),
-            "error should mention inherit + servers conflict: {err}",
-        );
+        let config = Config::load_from_sources(&[config_path])?;
+
+        // Verify the returned config borrows from the map
+        let (key, resolved) = config
+            .resolve_language("typescript")
+            .expect("should resolve");
+        assert_eq!(key, "typescript");
+        assert_eq!(resolved.servers, vec!["tsserver"]);
+        assert_eq!(resolved.min_severity.as_deref(), Some("warning"));
+
+        // Alias also borrows from the map (points to the base entry)
+        let (alias_key, alias_resolved) = config
+            .resolve_language("typescriptreact")
+            .expect("alias should resolve");
+        assert_eq!(alias_key, "typescript");
+        // Same pointer — alias returns the base entry's config
+        assert!(std::ptr::eq(resolved, alias_resolved));
+
+        Ok(())
     }
 
     #[test]
@@ -1018,9 +926,6 @@ command = "typescript-language-server"
 
 [language.typescript]
 servers = ["tsserver"]
-
-[language.typescriptreact]
-inherit = "typescript"
 "#,
         )?;
 
@@ -1033,10 +938,10 @@ inherit = "typescript"
         assert_eq!(key, "typescript");
         assert_eq!(resolved.servers, vec!["tsserver"]);
 
-        // Inherit resolution
+        // Alias resolution (typescriptreact → typescript via LANGUAGE_ALIASES)
         let (key, resolved) = config
             .resolve_language("typescriptreact")
-            .expect("should resolve");
+            .expect("should resolve via alias");
         assert_eq!(key, "typescript");
         assert_eq!(resolved.servers, vec!["tsserver"]);
 

@@ -21,7 +21,7 @@ use super::{Config, LanguageConfig, ServerDef, default_idle_timeout, default_log
 /// Returns an error if:
 /// - A configuration file exists but cannot be read or parsed.
 /// - A file uses the deprecated `[server.*]` key without `[language.*]`.
-/// - `inherit` targets are missing, chained, or cyclic.
+/// - A `[language.*]` entry uses the removed `inherit` field.
 /// - A concrete language entry has no `servers` list.
 pub fn load() -> Result<Config> {
     let sources = config_sources();
@@ -83,7 +83,6 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     }
 
     config.apply_env_overrides();
-    config.apply_default_inherits();
 
     let errors = config.validate();
     if !errors.is_empty() {
@@ -143,6 +142,14 @@ fn deserialize_source(contents: &str) -> Result<Config> {
     if let Some(lang_table) = raw.get("language").and_then(toml::Value::as_table) {
         for (lang_key, entry) in lang_table {
             if let Some(entry_table) = entry.as_table() {
+                if entry_table.contains_key("inherit") {
+                    bail!(
+                        "[language.{lang_key}] uses the removed `inherit` field — \
+                         copy the base language's `servers` list into \
+                         [language.{lang_key}] instead. Run `catenary doctor` for guidance.",
+                    );
+                }
+
                 let stale: Vec<&str> = SERVER_DEF_KEYS
                     .iter()
                     .copied()
@@ -261,29 +268,10 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                     LanguageConfig {
                         servers: vec![server_name],
                         min_severity: None,
-                        inherit: None,
                     },
                 ));
             }
         }
     }
     results
-}
-
-/// Apply default inherit entries for known language variants.
-pub(super) fn apply_default_inherits(config: &mut Config) {
-    for &(variant, base) in super::language::DEFAULT_INHERIT {
-        // Only apply if the base language is configured and the
-        // variant is not explicitly defined by the user.
-        if config.language.contains_key(base) && !config.language.contains_key(variant) {
-            config.language.insert(
-                variant.to_string(),
-                LanguageConfig {
-                    servers: Vec::new(),
-                    min_severity: None,
-                    inherit: Some(base.to_string()),
-                },
-            );
-        }
-    }
 }

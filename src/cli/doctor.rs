@@ -203,9 +203,7 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     // Build sorted list of (language, server_name) pairs
     let mut lang_entries: Vec<(&str, &str)> = Vec::new();
     for (lang, lc) in &config.language {
-        if let Some(ref target) = lc.inherit {
-            lang_entries.push((lang.as_str(), target.as_str()));
-        } else if let Some(server_name) = lc.servers.first() {
+        if let Some(server_name) = lc.servers.first() {
             lang_entries.push((lang.as_str(), server_name.as_str()));
         }
     }
@@ -219,42 +217,29 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
 
     for (lang, target) in &lang_entries {
         let lang_display = format!("  {lang:<max_lang_width$}");
-        let is_inherit = config
-            .language
-            .get(*lang)
-            .is_some_and(|lc| lc.inherit.is_some());
 
         // Check if any files for this language exist (only when roots provided)
         if let Some(ref det) = detected
             && !det.contains(*lang)
         {
-            let arrow = if is_inherit {
-                format!("inherits {target}")
-            } else {
-                format!("→ {target}")
-            };
             println!(
                 "{}  {}",
                 colors.dim(&lang_display),
-                colors.dim(&format!("{arrow}  - skipped (no matching files)")),
+                colors.dim(&format!("→ {target}  - skipped (no matching files)")),
             );
             continue;
         }
 
-        if is_inherit {
-            println!("{lang_display}  inherits {target}");
-        } else {
-            println!("{lang_display}  → {target}");
-            // Show capabilities from the server, indented
-            if let Some(tools) = server_capabilities.get(target)
-                && !tools.is_empty()
-            {
-                println!(
-                    "{}    {}",
-                    " ".repeat(max_lang_width + 2),
-                    colors.dim(&tools.join(" ")),
-                );
-            }
+        println!("{lang_display}  → {target}");
+        // Show capabilities from the server, indented
+        if let Some(tools) = server_capabilities.get(target)
+            && !tools.is_empty()
+        {
+            println!(
+                "{}    {}",
+                " ".repeat(max_lang_width + 2),
+                colors.dim(&tools.join(" ")),
+            );
         }
     }
 
@@ -312,6 +297,30 @@ fn doctor_check_config(colors: &ColorConfig) {
                 {
                     found_issues = true;
                     print_migration(colors, source, key, entry_table, true);
+                }
+            }
+        }
+
+        // Removed field: [language.*] entries with `inherit`
+        if let Some(table) = raw.get("language").and_then(toml::Value::as_table) {
+            for (key, entry) in table {
+                if let Some(entry_table) = entry.as_table()
+                    && entry_table.contains_key("inherit")
+                {
+                    found_issues = true;
+                    let target = entry_table
+                        .get("inherit")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("?");
+                    println!(
+                        "{}",
+                        colors.yellow(&format!(
+                            "⚠  {}: [language.{key}] uses removed `inherit` field — \
+                             copy `servers` list from [language.{target}] into \
+                             [language.{key}] instead.",
+                            source.display(),
+                        )),
+                    );
                 }
             }
         }
