@@ -267,9 +267,11 @@ impl FilesystemManager {
             };
         }
 
-        // Scan file for binary/text + line count + shebang
+        // Scan file for binary/text + line count + shebang.
+        // Shebang is checked first here, but in practice it only matters
+        // for extensionless scripts — `language_id()` short-circuits on
+        // filename/extension before reaching `classify()`.
         let kind = scan_file(path, metadata).map_or(FileKind::Binary, |scan| {
-            // Precedence: shebang > filename > extension
             let language_id = scan
                 .shebang_interpreter
                 .as_deref()
@@ -316,15 +318,18 @@ impl FilesystemManager {
 
     /// Returns the LSP language identifier for a file path, or `None` if unknown.
     ///
-    /// Tries filename/extension detection first (no I/O). If that fails
-    /// and the file exists on disk, falls back to full classification
-    /// which includes shebang detection.
+    /// Checks filename and extension first (no I/O). Falls back to full
+    /// classification (including shebang detection) only for files that
+    /// don't match any filename or extension rule. This is intentional:
+    /// shebangs identify the interpreter for executable scripts and are
+    /// only meaningful for extensionless files where there is no other
+    /// signal. A `.py` file is Python regardless of its shebang.
     pub fn language_id(&self, path: &Path) -> Option<String> {
         // Fast path: filename/extension (no I/O)
         if let Some(lang) = self.classification.classify_path(path) {
             return Some(lang);
         }
-        // Slow path: full classification for shebang
+        // Slow path: shebang detection for extensionless files
         let metadata = std::fs::metadata(path).ok()?;
         self.classify(path, &metadata)
             .language_id()
