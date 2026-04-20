@@ -119,8 +119,8 @@ impl LspClientManager {
     /// that have matching files. Servers that fail to spawn are logged and
     /// skipped — a misconfigured server should not prevent others from starting.
     ///
-    /// For workspace-capable servers, spawns a single instance and sends
-    /// `didChangeWorkspaceFolders` with any remaining roots. For legacy
+    /// For workspace-capable servers, spawns a single instance (all roots
+    /// are already included in the `initialize` request). For legacy
     /// servers, spawns a separate `Scope::Root` instance per root.
     pub async fn spawn_all(&self) {
         let roots = self.roots.lock().await.clone();
@@ -158,57 +158,27 @@ impl LspClientManager {
             let key = first_client.lock().await.server().key();
             let Some(key) = key else { continue };
 
-            match key.scope {
-                Scope::Workspace => {
-                    // Workspace-capable: notify about remaining roots.
-                    let remaining: Vec<(String, String)> = roots[1..]
-                        .iter()
-                        .map(|root| {
-                            (
-                                format!("file://{}", root.display()),
-                                root.file_name().map_or_else(
-                                    || "workspace".to_string(),
-                                    |s| s.to_string_lossy().to_string(),
-                                ),
-                            )
-                        })
-                        .collect();
-                    let added_refs: Vec<(&str, &str)> = remaining
-                        .iter()
-                        .map(|(u, n)| (u.as_str(), n.as_str()))
-                        .collect();
-                    if let Err(e) = first_client
-                        .lock()
-                        .await
-                        .did_change_workspace_folders(&added_refs, &[])
-                        .await
-                    {
-                        info!(
-                            "Failed to notify {lang} server about additional workspace folders: {e}",
+            // Workspace-capable servers already received all roots in the
+            // `initialize` request — no additional notification needed.
+            // Legacy servers need a separate instance per remaining root.
+            if let Scope::Root(_) = key.scope {
+                let server_name = key.server.clone();
+                info!(
+                    source = "lsp.lifecycle",
+                    language = lang.as_str(),
+                    server = server_name.as_str(),
+                    "Server does not support workspaceFolders — spawning per-root instances",
+                );
+                for root in &roots[1..] {
+                    if let Err(e) = self.spawn(&server_name, lang, root).await {
+                        warn!(
+                            source = "lsp.lifecycle",
+                            language = lang.as_str(),
+                            "Failed to spawn per-root instance for {lang} at {}: {e}",
+                            root.display(),
                         );
                     }
                 }
-                Scope::Root(_) => {
-                    // Legacy: spawn a separate instance per remaining root.
-                    let server_name = key.server.clone();
-                    info!(
-                        source = "lsp.lifecycle",
-                        language = lang.as_str(),
-                        server = server_name.as_str(),
-                        "Server does not support workspaceFolders — spawning per-root instances",
-                    );
-                    for root in &roots[1..] {
-                        if let Err(e) = self.spawn(&server_name, lang, root).await {
-                            warn!(
-                                source = "lsp.lifecycle",
-                                language = lang.as_str(),
-                                "Failed to spawn per-root instance for {lang} at {}: {e}",
-                                root.display(),
-                            );
-                        }
-                    }
-                }
-                _ => {}
             }
         }
     }
