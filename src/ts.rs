@@ -5,9 +5,9 @@
 //!
 //! Provides [`TsIndex`], a SQLite-backed symbol index built from tree-sitter
 //! grammars. The index walks workspace files, parses them using installed
-//! grammars, and writes extracted symbols to the database. The write side
-//! (`build`) lives here; the read/update side (`query`, `update_file`) is
-//! added by ticket 02b.
+//! grammars, and writes extracted symbols to the database. `build()` creates
+//! the initial index, `query()` reads it with regex filtering and lazy mtime
+//! staleness checks, and `update_file()` incrementally re-parses a single file.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,13 +43,13 @@ pub struct TsIndex {
     /// Owned connection for symbol queries and writes.
     conn: Connection,
     /// Loaded grammars keyed by scope (e.g. `"source.rust"`).
-    #[allow(dead_code, reason = "used by query/update in ticket 02b")]
     grammars: HashMap<String, tree_sitter::Language>,
     /// Scope → file extensions, from `grammars.file_types`.
     extensions: HashMap<String, Vec<String>>,
     /// tags.scm queries keyed by scope.
-    #[allow(dead_code, reason = "used by update_file in ticket 02b")]
     tag_queries: HashMap<String, tree_sitter::Query>,
+    /// File extension → grammar scope lookup for `update_file()`.
+    ext_to_scope: HashMap<String, String>,
 }
 
 /// Display labels for kind brackets in output.
@@ -172,6 +172,110 @@ struct RawDef {
     end_line: u32,
 }
 
+/// Read a file's mtime as nanoseconds since the Unix epoch.
+///
+/// Returns 0 if the metadata or system time conversion fails.
+fn file_mtime_ns(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0i64, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Parse a single file with a tree-sitter grammar and extract symbols.
+///
+/// Runs the query cursor over the parse tree, collects `RawDef` entries,
+/// then resolves scopes using a stack of enclosing definitions.
+fn parse_file(
+    source: &str,
+    language: &tree_sitter::Language,
+    query: &tree_sitter::Query,
+) -> Result<Vec<TsSymbol>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(language)
+        .map_err(|e| anyhow::anyhow!("failed to set parser language: {e}"))?;
+
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("tree-sitter parse returned None"))?;
+
+    let source_bytes = source.as_bytes();
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut query_matches = cursor.matches(query, tree.root_node(), source_bytes);
+
+    let mut defs: Vec<RawDef> = Vec::new();
+
+    while let Some(m) = query_matches.next() {
+        let mut name_text: Option<String> = None;
+        let mut def_info: Option<(String, usize, usize, u32, u32)> = None;
+
+        for capture in m.captures {
+            let cap_name: &str = capture_names[capture.index as usize];
+            if cap_name == "name" {
+                if let Ok(text) = capture.node.utf8_text(source_bytes) {
+                    name_text = Some(text.to_string());
+                }
+            } else if let Some(suffix) = cap_name.strip_prefix("definition.") {
+                let node = capture.node;
+                def_info = Some((
+                    suffix.to_string(),
+                    node.start_byte(),
+                    node.end_byte(),
+                    u32::try_from(node.start_position().row).unwrap_or(u32::MAX),
+                    u32::try_from(node.end_position().row).unwrap_or(u32::MAX),
+                ));
+            }
+        }
+
+        if let (Some(name), Some((kind, sb, eb, sl, el))) = (name_text, def_info) {
+            defs.push(RawDef {
+                name,
+                kind,
+                start_byte: sb,
+                end_byte: eb,
+                start_line: sl,
+                end_line: el,
+            });
+        }
+    }
+
+    // Sort by start_byte for scope determination.
+    defs.sort_by_key(|d| d.start_byte);
+
+    // Determine scopes using a stack of (name, kind, end_byte).
+    let mut scope_stack: Vec<(&str, &str, usize)> = Vec::new();
+    let mut symbols: Vec<TsSymbol> = Vec::new();
+
+    for def in &defs {
+        while scope_stack
+            .last()
+            .is_some_and(|&(_, _, eb)| eb <= def.start_byte)
+        {
+            scope_stack.pop();
+        }
+
+        let (scope_name, scope_kind) = scope_stack.last().map_or((None, None), |&(n, k, _)| {
+            (Some(n.to_string()), Some(k.to_string()))
+        });
+
+        symbols.push(TsSymbol {
+            name: def.name.clone(),
+            kind: def.kind.clone(),
+            line: def.start_line,
+            end_line: def.end_line,
+            scope: scope_name,
+            scope_kind,
+        });
+
+        scope_stack.push((&def.name, &def.kind, def.end_byte));
+    }
+
+    Ok(symbols)
+}
+
 impl TsIndex {
     /// Build the tree-sitter index from workspace roots.
     ///
@@ -276,96 +380,14 @@ impl TsIndex {
                     continue;
                 };
 
-                let mtime_ns = std::fs::metadata(path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0i64, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+                let mtime = file_mtime_ns(path);
 
-                let mut parser = tree_sitter::Parser::new();
-                parser
-                    .set_language(language)
-                    .map_err(|e| anyhow::anyhow!("failed to set parser language: {e}"))?;
-
-                let Some(tree) = parser.parse(&source, None) else {
+                let Ok(symbols) = parse_file(&source, language, query) else {
                     continue;
                 };
 
-                let source_bytes = source.as_bytes();
-                let capture_names = query.capture_names();
-                let mut cursor = tree_sitter::QueryCursor::new();
-                let mut query_matches = cursor.matches(query, tree.root_node(), source_bytes);
-
-                let mut defs: Vec<RawDef> = Vec::new();
-
-                while let Some(m) = query_matches.next() {
-                    let mut name_text: Option<String> = None;
-                    let mut def_info: Option<(String, usize, usize, u32, u32)> = None;
-
-                    for capture in m.captures {
-                        let cap_name: &str = capture_names[capture.index as usize];
-                        if cap_name == "name" {
-                            if let Ok(text) = capture.node.utf8_text(source_bytes) {
-                                name_text = Some(text.to_string());
-                            }
-                        } else if let Some(suffix) = cap_name.strip_prefix("definition.") {
-                            let node = capture.node;
-                            def_info = Some((
-                                suffix.to_string(),
-                                node.start_byte(),
-                                node.end_byte(),
-                                u32::try_from(node.start_position().row).unwrap_or(u32::MAX),
-                                u32::try_from(node.end_position().row).unwrap_or(u32::MAX),
-                            ));
-                        }
-                    }
-
-                    if let (Some(name), Some((kind, sb, eb, sl, el))) = (name_text, def_info) {
-                        defs.push(RawDef {
-                            name,
-                            kind,
-                            start_byte: sb,
-                            end_byte: eb,
-                            start_line: sl,
-                            end_line: el,
-                        });
-                    }
-                }
-
-                // Sort by start_byte for scope determination.
-                defs.sort_by_key(|d| d.start_byte);
-
-                // Determine scopes using a stack of (name, kind, end_byte).
-                let mut scope_stack: Vec<(&str, &str, usize)> = Vec::new();
-                let mut symbols: Vec<TsSymbol> = Vec::new();
-
-                for def in &defs {
-                    while scope_stack
-                        .last()
-                        .is_some_and(|&(_, _, eb)| eb <= def.start_byte)
-                    {
-                        scope_stack.pop();
-                    }
-
-                    let (scope_name, scope_kind) =
-                        scope_stack.last().map_or((None, None), |&(n, k, _)| {
-                            (Some(n.to_string()), Some(k.to_string()))
-                        });
-
-                    symbols.push(TsSymbol {
-                        name: def.name.clone(),
-                        kind: def.kind.clone(),
-                        line: def.start_line,
-                        end_line: def.end_line,
-                        scope: scope_name,
-                        scope_kind,
-                    });
-
-                    scope_stack.push((&def.name, &def.kind, def.end_byte));
-                }
-
                 let path_str = path.to_string_lossy().to_string();
-                file_states.push((path_str.clone(), mtime_ns, scope.clone()));
+                file_states.push((path_str.clone(), mtime, scope.clone()));
                 all_symbols.push((path_str, symbols));
             }
         }
@@ -413,6 +435,22 @@ impl TsIndex {
             tx.commit().context("commit transaction")?;
         }
 
+        // Step 4: Register REGEXP scalar function for query().
+        conn.create_scalar_function(
+            "regexp",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let pattern = ctx.get_raw(0).as_str()?;
+                let text = ctx.get_raw(1).as_str()?;
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                Ok(re.is_match(text))
+            },
+        )
+        .context("failed to register REGEXP function")?;
+
         let symbol_count: usize = all_symbols.iter().map(|(_, syms)| syms.len()).sum();
         info!(
             files = all_symbols.len(),
@@ -425,7 +463,207 @@ impl TsIndex {
             grammars,
             extensions,
             tag_queries,
+            ext_to_scope,
         })
+    }
+
+    /// Incrementally re-parse a single file and update its symbols.
+    ///
+    /// Looks up the file's grammar scope by extension. If no grammar matches,
+    /// returns `Ok(())`. Otherwise deletes the file's existing symbols, parses
+    /// the file, inserts fresh symbols, and updates the mtime record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, parsing fails, or the
+    /// database transaction fails.
+    pub fn update_file(&self, path: &Path) -> Result<()> {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return Ok(());
+        };
+        let Some(scope) = self.ext_to_scope.get(ext) else {
+            return Ok(());
+        };
+        let Some(language) = self.grammars.get(scope) else {
+            return Ok(());
+        };
+        let Some(query) = self.tag_queries.get(scope) else {
+            return Ok(());
+        };
+
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let symbols = parse_file(&source, language, query)?;
+        let mtime = file_mtime_ns(path);
+        let path_str = path.to_string_lossy();
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin transaction")?;
+
+        tx.execute(
+            "DELETE FROM symbols WHERE file_path = ?1",
+            rusqlite::params![path_str.as_ref() as &str],
+        )
+        .context("failed to delete old symbols")?;
+
+        for sym in &symbols {
+            tx.execute(
+                "INSERT INTO symbols \
+                 (file_path, name, kind, line, end_line, scope, scope_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    path_str.as_ref() as &str,
+                    sym.name,
+                    sym.kind,
+                    sym.line,
+                    sym.end_line,
+                    sym.scope,
+                    sym.scope_kind,
+                ],
+            )
+            .with_context(|| format!("failed to insert symbol {} in {}", sym.name, path_str))?;
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO file_parse_state (file_path, mtime_ns, grammar) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![path_str.as_ref() as &str, mtime, scope],
+        )
+        .context("failed to update file_parse_state")?;
+
+        tx.commit().context("commit transaction")?;
+        Ok(())
+    }
+
+    /// Query the index for symbols whose names match a regex pattern.
+    ///
+    /// If `files` is `Some`, only symbols from those files are returned.
+    /// Performs lazy mtime staleness checks: files in the result set whose
+    /// mtime has changed are re-parsed before returning final results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the regex is invalid, the database query fails,
+    /// or a stale file cannot be re-parsed.
+    pub fn query(
+        &self,
+        pattern: &str,
+        files: Option<&[PathBuf]>,
+    ) -> Result<Vec<(PathBuf, TsSymbol)>> {
+        // Run the initial query.
+        let mut results = self.run_symbol_query(pattern, files)?;
+
+        // Collect distinct file paths from results and check staleness.
+        let file_paths: HashSet<String> = results.iter().map(|(p, _)| p.clone()).collect();
+        let mut stale_files: Vec<PathBuf> = Vec::new();
+
+        for file_path in &file_paths {
+            let path = Path::new(file_path.as_str());
+            let current_mtime = file_mtime_ns(path);
+
+            let stored_mtime: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT mtime_ns FROM file_parse_state WHERE file_path = ?1",
+                    rusqlite::params![file_path],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if stored_mtime.is_none_or(|stored| current_mtime > stored) {
+                self.update_file(path)?;
+                stale_files.push(path.to_path_buf());
+            }
+        }
+
+        // If any files were re-parsed, re-run the query for those files
+        // and replace their entries in the results.
+        if !stale_files.is_empty() {
+            results.retain(|(p, _)| !stale_files.iter().any(|s| s.to_string_lossy() == *p));
+            let fresh = self.run_symbol_query(pattern, Some(&stale_files))?;
+            results.extend(fresh);
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|(p, sym)| (PathBuf::from(p), sym))
+            .collect())
+    }
+
+    /// Execute the symbol query against the database.
+    ///
+    /// Internal helper shared by the initial query and the re-query after
+    /// stale file updates.
+    fn run_symbol_query(
+        &self,
+        pattern: &str,
+        files: Option<&[PathBuf]>,
+    ) -> Result<Vec<(String, TsSymbol)>> {
+        let mut results = Vec::new();
+
+        match files {
+            Some(file_list) if !file_list.is_empty() => {
+                let placeholders: String = (0..file_list.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
+                     FROM symbols WHERE name REGEXP ?1 AND file_path IN ({placeholders})"
+                );
+                let mut stmt = self.conn.prepare(&sql).context("failed to prepare query")?;
+
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    Vec::with_capacity(1 + file_list.len());
+                params.push(Box::new(pattern.to_string()));
+                for f in file_list {
+                    params.push(Box::new(f.to_string_lossy().to_string()));
+                }
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(AsRef::as_ref).collect();
+
+                let rows = stmt
+                    .query_map(param_refs.as_slice(), Self::row_to_symbol)
+                    .context("failed to execute query")?;
+                for row in rows {
+                    results.push(row.context("failed to read symbol row")?);
+                }
+            }
+            _ => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
+                         FROM symbols WHERE name REGEXP ?1",
+                    )
+                    .context("failed to prepare query")?;
+                let rows = stmt
+                    .query_map([pattern], Self::row_to_symbol)
+                    .context("failed to execute query")?;
+                for row in rows {
+                    results.push(row.context("failed to read symbol row")?);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Map a database row to a `(file_path, TsSymbol)` pair.
+    fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, TsSymbol)> {
+        Ok((
+            row.get(0)?,
+            TsSymbol {
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                line: row.get(3)?,
+                end_line: row.get(4)?,
+                scope: row.get(5)?,
+                scope_kind: row.get(6)?,
+            },
+        ))
     }
 
     /// Check whether a grammar is installed for the file's language.
@@ -703,5 +941,177 @@ mod tests {
 
         assert!(index.has_children(Path::new("src/test.rs"), "MyStruct"));
         assert!(!index.has_children(Path::new("src/test.rs"), "NoSuchScope"));
+    }
+
+    // --- Query and update tests (ticket 02b) ---
+
+    /// Build a `TsIndex` with the mock grammar over a workspace directory.
+    #[allow(clippy::expect_used, reason = "test setup")]
+    fn build_index(
+        workspace: &std::path::Path,
+        db_path: &std::path::Path,
+        setup_conn: &Connection,
+    ) -> TsIndex {
+        let grammar_dir = tempfile::tempdir().expect("grammar tempdir");
+        install_mock_grammar(setup_conn, grammar_dir.path());
+        let index_conn = db::open_and_migrate_at(db_path).expect("index conn");
+        TsIndex::build(&[workspace.to_path_buf()], index_conn).expect("build index")
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_query_regex_filter() {
+        let (db_dir, setup_conn) = test_db();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(
+            workspace.path().join("test.mock"),
+            "fn foo\nfn foobar\nfn baz",
+        )
+        .expect("write test file");
+
+        let db_path = db_dir.path().join("test.db");
+        let index = build_index(workspace.path(), &db_path, &setup_conn);
+
+        let results = index.query("foo", None).expect("query");
+        let names: Vec<&str> = results.iter().map(|(_, s)| s.name.as_str()).collect();
+
+        assert!(names.contains(&"foo"), "should contain foo");
+        assert!(names.contains(&"foobar"), "should contain foobar");
+        assert!(!names.contains(&"baz"), "should not contain baz");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_query_file_scoping() {
+        let (db_dir, setup_conn) = test_db();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(workspace.path().join("a.mock"), "fn alpha\nfn beta").expect("write a.mock");
+        std::fs::write(workspace.path().join("b.mock"), "fn gamma\nfn delta")
+            .expect("write b.mock");
+
+        let db_path = db_dir.path().join("test.db");
+        let index = build_index(workspace.path(), &db_path, &setup_conn);
+
+        // Query scoped to a.mock only.
+        let a_path = workspace.path().join("a.mock");
+        let results = index
+            .query(".*", Some(std::slice::from_ref(&a_path)))
+            .expect("scoped query");
+
+        for (path, _) in &results {
+            assert_eq!(*path, a_path, "all results should be from a.mock");
+        }
+        let names: Vec<&str> = results.iter().map(|(_, s)| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(!names.contains(&"gamma"));
+        assert!(!names.contains(&"delta"));
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_update_file() {
+        let (db_dir, setup_conn) = test_db();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let file_path = workspace.path().join("test.mock");
+        std::fs::write(&file_path, "fn foo\nfn bar").expect("write test file");
+
+        let db_path = db_dir.path().join("test.db");
+        let index = build_index(workspace.path(), &db_path, &setup_conn);
+
+        // Verify initial state.
+        let initial = index.query(".*", None).expect("initial query");
+        assert_eq!(initial.len(), 2);
+
+        // Rewrite the file with a new function.
+        std::fs::write(&file_path, "fn foo\nfn bar\nfn newone").expect("rewrite test file");
+        index.update_file(&file_path).expect("update_file");
+
+        let updated = index.query(".*", None).expect("updated query");
+        let names: Vec<&str> = updated.iter().map(|(_, s)| s.name.as_str()).collect();
+        assert_eq!(updated.len(), 3, "should have 3 symbols after update");
+        assert!(names.contains(&"newone"), "should contain new symbol");
+        // Old symbols should still be present (not duplicated).
+        assert_eq!(
+            names.iter().filter(|&&n| n == "foo").count(),
+            1,
+            "foo should appear exactly once"
+        );
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_lazy_mtime_check() {
+        let (db_dir, setup_conn) = test_db();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let file_path = workspace.path().join("test.mock");
+        std::fs::write(&file_path, "fn lazy_old").expect("write test file");
+
+        let db_path = db_dir.path().join("test.db");
+        let index = build_index(workspace.path(), &db_path, &setup_conn);
+
+        // Modify the file without calling update_file — add a symbol.
+        // The pattern "lazy" matches both old and new symbols, so the
+        // initial query hits the file, triggering the mtime staleness
+        // check which re-parses and picks up the new symbol.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&file_path, "fn lazy_old\nfn lazy_new").expect("rewrite test file");
+
+        let results = index.query("lazy", None).expect("lazy query");
+        let names: Vec<&str> = results.iter().map(|(_, s)| s.name.as_str()).collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "lazy mtime check should find both symbols"
+        );
+        assert!(names.contains(&"lazy_old"));
+        assert!(names.contains(&"lazy_new"));
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_mtime_no_false_positive() {
+        let (db_dir, setup_conn) = test_db();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(workspace.path().join("test.mock"), "fn stable").expect("write test file");
+
+        let db_path = db_dir.path().join("test.db");
+        let index = build_index(workspace.path(), &db_path, &setup_conn);
+
+        // Read the stored mtime before query.
+        let mtime_before: i64 = setup_conn
+            .query_row("SELECT mtime_ns FROM file_parse_state LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read mtime");
+
+        // Query without modifying any files.
+        let results = index.query("stable", None).expect("query");
+        assert_eq!(results.len(), 1);
+
+        // Mtime should be unchanged (no re-parse occurred).
+        let mtime_after: i64 = setup_conn
+            .query_row("SELECT mtime_ns FROM file_parse_state LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read mtime after");
+        assert_eq!(mtime_before, mtime_after, "mtime should not change");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_query_empty_result() {
+        let (db_dir, setup_conn) = test_db();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(workspace.path().join("test.mock"), "fn foo").expect("write test file");
+
+        let db_path = db_dir.path().join("test.db");
+        let index = build_index(workspace.path(), &db_path, &setup_conn);
+
+        let results = index
+            .query("zzz_no_match", None)
+            .expect("empty result query");
+        assert!(results.is_empty(), "should return empty vec");
     }
 }
