@@ -49,18 +49,6 @@
               "default": []
             }
           }
-        },
-        "sed": {
-          "type": "object",
-          "description": "Sed tool configuration.",
-          "properties": {
-            "budget": {
-              "type": "integer",
-              "description": "Output budget in characters. Minimum: 1000.",
-              "default": 4000,
-              "minimum": 1000
-            }
-          }
         }
       }
     }

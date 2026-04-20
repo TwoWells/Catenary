@@ -245,8 +245,6 @@ pub struct ToolsConfig {
     pub grep: GrepConfig,
     /// Glob tool configuration.
     pub glob: GlobConfig,
-    /// Sed tool configuration.
-    pub sed: SedConfig,
 }
 
 impl ToolsConfig {
@@ -267,14 +265,6 @@ impl ToolsConfig {
                 "glob budget below minimum, clamping to 1000",
             );
             self.glob.budget = 1000;
-        }
-        if self.sed.budget < 1000 {
-            tracing::warn!(
-                budget = self.sed.budget,
-                min = 1000,
-                "sed budget below minimum, clamping to 1000",
-            );
-            self.sed.budget = 1000;
         }
     }
 }
@@ -312,20 +302,6 @@ impl Default for GlobConfig {
             maps_threshold: 200,
             maps_deny: Vec::new(),
         }
-    }
-}
-
-/// Sed tool configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct SedConfig {
-    /// Output budget in characters. Default: 4000, min: 1000.
-    pub budget: u32,
-}
-
-impl Default for SedConfig {
-    fn default() -> Self {
-        Self { budget: 4000 }
     }
 }
 
@@ -1663,7 +1639,6 @@ extensions = ["xyz"]
         let tools = config.tools.unwrap_or_default();
         assert_eq!(tools.grep.budget, 4000);
         assert_eq!(tools.glob.budget, 2000);
-        assert_eq!(tools.sed.budget, 4000);
 
         Ok(())
     }
@@ -1747,7 +1722,6 @@ extensions = ["xyz"]
         let tools = config.tools.unwrap_or_default();
         assert_eq!(tools.grep.budget, 4000);
         assert_eq!(tools.glob.budget, 2000);
-        assert_eq!(tools.sed.budget, 4000);
 
         Ok(())
     }
@@ -1761,9 +1735,8 @@ extensions = ["xyz"]
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
         assert_eq!(tools.grep.budget, 6000);
-        // glob and sed use defaults
+        // glob uses defaults
         assert_eq!(tools.glob.budget, 2000);
-        assert_eq!(tools.sed.budget, 4000);
 
         Ok(())
     }
