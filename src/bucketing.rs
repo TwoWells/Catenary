@@ -13,6 +13,11 @@
 
 use std::collections::BTreeMap;
 
+/// Minimum number of buckets the algorithm targets. Merge stops at this floor,
+/// and the trie expands until it reaches it. The actual count may be lower when
+/// the input has fewer distinct entries.
+const MIN_BUCKETS: usize = 10;
+
 /// A bucket produced by the bucketing algorithm.
 pub struct Bucket {
     /// The prefix pattern (e.g., `"test_mcp_*"`).
@@ -323,9 +328,10 @@ pub fn bucket_trie(input: &[BucketEntry], budget: usize) -> Vec<Bucket> {
     let mut buckets: Vec<(String, usize)> = Vec::new();
     expand_trie_node(&root, String::new(), &mut buckets, budget);
 
-    // Enforce minimum of 2 buckets by progressively expanding deeper.
+    // Enforce minimum bucket count by progressively expanding deeper.
+    let target = MIN_BUCKETS.min(input.len());
     let mut depth = 1;
-    while buckets.len() < 2 && input.len() >= 2 {
+    while buckets.len() < target {
         buckets.clear();
         force_expand_depth(&root, String::new(), &mut buckets, depth);
         // If expanding deeper didn't add any new buckets, the trie is
@@ -489,8 +495,9 @@ fn collapse_to_budget(buckets: &mut Vec<Bucket>, budget: usize) {
         }
     }
 
-    // Phase 2: merge bare handles by widening prefixes.
-    while rendered_size(buckets) > budget && buckets.len() > 1 {
+    // Phase 2: merge bare handles by widening prefixes. Stop at MIN_BUCKETS
+    // so the agent always has enough handles to navigate.
+    while rendered_size(buckets) > budget && buckets.len() > MIN_BUCKETS {
         merge_closest_pair(buckets);
     }
 }
@@ -805,9 +812,33 @@ mod tests {
     }
 
     #[test]
-    fn test_minimum_two_buckets() {
+    fn test_minimum_bucket_count() {
         // Adversarial: all strings same prefix, no separators.
-        let owned: Vec<String> = (0..10).map(|i| format!("x{i}")).collect();
+        // With 20 entries the trie should produce at least MIN_BUCKETS.
+        let owned: Vec<String> = (0..20).map(|i| format!("x{i:02}")).collect();
+        let input: Vec<BucketEntry> = owned
+            .iter()
+            .map(|v| BucketEntry {
+                value: v.clone(),
+                context: None,
+            })
+            .collect();
+        let buckets = bucket_trie(&input, 10_000);
+        assert!(
+            buckets.len() >= MIN_BUCKETS,
+            "trie must produce at least {MIN_BUCKETS} buckets, got {}: {:?}",
+            buckets.len(),
+            buckets
+                .iter()
+                .map(|b| (&b.pattern, b.count))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_minimum_bucket_count_small_input() {
+        // With fewer entries than MIN_BUCKETS, produce as many as we have.
+        let owned: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
         let input: Vec<BucketEntry> = owned
             .iter()
             .map(|v| BucketEntry {
@@ -818,7 +849,7 @@ mod tests {
         let buckets = bucket_trie(&input, 10_000);
         assert!(
             buckets.len() >= 2,
-            "trie must produce at least 2 buckets, got {}: {:?}",
+            "trie should still split small input, got {}: {:?}",
             buckets.len(),
             buckets
                 .iter()
@@ -905,13 +936,10 @@ mod tests {
 
     #[test]
     fn test_bare_handle_merging() {
-        // Many separator-based buckets with a tiny budget should merge bare
-        // handles by widening prefixes until output fits.
-        let owned: Vec<String> = (0..20)
-            .map(|i| format!("test_a_{i}"))
-            .chain((0..20).map(|i| format!("test_b_{i}")))
-            .chain((0..20).map(|i| format!("test_c_{i}")))
-            .chain((0..20).map(|i| format!("other_{i}")))
+        // Many separator-based buckets — budget too small for expanded
+        // entries but large enough that merging can reduce bare handles.
+        let owned: Vec<String> = ('a'..='z')
+            .flat_map(|c| (0..5).map(move |i| format!("grp_{c}_{i}")))
             .collect();
         let input: Vec<BucketEntry> = owned
             .iter()
@@ -920,15 +948,22 @@ mod tests {
                 context: None,
             })
             .collect();
-        // Budget so small that even bare handles don't fit — must merge.
-        let buckets = bucket(&input, 30, false);
-        // Should have merged down. The exact result depends on prefix
-        // structure, but rendered output must respect the budget or be at
-        // the floor of 1 bucket.
-        let size = rendered_size(&buckets);
+        // Budget allows bare handles but not expanded entries.
+        let buckets = bucket(&input, 200, false);
+        // All multi-entry buckets should be collapsed.
+        for b in &buckets {
+            if b.count > 1 {
+                assert!(
+                    b.entries.is_none(),
+                    "bucket {} should be a bare handle",
+                    b.pattern
+                );
+            }
+        }
+        // Should have merged some but stayed above MIN_BUCKETS floor.
         assert!(
-            size <= 30 || buckets.len() == 1,
-            "merging should bring output within budget or to 1 bucket, got size={size} buckets={}: {:?}",
+            buckets.len() >= MIN_BUCKETS,
+            "merging should stop at MIN_BUCKETS floor, got {}: {:?}",
             buckets.len(),
             buckets
                 .iter()
