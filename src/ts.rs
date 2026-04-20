@@ -6,8 +6,9 @@
 //! Provides [`TsIndex`], a SQLite-backed symbol index built from tree-sitter
 //! grammars. The index walks workspace files, parses them using installed
 //! grammars, and writes extracted symbols to the database. `build()` creates
-//! the initial index, `query()` reads it with regex filtering and lazy mtime
-//! staleness checks, and `update_file()` incrementally re-parses a single file.
+//! the initial index, `query()` reads it with regex filtering, and
+//! `update_file()` incrementally re-parses a single file. Callers are
+//! responsible for ensuring freshness via `update_file()` before querying.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -540,67 +541,17 @@ impl TsIndex {
     /// Query the index for symbols whose names match a regex pattern.
     ///
     /// If `files` is `Some`, only symbols from those files are returned.
-    /// Performs lazy mtime staleness checks: files in the result set whose
-    /// mtime has changed are re-parsed before returning final results.
+    /// This is a pure index read — callers are responsible for ensuring
+    /// freshness via `update_file()` before querying.
     ///
     /// # Errors
     ///
-    /// Returns an error if the regex is invalid, the database query fails,
-    /// or a stale file cannot be re-parsed.
+    /// Returns an error if the regex is invalid or the database query fails.
     pub fn query(
         &self,
         pattern: &str,
         files: Option<&[PathBuf]>,
     ) -> Result<Vec<(PathBuf, TsSymbol)>> {
-        // Run the initial query.
-        let mut results = self.run_symbol_query(pattern, files)?;
-
-        // Collect distinct file paths from results and check staleness.
-        let file_paths: HashSet<String> = results.iter().map(|(p, _)| p.clone()).collect();
-        let mut stale_files: Vec<PathBuf> = Vec::new();
-
-        for file_path in &file_paths {
-            let path = Path::new(file_path.as_str());
-            let current_mtime = file_mtime_ns(path);
-
-            let stored_mtime: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT mtime_ns FROM file_parse_state WHERE file_path = ?1",
-                    rusqlite::params![file_path],
-                    |row| row.get(0),
-                )
-                .ok();
-
-            if stored_mtime.is_none_or(|stored| current_mtime > stored) {
-                self.update_file(path)?;
-                stale_files.push(path.to_path_buf());
-            }
-        }
-
-        // If any files were re-parsed, re-run the query for those files
-        // and replace their entries in the results.
-        if !stale_files.is_empty() {
-            results.retain(|(p, _)| !stale_files.iter().any(|s| s.to_string_lossy() == *p));
-            let fresh = self.run_symbol_query(pattern, Some(&stale_files))?;
-            results.extend(fresh);
-        }
-
-        Ok(results
-            .into_iter()
-            .map(|(p, sym)| (PathBuf::from(p), sym))
-            .collect())
-    }
-
-    /// Execute the symbol query against the database.
-    ///
-    /// Internal helper shared by the initial query and the re-query after
-    /// stale file updates.
-    fn run_symbol_query(
-        &self,
-        pattern: &str,
-        files: Option<&[PathBuf]>,
-    ) -> Result<Vec<(String, TsSymbol)>> {
         let mut results = Vec::new();
 
         match files {
@@ -648,7 +599,10 @@ impl TsIndex {
             }
         }
 
-        Ok(results)
+        Ok(results
+            .into_iter()
+            .map(|(p, sym)| (PathBuf::from(p), sym))
+            .collect())
     }
 
     /// Map a database row to a `(file_path, TsSymbol)` pair.
@@ -1042,61 +996,30 @@ mod tests {
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
-    fn test_lazy_mtime_check() {
+    fn test_query_does_not_auto_refresh() {
         let (db_dir, setup_conn) = test_db();
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let file_path = workspace.path().join("test.mock");
-        std::fs::write(&file_path, "fn lazy_old").expect("write test file");
+        std::fs::write(&file_path, "fn original").expect("write test file");
 
         let db_path = db_dir.path().join("test.db");
         let index = build_index(workspace.path(), &db_path, &setup_conn);
 
-        // Modify the file without calling update_file — add a symbol.
-        // The pattern "lazy" matches both old and new symbols, so the
-        // initial query hits the file, triggering the mtime staleness
-        // check which re-parses and picks up the new symbol.
+        // Modify the file without calling update_file.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        std::fs::write(&file_path, "fn lazy_old\nfn lazy_new").expect("rewrite test file");
+        std::fs::write(&file_path, "fn original\nfn added").expect("rewrite test file");
 
-        let results = index.query("lazy", None).expect("lazy query");
-        let names: Vec<&str> = results.iter().map(|(_, s)| s.name.as_str()).collect();
-        assert_eq!(
-            results.len(),
-            2,
-            "lazy mtime check should find both symbols"
+        // query() is a pure index read — it should NOT see the new symbol.
+        let results = index.query("added", None).expect("query");
+        assert!(
+            results.is_empty(),
+            "query should not auto-refresh stale files"
         );
-        assert!(names.contains(&"lazy_old"));
-        assert!(names.contains(&"lazy_new"));
-    }
 
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_mtime_no_false_positive() {
-        let (db_dir, setup_conn) = test_db();
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        std::fs::write(workspace.path().join("test.mock"), "fn stable").expect("write test file");
-
-        let db_path = db_dir.path().join("test.db");
-        let index = build_index(workspace.path(), &db_path, &setup_conn);
-
-        // Read the stored mtime before query.
-        let mtime_before: i64 = setup_conn
-            .query_row("SELECT mtime_ns FROM file_parse_state LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .expect("read mtime");
-
-        // Query without modifying any files.
-        let results = index.query("stable", None).expect("query");
-        assert_eq!(results.len(), 1);
-
-        // Mtime should be unchanged (no re-parse occurred).
-        let mtime_after: i64 = setup_conn
-            .query_row("SELECT mtime_ns FROM file_parse_state LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .expect("read mtime after");
-        assert_eq!(mtime_before, mtime_after, "mtime should not change");
+        // Caller-driven freshness: update_file then re-query.
+        index.update_file(&file_path).expect("update_file");
+        let results = index.query("added", None).expect("query after update");
+        assert_eq!(results.len(), 1, "should find symbol after explicit update");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
