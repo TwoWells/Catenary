@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c48aea07.js";
+            window.path_to_searchindex_js = "../searchindex-7f2fd6a5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-fc1e27dc.js"></script>
@@ -209,12 +209,10 @@ servers = ["tsserver"]
 <li>Add a <code>jsconfig.json</code> to customize project settings</li>
 </ul>
 <h2 id="jsx--react"><a class="header" href="#jsx--react">JSX / React</a></h2>
-<p>JSX is handled automatically. Catenary ships a default <code>inherit</code> entry
-that routes <code>javascriptreact</code> to the <code>javascript</code> server — no extra
-config needed. To customize the variant independently:</p>
+<p>JSX is handled automatically. Configure <code>javascriptreact</code> with the
+same server to get full coverage for <code>.jsx</code> files:</p>
 <pre><code class="language-toml">[language.javascriptreact]
-inherit = "javascript"
-min_severity = "error"  # optional per-variant override
+servers = ["typescript-language-server"]
 </code></pre>
 <h2 id="links"><a class="header" href="#links">Links</a></h2>
 <ul>

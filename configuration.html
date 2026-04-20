@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c48aea07.js";
+            window.path_to_searchindex_js = "searchindex-7f2fd6a5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-fc1e27dc.js"></script>
@@ -184,11 +184,11 @@
 <p>Catenary loads configuration from multiple sources, in order of priority
 (last wins):</p>
 <ol>
-<li><strong>Defaults</strong>: <code>idle_timeout = 300</code>, <code>log_retention_days = 7</code>.</li>
+<li><strong>Defaults</strong>: <code>log_retention_days = 7</code>.</li>
 <li><strong>User config</strong>: <code>~/.config/catenary/config.toml</code>.</li>
 <li><strong>Project config</strong>: <code>.catenary.toml</code> in the current directory or any parent (searches upward).</li>
 <li><strong>Explicit file</strong>: <code>--config &lt;path&gt;</code>.</li>
-<li><strong>Environment variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_IDLE_TIMEOUT=600</code>). Use <code>__</code> for nested keys (e.g., <code>CATENARY_ICONS__PRESET=nerd</code>).</li>
+<li><strong>Environment variables</strong>: Prefixed with <code>CATENARY_</code> (e.g., <code>CATENARY_LOG_RETENTION_DAYS=30</code>). Use <code>__</code> for nested keys (e.g., <code>CATENARY_ICONS__PRESET=nerd</code>).</li>
 </ol>
 <h2 id="language-servers"><a class="header" href="#language-servers">Language Servers</a></h2>
 <p>Configuration uses two sections: <code>[server.*]</code> defines how to run a
@@ -201,9 +201,7 @@ args = ["arg1", "arg2"]
 servers = ["&lt;name&gt;"]
 </code></pre>
 <h3 id="example"><a class="header" href="#example">Example</a></h3>
-<pre><code class="language-toml">idle_timeout = 300
-
-[server.rust]
+<pre><code class="language-toml">[server.rust]
 command = "rust-analyzer"
 
 [server.rust.initialization_options]
@@ -404,7 +402,6 @@ If it starts with <code>#!</code>, the interpreter name is matched:</p>
 <tr><th>Option</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>idle_timeout</code></td><td><code>300</code></td><td>Seconds before auto-closing idle documents. <code>0</code> to disable.</td></tr>
 <tr><td><code>log_retention_days</code></td><td><code>7</code></td><td>Days to keep dead session data. <code>0</code> = remove on startup. <code>-1</code> = retain forever.</td></tr>
 </tbody>
 </table>
