@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use super::instance_key::InstanceKey;
 use super::params;
 use super::server::LspServer;
 use super::state::{ServerLifecycle, ServerStatus};
@@ -793,7 +794,7 @@ impl LspClient {
     }
 
     /// Returns detailed status for this server.
-    pub fn status(&self, language: String) -> ServerStatus {
+    pub fn status(&self, key: &InstanceKey) -> ServerStatus {
         let (title, message, percentage) = {
             let progress = self
                 .server
@@ -809,7 +810,13 @@ impl LspClient {
         };
 
         ServerStatus {
-            language,
+            language: key.language_id.clone(),
+            server_name: key.server.clone(),
+            scope_kind: key.scope.kind_str().to_string(),
+            scope_root: key
+                .scope
+                .root_path()
+                .map_or_else(String::new, |p| p.display().to_string()),
             state: self.lifecycle(),
             progress_title: title,
             progress_message: message,

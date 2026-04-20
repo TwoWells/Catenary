@@ -715,8 +715,8 @@ impl LspClientManager {
         let clients = self.clients.lock().await.clone();
         let mut statuses = Vec::new();
 
-        for (key, client_mutex) in clients {
-            let status = client_mutex.lock().await.status(key.language_id);
+        for (key, client_mutex) in &clients {
+            let status = client_mutex.lock().await.status(key);
             statuses.push(status);
         }
 
@@ -1810,6 +1810,85 @@ mod tests {
             Scope::Root(PathBuf::from("/tmp")),
             "/tmp instance should remain"
         );
+
+        Ok(())
+    }
+
+    // --- ServerStatus enrichment ---
+
+    #[tokio::test]
+    async fn test_server_status_enriched() -> Result<()> {
+        // status(&key) populates server_name, scope_kind, scope_root.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        let locked = client.lock().await;
+        let key = locked.server().key().expect("key should be set");
+        let status = locked.status(&key);
+        drop(locked);
+
+        assert_eq!(status.language, MOCK_LANG_A);
+        assert_eq!(status.server_name, format!("mockls-{MOCK_LANG_A}"));
+        assert_eq!(status.scope_kind, "root");
+        assert_eq!(status.scope_root, "/tmp");
+        assert_eq!(status.state.display_state(), "initializing");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_status_workspace_scope() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_workspace_folders_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        let locked = client.lock().await;
+        let key = locked.server().key().expect("key should be set");
+        let status = locked.status(&key);
+        drop(locked);
+
+        assert_eq!(status.scope_kind, "workspace");
+        assert!(
+            status.scope_root.is_empty(),
+            "workspace scope should have empty scope_root"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_all_server_status_multi_instance() -> Result<()> {
+        // Two instances of the same language produce two status entries
+        // with different scope info.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp", "/var"]),
+        );
+
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+        let _ = manager
+            .spawn(&server_name, MOCK_LANG_A, Path::new("/var"))
+            .await?;
+
+        let statuses = manager.all_server_status().await;
+        assert_eq!(statuses.len(), 2, "should have two status entries");
+
+        let roots: HashSet<String> = statuses.iter().map(|s| s.scope_root.clone()).collect();
+        assert!(roots.contains("/tmp"), "should include /tmp root");
+        assert!(roots.contains("/var"), "should include /var root");
+
+        for s in &statuses {
+            assert_eq!(s.language, MOCK_LANG_A);
+            assert_eq!(s.server_name, server_name);
+            assert_eq!(s.scope_kind, "root");
+        }
 
         Ok(())
     }

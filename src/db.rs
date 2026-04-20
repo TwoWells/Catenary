@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// Resolve the Catenary state directory.
 ///
@@ -130,6 +130,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 7 {
                 migrate_v6_to_v7(&conn)?;
             }
+            if version < 8 {
+                migrate_v7_to_v8(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -165,7 +168,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '7');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '8');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -217,10 +220,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id);
 
          CREATE TABLE IF NOT EXISTS language_servers (
-             session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-             name        TEXT NOT NULL,
-             state       TEXT NOT NULL,
-             PRIMARY KEY (session_id, name)
+             session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             language_id  TEXT NOT NULL,
+             server       TEXT NOT NULL,
+             scope_kind   TEXT NOT NULL,
+             scope_root   TEXT NOT NULL DEFAULT '',
+             state        TEXT NOT NULL,
+             PRIMARY KEY (session_id, language_id, server, scope_kind, scope_root)
          );
 
          CREATE TABLE IF NOT EXISTS filter_history (
@@ -469,6 +475,40 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 7 to 8.
+///
+/// Recreates the `language_servers` table with a wider primary key
+/// (`language_id`, `server`, `scope_kind`, `scope_root`) to support
+/// multiple instances per language (different servers, different scopes).
+///
+/// # Errors
+///
+/// Returns an error if the table recreation or version update fails.
+fn migrate_v7_to_v8(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         DROP TABLE IF EXISTS language_servers;
+
+         CREATE TABLE language_servers (
+             session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             language_id  TEXT NOT NULL,
+             server       TEXT NOT NULL,
+             scope_kind   TEXT NOT NULL,
+             scope_root   TEXT NOT NULL DEFAULT '',
+             state        TEXT NOT NULL,
+             PRIMARY KEY (session_id, language_id, server, scope_kind, scope_root)
+         );
+
+         UPDATE meta SET value = '8' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v7 to v8")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -558,7 +598,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 7, "schema version should be 7");
+        assert_eq!(version, 8, "schema version should be 8");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -795,7 +835,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 7, "schema version should be 7 after migration");
+        assert_eq!(version, 8, "schema version should be 8 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
@@ -836,7 +876,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 7, "schema version should be 7 after migration");
+        assert_eq!(version, 8, "schema version should be 8 after migration");
 
         // Verify client_session_id column exists by inserting a row that uses it.
         conn.execute(
@@ -888,7 +928,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 7, "schema version should be 7 after migration");
+        assert_eq!(version, 8, "schema version should be 8 after migration");
 
         assert!(
             table_exists(&conn, "messages"),
@@ -932,7 +972,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 7, "schema version should be 7 after migration");
+        assert_eq!(version, 8, "schema version should be 8 after migration");
 
         // Editing tables should be dropped by v6→v7
         assert!(
@@ -981,7 +1021,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 7, "schema version should be 7 after migration");
+        assert_eq!(version, 8, "schema version should be 8 after migration");
 
         assert!(
             !table_exists(&conn, "editing_state"),
@@ -991,5 +1031,117 @@ mod tests {
             !table_exists(&conn, "editing_files"),
             "editing_files should be dropped after v6→v7 migration"
         );
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_migrate_v7_to_v8() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        // Create a v7 database with old language_servers schema.
+        let conn = open_at(&path).expect("open_at failed");
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '7');
+             CREATE TABLE sessions (
+                 id             TEXT PRIMARY KEY,
+                 pid            INTEGER NOT NULL,
+                 display_name   TEXT NOT NULL,
+                 client_name    TEXT,
+                 client_version TEXT,
+                 client_session_id TEXT,
+                 started_at     TEXT NOT NULL,
+                 ended_at       TEXT,
+                 alive          INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE language_servers (
+                 session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 name        TEXT NOT NULL,
+                 state       TEXT NOT NULL,
+                 PRIMARY KEY (session_id, name)
+             );
+             INSERT INTO sessions (id, pid, display_name, started_at)
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
+             INSERT INTO language_servers (session_id, name, state)
+             VALUES ('s1', 'rust', 'ready');
+             COMMIT;",
+        )
+        .expect("failed to create v7 schema");
+        drop(conn);
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        let version = current_schema_version(&conn).expect("failed to read schema version");
+        assert_eq!(version, 8, "schema version should be 8 after migration");
+
+        // Old data should be gone (table was recreated).
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM language_servers", [], |row| {
+                row.get(0)
+            })
+            .expect("query language_servers count");
+        assert_eq!(count, 0, "old rows should be gone after table recreation");
+
+        // New schema should accept wider PK.
+        conn.execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES ('s1', 'rust', 'rust-analyzer', 'workspace', '', 'ready')",
+            [],
+        )
+        .expect("insert with new schema should succeed");
+
+        conn.execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES ('s1', 'rust', 'rust-analyzer', 'root', '/project', 'ready')",
+            [],
+        )
+        .expect("insert second instance with different scope should succeed");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_fresh_schema_has_new_language_servers() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        // Insert a session for FK.
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert session");
+
+        // Two instances of the same language with different scopes.
+        conn.execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES ('s1', 'rust', 'rust-analyzer', 'workspace', '', 'ready')",
+            [],
+        )
+        .expect("insert workspace instance");
+
+        conn.execute(
+            "INSERT INTO language_servers \
+             (session_id, language_id, server, scope_kind, scope_root, state) \
+             VALUES ('s1', 'rust', 'rust-analyzer', 'root', '/tmp', 'busy')",
+            [],
+        )
+        .expect("insert root instance");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM language_servers WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query count");
+        assert_eq!(count, 2, "should have two entries for same language");
     }
 }

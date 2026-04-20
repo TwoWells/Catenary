@@ -77,6 +77,13 @@ impl Serialize for ServerLifecycle {
 pub struct ServerStatus {
     /// The language ID this server handles.
     pub language: String,
+    /// Server name (binary / config entry name).
+    pub server_name: String,
+    /// Scope kind string ("workspace", "root", etc.).
+    pub scope_kind: String,
+    /// Scope root path (empty string for scopeless variants).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope_root: String,
     /// Current server lifecycle state.
     pub state: ServerLifecycle,
     /// Active progress title, if any.
