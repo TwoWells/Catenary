@@ -9,6 +9,60 @@
       "additionalProperties": {
         "$ref": "#/definitions/server_config"
       }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Per-tool configuration.",
+      "properties": {
+        "grep": {
+          "type": "object",
+          "description": "Grep tool configuration.",
+          "properties": {
+            "budget": {
+              "type": "integer",
+              "description": "Output budget in characters. Minimum: 2000.",
+              "default": 4000,
+              "minimum": 2000
+            }
+          }
+        },
+        "glob": {
+          "type": "object",
+          "description": "Glob tool configuration.",
+          "properties": {
+            "budget": {
+              "type": "integer",
+              "description": "Output budget in characters. Minimum: 1000.",
+              "default": 2000,
+              "minimum": 1000
+            },
+            "maps_threshold": {
+              "type": "integer",
+              "description": "Minimum line count for defensive maps.",
+              "default": 200,
+              "minimum": 1
+            },
+            "maps_deny": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Glob patterns excluded from defensive maps.",
+              "default": []
+            }
+          }
+        },
+        "sed": {
+          "type": "object",
+          "description": "Sed tool configuration.",
+          "properties": {
+            "budget": {
+              "type": "integer",
+              "description": "Output budget in characters. Minimum: 1000.",
+              "default": 4000,
+              "minimum": 1000
+            }
+          }
+        }
+      }
     }
   },
   "definitions": {

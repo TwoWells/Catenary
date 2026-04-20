@@ -96,6 +96,10 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
 
     config.apply_env_overrides();
 
+    if let Some(ref mut tools) = config.tools {
+        tools.clamp_budgets();
+    }
+
     let errors = config.validate();
     if !errors.is_empty() {
         bail!("Configuration errors:\n{}", errors.join("\n"));
@@ -233,6 +237,9 @@ pub(super) fn merge(config: &mut Config, other: Config) {
     }
     if other.tui.is_some() {
         config.tui = other.tui;
+    }
+    if other.tools.is_some() {
+        config.tools = other.tools;
     }
 }
 

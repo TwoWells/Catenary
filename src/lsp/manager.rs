@@ -916,6 +916,7 @@ mod tests {
             notifications: None,
             icons: None,
             tui: None,
+            tools: None,
         }
     }
 
@@ -961,6 +962,7 @@ mod tests {
             notifications: None,
             icons: None,
             tui: None,
+            tools: None,
         }
     }
 
@@ -994,6 +996,7 @@ mod tests {
             notifications: None,
             icons: None,
             tui: None,
+            tools: None,
         }
     }
 
@@ -1177,6 +1180,7 @@ mod tests {
             notifications: None,
             icons: None,
             tui: None,
+            tools: None,
         };
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));

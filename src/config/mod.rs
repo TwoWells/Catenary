@@ -104,6 +104,13 @@ pub struct Config {
     /// through to the earlier config layer.
     #[serde(default)]
     pub tui: Option<TuiConfig>,
+
+    /// Per-tool configuration (budgets, maps options, etc.).
+    ///
+    /// `None` when no source specified `[tools]`. Absent sections fall
+    /// through to the earlier config layer.
+    #[serde(default)]
+    pub tools: Option<ToolsConfig>,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -218,6 +225,110 @@ impl Default for TuiConfig {
     }
 }
 
+/// Per-tool configuration.
+///
+/// Configures output budgets and tool-specific options. Each tool has its
+/// own section under `[tools]`:
+///
+/// ```toml
+/// [tools.grep]
+/// budget = 4000
+///
+/// [tools.glob]
+/// budget = 2000
+/// maps_threshold = 200
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Grep tool configuration.
+    pub grep: GrepConfig,
+    /// Glob tool configuration.
+    pub glob: GlobConfig,
+    /// Sed tool configuration.
+    pub sed: SedConfig,
+}
+
+impl ToolsConfig {
+    /// Clamp budgets to their minimum values, warning on adjustment.
+    pub(crate) fn clamp_budgets(&mut self) {
+        if self.grep.budget < 2000 {
+            tracing::warn!(
+                budget = self.grep.budget,
+                min = 2000,
+                "grep budget below minimum, clamping to 2000",
+            );
+            self.grep.budget = 2000;
+        }
+        if self.glob.budget < 1000 {
+            tracing::warn!(
+                budget = self.glob.budget,
+                min = 1000,
+                "glob budget below minimum, clamping to 1000",
+            );
+            self.glob.budget = 1000;
+        }
+        if self.sed.budget < 1000 {
+            tracing::warn!(
+                budget = self.sed.budget,
+                min = 1000,
+                "sed budget below minimum, clamping to 1000",
+            );
+            self.sed.budget = 1000;
+        }
+    }
+}
+
+/// Grep tool configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GrepConfig {
+    /// Output budget in characters. Default: 4000, min: 2000.
+    pub budget: u32,
+}
+
+impl Default for GrepConfig {
+    fn default() -> Self {
+        Self { budget: 4000 }
+    }
+}
+
+/// Glob tool configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GlobConfig {
+    /// Output budget in characters. Default: 2000, min: 1000.
+    pub budget: u32,
+    /// Minimum line count for defensive maps. Default: 200.
+    pub maps_threshold: usize,
+    /// Glob patterns excluded from defensive maps (not from `into`).
+    pub maps_deny: Vec<String>,
+}
+
+impl Default for GlobConfig {
+    fn default() -> Self {
+        Self {
+            budget: 2000,
+            maps_threshold: 200,
+            maps_deny: Vec::new(),
+        }
+    }
+}
+
+/// Sed tool configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SedConfig {
+    /// Output budget in characters. Default: 4000, min: 1000.
+    pub budget: u32,
+}
+
+impl Default for SedConfig {
+    fn default() -> Self {
+        Self { budget: 4000 }
+    }
+}
+
 pub(crate) const fn default_log_retention_days() -> i64 {
     7
 }
@@ -300,6 +411,7 @@ impl Default for Config {
             notifications: None,
             icons: None,
             tui: None,
+            tools: None,
         }
     }
 }
@@ -1535,6 +1647,123 @@ extensions = ["xyz"]
         );
         // servers preserved (overlay had empty servers)
         assert_eq!(lc.servers, vec![ServerBinding::new("foo")]);
+
+        Ok(())
+    }
+
+    // --- Per-tool config (tools.*) ---
+
+    #[test]
+    fn test_default_budgets() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let tools = config.tools.unwrap_or_default();
+        assert_eq!(tools.grep.budget, 4000);
+        assert_eq!(tools.glob.budget, 2000);
+        assert_eq!(tools.sed.budget, 4000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_grep_budget() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[tools.grep]\nbudget = 8000\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.grep.budget, 8000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_minimum_grep_budget() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[tools.grep]\nbudget = 500\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.grep.budget, 2000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_minimum_glob_budget() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[tools.glob]\nbudget = 500\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.glob.budget, 1000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_glob_maps_threshold() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[tools.glob]\nmaps_threshold = 500\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.glob.maps_threshold, 500);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_glob_maps_deny() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[tools.glob]\nmaps_deny = [\"**/*.json\", \"**/fixtures/**\"]\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.glob.maps_deny.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_tools_section() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "log_retention_days = 14\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.tools.is_none());
+        let tools = config.tools.unwrap_or_default();
+        assert_eq!(tools.grep.budget, 4000);
+        assert_eq!(tools.glob.budget, 2000);
+        assert_eq!(tools.sed.budget, 4000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_partial_tools() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[tools.grep]\nbudget = 6000\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.grep.budget, 6000);
+        // glob and sed use defaults
+        assert_eq!(tools.glob.budget, 2000);
+        assert_eq!(tools.sed.budget, 4000);
 
         Ok(())
     }
