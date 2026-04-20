@@ -512,28 +512,64 @@ impl LspClientManager {
     /// Gets a client for a file path, detecting the language automatically.
     ///
     /// Uses [`FilesystemManager`] for language detection (extension, filename,
-    /// shebang). Falls back to the raw file extension as a direct config key
-    /// for custom or test languages (e.g., `.yX4Za` → config key `"yX4Za"`).
+    /// shebang) and [`FilesystemManager::resolve_root`] for scope-aware
+    /// instance lookup. Falls back to the raw file extension as a direct
+    /// config key for custom or test languages (e.g., `.yX4Za` → config key
+    /// `"yX4Za"`).
+    ///
+    /// Files outside all workspace roots return an explicit error — the agent
+    /// can use `/add-dir` to add the root. Tier 3 (single-file) support is
+    /// tracked in misc 28b.
     ///
     /// # Errors
     ///
-    /// Returns an error if no language can be detected for the path, or if
-    /// the detected language has no configured server, or if the server
-    /// fails to spawn.
+    /// Returns an error if:
+    /// - No language can be detected for the path.
+    /// - The file is outside all workspace roots.
+    /// - The detected language has no configured server.
+    /// - The server fails to spawn.
     pub async fn get_client(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
-        // Primary: use FilesystemManager for language detection
-        if let Some(lang_id) = self.fs.language_id(path)
-            && let Ok(client) = self.ensure_server_for_language(&lang_id).await
+        // Detect language: primary (FilesystemManager) then fallback (raw extension).
+        let lang_id = self
+            .fs
+            .language_id(path)
+            .or_else(|| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| anyhow!("No LSP server configured for {}", path.display()))?;
+
+        // Resolve owning workspace root.
+        let root = self
+            .fs
+            .resolve_root(path)
+            .ok_or_else(|| anyhow!("File outside all workspace roots: {}", path.display()))?;
+
+        // Look up first server binding for the language.
+        let lang_config = self
+            .config
+            .resolve_language(&lang_id)
+            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang_id}'"))?;
+        let server_name = &lang_config
+            .servers
+            .first()
+            .ok_or_else(|| anyhow!("No servers configured for language '{lang_id}'"))?
+            .name;
+
+        // Try existing instances: workspace-scoped first, then root-scoped.
         {
-            return Ok(client);
+            let clients = self.clients.lock().await;
+            if let Some(found) = find_instance(&clients, &lang_id, server_name, &root) {
+                if found.lock().await.is_alive() {
+                    return Ok(found);
+                }
+                anyhow::bail!("LSP server '{server_name}' ({lang_id}) is dead");
+            }
         }
 
-        // Fallback: try file extension as direct config key (custom/test languages)
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or_else(|| anyhow!("No LSP server configured for {}", path.display()))?;
-        self.ensure_server_for_language(ext).await
+        // No instance found — spawn via ensure_server.
+        self.ensure_server(&lang_id, server_name, &root).await
     }
 
     /// Closes a document previously opened via [`ensure_document_open`](Self::ensure_document_open).
@@ -611,13 +647,16 @@ impl LspClientManager {
     ///
     /// Used by workspace-wide tools (grep, glob) to discover languages added
     /// mid-session. For each path, detects the language via
-    /// [`FilesystemManager`]. Only spawns servers for configured languages
-    /// not already active. Servers that fail to spawn are logged and skipped.
+    /// [`FilesystemManager`] and resolves the owning root. Only spawns
+    /// servers for configured languages that don't already have an instance
+    /// covering the file's root. Unrooted files are skipped. Servers that
+    /// fail to spawn are logged and skipped.
     pub async fn ensure_clients_for_paths(&self, paths: &[PathBuf]) {
         let configured_keys: HashSet<&str> =
             self.config.language.keys().map(String::as_str).collect();
 
-        let mut to_spawn: HashSet<String> = HashSet::new();
+        // Collect (language, server_name, root) triples that need spawning.
+        let mut to_spawn: HashSet<(String, String, PathBuf)> = HashSet::new();
 
         {
             let active = self.clients.lock().await;
@@ -628,11 +667,26 @@ impl LspClientManager {
                         .map(str::to_string)
                 });
 
-                if let Some(lang) = lang
-                    && configured_keys.contains(lang.as_str())
-                    && !active.keys().any(|k| k.language_id == lang)
-                {
-                    to_spawn.insert(lang);
+                let Some(lang) = lang else { continue };
+                if !configured_keys.contains(lang.as_str()) {
+                    continue;
+                }
+
+                // Skip unrooted files.
+                let Some(root) = self.fs.resolve_root(path) else {
+                    continue;
+                };
+
+                let Some(lang_config) = self.config.resolve_language(&lang) else {
+                    continue;
+                };
+                let Some(binding) = lang_config.servers.first() else {
+                    continue;
+                };
+
+                // Check if a matching instance already exists for this root.
+                if find_instance(&active, &lang, &binding.name, &root).is_none() {
+                    to_spawn.insert((lang, binding.name.clone(), root));
                 }
             }
         }
@@ -641,12 +695,13 @@ impl LspClientManager {
             return;
         }
 
-        let mut sorted: Vec<&str> = to_spawn.iter().map(String::as_str).collect();
+        let mut sorted: Vec<&str> = to_spawn.iter().map(|(l, _, _)| l.as_str()).collect();
         sorted.sort_unstable();
+        sorted.dedup();
         info!("Mid-session server spawn for: {}", sorted.join(", "));
 
-        for lang in &to_spawn {
-            if let Err(e) = self.ensure_server_for_language(lang).await {
+        for (lang, server_name, root) in &to_spawn {
+            if let Err(e) = self.ensure_server(lang, server_name, root).await {
                 warn!(
                     source = "lsp.lifecycle",
                     language = lang.as_str(),
@@ -851,6 +906,12 @@ mod tests {
 
     fn test_fs() -> Arc<FilesystemManager> {
         Arc::new(FilesystemManager::new())
+    }
+
+    fn test_fs_with_roots(roots: &[&str]) -> Arc<FilesystemManager> {
+        let fs = Arc::new(FilesystemManager::new());
+        fs.set_roots(roots.iter().map(PathBuf::from).collect());
+        fs
     }
 
     fn test_config() -> Config {
@@ -1185,7 +1246,7 @@ mod tests {
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         assert!(manager.clients().await.is_empty());
@@ -1207,7 +1268,7 @@ mod tests {
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         // Pre-spawn the server
@@ -1232,7 +1293,7 @@ mod tests {
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         // .xyz has no configured server — should be silently skipped
@@ -1252,7 +1313,7 @@ mod tests {
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         // A file with the mock language extension should resolve to the mock server
@@ -1268,7 +1329,7 @@ mod tests {
             mockls_config(),
             vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         // A file with an unknown extension and no config key should error
@@ -1278,20 +1339,192 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_document_open_sends_did_open() -> Result<()> {
-        let manager = LspClientManager::new(
-            mockls_config(),
-            vec![PathBuf::from("/tmp")],
-            test_logging(),
-            test_fs(),
-        );
-
         let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let fs = test_fs_with_roots(&[]);
+        fs.set_roots(vec![root.clone()]);
+
+        let manager = LspClientManager::new(mockls_config(), vec![root], test_logging(), fs);
+
         let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
         std::fs::write(&path, "content").expect("write");
 
         let (uri, client_mutex) = manager.ensure_document_open(&path, None).await?;
         assert!(uri.starts_with("file://"));
         assert!(client_mutex.lock().await.is_alive());
+        Ok(())
+    }
+
+    // --- Scope-aware get_client tests ---
+
+    #[tokio::test]
+    async fn test_get_client_workspace_scope() -> Result<()> {
+        // File in root resolves to Scope::Workspace client when server
+        // supports workspace folders.
+        let manager = LspClientManager::new(
+            mockls_workspace_folders_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let client = manager.get_client(&path).await?;
+        let key = client
+            .lock()
+            .await
+            .server()
+            .key()
+            .expect("key should be set");
+        assert_eq!(key.scope, Scope::Workspace);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_client_root_scope() -> Result<()> {
+        // File in root resolves to Scope::Root(root) client when server
+        // is legacy (no workspace folder support).
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let client = manager.get_client(&path).await?;
+        let key = client
+            .lock()
+            .await
+            .server()
+            .key()
+            .expect("key should be set");
+        assert_eq!(key.scope, Scope::Root(PathBuf::from("/tmp")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_client_multi_root_legacy() -> Result<()> {
+        // File in root A resolves to Scope::Root(A) instance,
+        // file in root B resolves to Scope::Root(B) instance.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp"), PathBuf::from("/var")],
+            test_logging(),
+            test_fs_with_roots(&["/tmp", "/var"]),
+        );
+
+        let path_a = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let client_a = manager.get_client(&path_a).await?;
+        let key_a = client_a
+            .lock()
+            .await
+            .server()
+            .key()
+            .expect("key should be set");
+        assert_eq!(key_a.scope, Scope::Root(PathBuf::from("/tmp")));
+
+        let path_b = PathBuf::from(format!("/var/test.{MOCK_LANG_A}"));
+        let client_b = manager.get_client(&path_b).await?;
+        let key_b = client_b
+            .lock()
+            .await
+            .server()
+            .key()
+            .expect("key should be set");
+        assert_eq!(key_b.scope, Scope::Root(PathBuf::from("/var")));
+
+        // Different Arc instances for different roots.
+        assert!(!Arc::ptr_eq(&client_a, &client_b));
+        assert_eq!(manager.clients().await.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_client_unrooted_errors() {
+        // File outside all roots returns error.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let err_msg = manager
+            .get_client(Path::new(&format!("/other/test.{MOCK_LANG_A}")))
+            .await
+            .err()
+            .expect("should error for unrooted file")
+            .to_string();
+        assert!(
+            err_msg.contains("outside all workspace roots"),
+            "Error should mention workspace roots, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_client_spawns_on_miss() -> Result<()> {
+        // First call for a language in a root spawns via ensure_server.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        assert!(manager.clients().await.is_empty());
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let client = manager.get_client(&path).await?;
+        assert!(client.lock().await.is_alive());
+        assert_eq!(manager.clients().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_client_extension_fallback() -> Result<()> {
+        // Custom language detected via extension-as-config-key still works.
+        // The mock language extension IS the config key (MOCK_LANG_A).
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        // FilesystemManager won't know this extension, but the extension
+        // fallback in get_client maps it to the config key.
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let client = manager.get_client(&path).await?;
+        assert!(client.lock().await.is_alive());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clients_for_paths_scope_aware() -> Result<()> {
+        // Spawns instances per root, not per language.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp"), PathBuf::from("/var")],
+            test_logging(),
+            test_fs_with_roots(&["/tmp", "/var"]),
+        );
+
+        assert!(manager.clients().await.is_empty());
+
+        // Paths in two different roots should spawn two instances.
+        let paths = vec![
+            PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}")),
+            PathBuf::from(format!("/var/test.{MOCK_LANG_A}")),
+        ];
+        manager.ensure_clients_for_paths(&paths).await;
+
+        let clients = manager.clients().await;
+        assert_eq!(
+            count_scope(&clients, MOCK_LANG_A, "root"),
+            2,
+            "Should have two root-scoped instances"
+        );
         Ok(())
     }
 
