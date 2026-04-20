@@ -112,12 +112,39 @@ pub fn bucket_separators(input: &[BucketEntry], budget: usize) -> Vec<Bucket> {
 }
 
 /// Group input entries by the longest common prefix up to a separator boundary.
+///
+/// Sort-based O(n log n): sort entries, compare adjacent pairs to find the
+/// longest shared separator-boundary prefix, then group by that prefix.
 fn group_by_separator_prefix(input: &[BucketEntry]) -> BTreeMap<String, Vec<usize>> {
-    let mut prefix_map: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    // Build (value, original_index) pairs and sort by value.
+    let mut sorted: Vec<(usize, &str)> = input
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i, e.value.as_str()))
+        .collect();
+    sorted.sort_by(|a, b| a.1.cmp(b.1));
 
-    for (i, entry) in input.iter().enumerate() {
-        let prefix = longest_separator_prefix(&entry.value, input);
-        prefix_map.entry(prefix).or_default().push(i);
+    // For each entry, find the longest separator-boundary prefix shared with
+    // either sorted neighbor. In sorted order, shared prefixes cluster.
+    let mut prefixes: Vec<(usize, String)> = Vec::with_capacity(sorted.len());
+    for (pos, &(idx, value)) in sorted.iter().enumerate() {
+        let left = if pos > 0 {
+            Some(sorted[pos - 1].1)
+        } else {
+            None
+        };
+        let right = if pos + 1 < sorted.len() {
+            Some(sorted[pos + 1].1)
+        } else {
+            None
+        };
+        let prefix = longest_neighbor_separator_prefix(value, left, right);
+        prefixes.push((idx, prefix));
+    }
+
+    let mut prefix_map: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (idx, prefix) in prefixes {
+        prefix_map.entry(prefix).or_default().push(idx);
     }
 
     prefix_map
@@ -139,9 +166,14 @@ fn group_by_separator_prefix_depth(
     prefix_map
 }
 
-/// Find the longest prefix of `value` up to a separator boundary that is shared
-/// with at least one other entry in `input`.
-fn longest_separator_prefix(value: &str, input: &[BucketEntry]) -> String {
+/// Find the longest separator-boundary prefix of `value` shared with either
+/// sorted neighbor. Only needs to check left and right because sorted order
+/// guarantees that the longest shared prefix is with an adjacent entry.
+fn longest_neighbor_separator_prefix(
+    value: &str,
+    left: Option<&str>,
+    right: Option<&str>,
+) -> String {
     let sep_positions: Vec<usize> = value
         .char_indices()
         .filter(|(_, c)| SEPARATORS.contains(c))
@@ -151,11 +183,9 @@ fn longest_separator_prefix(value: &str, input: &[BucketEntry]) -> String {
     // Try from the deepest separator boundary backward.
     for &pos in sep_positions.iter().rev() {
         let candidate = &value[..=pos];
-        let matches = input
-            .iter()
-            .filter(|e| e.value.starts_with(candidate))
-            .count();
-        if matches > 1 {
+        let shared = left.is_some_and(|l| l.starts_with(candidate))
+            || right.is_some_and(|r| r.starts_with(candidate));
+        if shared {
             return candidate.to_owned();
         }
     }
@@ -439,12 +469,12 @@ fn rendered_size_estimate(buckets: &[(String, usize)]) -> usize {
 // Collapse / degrade
 // ---------------------------------------------------------------------------
 
-/// When total rendered output exceeds budget, collapse expanded buckets
-/// (smallest first) to bare handles until it fits.
-fn collapse_to_budget(buckets: &mut [Bucket], budget: usize) {
-    // Iteratively collapse the smallest expanded bucket until we fit.
+/// When total rendered output exceeds budget, first collapse expanded buckets
+/// (smallest first) to bare handles, then merge bare handles by widening
+/// prefixes until output fits.
+fn collapse_to_budget(buckets: &mut Vec<Bucket>, budget: usize) {
+    // Phase 1: collapse expanded buckets to bare handles.
     while rendered_size(buckets) > budget {
-        // Find the expanded bucket with the smallest count.
         let smallest = buckets
             .iter()
             .enumerate()
@@ -455,10 +485,58 @@ fn collapse_to_budget(buckets: &mut [Bucket], budget: usize) {
         if let Some(i) = smallest {
             buckets[i].entries = None;
         } else {
-            // All buckets are already bare handles. Nothing more to collapse.
             break;
         }
     }
+
+    // Phase 2: merge bare handles by widening prefixes.
+    while rendered_size(buckets) > budget && buckets.len() > 1 {
+        merge_closest_pair(buckets);
+    }
+}
+
+/// Find the pair of adjacent buckets (sorted by pattern) with the longest
+/// shared prefix and merge them into one wider bucket.
+fn merge_closest_pair(buckets: &mut Vec<Bucket>) {
+    if buckets.len() < 2 {
+        return;
+    }
+
+    // Find the adjacent pair with the longest shared prefix.
+    let mut best_idx = 0;
+    let mut best_shared = 0;
+    for i in 0..buckets.len() - 1 {
+        let a = buckets[i].pattern.trim_end_matches('*');
+        let b = buckets[i + 1].pattern.trim_end_matches('*');
+        let shared = shared_prefix_len(a, b);
+        if shared > best_shared {
+            best_shared = shared;
+            best_idx = i;
+        }
+    }
+
+    // Merge buckets[best_idx] and buckets[best_idx + 1].
+    let a_prefix = buckets[best_idx].pattern.trim_end_matches('*');
+    let b_prefix = buckets[best_idx + 1].pattern.trim_end_matches('*');
+    let common = &a_prefix[..shared_prefix_len(a_prefix, b_prefix)];
+    let merged_pattern = if common.is_empty() {
+        "*".to_owned()
+    } else {
+        format!("{common}*")
+    };
+    let merged_count = buckets[best_idx].count + buckets[best_idx + 1].count;
+
+    buckets[best_idx] = Bucket {
+        pattern: merged_pattern,
+        count: merged_count,
+        entries: None,
+    };
+    buckets.remove(best_idx + 1);
+}
+
+/// Length of the shared byte prefix between two strings.
+fn shared_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +895,40 @@ mod tests {
         assert!(
             buckets.len() >= 2,
             "adversarial long prefixes should produce at least 2 buckets, got {}: {:?}",
+            buckets.len(),
+            buckets
+                .iter()
+                .map(|b| (&b.pattern, b.count))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_bare_handle_merging() {
+        // Many separator-based buckets with a tiny budget should merge bare
+        // handles by widening prefixes until output fits.
+        let owned: Vec<String> = (0..20)
+            .map(|i| format!("test_a_{i}"))
+            .chain((0..20).map(|i| format!("test_b_{i}")))
+            .chain((0..20).map(|i| format!("test_c_{i}")))
+            .chain((0..20).map(|i| format!("other_{i}")))
+            .collect();
+        let input: Vec<BucketEntry> = owned
+            .iter()
+            .map(|v| BucketEntry {
+                value: v.clone(),
+                context: None,
+            })
+            .collect();
+        // Budget so small that even bare handles don't fit — must merge.
+        let buckets = bucket(&input, 30, false);
+        // Should have merged down. The exact result depends on prefix
+        // structure, but rendered output must respect the budget or be at
+        // the floor of 1 bucket.
+        let size = rendered_size(&buckets);
+        assert!(
+            size <= 30 || buckets.len() == 1,
+            "merging should bring output within budget or to 1 bucket, got size={size} buckets={}: {:?}",
             buckets.len(),
             buckets
                 .iter()
