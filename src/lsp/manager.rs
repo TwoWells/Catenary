@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{FileChange, GlobPattern, WatchKind};
+use crate::lsp::instance_key::{InstanceKey, Scope};
 use crate::lsp::state::ServerStatus;
 
 /// Filters filesystem changes against a server's watcher registrations.
@@ -42,6 +43,27 @@ fn match_file_changes(
         .collect()
 }
 
+/// Looks up an existing client instance by trying both `Scope::Workspace`
+/// and `Scope::Root(root)` keys. Returns `None` if no instance matches.
+fn find_instance(
+    clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>,
+    lang: &str,
+    server_name: &str,
+    root: &Path,
+) -> Option<Arc<Mutex<LspClient>>> {
+    let workspace_key =
+        InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::Workspace);
+    if let Some(client) = clients.get(&workspace_key) {
+        return Some(client.clone());
+    }
+    let root_key = InstanceKey::new(
+        lang.to_string(),
+        server_name.to_string(),
+        Scope::Root(root.to_path_buf()),
+    );
+    clients.get(&root_key).cloned()
+}
+
 /// Manages the lifecycle of LSP clients, document state, and language detection.
 ///
 /// Single authority for LSP server spawning, caching, shutdown, and document
@@ -50,7 +72,7 @@ fn match_file_changes(
 pub struct LspClientManager {
     config: Config,
     roots: Mutex<Vec<PathBuf>>,
-    clients: Mutex<HashMap<String, Arc<Mutex<LspClient>>>>,
+    clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
     logging: LoggingServer,
     fs: Arc<FilesystemManager>,
     doc_manager: Mutex<DocumentManager>,
@@ -112,7 +134,7 @@ impl LspClientManager {
         info!("Detected languages in workspace: {}", sorted.join(", "));
 
         for lang in &relevant {
-            if let Err(e) = self.get_or_spawn(lang).await {
+            if let Err(e) = self.ensure_server_for_language(lang).await {
                 warn!(
                     source = "lsp.lifecycle",
                     language = lang.as_str(),
@@ -145,7 +167,7 @@ impl LspClientManager {
         // restart those that don't.
         let clients = self.clients.lock().await.clone();
         let mut to_restart = Vec::new();
-        for (lang, client_mutex) in &clients {
+        for (key, client_mutex) in &clients {
             let client = client_mutex.lock().await;
             if !client.is_alive() {
                 continue;
@@ -157,20 +179,20 @@ impl LspClientManager {
                 {
                     info!(
                         "Failed to notify {} server about removed workspace folder: {}",
-                        lang, e
+                        key.language_id, e
                     );
                 }
             } else {
-                to_restart.push(lang.clone());
+                to_restart.push(key.clone());
             }
         }
 
-        for lang in &to_restart {
+        for key in &to_restart {
             info!(
                 "{} server does not support workspace folder changes, restarting",
-                lang
+                key.language_id
             );
-            self.shutdown_client(lang).await;
+            self.shutdown_instance(key).await;
         }
 
         Ok(())
@@ -249,7 +271,7 @@ impl LspClientManager {
         // restart those that don't.
         let clients = self.clients.lock().await.clone();
         let mut to_restart = Vec::new();
-        for (lang, client_mutex) in &clients {
+        for (key, client_mutex) in &clients {
             let client = client_mutex.lock().await;
             if !client.is_alive() {
                 continue;
@@ -261,74 +283,77 @@ impl LspClientManager {
                 {
                     info!(
                         "Failed to notify {} server about workspace folder changes: {}",
-                        lang, e
+                        key.language_id, e
                     );
                 }
             } else {
-                to_restart.push(lang.clone());
+                to_restart.push(key.clone());
             }
         }
 
-        for lang in &to_restart {
+        for key in &to_restart {
             info!(
                 "{} server does not support workspace folder changes, restarting",
-                lang
+                key.language_id
             );
-            self.shutdown_client(lang).await;
+            self.shutdown_instance(key).await;
         }
 
         Ok(())
     }
 
-    /// Gets or spawns a client for the given language key.
+    /// Pure map lookup by key.
+    #[allow(dead_code, reason = "public API for Phase 1c dispatch")]
+    async fn get(&self, key: &InstanceKey) -> Option<Arc<Mutex<LspClient>>> {
+        self.clients.lock().await.get(key).cloned()
+    }
+
+    /// Spawns a server process, runs `initialize`, constructs the final
+    /// `InstanceKey` from discovered capabilities, and inserts into the
+    /// clients map.
     ///
-    /// Dead clients are left in the map as tombstones — a server that
-    /// crashes will not be restarted. Intentional restarts (e.g. after
-    /// `sync_roots`) go through [`Self::shutdown_client`] which removes the
-    /// entry so a fresh spawn can occur.
+    /// Uses capability-driven scope: servers that advertise workspace
+    /// folder support get `Scope::Workspace`; others get
+    /// `Scope::Root(root)`.
+    ///
+    /// Holds the clients lock across the entire spawn+init sequence to
+    /// prevent double-spawns. Pre-fetches roots before acquiring the
+    /// clients lock to avoid lock ordering issues.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The server previously died (tombstone).
-    /// - No LSP server is configured for the language.
-    /// - The server fails to spawn.
-    /// - The server fails to initialize.
-    pub async fn get_or_spawn(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
-        let lang_config = self
-            .config
-            .resolve_language(lang)
-            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang}'"))?;
-
-        // Check if a client already exists
-        if let Some(client) = self.clients.lock().await.get(lang) {
-            if client.lock().await.is_alive() {
-                return Ok(client.clone());
-            }
-            anyhow::bail!("LSP server for '{lang}' is dead");
-        }
-
-        let mut clients = self.clients.lock().await;
-
-        // Double-check after acquiring write lock
-        if let Some(client) = clients.get(lang) {
-            if client.lock().await.is_alive() {
-                return Ok(client.clone());
-            }
-            anyhow::bail!("LSP server for '{lang}' is dead");
-        }
-
-        let server_name = &lang_config
-            .servers
-            .first()
-            .ok_or_else(|| anyhow!("No servers configured for language '{lang}'"))?
-            .name;
-
+    /// Returns an error if the server fails to spawn or initialize.
+    async fn spawn(
+        &self,
+        server_name: &str,
+        lang: &str,
+        root: &Path,
+    ) -> Result<(InstanceKey, Arc<Mutex<LspClient>>)> {
         let server_def = self
             .config
             .server
             .get(server_name)
             .ok_or_else(|| anyhow!("Server '{server_name}' not found in [server.*] config"))?;
+
+        // Pre-fetch roots before acquiring clients lock.
+        let roots = self.roots.lock().await.clone();
+
+        let mut clients = self.clients.lock().await;
+
+        // Double-check: another task may have spawned this server
+        // while we waited.
+        if let Some(found) = find_instance(&clients, lang, server_name, root) {
+            if found.lock().await.is_alive() {
+                let key = found
+                    .lock()
+                    .await
+                    .server()
+                    .key()
+                    .ok_or_else(|| anyhow!("Existing server missing instance key"))?;
+                return Ok((key, found));
+            }
+            anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
+        }
 
         info!(
             "Spawning LSP server for {}: {} {}",
@@ -351,17 +376,102 @@ impl LspClientManager {
             server_def.settings.clone(),
         )?;
 
-        // Initialize
-        let roots = self.roots.lock().await.clone();
         client
             .initialize(&roots, server_def.initialization_options.clone())
             .await?;
 
+        // Determine scope from capabilities (Option B from §16).
+        let scope = if client.supports_workspace_folders() {
+            Scope::Workspace
+        } else {
+            Scope::Root(root.to_path_buf())
+        };
+        client.server().set_scope(scope);
+
+        let key = client
+            .server()
+            .key()
+            .ok_or_else(|| anyhow!("Failed to construct instance key after initialization"))?;
+
         let client_mutex = Arc::new(Mutex::new(client));
-        clients.insert(lang.to_string(), client_mutex.clone());
+        clients.insert(key.clone(), client_mutex.clone());
         drop(clients);
 
-        Ok(client_mutex)
+        Ok((key, client_mutex))
+    }
+
+    /// Get-then-spawn composition.
+    ///
+    /// Looks up an existing instance by trying both `Scope::Workspace` and
+    /// `Scope::Root(root)` keys. On miss, calls [`Self::spawn`]. Dead
+    /// servers are left as tombstones — a server that crashes will not be
+    /// restarted. Intentional restarts (e.g. after `sync_roots`) go through
+    /// [`Self::shutdown_instance`] which removes the entry so a fresh spawn
+    /// can occur.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The server previously died (tombstone).
+    /// - The server definition is missing from config.
+    /// - The server fails to spawn or initialize.
+    async fn ensure_server(
+        &self,
+        lang: &str,
+        server_name: &str,
+        root: &Path,
+    ) -> Result<Arc<Mutex<LspClient>>> {
+        // Fast path: check both possible scope keys.
+        {
+            let clients = self.clients.lock().await;
+            if let Some(found) = find_instance(&clients, lang, server_name, root) {
+                if found.lock().await.is_alive() {
+                    return Ok(found);
+                }
+                anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
+            }
+        }
+
+        // Miss — spawn (spawn handles its own double-check).
+        let (_key, client) = self.spawn(server_name, lang, root).await?;
+        Ok(client)
+    }
+
+    /// Ensures a server is running for the given language.
+    ///
+    /// Uses the first server from the language's binding list and spawns
+    /// with the first workspace root. Single-server-per-language convenience
+    /// — Phase 1c callers use [`Self::ensure_server`] directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No LSP server is configured for the language.
+    /// - No servers are listed in the language binding.
+    /// - No workspace roots are available.
+    /// - The server previously died (tombstone).
+    /// - The server fails to spawn or initialize.
+    pub async fn ensure_server_for_language(&self, lang: &str) -> Result<Arc<Mutex<LspClient>>> {
+        let lang_config = self
+            .config
+            .resolve_language(lang)
+            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang}'"))?;
+
+        let server_name = &lang_config
+            .servers
+            .first()
+            .ok_or_else(|| anyhow!("No servers configured for language '{lang}'"))?
+            .name;
+
+        let root = self
+            .roots
+            .lock()
+            .await
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("No workspace roots available for spawning '{lang}'"))?;
+
+        self.ensure_server(lang, server_name, &root).await
     }
 
     /// Gets a client for a file path, detecting the language automatically.
@@ -378,7 +488,7 @@ impl LspClientManager {
     pub async fn get_client(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
         // Primary: use FilesystemManager for language detection
         if let Some(lang_id) = self.fs.language_id(path)
-            && let Ok(client) = self.get_or_spawn(&lang_id).await
+            && let Ok(client) = self.ensure_server_for_language(&lang_id).await
         {
             return Ok(client);
         }
@@ -388,7 +498,7 @@ impl LspClientManager {
             .extension()
             .and_then(|e| e.to_str())
             .ok_or_else(|| anyhow!("No LSP server configured for {}", path.display()))?;
-        self.get_or_spawn(ext).await
+        self.ensure_server_for_language(ext).await
     }
 
     /// Closes a document previously opened via [`ensure_document_open`](Self::ensure_document_open).
@@ -477,17 +587,17 @@ impl LspClientManager {
         {
             let active = self.clients.lock().await;
             for path in paths {
-                let key = self.fs.language_id(path).or_else(|| {
+                let lang = self.fs.language_id(path).or_else(|| {
                     path.extension()
                         .and_then(|e| e.to_str())
                         .map(str::to_string)
                 });
 
-                if let Some(key) = key
-                    && configured_keys.contains(key.as_str())
-                    && !active.contains_key(&key)
+                if let Some(lang) = lang
+                    && configured_keys.contains(lang.as_str())
+                    && !active.keys().any(|k| k.language_id == lang)
                 {
-                    to_spawn.insert(key);
+                    to_spawn.insert(lang);
                 }
             }
         }
@@ -501,7 +611,7 @@ impl LspClientManager {
         info!("Mid-session server spawn for: {}", sorted.join(", "));
 
         for lang in &to_spawn {
-            if let Err(e) = self.get_or_spawn(lang).await {
+            if let Err(e) = self.ensure_server_for_language(lang).await {
                 warn!(
                     source = "lsp.lifecycle",
                     language = lang.as_str(),
@@ -512,7 +622,7 @@ impl LspClientManager {
     }
 
     /// Returns a snapshot of all clients (including dead ones).
-    pub async fn clients(&self) -> HashMap<String, Arc<Mutex<LspClient>>> {
+    pub async fn clients(&self) -> HashMap<InstanceKey, Arc<Mutex<LspClient>>> {
         self.clients.lock().await.clone()
     }
 
@@ -521,24 +631,24 @@ impl LspClientManager {
         let clients = self.clients.lock().await.clone();
         let mut statuses = Vec::new();
 
-        for (lang, client_mutex) in clients {
-            let status = client_mutex.lock().await.status(lang);
+        for (key, client_mutex) in clients {
+            let status = client_mutex.lock().await.status(key.language_id);
             statuses.push(status);
         }
 
         statuses
     }
 
-    /// Shuts down a specific client if it exists.
-    pub async fn shutdown_client(&self, lang: &str) {
+    /// Shuts down a specific server instance if it exists.
+    pub async fn shutdown_instance(&self, key: &InstanceKey) {
         let mut clients = self.clients.lock().await;
-        if let Some(client_mutex) = clients.remove(lang) {
-            info!("Shutting down idle LSP server for {}", lang);
+        if let Some(client_mutex) = clients.remove(key) {
+            info!("Shutting down LSP server instance {}", key);
             let mut client = client_mutex.lock().await;
             if client.is_alive()
                 && let Err(e) = client.shutdown().await
             {
-                info!("Failed to shutdown LSP server for {}: {}", lang, e);
+                info!("Failed to shutdown LSP server instance {}: {}", key, e);
             }
         }
     }
@@ -558,7 +668,7 @@ impl LspClientManager {
         let clients = self.clients.lock().await.clone();
 
         let mut notified = 0u32;
-        for (lang, client_mutex) in &clients {
+        for (key, client_mutex) in &clients {
             let client = client_mutex.lock().await;
             if !client.is_alive() {
                 continue;
@@ -576,7 +686,7 @@ impl LspClientManager {
 
             let refs: Vec<(&str, u8)> = matched.iter().map(|(u, t)| (u.as_str(), *t)).collect();
             if let Err(e) = client.did_change_watched_files(&refs).await {
-                info!("Failed to send didChangeWatchedFiles to {lang}: {e}");
+                info!("Failed to send didChangeWatchedFiles to {key}: {e}");
             }
             drop(client);
             notified += 1;
@@ -596,19 +706,19 @@ impl LspClientManager {
     /// are dropped, which triggers the `Connection` drop handler to SIGKILL them.
     pub async fn shutdown_all(&self) {
         let mut clients = self.clients.lock().await;
-        for (lang, client_mutex) in clients.drain() {
+        for (key, client_mutex) in clients.drain() {
             let mut client = client_mutex.lock().await;
             if client.is_alive() {
                 let result = tokio::time::timeout(Duration::from_secs(5), client.shutdown()).await;
                 drop(client);
                 match result {
                     Ok(Err(e)) => {
-                        info!("Failed to shutdown LSP server for {}: {}", lang, e);
+                        info!("Failed to shutdown LSP server instance {}: {}", key, e);
                     }
                     Err(_) => {
                         info!(
-                            "LSP server for {} did not respond to shutdown within 5s, killing",
-                            lang
+                            "LSP server instance {} did not respond to shutdown within 5s, killing",
+                            key
                         );
                     }
                     Ok(Ok(())) => {}
@@ -813,6 +923,11 @@ mod tests {
         Ok(())
     }
 
+    /// Checks whether any client in the map has the given language ID.
+    fn has_language(clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>, lang: &str) -> bool {
+        clients.keys().any(|k| k.language_id == lang)
+    }
+
     #[tokio::test]
     async fn test_sync_roots_shuts_down_unsupported_client() -> Result<()> {
         // mockls without --workspace-folders does NOT advertise workspace folder support.
@@ -824,14 +939,14 @@ mod tests {
             test_fs(),
         );
 
-        let client = manager.get_or_spawn(MOCK_LANG_A).await?;
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
         assert!(
             !client.lock().await.supports_workspace_folders(),
             "mockls (no flags) should NOT support workspace folders"
         );
 
-        assert!(manager.clients().await.contains_key(MOCK_LANG_A));
+        assert!(has_language(&manager.clients().await, MOCK_LANG_A));
 
         // sync_roots should shut down the unsupported client
         manager
@@ -839,7 +954,7 @@ mod tests {
             .await?;
 
         assert!(
-            !manager.clients().await.contains_key(MOCK_LANG_A),
+            !has_language(&manager.clients().await, MOCK_LANG_A),
             "mockls client should be removed after sync_roots (no workspace folder support)"
         );
 
@@ -894,7 +1009,7 @@ mod tests {
 
         // get_client spawns + initializes; mockls sends workspace/configuration
         // during init. If Catenary responds correctly, initialization succeeds.
-        let client = manager.get_or_spawn(MOCK_LANG_A).await?;
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
 
         Ok(())
@@ -911,14 +1026,14 @@ mod tests {
             test_fs(),
         );
 
-        let client = manager.get_or_spawn(MOCK_LANG_A).await?;
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
         assert!(
             client.lock().await.supports_workspace_folders(),
             "mockls --workspace-folders should support workspace folders"
         );
 
-        assert!(manager.clients().await.contains_key(MOCK_LANG_A));
+        assert!(has_language(&manager.clients().await, MOCK_LANG_A));
 
         // sync_roots should send notification, NOT shut down the client
         manager
@@ -927,7 +1042,7 @@ mod tests {
 
         // Client should still be active (not removed)
         assert!(
-            manager.clients().await.contains_key(MOCK_LANG_A),
+            has_language(&manager.clients().await, MOCK_LANG_A),
             "mockls client should still be active after sync_roots (workspace folders supported)"
         );
 
@@ -950,7 +1065,7 @@ mod tests {
         manager.ensure_clients_for_paths(&paths).await;
 
         assert!(
-            manager.clients().await.contains_key(MOCK_LANG_A),
+            has_language(&manager.clients().await, MOCK_LANG_A),
             "ensure_clients_for_paths should spawn the mock language server"
         );
         Ok(())
@@ -966,7 +1081,7 @@ mod tests {
         );
 
         // Pre-spawn the server
-        let _ = manager.get_or_spawn(MOCK_LANG_A).await?;
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
         assert_eq!(manager.clients().await.len(), 1);
 
         // ensure_clients_for_paths should not fail or double-spawn
@@ -1047,6 +1162,115 @@ mod tests {
         let (uri, client_mutex) = manager.ensure_document_open(&path, None).await?;
         assert!(uri.starts_with("file://"));
         assert!(client_mutex.lock().await.is_alive());
+        Ok(())
+    }
+
+    // --- Two-step spawn and InstanceKey tests ---
+
+    #[tokio::test]
+    async fn test_spawn_workspace_scope() -> Result<()> {
+        // mockls with --workspace-folders gets Scope::Workspace key after init.
+        let manager = LspClientManager::new(
+            mockls_workspace_folders_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs(),
+        );
+
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        let key = client
+            .lock()
+            .await
+            .server()
+            .key()
+            .expect("key should be set after init");
+        assert_eq!(key.language_id, MOCK_LANG_A);
+        assert_eq!(key.scope, Scope::Workspace);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_legacy_scope() -> Result<()> {
+        // mockls without workspace folders gets Scope::Root(root) key after init.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs(),
+        );
+
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        let key = client
+            .lock()
+            .await
+            .server()
+            .key()
+            .expect("key should be set after init");
+        assert_eq!(key.language_id, MOCK_LANG_A);
+        assert_eq!(key.scope, Scope::Root(PathBuf::from("/tmp")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_server_idempotent() -> Result<()> {
+        // Second call returns same client, no double-spawn.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs(),
+        );
+
+        let client1 = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        let client2 = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        // Same Arc — no double spawn
+        assert!(Arc::ptr_eq(&client1, &client2));
+        assert_eq!(manager.clients().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_server_dead_tombstone() -> Result<()> {
+        // Dead server returns error on re-ensure.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs(),
+        );
+
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        // Kill the server by shutting it down without removing from map
+        client.lock().await.shutdown().await?;
+        // Wait briefly for the process to die
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let result = manager.ensure_server_for_language(MOCK_LANG_A).await;
+        assert!(result.is_err(), "dead server should return error");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clients_returns_instance_keys() -> Result<()> {
+        // clients() map has InstanceKey keys.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            vec![PathBuf::from("/tmp")],
+            test_logging(),
+            test_fs(),
+        );
+
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        let clients = manager.clients().await;
+
+        assert_eq!(clients.len(), 1);
+        let key = clients.keys().next().expect("should have one key");
+        assert_eq!(key.language_id, MOCK_LANG_A);
+        assert!(
+            matches!(key.scope, Scope::Root(_)),
+            "mockls without workspace folders should be Root-scoped"
+        );
         Ok(())
     }
 

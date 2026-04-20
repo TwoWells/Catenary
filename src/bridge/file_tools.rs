@@ -123,7 +123,7 @@ impl ToolServer for GlobServer {
                 .clients()
                 .await
                 .keys()
-                .cloned()
+                .map(|k| k.language_id.clone())
                 .collect();
             check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
         }
@@ -171,15 +171,17 @@ impl GlobServer {
     async fn wait_for_all_servers_ready(&self) {
         let clients = self.client_manager.clients().await;
 
-        for (lang, client_mutex) in clients {
+        for (key, client_mutex) in clients {
             if !client_mutex.lock().await.wait_ready().await {
-                debug!("[{lang}] server died \u{2014} tool will run in degraded mode");
+                debug!(
+                    "[{}] server died \u{2014} tool will run in degraded mode",
+                    key.language_id
+                );
             }
         }
     }
 
-    /// Returns the language key for a file path, matching the key used in
-    /// `clients()`.
+    /// Returns the language ID for a file path.
     async fn language_for_path(&self, path: &Path) -> Option<String> {
         let client_mutex = self.client_manager.get_client(path).await.ok()?;
         Some(client_mutex.lock().await.language().to_string())

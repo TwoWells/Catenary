@@ -24,6 +24,7 @@ use super::symbols::{
     self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
 };
 use super::tool_server::ToolServer;
+use crate::lsp::instance_key::InstanceKey;
 use crate::lsp::{LspClient, LspClientManager};
 
 /// Maximum unique LSP symbols for hover display in output. Above this
@@ -73,14 +74,17 @@ impl ToolServer for GrepServer {
 
         // Wait for all servers ready (grep doesn't target a specific file)
         let clients = self.client_manager.clients().await;
-        for (lang, client_mutex) in &clients {
+        for (key, client_mutex) in &clients {
             if !client_mutex.lock().await.wait_ready().await {
-                debug!("[{lang}] server died \u{2014} tool will run in degraded mode");
+                debug!(
+                    "[{}] server died \u{2014} tool will run in degraded mode",
+                    key.language_id
+                );
             }
         }
 
         // Emit state-transition notifications.
-        let touched: Vec<String> = clients.keys().cloned().collect();
+        let touched: Vec<String> = clients.keys().map(|k| k.language_id.clone()).collect();
         check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
 
         // Run pipeline
@@ -339,7 +343,7 @@ impl GrepServer {
     /// Resolves URI-only symbols when the server supports `workspaceSymbol/resolve`.
     async fn fetch_symbol_universe(
         &self,
-        clients: &HashMap<String, Arc<Mutex<LspClient>>>,
+        clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>,
         parent_id: Option<i64>,
     ) -> Vec<SymbolInfo> {
         let mut all_symbols: Vec<SymbolInfo> = Vec::new();
@@ -379,7 +383,7 @@ impl GrepServer {
     async fn fetch_symbols_by_queries(
         &self,
         queries: &[String],
-        clients: &HashMap<String, Arc<Mutex<LspClient>>>,
+        clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>,
         parent_id: Option<i64>,
     ) -> Vec<SymbolInfo> {
         let mut all_symbols: Vec<SymbolInfo> = Vec::new();

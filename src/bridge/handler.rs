@@ -41,7 +41,7 @@ pub(super) async fn check_server_health(
     // a stuck server is alive but not ready)
     let clients = client_manager.clients().await;
     for lang in touched_servers {
-        let ready = if let Some(c) = clients.get(lang) {
+        let ready = if let Some((_, c)) = clients.iter().find(|(k, _)| k.language_id == *lang) {
             let client = c.lock().await;
             matches!(
                 client.lifecycle(),
