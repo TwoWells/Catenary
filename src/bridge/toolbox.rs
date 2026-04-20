@@ -233,12 +233,10 @@ impl Toolbox {
     ///
     /// Returns an error if root synchronization fails.
     pub async fn sync_roots(&self, roots: Vec<PathBuf>) -> Result<()> {
-        self.path_validator
-            .write()
-            .await
-            .update_roots(roots.clone());
-        // sync_roots updates FilesystemManager roots internally.
-        self.client_manager.sync_roots(roots).await?;
+        // sync_roots updates FilesystemManager roots first (before any
+        // async work), then reacts to the diff.
+        self.client_manager.sync_roots(roots.clone()).await?;
+        self.path_validator.write().await.update_roots(roots);
 
         // Fire-and-forget: spawn_all is pre-warming, not a gate.
         // Tool calls that need a server will trigger get_client on demand.

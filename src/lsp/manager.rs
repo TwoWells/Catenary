@@ -241,7 +241,9 @@ impl LspClientManager {
     ///
     /// Returns an error if any root path cannot be converted to a valid URI.
     pub async fn sync_roots(&self, new_roots: Vec<PathBuf>) -> Result<()> {
+        // Snapshot before updating so the diff is computed against old state.
         let current_roots = self.fs.roots();
+        self.fs.set_roots(new_roots.clone());
 
         let to_add: Vec<PathBuf> = new_roots
             .iter()
@@ -263,9 +265,6 @@ impl LspClientManager {
             to_add.len(),
             to_remove.len()
         );
-
-        // Update the single source of truth for roots.
-        self.fs.set_roots(new_roots);
 
         let added_folders: Vec<(String, String)> = to_add
             .iter()
