@@ -21,6 +21,7 @@ use super::client::DiagnosticsCache;
 use super::connection::Connection;
 use super::extract;
 use super::glob::{FileWatcherRegistration, GlobPattern, ParsedWatcher, WatchKind};
+use super::instance_key::{InstanceKey, Scope};
 use super::protocol::RpcError;
 use super::state::{ProgressTracker, ServerLifecycle};
 
@@ -78,7 +79,12 @@ pub struct LspServer {
     pub(crate) publishes_version: Arc<AtomicBool>,
 
     // ── Identity ──────────────────────────────────────────────────
-    pub(crate) language: String,
+    /// Language identifier (known at spawn time, immutable).
+    language_id: String,
+    /// Server config name (known at spawn time, immutable).
+    server_name: String,
+    /// Routing scope (set once after `initialize`, via `OnceLock`).
+    scope: OnceLock<Scope>,
 
     // ── Configuration ─────────────────────────────────────────────
     settings: Option<Value>,
@@ -100,10 +106,14 @@ pub struct LspServer {
 impl LspServer {
     /// Creates a new `LspServer` with default state.
     ///
+    /// `language_id` and `server_name` are known at spawn time and never
+    /// change. The routing scope is set later via [`Self::set_scope`]
+    /// after the `initialize` handshake reveals server capabilities.
+    ///
     /// Call [`Self::set_capabilities`] after the `initialize` handshake
     /// to populate capability fields.
     #[must_use]
-    pub fn new(language: String, settings: Option<Value>) -> Self {
+    pub fn new(language_id: String, server_name: String, settings: Option<Value>) -> Self {
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
@@ -129,7 +139,9 @@ impl LspServer {
             state_notify: Arc::new(Notify::new()),
             ever_busy: AtomicBool::new(false),
             publishes_version: Arc::new(AtomicBool::new(false)),
-            language,
+            language_id,
+            server_name,
+            scope: OnceLock::new(),
             settings,
             tree_monitor: Mutex::new(None),
             file_watchers: Mutex::new(HashMap::new()),
@@ -140,6 +152,48 @@ impl LspServer {
     /// Returns the server settings, if configured.
     pub(crate) const fn settings(&self) -> Option<&Value> {
         self.settings.as_ref()
+    }
+
+    // ── Identity accessors ──────────────────────────────────────────
+
+    /// Returns the language identifier.
+    #[must_use]
+    pub fn language_id(&self) -> &str {
+        &self.language_id
+    }
+
+    /// Returns the server config name.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
+    /// Returns the routing scope (`None` before [`Self::set_scope`]).
+    #[must_use]
+    pub fn scope(&self) -> Option<&Scope> {
+        self.scope.get()
+    }
+
+    /// Sets the routing scope. Called once after `initialize`.
+    ///
+    /// Subsequent calls are no-ops (the `OnceLock` ignores them).
+    pub fn set_scope(&self, scope: Scope) {
+        let _ = self.scope.set(scope);
+    }
+
+    /// Constructs the full [`InstanceKey`] from stored components.
+    ///
+    /// Returns `None` if scope hasn't been set yet (pre-init).
+    /// After init, always returns `Some`.
+    #[must_use]
+    pub fn key(&self) -> Option<InstanceKey> {
+        self.scope.get().map(|s| {
+            InstanceKey::new(
+                self.language_id.clone(),
+                self.server_name.clone(),
+                s.clone(),
+            )
+        })
     }
 
     /// Sets capabilities from the `initialize` response. Called once.
@@ -780,11 +834,12 @@ fn resolve_section(settings: Option<&Value>, section: Option<&str>) -> Value {
     reason = "tests use expect for readable assertions"
 )]
 mod tests {
+    use super::super::instance_key::Scope;
     use super::*;
     use serde_json::json;
 
     fn test_server() -> LspServer {
-        LspServer::new("test".to_string(), None)
+        LspServer::new("test".to_string(), "test-server".to_string(), None)
     }
 
     /// Helper: creates an `LspServer` with capabilities already set.
@@ -792,6 +847,43 @@ mod tests {
         let server = test_server();
         server.set_capabilities(caps);
         server
+    }
+
+    // ── Identity accessor tests ──────────────────────────────────────
+
+    #[test]
+    fn test_lsp_server_accessors() {
+        let server = LspServer::new("rust".to_string(), "rust-analyzer".to_string(), None);
+        assert_eq!(server.language_id(), "rust");
+        assert_eq!(server.server_name(), "rust-analyzer");
+        assert!(server.scope().is_none());
+    }
+
+    #[test]
+    fn test_lsp_server_scope_set_once() {
+        let server = test_server();
+        assert!(server.scope().is_none());
+
+        server.set_scope(Scope::Workspace);
+        assert_eq!(server.scope(), Some(&Scope::Workspace));
+
+        // Second set is a no-op
+        server.set_scope(Scope::Root(std::path::PathBuf::from("/other")));
+        assert_eq!(server.scope(), Some(&Scope::Workspace));
+    }
+
+    #[test]
+    fn test_lsp_server_key_construction() {
+        let server = LspServer::new("rust".to_string(), "rust-analyzer".to_string(), None);
+
+        // Before set_scope, key() returns None
+        assert!(server.key().is_none());
+
+        server.set_scope(Scope::Workspace);
+        let key = server.key().expect("key should be Some after set_scope");
+        assert_eq!(key.language_id, "rust");
+        assert_eq!(key.server, "rust-analyzer");
+        assert_eq!(key.scope, Scope::Workspace);
     }
 
     // ── Capability tests ──────────────────────────────────────────
@@ -1036,6 +1128,7 @@ mod tests {
     fn configuration_request_uses_settings() {
         let server = LspServer::new(
             "test".to_string(),
+            "test-server".to_string(),
             Some(json!({"mockls": {"key": "value"}})),
         );
         let result = server

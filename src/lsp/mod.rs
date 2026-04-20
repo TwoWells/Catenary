@@ -9,6 +9,8 @@ pub(crate) mod connection;
 pub(crate) mod extract;
 /// LSP file watcher glob patterns and change types.
 pub mod glob;
+/// Instance identity types for LSP server routing.
+pub mod instance_key;
 /// Standalone pure functions for LSP document identity.
 pub mod lang;
 /// High-level manager for lazy-spawning and caching LSP clients.
@@ -27,6 +29,7 @@ pub mod state;
 pub(crate) mod types;
 
 pub use client::LspClient;
+pub use instance_key::{InstanceKey, Scope};
 pub use manager::LspClientManager;
 pub use server::LspServer;
 pub use state::{ProgressTracker, ServerLifecycle, ServerStatus};

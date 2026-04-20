@@ -56,11 +56,20 @@ impl LspClient {
     pub fn spawn(
         program: &str,
         args: &[&str],
-        language: &str,
+        language_id: &str,
+        server_name: &str,
         logging: LoggingServer,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
-        Self::spawn_inner(program, args, language, logging, Stdio::inherit(), settings)
+        Self::spawn_inner(
+            program,
+            args,
+            language_id,
+            server_name,
+            logging,
+            Stdio::inherit(),
+            settings,
+        )
     }
 
     /// Spawns the LSP server with stderr suppressed (for `catenary doctor`).
@@ -71,30 +80,44 @@ impl LspClient {
     pub fn spawn_quiet(
         program: &str,
         args: &[&str],
-        language: &str,
+        language_id: &str,
+        server_name: &str,
         logging: LoggingServer,
     ) -> Result<Self> {
-        Self::spawn_inner(program, args, language, logging, Stdio::null(), None)
+        Self::spawn_inner(
+            program,
+            args,
+            language_id,
+            server_name,
+            logging,
+            Stdio::null(),
+            None,
+        )
     }
 
     fn spawn_inner(
         program: &str,
         args: &[&str],
-        language: &str,
+        language_id: &str,
+        server_name: &str,
         logging: LoggingServer,
         stderr: Stdio,
         settings: Option<serde_json::Value>,
     ) -> Result<Self> {
-        let server = Arc::new(LspServer::new(language.to_string(), settings));
+        let server = Arc::new(LspServer::new(
+            language_id.to_string(),
+            server_name.to_string(),
+            settings,
+        ));
 
         let connection = super::connection::Connection::new(
             program,
             args,
             stderr,
             &server,
-            language.to_string(),
+            language_id.to_string(),
             logging,
-            program,
+            server_name,
         )?;
         server.set_connection(connection);
 
@@ -245,7 +268,8 @@ impl LspClient {
         self.wants_did_save = super::extract::wants_did_save(&caps);
         debug!(
             "[{}] server wants didSave: {}",
-            self.server.language, self.wants_did_save
+            self.server.language_id(),
+            self.wants_did_save
         );
 
         // Store server info and set capabilities on existing server profile
@@ -735,7 +759,13 @@ impl LspClient {
     /// Returns the language identifier for this client (e.g., "rust", "python").
     #[must_use]
     pub fn language(&self) -> &str {
-        &self.server.language
+        self.server.language_id()
+    }
+
+    /// Returns the server config name (e.g., "rust-analyzer", "pyright").
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        self.server.server_name()
     }
 
     /// Returns whether the server supports dynamic workspace folder changes.

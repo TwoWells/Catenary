@@ -647,7 +647,11 @@ async fn profile_intensity() -> Result<()> {
             }
         };
 
-        let server = Arc::new(LspServer::new(def.name.to_string(), None));
+        let server = Arc::new(LspServer::new(
+            def.name.to_string(),
+            def.name.to_string(),
+            None,
+        ));
         server.set_capabilities(capabilities);
 
         let pid = child
@@ -861,7 +865,11 @@ async fn profile_intensity_large() -> Result<()> {
         .context("Initialize failed")?
     };
 
-    let server = Arc::new(LspServer::new("rust".to_string(), None));
+    let server = Arc::new(LspServer::new(
+        "rust".to_string(),
+        "rust-analyzer".to_string(),
+        None,
+    ));
     server.set_capabilities(capabilities);
 
     let pid = child.id().context("No PID after spawn")?;

@@ -27,6 +27,7 @@ async fn test_mockls_initialize() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
+        MOCK_LANG_A,
         test_logging(),
         None,
     )?;
@@ -49,6 +50,7 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--workspace-folders"],
+        MOCK_LANG_A,
         MOCK_LANG_A,
         test_logging(),
         None,
@@ -78,6 +80,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
+        MOCK_LANG_A,
         MOCK_LANG_A,
         test_logging(),
         None,
@@ -116,6 +119,7 @@ async fn test_client_capabilities() -> Result<()> {
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--log-init-params", log_path],
+        MOCK_LANG_A,
         MOCK_LANG_A,
         test_logging(),
         None,
@@ -229,6 +233,7 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--indexing-delay", "200"],
         MOCK_LANG_A,
+        MOCK_LANG_A,
         test_logging(),
         None,
     )?;
@@ -270,6 +275,7 @@ async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--cpu-on-initialized", "100"],
         MOCK_LANG_A,
+        MOCK_LANG_A,
         test_logging(),
         None,
     )?;
@@ -308,6 +314,7 @@ async fn test_content_modified_retry() -> Result<()> {
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--content-modified-once"],
+        MOCK_LANG_A,
         MOCK_LANG_A,
         test_logging(),
         None,
@@ -349,6 +356,7 @@ async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
+        MOCK_LANG_A,
         test_logging(),
         None,
     )?;
@@ -388,6 +396,7 @@ async fn test_health_probe_transitions_to_healthy() -> Result<()> {
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
+        MOCK_LANG_A,
         MOCK_LANG_A,
         test_logging(),
         None,

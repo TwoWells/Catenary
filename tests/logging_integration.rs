@@ -215,6 +215,7 @@ async fn lsp_request_scope_chain() -> Result<()> {
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
+        MOCK_LANG_A,
         server.clone(),
         None,
     )?;
@@ -280,6 +281,7 @@ async fn pair_merge_still_works() -> Result<()> {
     let mut client = catenary_mcp::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
+        MOCK_LANG_A,
         MOCK_LANG_A,
         server.clone(),
         None,

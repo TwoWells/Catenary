@@ -180,6 +180,7 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
             command,
             &args_refs,
             name,
+            name,
             crate::logging::LoggingServer::new(),
         );
 

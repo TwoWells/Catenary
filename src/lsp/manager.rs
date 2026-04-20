@@ -346,6 +346,7 @@ impl LspClientManager {
             &server_def.command,
             &args,
             lang,
+            server_name,
             self.logging.clone(),
             server_def.settings.clone(),
         )?;

@@ -88,8 +88,14 @@ async fn spawn_initialized_client(
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client =
-        catenary_mcp::lsp::LspClient::spawn(bin, &[MOCK_LANG_A], MOCK_LANG_A, logging, None)?;
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A],
+        MOCK_LANG_A,
+        MOCK_LANG_A,
+        logging,
+        None,
+    )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;
     Ok((client, dir))
