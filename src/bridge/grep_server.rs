@@ -119,7 +119,7 @@ impl GrepServer {
             .map(Arc::new);
 
         // Determine effective search roots: absolute glob overrides workspace roots.
-        let workspace_roots = self.client_manager.roots().await;
+        let workspace_roots = self.client_manager.roots();
         let effective_roots = if let Some(ref rg) = resolved_glob
             && let Some(override_root) = rg.override_root()
         {

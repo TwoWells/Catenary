@@ -336,7 +336,7 @@ impl GlobServer {
         let search_roots = if let Some(override_root) = resolved.override_root() {
             vec![override_root.to_path_buf()]
         } else {
-            let roots = self.client_manager.roots().await;
+            let roots = self.client_manager.roots();
             if roots.is_empty() {
                 vec![std::env::current_dir()?]
             } else {

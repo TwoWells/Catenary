@@ -167,10 +167,9 @@ impl Toolbox {
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
         fs_manager.set_roots(roots.clone());
         fs_manager.seed();
-        let path_validator = Arc::new(RwLock::new(PathValidator::new(roots.clone())));
+        let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let client_manager = Arc::new(LspClientManager::new(
             config,
-            roots,
             logging.clone(),
             fs_manager.clone(),
         ));
@@ -234,11 +233,11 @@ impl Toolbox {
     ///
     /// Returns an error if root synchronization fails.
     pub async fn sync_roots(&self, roots: Vec<PathBuf>) -> Result<()> {
-        self.fs_manager.set_roots(roots.clone());
         self.path_validator
             .write()
             .await
             .update_roots(roots.clone());
+        // sync_roots updates FilesystemManager roots internally.
         self.client_manager.sync_roots(roots).await?;
 
         // Fire-and-forget: spawn_all is pre-warming, not a gate.

@@ -71,7 +71,6 @@ fn find_instance(
 /// LSP notifications are tightly coupled to server management.
 pub struct LspClientManager {
     config: Config,
-    roots: Mutex<Vec<PathBuf>>,
     clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
     logging: LoggingServer,
     fs: Arc<FilesystemManager>,
@@ -80,16 +79,13 @@ pub struct LspClientManager {
 
 impl LspClientManager {
     /// Creates a new `LspClientManager`.
+    ///
+    /// Workspace roots are sourced from the shared [`FilesystemManager`] —
+    /// call [`FilesystemManager::set_roots`] before constructing this manager.
     #[must_use]
-    pub fn new(
-        config: Config,
-        roots: Vec<PathBuf>,
-        logging: LoggingServer,
-        fs: Arc<FilesystemManager>,
-    ) -> Self {
+    pub fn new(config: Config, logging: LoggingServer, fs: Arc<FilesystemManager>) -> Self {
         Self {
             config,
-            roots: Mutex::new(roots),
             clients: Mutex::new(HashMap::new()),
             logging,
             fs,
@@ -123,7 +119,7 @@ impl LspClientManager {
     /// are already included in the `initialize` request). For legacy
     /// servers, spawns a separate `Scope::Root` instance per root.
     pub async fn spawn_all(&self) {
-        let roots = self.roots.lock().await.clone();
+        let roots = self.fs.roots();
         let configured_keys: HashSet<&str> =
             self.config.language.keys().map(String::as_str).collect();
         let relevant = self.fs.detect_workspace_languages(&roots, &configured_keys);
@@ -184,8 +180,8 @@ impl LspClientManager {
     }
 
     /// Returns the current workspace roots.
-    pub async fn roots(&self) -> Vec<PathBuf> {
-        self.roots.lock().await.clone()
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.fs.roots()
     }
 
     /// Removes a workspace root and updates all active LSP clients.
@@ -204,7 +200,9 @@ impl LspClientManager {
             |s| s.to_string_lossy().to_string(),
         );
 
-        self.roots.lock().await.retain(|r| r != root);
+        let mut roots = self.fs.roots();
+        roots.retain(|r| r != root);
+        self.fs.set_roots(roots);
 
         // Notify workspace-capable servers about the removal.
         let clients = self.clients.lock().await.clone();
@@ -243,7 +241,7 @@ impl LspClientManager {
     ///
     /// Returns an error if any root path cannot be converted to a valid URI.
     pub async fn sync_roots(&self, new_roots: Vec<PathBuf>) -> Result<()> {
-        let current_roots = self.roots.lock().await.clone();
+        let current_roots = self.fs.roots();
 
         let to_add: Vec<PathBuf> = new_roots
             .iter()
@@ -266,8 +264,8 @@ impl LspClientManager {
             to_remove.len()
         );
 
-        // Update internal state.
-        *self.roots.lock().await = new_roots;
+        // Update the single source of truth for roots.
+        self.fs.set_roots(new_roots);
 
         let added_folders: Vec<(String, String)> = to_add
             .iter()
@@ -370,9 +368,7 @@ impl LspClientManager {
             .get(server_name)
             .ok_or_else(|| anyhow!("Server '{server_name}' not found in [server.*] config"))?;
 
-        // Pre-fetch roots before acquiring clients lock.
-        let roots = self.roots.lock().await.clone();
-
+        let roots = self.fs.roots();
         let mut clients = self.clients.lock().await;
 
         // Double-check: another task may have spawned this server
@@ -499,11 +495,10 @@ impl LspClientManager {
             .name;
 
         let root = self
-            .roots
-            .lock()
-            .await
-            .first()
-            .cloned()
+            .fs
+            .roots()
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow!("No workspace roots available for spawning '{lang}'"))?;
 
         self.ensure_server(lang, server_name, &root).await
@@ -824,7 +819,7 @@ impl LspClientManager {
             return;
         }
 
-        let roots = self.roots.lock().await.clone();
+        let roots = self.fs.roots();
         let clients = self.clients.lock().await.clone();
 
         let mut notified = 0u32;
@@ -1007,12 +1002,11 @@ mod tests {
     async fn test_roots_returns_initial_roots() -> Result<()> {
         let manager = LspClientManager::new(
             test_config(),
-            vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp/root_a", "/tmp/root_b"]),
         );
 
-        let roots = manager.roots().await;
+        let roots = manager.roots();
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0], PathBuf::from("/tmp/root_a"));
         assert_eq!(roots[1], PathBuf::from("/tmp/root_b"));
@@ -1021,9 +1015,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_roots_empty_initial() -> Result<()> {
-        let manager = LspClientManager::new(test_config(), vec![], test_logging(), test_fs());
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
 
-        assert!(manager.roots().await.is_empty());
+        assert!(manager.roots().is_empty());
         Ok(())
     }
 
@@ -1031,16 +1025,15 @@ mod tests {
     async fn test_remove_root() -> Result<()> {
         let manager = LspClientManager::new(
             test_config(),
-            vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp/root_a", "/tmp/root_b"]),
         );
 
-        assert_eq!(manager.roots().await.len(), 2);
+        assert_eq!(manager.roots().len(), 2);
 
         manager.remove_root(Path::new("/tmp/root_a")).await?;
 
-        let roots = manager.roots().await;
+        let roots = manager.roots();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0], PathBuf::from("/tmp/root_b"));
         Ok(())
@@ -1050,9 +1043,8 @@ mod tests {
     async fn test_sync_roots_adds_and_removes() -> Result<()> {
         let manager = LspClientManager::new(
             test_config(),
-            vec![PathBuf::from("/tmp/root_a"), PathBuf::from("/tmp/root_b")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp/root_a", "/tmp/root_b"]),
         );
 
         // Sync: remove /tmp/root_a, keep /tmp/root_b, add /tmp/root_c
@@ -1063,7 +1055,7 @@ mod tests {
             ])
             .await?;
 
-        let roots = manager.roots().await;
+        let roots = manager.roots();
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0], PathBuf::from("/tmp/root_b"));
         assert_eq!(roots[1], PathBuf::from("/tmp/root_c"));
@@ -1074,16 +1066,15 @@ mod tests {
     async fn test_sync_roots_no_change() -> Result<()> {
         let manager = LspClientManager::new(
             test_config(),
-            vec![PathBuf::from("/tmp/root_a")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp/root_a"]),
         );
 
         manager
             .sync_roots(vec![PathBuf::from("/tmp/root_a")])
             .await?;
 
-        let roots = manager.roots().await;
+        let roots = manager.roots();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0], PathBuf::from("/tmp/root_a"));
         Ok(())
@@ -1100,9 +1091,8 @@ mod tests {
         // Removing a root should shut down the Scope::Root instance for that root.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1131,9 +1121,8 @@ mod tests {
         // for a root that is still present.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1191,12 +1180,7 @@ mod tests {
             tui: None,
         };
 
-        let manager = LspClientManager::new(
-            config,
-            vec![PathBuf::from("/tmp")],
-            test_logging(),
-            test_fs(),
-        );
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
 
         // get_client spawns + initializes; mockls sends workspace/configuration
         // during init. If Catenary responds correctly, initialization succeeds.
@@ -1212,9 +1196,8 @@ mod tests {
         // When roots change, it should receive a notification instead of being shut down.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1244,7 +1227,6 @@ mod tests {
     async fn test_ensure_clients_for_paths_spawns_new_language() -> Result<()> {
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1266,7 +1248,6 @@ mod tests {
     async fn test_ensure_clients_for_paths_skips_existing() -> Result<()> {
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1291,7 +1272,6 @@ mod tests {
     async fn test_ensure_clients_for_paths_ignores_unconfigured() -> Result<()> {
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1311,7 +1291,6 @@ mod tests {
     async fn test_get_client_resolves_language_from_path() -> Result<()> {
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1327,7 +1306,6 @@ mod tests {
     async fn test_get_client_unknown_language_errors() {
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1340,11 +1318,10 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_document_open_sends_did_open() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
         let fs = test_fs_with_roots(&[]);
-        fs.set_roots(vec![root.clone()]);
+        fs.set_roots(vec![dir.path().to_path_buf()]);
 
-        let manager = LspClientManager::new(mockls_config(), vec![root], test_logging(), fs);
+        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
 
         let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
         std::fs::write(&path, "content").expect("write");
@@ -1363,7 +1340,6 @@ mod tests {
         // supports workspace folders.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1386,7 +1362,6 @@ mod tests {
         // is legacy (no workspace folder support).
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1409,7 +1384,6 @@ mod tests {
         // file in root B resolves to Scope::Root(B) instance.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp"), PathBuf::from("/var")],
             test_logging(),
             test_fs_with_roots(&["/tmp", "/var"]),
         );
@@ -1445,7 +1419,6 @@ mod tests {
         // File outside all roots returns error.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1467,7 +1440,6 @@ mod tests {
         // First call for a language in a root spawns via ensure_server.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1487,7 +1459,6 @@ mod tests {
         // The mock language extension IS the config key (MOCK_LANG_A).
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -1505,7 +1476,6 @@ mod tests {
         // Spawns instances per root, not per language.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp"), PathBuf::from("/var")],
             test_logging(),
             test_fs_with_roots(&["/tmp", "/var"]),
         );
@@ -1535,9 +1505,8 @@ mod tests {
         // mockls with --workspace-folders gets Scope::Workspace key after init.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1557,9 +1526,8 @@ mod tests {
         // mockls without workspace folders gets Scope::Root(root) key after init.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1579,9 +1547,8 @@ mod tests {
         // Second call returns same client, no double-spawn.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client1 = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1598,9 +1565,8 @@ mod tests {
         // Dead server returns error on re-ensure.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1619,9 +1585,8 @@ mod tests {
         // clients() map has InstanceKey keys.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1656,9 +1621,8 @@ mod tests {
         // Legacy server (no workspace folders) should get one instance per root.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp"), PathBuf::from("/var")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp", "/var"]),
         );
 
         manager.spawn_all().await;
@@ -1700,9 +1664,8 @@ mod tests {
         // Workspace-capable server should be spawned once with Scope::Workspace.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
-            vec![PathBuf::from("/tmp"), PathBuf::from("/var")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp", "/var"]),
         );
 
         let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1725,9 +1688,8 @@ mod tests {
         // Regression test for restart hack removal.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1757,9 +1719,8 @@ mod tests {
         // remove_root should shut down the Scope::Root instance for the removed root.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1780,9 +1741,8 @@ mod tests {
         // Workspace-capable server stays alive after remove_root.
         let manager = LspClientManager::new(
             mockls_workspace_folders_config(),
-            vec![PathBuf::from("/tmp"), PathBuf::from("/var")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp", "/var"]),
         );
 
         let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1803,9 +1763,8 @@ mod tests {
         // Identical root set produces no spawns or shutdowns.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
@@ -1828,9 +1787,8 @@ mod tests {
         // Other roots and workspace instances are untouched.
         let manager = LspClientManager::new(
             mockls_config(),
-            vec![PathBuf::from("/tmp")],
             test_logging(),
-            test_fs(),
+            test_fs_with_roots(&["/tmp"]),
         );
 
         // Spawn two root-scoped instances.

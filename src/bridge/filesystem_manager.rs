@@ -352,6 +352,12 @@ impl FilesystemManager {
             .cloned()
     }
 
+    /// Returns a snapshot of the current workspace roots.
+    #[must_use]
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots.lock().map_or_else(|_| Vec::new(), |r| r.clone())
+    }
+
     /// Updates the known workspace root set.
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
         if let Ok(mut current) = self.roots.lock() {
