@@ -1,1 +1,2 @@
-; Minimal tags query for the mock grammar (no captures).
+(function_definition (identifier) @name) @definition.function
+(struct_definition (identifier) @name) @definition.struct

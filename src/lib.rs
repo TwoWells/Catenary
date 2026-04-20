@@ -28,5 +28,7 @@ pub mod lsp;
 pub mod mcp;
 /// Session management and event broadcasting.
 pub mod session;
+/// Tree-sitter index for workspace-wide symbol extraction.
+pub mod ts;
 /// Interactive TUI for session browsing and event tailing.
 pub mod tui;

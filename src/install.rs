@@ -257,7 +257,7 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
 ///
 /// Returns an error if metadata is missing, tags.scm is absent, compilation
 /// fails, or the database insert fails.
-fn install_from_dir(
+pub(crate) fn install_from_dir(
     repo_dir: &Path,
     grammar_base: &Path,
     db: &Connection,

@@ -160,6 +160,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "streaming-iterator",
  "tempfile",
  "thiserror",
  "tokio",
