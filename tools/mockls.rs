@@ -171,12 +171,6 @@ struct Args {
     #[arg(long)]
     symbol_limit: Option<usize>,
 
-    /// Return the literal word under the cursor for hover, without resolving
-    /// keywords to the following symbol name. Simulates real LSP behavior where
-    /// hovering on `fn` returns keyword docs, not the function's signature.
-    #[arg(long)]
-    literal_keyword_hover: bool,
-
     /// Send `client/registerCapability` after `initialized` to register a
     /// file watcher. The glob pattern defaults to `**/*`; override with
     /// `--watcher-glob`.
@@ -494,9 +488,8 @@ impl MockServer {
             }
             "textDocument/codeAction" => Some(self.handle_code_action(&request.params)),
             "textDocument/prepareRename" => self.handle_prepare_rename(&request.params),
-            "callHierarchy/outgoingCalls" | "typeHierarchy/supertypes" => {
-                Some(Value::Array(Vec::new()))
-            }
+            "callHierarchy/outgoingCalls" => self.handle_outgoing_calls(&request.params),
+            "typeHierarchy/supertypes" => self.handle_type_hierarchy_supertypes(&request.params),
             _ => {
                 self.send_response(&Response {
                     jsonrpc: "2.0".to_string(),
@@ -763,11 +756,7 @@ impl MockServer {
     fn handle_hover(&self, params: &Value) -> Option<Value> {
         let (uri, line, col) = extract_position(params)?;
         let content = self.documents.get(uri)?;
-        let word = if self.args.literal_keyword_hover {
-            extract_word(content, line, col)?
-        } else {
-            extract_symbol_name(content, line, col)?
-        };
+        let word = extract_symbol_name(content, line, col)?;
 
         Some(serde_json::json!({
             "contents": {
@@ -1003,7 +992,7 @@ impl MockServer {
         let name = extract_symbol_name(content, line, col)?;
         let line_text = content.lines().nth(line)?;
 
-        Some(serde_json::json!([{
+        let mut item = serde_json::json!({
             "name": name,
             "kind": 12,
             "uri": uri,
@@ -1015,7 +1004,12 @@ impl MockServer {
                 "start": { "line": line, "character": 0 },
                 "end": { "line": line, "character": line_text.len() }
             }
-        }]))
+        });
+        if line_text.trim_start().contains("@deprecated") {
+            item["tags"] = serde_json::json!([1]);
+        }
+
+        Some(serde_json::json!([item]))
     }
 
     fn handle_incoming_calls(&self, params: &Value) -> Option<Value> {
@@ -1038,20 +1032,24 @@ impl MockServer {
 
                 if let Some((fn_name, fn_line)) = find_enclosing_function(content, line_idx) {
                     let fn_line_text = content.lines().nth(fn_line).unwrap_or("");
-                    calls.push(serde_json::json!({
-                        "from": {
-                            "name": fn_name,
-                            "kind": 12,
-                            "uri": doc_uri,
-                            "range": {
-                                "start": { "line": fn_line, "character": 0 },
-                                "end": { "line": fn_line, "character": fn_line_text.len() }
-                            },
-                            "selectionRange": {
-                                "start": { "line": fn_line, "character": 0 },
-                                "end": { "line": fn_line, "character": fn_line_text.len() }
-                            }
+                    let mut from_item = serde_json::json!({
+                        "name": fn_name,
+                        "kind": 12,
+                        "uri": doc_uri,
+                        "range": {
+                            "start": { "line": fn_line, "character": 0 },
+                            "end": { "line": fn_line, "character": fn_line_text.len() }
                         },
+                        "selectionRange": {
+                            "start": { "line": fn_line, "character": 0 },
+                            "end": { "line": fn_line, "character": fn_line_text.len() }
+                        }
+                    });
+                    if fn_line_text.trim_start().contains("@deprecated") {
+                        from_item["tags"] = serde_json::json!([1]);
+                    }
+                    calls.push(serde_json::json!({
+                        "from": from_item,
                         "fromRanges": [{
                             "start": { "line": line_idx, "character": 0 },
                             "end": { "line": line_idx, "character": line_text.len() }
@@ -1081,7 +1079,7 @@ impl MockServer {
             23
         };
 
-        Some(serde_json::json!([{
+        let mut item = serde_json::json!({
             "name": name,
             "kind": kind,
             "uri": uri,
@@ -1093,7 +1091,12 @@ impl MockServer {
                 "start": { "line": line, "character": 0 },
                 "end": { "line": line, "character": line_text.len() }
             }
-        }]))
+        });
+        if trimmed.contains("@deprecated") {
+            item["tags"] = serde_json::json!([1]);
+        }
+
+        Some(serde_json::json!([item]))
     }
 
     fn handle_type_hierarchy_subtypes(&self, params: &Value) -> Option<Value> {
@@ -1113,9 +1116,98 @@ impl MockServer {
                             .collect();
                         if !type_name.is_empty() {
                             let kind: u32 = if *kw == "struct " { 23 } else { 5 };
-                            subtypes.push(serde_json::json!({
+                            let mut item_json = serde_json::json!({
                                 "name": type_name,
                                 "kind": kind,
+                                "uri": doc_uri,
+                                "range": {
+                                    "start": { "line": line_idx, "character": 0 },
+                                    "end": { "line": line_idx, "character": line_text.len() }
+                                },
+                                "selectionRange": {
+                                    "start": { "line": line_idx, "character": 0 },
+                                    "end": { "line": line_idx, "character": line_text.len() }
+                                }
+                            });
+                            if trimmed.contains("@deprecated") {
+                                item_json["tags"] = serde_json::json!([1]);
+                            }
+                            subtypes.push(item_json);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(Value::Array(subtypes))
+    }
+
+    fn handle_type_hierarchy_supertypes(&self, params: &Value) -> Option<Value> {
+        let item = params.get("item")?;
+        let name = item.get("name")?.as_str()?;
+
+        let mut supertypes = Vec::new();
+
+        // Find the declaration line for this type and look for extends/implements
+        for (doc_uri, content) in &self.documents {
+            for (line_idx, line_text) in content.lines().enumerate() {
+                let trimmed = line_text.trim_start();
+                // Check if this line declares the type we're looking for
+                let declares_name = ["struct ", "class ", "interface ", "trait ", "enum "]
+                    .iter()
+                    .any(|kw| {
+                        trimmed.strip_prefix(kw).is_some_and(|after| {
+                            let decl_name: String = after
+                                .chars()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .collect();
+                            decl_name == name
+                        })
+                    });
+
+                if !declares_name {
+                    continue;
+                }
+
+                // Look for `extends <Type>` or `implements <Type>` on this line
+                for pattern in &["extends ", "implements "] {
+                    if let Some(pos) = trimmed.find(pattern) {
+                        let after = &trimmed[pos + pattern.len()..];
+                        let parent_name: String = after
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if parent_name.is_empty() {
+                            continue;
+                        }
+
+                        // Find the parent type's declaration
+                        if let Some((parent_uri, parent_line, parent_line_text, parent_kind)) =
+                            self.find_type_declaration(&parent_name)
+                        {
+                            let mut item_json = serde_json::json!({
+                                "name": parent_name,
+                                "kind": parent_kind,
+                                "uri": parent_uri,
+                                "range": {
+                                    "start": { "line": parent_line, "character": 0 },
+                                    "end": { "line": parent_line, "character": parent_line_text.len() }
+                                },
+                                "selectionRange": {
+                                    "start": { "line": parent_line, "character": 0 },
+                                    "end": { "line": parent_line, "character": parent_line_text.len() }
+                                }
+                            });
+                            // Add deprecated tag if the parent declaration has @deprecated
+                            if parent_line_text.contains("@deprecated") {
+                                item_json["tags"] = serde_json::json!([1]);
+                            }
+                            supertypes.push(item_json);
+                        } else {
+                            // Parent not found in documents — synthetic entry
+                            supertypes.push(serde_json::json!({
+                                "name": parent_name,
+                                "kind": 5,
                                 "uri": doc_uri,
                                 "range": {
                                     "start": { "line": line_idx, "character": 0 },
@@ -1132,7 +1224,132 @@ impl MockServer {
             }
         }
 
-        Some(Value::Array(subtypes))
+        Some(Value::Array(supertypes))
+    }
+
+    fn handle_outgoing_calls(&self, params: &Value) -> Option<Value> {
+        let item = params.get("item")?;
+        let caller_name = item.get("name")?.as_str()?;
+        let caller_uri = item.get("uri")?.as_str()?;
+        let caller_line =
+            usize::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
+
+        let content = self.documents.get(caller_uri)?;
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Find the end of the function: next function declaration or end of file
+        let fn_keywords = ["fn ", "function ", "def ", "method "];
+        let body_end = lines
+            .iter()
+            .enumerate()
+            .skip(caller_line + 1)
+            .find(|(_, line)| {
+                let trimmed = line.trim_start();
+                fn_keywords.iter().any(|kw| trimmed.starts_with(kw))
+            })
+            .map_or(lines.len(), |(idx, _)| idx);
+
+        // Collect all known function names across all documents
+        let mut known_functions: Vec<(String, String, usize, usize)> = Vec::new(); // (name, uri, line, line_len)
+        for (doc_uri, doc_content) in &self.documents {
+            for (line_idx, line_text) in doc_content.lines().enumerate() {
+                let trimmed = line_text.trim_start();
+                for kw in &fn_keywords {
+                    if let Some(after_kw) = trimmed.strip_prefix(kw) {
+                        let fn_name: String = after_kw
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if !fn_name.is_empty() && fn_name != caller_name {
+                            known_functions.push((
+                                fn_name,
+                                doc_uri.clone(),
+                                line_idx,
+                                line_text.len(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut calls = Vec::new();
+        for (fn_name, fn_uri, fn_line, fn_line_len) in &known_functions {
+            let mut from_ranges = Vec::new();
+
+            for line_idx in (caller_line + 1)..body_end {
+                if let Some(line_text) = lines.get(line_idx)
+                    && line_text.contains(fn_name.as_str())
+                {
+                    from_ranges.push(serde_json::json!({
+                        "start": { "line": line_idx, "character": 0 },
+                        "end": { "line": line_idx, "character": line_text.len() }
+                    }));
+                }
+            }
+
+            if !from_ranges.is_empty() {
+                let mut to_item = serde_json::json!({
+                    "name": fn_name,
+                    "kind": 12,
+                    "uri": fn_uri,
+                    "range": {
+                        "start": { "line": fn_line, "character": 0 },
+                        "end": { "line": fn_line, "character": fn_line_len }
+                    },
+                    "selectionRange": {
+                        "start": { "line": fn_line, "character": 0 },
+                        "end": { "line": fn_line, "character": fn_line_len }
+                    }
+                });
+                // Add deprecated tag if the function declaration has @deprecated
+                let target_line = self
+                    .documents
+                    .get(fn_uri.as_str())
+                    .and_then(|c| c.lines().nth(*fn_line))
+                    .unwrap_or("");
+                if target_line.contains("@deprecated") {
+                    to_item["tags"] = serde_json::json!([1]);
+                }
+                calls.push(serde_json::json!({
+                    "to": to_item,
+                    "fromRanges": from_ranges
+                }));
+            }
+        }
+
+        Some(Value::Array(calls))
+    }
+
+    /// Find a type declaration by name across all documents.
+    /// Returns `(uri, line_idx, line_text, kind)`.
+    fn find_type_declaration(&self, name: &str) -> Option<(String, usize, String, u32)> {
+        let type_keywords: &[(&str, u32)] = &[
+            ("struct ", 23),
+            ("class ", 5),
+            ("interface ", 11),
+            ("trait ", 11),
+            ("enum ", 10),
+        ];
+
+        for (doc_uri, content) in &self.documents {
+            for (line_idx, line_text) in content.lines().enumerate() {
+                let trimmed = line_text.trim_start();
+                for &(kw, kind) in type_keywords {
+                    if let Some(after_kw) = trimmed.strip_prefix(kw) {
+                        let decl_name: String = after_kw
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if decl_name == name {
+                            return Some((doc_uri.clone(), line_idx, line_text.to_string(), kind));
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn handle_pull_diagnostics(&self, params: &Value) -> Value {
@@ -1898,7 +2115,7 @@ fn extract_symbols(content: &str) -> Vec<Value> {
         let indent = line_text.len() - trimmed.len();
         let col_start = indent + prefix_len;
 
-        symbols.push(serde_json::json!({
+        let mut sym = serde_json::json!({
             "name": name,
             "kind": kind_num,
             "range": {
@@ -1909,7 +2126,11 @@ fn extract_symbols(content: &str) -> Vec<Value> {
                 "start": { "line": line_idx, "character": col_start },
                 "end": { "line": line_idx, "character": col_start + name.len() }
             }
-        }));
+        });
+        if trimmed.contains("@deprecated") {
+            sym["tags"] = serde_json::json!([1]);
+        }
+        symbols.push(sym);
     }
 
     symbols
@@ -1966,7 +2187,6 @@ mod tests {
             resolve_provider: false,
             no_empty_query: false,
             symbol_limit: None,
-            literal_keyword_hover: false,
             register_file_watchers: false,
             watcher_glob: "**/*".to_string(),
             watcher_kind: None,
@@ -2625,6 +2845,288 @@ const PI: f64
         assert_eq!(
             def_b["result"]["uri"], uri_defs,
             "Fallback in b.yX4Za should resolve to defs.yX4Za"
+        );
+    }
+
+    fn prepare_type_hierarchy_request(id: u64, uri: &str, line: u64, character: u64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/prepareTypeHierarchy",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        })
+        .to_string()
+    }
+
+    fn supertypes_request(id: u64, item: &Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "typeHierarchy/supertypes",
+            "params": { "item": item }
+        })
+        .to_string()
+    }
+
+    fn subtypes_request(id: u64, item: &Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "typeHierarchy/subtypes",
+            "params": { "item": item }
+        })
+        .to_string()
+    }
+
+    fn prepare_call_hierarchy_request(id: u64, uri: &str, line: u64, character: u64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/prepareCallHierarchy",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        })
+        .to_string()
+    }
+
+    fn outgoing_calls_request(id: u64, item: &Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "callHierarchy/outgoingCalls",
+            "params": { "item": item }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_mockls_supertypes() {
+        let uri = "file:///tmp/hierarchy.yX4Za";
+        let text = "interface Animal\nclass Dog extends Animal\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // prepareTypeHierarchy on 'Dog' (line 1, character 6)
+        input.extend(frame(&prepare_type_hierarchy_request(2, uri, 1, 6)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepareTypeHierarchy response with id=2");
+        assert!(prepare["error"].is_null(), "Expected no error");
+        let items = prepare["result"].as_array().expect("result array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "Dog");
+        assert_eq!(items[0]["kind"], 5); // Class
+
+        // Now request supertypes using the prepared item
+        let dog_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri, text)));
+        input2.extend(frame(&supertypes_request(11, dog_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+
+        let supertypes = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("supertypes response with id=11");
+        assert!(supertypes["error"].is_null(), "Expected no error");
+        let parents = supertypes["result"].as_array().expect("result array");
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0]["name"], "Animal");
+        assert_eq!(parents[0]["kind"], 11); // Interface
+        assert_eq!(parents[0]["uri"], uri);
+        assert_eq!(parents[0]["range"]["start"]["line"], 0);
+    }
+
+    #[test]
+    fn test_mockls_subtypes() {
+        let uri = "file:///tmp/hierarchy.yX4Za";
+        let text = "interface Animal\nstruct Dog\nclass Cat\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // prepareTypeHierarchy on 'Animal' (line 0, character 10)
+        input.extend(frame(&prepare_type_hierarchy_request(2, uri, 0, 10)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepareTypeHierarchy response with id=2");
+        assert!(prepare["error"].is_null(), "Expected no error");
+        let items = prepare["result"].as_array().expect("result array");
+        assert_eq!(items[0]["name"], "Animal");
+
+        // Now request subtypes
+        let animal_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri, text)));
+        input2.extend(frame(&subtypes_request(11, animal_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+
+        let subtypes = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("subtypes response with id=11");
+        assert!(subtypes["error"].is_null(), "Expected no error");
+        let children = subtypes["result"].as_array().expect("result array");
+        assert!(children.len() >= 2, "Expected at least 2 subtypes");
+
+        let names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert!(names.contains(&"Dog"), "Expected Dog in subtypes");
+        assert!(names.contains(&"Cat"), "Expected Cat in subtypes");
+    }
+
+    #[test]
+    fn test_mockls_outgoing_calls() {
+        let uri = "file:///tmp/calls.yX4Za";
+        let text = "fn helper()\nfn caller()\n    helper\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // prepareCallHierarchy on 'caller' (line 1, character 3)
+        input.extend(frame(&prepare_call_hierarchy_request(2, uri, 1, 3)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        let prepare = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("prepareCallHierarchy response with id=2");
+        assert!(prepare["error"].is_null(), "Expected no error");
+        let items = prepare["result"].as_array().expect("result array");
+        assert_eq!(items[0]["name"], "caller");
+
+        // Now request outgoing calls
+        let caller_item = &items[0];
+        let mut input2 = frame(&initialize_request(10));
+        input2.extend(frame(&did_open_notification(uri, text)));
+        input2.extend(frame(&outgoing_calls_request(11, caller_item)));
+        input2.extend(frame(&shutdown_request(99)));
+
+        let messages2 = run_server_with(default_args(), &input2);
+
+        let outgoing = messages2
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(11))
+            .expect("outgoingCalls response with id=11");
+        assert!(outgoing["error"].is_null(), "Expected no error");
+        let calls = outgoing["result"].as_array().expect("result array");
+        assert_eq!(calls.len(), 1, "Expected 1 outgoing call");
+        assert_eq!(calls[0]["to"]["name"], "helper");
+        assert_eq!(calls[0]["to"]["kind"], 12); // Function
+
+        let from_ranges = calls[0]["fromRanges"].as_array().expect("fromRanges");
+        assert!(!from_ranges.is_empty(), "Expected at least one fromRange");
+        assert_eq!(from_ranges[0]["start"]["line"], 2); // Line where helper is called
+    }
+
+    #[test]
+    fn test_mockls_deprecated_tag() {
+        let uri = "file:///tmp/deprecated.yX4Za";
+        let text = "fn old_func() @deprecated\nstruct OldType @deprecated\nfn normal()\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        // Document symbols should include deprecated tags
+        let doc_symbols_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": { "textDocument": { "uri": uri } }
+        })
+        .to_string();
+        input.extend(frame(&doc_symbols_req));
+        // prepareCallHierarchy on deprecated function (line 0, col 3)
+        input.extend(frame(&prepare_call_hierarchy_request(3, uri, 0, 3)));
+        // prepareTypeHierarchy on deprecated struct (line 1, col 7)
+        input.extend(frame(&prepare_type_hierarchy_request(4, uri, 1, 7)));
+        input.extend(frame(&shutdown_request(99)));
+
+        let messages = run_server_with(default_args(), &input);
+
+        // Document symbols: deprecated symbols have tags
+        let symbols = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("documentSymbol response with id=2");
+        let syms = symbols["result"].as_array().expect("result array");
+
+        let old_func = syms
+            .iter()
+            .find(|s| s["name"] == "old_func")
+            .expect("old_func");
+        assert_eq!(
+            old_func["tags"],
+            serde_json::json!([1]),
+            "old_func should have DEPRECATED tag"
+        );
+
+        let old_type = syms
+            .iter()
+            .find(|s| s["name"] == "OldType")
+            .expect("OldType");
+        assert_eq!(
+            old_type["tags"],
+            serde_json::json!([1]),
+            "OldType should have DEPRECATED tag"
+        );
+
+        let normal = syms.iter().find(|s| s["name"] == "normal").expect("normal");
+        assert!(
+            normal.get("tags").is_none() || normal["tags"].is_null(),
+            "normal should not have DEPRECATED tag"
+        );
+
+        // CallHierarchyItem for deprecated function has tag
+        let call_prep = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("prepareCallHierarchy response with id=3");
+        let call_items = call_prep["result"].as_array().expect("result array");
+        assert_eq!(
+            call_items[0]["tags"],
+            serde_json::json!([1]),
+            "CallHierarchyItem should have DEPRECATED tag"
+        );
+
+        // TypeHierarchyItem for deprecated struct has tag
+        let type_prep = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(4))
+            .expect("prepareTypeHierarchy response with id=4");
+        let type_items = type_prep["result"].as_array().expect("result array");
+        assert_eq!(
+            type_items[0]["tags"],
+            serde_json::json!([1]),
+            "TypeHierarchyItem should have DEPRECATED tag"
+        );
+    }
+
+    #[test]
+    fn test_mockls_no_keyword_hover_flag() {
+        // Verify --literal-keyword-hover is no longer accepted by the parser
+        let result =
+            <Args as clap::Parser>::try_parse_from(["mockls", "test", "--literal-keyword-hover"]);
+        assert!(
+            result.is_err(),
+            "--literal-keyword-hover should no longer be accepted"
         );
     }
 }

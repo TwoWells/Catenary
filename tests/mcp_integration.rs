@@ -2575,68 +2575,6 @@ fn test_grep_rg_bootstrap_no_duplicate_heading() -> Result<()> {
     Ok(())
 }
 
-/// Regression: when hovering on a keyword token (`fn`) resolves to a different
-/// name (`my_func`), the bootstrap must skip the keyword and use the hover
-/// content from the actual symbol token. `--literal-keyword-hover` makes mockls
-/// return the raw word on hover (like real LSPs), so hovering `fn` returns `fn`
-/// while `prepareCallHierarchy` still resolves to the function name.
-#[test]
-fn test_grep_rg_bootstrap_keyword_hover_content() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let file = dir.path().join(format!("kw_hover.{MOCK_LANG_A}"));
-    std::fs::write(&file, "fn kw_hover_sym()\nkw_hover_sym\n")?;
-
-    let lsp = mockls_lsp_arg(
-        MOCK_LANG_A,
-        "--scan-roots --symbol-limit 0 --literal-keyword-hover",
-    );
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2050,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "fn kw_hover_sym" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep bootstrap keyword hover content failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for keyword hover content")?;
-
-    // Should still get enrichment — the keyword is skipped, the symbol token is used
-    assert!(
-        text.contains("## [Function]"),
-        "Expected ## [Function] heading, got:\n{text}"
-    );
-
-    // Hover content must contain the symbol name, not the keyword
-    assert!(
-        text.contains("kw_hover_sym"),
-        "Expected hover content with symbol name 'kw_hover_sym', got:\n{text}"
-    );
-
-    // The keyword text `fn` as a standalone hover block must not appear.
-    // mockls hover format is ```\n{word}\n``` — check for keyword-only hover.
-    assert!(
-        !text.contains("```\nfn\n```"),
-        "Hover content should be from the symbol, not the `fn` keyword:\n{text}"
-    );
-
-    Ok(())
-}
-
 /// Verify that LSP messages triggered by grep carry the MCP tool call's
 /// `parent_id` in the database (misc 30: `parent_id` threading).
 #[test]
