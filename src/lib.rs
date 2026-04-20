@@ -8,6 +8,8 @@
 
 /// Bridge logic between MCP and LSP.
 pub mod bridge;
+/// Two-stage bucketing for grep tier 3 and glob tier 3 output.
+pub mod bucketing;
 /// Command-line interface definitions and utilities.
 pub mod cli;
 /// Configuration handling for language servers and session settings.
