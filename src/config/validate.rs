@@ -4,6 +4,7 @@
 //! Configuration validation.
 
 use super::Config;
+use crate::lsp::glob::LspGlob;
 
 /// Validate the merged config, returning all errors found.
 ///
@@ -80,7 +81,7 @@ pub fn validate(config: &Config) -> Vec<String> {
                 errors.push(format!(
                     "Server '{name}' has an empty string in `file_patterns`"
                 ));
-            } else if let Err(e) = globset::Glob::new(pattern) {
+            } else if let Err(e) = LspGlob::new(pattern) {
                 errors.push(format!(
                     "Server '{name}' has an invalid glob in `file_patterns`: \
                      '{pattern}' — {e}"

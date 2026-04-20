@@ -17,7 +17,7 @@ use globset::{GlobBuilder, GlobMatcher};
 ///
 /// Wraps a [`GlobMatcher`] compiled with `literal_separator(true)` so that
 /// `*` does not cross path segment boundaries, matching LSP 3.17 semantics.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LspGlob {
     matcher: GlobMatcher,
 }

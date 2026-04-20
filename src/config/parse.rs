@@ -100,6 +100,13 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
         tools.clamp_budgets();
     }
 
+    // Compile file_patterns globs on each ServerDef before validation.
+    for (name, server_def) in &mut config.server {
+        server_def
+            .compile_patterns()
+            .with_context(|| format!("Server '{name}' has invalid file_patterns"))?;
+    }
+
     let errors = config.validate();
     if !errors.is_empty() {
         bail!("Configuration errors:\n{}", errors.join("\n"));
@@ -287,6 +294,7 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                         settings: None,
                         min_severity: None,
                         file_patterns: Vec::new(),
+                        compiled_patterns: Vec::new(),
                     },
                     LanguageConfig {
                         servers: vec![ServerBinding::new(server_name)],

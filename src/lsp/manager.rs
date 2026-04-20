@@ -14,8 +14,9 @@ use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::config::Config;
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
-use crate::lsp::glob::{FileChange, GlobPattern, WatchKind};
+use crate::lsp::glob::{FileChange, GlobPattern, LspGlob, WatchKind};
 use crate::lsp::instance_key::{InstanceKey, Scope};
+use crate::lsp::server::LspServer;
 use crate::lsp::state::ServerStatus;
 
 /// Filters filesystem changes against a server's watcher registrations.
@@ -62,6 +63,22 @@ fn find_instance(
         Scope::Root(root.to_path_buf()),
     );
     clients.get(&root_key).cloned()
+}
+
+/// Tests whether a path matches a server's `file_patterns`.
+///
+/// If `patterns` is empty, returns `true` (no filter = match all).
+/// Otherwise, matches the filename component of `path` against the
+/// compiled globs.
+fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    let file_path = Path::new(file_name);
+    patterns.iter().any(|g| g.is_match(file_path))
 }
 
 /// Manages the lifecycle of LSP clients, document state, and language detection.
@@ -335,9 +352,99 @@ impl LspClientManager {
     }
 
     /// Pure map lookup by key.
-    #[allow(dead_code, reason = "public API for Phase 1c dispatch")]
+    #[allow(
+        dead_code,
+        reason = "public API for Phase 1c dispatch (used by wait primitives)"
+    )]
     async fn get(&self, key: &InstanceKey) -> Option<Arc<Mutex<LspClient>>> {
         self.clients.lock().await.get(key).cloned()
+    }
+
+    /// Returns clients for a file path, filtered by capability and
+    /// `file_patterns`, in priority order (from the `servers` list in
+    /// `[language.*]`).
+    ///
+    /// Resolves language from path via `FilesystemManager`, iterates
+    /// the binding's servers, filters by:
+    /// 1. `file_patterns` on `[server.*]` (filename-level glob)
+    /// 2. The given capability check
+    ///
+    /// Returns an empty Vec when no server matches. On empty result,
+    /// emits a `warn!()` — dedup handled by `NotificationQueueSink`.
+    ///
+    /// Does not block on server readiness — callers must call
+    /// `wait_ready_for_path` or `wait_ready_all` before invoking.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "clients lock held across async iteration for consistent snapshot"
+    )]
+    pub async fn get_servers(
+        &self,
+        path: &Path,
+        capability: fn(&LspServer) -> bool,
+    ) -> Vec<Arc<Mutex<LspClient>>> {
+        // Detect language: primary (FilesystemManager) then fallback (raw extension).
+        let Some(lang_id) = self.fs.language_id(path).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        }) else {
+            return Vec::new();
+        };
+
+        // Resolve owning workspace root.
+        let Some(root) = self.fs.resolve_root(path) else {
+            return Vec::new();
+        };
+
+        // Look up language config.
+        let Some(lang_config) = self.config.resolve_language(&lang_id) else {
+            return Vec::new();
+        };
+
+        let clients = self.clients.lock().await;
+        let mut result = Vec::new();
+
+        for binding in &lang_config.servers {
+            // Look up the ServerDef for file_patterns.
+            let Some(server_def) = self.config.server.get(&binding.name) else {
+                continue;
+            };
+
+            // file_patterns filter: if non-empty, filename must match.
+            if !file_matches_patterns(path, &server_def.compiled_patterns) {
+                continue;
+            }
+
+            // Instance lookup: tries Workspace then Root(root).
+            let Some(client) = find_instance(&clients, &lang_id, &binding.name, &root) else {
+                continue;
+            };
+
+            // Liveness check.
+            let locked = client.lock().await;
+            if !locked.is_alive() {
+                continue;
+            }
+
+            // Capability check (conservatively false for uninitialized servers).
+            if !capability(locked.server()) {
+                continue;
+            }
+            drop(locked);
+
+            result.push(client);
+        }
+
+        if result.is_empty() && !lang_config.servers.is_empty() {
+            warn!(
+                source = "lsp.routing",
+                language = lang_id.as_str(),
+                "No server supports the requested capability for {lang_id} files",
+            );
+        }
+
+        result
     }
 
     /// Spawns a server process, runs `initialize`, constructs the final
@@ -945,6 +1052,7 @@ mod tests {
                 settings: None,
                 min_severity: None,
                 file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
             },
         );
         let mut language = HashMap::new();
@@ -979,6 +1087,7 @@ mod tests {
                 settings: None,
                 min_severity: None,
                 file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
             },
         );
         let mut language = HashMap::new();
@@ -1163,6 +1272,7 @@ mod tests {
                 settings: Some(serde_json::json!({"mockls": {"key": "value"}})),
                 min_severity: None,
                 file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
             },
         );
         let mut language = HashMap::new();
@@ -1898,6 +2008,394 @@ mod tests {
     }
 
     // --- match_file_changes ---
+
+    // --- file_matches_patterns ---
+
+    mod file_patterns_matching {
+        use super::*;
+        use crate::lsp::glob::LspGlob;
+
+        fn compile(patterns: &[&str]) -> Vec<LspGlob> {
+            patterns
+                .iter()
+                .map(|p| LspGlob::new(p).expect("valid glob"))
+                .collect()
+        }
+
+        #[test]
+        fn empty_patterns_matches_all() {
+            assert!(file_matches_patterns(Path::new("/tmp/test.rs"), &[]));
+            assert!(file_matches_patterns(Path::new("/tmp/PKGBUILD"), &[]));
+        }
+
+        #[test]
+        fn exact_filename_match() {
+            let patterns = compile(&["PKGBUILD"]);
+            assert!(file_matches_patterns(
+                Path::new("/home/user/PKGBUILD"),
+                &patterns
+            ));
+        }
+
+        #[test]
+        fn exact_filename_no_match() {
+            let patterns = compile(&["PKGBUILD"]);
+            assert!(!file_matches_patterns(
+                Path::new("/home/user/script.sh"),
+                &patterns
+            ));
+        }
+
+        #[test]
+        fn glob_extension_match() {
+            let patterns = compile(&["*.ebuild"]);
+            assert!(file_matches_patterns(
+                Path::new("/repo/foo.ebuild"),
+                &patterns
+            ));
+        }
+
+        #[test]
+        fn glob_extension_no_match() {
+            let patterns = compile(&["*.ebuild"]);
+            assert!(!file_matches_patterns(Path::new("/repo/foo.rs"), &patterns));
+        }
+
+        #[test]
+        fn multiple_patterns_any_match() {
+            let patterns = compile(&["PKGBUILD", "*.ebuild"]);
+            assert!(file_matches_patterns(
+                Path::new("/repo/PKGBUILD"),
+                &patterns
+            ));
+            assert!(file_matches_patterns(
+                Path::new("/repo/foo.ebuild"),
+                &patterns
+            ));
+            assert!(!file_matches_patterns(
+                Path::new("/repo/script.sh"),
+                &patterns
+            ));
+        }
+
+        #[test]
+        fn no_filename_returns_false() {
+            // A path that is just "/" has no file_name component.
+            let patterns = compile(&["*"]);
+            assert!(!file_matches_patterns(Path::new("/"), &patterns));
+        }
+
+        #[test]
+        fn star_does_not_cross_separator() {
+            // LspGlob uses literal_separator(true): * should not match paths.
+            let patterns = compile(&["*.rs"]);
+            // "foo.rs" matches
+            assert!(file_matches_patterns(Path::new("/tmp/foo.rs"), &patterns));
+            // "src/foo.rs" as a single filename component would not occur,
+            // but matching against just the filename means this works normally.
+            assert!(file_matches_patterns(
+                Path::new("/project/src/foo.rs"),
+                &patterns
+            ));
+        }
+    }
+
+    // --- get_servers ---
+
+    #[tokio::test]
+    async fn test_get_servers_single_server() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        // Pre-spawn the server
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        // Use a capability that mockls supports (document symbols — all mockls
+        // instances advertise it).
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert_eq!(servers.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_capability_filter() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        // Use a capability that mockls does NOT support (pull diagnostics
+        // requires --pull-diagnostics flag which mockls_config doesn't set).
+        let servers = manager
+            .get_servers(&path, LspServer::supports_pull_diagnostics)
+            .await;
+        assert!(
+            servers.is_empty(),
+            "mockls (default) does not support pull diagnostics, should return empty"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_file_patterns_match() -> Result<()> {
+        // file_patterns filters within the language. Use a pattern that
+        // matches the filename of a file with the mock extension.
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-fp");
+        let pattern = "special.*".to_string();
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: vec![pattern.clone()],
+                compiled_patterns: vec![
+                    crate::lsp::glob::LspGlob::new(&pattern).expect("valid glob"),
+                ],
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
+            },
+        );
+        let config = Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+        };
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        // Filename "special.yX4Za" matches pattern "special.*"
+        let path = PathBuf::from(format!("/tmp/special.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert_eq!(
+            servers.len(),
+            1,
+            "special.{MOCK_LANG_A} should match file_patterns=[\"special.*\"]"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_file_patterns_no_match() -> Result<()> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-fp2");
+        let pattern = "special.*".to_string();
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: vec![pattern.clone()],
+                compiled_patterns: vec![
+                    crate::lsp::glob::LspGlob::new(&pattern).expect("valid glob"),
+                ],
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
+            },
+        );
+        let config = Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+        };
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        // Filename "other.yX4Za" does NOT match pattern "special.*"
+        let path = PathBuf::from(format!("/tmp/other.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert!(
+            servers.is_empty(),
+            "other.{MOCK_LANG_A} should not match file_patterns=[\"special.*\"]"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_file_patterns_glob() -> Result<()> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-fpg");
+        let pattern = format!("*.{MOCK_LANG_A}");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: vec![pattern.clone()],
+                compiled_patterns: vec![
+                    crate::lsp::glob::LspGlob::new(&pattern).expect("valid glob"),
+                ],
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
+            },
+        );
+        let config = Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+        };
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        let path = PathBuf::from(format!("/tmp/foo.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert_eq!(servers.len(), 1, "*.ext glob should match");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_empty_file_patterns() -> Result<()> {
+        // Server with no file_patterns matches all files for the language.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        let path = PathBuf::from(format!("/tmp/anything.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert_eq!(
+            servers.len(),
+            1,
+            "empty file_patterns should match all files"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_dead_server_skipped() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+        // Kill the server
+        client.lock().await.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert!(servers.is_empty(), "dead server should be skipped");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_outside_roots() {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let path = PathBuf::from(format!("/other/test.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert!(servers.is_empty(), "file outside roots should return empty");
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_unknown_language() {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let servers = manager
+            .get_servers(Path::new("/tmp/test.xyz"), LspServer::supports_hover)
+            .await;
+        assert!(servers.is_empty(), "unknown language should return empty");
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_priority_order() -> Result<()> {
+        // With multiple servers in the binding, result preserves order.
+        // (Currently only one server per language is spawned, so this test
+        // exercises the path ordering with a single entry — 1c-01 will
+        // extend it to multiple.)
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+        let _ = manager.ensure_server_for_language(MOCK_LANG_A).await?;
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert_eq!(servers.len(), 1);
+        Ok(())
+    }
 
     mod file_change_matching {
         use super::*;

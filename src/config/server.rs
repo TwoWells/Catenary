@@ -3,7 +3,10 @@
 
 //! Server definitions — how to run and configure a language server.
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
+
+use crate::lsp::glob::LspGlob;
 
 /// Server definition — how to run and configure a language server.
 ///
@@ -41,4 +44,28 @@ pub struct ServerDef {
     /// Example: `["PKGBUILD", "*.ebuild"]`
     #[serde(default)]
     pub file_patterns: Vec<String>,
+
+    /// Compiled glob patterns from `file_patterns`. Populated by
+    /// [`Self::compile_patterns`] after deserialization.
+    #[serde(skip)]
+    pub compiled_patterns: Vec<LspGlob>,
+}
+
+impl ServerDef {
+    /// Compiles `file_patterns` into [`LspGlob`] matchers.
+    ///
+    /// Called once after deserialization. Fails fast on invalid patterns
+    /// so `catenary doctor` can surface the issue at config load time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any pattern in `file_patterns` fails to compile.
+    pub fn compile_patterns(&mut self) -> Result<()> {
+        self.compiled_patterns = self
+            .file_patterns
+            .iter()
+            .map(|p| LspGlob::new(p).with_context(|| format!("file_patterns glob '{p}'")))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(())
+    }
 }
