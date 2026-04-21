@@ -291,41 +291,63 @@ impl DiagnosticsServer {
         Ok(DiagnosticsResult { content, count })
     }
 
-    /// Processes multiple file changes and returns a combined diagnostics string.
+    /// Processes multiple file changes and returns a combined diagnostics
+    /// summary.
     ///
-    /// Runs the full pipeline for each file (document sync, settle, severity
-    /// filtering, noise filtering, quick-fixes). Files with `[clean]` or
-    /// `[no language server]` results are omitted. Errors are best-effort
-    /// skipped.
+    /// Runs the full pipeline for each file and categorizes results:
+    /// - Files with diagnostics are listed with their formatted output.
+    /// - Clean files (server ran, no issues) are grouped on one line.
+    /// - Uncovered files (no language server) are grouped as N/A.
+    ///
+    /// File paths are displayed relative to their owning workspace root.
     pub async fn process_files(&self, files: &[&str], entry_id: i64) -> String {
         use std::fmt::Write;
 
         // Notify servers about filesystem changes once before the batch.
         self.client_manager.notify_file_changes().await;
 
-        let mut output = String::new();
+        let roots = self.client_manager.roots();
+        let rel = |file: &str| -> String {
+            let path = std::path::Path::new(file);
+            roots
+                .iter()
+                .filter_map(|r| path.strip_prefix(r).ok())
+                .min_by_key(|rel| rel.as_os_str().len())
+                .map_or_else(|| file.to_string(), |r| r.to_string_lossy().to_string())
+        };
+
+        let mut diagnostics_output = String::new();
+        let mut clean: Vec<String> = Vec::new();
+        let mut uncovered: Vec<String> = Vec::new();
 
         for &file in files {
             let Ok(result) = self.process_file(file, entry_id).await else {
+                uncovered.push(rel(file));
                 continue;
             };
 
-            if result.content.is_empty()
-                || result.content == "[clean]"
-                || result.content == "[no language server]"
-            {
-                continue;
-            }
-
-            if output.is_empty() {
-                output.push_str("diagnostics:\n");
-            }
-            _ = writeln!(output, "\t{file}");
-            for line in result.content.lines() {
-                _ = writeln!(output, "\t{line}");
+            match result.content.as_str() {
+                "[clean]" | "" => clean.push(rel(file)),
+                "[no language server]" => uncovered.push(rel(file)),
+                _ => {
+                    _ = writeln!(diagnostics_output, "{}:", rel(file));
+                    for line in result.content.lines() {
+                        _ = writeln!(diagnostics_output, "\t{line}");
+                    }
+                }
             }
         }
 
+        let mut output = String::new();
+        if !diagnostics_output.is_empty() {
+            output.push_str(&diagnostics_output);
+        }
+        if !clean.is_empty() {
+            _ = writeln!(output, "{}: clean", clean.join(", "));
+        }
+        if !uncovered.is_empty() {
+            _ = writeln!(output, "{}: N/A", uncovered.join(", "));
+        }
         output
     }
 }

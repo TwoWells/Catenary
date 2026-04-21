@@ -261,23 +261,22 @@ impl ToolHandler for McpRouter {
         if name == "done_editing" {
             let files = self.toolbox.editing.drain_all_and_clear();
 
-            if !files.is_empty() {
-                let file_strs: Vec<String> = files
-                    .iter()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect();
-                let file_refs: Vec<&str> = file_strs.iter().map(String::as_str).collect();
-                let entry_id = parent_id.unwrap_or(0);
-                let output = self
-                    .toolbox
-                    .runtime
-                    .block_on(self.toolbox.diagnostics.process_files(&file_refs, entry_id));
-
-                if !output.is_empty() {
-                    return Ok(CallToolResult::text(output));
-                }
+            if files.is_empty() {
+                return Ok(CallToolResult::text("[clean]"));
             }
-            return Ok(CallToolResult::text("[clean]"));
+
+            let file_strs: Vec<String> = files
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let file_refs: Vec<&str> = file_strs.iter().map(String::as_str).collect();
+            let entry_id = parent_id.unwrap_or(0);
+            let output = self
+                .toolbox
+                .runtime
+                .block_on(self.toolbox.diagnostics.process_files(&file_refs, entry_id));
+
+            return Ok(CallToolResult::text(output));
         }
 
         // Notify servers about filesystem changes before any LSP interaction.

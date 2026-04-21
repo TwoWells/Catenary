@@ -537,8 +537,8 @@ fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
-        text.contains("[clean]"),
-        "Server with no push and no pull should return [clean] after settle. Got: {text}"
+        text.contains("clean"),
+        "Server with no push and no pull should return clean after settle. Got: {text}"
     );
 
     Ok(())
@@ -606,18 +606,18 @@ fn test_pull_downgrade_no_push() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    // First call: pull fails → downgrade → [clean]
+    // First call: pull fails → downgrade → clean
     let text1 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text1.contains("[clean]"),
-        "Failed pull with no push should return [clean]. Got: {text1}"
+        text1.contains("clean"),
+        "Failed pull with no push should return clean. Got: {text1}"
     );
 
-    // Second call: pull skipped (downgraded) → [clean]
+    // Second call: pull skipped (downgraded) → clean
     let text2 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text2.contains("[clean]"),
-        "Downgraded server should return [clean] without retrying pull. Got: {text2}"
+        text2.contains("clean"),
+        "Downgraded server should return clean without retrying pull. Got: {text2}"
     );
 
     Ok(())
