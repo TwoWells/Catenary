@@ -227,7 +227,7 @@ impl ToolHandler for McpRouter {
             Tool {
                 name: "done_editing".to_string(),
                 title: Some("Done Editing".to_string()),
-                description: Some("Exit editing mode and return LSP diagnostics for all modified files. Must be called after start_editing before using non-Edit tools.".to_string()),
+                description: Some("Exit editing mode and return LSP diagnostics for all modified files. Must be called after start_editing before using non-Edit tools.\n\nOutput lists every modified file in one of three categories:\n- Diagnostics: file path followed by indented errors/warnings.\n- Clean: files where the language server found no issues (grouped on one line).\n- N/A: files with no language server coverage (grouped on one line).\n\nFile paths are relative to the workspace root.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},
