@@ -42,6 +42,7 @@ pub struct LspServer {
     capabilities: OnceLock<Value>,
 
     supports_pull_diagnostics: AtomicBool,
+    supports_text_document_sync: OnceLock<bool>,
     supports_hover: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
     supports_references: OnceLock<bool>,
@@ -117,6 +118,7 @@ impl LspServer {
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
+            supports_text_document_sync: OnceLock::new(),
             supports_hover: OnceLock::new(),
             supports_definition: OnceLock::new(),
             supports_references: OnceLock::new(),
@@ -210,6 +212,9 @@ impl LspServer {
         };
         self.supports_pull_diagnostics
             .store(has("diagnosticProvider"), Ordering::SeqCst);
+        let _ = self
+            .supports_text_document_sync
+            .set(has("textDocumentSync"));
         let _ = self.supports_hover.set(has("hoverProvider"));
         let _ = self.supports_definition.set(has("definitionProvider"));
         let _ = self.supports_references.set(has("referencesProvider"));
@@ -251,6 +256,20 @@ impl LspServer {
         self.capabilities
             .get()
             .unwrap_or_else(|| EMPTY.get_or_init(|| Value::Object(serde_json::Map::new())))
+    }
+
+    /// Returns whether the server can produce diagnostics.
+    ///
+    /// True if the server advertises `textDocumentSync` (push diagnostics
+    /// via `publishDiagnostics`) or `diagnosticProvider` (pull diagnostics
+    /// via `textDocument/diagnostic`). Used as the capability gate for
+    /// diagnostic dispatch in [`super::LspClientManager::get_servers`].
+    pub fn supports_diagnostics(&self) -> bool {
+        self.supports_text_document_sync
+            .get()
+            .copied()
+            .unwrap_or(false)
+            || self.supports_pull_diagnostics()
     }
 
     /// Returns whether the server supports pull diagnostics.

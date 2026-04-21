@@ -764,65 +764,63 @@ impl LspClientManager {
     /// Opens a document on all diagnostic-enabled servers for the file's
     /// language binding.
     ///
-    /// Resolves language, iterates bindings, checks
-    /// [`LanguageConfig::diagnostics_enabled`] for each server. Opens the
-    /// document on every matching server.
+    /// Uses [`get_servers`](Self::get_servers) with
+    /// [`LspServer::supports_diagnostics`] as the capability gate, then
+    /// filters by [`LanguageConfig::diagnostics_enabled`] (config-level
+    /// suppression). Opens the document on every remaining server.
     ///
     /// Returns `(uri, Vec of clients that have the document open)`.
-    /// Callers use this for diagnostic collection after settle.
+    /// Returns an empty Vec when no diagnostic-capable server is
+    /// available — callers should treat this the same as "no language
+    /// server." The URI is meaningless when the Vec is empty.
     ///
     /// # Errors
     ///
-    /// Returns an error if path resolution or file reading fails.
+    /// Returns an error if document opening fails on any server.
     pub async fn open_document_for_diagnostics(
         &self,
         path: &Path,
         parent_id: Option<i64>,
     ) -> Result<(String, Vec<Arc<Mutex<LspClient>>>)> {
-        let lang_id = self
-            .fs
-            .language_id(path)
-            .or_else(|| {
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| anyhow!("No language detected for {}", path.display()))?;
+        let servers = self
+            .get_servers(path, LspServer::supports_diagnostics)
+            .await;
 
-        let root = self
-            .fs
-            .resolve_root(path)
-            .ok_or_else(|| anyhow!("File outside all workspace roots: {}", path.display()))?;
+        if servers.is_empty() {
+            return Ok((String::new(), Vec::new()));
+        }
 
-        let lang_config = self
-            .config
-            .resolve_language(&lang_id)
-            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang_id}'"))?;
+        // Config-level filter: diagnostics_enabled AND per-binding flag.
+        let lang_id = self.fs.language_id(path).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        });
+        let lang_config = lang_id
+            .as_deref()
+            .and_then(|id| self.config.resolve_language(id));
 
-        let clients_map = self.clients.lock().await;
-        let mut result = Vec::new();
-        let mut uri = String::new();
-
-        for binding in &lang_config.servers {
-            if !lang_config.diagnostics_enabled(&binding.name) {
-                continue;
-            }
-
-            let Some(client) = find_instance(&clients_map, &lang_id, &binding.name, &root) else {
-                continue;
-            };
-
-            if client.lock().await.is_alive() {
-                result.push(client);
+        let mut clients = Vec::new();
+        for client in &servers {
+            let server_name = client.lock().await.server_name().to_string();
+            let enabled = lang_config
+                .as_ref()
+                .is_some_and(|lc| lc.diagnostics_enabled(&server_name));
+            if enabled {
+                clients.push(client.clone());
             }
         }
-        drop(clients_map);
 
-        for client in &result {
+        if clients.is_empty() {
+            return Ok((String::new(), Vec::new()));
+        }
+
+        let mut uri = String::new();
+        for client in &clients {
             uri = self.open_document_on(path, client, parent_id).await?;
         }
 
-        Ok((uri, result))
+        Ok((uri, clients))
     }
 
     /// Closes a document on a specific client.
