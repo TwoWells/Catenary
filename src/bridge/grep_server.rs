@@ -467,24 +467,55 @@ impl GrepServer {
 
 /// Promote-from-bottom tier selection.
 ///
-/// 1. Render tier 3 (bucketed). Always fits after degradation.
+/// 1. Estimate tier 2 size cheaply. If clearly over budget → skip to tier 3.
 /// 2. Render tier 2 (structure heatmap). If it fits → use tier 2.
-/// 3. Stub: if tier 2 fits, emit tier 2. (Ticket 07a replaces this with
-///    actual enrichment + promotion to tier 1.)
+///    (Ticket 07a adds: if tier 2 fits, try enrichment for tier 1.)
+/// 3. Fall back to tier 3 (bucketed). Always fits after degradation.
 fn select_and_render_tier(
     hits: &[GrepHit],
     budget: usize,
     fs_manager: &FilesystemManager,
 ) -> String {
-    // Render tier 2
-    let tier2 = render_tier2(hits, fs_manager);
-    if tier2.len() <= budget {
-        // Stub: emit tier 2. (07a replaces with enrichment attempt.)
-        return tier2;
+    // Cheap lower-bound estimate for tier 2 size: unique name lengths +
+    // unique path lengths + per-hit overhead. If the lower bound already
+    // exceeds the budget, tier 2 definitely won't fit.
+    if estimate_tier2_lower_bound(hits, fs_manager) <= budget {
+        let tier2 = render_tier2(hits, fs_manager);
+        if tier2.len() <= budget {
+            // Stub: emit tier 2. (07a replaces with enrichment attempt.)
+            return tier2;
+        }
     }
 
     // Tier 2 doesn't fit — fall back to tier 3 (bucketed)
     render_tier3(hits, budget, fs_manager)
+}
+
+/// Lower-bound estimate for tier 2 rendered size.
+///
+/// Sums unique name lengths, unique relative path lengths, and a
+/// per-hit minimum overhead. Avoids building the full output string.
+fn estimate_tier2_lower_bound(hits: &[GrepHit], fs_manager: &FilesystemManager) -> usize {
+    let mut unique_names: HashSet<&str> = HashSet::new();
+    let mut unique_paths: HashSet<String> = HashSet::new();
+
+    for hit in hits {
+        let name = match &hit.classification {
+            HitClass::Symbol { symbol } => symbol.name.as_str(),
+            _ => hit.matched_text.as_str(),
+        };
+        unique_names.insert(name);
+        unique_paths.insert(display_path(&hit.file.to_string_lossy(), fs_manager));
+    }
+
+    // Each unique name: name + newline
+    let name_cost: usize = unique_names.iter().map(|n| n.len() + 1).sum();
+    // Each unique path: tab(s) + dir + tab(s) + file + newline (~4 overhead)
+    let path_cost: usize = unique_paths.iter().map(|p| p.len() + 4).sum();
+    // Each hit: tabs + colon + digits + kind bracket + span (~15 minimum)
+    let hit_cost: usize = hits.len() * 15;
+
+    name_cost + path_cost + hit_cost
 }
 
 /// Tier 2: Structure heatmap.
@@ -494,33 +525,13 @@ fn select_and_render_tier(
 fn render_tier2(hits: &[GrepHit], fs_manager: &FilesystemManager) -> String {
     use std::fmt::Write;
 
-    // Group by name
-    let mut by_name: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
-    for hit in hits {
-        let key = match &hit.classification {
-            HitClass::Symbol { symbol } => symbol.name.clone(),
-            _ => hit.matched_text.clone(),
-        };
-        by_name.entry(key).or_default().push(hit);
-    }
-
+    let by_name = group_hits_by_name(hits);
     let mut output = String::new();
 
     for (name, group) in &by_name {
         let _ = writeln!(output, "{name}");
 
-        // Group by directory, then file
-        let mut by_dir_file: BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>> = BTreeMap::new();
-        for hit in group {
-            let rel = display_path(&hit.file.to_string_lossy(), fs_manager);
-            let (dir, file) = split_dir_file(&rel);
-            by_dir_file
-                .entry(dir)
-                .or_default()
-                .entry(file)
-                .or_default()
-                .push(hit);
-        }
+        let by_dir_file = group_hits_by_dir_file(group, fs_manager);
 
         for (dir, files) in &by_dir_file {
             if !dir.is_empty() {
@@ -543,23 +554,17 @@ fn render_tier2(hits: &[GrepHit], fs_manager: &FilesystemManager) -> String {
     output
 }
 
-/// Tier 3: Bucketed patterns.
+/// Tier 3: Bucketed patterns with per-bucket equal budget.
 ///
-/// Matched strings bucketed into drillable sub-patterns with file trees.
-/// Expanded buckets show file-level detail with enclosing structures.
-/// Collapsed buckets are bare handles with count.
+/// Matched strings bucketed into drillable sub-patterns. Each expanded
+/// bucket gets an equal share of the rendering budget. Within its share
+/// the bucket tries file-level detail first, then falls back to directory
+/// counts. Bare-handle buckets (from the bucketing module's own
+/// degradation) are rendered as-is.
 fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager) -> String {
     use std::fmt::Write;
 
-    // Collect unique matched texts and map them to their hits
-    let mut text_to_hits: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
-    for hit in hits {
-        let key = match &hit.classification {
-            HitClass::Symbol { symbol } => symbol.name.clone(),
-            _ => hit.matched_text.clone(),
-        };
-        text_to_hits.entry(key).or_default().push(hit);
-    }
+    let text_to_hits = group_hits_by_name(hits);
 
     // Build bucket entries from unique matched texts
     let bucket_input: Vec<BucketEntry> = text_to_hits
@@ -571,6 +576,20 @@ fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager)
         .collect();
 
     let buckets = bucketing::bucket(&bucket_input, budget, true);
+
+    // Compute per-bucket budget: divide equally among expanded buckets.
+    let expanded_count = buckets.iter().filter(|b| b.entries.is_some()).count();
+    // Reserve space for bare handles.
+    let bare_cost: usize = buckets
+        .iter()
+        .filter(|b| b.entries.is_none())
+        .map(|b| b.pattern.len() + count_digits(b.count) + 5) // "pattern (N)\n"
+        .sum();
+    let per_bucket_budget = if expanded_count > 0 {
+        budget.saturating_sub(bare_cost) / expanded_count
+    } else {
+        0
+    };
 
     let mut output = String::new();
 
@@ -585,48 +604,37 @@ fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager)
             continue;
         }
 
-        // Expanded bucket: show file-level detail
-        let prefix = b.pattern.trim_end_matches('*');
+        // Bucket header
+        let header = render_bucket_header(b);
+        let _ = write!(output, "{header}");
 
-        // Collect all hits belonging to this bucket
-        let bucket_hits: Vec<&&GrepHit> = text_to_hits
+        // Collect hits for this bucket
+        let prefix = b.pattern.trim_end_matches('*');
+        let bucket_hits: Vec<&GrepHit> = text_to_hits
             .iter()
-            .filter(|(k, _)| k.starts_with(prefix) || b.count == 1)
-            .flat_map(|(_, v)| v)
+            .filter(|(k, _)| {
+                if b.count == 1 {
+                    b.entries
+                        .as_ref()
+                        .and_then(|e| e.first())
+                        .is_some_and(|e| e.value == **k)
+                } else {
+                    k.starts_with(prefix)
+                }
+            })
+            .flat_map(|(_, v)| v.iter().copied())
             .collect();
 
-        // Single-entry bucket: show the full string as the header
-        if b.count == 1
-            && let Some(entries) = &b.entries
-            && let Some(entry) = entries.first()
-        {
-            let _ = write!(output, "{}", entry.value);
-        } else {
-            let _ = write!(output, "{}", b.pattern);
-        }
+        let by_dir_file = group_hits_by_dir_file(&bucket_hits, fs_manager);
 
-        // Group by directory with counts for collapsed dirs
-        let mut by_dir_file: BTreeMap<String, BTreeMap<String, Vec<&&GrepHit>>> = BTreeMap::new();
-        for hit in &bucket_hits {
-            let rel = display_path(&hit.file.to_string_lossy(), fs_manager);
-            let (dir, file) = split_dir_file(&rel);
-            by_dir_file
-                .entry(dir)
-                .or_default()
-                .entry(file)
-                .or_default()
-                .push(hit);
-        }
-
-        // Render file tree under the bucket header
-        // Check if expanded detail fits within remaining budget
-        let detail = render_tier3_detail(&by_dir_file);
-        if output.len() + detail.len() <= budget {
+        // Try file detail within this bucket's budget share
+        let detail = render_bucket_file_detail(&by_dir_file);
+        if header.len() + detail.len() <= per_bucket_budget {
             output.push_str(&detail);
         } else {
-            // Collapse to directory counts
-            let dir_summary = render_tier3_dir_counts(&by_dir_file);
-            output.push_str(&dir_summary);
+            // Fall back to directory counts
+            let dir_counts = render_bucket_dir_counts(&by_dir_file);
+            output.push_str(&dir_counts);
         }
     }
 
@@ -635,8 +643,23 @@ fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager)
     output
 }
 
-/// Renders expanded file-level detail for a tier 3 bucket.
-fn render_tier3_detail(by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&&GrepHit>>>) -> String {
+/// Renders the header line for a tier 3 bucket.
+fn render_bucket_header(b: &bucketing::Bucket) -> String {
+    if b.count == 1
+        && let Some(entries) = &b.entries
+        && let Some(entry) = entries.first()
+    {
+        entry.value.clone()
+    } else {
+        b.pattern.clone()
+    }
+}
+
+/// Renders file-level detail for a bucket: directory tree with per-file
+/// hit lines and enclosing structures.
+fn render_bucket_file_detail(
+    by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>>,
+) -> String {
     use std::fmt::Write;
     let mut out = String::new();
 
@@ -658,9 +681,10 @@ fn render_tier3_detail(by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&&Gre
     out
 }
 
-/// Renders collapsed directory counts for a tier 3 bucket.
-fn render_tier3_dir_counts(
-    by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&&GrepHit>>>,
+/// Renders directory counts for a bucket: each directory with its total
+/// hit count.
+fn render_bucket_dir_counts(
+    by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>>,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -672,6 +696,52 @@ fn render_tier3_dir_counts(
     }
 
     out
+}
+
+/// Groups hits by extracted identifier name (`BTreeMap` for stable order).
+fn group_hits_by_name(hits: &[GrepHit]) -> BTreeMap<String, Vec<&GrepHit>> {
+    let mut by_name: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
+    for hit in hits {
+        let key = match &hit.classification {
+            HitClass::Symbol { symbol } => symbol.name.clone(),
+            _ => hit.matched_text.clone(),
+        };
+        by_name.entry(key).or_default().push(hit);
+    }
+    by_name
+}
+
+/// Groups hits by directory and file for tree rendering.
+fn group_hits_by_dir_file<'a>(
+    hits: &[&'a GrepHit],
+    fs_manager: &FilesystemManager,
+) -> BTreeMap<String, BTreeMap<String, Vec<&'a GrepHit>>> {
+    let mut by_dir_file: BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>> = BTreeMap::new();
+    for hit in hits {
+        let rel = display_path(&hit.file.to_string_lossy(), fs_manager);
+        let (dir, file) = split_dir_file(&rel);
+        by_dir_file
+            .entry(dir)
+            .or_default()
+            .entry(file)
+            .or_default()
+            .push(hit);
+    }
+    by_dir_file
+}
+
+/// Number of decimal digits in a `usize`.
+const fn count_digits(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut digits = 0;
+    let mut val = n;
+    while val > 0 {
+        digits += 1;
+        val /= 10;
+    }
+    digits
 }
 
 /// Formats a single hit line with enclosing structure.
@@ -1266,6 +1336,87 @@ mod tests {
             output.contains(')'),
             "expected bare handle counts: {output}"
         );
+    }
+
+    #[test]
+    fn test_tier3_per_bucket_equal_budget() {
+        let fs = test_fs("/project");
+
+        // Two clusters: 5 "alpha" hits, 5 "beta" hits.
+        // With enough budget for dir counts but not full file detail for
+        // all, both clusters should get the same level of detail.
+        let mut hits = Vec::new();
+        for i in 0..5 {
+            hits.push(sym_hit(
+                &format!("/project/src/alpha_{i}.rs"),
+                i * 10,
+                &format!("test_alpha_{i}"),
+                "function",
+            ));
+        }
+        for i in 0..5 {
+            hits.push(sym_hit(
+                &format!("/project/src/beta_{i}.rs"),
+                i * 10,
+                &format!("test_beta_{i}"),
+                "function",
+            ));
+        }
+
+        // Budget large enough for dir counts on both, not file detail
+        let output = render_tier3(&hits, 300, &fs);
+
+        // Both clusters should appear in the output
+        let has_alpha = output.contains("alpha");
+        let has_beta = output.contains("beta");
+        assert!(
+            has_alpha && has_beta,
+            "both clusters should appear: {output}"
+        );
+
+        // If one has dir counts, the other should too (uniform detail)
+        let alpha_has_dir_count = output.contains("src/") && output.contains('(');
+        if alpha_has_dir_count {
+            // Count how many dir-count lines exist — should be balanced
+            let dir_count_count = output
+                .lines()
+                .filter(|l| l.contains('(') && l.contains(')') && l.trim().starts_with("src/"))
+                .count();
+            // With two clusters, we expect either 0 or 2 dir-count lines
+            // (not 1, which would mean one cluster got counts and the other didn't)
+            assert!(
+                dir_count_count != 1,
+                "expected uniform detail across buckets (0 or 2 dir counts, got 1): {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tier2_estimate_skips_render() {
+        let fs = test_fs("/project");
+
+        // Many hits — estimate should exceed a tiny budget
+        let mut hits = Vec::new();
+        for i in 0..200 {
+            hits.push(sym_hit(
+                &format!("/project/src/very_long_directory_name/file_{i}.rs"),
+                i,
+                &format!("a_very_long_symbol_name_{i}"),
+                "function",
+            ));
+        }
+
+        // The estimate should be well over 100
+        let estimate = estimate_tier2_lower_bound(&hits, &fs);
+        assert!(
+            estimate > 100,
+            "estimate should exceed tiny budget, got {estimate}"
+        );
+
+        // select_and_render_tier should produce tier 3, not tier 2
+        let output = select_and_render_tier(&hits, 100, &fs);
+        let has_bucket = output.contains('*') || output.contains('(');
+        assert!(has_bucket, "expected tier 3 (bucketed): {output}");
     }
 
     // ─── format_hit_line tests ──────────────────────────────────────────
