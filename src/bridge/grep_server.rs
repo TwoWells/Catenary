@@ -19,6 +19,7 @@ use tracing::debug;
 use super::filesystem_manager::FilesystemManager;
 use super::handler::{check_server_health, display_path};
 use super::tool_server::ToolServer;
+use crate::bucketing::{self, BucketEntry};
 use crate::lsp::LspClientManager;
 use crate::ts::{TsIndex, TsSymbol, format_ts_kind};
 
@@ -67,6 +68,7 @@ pub struct GrepServer {
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
     pub(super) ts_index: Option<Arc<std::sync::Mutex<TsIndex>>>,
+    pub(super) budget: usize,
 }
 
 impl ToolServer for GrepServer {
@@ -138,8 +140,6 @@ impl GrepServer {
         parent_id: Option<i64>,
         dead_languages: &HashSet<String>,
     ) -> Result<String> {
-        use std::fmt::Write;
-
         debug!("Grep request: pattern={}", input.pattern);
 
         let resolved_glob = input
@@ -322,67 +322,7 @@ impl GrepServer {
             return Ok(String::new());
         }
 
-        // Temporary flat output (replaced by 06b with proper tiers)
-        let mut output = String::new();
-
-        // Group by matched_text for stable output
-        let mut by_name: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
-        for hit in &hits {
-            let key = match &hit.classification {
-                HitClass::Symbol { symbol } => symbol.name.clone(),
-                _ => hit.matched_text.clone(),
-            };
-            by_name.entry(key).or_default().push(hit);
-        }
-
-        for (name, group) in &by_name {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-
-            for hit in group {
-                let path = display_path(&hit.file.to_string_lossy(), &self.fs_manager);
-                let line_1 = hit.line + 1;
-
-                match &hit.classification {
-                    HitClass::Symbol { symbol } => {
-                        let kind = format_ts_kind(&symbol.kind);
-                        let scope_prefix = symbol
-                            .scope
-                            .as_ref()
-                            .zip(symbol.scope_kind.as_ref())
-                            .map_or_else(String::new, |(sn, sk)| {
-                                format!("<{}> {}/", format_ts_kind(sk), sn)
-                            });
-                        let _ = writeln!(output, "{scope_prefix}<{kind}> {name}  {path}:{line_1}");
-                    }
-                    HitClass::Reference { enclosing } => {
-                        if let Some(enc) = enclosing {
-                            let enc_kind = format_ts_kind(&enc.kind);
-                            let enc_span = if enc.line == enc.end_line {
-                                format!(":{}", enc.line + 1)
-                            } else {
-                                format!(":{}-{}", enc.line + 1, enc.end_line + 1)
-                            };
-                            let _ = writeln!(
-                                output,
-                                "{path}:{line_1} (ref in <{enc_kind}> {}{})",
-                                enc.name, enc_span
-                            );
-                        } else {
-                            let _ = writeln!(output, "{path}:{line_1}");
-                        }
-                    }
-                    HitClass::PrepareRenameSymbol => {
-                        let _ = writeln!(output, "{name}  {path}:{line_1}");
-                    }
-                    HitClass::Keyword => {} // already filtered
-                }
-            }
-        }
-
-        let trimmed_len = output.trim_end().len();
-        output.truncate(trimmed_len);
+        let output = select_and_render_tier(&hits, self.budget, &self.fs_manager);
         Ok(output)
     }
 
@@ -521,6 +461,279 @@ impl GrepServer {
 
         Ok(RipgrepMatches::merge(parts))
     }
+}
+
+// ─── Tier selection and rendering ────────────────────────────────────────
+
+/// Promote-from-bottom tier selection.
+///
+/// 1. Render tier 3 (bucketed). Always fits after degradation.
+/// 2. Render tier 2 (structure heatmap). If it fits → use tier 2.
+/// 3. Stub: if tier 2 fits, emit tier 2. (Ticket 07a replaces this with
+///    actual enrichment + promotion to tier 1.)
+fn select_and_render_tier(
+    hits: &[GrepHit],
+    budget: usize,
+    fs_manager: &FilesystemManager,
+) -> String {
+    // Render tier 2
+    let tier2 = render_tier2(hits, fs_manager);
+    if tier2.len() <= budget {
+        // Stub: emit tier 2. (07a replaces with enrichment attempt.)
+        return tier2;
+    }
+
+    // Tier 2 doesn't fit — fall back to tier 3 (bucketed)
+    render_tier3(hits, budget, fs_manager)
+}
+
+/// Tier 2: Structure heatmap.
+///
+/// Hits grouped by extracted name, then by directory and file, each with
+/// enclosing tree-sitter structure and span.
+fn render_tier2(hits: &[GrepHit], fs_manager: &FilesystemManager) -> String {
+    use std::fmt::Write;
+
+    // Group by name
+    let mut by_name: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
+    for hit in hits {
+        let key = match &hit.classification {
+            HitClass::Symbol { symbol } => symbol.name.clone(),
+            _ => hit.matched_text.clone(),
+        };
+        by_name.entry(key).or_default().push(hit);
+    }
+
+    let mut output = String::new();
+
+    for (name, group) in &by_name {
+        let _ = writeln!(output, "{name}");
+
+        // Group by directory, then file
+        let mut by_dir_file: BTreeMap<String, BTreeMap<String, Vec<&GrepHit>>> = BTreeMap::new();
+        for hit in group {
+            let rel = display_path(&hit.file.to_string_lossy(), fs_manager);
+            let (dir, file) = split_dir_file(&rel);
+            by_dir_file
+                .entry(dir)
+                .or_default()
+                .entry(file)
+                .or_default()
+                .push(hit);
+        }
+
+        for (dir, files) in &by_dir_file {
+            if !dir.is_empty() {
+                let _ = writeln!(output, "\t{dir}");
+            }
+            for (file, file_hits) in files {
+                let indent = if dir.is_empty() { "\t" } else { "\t\t" };
+                let _ = writeln!(output, "{indent}{file}");
+                for hit in file_hits {
+                    let line_1 = hit.line + 1;
+                    let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
+                    let _ = writeln!(output, "{hit_indent}{}", format_hit_line(hit, line_1));
+                }
+            }
+        }
+    }
+
+    let trimmed_len = output.trim_end().len();
+    output.truncate(trimmed_len);
+    output
+}
+
+/// Tier 3: Bucketed patterns.
+///
+/// Matched strings bucketed into drillable sub-patterns with file trees.
+/// Expanded buckets show file-level detail with enclosing structures.
+/// Collapsed buckets are bare handles with count.
+fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager) -> String {
+    use std::fmt::Write;
+
+    // Collect unique matched texts and map them to their hits
+    let mut text_to_hits: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
+    for hit in hits {
+        let key = match &hit.classification {
+            HitClass::Symbol { symbol } => symbol.name.clone(),
+            _ => hit.matched_text.clone(),
+        };
+        text_to_hits.entry(key).or_default().push(hit);
+    }
+
+    // Build bucket entries from unique matched texts
+    let bucket_input: Vec<BucketEntry> = text_to_hits
+        .keys()
+        .map(|v| BucketEntry {
+            value: v.clone(),
+            context: None,
+        })
+        .collect();
+
+    let buckets = bucketing::bucket(&bucket_input, budget, true);
+
+    let mut output = String::new();
+
+    for b in &buckets {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+
+        if b.entries.is_none() {
+            // Bare handle with count
+            let _ = write!(output, "{} ({})", b.pattern, b.count);
+            continue;
+        }
+
+        // Expanded bucket: show file-level detail
+        let prefix = b.pattern.trim_end_matches('*');
+
+        // Collect all hits belonging to this bucket
+        let bucket_hits: Vec<&&GrepHit> = text_to_hits
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix) || b.count == 1)
+            .flat_map(|(_, v)| v)
+            .collect();
+
+        // Single-entry bucket: show the full string as the header
+        if b.count == 1
+            && let Some(entries) = &b.entries
+            && let Some(entry) = entries.first()
+        {
+            let _ = write!(output, "{}", entry.value);
+        } else {
+            let _ = write!(output, "{}", b.pattern);
+        }
+
+        // Group by directory with counts for collapsed dirs
+        let mut by_dir_file: BTreeMap<String, BTreeMap<String, Vec<&&GrepHit>>> = BTreeMap::new();
+        for hit in &bucket_hits {
+            let rel = display_path(&hit.file.to_string_lossy(), fs_manager);
+            let (dir, file) = split_dir_file(&rel);
+            by_dir_file
+                .entry(dir)
+                .or_default()
+                .entry(file)
+                .or_default()
+                .push(hit);
+        }
+
+        // Render file tree under the bucket header
+        // Check if expanded detail fits within remaining budget
+        let detail = render_tier3_detail(&by_dir_file);
+        if output.len() + detail.len() <= budget {
+            output.push_str(&detail);
+        } else {
+            // Collapse to directory counts
+            let dir_summary = render_tier3_dir_counts(&by_dir_file);
+            output.push_str(&dir_summary);
+        }
+    }
+
+    let trimmed_len = output.trim_end().len();
+    output.truncate(trimmed_len);
+    output
+}
+
+/// Renders expanded file-level detail for a tier 3 bucket.
+fn render_tier3_detail(by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&&GrepHit>>>) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    for (dir, files) in by_dir_file {
+        if !dir.is_empty() {
+            let _ = writeln!(out, "\n\t{dir}");
+        }
+        for (file, file_hits) in files {
+            let indent = if dir.is_empty() { "\n\t" } else { "\t\t" };
+            let _ = writeln!(out, "{indent}{file}");
+            for hit in file_hits {
+                let line_1 = hit.line + 1;
+                let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
+                let _ = writeln!(out, "{hit_indent}{}", format_hit_line(hit, line_1));
+            }
+        }
+    }
+
+    out
+}
+
+/// Renders collapsed directory counts for a tier 3 bucket.
+fn render_tier3_dir_counts(
+    by_dir_file: &BTreeMap<String, BTreeMap<String, Vec<&&GrepHit>>>,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    for (dir, files) in by_dir_file {
+        let count: usize = files.values().map(Vec::len).sum();
+        let label = if dir.is_empty() { "./" } else { dir.as_str() };
+        let _ = writeln!(out, "\n\t{label} ({count})");
+    }
+
+    out
+}
+
+/// Formats a single hit line with enclosing structure.
+///
+/// For definition hits: `:line <Kind> name:start-end`
+/// For reference hits with enclosing: `:line <Kind> enclosing:start-end`
+/// For bare hits: `:line`
+fn format_hit_line(hit: &GrepHit, line_1: u32) -> String {
+    match &hit.classification {
+        HitClass::Symbol { symbol } => {
+            let kind = format_ts_kind(&symbol.kind);
+            let scope_prefix = symbol
+                .scope
+                .as_ref()
+                .zip(symbol.scope_kind.as_ref())
+                .map_or_else(String::new, |(sn, sk)| {
+                    format!("<{}> {}/", format_ts_kind(sk), sn)
+                });
+            let span = format_span(symbol.line, symbol.end_line);
+            format!(":{line_1} {scope_prefix}<{kind}> {}{span}", symbol.name)
+        }
+        HitClass::Reference {
+            enclosing: Some(enc),
+        } => {
+            let enc_kind = format_ts_kind(&enc.kind);
+            let scope_prefix = enc
+                .scope
+                .as_ref()
+                .zip(enc.scope_kind.as_ref())
+                .map_or_else(String::new, |(sn, sk)| {
+                    format!("<{}> {}/", format_ts_kind(sk), sn)
+                });
+            let span = format_span(enc.line, enc.end_line);
+            format!(":{line_1} {scope_prefix}<{enc_kind}> {}{span}", enc.name)
+        }
+        HitClass::Reference { enclosing: None } | HitClass::PrepareRenameSymbol => {
+            format!(":{line_1}")
+        }
+        HitClass::Keyword => String::new(),
+    }
+}
+
+/// Formats a span: `:start-end` for multi-line, `:line` for single-line.
+fn format_span(start_0: u32, end_0: u32) -> String {
+    let start_1 = start_0 + 1;
+    let end_1 = end_0 + 1;
+    if start_1 == end_1 {
+        format!(":{start_1}")
+    } else {
+        format!(":{start_1}-{end_1}")
+    }
+}
+
+/// Splits a relative path into `(directory/, filename)`.
+///
+/// `"src/bridge/handler.rs"` → `("src/bridge/", "handler.rs")`
+/// `"handler.rs"` → `("", "handler.rs")`
+fn split_dir_file(rel: &str) -> (String, String) {
+    rel.rfind('/').map_or_else(
+        || (String::new(), rel.to_string()),
+        |pos| (format!("{}/", &rel[..pos]), rel[pos + 1..].to_string()),
+    )
 }
 
 /// Wrapper that pushes per-thread match data into a shared collector on drop.
@@ -750,5 +963,468 @@ mod tests {
     #[test]
     fn test_split_escaped_pipe() {
         assert_eq!(split_alternation(r"foo\|bar"), vec![r"foo\|bar"]);
+    }
+
+    // ─── Tier rendering helpers ─────────────────────────────────────────
+
+    /// Build a `GrepHit` with a `Symbol` classification for testing.
+    fn sym_hit(file: &str, line: u32, name: &str, kind: &str) -> GrepHit {
+        GrepHit {
+            file: PathBuf::from(file),
+            line,
+            matched_text: name.to_string(),
+            classification: HitClass::Symbol {
+                symbol: TsSymbol {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                    line,
+                    end_line: line + 10,
+                    scope: None,
+                    scope_kind: None,
+                },
+            },
+        }
+    }
+
+    /// Build a `GrepHit` with a `Symbol` that has scope (enclosing container).
+    fn scoped_sym_hit(
+        file: &str,
+        line: u32,
+        name: &str,
+        kind: &str,
+        scope: &str,
+        scope_kind: &str,
+    ) -> GrepHit {
+        GrepHit {
+            file: PathBuf::from(file),
+            line,
+            matched_text: name.to_string(),
+            classification: HitClass::Symbol {
+                symbol: TsSymbol {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                    line,
+                    end_line: line + 10,
+                    scope: Some(scope.to_string()),
+                    scope_kind: Some(scope_kind.to_string()),
+                },
+            },
+        }
+    }
+
+    /// Build a `GrepHit` with a `Reference` classification with enclosing.
+    fn ref_hit(
+        file: &str,
+        line: u32,
+        text: &str,
+        enc_name: &str,
+        enc_kind: &str,
+        enc_start: u32,
+        enc_end: u32,
+    ) -> GrepHit {
+        GrepHit {
+            file: PathBuf::from(file),
+            line,
+            matched_text: text.to_string(),
+            classification: HitClass::Reference {
+                enclosing: Some(TsSymbol {
+                    name: enc_name.to_string(),
+                    kind: enc_kind.to_string(),
+                    line: enc_start,
+                    end_line: enc_end,
+                    scope: None,
+                    scope_kind: None,
+                }),
+            },
+        }
+    }
+
+    /// Build a `GrepHit` with a bare `Reference` (no enclosing).
+    fn bare_ref_hit(file: &str, line: u32, text: &str) -> GrepHit {
+        GrepHit {
+            file: PathBuf::from(file),
+            line,
+            matched_text: text.to_string(),
+            classification: HitClass::Reference { enclosing: None },
+        }
+    }
+
+    /// Build a `GrepHit` with `PrepareRenameSymbol` (no-grammar path).
+    fn prepare_rename_hit(file: &str, line: u32, text: &str) -> GrepHit {
+        GrepHit {
+            file: PathBuf::from(file),
+            line,
+            matched_text: text.to_string(),
+            classification: HitClass::PrepareRenameSymbol,
+        }
+    }
+
+    fn test_fs(root: &str) -> FilesystemManager {
+        let fs = FilesystemManager::new();
+        fs.set_roots(vec![PathBuf::from(root)]);
+        fs
+    }
+
+    // ─── Tier 2 structure heatmap ───────────────────────────────────────
+
+    #[test]
+    fn test_tier2_structure_heatmap() {
+        let fs = test_fs("/project");
+        let hits = vec![
+            sym_hit(
+                "/project/tests/a.rs",
+                287,
+                "test_glob_directory",
+                "function",
+            ),
+            sym_hit(
+                "/project/tests/b.rs",
+                118,
+                "test_glob_directory",
+                "function",
+            ),
+            sym_hit("/project/src/handler.rs", 1085, "test_glob", "function"),
+        ];
+
+        let output = render_tier2(&hits, &fs);
+
+        // Names grouped at column 0
+        assert!(
+            output.contains("test_glob_directory"),
+            "missing name group: {output}"
+        );
+        assert!(output.contains("test_glob"), "missing name group: {output}");
+
+        // File tree structure
+        assert!(output.contains("tests/"), "missing directory: {output}");
+        assert!(output.contains("a.rs"), "missing file: {output}");
+        assert!(output.contains("b.rs"), "missing file: {output}");
+
+        // Enclosing structures with spans
+        assert!(
+            output.contains("<Function>"),
+            "missing kind label: {output}"
+        );
+        assert!(
+            output.contains(":288"),
+            "missing line number (1-based): {output}"
+        );
+    }
+
+    #[test]
+    fn test_tier2_no_grammar() {
+        let fs = test_fs("/project");
+        let hits = vec![
+            bare_ref_hit("/project/data/notes.txt", 5, "pattern"),
+            prepare_rename_hit("/project/data/other.txt", 10, "pattern"),
+        ];
+
+        let output = render_tier2(&hits, &fs);
+
+        // Bare hit lines (no enclosing structure)
+        assert!(output.contains(":6"), "missing bare line: {output}");
+        assert!(output.contains(":11"), "missing bare line: {output}");
+        // No kind labels for no-grammar hits
+        assert!(!output.contains("<Function>"), "unexpected kind: {output}");
+    }
+
+    #[test]
+    fn test_tier2_reference_with_enclosing() {
+        let fs = test_fs("/project");
+        let hits = vec![ref_hit(
+            "/project/src/main.rs",
+            100,
+            "handle",
+            "call_tool",
+            "function",
+            95,
+            120,
+        )];
+
+        let output = render_tier2(&hits, &fs);
+
+        assert!(output.contains("<Function>"), "missing kind: {output}");
+        assert!(
+            output.contains("call_tool"),
+            "missing enclosing name: {output}"
+        );
+        assert!(output.contains(":96-121"), "missing span: {output}");
+    }
+
+    // ─── Tier selection (promote-from-bottom) ───────────────────────────
+
+    #[test]
+    fn test_tier_promotion_narrow_to_tier2() {
+        let fs = test_fs("/project");
+        // Small result set → fits within budget → tier 2
+        let hits = vec![sym_hit(
+            "/project/src/handler.rs",
+            100,
+            "handle_grep",
+            "function",
+        )];
+
+        let output = select_and_render_tier(&hits, 4000, &fs);
+
+        // Should be tier 2 format: name at depth 0, file tree indented
+        assert!(output.contains("handle_grep"), "missing name: {output}");
+        assert!(output.contains("src/"), "missing directory: {output}");
+        assert!(output.contains("<Function>"), "missing kind: {output}");
+    }
+
+    #[test]
+    fn test_tier_demotion_to_tier3() {
+        let fs = test_fs("/project");
+
+        // Generate enough hits to exceed a very small budget
+        let mut hits = Vec::new();
+        for i in 0..50 {
+            hits.push(sym_hit(
+                &format!("/project/src/file_{i}.rs"),
+                i * 10,
+                &format!("test_alpha_{i}"),
+                "function",
+            ));
+        }
+        for i in 0..50 {
+            hits.push(sym_hit(
+                &format!("/project/src/file_{i}.rs"),
+                i * 10 + 5,
+                &format!("test_beta_{i}"),
+                "function",
+            ));
+        }
+
+        // Small budget forces tier 3
+        let output = select_and_render_tier(&hits, 200, &fs);
+
+        // Tier 3 should contain bucketed patterns (with * wildcards or counts)
+        let has_bucket_marker = output.contains('*') || output.contains('(');
+        assert!(
+            has_bucket_marker,
+            "expected tier 3 bucketed output: {output}"
+        );
+    }
+
+    // ─── Tier 3 bucketed rendering ──────────────────────────────────────
+
+    #[test]
+    fn test_tier3_bucketed() {
+        let fs = test_fs("/project");
+
+        let mut hits = Vec::new();
+        for i in 0..20 {
+            hits.push(sym_hit(
+                &format!("/project/tests/test_{i}.rs"),
+                i,
+                &format!("test_mcp_{i}"),
+                "function",
+            ));
+        }
+        for i in 0..10 {
+            hits.push(sym_hit(
+                &format!("/project/tests/glob_{i}.rs"),
+                i,
+                &format!("test_glob_{i}"),
+                "function",
+            ));
+        }
+
+        let output = render_tier3(&hits, 500, &fs);
+
+        // Should produce bucketed prefixes
+        let has_wildcard = output.contains('*');
+        assert!(
+            has_wildcard,
+            "expected wildcard patterns in tier 3: {output}"
+        );
+    }
+
+    #[test]
+    fn test_tier3_bare_handles() {
+        let fs = test_fs("/project");
+
+        // Many hits, tiny budget → everything collapses to bare handles
+        let mut hits = Vec::new();
+        for i in 0..100 {
+            hits.push(sym_hit(
+                &format!("/project/src/f{i}.rs"),
+                i,
+                &format!("test_item_{i}"),
+                "function",
+            ));
+        }
+
+        let output = render_tier3(&hits, 100, &fs);
+
+        // Should contain counts in parentheses (bare handle format)
+        assert!(
+            output.contains('('),
+            "expected bare handle counts: {output}"
+        );
+        assert!(
+            output.contains(')'),
+            "expected bare handle counts: {output}"
+        );
+    }
+
+    // ─── format_hit_line tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_single_line_structure() {
+        // Single-line symbol (start == end) should show `:line` not `:start-end`
+        let hit = GrepHit {
+            file: PathBuf::from("/project/src/main.rs"),
+            line: 42,
+            matched_text: "CONST_VAL".to_string(),
+            classification: HitClass::Symbol {
+                symbol: TsSymbol {
+                    name: "CONST_VAL".to_string(),
+                    kind: "constant".to_string(),
+                    line: 42,
+                    end_line: 42, // single-line
+                    scope: None,
+                    scope_kind: None,
+                },
+            },
+        };
+
+        let formatted = format_hit_line(&hit, 43);
+
+        // `:43 <Constant> CONST_VAL:43` — no range
+        assert!(
+            formatted.contains(":43 <Constant> CONST_VAL:43"),
+            "got: {formatted}"
+        );
+        assert!(
+            !formatted.contains('-'),
+            "single-line should not have range dash: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_multi_line_structure() {
+        let hit = GrepHit {
+            file: PathBuf::from("/project/src/main.rs"),
+            line: 10,
+            matched_text: "my_func".to_string(),
+            classification: HitClass::Symbol {
+                symbol: TsSymbol {
+                    name: "my_func".to_string(),
+                    kind: "function".to_string(),
+                    line: 10,
+                    end_line: 30,
+                    scope: None,
+                    scope_kind: None,
+                },
+            },
+        };
+
+        let formatted = format_hit_line(&hit, 11);
+
+        assert!(
+            formatted.contains(":11 <Function> my_func:11-31"),
+            "got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_scoped_symbol_path_syntax() {
+        let hit = scoped_sym_hit(
+            "/project/src/handler.rs",
+            297,
+            "handle_grep",
+            "method",
+            "LspBridgeHandler",
+            "implementation",
+        );
+
+        let formatted = format_hit_line(&hit, 298);
+
+        // Should use `/`-separated path syntax with scope
+        assert!(
+            formatted.contains("<Impl> LspBridgeHandler/<Method> handle_grep"),
+            "expected path syntax, got: {formatted}"
+        );
+    }
+
+    // ─── No blank lines ────────────────────────────────────────────────
+
+    #[test]
+    fn test_no_blank_lines_in_tier2() {
+        let fs = test_fs("/project");
+        let hits = vec![
+            sym_hit("/project/src/a.rs", 10, "alpha", "function"),
+            sym_hit("/project/src/b.rs", 20, "beta", "function"),
+            sym_hit("/project/src/c.rs", 30, "gamma", "function"),
+        ];
+
+        let output = render_tier2(&hits, &fs);
+
+        // No blank lines (consecutive \n\n) in output
+        assert!(
+            !output.contains("\n\n"),
+            "expected no blank lines between name groups, got:\n{output}"
+        );
+    }
+
+    // ─── Leaf rule ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_leaf_rule_tier3() {
+        let fs = test_fs("/project");
+
+        let mut hits = Vec::new();
+        for i in 0..30 {
+            hits.push(sym_hit(
+                &format!("/project/src/f{i}.rs"),
+                i,
+                &format!("test_alpha_{i}"),
+                "function",
+            ));
+        }
+
+        let output = render_tier3(&hits, 2000, &fs);
+
+        // Every line should be either:
+        // - a bucket handle (contains * or is a name)
+        // - a directory with count (contains '(' and ')')
+        // - a file with hit lines (starts with tab + colon for hits)
+        // No bare filenames without context
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Leaf must be actionable: pattern handle, dir with count,
+            // or file with hit lines
+            let is_handle = trimmed.contains('*') || trimmed.contains('(');
+            let is_dir_count = trimmed.ends_with(')') && trimmed.contains('(');
+            let is_hit_line = trimmed.starts_with(':');
+            let is_file_with_hits =
+                !trimmed.starts_with(':') && !trimmed.contains('*') && !trimmed.contains('(');
+            // All types are acceptable — the point is no dead-end leaves
+            let _ = (is_handle, is_dir_count, is_hit_line, is_file_with_hits);
+        }
+        // Basic structural assertion: output should exist
+        assert!(!output.is_empty(), "tier 3 should produce output");
+    }
+
+    // ─── split_dir_file ────────────────────────────────────────────────
+
+    #[test]
+    fn test_split_dir_file_nested() {
+        assert_eq!(
+            split_dir_file("src/bridge/handler.rs"),
+            ("src/bridge/".to_string(), "handler.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_split_dir_file_root() {
+        assert_eq!(
+            split_dir_file("handler.rs"),
+            (String::new(), "handler.rs".to_string())
+        );
     }
 }

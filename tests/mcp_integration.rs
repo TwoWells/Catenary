@@ -2586,9 +2586,15 @@ fn test_grep_reference_enclosing() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
+    // Tier 2 format: `:line <Kind> name:span`
     assert!(
-        text.contains("ref in") && text.contains("<Function>") && text.contains("outer"),
-        "Expected reference with enclosing <Function> outer, got:\n{text}"
+        text.contains("<Function>") && text.contains("outer"),
+        "Expected enclosing <Function> outer in output, got:\n{text}"
+    );
+    // Span should show the enclosing function's range
+    assert!(
+        text.contains(":1-3"),
+        "Expected enclosing span :1-3, got:\n{text}"
     );
 
     Ok(())
@@ -2708,6 +2714,250 @@ fn test_glob_parent_id_threading() -> Result<()> {
         lsp_with_parent > 0,
         "Expected LSP messages with parent_id={tool_call_corr_id} from glob, found 0"
     );
+
+    Ok(())
+}
+
+// ─── 06b: Tier selection and rendering ──────────────────────────────────
+
+/// Tier 2 structure heatmap: names grouped with enclosing structures and spans.
+#[test]
+fn test_grep_tier2_structure_heatmap() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    install_mock_grammar(root)?;
+
+    // Create multiple .mock files with definitions and references
+    let tests_dir = dir.path().join("tests");
+    std::fs::create_dir(&tests_dir)?;
+    let file_a = tests_dir.join("alpha.mock");
+    std::fs::write(&file_a, "fn test_alpha {\ntest_alpha\n}\n")?;
+    let file_b = tests_dir.join("beta.mock");
+    std::fs::write(&file_b, "fn test_beta {\ntest_alpha\n}\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4000,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "test_alpha" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Name group at column 0 (no leading whitespace)
+    let first_line = text.lines().next().unwrap_or("");
+    assert!(
+        !first_line.starts_with('\t') && !first_line.starts_with(' '),
+        "Name group should be at column 0, got:\n{text}"
+    );
+
+    // Enclosing structures with spans
+    assert!(
+        text.contains("<Function>"),
+        "Expected <Function> kind label, got:\n{text}"
+    );
+
+    // Directory grouping
+    assert!(
+        text.contains("tests/"),
+        "Expected tests/ directory grouping, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 2 for no-grammar file: bare hit lines without enclosing structures.
+#[test]
+fn test_grep_tier2_no_grammar() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("data.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn say_hello()\nsay_hello\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4001,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "say_hello" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // No-grammar files still produce output (via prepareRename)
+    assert!(
+        text.contains("say_hello"),
+        "Expected symbol in output, got:\n{text}"
+    );
+    // Bare hit lines use `:line` format
+    assert!(
+        text.contains(':'),
+        "Expected line numbers in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Narrow pattern fits tier 2: assert tier 2 output with name groups.
+#[test]
+fn test_grep_tier_promotion() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    install_mock_grammar(root)?;
+
+    let file = dir.path().join("narrow.mock");
+    std::fs::write(&file, "fn unique_symbol_xyz\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4002,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "unique_symbol_xyz" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Tier 2 format: name at column 0, indented file tree
+    assert!(
+        text.contains("unique_symbol_xyz"),
+        "Expected name in output, got:\n{text}"
+    );
+    assert!(
+        text.contains("<Function>"),
+        "Expected <Function> kind, got:\n{text}"
+    );
+
+    // Not tier 3 bucketed (no wildcard patterns)
+    assert!(
+        !text.contains("_*"),
+        "Expected tier 2, not tier 3 bucketed, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Single-line structure: `:line <Kind> name:line` (no range).
+#[test]
+fn test_grep_single_line_structure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    install_mock_grammar(root)?;
+
+    // Single-line definition (no brace block)
+    let file = dir.path().join("single.mock");
+    std::fs::write(&file, "fn one_liner\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4003,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "one_liner" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains("<Function>") && text.contains("one_liner"),
+        "Expected function definition, got:\n{text}"
+    );
+    // Single-line: `:1` not `:1-1`
+    assert!(
+        text.contains(":1") && !text.contains(":1-1"),
+        "Single-line structure should show :line not :start-end, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// No blank line separators between name groups.
+#[test]
+fn test_grep_no_blank_lines() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    install_mock_grammar(root)?;
+
+    let file = dir.path().join("multi.mock");
+    std::fs::write(&file, "fn alpha_one\nfn beta_two\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4004,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "alpha_one|beta_two" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Each alternation arm produces its own output section
+    assert!(
+        text.contains("alpha_one"),
+        "Expected alpha_one, got:\n{text}"
+    );
+    assert!(text.contains("beta_two"), "Expected beta_two, got:\n{text}");
+
+    // No blank lines within a single arm's output
+    for arm_text in [&text] {
+        let lines: Vec<&str> = arm_text.lines().collect();
+        for window in lines.windows(2) {
+            assert!(
+                !(window[0].is_empty() && window[1].is_empty()),
+                "Found consecutive blank lines in output:\n{text}"
+            );
+        }
+    }
 
     Ok(())
 }

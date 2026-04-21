@@ -177,6 +177,11 @@ impl Toolbox {
             .map_err(|e| tracing::info!("tree-sitter index unavailable: {e}"))
             .ok();
 
+        let grep_budget = config
+            .tools
+            .as_ref()
+            .map_or(4000, |t| t.grep.budget as usize);
+
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let client_manager = Arc::new(LspClientManager::new(
             config,
@@ -194,6 +199,7 @@ impl Toolbox {
             fs_manager: fs_manager.clone(),
             notified_offline: notified_offline.clone(),
             ts_index: ts_index.clone(),
+            budget: grep_budget,
         };
         let glob = GlobServer {
             client_manager: client_manager.clone(),
