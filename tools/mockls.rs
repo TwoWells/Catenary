@@ -171,6 +171,12 @@ struct Args {
     #[arg(long)]
     symbol_limit: Option<usize>,
 
+    /// Return the literal word under the cursor for hover, without resolving
+    /// keywords to the following symbol name. Simulates real LSP behavior where
+    /// hovering on `fn` returns keyword docs, not the function's signature.
+    #[arg(long)]
+    literal_keyword_hover: bool,
+
     /// Send `client/registerCapability` after `initialized` to register a
     /// file watcher. The glob pattern defaults to `**/*`; override with
     /// `--watcher-glob`.
@@ -756,7 +762,11 @@ impl MockServer {
     fn handle_hover(&self, params: &Value) -> Option<Value> {
         let (uri, line, col) = extract_position(params)?;
         let content = self.documents.get(uri)?;
-        let word = extract_symbol_name(content, line, col)?;
+        let word = if self.args.literal_keyword_hover {
+            extract_word(content, line, col)?
+        } else {
+            extract_symbol_name(content, line, col)?
+        };
 
         Some(serde_json::json!({
             "contents": {
@@ -1100,41 +1110,74 @@ impl MockServer {
     }
 
     fn handle_type_hierarchy_subtypes(&self, params: &Value) -> Option<Value> {
-        let type_keywords = ["struct ", "class "];
-        let mut subtypes = Vec::new();
+        let item = params.get("item")?;
+        let parent_name = item.get("name")?.as_str()?;
 
-        let _item = params.get("item")?;
+        let type_keywords: &[(&str, u32)] = &[
+            ("struct ", 23),
+            ("class ", 5),
+            ("interface ", 11),
+            ("trait ", 11),
+            ("enum ", 10),
+        ];
+        let mut subtypes = Vec::new();
 
         for (doc_uri, content) in &self.documents {
             for (line_idx, line_text) in content.lines().enumerate() {
                 let trimmed = line_text.trim_start();
-                for kw in &type_keywords {
+
+                // Check if this line declares a type that extends/implements the parent
+                let mut is_subtype = false;
+                let mut type_name = String::new();
+                let mut kind: u32 = 5;
+
+                for &(kw, kw_kind) in type_keywords {
                     if let Some(after_kw) = trimmed.strip_prefix(kw) {
-                        let type_name: String = after_kw
+                        let name: String = after_kw
                             .chars()
                             .take_while(|c| c.is_alphanumeric() || *c == '_')
                             .collect();
-                        if !type_name.is_empty() {
-                            let kind: u32 = if *kw == "struct " { 23 } else { 5 };
-                            let mut item_json = serde_json::json!({
-                                "name": type_name,
-                                "kind": kind,
-                                "uri": doc_uri,
-                                "range": {
-                                    "start": { "line": line_idx, "character": 0 },
-                                    "end": { "line": line_idx, "character": line_text.len() }
-                                },
-                                "selectionRange": {
-                                    "start": { "line": line_idx, "character": 0 },
-                                    "end": { "line": line_idx, "character": line_text.len() }
-                                }
-                            });
-                            if trimmed.contains("@deprecated") {
-                                item_json["tags"] = serde_json::json!([1]);
-                            }
-                            subtypes.push(item_json);
+                        if name.is_empty() {
+                            continue;
                         }
+                        // Check for `extends <parent>` or `implements <parent>`
+                        for pattern in &["extends ", "implements "] {
+                            if let Some(pos) = trimmed.find(pattern) {
+                                let after = &trimmed[pos + pattern.len()..];
+                                let target: String = after
+                                    .chars()
+                                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                    .collect();
+                                if target == parent_name {
+                                    is_subtype = true;
+                                    type_name.clone_from(&name);
+                                    kind = kw_kind;
+                                    break;
+                                }
+                            }
+                        }
+                        break; // Only one keyword prefix can match per line
                     }
+                }
+
+                if is_subtype {
+                    let mut item_json = serde_json::json!({
+                        "name": type_name,
+                        "kind": kind,
+                        "uri": doc_uri,
+                        "range": {
+                            "start": { "line": line_idx, "character": 0 },
+                            "end": { "line": line_idx, "character": line_text.len() }
+                        },
+                        "selectionRange": {
+                            "start": { "line": line_idx, "character": 0 },
+                            "end": { "line": line_idx, "character": line_text.len() }
+                        }
+                    });
+                    if trimmed.contains("@deprecated") {
+                        item_json["tags"] = serde_json::json!([1]);
+                    }
+                    subtypes.push(item_json);
                 }
             }
         }
@@ -2187,6 +2230,7 @@ mod tests {
             resolve_provider: false,
             no_empty_query: false,
             symbol_limit: None,
+            literal_keyword_hover: false,
             register_file_watchers: false,
             watcher_glob: "**/*".to_string(),
             watcher_kind: None,
@@ -2952,7 +2996,8 @@ const PI: f64
     #[test]
     fn test_mockls_subtypes() {
         let uri = "file:///tmp/hierarchy.yX4Za";
-        let text = "interface Animal\nstruct Dog\nclass Cat\n";
+        // Dog and Cat extend Animal; Car extends Vehicle (should not appear)
+        let text = "interface Animal\nstruct Dog extends Animal\nclass Cat implements Animal\ninterface Vehicle\nclass Car extends Vehicle\n";
 
         let mut input = frame(&initialize_request(1));
         input.extend(frame(&did_open_notification(uri, text)));
@@ -2985,11 +3030,15 @@ const PI: f64
             .expect("subtypes response with id=11");
         assert!(subtypes["error"].is_null(), "Expected no error");
         let children = subtypes["result"].as_array().expect("result array");
-        assert!(children.len() >= 2, "Expected at least 2 subtypes");
+        assert_eq!(children.len(), 2, "Expected exactly 2 subtypes of Animal");
 
         let names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(names.contains(&"Dog"), "Expected Dog in subtypes");
         assert!(names.contains(&"Cat"), "Expected Cat in subtypes");
+        assert!(
+            !names.contains(&"Car"),
+            "Car should not be a subtype of Animal"
+        );
     }
 
     #[test]
@@ -3116,17 +3165,6 @@ const PI: f64
             type_items[0]["tags"],
             serde_json::json!([1]),
             "TypeHierarchyItem should have DEPRECATED tag"
-        );
-    }
-
-    #[test]
-    fn test_mockls_no_keyword_hover_flag() {
-        // Verify --literal-keyword-hover is no longer accepted by the parser
-        let result =
-            <Args as clap::Parser>::try_parse_from(["mockls", "test", "--literal-keyword-hover"]);
-        assert!(
-            result.is_err(),
-            "--literal-keyword-hover should no longer be accepted"
         );
     }
 }
