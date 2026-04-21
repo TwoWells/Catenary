@@ -16,9 +16,6 @@ use super::toolbox::Toolbox;
 use crate::lsp::LspClientManager;
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 
-/// Maximum unique LSP symbols for hover display in grep output.
-const GREP_HOVER_THRESHOLD: usize = 10;
-
 /// Checks server health for the given languages and emits one-time
 /// state-transition notifications via `tracing`.
 ///
@@ -157,7 +154,7 @@ impl ToolHandler for McpRouter {
             Tool {
                 name: "grep".to_string(),
                 title: Some("Grep".to_string()),
-                description: Some(format!("Search for a pattern across the workspace. Queries the full LSP symbol index and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). Scope with `glob` and `exclude` to narrow the file set. Returns per-symbol sections with definitions, hover docs, and references (\u{2264}{GREP_HOVER_THRESHOLD} symbols) or name+kind+location (>{GREP_HOVER_THRESHOLD}).")),
+                description: Some("Search for a pattern across the workspace. Queries the tree-sitter symbol index and ripgrep in parallel. Returns symbols with structural context and navigation edges.\n\nPATTERN (required)\nRegex pattern. Supports `|` for alternation (e.g., `foo|bar`). Matched against symbol names and file contents.\n\nGLOB\nGlob pattern to narrow the search scope. Only files matching the glob are searched. See the glob tool for pattern syntax.\n\nEXCLUDE\nGlob pattern to exclude from matches.\n\nINCLUDE_GITIGNORED (default: false)\nInclude files ignored by `.gitignore` in the search.\n\nINCLUDE_HIDDEN (default: false)\nInclude hidden files (dotfiles) in the search.\n\nOUTPUT\nOutput fits a fixed character budget to protect your context window. Broad queries produce more matches than the budget can show at full detail, so the tool reduces detail automatically. Narrow your pattern or add a glob to get richer results.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

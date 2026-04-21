@@ -633,6 +633,41 @@ impl TsIndex {
             .any(|exts| exts.iter().any(|e| e == ext))
     }
 
+    /// Ensures the index is fresh for the given files.
+    ///
+    /// For each file, checks `file_parse_state.mtime_ns` against the current
+    /// filesystem mtime. Files that are missing from `file_parse_state` or whose
+    /// current mtime exceeds the stored value are re-parsed via `update_file()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a database query or file re-parse fails.
+    pub fn ensure_fresh(&self, files: &[PathBuf]) -> Result<()> {
+        for path in files {
+            let path_str = path.to_string_lossy();
+            let stored_mtime: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT mtime_ns FROM file_parse_state WHERE file_path = ?1",
+                    rusqlite::params![path_str.as_ref() as &str],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            let current_mtime = file_mtime_ns(path);
+
+            let needs_update = stored_mtime.map_or_else(
+                || self.has_grammar_for(path),
+                |stored| current_mtime > stored,
+            );
+
+            if needs_update {
+                self.update_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Check whether a scope (container) has children in the given file.
     ///
     /// Returns `true` if any symbol in the index has `scope = scope_name`

@@ -27,6 +27,7 @@ use crate::logging::LoggingServer;
 use crate::logging::notification_queue::NotificationQueueSink;
 use crate::lsp::LspClientManager;
 use crate::lsp::glob::LspGlob;
+use crate::ts::TsIndex;
 
 /// A resolved glob pattern that handles tilde expansion and absolute paths.
 ///
@@ -128,6 +129,8 @@ pub struct Toolbox {
     pub logging: LoggingServer,
     /// Notification queue for draining into `systemMessage`.
     pub notifications: Arc<NotificationQueueSink>,
+    /// Tree-sitter symbol index (shared with grep).
+    pub ts_index: Option<Arc<std::sync::Mutex<TsIndex>>>,
     /// Catenary instance ID (unique per process invocation).
     pub instance_id: Arc<str>,
     /// Tokio runtime handle for blocking dispatch.
@@ -167,6 +170,22 @@ impl Toolbox {
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
         fs_manager.set_roots(roots.clone());
         fs_manager.seed();
+
+        // Build tree-sitter index (separate connection for symbol writes).
+        let ts_index = match crate::db::open_and_migrate() {
+            Ok(ts_conn) => match TsIndex::build(&roots, ts_conn) {
+                Ok(index) => Some(Arc::new(std::sync::Mutex::new(index))),
+                Err(e) => {
+                    tracing::info!("tree-sitter index unavailable: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::info!("tree-sitter index unavailable (db): {e}");
+                None
+            }
+        };
+
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let client_manager = Arc::new(LspClientManager::new(
             config,
@@ -177,11 +196,13 @@ impl Toolbox {
             client_manager.clone(),
             path_validator.clone(),
         ));
+
         let notified_offline = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let grep = GrepServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
             notified_offline: notified_offline.clone(),
+            ts_index: ts_index.clone(),
         };
         let glob = GlobServer {
             client_manager: client_manager.clone(),
@@ -198,6 +219,7 @@ impl Toolbox {
             path_validator,
             logging,
             notifications,
+            ts_index,
             instance_id,
             runtime,
         }

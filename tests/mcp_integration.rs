@@ -538,12 +538,8 @@ fn test_multi_root_find_symbol() -> Result<()> {
         "Expected search to find alpha.mock, got: {text_a}"
     );
     assert!(
-        text_a.contains("# alpha_func"),
-        "Expected symbol heading for alpha_func, got: {text_a}"
-    );
-    assert!(
-        text_a.contains("[Function]"),
-        "Expected [Function] kind for alpha_func, got: {text_a}"
+        text_a.contains("alpha_func"),
+        "Expected alpha_func in output, got: {text_a}"
     );
 
     // Search should locate beta_func from root B (via symbols or heatmap)
@@ -761,7 +757,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
             .as_str()
             .context("Missing text")?;
         last_text = text.to_string();
-        if text.contains("## [") && text.contains(&format!("funcs_b.{MOCK_LANG_A}")) {
+        if text.contains("unique_root_b_func") && text.contains(&format!("funcs_b.{MOCK_LANG_A}")) {
             success = true;
             break;
         }
@@ -1011,8 +1007,8 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
             "Profile {name}: search in root B should reference funcs_b.mock, got: {text}"
         );
         assert!(
-            text.contains("## ["),
-            "Profile {name}: search in root B should have Symbols section, got: {text}"
+            text.contains("unique_root_b_func"),
+            "Profile {name}: search in root B should find unique_root_b_func, got: {text}"
         );
     }
     Ok(())
@@ -1107,8 +1103,8 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
         "Expected 'funcs_b.mock' in search results, got: {text}"
     );
     assert!(
-        text.contains("## ["),
-        "Root B search should have Symbols section, got: {text}"
+        text.contains("world"),
+        "Root B search should find world, got: {text}"
     );
 
     Ok(())
@@ -1180,8 +1176,8 @@ fn test_mockls_multiplexing() -> Result<()> {
         "Lang A search should reference test file, got: {text_a}"
     );
     assert!(
-        text_a.contains("## ["),
-        "Lang A search should have Symbols section, got: {text_a}"
+        text_a.contains("greet"),
+        "Lang A search should find symbol, got: {text_a}"
     );
     assert!(
         text_b.contains(&format!("test.{MOCK_LANG_B}")),
@@ -1291,16 +1287,14 @@ fn test_search_graceful_degradation() -> Result<()> {
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .context("Missing search text")?;
-    // Should still find via ripgrep
+    // Should still find via ripgrep (no dependency on workspace/symbol)
+    assert!(
+        text.contains("greet"),
+        "Search should find greet via ripgrep, got: {text}"
+    );
     assert!(
         text.contains(&format!("test.{MOCK_LANG_A}")),
-        "Search should find test.mock via ripgrep, got: {text}"
-    );
-    // Rg-bootstrapped enrichment recovers the symbol via hover even
-    // when workspace/symbol fails.
-    assert!(
-        text.contains("## ["),
-        "Bootstrap should recover symbol via hover when workspace/symbol fails, got: {text}"
+        "Search should find test file via ripgrep, got: {text}"
     );
 
     Ok(())
@@ -1437,8 +1431,8 @@ fn test_warmup_observation() -> Result<()> {
         "Search should succeed after warmup observation. Got: {text}"
     );
     assert!(
-        text.contains("## ["),
-        "Search after warmup should have Symbols section, got: {text}"
+        text.contains("my_function"),
+        "Search after warmup should find symbol, got: {text}"
     );
 
     Ok(())
@@ -1480,19 +1474,18 @@ fn test_search_symbols_with_scan_roots() -> Result<()> {
         .context("Missing search text")?;
 
     assert!(
-        text.contains("## ["),
-        "Search with --scan-roots should produce ## Symbols section, got: {text}"
+        text.contains("greet"),
+        "Search should find 'greet', got: {text}"
     );
     assert!(
-        text.contains("greet"),
-        "Symbols section should contain 'greet', got: {text}"
+        text.contains(&format!("greeter.{MOCK_LANG_A}")),
+        "Search should find greeter file, got: {text}"
     );
 
     Ok(())
 }
 
-/// Verifies per-symbol `#` / `##` output structure with enrichment.
-/// Two symbols, each with hover and references.
+/// Verifies classified output for two symbols found via alternation.
 #[test]
 fn test_grep_per_symbol_output() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1523,29 +1516,30 @@ fn test_grep_per_symbol_output() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Per-symbol # headings
+    // Both symbols should appear in output
     assert!(
-        text.contains("# load_config") || text.contains("# save_config"),
-        "Expected # symbol headings, got:\n{text}"
+        text.contains("load_config"),
+        "Expected load_config in output, got:\n{text}"
+    );
+    assert!(
+        text.contains("save_config"),
+        "Expected save_config in output, got:\n{text}"
     );
 
-    // ## [Kind] definition headings
+    // Both files should appear
     assert!(
-        text.contains("## [Function]"),
-        "Expected ## [Function] headings, got:\n{text}"
+        text.contains(&format!("mod_a.{MOCK_LANG_A}")),
+        "Expected mod_a file, got:\n{text}"
     );
-
-    // Hover content (code block from mockls)
     assert!(
-        text.contains("```"),
-        "Expected hover code block in enriched output, got:\n{text}"
+        text.contains(&format!("mod_b.{MOCK_LANG_A}")),
+        "Expected mod_b file, got:\n{text}"
     );
 
     Ok(())
 }
 
-/// Verifies that mockls with `--resolve-provider` returns URI-only symbols
-/// that are resolved via `workspaceSymbol/resolve`, producing the same output.
+/// Verifies that grep finds symbols via ripgrep + prepareRename (no grammar).
 #[test]
 fn test_grep_resolve_provider() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1573,14 +1567,9 @@ fn test_grep_resolve_provider() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Symbol should be found and resolved
     assert!(
-        text.contains("# resolve_me"),
-        "Expected # resolve_me heading, got:\n{text}"
-    );
-    assert!(
-        text.contains("## [Function]"),
-        "Expected ## [Function] heading after resolve, got:\n{text}"
+        text.contains("resolve_me"),
+        "Expected resolve_me in output, got:\n{text}"
     );
     assert!(
         text.contains(&format!("resolve.{MOCK_LANG_A}")),
@@ -1642,10 +1631,6 @@ fn test_grep_alternation() -> Result<()> {
 
     // Both symbols should appear
     assert!(
-        text.contains("## ["),
-        "Expected Symbols section for alternation, got: {text}"
-    );
-    assert!(
         text.contains("alpha_func"),
         "Expected alpha_func symbol, got: {text}"
     );
@@ -1657,8 +1642,8 @@ fn test_grep_alternation() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that >10 unique symbols skips enrichment: no References section,
-/// no hover content, but Symbols with name + kind + location are present.
+/// Verifies that broad search with many symbols produces flat output.
+/// (Output budget and tier selection are in ticket 06b.)
 #[test]
 fn test_grep_enrichment_threshold_broad() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1702,26 +1687,19 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         .as_str()
         .context("Missing text for broad search")?;
 
-    // Symbols tier should be present with names and kinds
+    // All 11 symbols should appear in the flat output
     assert!(
-        text.contains("## ["),
-        "Expected Symbols section for broad search, got: {text}"
+        text.contains("zz_broad_one"),
+        "Expected zz_broad_one in output, got: {text}"
     );
     assert!(
-        text.contains("[Function]"),
-        "Expected [Function] kind in broad search, got: {text}"
+        text.contains("zz_broad_eleven"),
+        "Expected zz_broad_eleven in output, got: {text}"
     );
-
-    // Structural enrichment (callers, references) is always present
+    // Each should have file:line references
     assert!(
-        text.contains("### Callers") || text.contains("### References"),
-        "Structural enrichment should be present even above hover threshold, got: {text}"
-    );
-
-    // Hover content should NOT be present when >10 symbols
-    assert!(
-        !text.contains("> ```"),
-        "Hover blockquote should not appear above hover threshold, got: {text}"
+        text.contains(&format!("many.{MOCK_LANG_A}")),
+        "Expected file reference, got: {text}"
     );
 
     Ok(())
@@ -1774,24 +1752,24 @@ fn test_grep_rg_only_groups_by_matched_string() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Should have separate # headings for each matched string
+    // Both tokens should appear in output
     assert!(
-        text.contains("# alpha_token"),
-        "Expected '# alpha_token' heading, got:\n{text}"
+        text.contains("alpha_token"),
+        "Expected alpha_token in output, got:\n{text}"
     );
     assert!(
-        text.contains("# beta_token"),
-        "Expected '# beta_token' heading, got:\n{text}"
+        text.contains("beta_token"),
+        "Expected beta_token in output, got:\n{text}"
     );
 
-    // Each heading should have its own file hits, not all dumped together
+    // Both files should appear
     assert!(
         text.contains(&format!("notes.{MOCK_LANG_A}")),
-        "Expected notes file in alpha_token section, got:\n{text}"
+        "Expected notes file, got:\n{text}"
     );
     assert!(
         text.contains(&format!("readme.{MOCK_LANG_A}")),
-        "Expected readme file in beta_token section, got:\n{text}"
+        "Expected readme file, got:\n{text}"
     );
 
     Ok(())
@@ -1838,36 +1816,24 @@ fn test_grep_alternation_routes_non_code_hits() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Both symbols should have # headings
+    // Both symbols should appear in output
     assert!(
-        text.contains("# compute"),
-        "Expected '# compute' heading, got:\n{text}"
+        text.contains("compute"),
+        "Expected compute in output, got:\n{text}"
     );
     assert!(
-        text.contains("# render"),
-        "Expected '# render' heading, got:\n{text}"
+        text.contains("render"),
+        "Expected render in output, got:\n{text}"
     );
 
-    // Both should have ## [Function] definition sub-headings
-    let compute_idx = text
-        .find("# compute")
-        .context("Missing # compute heading")?;
-    let render_idx = text.find("# render").context("Missing # render heading")?;
-
-    // Each section should contain its own ## [Function] heading
-    let (first_section, second_section) = if compute_idx < render_idx {
-        (&text[compute_idx..render_idx], &text[render_idx..])
-    } else {
-        (&text[render_idx..compute_idx], &text[compute_idx..])
-    };
-
+    // Both files should appear
     assert!(
-        first_section.contains("## [Function]"),
-        "First section should have ## [Function], got:\n{first_section}"
+        text.contains(&format!("engine.{MOCK_LANG_A}")),
+        "Expected engine file, got:\n{text}"
     );
     assert!(
-        second_section.contains("## [Function]"),
-        "Second section should have ## [Function], got:\n{second_section}"
+        text.contains(&format!("display.{MOCK_LANG_A}")),
+        "Expected display file, got:\n{text}"
     );
 
     Ok(())
@@ -1915,20 +1881,11 @@ fn test_grep_two_defs_same_name_per_heading_refs() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Should have exactly one # heading
+    // Both files should appear with the symbol
     assert!(
-        text.contains("# process"),
-        "Expected '# process' heading, got:\n{text}"
+        text.contains("process"),
+        "Expected process in output, got:\n{text}"
     );
-
-    // Count ## [Function] headings — should be exactly 2
-    let def_count = text.matches("## [Function]").count();
-    assert_eq!(
-        def_count, 2,
-        "Expected 2 ## [Function] headings for two defs, got {def_count}:\n{text}"
-    );
-
-    // Both files should appear
     assert!(
         text.contains(&format!("impl_a.{MOCK_LANG_A}")),
         "Expected impl_a in output, got:\n{text}"
@@ -1980,14 +1937,10 @@ fn test_grep_resolve_fallback_path() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Symbol should be found via fallback + resolve
+    // Symbol should be found via ripgrep + prepareRename
     assert!(
-        text.contains("# resolve_fallback"),
-        "Expected '# resolve_fallback' heading, got:\n{text}"
-    );
-    assert!(
-        text.contains("## [Function]"),
-        "Expected ## [Function] heading after fallback resolve, got:\n{text}"
+        text.contains("resolve_fallback"),
+        "Expected resolve_fallback in output, got:\n{text}"
     );
     assert!(
         text.contains(&format!("fallback.{MOCK_LANG_A}")),
@@ -2036,20 +1989,11 @@ fn test_grep_cross_server_same_symbol() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Single # heading
+    // Symbol should appear with both files
     assert!(
-        text.contains("# cross_server_fn"),
-        "Expected '# cross_server_fn' heading, got:\n{text}"
+        text.contains("cross_server_fn"),
+        "Expected cross_server_fn in output, got:\n{text}"
     );
-
-    // Two ## [Function] sub-headings, one from each server's file
-    let def_count = text.matches("## [Function]").count();
-    assert_eq!(
-        def_count, 2,
-        "Expected 2 ## [Function] headings from two servers, got {def_count}:\n{text}"
-    );
-
-    // Both files should appear
     assert!(
         text.contains(&format!("shared.{MOCK_LANG_A}")),
         "Expected shared.{MOCK_LANG_A} in output, got:\n{text}"
@@ -2096,13 +2040,14 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
         .as_str()
         .context("Missing text for incoming calls")?;
 
+    // In 06a, no enrichment sections — just verify the symbol is found
     assert!(
-        text.contains("### Callers"),
-        "Expected '### Callers' section, got:\n{text}"
+        text.contains("callee_fn"),
+        "Expected callee_fn in output, got:\n{text}"
     );
     assert!(
-        text.contains("caller_fn"),
-        "Expected caller_fn in '### Callers' section, got:\n{text}"
+        text.contains(&format!("calls.{MOCK_LANG_A}")),
+        "Expected file name in output, got:\n{text}"
     );
 
     Ok(())
@@ -2143,9 +2088,10 @@ fn test_grep_enrichment_implementations() -> Result<()> {
         .as_str()
         .context("Missing text for implementations")?;
 
+    // In 06a, no enrichment sections — just verify the symbol is found
     assert!(
-        text.contains("### Implementations"),
-        "Expected '### Implementations' section, got:\n{text}"
+        text.contains("MyStruct"),
+        "Expected MyStruct in output, got:\n{text}"
     );
 
     Ok(())
@@ -2187,17 +2133,11 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
         .as_str()
         .context("Missing text for subtypes")?;
 
+    // In 06a, no enrichment sections — just verify the symbol is found.
+    // Dog and Cat are subtypes found via LSP (added in ticket 07a).
     assert!(
-        text.contains("### Subtypes"),
-        "Expected '### Subtypes' section, got:\n{text}"
-    );
-    assert!(
-        text.contains("Dog"),
-        "Expected Dog in '### Subtypes' section, got:\n{text}"
-    );
-    assert!(
-        text.contains("Cat"),
-        "Expected Cat in '### Subtypes' section, got:\n{text}"
+        text.contains("Animal"),
+        "Expected Animal in output, got:\n{text}"
     );
 
     Ok(())
@@ -2263,17 +2203,11 @@ fn test_ra_symbol_universe_includes_methods() -> Result<()> {
 
         let response = bridge.recv()?;
         let result = &response["result"];
-        if let Some(t) = result["content"][0]["text"].as_str() {
-            if t.contains("## [") {
-                // Got enriched symbol output — universe includes methods
-                text = t.to_string();
-                break;
-            }
-            if t.contains("zz_widget_method") {
-                // Got rg hits but no symbol enrichment — keep trying
-                // (RA may still be indexing)
-                text = t.to_string();
-            }
+        if let Some(t) = result["content"][0]["text"].as_str()
+            && t.contains("zz_widget_method")
+        {
+            text = t.to_string();
+            break;
         }
     }
 
@@ -2284,357 +2218,263 @@ fn test_ra_symbol_universe_includes_methods() -> Result<()> {
     );
 
     assert!(
-        text.contains("# zz_widget_method"),
-        "Expected '# zz_widget_method' heading, got:\n{text}"
-    );
-
-    // This is the key assertion: the rg bootstrap should recover the method
-    // that workspace/symbol("") truncated, producing an enriched heading.
-    assert!(
-        text.contains("## ["),
-        "Expected ## [Function] or ## [Method] heading — \
-         rg bootstrap should have recovered the truncated method. Got:\n{text}"
+        text.contains("zz_widget_method"),
+        "Expected 'zz_widget_method' in output, got:\n{text}"
     );
 
     Ok(())
 }
 
-// ─── Rg-bootstrapped enrichment tests ───────────────────────────────────
+// ─── SEARCHv2 grep pipeline tests (ticket 06a) ─────────────────────────
 
-/// Truncation bootstrap: when `--symbol-limit` causes a symbol to be missing
-/// from the universe, the rg bootstrap path should recover it via hover.
+/// Pattern matching a known symbol — no grammar installed, so the
+/// no-grammar path (prepareRename) identifies symbols.
 #[test]
-fn test_grep_rg_bootstrap_truncation() -> Result<()> {
+fn test_grep_basic_hits() -> Result<()> {
     let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("greet.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn say_hello()\nsay_hello\n")?;
 
-    // Create three files with distinct function names. With --symbol-limit 1,
-    // only the first one (alphabetically by URI) enters the universe.
-    let file_a = dir.path().join(format!("aaa_first.{MOCK_LANG_A}"));
-    std::fs::write(&file_a, "fn alpha_sym()\nalpha_sym\n")?;
-
-    let file_b = dir.path().join(format!("bbb_second.{MOCK_LANG_A}"));
-    std::fs::write(&file_b, "fn beta_sym()\nbeta_sym\n")?;
-
-    let file_c = dir.path().join(format!("ccc_third.{MOCK_LANG_A}"));
-    std::fs::write(&file_c, "fn gamma_sym()\ngamma_sym\n")?;
-
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --symbol-limit 1");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    // Grep for a symbol that is NOT in the top 1 of the universe
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2000,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "gamma_sym" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep bootstrap truncation failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for bootstrap truncation")?;
-
-    // Should have a # heading
-    assert!(
-        text.contains("# gamma_sym"),
-        "Expected '# gamma_sym' heading, got:\n{text}"
-    );
-
-    // Key assertion: bootstrap should produce ## [Function] with hover enrichment
-    assert!(
-        text.contains("## [Function]"),
-        "Expected ## [Function] heading via rg bootstrap, got:\n{text}"
-    );
-    assert!(
-        text.contains("```"),
-        "Expected hover code block via rg bootstrap, got:\n{text}"
-    );
-
-    Ok(())
-}
-
-/// Keyword prefix: grepping for `fn my_func` should still produce enrichment
-/// because hover skips the keyword and resolves the actual symbol name.
-#[test]
-fn test_grep_rg_bootstrap_keyword_prefix() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let file = dir.path().join(format!("kw_test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "fn kw_target_func()\nkw_target_func\n")?;
-
-    // --symbol-limit 0 forces empty universe, so all enrichment comes from bootstrap
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --symbol-limit 0");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
         "jsonrpc": "2.0",
-        "id": 2010,
+        "id": 3000,
         "method": "tools/call",
         "params": {
             "name": "grep",
-            "arguments": { "pattern": "fn kw_target_func" }
+            "arguments": { "pattern": "say_hello" }
         }
     }))?;
 
     let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep bootstrap keyword prefix failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
+    let text = response["result"]["content"][0]["text"]
         .as_str()
-        .context("Missing text for keyword prefix")?;
+        .context("Missing text")?;
 
-    // The keyword `fn` should be skipped by hover; `kw_target_func` should be enriched
+    // Should find the symbol with file and line reference
     assert!(
-        text.contains("## [Function]"),
-        "Expected ## [Function] heading via keyword prefix bootstrap, got:\n{text}"
+        text.contains("say_hello"),
+        "Expected say_hello in output, got:\n{text}"
     );
     assert!(
-        text.contains("```"),
-        "Expected hover code block for keyword prefix, got:\n{text}"
+        text.contains(&format!("greet.{MOCK_LANG_A}")),
+        "Expected filename in output, got:\n{text}"
     );
 
     Ok(())
 }
 
-/// Same-name disambiguation: two files each defining `fn process()` should
-/// both get separate `## [Function]` headings via rg bootstrap.
+/// Grep with `glob` scoping — only matching files appear.
 #[test]
-fn test_grep_rg_bootstrap_same_name() -> Result<()> {
-    let dir_a = tempfile::tempdir()?;
-    let dir_b = tempfile::tempdir()?;
+fn test_grep_glob_scoping() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir(&src_dir)?;
+    let file_a = src_dir.join(format!("a.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn scope_target()\nscope_target\n")?;
+    let file_b = dir.path().join(format!("b.{MOCK_LANG_A}"));
+    std::fs::write(&file_b, "fn scope_target()\nscope_target\n")?;
 
-    let file_a = dir_a.path().join(format!("impl_x.{MOCK_LANG_A}"));
-    std::fs::write(&file_a, "fn disambig_proc()\ndisambig_proc\n")?;
-
-    let file_b = dir_b.path().join(format!("impl_y.{MOCK_LANG_A}"));
-    std::fs::write(&file_b, "fn disambig_proc()\ndisambig_proc\n")?;
-
-    let root_a = dir_a.path().to_str().context("root A")?;
-    let root_b = dir_b.path().to_str().context("root B")?;
-
-    // --symbol-limit 0 forces all enrichment through bootstrap
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --symbol-limit 0");
-    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[root_a, root_b])?;
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
         "jsonrpc": "2.0",
-        "id": 2020,
+        "id": 3001,
         "method": "tools/call",
         "params": {
             "name": "grep",
-            "arguments": { "pattern": "disambig_proc" }
+            "arguments": {
+                "pattern": "scope_target",
+                "glob": "src/**"
+            }
         }
     }))?;
 
     let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep bootstrap same-name failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
+    let text = response["result"]["content"][0]["text"]
         .as_str()
-        .context("Missing text for same-name")?;
+        .context("Missing text")?;
 
-    // Should have one # heading
     assert!(
-        text.contains("# disambig_proc"),
-        "Expected '# disambig_proc' heading, got:\n{text}"
+        text.contains(&format!("a.{MOCK_LANG_A}")),
+        "Expected src/a file in output, got:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("b.{MOCK_LANG_A}")),
+        "Expected b file excluded from glob scope, got:\n{text}"
     );
 
-    // Both files should appear with ## [Function] headings
-    let def_count = text.matches("## [Function]").count();
+    Ok(())
+}
+
+/// Grep with `exclude` — test files excluded from matches.
+#[test]
+fn test_grep_exclude() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file_a = dir.path().join(format!("main.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn excl_func()\nexcl_func\n")?;
+    let file_b = dir.path().join(format!("test_main.{MOCK_LANG_A}"));
+    std::fs::write(&file_b, "fn excl_func()\nexcl_func\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3002,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": {
+                "pattern": "excl_func",
+                "exclude": "**/test_*"
+            }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains(&format!("main.{MOCK_LANG_A}")),
+        "Expected main file in output, got:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("test_main.{MOCK_LANG_A}")),
+        "Expected test file excluded, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// `foo|bar` pattern produces two independent result sections.
+#[test]
+fn test_grep_alternation_split() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file_a = dir.path().join(format!("alt_a.{MOCK_LANG_A}"));
+    std::fs::write(&file_a, "fn alt_alpha()\nalt_alpha\n")?;
+    let file_b = dir.path().join(format!("alt_b.{MOCK_LANG_A}"));
+    std::fs::write(&file_b, "fn alt_beta()\nalt_beta\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3004,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "alt_alpha|alt_beta" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains("alt_alpha"),
+        "Expected alt_alpha in output, got:\n{text}"
+    );
+    assert!(
+        text.contains("alt_beta"),
+        "Expected alt_beta in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// `(foo|bar)_baz` pattern is a single result section (not split).
+#[test]
+fn test_grep_alternation_nested() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("nested.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "fn alpha_baz()\nalpha_baz\nfn beta_baz()\nbeta_baz\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3005,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "(alpha|beta)_baz" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Both matches should appear — the nested alternation is one arm
+    assert!(
+        text.contains("alpha_baz") && text.contains("beta_baz"),
+        "Expected both alpha_baz and beta_baz in single section, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// No-grammar file, pattern matches only keywords. Keywords filtered out
+/// via `prepareRename` returning null should not appear in output.
+/// Searches for the keyword `struct` which mockls recognizes and returns
+/// null for via prepareRename.
+#[test]
+fn test_grep_prepare_rename_keyword() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("kw.{MOCK_LANG_A}"));
+    // Only the keyword `struct` matches — mockls returns null for keywords
+    std::fs::write(&file, "struct MyType\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Search for the keyword `struct` (not the symbol name)
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3006,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "^struct$" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // The keyword `struct` is filtered out by prepareRename returning null.
+    // Only the keyword itself matched (not the symbol name), so output is empty.
     assert_eq!(
-        def_count, 2,
-        "Expected 2 ## [Function] headings for same-name disambiguation, got {def_count}:\n{text}"
-    );
-
-    assert!(
-        text.contains(&format!("impl_x.{MOCK_LANG_A}")),
-        "Expected impl_x in output, got:\n{text}"
-    );
-    assert!(
-        text.contains(&format!("impl_y.{MOCK_LANG_A}")),
-        "Expected impl_y in output, got:\n{text}"
-    );
-
-    Ok(())
-}
-
-/// Plain text: rg hits where hover returns nothing should produce rg-only
-/// output (path + line ranges) with no `## [kind]` heading.
-/// Uses `--fail-on textDocument/hover` so hover always fails, simulating
-/// a position with no symbol.
-#[test]
-fn test_grep_rg_bootstrap_plain_text() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let file = dir.path().join(format!("notes.{MOCK_LANG_A}"));
-    std::fs::write(&file, "plain_marker\nplain_marker\n")?;
-
-    // --fail-on textDocument/prepareRename makes the keyword filter treat
-    // every token as non-symbol, so the bootstrap produces rg-only output.
-    let lsp = mockls_lsp_arg(
-        MOCK_LANG_A,
-        "--scan-roots --symbol-limit 0 --fail-on textDocument/prepareRename",
-    );
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2030,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "plain_marker" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep bootstrap plain text failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for plain text")?;
-
-    // Should have rg-only output with the heading
-    assert!(
-        text.contains("# plain_marker"),
-        "Expected '# plain_marker' heading, got:\n{text}"
-    );
-
-    // Should NOT have any ## [kind] heading — prepareRename always failed
-    assert!(
-        !text.contains("## ["),
-        "Expected no ## [kind] heading when prepareRename fails, got:\n{text}"
-    );
-
-    Ok(())
-}
-
-/// Regression: rg-bootstrapped symbols must not produce duplicate `# heading`
-/// entries. Previously, `name_order` was pushed both by the bootstrap result
-/// merge and the `by_name` insertion loop.
-#[test]
-fn test_grep_rg_bootstrap_no_duplicate_heading() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let file = dir.path().join(format!("dedup_test.{MOCK_LANG_A}"));
-    std::fs::write(&file, "fn dedup_target()\ndedup_target\n")?;
-
-    // --symbol-limit 0 forces empty universe; all enrichment comes from bootstrap
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --symbol-limit 0");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2040,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "dedup_target" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep bootstrap dedup failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for dedup")?;
-
-    let heading_count = text.matches("# dedup_target").count();
-    assert_eq!(
-        heading_count, 1,
-        "Expected exactly 1 '# dedup_target' heading, got {heading_count}:\n{text}"
-    );
-
-    Ok(())
-}
-
-/// Regression: when hovering on a keyword token (`fn`) resolves to a different
-/// name (`my_func`), the bootstrap must skip the keyword and use the hover
-/// content from the actual symbol token. `--literal-keyword-hover` makes mockls
-/// return the raw word on hover (like real LSPs), so hovering `fn` returns `fn`
-/// while `prepareCallHierarchy` still resolves to the function name.
-#[test]
-fn test_grep_rg_bootstrap_keyword_hover_content() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-
-    let file = dir.path().join(format!("kw_hover.{MOCK_LANG_A}"));
-    std::fs::write(&file, "fn kw_hover_sym()\nkw_hover_sym\n")?;
-
-    let lsp = mockls_lsp_arg(
-        MOCK_LANG_A,
-        "--scan-roots --symbol-limit 0 --literal-keyword-hover",
-    );
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    bridge.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 2050,
-        "method": "tools/call",
-        "params": {
-            "name": "grep",
-            "arguments": { "pattern": "fn kw_hover_sym" }
-        }
-    }))?;
-
-    let response = bridge.recv()?;
-    let result = &response["result"];
-    assert!(
-        result["isError"].is_null() || result["isError"] == false,
-        "grep bootstrap keyword hover content failed: {response:?}"
-    );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .context("Missing text for keyword hover content")?;
-
-    // Should still get enrichment — the keyword is skipped, the symbol token is used
-    assert!(
-        text.contains("## [Function]"),
-        "Expected ## [Function] heading, got:\n{text}"
-    );
-
-    // Hover content must contain the symbol name, not the keyword
-    assert!(
-        text.contains("kw_hover_sym"),
-        "Expected hover content with symbol name 'kw_hover_sym', got:\n{text}"
-    );
-
-    // The keyword text `fn` as a standalone hover block must not appear.
-    // mockls hover format is ```\n{word}\n``` — check for keyword-only hover.
-    assert!(
-        !text.contains("```\nfn\n```"),
-        "Hover content should be from the symbol, not the `fn` keyword:\n{text}"
+        text, "No results found",
+        "Expected 'No results found' when only keywords match, got:\n{text}"
     );
 
     Ok(())

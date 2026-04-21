@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Grep tool: ripgrep + workspace/symbol pipeline with LSP enrichment.
+//! Grep tool: ripgrep + tree-sitter index pipeline with LSP enrichment.
 
 use super::toolbox::ResolvedGlob;
 use anyhow::{Result, anyhow};
@@ -9,29 +9,18 @@ use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{Searcher, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::debug;
 
 use super::filesystem_manager::FilesystemManager;
 use super::handler::{check_server_health, display_path};
-use super::symbols::{
-    self, SymbolInfo, extract_locations, extract_symbol_infos, format_symbol_kind,
-};
 use super::tool_server::ToolServer;
-use crate::lsp::instance_key::InstanceKey;
-use crate::lsp::{LspClient, LspClientManager};
-
-/// Maximum unique LSP symbols for hover display in output. Above this
-/// threshold, hover content is omitted but structural enrichment (references,
-/// callers, implementations, subtypes) is always included. Also caps the
-/// bootstrap discovery loop.
-const GREP_HOVER_THRESHOLD: usize = 10;
+use crate::lsp::LspClientManager;
+use crate::ts::{TsIndex, TsSymbol, format_ts_kind};
 
 /// Input for grep tool.
 #[derive(Debug, Deserialize)]
@@ -52,11 +41,32 @@ pub struct GrepInput {
     pub include_hidden: bool,
 }
 
-/// Grep tool server: ripgrep + workspace/symbol pipeline with LSP enrichment.
+/// A classified hit from the grep pipeline.
+struct GrepHit {
+    file: PathBuf,
+    line: u32,
+    matched_text: String,
+    classification: HitClass,
+}
+
+/// Classification of a ripgrep hit against the tree-sitter index.
+enum HitClass {
+    /// rg hit at a tree-sitter definition line.
+    Symbol { symbol: TsSymbol },
+    /// rg hit at a non-definition line, with optional enclosing structure.
+    Reference { enclosing: Option<TsSymbol> },
+    /// Symbol identified via `prepareRename` (no-grammar path).
+    PrepareRenameSymbol,
+    /// Keyword filtered out via `prepareRename` (will be dropped).
+    Keyword,
+}
+
+/// Grep tool server: ripgrep + tree-sitter index pipeline with LSP enrichment.
 pub struct GrepServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
+    pub(super) ts_index: Option<Arc<std::sync::Mutex<TsIndex>>>,
 }
 
 impl ToolServer for GrepServer {
@@ -87,21 +97,40 @@ impl ToolServer for GrepServer {
         let touched: Vec<String> = clients.keys().map(|k| k.language_id.clone()).collect();
         check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
 
-        // Run pipeline
-        let output = self.run(input, parent_id).await?;
+        // Split top-level alternation into independent arms
+        let arms = split_alternation(&input.pattern);
 
-        Ok(Value::String(output))
+        let mut all_output = String::new();
+        for arm in &arms {
+            let arm_input = GrepInput {
+                pattern: arm.clone(),
+                glob: input.glob.clone(),
+                exclude: input.exclude.clone(),
+                include_gitignored: input.include_gitignored,
+                include_hidden: input.include_hidden,
+            };
+            let output = self.run(arm_input, parent_id).await?;
+            if !output.is_empty() {
+                if !all_output.is_empty() {
+                    all_output.push('\n');
+                }
+                all_output.push_str(&output);
+            }
+        }
+
+        if all_output.is_empty() {
+            return Ok(Value::String("No results found".to_string()));
+        }
+
+        Ok(Value::String(all_output))
     }
 }
 
 impl GrepServer {
-    /// Grep: ripgrep + `workspace/symbol("")` pipeline with LSP enrichment.
+    /// Grep pipeline: ripgrep + tree-sitter index + hit classification.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
     async fn run(&self, input: GrepInput, parent_id: Option<i64>) -> Result<String> {
         use std::fmt::Write;
-
-        let re = Regex::new(&format!("(?i){}", &input.pattern))
-            .map_err(|e| anyhow!("Invalid regex pattern: {e}"))?;
 
         debug!("Grep request: pattern={}", input.pattern);
 
@@ -128,7 +157,7 @@ impl GrepServer {
             workspace_roots
         };
 
-        // 1. Ripgrep: get matched strings + file/line heatmap in one pass
+        // Step 1: Ripgrep scoped to file set → raw hits with matched text.
         let rg = Self::ripgrep_matches(
             &input.pattern,
             &effective_roots,
@@ -139,682 +168,231 @@ impl GrepServer {
             &self.fs_manager,
         )?;
 
-        // 1b. Ensure servers exist for any new languages in matched files
+        if rg.file_lines.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Step 2: Ensure servers exist for matched files.
         let rg_paths: Vec<PathBuf> = rg.file_lines.keys().map(PathBuf::from).collect();
         self.client_manager
             .ensure_clients_for_paths(&rg_paths)
             .await;
 
-        // 2. Symbol universe: workspace/symbol("") + regex filter, with rg fallback
-        let mut symbols = {
-            let clients = self.client_manager.clients().await;
-
-            // Try workspace/symbol("") first — returns the full symbol index
-            let mut all_symbols: Vec<SymbolInfo> =
-                self.fetch_symbol_universe(&clients, parent_id).await;
-
-            // Fallback: if symbol("") returned nothing, use rg matched strings
-            if all_symbols.is_empty() && !rg.matched_strings.is_empty() {
-                all_symbols = self
-                    .fetch_symbols_by_queries(&rg.matched_strings, &clients, parent_id)
-                    .await;
-            }
-
-            // Regex filter against the user's pattern
-            all_symbols.retain(|s| re.is_match(&s.name));
-
-            // Dedupe by (name, file_path, line)
-            let mut seen: HashSet<(String, String, u32)> = HashSet::new();
-            all_symbols.retain(|s| seen.insert((s.name.clone(), s.file_path.clone(), s.line)));
-
-            all_symbols
-        };
-
-        // Filter symbols to glob/exclude scope
-        if let Some(ref rg) = resolved_glob {
-            symbols.retain(|s| {
-                effective_roots
+        // Step 3: Tree-sitter index freshness check and query.
+        let (ts_symbols, all_symbols_in_files, grammar_files) =
+            if let Some(ref index_mutex) = self.ts_index {
+                let index = index_mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let re_pattern = format!("(?i){}", &input.pattern);
+                if let Err(e) = index.ensure_fresh(&rg_paths) {
+                    debug!("tree-sitter freshness check failed: {e}");
+                }
+                let ts_syms = index
+                    .query(&re_pattern, Some(&rg_paths))
+                    .unwrap_or_default();
+                // Query ALL symbols in hit files for enclosing structure resolution
+                let all_syms = index.query(".*", Some(&rg_paths)).unwrap_or_default();
+                // Pre-check which files have grammars
+                let gf: HashSet<String> = rg_paths
                     .iter()
-                    .any(|root| rg.is_match(Path::new(&s.file_path), root))
-            });
-        }
-        if let Some(ref rg) = resolved_exclude {
-            symbols.retain(|s| {
-                !effective_roots
-                    .iter()
-                    .any(|root| rg.is_match(Path::new(&s.file_path), root))
-            });
+                    .filter(|p| index.has_grammar_for(p))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+                drop(index);
+                (ts_syms, all_syms, gf)
+            } else {
+                (Vec::new(), Vec::new(), HashSet::new())
+            };
+
+        // Build lookup: (file_path, line) → TsSymbol for definitions
+        let mut def_lookup: HashMap<(String, u32), TsSymbol> = HashMap::new();
+        for (path, sym) in &ts_symbols {
+            let path_str = path.to_string_lossy().to_string();
+            def_lookup.insert(
+                (path_str, sym.line),
+                TsSymbol {
+                    name: sym.name.clone(),
+                    kind: sym.kind.clone(),
+                    line: sym.line,
+                    end_line: sym.end_line,
+                    scope: sym.scope.clone(),
+                    scope_kind: sym.scope_kind.clone(),
+                },
+            );
         }
 
-        let show_hover = symbols.len() <= GREP_HOVER_THRESHOLD;
+        // Step 4: Classify each rg hit.
+        let mut hits: Vec<GrepHit> = Vec::new();
 
-        // 3. Group symbols by name (preserving order of first occurrence)
-        let mut name_order: Vec<String> = Vec::new();
-        let mut by_name: BTreeMap<String, Vec<&SymbolInfo>> = BTreeMap::new();
-        for sym in &symbols {
-            if !by_name.contains_key(&sym.name) {
-                name_order.push(sym.name.clone());
+        for (file_str, line_map) in &rg.file_line_texts {
+            let file_path = PathBuf::from(file_str);
+            let has_grammar = grammar_files.contains(file_str);
+
+            for (&line_1, texts) in line_map {
+                let line_0 = line_1 - 1;
+                let matched_text = texts.first().map(|(t, _)| t.clone()).unwrap_or_default();
+
+                if has_grammar {
+                    // Check if this line is a definition
+                    if let Some(sym) = def_lookup.get(&(file_str.clone(), line_0)) {
+                        hits.push(GrepHit {
+                            file: file_path.clone(),
+                            line: line_0,
+                            matched_text: matched_text.clone(),
+                            classification: HitClass::Symbol {
+                                symbol: TsSymbol {
+                                    name: sym.name.clone(),
+                                    kind: sym.kind.clone(),
+                                    line: sym.line,
+                                    end_line: sym.end_line,
+                                    scope: sym.scope.clone(),
+                                    scope_kind: sym.scope_kind.clone(),
+                                },
+                            },
+                        });
+                    } else {
+                        // Non-definition line — find enclosing structure
+                        let enclosing =
+                            find_enclosing_symbol(file_str, line_0, &all_symbols_in_files);
+                        hits.push(GrepHit {
+                            file: file_path.clone(),
+                            line: line_0,
+                            matched_text,
+                            classification: HitClass::Reference { enclosing },
+                        });
+                    }
+                } else {
+                    // No grammar — use prepareRename for keyword discrimination
+                    let col = texts.first().map_or(0, |(_, c)| *c);
+                    let is_symbol = self
+                        .prepare_rename_check(&file_path, line_0, col, parent_id)
+                        .await;
+                    if is_symbol {
+                        hits.push(GrepHit {
+                            file: file_path.clone(),
+                            line: line_0,
+                            matched_text,
+                            classification: HitClass::PrepareRenameSymbol,
+                        });
+                    } else {
+                        hits.push(GrepHit {
+                            file: file_path.clone(),
+                            line: line_0,
+                            matched_text,
+                            classification: HitClass::Keyword,
+                        });
+                    }
+                }
             }
-            by_name.entry(sym.name.clone()).or_default().push(sym);
         }
 
-        // 4. Always enrich: references, callers, implementations, subtypes
-        let mut enrichments: HashMap<(String, u32), SymbolEnrichment> = HashMap::new();
-        let mut all_ref_lines: HashMap<String, HashSet<u32>> = HashMap::new();
+        // Drop keywords
+        hits.retain(|h| !matches!(h.classification, HitClass::Keyword));
 
-        for sym in &symbols {
-            let enrichment = self.enrich_symbol(sym, parent_id).await;
-            for (file, lines) in &enrichment.ref_lines {
-                all_ref_lines.entry(file.clone()).or_default().extend(lines);
-            }
-            let key = (sym.file_path.clone(), sym.line);
-            enrichments.insert(key, enrichment);
+        if hits.is_empty() {
+            return Ok(String::new());
         }
 
-        // 4b. Rg-bootstrapped enrichment: enrich unaccounted rg hits via hover
-        let br = self
-            .bootstrap_from_rg(&rg, &by_name, &all_ref_lines, parent_id)
-            .await;
-        enrichments.extend(br.enrichments);
-        for (file, lines) in br.ref_lines {
-            all_ref_lines.entry(file).or_default().extend(lines);
-        }
-        for n in &br.name_order {
-            if !name_order.contains(n) {
-                name_order.push(n.clone());
-            }
-        }
-        let bootstrapped = br.symbols;
-        for sym in &bootstrapped {
-            by_name.entry(sym.name.clone()).or_default().push(sym);
-        }
-
-        // 5. Assign rg lines to symbol names; leftover lines are non-code hits
-        let rg_by_name = assign_rg_lines_to_symbols(&by_name, &all_ref_lines, &rg);
-
-        // 6. Build unified name_order: LSP symbol names + rg-only matched strings
-        // Add rg-only headings (matched strings that don't correspond to any LSP symbol)
-        for heading in rg_by_name.keys() {
-            if !heading.is_empty() && !name_order.contains(heading) {
-                name_order.push(heading.clone());
-            }
-        }
-
-        if name_order.is_empty() && rg.file_lines.is_empty() {
-            return Ok("No results found".to_string());
-        }
-
+        // Temporary flat output (replaced by 06b with proper tiers)
         let mut output = String::new();
 
-        // Single loop over all headings (LSP symbols and rg-only)
-        for name in &name_order {
+        // Group by matched_text for stable output
+        let mut by_name: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
+        for hit in &hits {
+            let key = match &hit.classification {
+                HitClass::Symbol { symbol } => symbol.name.clone(),
+                _ => hit.matched_text.clone(),
+            };
+            by_name.entry(key).or_default().push(hit);
+        }
+
+        for (name, group) in &by_name {
             if !output.is_empty() {
                 output.push('\n');
             }
-            let _ = writeln!(output, "# {name}");
 
-            // Non-code rg hits for this heading, with hover-resolved context
-            if let Some(lines) = rg_by_name.get(name.as_str())
-                && !lines.is_empty()
-            {
-                let _ = writeln!(output);
-                for (file, file_lines) in lines {
-                    let path = display_path(file, &self.fs_manager);
-                    let _ = writeln!(output, "{path} {}", format_line_ranges(file_lines));
-                }
-            }
+            for hit in group {
+                let path = display_path(&hit.file.to_string_lossy(), &self.fs_manager);
+                let line_1 = hit.line + 1;
 
-            // Definition sub-headings (only for LSP symbols)
-            if let Some(defs) = by_name.get(name) {
-                for sym in defs {
-                    let kind = format_symbol_kind(sym.kind);
-                    let path = display_path(&sym.file_path, &self.fs_manager);
-                    let line = sym.line + 1;
-                    let _ = writeln!(output, "\n## [{kind}] {path}:{line}");
-
-                    let key = (sym.file_path.clone(), sym.line);
-                    if let Some(enrichment) = enrichments.get(&key) {
-                        // Hover only when symbol count is within threshold
-                        if show_hover && let Some(hover) = &enrichment.hover {
-                            output.push('\n');
-                            for line in hover.lines() {
-                                let _ = writeln!(output, "> {line}");
-                            }
-                        }
-
-                        // Structural enrichment always shown
-                        let mut labeled_lines: HashSet<(String, u32)> = HashSet::new();
-
-                        if !enrichment.incoming_calls.is_empty() {
-                            let _ = writeln!(output, "\n### Callers\n");
-                            for (name, file, line) in &enrichment.incoming_calls {
-                                let path = display_path(file, &self.fs_manager);
-                                let _ = writeln!(output, "{name}  {path}:{line}");
-                                labeled_lines.insert((file.clone(), *line));
-                            }
-                        }
-
-                        if !enrichment.implementations.is_empty() {
-                            let _ = writeln!(output, "\n### Implementations\n");
-                            for (file, line) in &enrichment.implementations {
-                                let path = display_path(file, &self.fs_manager);
-                                let _ = writeln!(output, "{path}:{line}");
-                                labeled_lines.insert((file.clone(), *line));
-                            }
-                        }
-
-                        if !enrichment.subtypes.is_empty() {
-                            let _ = writeln!(output, "\n### Subtypes\n");
-                            for (name, file, line) in &enrichment.subtypes {
-                                let path = display_path(file, &self.fs_manager);
-                                let _ = writeln!(output, "{name}  {path}:{line}");
-                                labeled_lines.insert((file.clone(), *line));
-                            }
-                        }
-
-                        // References (excluding definition line and labeled lines)
-                        let ref_output = format_symbol_references(
-                            enrichment,
-                            &sym.file_path,
-                            sym.line,
-                            &self.fs_manager,
-                            &labeled_lines,
-                        );
-                        if !ref_output.is_empty() {
-                            let _ = writeln!(output, "\n### References\n\n{ref_output}");
+                match &hit.classification {
+                    HitClass::Symbol { symbol } => {
+                        let kind = format_ts_kind(&symbol.kind);
+                        let scope_prefix = symbol
+                            .scope
+                            .as_ref()
+                            .zip(symbol.scope_kind.as_ref())
+                            .map_or_else(String::new, |(sn, sk)| {
+                                format!("<{}> {}/", format_ts_kind(sk), sn)
+                            });
+                        let _ = writeln!(output, "{scope_prefix}<{kind}> {name}  {path}:{line_1}");
+                    }
+                    HitClass::Reference { enclosing } => {
+                        if let Some(enc) = enclosing {
+                            let enc_kind = format_ts_kind(&enc.kind);
+                            let enc_span = if enc.line == enc.end_line {
+                                format!(":{}", enc.line + 1)
+                            } else {
+                                format!(":{}-{}", enc.line + 1, enc.end_line + 1)
+                            };
+                            let _ = writeln!(
+                                output,
+                                "{path}:{line_1} (ref in <{enc_kind}> {}{})",
+                                enc.name, enc_span
+                            );
+                        } else {
+                            let _ = writeln!(output, "{path}:{line_1}");
                         }
                     }
+                    HitClass::PrepareRenameSymbol => {
+                        let _ = writeln!(output, "{name}  {path}:{line_1}");
+                    }
+                    HitClass::Keyword => {} // already filtered
                 }
             }
         }
 
-        // Trim trailing whitespace
         let trimmed_len = output.trim_end().len();
         output.truncate(trimmed_len);
-
-        if output.is_empty() {
-            return Ok("No results found".to_string());
-        }
-
         Ok(output)
     }
 
-    /// Fetches the full symbol universe via `workspace/symbol("")` from all servers.
-    /// Resolves URI-only symbols when the server supports `workspaceSymbol/resolve`.
-    async fn fetch_symbol_universe(
-        &self,
-        clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>,
-        parent_id: Option<i64>,
-    ) -> Vec<SymbolInfo> {
-        let mut all_symbols: Vec<SymbolInfo> = Vec::new();
-
-        for client_mutex in clients.values() {
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
-            let supports_resolve = client.supports_workspace_symbol_resolve();
-
-            let Ok(response) = client.workspace_symbols("").await else {
-                continue;
-            };
-
-            // Extract symbols that have full location info
-            all_symbols.extend(extract_symbol_infos(&response));
-
-            // Resolve URI-only symbols when server supports it
-            if supports_resolve && let Some(arr) = response.as_array() {
-                for item in arr {
-                    let has_uri = item.get("location").and_then(|l| l.get("uri")).is_some();
-                    let has_range = item.get("location").and_then(|l| l.get("range")).is_some();
-                    if has_uri
-                        && !has_range
-                        && let Ok(resolved) = client.workspace_symbol_resolve(item).await
-                    {
-                        all_symbols.extend(extract_symbol_infos(&Value::Array(vec![resolved])));
-                    }
-                }
-            }
-        }
-
-        all_symbols
-    }
-
-    /// Fallback: queries workspace/symbol with each matched string (ticket 08 behavior).
-    /// Resolves URI-only symbols via resolve when supported.
-    async fn fetch_symbols_by_queries(
-        &self,
-        queries: &[String],
-        clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>,
-        parent_id: Option<i64>,
-    ) -> Vec<SymbolInfo> {
-        let mut all_symbols: Vec<SymbolInfo> = Vec::new();
-
-        for query in queries {
-            for client_mutex in clients.values() {
-                let mut client = client_mutex.lock().await;
-                client.set_parent_id(parent_id);
-                let supports_resolve = client.supports_workspace_symbol_resolve();
-
-                let Ok(response) = client.workspace_symbols(query).await else {
-                    continue;
-                };
-
-                all_symbols.extend(extract_symbol_infos(&response));
-
-                if supports_resolve && let Some(arr) = response.as_array() {
-                    for item in arr {
-                        let has_uri = item.get("location").and_then(|l| l.get("uri")).is_some();
-                        let has_range = item.get("location").and_then(|l| l.get("range")).is_some();
-                        if has_uri
-                            && !has_range
-                            && let Ok(resolved) = client.workspace_symbol_resolve(item).await
-                        {
-                            all_symbols.extend(extract_symbol_infos(&Value::Array(vec![resolved])));
-                        }
-                    }
-                }
-            }
-        }
-
-        all_symbols
-    }
-
-    /// Enriches a symbol with hover, references, and kind-specific labels.
-    async fn enrich_symbol(&self, sym: &SymbolInfo, parent_id: Option<i64>) -> SymbolEnrichment {
-        let path = PathBuf::from(&sym.file_path);
-        self.enrich_at_position(&path, sym.line, sym.character, sym.kind, parent_id)
-            .await
-    }
-
-    /// Enriches a position with hover, references, and kind-specific labels.
-    #[allow(clippy::too_many_lines, reason = "Sequential LSP calls by kind")]
-    async fn enrich_at_position(
-        &self,
-        path: &Path,
-        line_0: u32,
-        col: u32,
-        kind: u32,
-        parent_id: Option<i64>,
-    ) -> SymbolEnrichment {
-        let mut enrichment = SymbolEnrichment::default();
-
-        let Ok((uri_str, client_mutex)) = self
-            .client_manager
-            .ensure_document_open(path, parent_id)
-            .await
-        else {
-            return enrichment;
-        };
-
-        let mut client = client_mutex.lock().await;
-        client.set_parent_id(parent_id);
-
-        // Hover — signature + docs
-        if let Ok(hover) = client.hover(&uri_str, line_0, col).await {
-            enrichment.hover = extract_hover_text_from_value(&hover);
-        }
-
-        // References — collect line numbers for dedup
-        if let Ok(refs) = client.references(&uri_str, line_0, col, true).await {
-            for (file, line, _char) in extract_locations(&refs) {
-                enrichment
-                    .ref_lines
-                    .entry(file)
-                    .or_default()
-                    .insert(line + 1);
-            }
-        }
-
-        // Kind-specific enrichment
-        match kind {
-            // Functions/methods/constructors → incoming calls
-            symbols::SK_FUNCTION | symbols::SK_METHOD | symbols::SK_CONSTRUCTOR => {
-                if let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
-                    && let Some(items) = response.as_array()
-                {
-                    for item in items {
-                        if let Ok(calls) = client.incoming_calls(item).await {
-                            extract_incoming_calls(&calls, &mut enrichment);
-                        }
-                    }
-                }
-            }
-
-            // Structs/classes/enums → implementations
-            symbols::SK_STRUCT | symbols::SK_CLASS | symbols::SK_ENUM => {
-                if let Ok(response) = client.implementation(&uri_str, line_0, col).await {
-                    for (file, line, _char) in extract_locations(&response) {
-                        enrichment.implementations.push((file, line + 1));
-                    }
-                }
-            }
-
-            // Interfaces/traits → subtypes
-            symbols::SK_INTERFACE => {
-                if let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
-                    && let Some(items) = response.as_array()
-                {
-                    for item in items {
-                        if let Ok(subs) = client.subtypes(item).await {
-                            extract_subtypes(&subs, &mut enrichment);
-                        }
-                    }
-                }
-            }
-
-            _ => {}
-        }
-
-        drop(client);
-        self.client_manager
-            .close_document(&uri_str, &client_mutex)
-            .await;
-
-        enrichment
-    }
-
-    /// Enriches a position with kind inference — tries all kind-specific
-    /// enrichments and infers kind from what returns results. Used by the
-    /// rg-bootstrapped enrichment path where kind is unknown.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Sequential LSP calls for kind inference"
-    )]
-    async fn enrich_at_position_infer_kind(
+    /// Checks `prepareRename` at a position to distinguish symbols from keywords.
+    ///
+    /// Returns `true` if the position is a symbol, `false` if keyword.
+    /// Defaults to `true` (assume symbol) when the server is unavailable.
+    async fn prepare_rename_check(
         &self,
         path: &Path,
         line_0: u32,
         col: u32,
         parent_id: Option<i64>,
-    ) -> (u32, Option<String>, SymbolEnrichment) {
-        let mut enrichment = SymbolEnrichment::default();
-        let mut inferred_kind = symbols::SK_VARIABLE;
-        let mut resolved_name: Option<String> = None;
-
+    ) -> bool {
         let Ok((uri_str, client_mutex)) = self
             .client_manager
             .ensure_document_open(path, parent_id)
             .await
         else {
-            return (inferred_kind, resolved_name, enrichment);
+            // Server unavailable — can't check, assume symbol
+            return true;
         };
 
         let mut client = client_mutex.lock().await;
         client.set_parent_id(parent_id);
-
-        // Hover — signature + docs
-        if let Ok(hover) = client.hover(&uri_str, line_0, col).await {
-            enrichment.hover = extract_hover_text_from_value(&hover);
-        }
-
-        // References — collect line numbers for dedup
-        if let Ok(refs) = client.references(&uri_str, line_0, col, true).await {
-            for (file, line, _char) in extract_locations(&refs) {
-                enrichment
-                    .ref_lines
-                    .entry(file)
-                    .or_default()
-                    .insert(line + 1);
+        let result = if client.supports_rename() {
+            match client.prepare_rename(&uri_str, line_0, col).await {
+                Ok(v) if v.is_null() => false, // null → keyword
+                _ => true,                     // range or error → assume symbol
             }
-        }
-
-        // Try all kind-specific enrichments — infer kind from results
-
-        // Call hierarchy → FUNCTION
-        if let Ok(response) = client.prepare_call_hierarchy(&uri_str, line_0, col).await
-            && let Some(items) = response.as_array()
-            && !items.is_empty()
-        {
-            inferred_kind = symbols::SK_FUNCTION;
-            // The first item's name is the LSP-canonical symbol name.
-            resolved_name = items
-                .first()
-                .and_then(|i| i.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            for item in items {
-                if let Ok(calls) = client.incoming_calls(item).await {
-                    extract_incoming_calls(&calls, &mut enrichment);
-                }
-            }
-        }
-
-        // Implementation → STRUCT (only if not already identified as function)
-        if inferred_kind == symbols::SK_VARIABLE
-            && let Ok(response) = client.implementation(&uri_str, line_0, col).await
-        {
-            let locs = extract_locations(&response);
-            if !locs.is_empty() {
-                inferred_kind = symbols::SK_STRUCT;
-                for (file, line, _char) in locs {
-                    enrichment.implementations.push((file, line + 1));
-                }
-            }
-        }
-
-        // Type hierarchy → INTERFACE (only if not already identified)
-        if inferred_kind == symbols::SK_VARIABLE
-            && let Ok(response) = client.prepare_type_hierarchy(&uri_str, line_0, col).await
-            && let Some(items) = response.as_array()
-            && !items.is_empty()
-        {
-            inferred_kind = symbols::SK_INTERFACE;
-            resolved_name = items
-                .first()
-                .and_then(|i| i.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            for item in items {
-                if let Ok(subs) = client.subtypes(item).await {
-                    extract_subtypes(&subs, &mut enrichment);
-                }
-            }
-        }
-
+        } else {
+            // No renameProvider — can't distinguish, assume symbol
+            true
+        };
         drop(client);
         self.client_manager
             .close_document(&uri_str, &client_mutex)
             .await;
-
-        (inferred_kind, resolved_name, enrichment)
-    }
-
-    /// Bootstraps LSP enrichment from unaccounted rg hit positions.
-    ///
-    /// After the symbol universe enrichment, some rg hits may not be explained
-    /// by any universe symbol (truncation, keyword prefixes). This method
-    /// uses `prepareRename` to distinguish symbols from keywords, then
-    /// enriches confirmed symbols with full LSP queries.
-    ///
-    /// Returns owned `SymbolInfo` values (plus enrichments and ref lines).
-    /// The caller merges these into `by_name` where both the universe
-    /// `symbols` vec and the returned vec are in scope.
-    #[allow(clippy::too_many_lines, reason = "Iterative elimination loop")]
-    async fn bootstrap_from_rg(
-        &self,
-        rg: &RipgrepMatches,
-        by_name: &BTreeMap<String, Vec<&SymbolInfo>>,
-        all_ref_lines: &HashMap<String, HashSet<u32>>,
-        parent_id: Option<i64>,
-    ) -> BootstrapResult {
-        let mut result = BootstrapResult {
-            symbols: Vec::new(),
-            enrichments: HashMap::new(),
-            ref_lines: HashMap::new(),
-            name_order: Vec::new(),
-        };
-
-        // Build accounted set: definition lines + reference lines from universe
-        let mut accounted: HashMap<String, HashSet<u32>> = HashMap::new();
-        for defs in by_name.values() {
-            for sym in defs {
-                accounted
-                    .entry(sym.file_path.clone())
-                    .or_default()
-                    .insert(sym.line + 1);
-            }
-        }
-        for (file, ref_set) in all_ref_lines {
-            accounted.entry(file.clone()).or_default().extend(ref_set);
-        }
-
-        // Collect unaccounted rg hits: (file, line_1based, matched_text, col)
-        let mut unaccounted: Vec<(String, u32, String, u32)> = Vec::new();
-        for (file, line_map) in &rg.file_line_texts {
-            for (&line, texts) in line_map {
-                if accounted.get(file).is_some_and(|s| s.contains(&line)) {
-                    continue;
-                }
-                for (text, col) in texts {
-                    unaccounted.push((file.clone(), line, text.clone(), *col));
-                }
-            }
-        }
-
-        if unaccounted.is_empty() {
-            return result;
-        }
-
-        // Identifier token regex for extracting symbols from matched text
-        let Ok(ident_re) = Regex::new(r"[a-zA-Z_]\w*") else {
-            return result;
-        };
-
-        // Track names we've already bootstrapped to avoid duplicates
-        let mut bootstrapped_names: HashSet<String> = HashSet::new();
-
-        // Total distinct symbol count: universe + bootstrapped
-        let total_symbols = |result: &BootstrapResult| by_name.len() + result.symbols.len();
-
-        for (file, line_1, matched_text, match_col) in &unaccounted {
-            if total_symbols(&result) >= GREP_HOVER_THRESHOLD {
-                break;
-            }
-
-            // Check if this line is now accounted (by a prior bootstrap round)
-            if accounted.get(file).is_some_and(|s| s.contains(line_1)) {
-                continue;
-            }
-
-            let line_0 = line_1 - 1;
-            let path = PathBuf::from(file.as_str());
-
-            // Extract identifier tokens from the matched text
-            for m in ident_re.find_iter(matched_text) {
-                if total_symbols(&result) >= GREP_HOVER_THRESHOLD {
-                    break;
-                }
-
-                let token = m.as_str();
-
-                // Skip if already a known symbol name or already bootstrapped
-                if by_name.contains_key(token) || bootstrapped_names.contains(token) {
-                    continue;
-                }
-
-                // Column = match start on line + token offset within match text
-                let col = match_col + u32::try_from(m.start()).unwrap_or(0);
-
-                // prepareRename: Ok(non-null) → symbol, Ok(null) → keyword.
-                // No renameProvider → skip the check, assume symbol.
-                let is_symbol = {
-                    let open_result = self
-                        .client_manager
-                        .ensure_document_open(&path, parent_id)
-                        .await;
-                    if let Ok((uri_str, client_mutex)) = open_result {
-                        let mut client = client_mutex.lock().await;
-                        client.set_parent_id(parent_id);
-                        let result = if client.supports_rename() {
-                            let response = client.prepare_rename(&uri_str, line_0, col).await;
-                            matches!(response, Ok(ref v) if !v.is_null())
-                        } else {
-                            true
-                        };
-                        drop(client);
-                        self.client_manager
-                            .close_document(&uri_str, &client_mutex)
-                            .await;
-                        result
-                    } else {
-                        false
-                    }
-                };
-                if !is_symbol {
-                    continue;
-                }
-
-                let (kind, resolved, enrichment) = self
-                    .enrich_at_position_infer_kind(&path, line_0, col, parent_id)
-                    .await;
-
-                // resolved_name comes from prepareCallHierarchy (functions)
-                // or prepareTypeHierarchy (types). If neither returned a name,
-                // this token isn't a structural symbol — skip it.
-                let Some(name) = resolved else { continue };
-                // If the resolved name doesn't contain the token, this is a
-                // keyword (`fn`, `struct`) that resolved to the adjacent symbol
-                // — skip and let the real token get enriched. Substring matches
-                // (e.g., token `test_glob` resolving to `test_glob_basic`) are
-                // legitimate and should proceed.
-                if !name.contains(token) {
-                    continue;
-                }
-
-                // Skip if this resolved name is already known
-                if by_name.contains_key(&name) || bootstrapped_names.contains(&name) {
-                    // Still update accounted set so remaining hits are explained
-                    for (ref_file, ref_lines) in &enrichment.ref_lines {
-                        accounted
-                            .entry(ref_file.clone())
-                            .or_default()
-                            .extend(ref_lines);
-                        result
-                            .ref_lines
-                            .entry(ref_file.clone())
-                            .or_default()
-                            .extend(ref_lines);
-                    }
-                    accounted.entry(file.clone()).or_default().insert(*line_1);
-                    continue;
-                }
-
-                // Update accounted set with new reference lines
-                for (ref_file, ref_lines) in &enrichment.ref_lines {
-                    accounted
-                        .entry(ref_file.clone())
-                        .or_default()
-                        .extend(ref_lines);
-                    result
-                        .ref_lines
-                        .entry(ref_file.clone())
-                        .or_default()
-                        .extend(ref_lines);
-                }
-
-                // Add definition line to accounted
-                accounted.entry(file.clone()).or_default().insert(*line_1);
-
-                // Store enrichment
-                result
-                    .enrichments
-                    .insert((file.clone(), line_0), enrichment);
-
-                let sym = SymbolInfo {
-                    name: name.clone(),
-                    kind,
-                    file_path: file.clone(),
-                    line: line_0,
-                    character: col,
-                };
-
-                if !by_name.contains_key(&name) {
-                    result.name_order.push(name.clone());
-                }
-                result.symbols.push(sym);
-                bootstrapped_names.insert(name);
-            }
-        }
-
         result
     }
 
@@ -928,7 +506,7 @@ struct CollectOnDrop {
 impl Drop for CollectOnDrop {
     fn drop(&mut self) {
         let local = std::mem::take(&mut self.local);
-        if local.file_lines.is_empty() && local.matched_set.is_empty() {
+        if local.file_lines.is_empty() {
             return;
         }
         if let Ok(mut vec) = self.collected.lock() {
@@ -970,16 +548,14 @@ impl Sink for MatchSink<'_> {
                 continue;
             }
             if let Ok(text) = std::str::from_utf8(&line_bytes[m]) {
-                let text = text.to_string();
                 let col = u32::try_from(m.start()).unwrap_or(0);
-                self.local.matched_set.insert(text.clone());
                 self.local
                     .file_line_texts
                     .entry(self.path.to_string())
                     .or_default()
                     .entry(line_num)
                     .or_default()
-                    .push((text, col));
+                    .push((text.to_string(), col));
             }
             at = m.end();
         }
@@ -994,45 +570,16 @@ impl Sink for MatchSink<'_> {
     }
 }
 
-// ─── Search enrichment types and formatting ─────────────────────────────
-
-/// Enrichment data collected for a single workspace symbol.
-#[derive(Default)]
-struct SymbolEnrichment {
-    /// Hover content (signature + docs).
-    hover: Option<String>,
-    /// Reference line numbers per file (for deduplication).
-    ref_lines: HashMap<String, HashSet<u32>>,
-    /// Incoming calls: `(caller_name, file_path, line_1based)`.
-    incoming_calls: Vec<(String, String, u32)>,
-    /// Implementation locations: `(file_path, line_1based)`.
-    implementations: Vec<(String, u32)>,
-    /// Subtypes: `(type_name, file_path, line_1based)`.
-    subtypes: Vec<(String, String, u32)>,
-}
-
-/// Symbols and enrichment discovered by rg-bootstrapped hover.
-struct BootstrapResult {
-    /// Newly-discovered `SymbolInfo` values.
-    symbols: Vec<SymbolInfo>,
-    /// Enrichment keyed by `(file_path, line_0based)`.
-    enrichments: HashMap<(String, u32), SymbolEnrichment>,
-    /// Reference lines discovered during bootstrap, keyed by file path.
-    ref_lines: HashMap<String, HashSet<u32>>,
-    /// Names of bootstrapped symbols in discovery order.
-    name_order: Vec<String>,
-}
+// ─── Alternation splitting ────────────────────────────────────────────
 
 /// Result of a ripgrep `--only-matching` search.
 #[derive(Default)]
 struct RipgrepMatches {
-    /// Unique matched strings (for LSP queries).
-    matched_strings: Vec<String>,
     /// Per-file line numbers (for heatmap tier).
     file_lines: BTreeMap<String, Vec<u32>>,
     /// Per-file, per-line matched texts with column offsets
-    /// `(matched_text, column_byte_offset)` for routing unclaimed lines
-    /// to headings and for rg-bootstrapped hover positions.
+    /// `(matched_text, column_byte_offset)` for hit classification
+    /// and for no-grammar `prepareRename` positions.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
 }
 
@@ -1040,14 +587,12 @@ impl RipgrepMatches {
     /// Merges per-thread match accumulators into a single result.
     fn merge(parts: Vec<ThreadMatches>) -> Self {
         let mut file_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-        let mut matched_set: HashSet<String> = HashSet::new();
         let mut file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>> = HashMap::new();
 
         for part in parts {
             for (file, lines) in part.file_lines {
                 file_lines.entry(file).or_default().extend(lines);
             }
-            matched_set.extend(part.matched_set);
             for (file, line_map) in part.file_line_texts {
                 let entry = file_line_texts.entry(file).or_default();
                 for (line, texts) in line_map {
@@ -1057,7 +602,6 @@ impl RipgrepMatches {
         }
 
         Self {
-            matched_strings: matched_set.into_iter().collect(),
             file_lines,
             file_line_texts,
         }
@@ -1069,308 +613,89 @@ impl RipgrepMatches {
 struct ThreadMatches {
     /// Per-file line numbers.
     file_lines: BTreeMap<String, Vec<u32>>,
-    /// Unique matched strings (`HashSet` for efficient per-thread dedup).
-    matched_set: HashSet<String>,
     /// Per-file, per-line matched texts with column offsets.
     file_line_texts: HashMap<String, HashMap<u32, Vec<(String, u32)>>>,
 }
 
-/// Extracts plain text from a `Value`-based LSP hover response.
-fn extract_hover_text_from_value(hover: &Value) -> Option<String> {
-    let contents = hover.get("contents")?;
-
-    // String: plain MarkedString
-    if let Some(s) = contents.as_str() {
-        let s = s.trim();
-        return if s.is_empty() {
-            None
-        } else {
-            Some(s.to_string())
-        };
-    }
-
-    // Object with "value" field: MarkupContent or LanguageString MarkedString
-    if let Some(value) = contents.get("value").and_then(Value::as_str) {
-        let text = value.trim();
-        return if text.is_empty() {
-            None
-        } else {
-            Some(text.to_string())
-        };
-    }
-
-    // Array of MarkedString
-    if let Some(arr) = contents.as_array() {
-        let texts: Vec<String> = arr
-            .iter()
-            .filter_map(|item| {
-                item.as_str().map_or_else(
-                    || {
-                        item.get("value")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    },
-                    |s| Some(s.to_string()),
-                )
-            })
-            .collect();
-        return if texts.is_empty() {
-            None
-        } else {
-            Some(texts.join("\n"))
-        };
-    }
-
-    None
-}
-
-/// Extracts the file path from a hierarchy item's `uri` field.
-fn value_file_path(item: &Value) -> String {
-    item.get("uri")
-        .and_then(Value::as_str)
-        .and_then(symbols::uri_to_path)
-        .unwrap_or_default()
-}
-
-/// Extracts `range.start.line` from a hierarchy item `Value`.
-fn value_start_line(item: &Value) -> u32 {
-    item.get("range")
-        .and_then(|r| r.get("start"))
-        .and_then(|s| s.get("line"))
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0)
-}
-
-/// Extracts incoming calls from a `callHierarchy/incomingCalls` response
-/// into the enrichment's `incoming_calls` list.
-fn extract_incoming_calls(response: &Value, enrichment: &mut SymbolEnrichment) {
-    if let Some(calls) = response.as_array() {
-        for call in calls {
-            if let Some(from) = call.get("from") {
-                enrichment.incoming_calls.push((
-                    from.get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    value_file_path(from),
-                    value_start_line(from) + 1,
-                ));
-            }
-        }
-    }
-}
-
-/// Extracts subtypes from a `typeHierarchy/subtypes` response
-/// into the enrichment's `subtypes` list.
-fn extract_subtypes(response: &Value, enrichment: &mut SymbolEnrichment) {
-    if let Some(subs) = response.as_array() {
-        for sub in subs {
-            enrichment.subtypes.push((
-                sub.get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                value_file_path(sub),
-                value_start_line(sub) + 1,
-            ));
-        }
-    }
-}
-
-/// Formats sorted line numbers as compact ranges: `L45`, `L15-L20`.
-/// Nearby lines are clustered using sqrt-based merge distance (DBSCAN-style):
-/// `merge_distance = ceil(sqrt(max_line))`. This scales with file size —
-/// small files cluster tightly, large files tolerate wider gaps.
-fn format_line_ranges(lines: &[u32]) -> String {
-    if lines.is_empty() {
-        return String::new();
-    }
-
-    let mut sorted = lines.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-
-    let max_line = sorted[sorted.len() - 1];
-    // Integer ceiling of sqrt: isqrt rounds down, so add 1 unless it's a perfect square.
-    let isqrt = u32::isqrt(max_line);
-    let merge_distance = if isqrt * isqrt == max_line {
-        isqrt
-    } else {
-        isqrt + 1
-    }
-    .max(1);
-
-    let mut ranges: Vec<String> = Vec::new();
-    let mut start = sorted[0];
-    let mut end = sorted[0];
-
-    for &line in &sorted[1..] {
-        if line - end > merge_distance {
-            ranges.push(format_single_range(start, end));
-            start = line;
-        }
-        end = line;
-    }
-    ranges.push(format_single_range(start, end));
-
-    ranges.join(" ")
-}
-
-/// Formats a single line or range.
-fn format_single_range(start: u32, end: u32) -> String {
-    if start == end {
-        format!("L{start}")
-    } else {
-        format!("L{start}-L{end}")
-    }
-}
-
-/// Formats references from enrichment, excluding the definition line
-/// and any lines already shown in labeled sections.
-fn format_symbol_references(
-    enrichment: &SymbolEnrichment,
-    def_file: &str,
-    def_line_0: u32,
-    fs: &FilesystemManager,
-    labeled_lines: &HashSet<(String, u32)>,
-) -> String {
-    use std::fmt::Write;
-
-    let def_line_1 = def_line_0 + 1;
-    let mut output = String::new();
-
-    // Sort files for stable output
-    let mut files: Vec<&String> = enrichment.ref_lines.keys().collect();
-    files.sort();
-
-    for file in files {
-        let lines = &enrichment.ref_lines[file];
-        // Filter out the definition line and labeled lines
-        let is_def_file = file.as_str() == def_file;
-        let mut filtered: Vec<u32> = lines
-            .iter()
-            .copied()
-            .filter(|&l| {
-                if is_def_file && l == def_line_1 {
-                    return false;
-                }
-                !labeled_lines.contains(&(file.clone(), l))
-            })
-            .collect();
-        if filtered.is_empty() {
-            continue;
-        }
-        filtered.sort_unstable();
-        let path = display_path(file, fs);
-        let _ = writeln!(output, "{path} {}", format_line_ranges(&filtered));
-    }
-
-    let trimmed_len = output.trim_end().len();
-    output.truncate(trimmed_len);
-    output
-}
-
-/// Assigns rg file/line hits to symbol names based on LSP reference data
-/// and matched text routing.
+/// Splits a regex pattern on top-level `|` alternation.
 ///
-/// Returns a map from heading name to file hits. Each heading name is either
-/// an LSP symbol name or an rg-only matched string.
-fn assign_rg_lines_to_symbols(
-    by_name: &BTreeMap<String, Vec<&SymbolInfo>>,
-    all_ref_lines: &HashMap<String, HashSet<u32>>,
-    rg: &RipgrepMatches,
-) -> BTreeMap<String, Vec<(String, Vec<u32>)>> {
-    let mut result: BTreeMap<String, Vec<(String, Vec<u32>)>> = BTreeMap::new();
+/// Only splits on `|` when depth == 0 and not inside a character class.
+/// `foo|bar` → `["foo", "bar"]`. `(foo|bar)_baz` → `["(foo|bar)_baz"]`.
+fn split_alternation(pattern: &str) -> Vec<String> {
+    let mut arms = Vec::new();
+    let mut depth: usize = 0;
+    let mut in_class = false;
+    let mut start = 0;
+    let mut escaped = false;
 
-    // Track which rg lines are claimed by any symbol's references
-    let mut claimed: HashMap<String, HashSet<u32>> = HashMap::new();
-    for (file, ref_set) in all_ref_lines {
-        claimed.entry(file.clone()).or_default().extend(ref_set);
-    }
-
-    // Also claim definition lines
-    for defs in by_name.values() {
-        for sym in defs {
-            claimed
-                .entry(sym.file_path.clone())
-                .or_default()
-                .insert(sym.line + 1);
-        }
-    }
-
-    // Build a lowercase lookup for symbol names
-    let name_lower: Vec<(String, String)> = by_name
-        .keys()
-        .map(|n: &String| (n.clone(), n.to_lowercase()))
-        .collect();
-
-    // For each rg file, find unclaimed lines and route by matched text
-    for (file, lines) in &rg.file_lines {
-        let unclaimed: Vec<u32> = lines
-            .iter()
-            .copied()
-            .filter(|l| !claimed.get(file.as_str()).is_some_and(|s| s.contains(l)))
-            .collect();
-        if unclaimed.is_empty() {
+    for (i, ch) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-
-        // Group unclaimed lines by their matched text, then route to headings
-        let file_texts = rg.file_line_texts.get(file.as_str());
-        // Collect (heading, lines) per heading for this file
-        let mut heading_lines: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-
-        for &line_num in &unclaimed {
-            let texts = file_texts.and_then(|ft| ft.get(&line_num));
-            let mut routed = false;
-
-            if let Some(texts) = texts {
-                for (matched_text, _col) in texts {
-                    let mt_lower = matched_text.to_lowercase();
-                    // Try to match to a known symbol name
-                    for (name, nl) in &name_lower {
-                        if mt_lower == *nl || mt_lower.contains(nl.as_str()) {
-                            heading_lines
-                                .entry(name.clone())
-                                .or_default()
-                                .push(line_num);
-                            routed = true;
-                            break;
-                        }
-                    }
-                    if !routed {
-                        // No symbol match — use the matched text itself as heading
-                        heading_lines
-                            .entry(matched_text.clone())
-                            .or_default()
-                            .push(line_num);
-                        routed = true;
-                    }
-                    if routed {
-                        break;
-                    }
-                }
-            }
-
-            if !routed {
-                // No matched text info — fallback to empty key
-                heading_lines
-                    .entry(String::new())
-                    .or_default()
-                    .push(line_num);
-            }
+        if ch == '\\' {
+            escaped = true;
+            continue;
         }
+        if in_class {
+            if ch == ']' {
+                in_class = false;
+            }
+            continue;
+        }
+        match ch {
+            '[' => in_class = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
+                arms.push(pattern[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    arms.push(pattern[start..].to_string());
+    arms.retain(|a| !a.is_empty());
+    if arms.is_empty() {
+        arms.push(pattern.to_string());
+    }
+    arms
+}
 
-        for (heading, lines) in heading_lines {
-            result
-                .entry(heading)
-                .or_default()
-                .push((file.clone(), lines));
+/// Finds the innermost enclosing symbol for a line in a file.
+///
+/// Scans all symbols in the given file from the full index and returns
+/// the tightest enclosing definition (smallest span containing the line).
+fn find_enclosing_symbol(
+    file_str: &str,
+    line_0: u32,
+    all_symbols: &[(PathBuf, TsSymbol)],
+) -> Option<TsSymbol> {
+    let mut best: Option<&TsSymbol> = None;
+    let mut best_span = u32::MAX;
+
+    for (path, sym) in all_symbols {
+        if path.to_string_lossy() != file_str {
+            continue;
+        }
+        if sym.line <= line_0 && line_0 <= sym.end_line {
+            // This symbol contains the line. Is it tighter?
+            let span = sym.end_line - sym.line;
+            if span < best_span {
+                best = Some(sym);
+                best_span = span;
+            }
         }
     }
 
-    result
+    best.map(|s| TsSymbol {
+        name: s.name.clone(),
+        kind: s.kind.clone(),
+        line: s.line,
+        end_line: s.end_line,
+        scope: s.scope.clone(),
+        scope_kind: s.scope_kind.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -1403,85 +728,35 @@ mod tests {
         );
     }
 
-    // ─── format_line_ranges tests ────────────────────────────────────────
+    // ─── split_alternation tests ─────────────────────────────────────────
 
     #[test]
-    fn test_format_line_ranges_empty() {
-        assert_eq!(format_line_ranges(&[]), "");
+    fn test_split_top_level() {
+        assert_eq!(split_alternation("foo|bar"), vec!["foo", "bar"]);
     }
 
     #[test]
-    fn test_format_line_ranges_single() {
-        assert_eq!(format_line_ranges(&[42]), "L42");
+    fn test_split_nested_no_split() {
+        assert_eq!(split_alternation("(foo|bar)_baz"), vec!["(foo|bar)_baz"]);
     }
 
     #[test]
-    fn test_format_line_ranges_consecutive() {
-        assert_eq!(format_line_ranges(&[10, 11, 12]), "L10-L12");
+    fn test_split_character_class() {
+        assert_eq!(split_alternation("[a|b]_c"), vec!["[a|b]_c"]);
     }
 
     #[test]
-    fn test_format_line_ranges_disjoint() {
-        // max=20, merge_distance=ceil(sqrt(20))=5
-        // gap 5→10 = 5 ≤ 5 → merge; gap 10→20 = 10 > 5 → split
-        assert_eq!(format_line_ranges(&[5, 10, 20]), "L5-L10 L20");
+    fn test_split_three_arms() {
+        assert_eq!(split_alternation("a|b|c"), vec!["a", "b", "c"]);
     }
 
     #[test]
-    fn test_format_line_ranges_mixed() {
-        // max=50, merge_distance=ceil(sqrt(50))=8
-        // gaps: 3→10=7 ≤ 8, 11→50=39 > 8
-        assert_eq!(format_line_ranges(&[1, 2, 3, 10, 11, 50]), "L1-L11 L50");
+    fn test_split_no_alternation() {
+        assert_eq!(split_alternation("foobar"), vec!["foobar"]);
     }
 
     #[test]
-    fn test_format_line_ranges_unsorted() {
-        // max=20, merge_distance=5; sorted [10,11,20]; gap 11→20=9 > 5
-        assert_eq!(format_line_ranges(&[20, 10, 11]), "L10-L11 L20");
-    }
-
-    #[test]
-    fn test_format_line_ranges_dbscan_nearby() {
-        // max=30, merge_distance=ceil(sqrt(30))=6; gap 25→30=5 ≤ 6
-        assert_eq!(format_line_ranges(&[25, 30]), "L25-L30");
-    }
-
-    #[test]
-    fn test_format_line_ranges_dbscan_far_apart() {
-        // max=1000, merge_distance=ceil(sqrt(1000))=32; gap=999 > 32
-        assert_eq!(format_line_ranges(&[1, 1000]), "L1 L1000");
-    }
-
-    #[test]
-    fn test_format_line_ranges_dbscan_mixed() {
-        // max=14, merge_distance=ceil(sqrt(14))=4
-        // gap 5→10=5 > 4 → split; gap 10→14=4 ≤ 4 → merge
-        assert_eq!(format_line_ranges(&[5, 10, 14]), "L5 L10-L14");
-    }
-
-    // ─── format_symbol_references tests ──────────────────────────────────
-
-    #[test]
-    fn test_format_symbol_references_excludes_def() {
-        let mut ref_lines = HashMap::new();
-        ref_lines.insert("/src/lib.rs".to_string(), HashSet::from([1, 10, 20]));
-
-        let enrichment = SymbolEnrichment {
-            hover: None,
-            ref_lines,
-            ..SymbolEnrichment::default()
-        };
-        let fs = FilesystemManager::new();
-        fs.set_roots(vec![PathBuf::from("/")]);
-        let labeled = HashSet::new();
-
-        // Definition is at line 0 (0-indexed) = line 1 (1-indexed)
-        let result = format_symbol_references(&enrichment, "/src/lib.rs", 0, &fs, &labeled);
-        assert!(result.contains("L10"));
-        assert!(result.contains("L20"));
-        assert!(
-            !result.contains("L1 "),
-            "Definition line should be excluded"
-        );
+    fn test_split_escaped_pipe() {
+        assert_eq!(split_alternation(r"foo\|bar"), vec![r"foo\|bar"]);
     }
 }
