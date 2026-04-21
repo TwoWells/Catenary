@@ -361,15 +361,6 @@ impl LspClientManager {
         Ok(())
     }
 
-    /// Pure map lookup by key.
-    #[allow(
-        dead_code,
-        reason = "public API for Phase 1c dispatch (used by wait primitives)"
-    )]
-    async fn get(&self, key: &InstanceKey) -> Option<Arc<Mutex<LspClient>>> {
-        self.clients.lock().await.get(key).cloned()
-    }
-
     /// Returns clients for a file path, filtered by capability and
     /// `file_patterns`, in priority order (from the `servers` list in
     /// `[language.*]`).
