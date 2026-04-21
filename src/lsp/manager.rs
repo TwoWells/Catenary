@@ -2680,6 +2680,16 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_legacy_for_added_roots_multi_server() -> Result<()> {
         // Adding a root spawns per-root instances for all legacy servers.
+        // Uses a tempdir with real files so detect_workspace_languages succeeds.
+        let root_a = tempfile::tempdir().expect("tempdir");
+        let root_b = tempfile::tempdir().expect("tempdir");
+
+        // Create files with the synthetic extension so language detection works.
+        std::fs::write(root_a.path().join(format!("file.{MOCK_LANG_A}")), "content")
+            .expect("write");
+        std::fs::write(root_b.path().join(format!("file.{MOCK_LANG_A}")), "content")
+            .expect("write");
+
         let config = mockls_multi_server_config();
         let bindings: Vec<String> = config
             .resolve_language(MOCK_LANG_A)
@@ -2689,48 +2699,37 @@ mod tests {
             .map(|b| b.name.clone())
             .collect();
 
-        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+        let fs = test_fs();
+        fs.set_roots(vec![root_a.path().to_path_buf()]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
 
-        // Spawn both servers for /tmp.
+        // Spawn both servers for root_a.
         for name in &bindings {
             manager
-                .ensure_server(MOCK_LANG_A, name, Path::new("/tmp"))
+                .ensure_server(MOCK_LANG_A, name, root_a.path())
                 .await?;
         }
         assert_eq!(manager.clients().await.len(), 2);
 
-        // sync_roots adds /var — both legacy servers should get /var instances.
+        // sync_roots adds root_b — both legacy servers should get root_b instances.
         manager
-            .sync_roots(vec![PathBuf::from("/tmp"), PathBuf::from("/var")])
+            .sync_roots(vec![
+                root_a.path().to_path_buf(),
+                root_b.path().to_path_buf(),
+            ])
             .await?;
 
         let clients = manager.clients().await;
-        // 2 servers × 2 roots = 4 (but spawn_legacy_for_added_roots only spawns
-        // for added roots, and only if files are detected. Since /var won't have
-        // matching files for the synthetic extension, the detection check gates
-        // spawning. Verify the mechanism works for languages that pass detection.)
-        // Instead, test the raw method directly.
-        drop(clients);
+        assert_eq!(clients.len(), 4, "2 legacy servers × 2 roots = 4 instances");
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 4);
 
-        // Test spawn_legacy_for_added_roots directly: add /opt as a root with
-        // the detection already satisfied.
-        manager.fs.set_roots(vec![
-            PathBuf::from("/tmp"),
-            PathBuf::from("/var"),
-            PathBuf::from("/opt"),
-        ]);
-        let opt = PathBuf::from("/opt");
-        manager.spawn_legacy_for_added_roots(&[&opt]).await;
-
-        // spawn_legacy_for_added_roots checks detect_workspace_languages,
-        // which scans for files. With synthetic extensions, no files match.
-        // The 2 existing /tmp instances confirm the mechanism works.
-        // The real-world scenario (real files) is covered by integration tests.
-        assert_eq!(
-            count_scope(&manager.clients().await, MOCK_LANG_A, "root"),
-            2,
-            "Only /tmp instances exist (no files detected in /opt for synthetic extension)"
-        );
+        // Verify both roots are represented.
+        let root_paths: HashSet<PathBuf> = clients
+            .keys()
+            .filter_map(|k| k.scope.root_path().map(Path::to_path_buf))
+            .collect();
+        assert!(root_paths.contains(root_a.path()));
+        assert!(root_paths.contains(root_b.path()));
         Ok(())
     }
 
