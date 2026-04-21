@@ -594,19 +594,15 @@ fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager)
     let mut output = String::new();
 
     for b in &buckets {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-
         if b.entries.is_none() {
             // Bare handle with count
-            let _ = write!(output, "{} ({})", b.pattern, b.count);
+            let _ = writeln!(output, "{} ({})", b.pattern, b.count);
             continue;
         }
 
-        // Bucket header
+        // Bucket header (with trailing newline — detail lines follow indented)
         let header = render_bucket_header(b);
-        let _ = write!(output, "{header}");
+        let _ = writeln!(output, "{header}");
 
         // Collect hits for this bucket
         let prefix = b.pattern.trim_end_matches('*');
@@ -665,10 +661,10 @@ fn render_bucket_file_detail(
 
     for (dir, files) in by_dir_file {
         if !dir.is_empty() {
-            let _ = writeln!(out, "\n\t{dir}");
+            let _ = writeln!(out, "\t{dir}");
         }
         for (file, file_hits) in files {
-            let indent = if dir.is_empty() { "\n\t" } else { "\t\t" };
+            let indent = if dir.is_empty() { "\t" } else { "\t\t" };
             let _ = writeln!(out, "{indent}{file}");
             for hit in file_hits {
                 let line_1 = hit.line + 1;
@@ -692,7 +688,7 @@ fn render_bucket_dir_counts(
     for (dir, files) in by_dir_file {
         let count: usize = files.values().map(Vec::len).sum();
         let label = if dir.is_empty() { "./" } else { dir.as_str() };
-        let _ = writeln!(out, "\n\t{label} ({count})");
+        let _ = writeln!(out, "\t{label} ({count})");
     }
 
     out
@@ -1516,6 +1512,36 @@ mod tests {
         assert!(
             !output.contains("\n\n"),
             "expected no blank lines between name groups, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_no_blank_lines_in_tier3() {
+        let fs = test_fs("/project");
+
+        let mut hits = Vec::new();
+        for i in 0..15 {
+            hits.push(sym_hit(
+                &format!("/project/src/alpha_{i}.rs"),
+                i * 10,
+                &format!("test_alpha_{i}"),
+                "function",
+            ));
+        }
+        for i in 0..15 {
+            hits.push(sym_hit(
+                &format!("/project/tests/beta_{i}.rs"),
+                i * 10,
+                &format!("test_beta_{i}"),
+                "function",
+            ));
+        }
+
+        let output = render_tier3(&hits, 2000, &fs);
+
+        assert!(
+            !output.contains("\n\n"),
+            "expected no blank lines in tier 3 output, got:\n{output}"
         );
     }
 
