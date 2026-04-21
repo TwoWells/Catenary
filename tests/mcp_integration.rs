@@ -72,6 +72,34 @@ impl BridgeProcess {
         })
     }
 
+    /// Spawn using a TOML config file instead of `CATENARY_SERVERS`.
+    ///
+    /// Required for multi-server-per-language tests where each server
+    /// needs different flags.
+    fn spawn_with_config(config_path: &std::path::Path, root: &str) -> Result<Self> {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        cmd.env("CATENARY_CONFIG", config_path);
+        cmd.env("CATENARY_ROOTS", root);
+        cmd.env("XDG_CONFIG_HOME", root);
+        cmd.env("XDG_STATE_HOME", root);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
+        let stdin = child.stdin.take().context("Failed to get stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+        let stderr = child.stderr.take();
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            stderr,
+            state_home: Some(root.to_string()),
+        })
+    }
+
     fn send(&mut self, request: &Value) -> Result<()> {
         let json = serde_json::to_string(request)?;
         let stdin = self.stdin.as_mut().context("Stdin already closed")?;
@@ -2958,6 +2986,66 @@ fn test_grep_no_blank_lines() -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+/// Multi-server priority chain for `prepareRename`: first server errors,
+/// second server succeeds. The symbol should still appear in output.
+///
+/// Uses two mockls servers for the same language. Server A has
+/// `--fail-on textDocument/prepareRename`; server B works normally.
+/// No grammar installed, so the no-grammar path exercises
+/// `prepare_rename_check` priority chain fallthrough.
+#[test]
+fn test_grep_prepare_rename_priority_chain() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("chain.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn chain_symbol\nchain_symbol\n")?;
+
+    // Config with two servers: first fails on prepareRename, second works
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server.mockls-fail]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\", \"--scan-roots\", \"--fail-on\", \"textDocument/prepareRename\"]\n\n\
+             [server.mockls-ok]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
+             [language.{MOCK_LANG_A}]\n\
+             servers = [\"mockls-fail\", \"mockls-ok\"]\n"
+        ),
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4100,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "chain_symbol" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Server A errors on prepareRename, server B succeeds.
+    // The symbol should appear despite the first server failing.
+    assert!(
+        text.contains("chain_symbol"),
+        "Expected chain_symbol in output (priority chain fallthrough), got:\n{text}"
+    );
 
     Ok(())
 }
