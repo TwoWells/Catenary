@@ -14,13 +14,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::filesystem_manager::FilesystemManager;
 use super::handler::{check_server_health, display_path};
 use super::tool_server::ToolServer;
 use crate::bucketing::{self, BucketEntry};
 use crate::lsp::LspClientManager;
+use crate::lsp::server::LspServer;
 use crate::ts::{TsIndex, TsSymbol, format_ts_kind};
 
 /// Input for grep tool.
@@ -85,11 +86,13 @@ impl ToolServer for GrepServer {
         }
 
         // Wait for all servers ready (grep doesn't target a specific file).
-        // Track dead languages so the pipeline can skip prepareRename for them.
+        self.client_manager.wait_ready_all().await;
+
+        // Collect dead languages so the pipeline can skip prepareRename for them.
         let mut dead_languages: HashSet<String> = HashSet::new();
         let clients = self.client_manager.clients().await;
         for (key, client_mutex) in &clients {
-            if !client_mutex.lock().await.wait_ready().await {
+            if !client_mutex.lock().await.is_alive() {
                 debug!(
                     "[{}] server died \u{2014} tool will run in degraded mode",
                     key.language_id
@@ -180,10 +183,10 @@ impl GrepServer {
             return Ok(String::new());
         }
 
-        // Step 2: Ensure servers exist for matched files.
+        // Step 2: Ensure servers exist for matched files and wait for readiness.
         let rg_paths: Vec<PathBuf> = rg.file_lines.keys().map(PathBuf::from).collect();
         self.client_manager
-            .ensure_clients_for_paths(&rg_paths)
+            .ensure_and_wait_for_paths(&rg_paths)
             .await;
 
         // Step 3: Tree-sitter index freshness check and query.
@@ -328,9 +331,12 @@ impl GrepServer {
 
     /// Checks `prepareRename` at a position to distinguish symbols from keywords.
     ///
-    /// Returns `true` if the position is a symbol, `false` if keyword.
-    /// Callers should check server health before calling — this method
-    /// returns `false` if the server is unreachable.
+    /// Uses priority chain dispatch: iterates servers that support rename
+    /// in binding order, returns on the first definitive answer. Dispatch
+    /// errors are logged via `warn!()` and never surface in the tool result.
+    ///
+    /// Returns `true` if the position is a symbol (or no capable server
+    /// exists), `false` if keyword.
     async fn prepare_rename_check(
         &self,
         path: &Path,
@@ -338,30 +344,37 @@ impl GrepServer {
         col: u32,
         parent_id: Option<i64>,
     ) -> bool {
-        let Ok((uri_str, client_mutex)) = self
+        let servers = self
             .client_manager
-            .ensure_document_open(path, parent_id)
-            .await
-        else {
-            return false;
-        };
-
-        let mut client = client_mutex.lock().await;
-        client.set_parent_id(parent_id);
-        let result = if client.supports_rename() {
-            match client.prepare_rename(&uri_str, line_0, col).await {
-                Ok(v) if v.is_null() => false, // null → keyword
-                _ => true,                     // range or error → assume symbol
-            }
-        } else {
-            // No renameProvider — can't distinguish, assume symbol
-            true
-        };
-        drop(client);
-        self.client_manager
-            .close_document(&uri_str, &client_mutex)
+            .get_servers(path, LspServer::supports_rename)
             .await;
-        result
+
+        for client_mutex in &servers {
+            let Ok(uri) = self
+                .client_manager
+                .open_document_on(path, client_mutex, parent_id)
+                .await
+            else {
+                continue;
+            };
+
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            let response = client.prepare_rename(&uri, line_0, col).await;
+            drop(client);
+            self.client_manager.close_document(&uri, client_mutex).await;
+
+            match response {
+                Ok(v) if v.is_null() => return false, // null → keyword
+                Ok(_) => return true,                 // range → symbol
+                Err(e) => {
+                    warn!(source = "lsp.dispatch", "prepare_rename failed: {e}");
+                }
+            }
+        }
+
+        // No capable server or all errored — can't distinguish, assume symbol
+        true
     }
 
     /// Searches workspace roots for pattern matches using the `grep-*` crates
