@@ -2555,19 +2555,17 @@ fn test_grep_kind_brackets() -> Result<()> {
 }
 
 /// Reference hit at a non-definition line reports enclosing tree-sitter structure.
-/// Requires a multi-line grammar — the mock grammar only supports single-line
-/// definitions (`fn name`, `struct name`), so this test is skipped until the
-/// mock grammar is extended with block syntax.
+/// Uses the mock grammar's brace-delimited block syntax: `fn outer { target }`.
 #[test]
-#[ignore = "requires mock grammar with multi-line block syntax"]
 fn test_grep_reference_enclosing() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     install_mock_grammar(root)?;
 
+    // fn outer spans lines 0-2, "target" on line 1 is enclosed by it
     let file = dir.path().join("enclosing.mock");
-    std::fs::write(&file, "fn outer\ntarget\nend\n")?;
+    std::fs::write(&file, "fn outer {\ntarget\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
