@@ -10,7 +10,6 @@
 
 use super::path_security::PathValidator;
 use super::tool_server::ToolServer;
-use crate::lsp::lang::path_to_uri;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::ServerLifecycle;
 use crate::lsp::{LspClient, LspClientManager};
@@ -67,6 +66,10 @@ impl DiagnosticsServer {
         clippy::too_many_lines,
         reason = "Pipeline steps are sequential and cannot be split"
     )]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Client lock held across pipeline for exclusive access"
+    )]
     pub async fn process_file(&self, file_path: &str, entry_id: i64) -> Result<DiagnosticsResult> {
         let path = resolve_path(file_path)?;
 
@@ -82,51 +85,52 @@ impl DiagnosticsServer {
             });
         };
 
-        let mut client = client_mutex.lock().await;
-        let lang_id = client.language().to_string();
-
-        // Thread parent_id so LSP requests are correlated with this hook
-        client.set_parent_id(Some(entry_id));
-
-        // Check lifecycle before opening the document
-        match client.lifecycle() {
-            ServerLifecycle::Failed | ServerLifecycle::Dead => {
-                client.set_parent_id(None);
-                return Ok(DiagnosticsResult {
-                    content: "[no language server]".into(),
-                    count: 0,
-                });
+        // Check lifecycle before opening the document (brief lock)
+        {
+            let client = client_mutex.lock().await;
+            match client.lifecycle() {
+                ServerLifecycle::Failed | ServerLifecycle::Dead => {
+                    return Ok(DiagnosticsResult {
+                        content: "[no language server]".into(),
+                        count: 0,
+                    });
+                }
+                _ => {}
             }
-            _ => {}
         }
 
-        let uri = path_to_uri(&canonical);
-        let text = tokio::fs::read_to_string(&canonical).await?;
+        // Tracked open: reads file, sends didOpen/didChange, manages
+        // per-client open state. Sets parent_id for causation tracking.
+        let uri = self
+            .client_manager
+            .open_document_on(&canonical, &client_mutex, Some(entry_id))
+            .await?;
 
-        let mut doc_manager = self.client_manager.doc_manager().lock().await;
-        let (first_open, version) = doc_manager.open(&uri);
-        drop(doc_manager);
+        // Lock for the diagnostics pipeline
+        let client = client_mutex.lock().await;
+        let lang_id = client.language().to_string();
+        let result = self.process_file_inner(&client, &uri, &lang_id).await;
+        drop(client);
 
-        // From here, must close document on all paths
-        let result = self
-            .process_file_inner(&client, &uri, &lang_id, first_open, version, &text)
+        // Tracked close: sends didClose, manages per-client open state
+        self.client_manager
+            .close_document(&uri, &client_mutex)
             .await;
 
-        // Always close the document
-        let mut doc_manager = self.client_manager.doc_manager().lock().await;
-        if doc_manager.close(&uri) {
-            let _ = client.did_close(&uri).await;
-        }
-        drop(doc_manager);
-
-        client.set_parent_id(None);
-        drop(client);
+        // Clear parent_id
+        client_mutex.lock().await.set_parent_id(None);
 
         result
     }
 
     /// Inner pipeline after document open — extracted to ensure the outer
     /// function always runs the close path.
+    ///
+    /// The document stimulus (`didOpen`/`didChange`) was already sent by
+    /// [`LspClientManager::open_document_on`] before this function is
+    /// called. The unconditional idle wait covers both prior server work
+    /// and processing of the stimulus. For `didSave` servers, a second
+    /// baseline+idle sequence gates on the flycheck.
     #[allow(
         clippy::too_many_lines,
         reason = "Pipeline steps are sequential and cannot be split"
@@ -136,17 +140,15 @@ impl DiagnosticsServer {
         client: &LspClient,
         uri: &str,
         lang_id: &str,
-        first_open: bool,
-        version: i32,
-        text: &str,
     ) -> Result<DiagnosticsResult> {
         let server = client.server().clone();
         let cancel = CancellationToken::new();
 
-        // Pre-stimulus idle wait: ensure clean starting state
+        // Idle wait: ensure server has settled — covers processing of the
+        // didOpen/didChange sent by open_document_on plus any prior work.
         let pre_detector = IdleDetector::unconditional();
         let pre_result = await_idle(&server, pre_detector, cancel.clone()).await;
-        debug!("pre-stimulus idle result: {pre_result:?}");
+        debug!("idle result: {pre_result:?}");
 
         if pre_result == SettleResult::RootDied
             || matches!(
@@ -160,25 +162,7 @@ impl DiagnosticsServer {
             });
         }
 
-        // Pre-stimulus baseline: prime the tree monitor's counters so the
-        // first post-stimulus sample captures any activity from processing.
-        let baseline_ticks = {
-            let s = Arc::clone(&server);
-            tokio::task::spawn_blocking(move || {
-                s.sample_tree().map_or(0, |snap| snap.cumulative_ticks)
-            })
-            .await
-            .unwrap_or(0)
-        };
-
-        // Send stimulus: didOpen or didChange
-        if first_open {
-            client.did_open(uri, lang_id, version, text).await?;
-        } else {
-            client.did_change(uri, version, text).await?;
-        }
-
-        // Health probe: verify the server can respond before waiting
+        // Health probe: verify the server can respond before continuing
         if client.lifecycle() == ServerLifecycle::Probing && !client.run_health_probe(uri).await {
             return Ok(DiagnosticsResult {
                 content: "[no language server]".into(),
@@ -186,29 +170,36 @@ impl DiagnosticsServer {
             });
         }
 
-        // Trigger flycheck on servers that only run diagnostics on save
+        // Trigger flycheck on servers that only run diagnostics on save.
+        // Uses a separate baseline+idle sequence because didSave is a
+        // second stimulus after the initial didOpen/didChange.
         if client.wants_did_save() {
+            let baseline_ticks = {
+                let s = Arc::clone(&server);
+                tokio::task::spawn_blocking(move || {
+                    s.sample_tree().map_or(0, |snap| snap.cumulative_ticks)
+                })
+                .await
+                .unwrap_or(0)
+            };
+
             client.did_save(uri).await?;
-        }
 
-        // Post-stimulus idle wait: wait for server to finish processing.
-        // Uses the pre-stimulus baseline so that even sub-delta-resolution
-        // activity (e.g., a single context switch) satisfies the work gate.
-        let post_detector = IdleDetector::after_activity(baseline_ticks);
-        let post_result = await_idle(&server, post_detector, cancel).await;
-        debug!("post-stimulus idle result: {post_result:?}");
+            let post_detector = IdleDetector::after_activity(baseline_ticks);
+            let post_result = await_idle(&server, post_detector, cancel).await;
+            debug!("post-didSave idle result: {post_result:?}");
 
-        // Check lifecycle after idle wait — server may have died
-        if post_result == SettleResult::RootDied
-            || matches!(
-                client.lifecycle(),
-                ServerLifecycle::Failed | ServerLifecycle::Dead
-            )
-        {
-            return Ok(DiagnosticsResult {
-                content: "[no language server]".into(),
-                count: 0,
-            });
+            if post_result == SettleResult::RootDied
+                || matches!(
+                    client.lifecycle(),
+                    ServerLifecycle::Failed | ServerLifecycle::Dead
+                )
+            {
+                return Ok(DiagnosticsResult {
+                    content: "[no language server]".into(),
+                    count: 0,
+                });
+            }
         }
 
         // Retrieve diagnostics: push cache first, pull fallback
