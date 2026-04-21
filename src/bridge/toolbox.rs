@@ -171,20 +171,11 @@ impl Toolbox {
         fs_manager.set_roots(roots.clone());
         fs_manager.seed();
 
-        // Build tree-sitter index (separate connection for symbol writes).
-        let ts_index = match crate::db::open_and_migrate() {
-            Ok(ts_conn) => match TsIndex::build(&roots, ts_conn) {
-                Ok(index) => Some(Arc::new(std::sync::Mutex::new(index))),
-                Err(e) => {
-                    tracing::info!("tree-sitter index unavailable: {e}");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::info!("tree-sitter index unavailable (db): {e}");
-                None
-            }
-        };
+        // Build tree-sitter index (in-memory, no database dependency).
+        let ts_index = TsIndex::build(&roots)
+            .map(|idx| Arc::new(std::sync::Mutex::new(idx)))
+            .map_err(|e| tracing::info!("tree-sitter index unavailable: {e}"))
+            .ok();
 
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let client_manager = Arc::new(LspClientManager::new(

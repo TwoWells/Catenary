@@ -221,15 +221,14 @@ async fn main() -> Result<()> {
             cli::doctor::run_doctor(&roots, nocolor, diff).await
         }
         Some(Command::Install { spec, list, remove }) => {
-            let conn = catenary_mcp::db::open_and_migrate()?;
             if list {
-                catenary_mcp::install::list_grammars(&conn)
+                catenary_mcp::install::list_grammars()
             } else if let Some(scope) = remove {
-                catenary_mcp::install::remove_grammar(&scope, &conn)
+                catenary_mcp::install::remove_grammar(&scope)
             } else if let Some(spec) = spec {
-                catenary_mcp::install::install_grammar(&spec, &conn)
+                catenary_mcp::install::install_grammar(&spec)
             } else {
-                catenary_mcp::install::list_grammars(&conn)
+                catenary_mcp::install::list_grammars()
             }
         }
         Some(Command::Hook { command }) => {

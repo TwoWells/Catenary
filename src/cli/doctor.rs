@@ -932,12 +932,7 @@ fn expand_home(path_str: &str, home: &Path) -> PathBuf {
 fn check_grammars(colors: &ColorConfig) {
     check_grammars_compiler(colors);
     check_grammars_dir(colors);
-
-    let Ok(db) = crate::db::open_and_migrate() else {
-        println!("  {}", colors.red("✗ failed to open database"));
-        return;
-    };
-    check_grammars_installed(colors, &db);
+    check_grammars_installed(colors);
 }
 
 /// Check whether a C compiler is available for grammar compilation.
@@ -967,43 +962,28 @@ fn check_grammars_dir(colors: &ColorConfig) {
 }
 
 /// List installed grammars and verify their files exist on disk.
-pub(crate) fn check_grammars_installed(colors: &ColorConfig, db: &rusqlite::Connection) {
-    let Ok(mut stmt) = db.prepare("SELECT scope, lib_path, tags_path FROM grammars ORDER BY scope")
-    else {
-        println!("  {}", colors.red("✗ failed to query grammars"));
-        return;
-    };
+pub(crate) fn check_grammars_installed(colors: &ColorConfig) {
+    let grammars = install::scan_grammars().unwrap_or_default();
 
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .ok()
-        .map(|iter| iter.filter_map(Result::ok).collect())
-        .unwrap_or_default();
-
-    if rows.is_empty() {
+    if grammars.is_empty() {
         println!("  {}", colors.dim("(none installed)"));
         return;
     }
 
-    for (scope, lib_path, tags_path) in &rows {
-        let lib_ok = Path::new(lib_path).exists();
-        let tags_ok = Path::new(tags_path).exists();
+    let grammar_base = install::grammar_dir();
+    for meta in &grammars {
+        let scope = &meta.scope;
+        let scope_dir = grammar_base.join(scope);
+        let lib_filename = format!("parser.{}", std::env::consts::DLL_EXTENSION);
+        let lib_ok = scope_dir.join(&lib_filename).exists();
+        let tags_ok = scope_dir.join("tags.scm").exists();
 
         if lib_ok && tags_ok {
             println!("  {}", colors.green(&format!("✓ {scope}")));
         } else if !lib_ok {
-            let lib_name = Path::new(lib_path)
-                .file_name()
-                .map_or("parser.so", |n| n.to_str().unwrap_or("parser.so"));
             println!(
                 "  {}",
-                colors.red(&format!("✗ {scope} — missing {lib_name}")),
+                colors.red(&format!("✗ {scope} — missing {lib_filename}")),
             );
         } else {
             println!("  {}", colors.red(&format!("✗ {scope} — missing tags.scm")),);
@@ -1020,44 +1000,10 @@ mod tests {
     use super::*;
     use crate::cli::ColorConfig;
 
-    /// Open an isolated test database in a tempdir.
-    fn test_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
-        let dir = tempfile::tempdir().expect("failed to create tempdir for test DB");
-        let path = dir.path().join("catenary").join("catenary.db");
-        let conn = crate::db::open_and_migrate_at(&path).expect("failed to open test DB");
-        (dir, path, conn)
-    }
-
     #[test]
     fn test_doctor_grammar_section_no_grammars() {
-        let (_dir, _path, conn) = test_db();
         let colors = ColorConfig::new(true);
-
-        // Should not panic on empty grammars table
-        check_grammars_installed(&colors, &conn);
-    }
-
-    #[test]
-    fn test_doctor_grammar_section_with_grammar() {
-        let (_dir, _path, conn) = test_db();
-        let colors = ColorConfig::new(true);
-
-        // Insert a grammar row with paths that don't exist on disk
-        conn.execute(
-            "INSERT INTO grammars (scope, file_types, lib_path, tags_path, repo_url, installed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                "source.mock",
-                r#"["mock"]"#,
-                "/nonexistent/parser.so",
-                "/nonexistent/tags.scm",
-                "https://github.com/test/mock",
-                "2026-03-07T12:00:00Z",
-            ],
-        )
-        .expect("insert grammar row");
-
-        // Should not panic; will report missing files
-        check_grammars_installed(&colors, &conn);
+        // Should not panic on empty/default grammar directory
+        check_grammars_installed(&colors);
     }
 }

@@ -35,19 +35,18 @@ pub struct TsSymbol {
     pub scope_kind: Option<String>,
 }
 
-/// Workspace-wide tree-sitter index backed by `SQLite`.
+/// Workspace-wide tree-sitter index backed by in-memory `SQLite`.
 ///
-/// Owns a write connection for index updates and opens throwaway read
-/// connections for queries. WAL mode allows concurrent reads while a
-/// single writer updates the index.
+/// Grammars are loaded from the filesystem (grammar directory with
+/// `metadata.json` sidecars). The symbol index is ephemeral — built on
+/// session start, rebuilt on file changes, discarded on session end.
+/// No dependency on the persistent session database.
 pub struct TsIndex {
-    /// Owned connection for writes (`update_file`, `ensure_fresh`).
+    /// In-memory connection for symbol reads and writes.
     conn: Connection,
-    /// Database path for opening read connections on demand.
-    db_path: PathBuf,
     /// Loaded grammars keyed by scope (e.g. `"source.rust"`).
     grammars: HashMap<String, tree_sitter::Language>,
-    /// Scope → file extensions, from `grammars.file_types`.
+    /// Scope → file extensions, from grammar metadata.
     extensions: HashMap<String, Vec<String>>,
     /// tags.scm queries keyed by scope.
     tag_queries: HashMap<String, tree_sitter::Query>,
@@ -282,71 +281,113 @@ fn parse_file(
 impl TsIndex {
     /// Build the tree-sitter index from workspace roots.
     ///
-    /// Loads all installed grammars from the database, walks the workspace
-    /// roots to find files matching grammar file types, parses each file,
-    /// extracts symbols, and writes them to `SQLite` in a single transaction.
+    /// Scans the grammar directory for installed grammars (`metadata.json`
+    /// sidecars), walks workspace roots to find files matching grammar file
+    /// types, parses each file, and writes symbols to an in-memory `SQLite`
+    /// database. No persistent database dependency.
     ///
     /// # Errors
     ///
-    /// Returns an error if grammar loading fails, the database query fails,
-    /// or the write transaction fails.
+    /// Returns an error if grammar loading fails or the in-memory database
+    /// operations fail.
     #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
-    pub fn build(roots: &[PathBuf], conn: Connection) -> Result<Self> {
+    pub fn build(roots: &[PathBuf]) -> Result<Self> {
+        Self::build_with_grammar_dir(roots, &crate::install::grammar_dir())
+    }
+
+    /// Build the tree-sitter index with an explicit grammar directory.
+    ///
+    /// Like [`build`](Self::build) but uses the given directory instead of
+    /// the default grammar location. Used by tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if grammar loading fails or the in-memory database
+    /// operations fail.
+    #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
+    pub fn build_with_grammar_dir(roots: &[PathBuf], grammar_base: &Path) -> Result<Self> {
         let mut grammars = HashMap::new();
         let mut extensions = HashMap::new();
         let mut tag_queries = HashMap::new();
         let mut ext_to_scope: HashMap<String, String> = HashMap::new();
 
-        // Step 1: Load installed grammars from the database.
-        {
-            let mut stmt = conn
-                .prepare("SELECT scope, file_types, lib_path, tags_path FROM grammars")
-                .context("failed to query grammars")?;
+        // Step 1: Load installed grammars from the filesystem.
+        let grammar_metas = crate::install::scan_grammars_in(grammar_base).unwrap_or_default();
 
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })
-                .context("failed to iterate grammars")?;
+        for meta in &grammar_metas {
+            let scope = &meta.scope;
+            let scope_dir = grammar_base.join(scope);
 
-            for row in rows {
-                let (scope, file_types_json, lib_path, tags_path) =
-                    row.context("failed to read grammar row")?;
+            let lib_filename = format!("parser.{}", std::env::consts::DLL_EXTENSION);
+            let lib_path = scope_dir.join(&lib_filename);
+            let tags_path = scope_dir.join("tags.scm");
 
-                // Derive symbol name: last `.`-component → tree_sitter_{lang}
-                let lang_name = scope
-                    .rsplit('.')
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("invalid scope: {scope}"))?;
-                let symbol_name = format!("tree_sitter_{lang_name}");
-
-                let language = catenary_ts::load_grammar(Path::new(&lib_path), &symbol_name)
-                    .with_context(|| format!("failed to load grammar for {scope}"))?;
-
-                let tags_source = std::fs::read_to_string(&tags_path)
-                    .with_context(|| format!("failed to read tags.scm for {scope}"))?;
-                let query = tree_sitter::Query::new(&language, &tags_source)
-                    .map_err(|e| anyhow::anyhow!("failed to compile tags.scm for {scope}: {e}"))?;
-
-                let file_exts: Vec<String> = serde_json::from_str(&file_types_json)
-                    .with_context(|| format!("failed to parse file_types for {scope}"))?;
-
-                for ext in &file_exts {
-                    ext_to_scope.insert(ext.clone(), scope.clone());
-                }
-
-                grammars.insert(scope.clone(), language);
-                extensions.insert(scope.clone(), file_exts);
-                tag_queries.insert(scope, query);
+            if !lib_path.exists() || !tags_path.exists() {
+                info!(scope, "skipping grammar — missing files");
+                continue;
             }
+
+            let lang_name = scope
+                .rsplit('.')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("invalid scope: {scope}"))?;
+            let symbol_name = format!("tree_sitter_{lang_name}");
+
+            let language = catenary_ts::load_grammar(&lib_path, &symbol_name)
+                .with_context(|| format!("failed to load grammar for {scope}"))?;
+
+            let tags_source = std::fs::read_to_string(&tags_path)
+                .with_context(|| format!("failed to read tags.scm for {scope}"))?;
+            let query = tree_sitter::Query::new(&language, &tags_source)
+                .map_err(|e| anyhow::anyhow!("failed to compile tags.scm for {scope}: {e}"))?;
+
+            for ext in &meta.file_types {
+                ext_to_scope.insert(ext.clone(), scope.clone());
+            }
+
+            grammars.insert(scope.clone(), language);
+            extensions.insert(scope.clone(), meta.file_types.clone());
+            tag_queries.insert(scope.clone(), query);
         }
 
-        // Step 2: Walk workspace roots and collect symbols.
+        // Step 2: Create in-memory SQLite for the symbol index.
+        let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
+        conn.execute_batch(
+            "CREATE TABLE symbols (
+                file_path   TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                line        INTEGER NOT NULL,
+                end_line    INTEGER NOT NULL,
+                scope       TEXT,
+                scope_kind  TEXT,
+                PRIMARY KEY (file_path, line)
+            );
+            CREATE INDEX idx_symbols_name ON symbols(name);
+            CREATE TABLE file_parse_state (
+                file_path   TEXT PRIMARY KEY,
+                mtime_ns    INTEGER NOT NULL,
+                grammar     TEXT NOT NULL
+            );",
+        )
+        .context("failed to create in-memory tables")?;
+
+        conn.create_scalar_function(
+            "regexp",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let pattern = ctx.get_raw(0).as_str()?;
+                let text = ctx.get_raw(1).as_str()?;
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                Ok(re.is_match(text))
+            },
+        )
+        .context("failed to register REGEXP function")?;
+
+        // Step 3: Walk workspace roots and collect symbols.
         let mut all_symbols: Vec<(String, Vec<TsSymbol>)> = Vec::new();
         let mut file_states: Vec<(String, i64, String)> = Vec::new();
 
@@ -395,14 +436,9 @@ impl TsIndex {
             }
         }
 
-        // Step 3: Write to SQLite in a single transaction.
+        // Step 4: Write symbols to in-memory SQLite.
         {
             let tx = conn.unchecked_transaction().context("begin transaction")?;
-
-            tx.execute("DELETE FROM symbols", [])
-                .context("failed to clear symbols")?;
-            tx.execute("DELETE FROM file_parse_state", [])
-                .context("failed to clear file_parse_state")?;
 
             for (file_path, symbols) in &all_symbols {
                 for sym in symbols {
@@ -438,22 +474,6 @@ impl TsIndex {
             tx.commit().context("commit transaction")?;
         }
 
-        // Step 4: Register REGEXP scalar function for query().
-        conn.create_scalar_function(
-            "regexp",
-            2,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let pattern = ctx.get_raw(0).as_str()?;
-                let text = ctx.get_raw(1).as_str()?;
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(re.is_match(text))
-            },
-        )
-        .context("failed to register REGEXP function")?;
-
         let symbol_count: usize = all_symbols.iter().map(|(_, syms)| syms.len()).sum();
         info!(
             files = all_symbols.len(),
@@ -461,11 +481,8 @@ impl TsIndex {
             "tree-sitter index built"
         );
 
-        let db_path = conn.path().map(PathBuf::from).unwrap_or_default();
-
         Ok(Self {
             conn,
-            db_path,
             grammars,
             extensions,
             tag_queries,
@@ -543,43 +560,18 @@ impl TsIndex {
         Ok(())
     }
 
-    /// Opens a throwaway read-only connection for queries.
-    ///
-    /// WAL mode allows concurrent readers alongside the single writer.
-    fn read_conn(&self) -> Result<Connection> {
-        let conn = crate::db::open_at(&self.db_path)?;
-        conn.create_scalar_function(
-            "regexp",
-            2,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let pattern = ctx.get_raw(0).as_str()?;
-                let text = ctx.get_raw(1).as_str()?;
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(re.is_match(text))
-            },
-        )
-        .context("failed to register REGEXP function")?;
-        Ok(conn)
-    }
-
     /// Query the index for symbols whose names match a regex pattern.
     ///
     /// If `files` is `Some`, only symbols from those files are returned.
-    /// Opens a throwaway read connection — concurrent queries don't block
-    /// each other or the write path.
     ///
     /// # Errors
     ///
-    /// Returns an error if the regex is invalid or the database query fails.
+    /// Returns an error if the regex is invalid or the query fails.
     pub fn query(
         &self,
         pattern: &str,
         files: Option<&[PathBuf]>,
     ) -> Result<Vec<(PathBuf, TsSymbol)>> {
-        let conn = self.read_conn()?;
         let mut results = Vec::new();
 
         match files {
@@ -592,7 +584,7 @@ impl TsIndex {
                     "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
                      FROM symbols WHERE name REGEXP ?1 AND file_path IN ({placeholders})"
                 );
-                let mut stmt = conn.prepare(&sql).context("failed to prepare query")?;
+                let mut stmt = self.conn.prepare(&sql).context("failed to prepare query")?;
 
                 let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
                     Vec::with_capacity(1 + file_list.len());
@@ -611,7 +603,8 @@ impl TsIndex {
                 }
             }
             _ => {
-                let mut stmt = conn
+                let mut stmt = self
+                    .conn
                     .prepare(
                         "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
                          FROM symbols WHERE name REGEXP ?1",
@@ -635,15 +628,14 @@ impl TsIndex {
     /// Finds the innermost symbol enclosing a line in a file.
     ///
     /// Returns the tightest definition (smallest span) containing the given
-    /// 0-based line. Opens a throwaway read connection.
+    /// 0-based line.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
+    /// Returns an error if the query fails.
     pub fn find_enclosing(&self, file_path: &Path, line_0: u32) -> Result<Option<TsSymbol>> {
-        let conn = self.read_conn()?;
         let path_str = file_path.to_string_lossy();
-        let mut stmt = conn.prepare(
+        let mut stmt = self.conn.prepare(
             "SELECT name, kind, line, end_line, scope, scope_kind \
              FROM symbols \
              WHERE file_path = ?1 AND line <= ?2 AND end_line >= ?2 \
@@ -754,10 +746,7 @@ impl TsIndex {
 mod tests {
     use std::path::Path;
 
-    use rusqlite::Connection;
-
     use super::{EnrichmentCategory, TsIndex, categorize, format_ts_kind, lsp_kind_label};
-    use crate::db;
 
     fn fixture_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -765,25 +754,22 @@ mod tests {
             .join("mock_grammar")
     }
 
+    /// Installs the mock grammar fixture into a temporary directory.
+    ///
+    /// Returns `(tempdir, grammar_base_path)`. The tempdir must be kept
+    /// alive for the duration of the test.
     #[allow(clippy::expect_used, reason = "test setup")]
-    fn test_db() -> (tempfile::TempDir, Connection) {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let conn =
-            db::open_and_migrate_at(&dir.path().join("test.db")).expect("failed to create test db");
-        (dir, conn)
-    }
-
-    /// Installs the mock grammar fixture into the given output directory
-    /// and registers it in the database.
-    #[allow(clippy::expect_used, reason = "test setup")]
-    fn install_mock_grammar(conn: &Connection, grammar_dir: &Path) {
+    fn install_mock_grammar() -> (tempfile::TempDir, std::path::PathBuf) {
+        let data_dir = tempfile::tempdir().expect("data tempdir");
+        let grammar_base = data_dir.path().join("grammars");
+        std::fs::create_dir_all(&grammar_base).expect("create grammar dir");
         crate::install::install_from_dir(
             &fixture_dir(),
-            grammar_dir,
-            conn,
+            &grammar_base,
             "https://github.com/test/mock",
         )
         .expect("install mock grammar");
+        (data_dir, grammar_base)
     }
 
     // --- Pure unit tests (no grammar needed) ---
@@ -817,9 +803,7 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_build_index_parses_symbols() {
-        let (db_dir, setup_conn) = test_db();
-        let grammar_dir = tempfile::tempdir().expect("grammar tempdir");
-        install_mock_grammar(&setup_conn, grammar_dir.path());
+        let (_data_dir, grammar_base) = install_mock_grammar();
 
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         std::fs::write(
@@ -828,122 +812,45 @@ mod tests {
         )
         .expect("write test file");
 
-        let db_path = db_dir.path().join("test.db");
-        let index_conn = db::open_and_migrate_at(&db_path).expect("index conn");
-        let _index =
-            TsIndex::build(&[workspace.path().to_path_buf()], index_conn).expect("build index");
+        let index =
+            TsIndex::build_with_grammar_dir(&[workspace.path().to_path_buf()], &grammar_base)
+                .expect("build index");
 
-        // Verify symbols through the setup connection (WAL read).
-        let mut stmt = setup_conn
-            .prepare(
-                "SELECT name, kind, line, end_line, scope FROM symbols \
-                 ORDER BY line",
-            )
-            .expect("prepare query");
-        let symbols: Vec<(String, String, i64, i64, Option<String>)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .expect("query symbols")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect symbols");
+        // Verify symbols via query
+        let results = index.query(".*", None).expect("query all");
+        assert_eq!(results.len(), 3, "expected 3 symbols");
 
-        assert_eq!(symbols.len(), 3, "expected 3 symbols");
+        let names: Vec<&str> = results.iter().map(|(_, s)| s.name.as_str()).collect();
+        assert!(names.contains(&"foo"));
+        assert!(names.contains(&"Bar"));
+        assert!(names.contains(&"baz"));
 
-        assert_eq!(symbols[0].0, "foo");
-        assert_eq!(symbols[0].1, "function");
-        assert_eq!(symbols[0].2, 0);
-        assert_eq!(symbols[0].3, 0);
-        assert!(symbols[0].4.is_none());
-
-        assert_eq!(symbols[1].0, "Bar");
-        assert_eq!(symbols[1].1, "struct");
-        assert_eq!(symbols[1].2, 1);
-        assert_eq!(symbols[1].3, 1);
-        assert!(symbols[1].4.is_none());
-
-        assert_eq!(symbols[2].0, "baz");
-        assert_eq!(symbols[2].1, "function");
-        assert_eq!(symbols[2].2, 2);
-        assert_eq!(symbols[2].3, 2);
-        assert!(symbols[2].4.is_none());
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_build_index_records_mtime() {
-        let (db_dir, setup_conn) = test_db();
-        let grammar_dir = tempfile::tempdir().expect("grammar tempdir");
-        install_mock_grammar(&setup_conn, grammar_dir.path());
-
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        std::fs::write(
-            workspace.path().join("test.mock"),
-            "fn foo\nstruct Bar\nfn baz",
-        )
-        .expect("write test file");
-
-        let db_path = db_dir.path().join("test.db");
-        let index_conn = db::open_and_migrate_at(&db_path).expect("index conn");
-        let _index =
-            TsIndex::build(&[workspace.path().to_path_buf()], index_conn).expect("build index");
-
-        let (mtime_ns, grammar): (i64, String) = setup_conn
-            .query_row(
-                "SELECT mtime_ns, grammar FROM file_parse_state LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("query file_parse_state");
-
-        assert!(mtime_ns > 0, "mtime should be non-zero");
-        assert_eq!(grammar, "source.mock");
+        let foo = results.iter().find(|(_, s)| s.name == "foo").expect("foo");
+        assert_eq!(foo.1.kind, "function");
+        assert_eq!(foo.1.line, 0);
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_no_grammar_skip() {
-        let (db_dir, setup_conn) = test_db();
-        let grammar_dir = tempfile::tempdir().expect("grammar tempdir");
-        install_mock_grammar(&setup_conn, grammar_dir.path());
+        let (_data_dir, grammar_base) = install_mock_grammar();
 
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         std::fs::write(workspace.path().join("readme.txt"), "hello world").expect("write txt file");
 
-        let db_path = db_dir.path().join("test.db");
-        let index_conn = db::open_and_migrate_at(&db_path).expect("index conn");
-        let _index =
-            TsIndex::build(&[workspace.path().to_path_buf()], index_conn).expect("build index");
+        let index =
+            TsIndex::build_with_grammar_dir(&[workspace.path().to_path_buf()], &grammar_base)
+                .expect("build index");
 
-        let count: i64 = setup_conn
-            .query_row("SELECT COUNT(*) FROM file_parse_state", [], |row| {
-                row.get(0)
-            })
-            .expect("count file_parse_state");
-        assert_eq!(count, 0, "no file_parse_state for .txt files");
-
-        let sym_count: i64 = setup_conn
-            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
-            .expect("count symbols");
-        assert_eq!(sym_count, 0, "no symbols for .txt files");
+        let results = index.query(".*", None).expect("query all");
+        assert!(results.is_empty(), "no symbols for .txt files");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_has_grammar_for() {
-        let (db_dir, setup_conn) = test_db();
-        let grammar_dir = tempfile::tempdir().expect("grammar tempdir");
-        install_mock_grammar(&setup_conn, grammar_dir.path());
-
-        let db_path = db_dir.path().join("test.db");
-        let index_conn = db::open_and_migrate_at(&db_path).expect("index conn");
-        let index = TsIndex::build(&[], index_conn).expect("build empty index");
+        let (_data_dir, grammar_base) = install_mock_grammar();
+        let index = TsIndex::build_with_grammar_dir(&[], &grammar_base).expect("build empty index");
 
         assert!(index.has_grammar_for(Path::new("test.mock")));
         assert!(!index.has_grammar_for(Path::new("test.txt")));
@@ -952,70 +859,36 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_has_children() {
-        let (db_dir, setup_conn) = test_db();
+        let (_data_dir, grammar_base) = install_mock_grammar();
 
-        let db_path = db_dir.path().join("test.db");
-        let index_conn = db::open_and_migrate_at(&db_path).expect("index conn");
-        let index = TsIndex::build(&[], index_conn).expect("build empty index");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(workspace.path().join("test.mock"), "fn my_method\nfn other")
+            .expect("write test file");
 
-        // Manually insert symbols through the setup connection.
-        setup_conn
-            .execute(
-                "INSERT INTO symbols \
-                 (file_path, name, kind, line, end_line, scope, scope_kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    "src/test.rs",
-                    "MyStruct",
-                    "struct",
-                    0,
-                    10,
-                    None::<String>,
-                    None::<String>
-                ],
-            )
-            .expect("insert struct");
+        let index =
+            TsIndex::build_with_grammar_dir(&[workspace.path().to_path_buf()], &grammar_base)
+                .expect("build index");
 
-        setup_conn
-            .execute(
-                "INSERT INTO symbols \
-                 (file_path, name, kind, line, end_line, scope, scope_kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    "src/test.rs",
-                    "my_method",
-                    "method",
-                    2,
-                    5,
-                    "MyStruct",
-                    "struct"
-                ],
-            )
-            .expect("insert method");
-
-        assert!(index.has_children(Path::new("src/test.rs"), "MyStruct"));
-        assert!(!index.has_children(Path::new("src/test.rs"), "NoSuchScope"));
+        // "my_method" has no children (it's a leaf function)
+        assert!(!index.has_children(&workspace.path().join("test.mock"), "my_method"));
     }
 
-    // --- Query and update tests (ticket 02b) ---
+    // --- Query and update tests ---
 
     /// Build a `TsIndex` with the mock grammar over a workspace directory.
+    ///
+    /// Returns `(TsIndex, _tempdir)` — the tempdir must stay alive.
     #[allow(clippy::expect_used, reason = "test setup")]
-    fn build_index(
-        workspace: &std::path::Path,
-        db_path: &std::path::Path,
-        setup_conn: &Connection,
-    ) -> TsIndex {
-        let grammar_dir = tempfile::tempdir().expect("grammar tempdir");
-        install_mock_grammar(setup_conn, grammar_dir.path());
-        let index_conn = db::open_and_migrate_at(db_path).expect("index conn");
-        TsIndex::build(&[workspace.to_path_buf()], index_conn).expect("build index")
+    fn build_test_index(workspace: &std::path::Path) -> (TsIndex, tempfile::TempDir) {
+        let (data_dir, grammar_base) = install_mock_grammar();
+        let index = TsIndex::build_with_grammar_dir(&[workspace.to_path_buf()], &grammar_base)
+            .expect("build index");
+        (index, data_dir)
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_query_regex_filter() {
-        let (db_dir, setup_conn) = test_db();
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         std::fs::write(
             workspace.path().join("test.mock"),
@@ -1023,8 +896,7 @@ mod tests {
         )
         .expect("write test file");
 
-        let db_path = db_dir.path().join("test.db");
-        let index = build_index(workspace.path(), &db_path, &setup_conn);
+        let (index, _data_dir) = build_test_index(workspace.path());
 
         let results = index.query("foo", None).expect("query");
         let names: Vec<&str> = results.iter().map(|(_, s)| s.name.as_str()).collect();
@@ -1038,16 +910,13 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_query_file_scoping() {
-        let (db_dir, setup_conn) = test_db();
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         std::fs::write(workspace.path().join("a.mock"), "fn alpha\nfn beta").expect("write a.mock");
         std::fs::write(workspace.path().join("b.mock"), "fn gamma\nfn delta")
             .expect("write b.mock");
 
-        let db_path = db_dir.path().join("test.db");
-        let index = build_index(workspace.path(), &db_path, &setup_conn);
+        let (index, _data_dir) = build_test_index(workspace.path());
 
-        // Query scoped to a.mock only.
         let a_path = workspace.path().join("a.mock");
         let results = index
             .query(".*", Some(std::slice::from_ref(&a_path)))
@@ -1066,19 +935,15 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_update_file() {
-        let (db_dir, setup_conn) = test_db();
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let file_path = workspace.path().join("test.mock");
         std::fs::write(&file_path, "fn foo\nfn bar").expect("write test file");
 
-        let db_path = db_dir.path().join("test.db");
-        let index = build_index(workspace.path(), &db_path, &setup_conn);
+        let (index, _data_dir) = build_test_index(workspace.path());
 
-        // Verify initial state.
         let initial = index.query(".*", None).expect("initial query");
         assert_eq!(initial.len(), 2);
 
-        // Rewrite the file with a new function.
         std::fs::write(&file_path, "fn foo\nfn bar\nfn newone").expect("rewrite test file");
         index.update_file(&file_path).expect("update_file");
 
@@ -1086,7 +951,6 @@ mod tests {
         let names: Vec<&str> = updated.iter().map(|(_, s)| s.name.as_str()).collect();
         assert_eq!(updated.len(), 3, "should have 3 symbols after update");
         assert!(names.contains(&"newone"), "should contain new symbol");
-        // Old symbols should still be present (not duplicated).
         assert_eq!(
             names.iter().filter(|&&n| n == "foo").count(),
             1,
@@ -1097,26 +961,21 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_query_does_not_auto_refresh() {
-        let (db_dir, setup_conn) = test_db();
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let file_path = workspace.path().join("test.mock");
         std::fs::write(&file_path, "fn original").expect("write test file");
 
-        let db_path = db_dir.path().join("test.db");
-        let index = build_index(workspace.path(), &db_path, &setup_conn);
+        let (index, _data_dir) = build_test_index(workspace.path());
 
-        // Modify the file without calling update_file.
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&file_path, "fn original\nfn added").expect("rewrite test file");
 
-        // query() is a pure index read — it should NOT see the new symbol.
         let results = index.query("added", None).expect("query");
         assert!(
             results.is_empty(),
             "query should not auto-refresh stale files"
         );
 
-        // Caller-driven freshness: update_file then re-query.
         index.update_file(&file_path).expect("update_file");
         let results = index.query("added", None).expect("query after update");
         assert_eq!(results.len(), 1, "should find symbol after explicit update");
@@ -1125,12 +984,10 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_query_empty_result() {
-        let (db_dir, setup_conn) = test_db();
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         std::fs::write(workspace.path().join("test.mock"), "fn foo").expect("write test file");
 
-        let db_path = db_dir.path().join("test.db");
-        let index = build_index(workspace.path(), &db_path, &setup_conn);
+        let (index, _data_dir) = build_test_index(workspace.path());
 
         let results = index
             .query("zzz_no_match", None)

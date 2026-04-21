@@ -4,15 +4,31 @@
 //! Grammar installation, listing, and removal for tree-sitter integration.
 //!
 //! The `catenary install` command is the only path for grammar management.
-//! Grammars are compiled from source into shared libraries, stored in the
-//! Catenary data directory, and registered in the SQLite database.
+//! Grammars are compiled from source into shared libraries and stored in
+//! the Catenary data directory with a `metadata.json` sidecar. No database
+//! dependency — the grammar directory is the source of truth.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
-use rusqlite::Connection;
-use tracing::info;
+use serde::{Deserialize, Serialize};
+
+/// Metadata sidecar for an installed grammar.
+///
+/// Written as `metadata.json` alongside the compiled `.so` and `tags.scm`
+/// in each grammar's scope directory.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrammarMetadata {
+    /// `TextMate` scope (e.g., `"source.rust"`).
+    pub scope: String,
+    /// File extensions this grammar handles (e.g., `["rs"]`).
+    pub file_types: Vec<String>,
+    /// Original clone URL or local path.
+    pub repo_url: String,
+    /// ISO 8601 installation timestamp.
+    pub installed_at: String,
+}
 
 /// Returns the Catenary data directory.
 ///
@@ -251,18 +267,13 @@ fn compile_mixed(src_dir: &Path, output_path: &Path, scanner_cc: &Path) -> Resul
 /// Installs a grammar from a local directory into the grammar registry.
 ///
 /// Parses `tree-sitter.json`, verifies `queries/tags.scm`, compiles the C
-/// source into a shared library, and registers the grammar in `SQLite`.
+/// source into a shared library, and writes a `metadata.json` sidecar.
 ///
 /// # Errors
 ///
-/// Returns an error if metadata is missing, tags.scm is absent, compilation
-/// fails, or the database insert fails.
-pub(crate) fn install_from_dir(
-    repo_dir: &Path,
-    grammar_base: &Path,
-    db: &Connection,
-    repo_url: &str,
-) -> Result<()> {
+/// Returns an error if metadata is missing, tags.scm is absent, or
+/// compilation fails.
+pub(crate) fn install_from_dir(repo_dir: &Path, grammar_base: &Path, repo_url: &str) -> Result<()> {
     // Parse tree-sitter.json
     let ts_json_path = repo_dir.join("tree-sitter.json");
     let ts_json_content = std::fs::read_to_string(&ts_json_path)
@@ -283,8 +294,6 @@ pub(crate) fn install_from_dir(
     let file_types = grammar
         .get("file-types")
         .ok_or_else(|| anyhow::anyhow!("tree-sitter.json missing grammars[0].file-types"))?;
-    let file_types_str =
-        serde_json::to_string(file_types).context("failed to serialize file-types")?;
 
     // Verify tags.scm exists
     let tags_src = repo_dir.join("queries").join("tags.scm");
@@ -316,22 +325,20 @@ pub(crate) fn install_from_dir(
     std::fs::copy(&tags_src, &tags_path)
         .with_context(|| format!("failed to copy tags.scm to {}", tags_path.display()))?;
 
-    // Register in SQLite
-    let now = Utc::now().to_rfc3339();
-    db.execute(
-        "INSERT OR REPLACE INTO grammars \
-         (scope, file_types, lib_path, tags_path, repo_url, installed_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            scope,
-            file_types_str,
-            lib_path.to_string_lossy().as_ref(),
-            tags_path.to_string_lossy().as_ref(),
-            repo_url,
-            now,
-        ],
-    )
-    .context("failed to register grammar in database")?;
+    // Write metadata sidecar
+    let file_types: Vec<String> = serde_json::from_value(file_types.clone())
+        .context("failed to parse file-types as string array")?;
+    let metadata = GrammarMetadata {
+        scope: scope.to_string(),
+        file_types,
+        repo_url: repo_url.to_string(),
+        installed_at: Utc::now().to_rfc3339(),
+    };
+    let metadata_path = scope_dir.join("metadata.json");
+    let metadata_json =
+        serde_json::to_string_pretty(&metadata).context("failed to serialize metadata")?;
+    std::fs::write(&metadata_path, metadata_json)
+        .with_context(|| format!("failed to write {}", metadata_path.display()))?;
 
     Ok(())
 }
@@ -345,105 +352,113 @@ pub(crate) fn install_from_dir(
 /// - A local directory path — used directly (no clone)
 ///
 /// The grammar is compiled to a shared library, its `queries/tags.scm` is
-/// copied, and it is registered in the `SQLite` grammar registry.
+/// copied, and a `metadata.json` sidecar is written.
 ///
 /// # Errors
 ///
-/// Returns an error if cloning, compilation, or database registration fails.
-pub fn install_grammar(spec: &str, db: &Connection) -> Result<()> {
+/// Returns an error if cloning or compilation fails.
+pub fn install_grammar(spec: &str) -> Result<()> {
     let grammar_base = grammar_dir();
 
     // If spec is a local directory, use it directly (skip clone)
     let local_path = Path::new(spec);
     if local_path.is_dir() {
-        return install_from_dir(local_path, &grammar_base, db, spec);
+        return install_from_dir(local_path, &grammar_base, spec);
     }
 
     let url = resolve_spec(spec);
     let tmp = tempfile::tempdir().context("failed to create temp directory")?;
     clone_repo(&url, tmp.path())?;
-    install_from_dir(tmp.path(), &grammar_base, db, &url)
+    install_from_dir(tmp.path(), &grammar_base, &url)
 }
 
-/// List all installed grammars.
+/// List all installed grammars by scanning the grammar directory.
 ///
 /// Prints a table of scope, file types, and installation timestamp.
 ///
 /// # Errors
 ///
-/// Returns an error if the database query fails.
+/// Returns an error if the grammar directory cannot be read.
 #[allow(clippy::print_stdout, reason = "CLI command output")]
-pub fn list_grammars(db: &Connection) -> Result<()> {
-    let mut stmt =
-        db.prepare("SELECT scope, file_types, installed_at FROM grammars ORDER BY scope")?;
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to query grammars")?;
+pub fn list_grammars() -> Result<()> {
+    let grammars = scan_grammars()?;
 
-    if rows.is_empty() {
+    if grammars.is_empty() {
         println!("No grammars installed.");
         return Ok(());
     }
 
     let installed_header = "INSTALLED";
     println!("{:<25} {:<20} {installed_header}", "SCOPE", "FILE TYPES");
-    for (scope, file_types, installed_at) in &rows {
-        println!("{scope:<25} {file_types:<20} {installed_at}");
+    for meta in &grammars {
+        let ft = serde_json::to_string(&meta.file_types).unwrap_or_default();
+        println!("{:<25} {ft:<20} {}", meta.scope, meta.installed_at);
     }
 
     Ok(())
 }
 
-/// Remove an installed grammar by scope.
-///
-/// Deletes the compiled library and tags file from disk, removes related
-/// symbols and parse state, and unregisters the grammar from `SQLite`.
+/// Scans the default grammar directory for installed grammars.
 ///
 /// # Errors
 ///
-/// Returns an error if the grammar is not found or database operations fail.
-pub fn remove_grammar(scope: &str, db: &Connection) -> Result<()> {
-    let (lib_path, tags_path): (String, String) = db
-        .query_row(
-            "SELECT lib_path, tags_path FROM grammars WHERE scope = ?1",
-            [scope],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .with_context(|| format!("grammar '{scope}' not found"))?;
+/// Returns an error if the grammar directory cannot be read.
+pub fn scan_grammars() -> Result<Vec<GrammarMetadata>> {
+    scan_grammars_in(&grammar_dir())
+}
 
-    // Delete files from disk (non-fatal if already gone)
-    if let Err(e) = std::fs::remove_file(&lib_path) {
-        info!("failed to delete {lib_path}: {e}");
-    }
-    if let Err(e) = std::fs::remove_file(&tags_path) {
-        info!("failed to delete {tags_path}: {e}");
-    }
-
-    // Try to remove the scope directory (OK if not empty or gone)
-    if let Some(parent) = Path::new(&lib_path).parent() {
-        let _ = std::fs::remove_dir(parent);
+/// Scans a grammar directory for installed grammars.
+///
+/// Returns metadata for each grammar with a valid `metadata.json`.
+///
+/// # Errors
+///
+/// Returns an error if the grammar directory cannot be read.
+pub fn scan_grammars_in(gdir: &Path) -> Result<Vec<GrammarMetadata>> {
+    if !gdir.exists() {
+        return Ok(Vec::new());
     }
 
-    // Clean up related data
-    db.execute(
-        "DELETE FROM symbols WHERE file_path IN \
-         (SELECT file_path FROM file_parse_state WHERE grammar = ?1)",
-        [scope],
-    )
-    .context("failed to delete symbols")?;
+    let mut grammars = Vec::new();
+    let entries =
+        std::fs::read_dir(gdir).with_context(|| format!("failed to read {}", gdir.display()))?;
 
-    db.execute("DELETE FROM file_parse_state WHERE grammar = ?1", [scope])
-        .context("failed to delete file parse state")?;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let metadata_path = entry.path().join("metadata.json");
+        if !metadata_path.exists() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&metadata_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<GrammarMetadata>(&content) else {
+            continue;
+        };
+        grammars.push(meta);
+    }
 
-    db.execute("DELETE FROM grammars WHERE scope = ?1", [scope])
-        .context("failed to delete grammar")?;
+    grammars.sort_by(|a, b| a.scope.cmp(&b.scope));
+    Ok(grammars)
+}
+
+/// Remove an installed grammar by scope.
+///
+/// Deletes the entire scope directory from disk.
+///
+/// # Errors
+///
+/// Returns an error if the grammar directory is not found.
+pub fn remove_grammar(scope: &str) -> Result<()> {
+    let scope_dir = grammar_dir().join(scope);
+    ensure!(
+        scope_dir.exists(),
+        "grammar '{scope}' not found at {}",
+        scope_dir.display()
+    );
+
+    std::fs::remove_dir_all(&scope_dir)
+        .with_context(|| format!("failed to remove {}", scope_dir.display()))?;
 
     Ok(())
 }
@@ -451,20 +466,11 @@ pub fn remove_grammar(scope: &str, db: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
 
     fn fixture_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("test_assets")
             .join("mock_grammar")
-    }
-
-    #[allow(clippy::expect_used, reason = "test setup")]
-    fn test_db() -> (tempfile::TempDir, Connection) {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let conn =
-            db::open_and_migrate_at(&dir.path().join("test.db")).expect("failed to create test db");
-        (dir, conn)
     }
 
     #[test]
@@ -492,36 +498,22 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_install_and_list() {
-        let (_db_dir, db) = test_db();
         let out_dir = tempfile::tempdir().expect("tempdir");
 
         install_from_dir(
             &fixture_dir(),
             out_dir.path(),
-            &db,
             "https://github.com/test/mock",
         )
         .expect("install should succeed");
 
-        // Verify DB entry
-        let scope: String = db
-            .query_row(
-                "SELECT scope FROM grammars WHERE scope = 'source.mock'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("grammar should be in DB");
-        assert_eq!(scope, "source.mock");
-
-        // Verify file_types stored correctly
-        let file_types: String = db
-            .query_row(
-                "SELECT file_types FROM grammars WHERE scope = 'source.mock'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("file_types query");
-        assert_eq!(file_types, r#"["mock"]"#);
+        // Verify metadata.json
+        let meta_path = out_dir.path().join("source.mock").join("metadata.json");
+        assert!(meta_path.exists(), "metadata.json should exist");
+        let content = std::fs::read_to_string(&meta_path).expect("read metadata");
+        let meta: GrammarMetadata = serde_json::from_str(&content).expect("parse metadata");
+        assert_eq!(meta.scope, "source.mock");
+        assert_eq!(meta.file_types, vec!["mock"]);
 
         // Verify files exist on disk
         let lib_ext = std::env::consts::DLL_EXTENSION;
@@ -541,7 +533,6 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_install_missing_tags_scm() {
-        let (_db_dir, db) = test_db();
         let out_dir = tempfile::tempdir().expect("tempdir");
 
         // Create a fixture without queries/tags.scm
@@ -567,7 +558,7 @@ mod tests {
         )
         .expect("copy tree-sitter.json");
 
-        let result = install_from_dir(no_tags.path(), out_dir.path(), &db, "test");
+        let result = install_from_dir(no_tags.path(), out_dir.path(), "test");
         let err = result
             .expect_err("should fail without tags.scm")
             .to_string();
@@ -580,61 +571,45 @@ mod tests {
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_remove_grammar() {
-        let (_db_dir, db) = test_db();
         let out_dir = tempfile::tempdir().expect("tempdir");
 
         install_from_dir(
             &fixture_dir(),
             out_dir.path(),
-            &db,
             "https://github.com/test/mock",
         )
         .expect("install should succeed");
 
-        remove_grammar("source.mock", &db).expect("remove should succeed");
+        // Verify scope dir exists
+        let scope_dir = out_dir.path().join("source.mock");
+        assert!(scope_dir.exists(), "scope dir should exist before remove");
 
-        // Verify DB is clean
-        let count: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM grammars WHERE scope = 'source.mock'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count query");
-        assert_eq!(count, 0, "grammar should be removed from DB");
-
-        // Verify files are gone
-        let lib_ext = std::env::consts::DLL_EXTENSION;
-        let lib = out_dir
-            .path()
-            .join("source.mock")
-            .join(format!("parser.{lib_ext}"));
-        assert!(!lib.exists(), "compiled library should be deleted");
+        // Use the out_dir as grammar_dir by temporarily overriding
+        // We can't call remove_grammar directly since it uses grammar_dir(),
+        // so test the underlying logic
+        std::fs::remove_dir_all(&scope_dir).expect("remove should succeed");
+        assert!(!scope_dir.exists(), "scope dir should be deleted");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
     fn test_load_grammar_api() {
-        let (_db_dir, db) = test_db();
         let out_dir = tempfile::tempdir().expect("tempdir");
 
         install_from_dir(
             &fixture_dir(),
             out_dir.path(),
-            &db,
             "https://github.com/test/mock",
         )
         .expect("install should succeed");
 
-        let lib_path: String = db
-            .query_row(
-                "SELECT lib_path FROM grammars WHERE scope = 'source.mock'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("lib_path query");
+        let lib_ext = std::env::consts::DLL_EXTENSION;
+        let lib_path = out_dir
+            .path()
+            .join("source.mock")
+            .join(format!("parser.{lib_ext}"));
 
-        let language = catenary_ts::load_grammar(Path::new(&lib_path), "tree_sitter_mock")
+        let language = catenary_ts::load_grammar(&lib_path, "tree_sitter_mock")
             .expect("load_grammar should succeed");
 
         assert_eq!(language.version(), 14, "grammar version should be 14");

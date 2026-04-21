@@ -238,34 +238,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
          CREATE INDEX IF NOT EXISTS idx_filter_workspace ON filter_history(workspace, created_at DESC);
 
-         CREATE TABLE IF NOT EXISTS grammars (
-             scope       TEXT PRIMARY KEY,
-             file_types  TEXT NOT NULL,
-             lib_path    TEXT NOT NULL,
-             tags_path   TEXT NOT NULL,
-             repo_url    TEXT NOT NULL,
-             installed_at TEXT NOT NULL
-         );
-
-         CREATE TABLE IF NOT EXISTS symbols (
-             file_path   TEXT NOT NULL,
-             name        TEXT NOT NULL,
-             kind        TEXT NOT NULL,
-             line        INTEGER NOT NULL,
-             end_line    INTEGER NOT NULL,
-             scope       TEXT,
-             scope_kind  TEXT,
-             PRIMARY KEY (file_path, line)
-         );
-
-         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
-
-         CREATE TABLE IF NOT EXISTS file_parse_state (
-             file_path   TEXT PRIMARY KEY,
-             mtime_ns    INTEGER NOT NULL,
-             grammar     TEXT NOT NULL REFERENCES grammars(scope)
-         );
-
          COMMIT;",
     )
     .context("failed to create database schema")?;
@@ -559,9 +531,6 @@ mod tests {
             "messages",
             "language_servers",
             "filter_history",
-            "grammars",
-            "symbols",
-            "file_parse_state",
         ];
 
         for table in &expected_tables {
@@ -631,178 +600,9 @@ mod tests {
         assert_eq!(fk, 1, "foreign keys should be enabled");
     }
 
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_grammar_tables_exist() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        for table in &["grammars", "symbols", "file_parse_state"] {
-            assert!(
-                table_exists(&conn, table),
-                "table '{table}' should exist after migration"
-            );
-        }
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_grammar_insert_and_query() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        conn.execute(
-            "INSERT INTO grammars (scope, file_types, lib_path, tags_path, repo_url, installed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                "source.rust",
-                r#"["rs"]"#,
-                "/path/to/rust.so",
-                "/path/to/tags.scm",
-                "https://github.com/tree-sitter/tree-sitter-rust",
-                "2026-03-07T12:00:00Z",
-            ],
-        )
-        .expect("failed to insert grammar");
-
-        let (scope, file_types, lib_path): (String, String, String) = conn
-            .query_row(
-                "SELECT scope, file_types, lib_path FROM grammars WHERE scope = ?1",
-                ["source.rust"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("failed to query grammar");
-
-        assert_eq!(scope, "source.rust");
-        assert_eq!(file_types, r#"["rs"]"#);
-        assert_eq!(lib_path, "/path/to/rust.so");
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_symbols_insert_and_query() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        conn.execute(
-            "INSERT INTO symbols (file_path, name, kind, line, end_line, scope, scope_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "src/main.rs",
-                "main",
-                "function",
-                1,
-                10,
-                None::<String>,
-                None::<String>
-            ],
-        )
-        .expect("failed to insert symbol");
-
-        conn.execute(
-            "INSERT INTO symbols (file_path, name, kind, line, end_line, scope, scope_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "src/main.rs",
-                "Config",
-                "struct",
-                12,
-                25,
-                None::<String>,
-                None::<String>
-            ],
-        )
-        .expect("failed to insert second symbol");
-
-        let mut stmt = conn
-            .prepare("SELECT file_path, name, kind, line, end_line FROM symbols WHERE name = ?1")
-            .expect("failed to prepare query");
-
-        let (file_path, name, kind, line, end_line): (String, String, String, i64, i64) = stmt
-            .query_row(["main"], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .expect("failed to query symbol");
-
-        assert_eq!(file_path, "src/main.rs");
-        assert_eq!(name, "main");
-        assert_eq!(kind, "function");
-        assert_eq!(line, 1);
-        assert_eq!(end_line, 10);
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_file_parse_state_mtime() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        // Insert a grammar first (FK target).
-        conn.execute(
-            "INSERT INTO grammars (scope, file_types, lib_path, tags_path, repo_url, installed_at)
-             VALUES ('source.rust', '[\"rs\"]', '/lib.so', '/tags.scm', 'https://example.com', '2026-03-07T12:00:00Z')",
-            [],
-        )
-        .expect("failed to insert grammar");
-
-        conn.execute(
-            "INSERT INTO file_parse_state (file_path, mtime_ns, grammar)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params!["src/main.rs", 1_000_000_000_i64, "source.rust"],
-        )
-        .expect("failed to insert file_parse_state");
-
-        conn.execute(
-            "UPDATE file_parse_state SET mtime_ns = ?1 WHERE file_path = ?2",
-            rusqlite::params![2_000_000_000_i64, "src/main.rs"],
-        )
-        .expect("failed to update mtime");
-
-        let mtime: i64 = conn
-            .query_row(
-                "SELECT mtime_ns FROM file_parse_state WHERE file_path = ?1",
-                ["src/main.rs"],
-                |row| row.get(0),
-            )
-            .expect("failed to query mtime");
-
-        assert_eq!(mtime, 2_000_000_000);
-    }
-
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    #[test]
-    fn test_file_parse_state_foreign_key() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let path = dir.path().join("test.db");
-
-        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
-
-        // Inserting file_parse_state with a non-existent grammar should fail.
-        let result = conn.execute(
-            "INSERT INTO file_parse_state (file_path, mtime_ns, grammar)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params!["src/main.rs", 1_000_000_000_i64, "source.nonexistent"],
-        );
-
-        assert!(
-            result.is_err(),
-            "inserting file_parse_state with invalid grammar should fail"
-        );
-    }
+    // Grammar/symbol/parse_state tables removed from schema in SEARCHv2
+    // ticket 06a — tree-sitter index uses in-memory SQLite, grammar registry
+    // uses filesystem metadata.json sidecars.
 
     #[allow(clippy::expect_used, reason = "test assertions")]
     #[test]
