@@ -895,6 +895,28 @@ fn test_no_roots_request_without_capability() -> Result<()> {
 // These tests use mockls instead of real language servers, so they always
 // run regardless of installed toolchains.
 
+/// Pre-installs the mock tree-sitter grammar into a test's isolated state dir.
+///
+/// Runs `catenary install <fixture_path>` with `XDG_STATE_HOME` pointing at
+/// the test root so the bridge process finds the grammar at startup.
+fn install_mock_grammar(state_home: &str) -> Result<()> {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_assets")
+        .join("mock_grammar");
+    let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
+        .arg("install")
+        .arg(fixture.to_str().context("fixture path")?)
+        .env("XDG_STATE_HOME", state_home)
+        .env("XDG_CONFIG_HOME", state_home)
+        .output()
+        .context("failed to run catenary install")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("catenary install failed: {stderr}");
+    }
+    Ok(())
+}
+
 /// Build a `CATENARY_SERVERS` spec for `BridgeProcess::spawn` using mockls.
 fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_mockls");
@@ -2475,6 +2497,100 @@ fn test_grep_prepare_rename_keyword() -> Result<()> {
     assert_eq!(
         text, "No results found",
         "Expected 'No results found' when only keywords match, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tree-sitter kind labels use `<Kind>` angle brackets.
+/// Requires the mock grammar to be installed so tree-sitter can classify symbols.
+#[test]
+fn test_grep_kind_brackets() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // Install mock grammar into the test's state dir
+    install_mock_grammar(root)?;
+
+    // Create a .mock file — the mock grammar parses `fn name` and `struct name`
+    let file = dir.path().join("kinds.mock");
+    std::fs::write(&file, "fn my_func\nstruct MyStruct\n")?;
+
+    // No LSP needed for tree-sitter classification — use mockls as a no-op server
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3010,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "my_func|MyStruct" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Tree-sitter kind labels should use <Kind> angle brackets
+    assert!(
+        text.contains("<Function>"),
+        "Expected <Function> kind label, got:\n{text}"
+    );
+    assert!(
+        text.contains("<Struct>"),
+        "Expected <Struct> kind label, got:\n{text}"
+    );
+    // Must NOT use [Kind] square brackets (old format)
+    assert!(
+        !text.contains("[Function]") && !text.contains("[Struct]"),
+        "Expected angle brackets <Kind>, not square brackets [Kind], got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Reference hit at a non-definition line reports enclosing tree-sitter structure.
+/// Requires a multi-line grammar — the mock grammar only supports single-line
+/// definitions (`fn name`, `struct name`), so this test is skipped until the
+/// mock grammar is extended with block syntax.
+#[test]
+#[ignore = "requires mock grammar with multi-line block syntax"]
+fn test_grep_reference_enclosing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    install_mock_grammar(root)?;
+
+    let file = dir.path().join("enclosing.mock");
+    std::fs::write(&file, "fn outer\ntarget\nend\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3011,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "target" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains("ref in") && text.contains("<Function>") && text.contains("outer"),
+        "Expected reference with enclosing <Function> outer, got:\n{text}"
     );
 
     Ok(())
