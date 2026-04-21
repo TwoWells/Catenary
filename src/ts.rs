@@ -37,12 +37,14 @@ pub struct TsSymbol {
 
 /// Workspace-wide tree-sitter index backed by `SQLite`.
 ///
-/// Owns its own WAL-mode database connection, separate from the session's
-/// event-writing connection. Concurrent grep calls each open their own
-/// read transaction via WAL mode.
+/// Owns a write connection for index updates and opens throwaway read
+/// connections for queries. WAL mode allows concurrent reads while a
+/// single writer updates the index.
 pub struct TsIndex {
-    /// Owned connection for symbol queries and writes.
+    /// Owned connection for writes (`update_file`, `ensure_fresh`).
     conn: Connection,
+    /// Database path for opening read connections on demand.
+    db_path: PathBuf,
     /// Loaded grammars keyed by scope (e.g. `"source.rust"`).
     grammars: HashMap<String, tree_sitter::Language>,
     /// Scope → file extensions, from `grammars.file_types`.
@@ -459,8 +461,11 @@ impl TsIndex {
             "tree-sitter index built"
         );
 
+        let db_path = conn.path().map(PathBuf::from).unwrap_or_default();
+
         Ok(Self {
             conn,
+            db_path,
             grammars,
             extensions,
             tag_queries,
@@ -538,11 +543,33 @@ impl TsIndex {
         Ok(())
     }
 
+    /// Opens a throwaway read-only connection for queries.
+    ///
+    /// WAL mode allows concurrent readers alongside the single writer.
+    fn read_conn(&self) -> Result<Connection> {
+        let conn = crate::db::open_at(&self.db_path)?;
+        conn.create_scalar_function(
+            "regexp",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let pattern = ctx.get_raw(0).as_str()?;
+                let text = ctx.get_raw(1).as_str()?;
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                Ok(re.is_match(text))
+            },
+        )
+        .context("failed to register REGEXP function")?;
+        Ok(conn)
+    }
+
     /// Query the index for symbols whose names match a regex pattern.
     ///
     /// If `files` is `Some`, only symbols from those files are returned.
-    /// This is a pure index read — callers are responsible for ensuring
-    /// freshness via `update_file()` before querying.
+    /// Opens a throwaway read connection — concurrent queries don't block
+    /// each other or the write path.
     ///
     /// # Errors
     ///
@@ -552,6 +579,7 @@ impl TsIndex {
         pattern: &str,
         files: Option<&[PathBuf]>,
     ) -> Result<Vec<(PathBuf, TsSymbol)>> {
+        let conn = self.read_conn()?;
         let mut results = Vec::new();
 
         match files {
@@ -564,7 +592,7 @@ impl TsIndex {
                     "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
                      FROM symbols WHERE name REGEXP ?1 AND file_path IN ({placeholders})"
                 );
-                let mut stmt = self.conn.prepare(&sql).context("failed to prepare query")?;
+                let mut stmt = conn.prepare(&sql).context("failed to prepare query")?;
 
                 let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
                     Vec::with_capacity(1 + file_list.len());
@@ -583,8 +611,7 @@ impl TsIndex {
                 }
             }
             _ => {
-                let mut stmt = self
-                    .conn
+                let mut stmt = conn
                     .prepare(
                         "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
                          FROM symbols WHERE name REGEXP ?1",
@@ -603,6 +630,44 @@ impl TsIndex {
             .into_iter()
             .map(|(p, sym)| (PathBuf::from(p), sym))
             .collect())
+    }
+
+    /// Finds the innermost symbol enclosing a line in a file.
+    ///
+    /// Returns the tightest definition (smallest span) containing the given
+    /// 0-based line. Opens a throwaway read connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn find_enclosing(&self, file_path: &Path, line_0: u32) -> Result<Option<TsSymbol>> {
+        let conn = self.read_conn()?;
+        let path_str = file_path.to_string_lossy();
+        let mut stmt = conn.prepare(
+            "SELECT name, kind, line, end_line, scope, scope_kind \
+             FROM symbols \
+             WHERE file_path = ?1 AND line <= ?2 AND end_line >= ?2 \
+             ORDER BY (end_line - line) ASC \
+             LIMIT 1",
+        )?;
+
+        let result = stmt
+            .query_row(
+                rusqlite::params![path_str.as_ref() as &str, line_0],
+                |row| {
+                    Ok(TsSymbol {
+                        name: row.get(0)?,
+                        kind: row.get(1)?,
+                        line: row.get(2)?,
+                        end_line: row.get(3)?,
+                        scope: row.get(4)?,
+                        scope_kind: row.get(5)?,
+                    })
+                },
+            )
+            .ok();
+
+        Ok(result)
     }
 
     /// Map a database row to a `(file_path, TsSymbol)` pair.

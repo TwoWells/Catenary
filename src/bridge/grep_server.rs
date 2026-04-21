@@ -82,7 +82,9 @@ impl ToolServer for GrepServer {
             return Err(anyhow!("pattern must be non-empty"));
         }
 
-        // Wait for all servers ready (grep doesn't target a specific file)
+        // Wait for all servers ready (grep doesn't target a specific file).
+        // Track dead languages so the pipeline can skip prepareRename for them.
+        let mut dead_languages: HashSet<String> = HashSet::new();
         let clients = self.client_manager.clients().await;
         for (key, client_mutex) in &clients {
             if !client_mutex.lock().await.wait_ready().await {
@@ -90,6 +92,7 @@ impl ToolServer for GrepServer {
                     "[{}] server died \u{2014} tool will run in degraded mode",
                     key.language_id
                 );
+                dead_languages.insert(key.language_id.clone());
             }
         }
 
@@ -109,7 +112,7 @@ impl ToolServer for GrepServer {
                 include_gitignored: input.include_gitignored,
                 include_hidden: input.include_hidden,
             };
-            let output = self.run(arm_input, parent_id).await?;
+            let output = self.run(arm_input, parent_id, &dead_languages).await?;
             if !output.is_empty() {
                 if !all_output.is_empty() {
                     all_output.push('\n');
@@ -129,7 +132,12 @@ impl ToolServer for GrepServer {
 impl GrepServer {
     /// Grep pipeline: ripgrep + tree-sitter index + hit classification.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
-    async fn run(&self, input: GrepInput, parent_id: Option<i64>) -> Result<String> {
+    async fn run(
+        &self,
+        input: GrepInput,
+        parent_id: Option<i64>,
+        dead_languages: &HashSet<String>,
+    ) -> Result<String> {
         use std::fmt::Write;
 
         debug!("Grep request: pattern={}", input.pattern);
@@ -179,31 +187,29 @@ impl GrepServer {
             .await;
 
         // Step 3: Tree-sitter index freshness check and query.
-        let (ts_symbols, all_symbols_in_files, grammar_files) =
-            if let Some(ref index_mutex) = self.ts_index {
-                let index = index_mutex
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let re_pattern = format!("(?i){}", &input.pattern);
-                if let Err(e) = index.ensure_fresh(&rg_paths) {
-                    debug!("tree-sitter freshness check failed: {e}");
-                }
-                let ts_syms = index
-                    .query(&re_pattern, Some(&rg_paths))
-                    .unwrap_or_default();
-                // Query ALL symbols in hit files for enclosing structure resolution
-                let all_syms = index.query(".*", Some(&rg_paths)).unwrap_or_default();
-                // Pre-check which files have grammars
-                let gf: HashSet<String> = rg_paths
-                    .iter()
-                    .filter(|p| index.has_grammar_for(p))
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect();
-                drop(index);
-                (ts_syms, all_syms, gf)
-            } else {
-                (Vec::new(), Vec::new(), HashSet::new())
-            };
+        let (ts_symbols, grammar_files) = if let Some(ref index_mutex) = self.ts_index {
+            let index = index_mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let re_pattern = format!("(?i){}", &input.pattern);
+            if let Err(e) = index.ensure_fresh(&rg_paths) {
+                debug!("tree-sitter freshness check failed: {e}");
+            }
+            // query() and find_enclosing() use throwaway read connections,
+            // so we only hold the lock for ensure_fresh (writes).
+            let ts_syms = index
+                .query(&re_pattern, Some(&rg_paths))
+                .unwrap_or_default();
+            let gf: HashSet<String> = rg_paths
+                .iter()
+                .filter(|p| index.has_grammar_for(p))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            drop(index);
+            (ts_syms, gf)
+        } else {
+            (Vec::new(), HashSet::new())
+        };
 
         // Build lookup: (file_path, line) → TsSymbol for definitions
         let mut def_lookup: HashMap<(String, u32), TsSymbol> = HashMap::new();
@@ -252,9 +258,15 @@ impl GrepServer {
                             },
                         });
                     } else {
-                        // Non-definition line — find enclosing structure
-                        let enclosing =
-                            find_enclosing_symbol(file_str, line_0, &all_symbols_in_files);
+                        // Non-definition line — find enclosing structure via SQL.
+                        // find_enclosing opens a throwaway read connection internally.
+                        let enclosing = self.ts_index.as_ref().and_then(|idx| {
+                            idx.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .find_enclosing(&file_path, line_0)
+                                .ok()
+                                .flatten()
+                        });
                         hits.push(GrepHit {
                             file: file_path.clone(),
                             line: line_0,
@@ -263,25 +275,41 @@ impl GrepServer {
                         });
                     }
                 } else {
-                    // No grammar — use prepareRename for keyword discrimination
-                    let col = texts.first().map_or(0, |(_, c)| *c);
-                    let is_symbol = self
-                        .prepare_rename_check(&file_path, line_0, col, parent_id)
-                        .await;
-                    if is_symbol {
+                    // No grammar — check if the language server is alive
+                    let lang = self.fs_manager.language_id(&file_path);
+                    let server_dead = lang
+                        .as_ref()
+                        .is_some_and(|l| dead_languages.contains(l.as_str()));
+
+                    if server_dead {
+                        // Server unavailable — emit bare reference, skip LSP
                         hits.push(GrepHit {
                             file: file_path.clone(),
                             line: line_0,
                             matched_text,
-                            classification: HitClass::PrepareRenameSymbol,
+                            classification: HitClass::Reference { enclosing: None },
                         });
                     } else {
-                        hits.push(GrepHit {
-                            file: file_path.clone(),
-                            line: line_0,
-                            matched_text,
-                            classification: HitClass::Keyword,
-                        });
+                        // Server alive — use prepareRename for keyword discrimination
+                        let col = texts.first().map_or(0, |(_, c)| *c);
+                        let is_symbol = self
+                            .prepare_rename_check(&file_path, line_0, col, parent_id)
+                            .await;
+                        if is_symbol {
+                            hits.push(GrepHit {
+                                file: file_path.clone(),
+                                line: line_0,
+                                matched_text,
+                                classification: HitClass::PrepareRenameSymbol,
+                            });
+                        } else {
+                            hits.push(GrepHit {
+                                file: file_path.clone(),
+                                line: line_0,
+                                matched_text,
+                                classification: HitClass::Keyword,
+                            });
+                        }
                     }
                 }
             }
@@ -361,7 +389,8 @@ impl GrepServer {
     /// Checks `prepareRename` at a position to distinguish symbols from keywords.
     ///
     /// Returns `true` if the position is a symbol, `false` if keyword.
-    /// Defaults to `true` (assume symbol) when the server is unavailable.
+    /// Callers should check server health before calling — this method
+    /// returns `false` if the server is unreachable.
     async fn prepare_rename_check(
         &self,
         path: &Path,
@@ -374,8 +403,7 @@ impl GrepServer {
             .ensure_document_open(path, parent_id)
             .await
         else {
-            // Server unavailable — can't check, assume symbol
-            return true;
+            return false;
         };
 
         let mut client = client_mutex.lock().await;
@@ -660,42 +688,6 @@ fn split_alternation(pattern: &str) -> Vec<String> {
         arms.push(pattern.to_string());
     }
     arms
-}
-
-/// Finds the innermost enclosing symbol for a line in a file.
-///
-/// Scans all symbols in the given file from the full index and returns
-/// the tightest enclosing definition (smallest span containing the line).
-fn find_enclosing_symbol(
-    file_str: &str,
-    line_0: u32,
-    all_symbols: &[(PathBuf, TsSymbol)],
-) -> Option<TsSymbol> {
-    let mut best: Option<&TsSymbol> = None;
-    let mut best_span = u32::MAX;
-
-    for (path, sym) in all_symbols {
-        if path.to_string_lossy() != file_str {
-            continue;
-        }
-        if sym.line <= line_0 && line_0 <= sym.end_line {
-            // This symbol contains the line. Is it tighter?
-            let span = sym.end_line - sym.line;
-            if span < best_span {
-                best = Some(sym);
-                best_span = span;
-            }
-        }
-    }
-
-    best.map(|s| TsSymbol {
-        name: s.name.clone(),
-        kind: s.kind.clone(),
-        line: s.line,
-        end_line: s.end_line,
-        scope: s.scope.clone(),
-        scope_kind: s.scope_kind.clone(),
-    })
 }
 
 #[cfg(test)]
