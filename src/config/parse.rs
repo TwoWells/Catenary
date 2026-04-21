@@ -100,16 +100,18 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
         tools.clamp_budgets();
     }
 
-    // Compile file_patterns globs on each ServerDef before validation.
-    for (name, server_def) in &mut config.server {
-        server_def
-            .compile_patterns()
-            .with_context(|| format!("Server '{name}' has invalid file_patterns"))?;
-    }
-
     let errors = config.validate();
     if !errors.is_empty() {
         bail!("Configuration errors:\n{}", errors.join("\n"));
+    }
+
+    // Compile file_patterns globs after validation. Validation already
+    // checks each pattern with LspGlob::new(), so this is guaranteed to
+    // succeed — it just populates the compiled_patterns field.
+    for server_def in config.server.values_mut() {
+        server_def
+            .compile_patterns()
+            .context("file_patterns compilation failed after validation (bug)")?;
     }
 
     Ok(config)
