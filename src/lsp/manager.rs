@@ -457,6 +457,70 @@ impl LspClientManager {
         result
     }
 
+    /// Waits for every server bound to this path's language binding.
+    ///
+    /// Resolves language from path, iterates all servers in the
+    /// binding, waits for each to reach Ready or terminal state.
+    /// Dead servers don't block — they return immediately. Servers
+    /// that haven't been spawned yet are skipped (not spawned).
+    pub async fn wait_ready_for_path(&self, path: &Path) {
+        // Detect language: primary (FilesystemManager) then fallback (raw extension).
+        let Some(lang_id) = self.fs.language_id(path).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        }) else {
+            return;
+        };
+
+        // Resolve owning workspace root — unrooted files skip waiting.
+        let Some(root) = self.fs.resolve_root(path) else {
+            return;
+        };
+
+        // Look up language config — unconfigured languages skip.
+        let Some(lang_config) = self.config.resolve_language(&lang_id) else {
+            return;
+        };
+
+        // Collect matching instances under the lock, then release before waiting.
+        let to_wait: Vec<Arc<Mutex<LspClient>>> = {
+            let clients = self.clients.lock().await;
+            lang_config
+                .servers
+                .iter()
+                .filter_map(|binding| find_instance(&clients, &lang_id, &binding.name, &root))
+                .collect()
+        };
+
+        for client_mutex in to_wait {
+            client_mutex.lock().await.wait_ready().await;
+        }
+    }
+
+    /// Waits for every active instance across all bindings.
+    ///
+    /// Clones the client map, waits for each to reach Ready or
+    /// terminal state. Dead servers return immediately.
+    pub async fn wait_ready_all(&self) {
+        let clients = self.clients.lock().await.clone();
+        for (_key, client_mutex) in clients {
+            client_mutex.lock().await.wait_ready().await;
+        }
+    }
+
+    /// Spawns missing servers for the given paths and waits for
+    /// all to be ready.
+    ///
+    /// Combines [`ensure_clients_for_paths`](Self::ensure_clients_for_paths)
+    /// (spawn) with [`wait_ready_all`](Self::wait_ready_all). Closes the
+    /// lazy-spawn gap: after this call, all servers for the discovered
+    /// languages are Ready (or terminal).
+    pub async fn ensure_and_wait_for_paths(&self, paths: &[PathBuf]) {
+        self.ensure_clients_for_paths(paths).await;
+        self.wait_ready_all().await;
+    }
+
     /// Spawns a server process, runs `initialize`, constructs the final
     /// `InstanceKey` from discovered capabilities, and inserts into the
     /// clients map.
@@ -2940,5 +3004,126 @@ mod tests {
             let matched = match_file_changes(&changes, &watchers, &roots);
             assert_eq!(matched.len(), 1);
         }
+    }
+
+    // --- Wait primitives (1c-02) ---
+
+    #[tokio::test]
+    async fn test_wait_ready_for_path_healthy() -> Result<()> {
+        // Server reaches ready state: wait_ready_for_path returns.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        manager.wait_ready_for_path(&path).await;
+
+        // If we got here, it didn't hang.
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_for_path_dead() -> Result<()> {
+        // Server dies: wait_ready_for_path returns (doesn't hang).
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        // Kill the server.
+        client.lock().await.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        manager.wait_ready_for_path(&path).await;
+
+        // If we got here, dead server didn't block.
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_for_path_unrooted() {
+        // File outside roots: returns immediately (no servers to wait for).
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let path = PathBuf::from(format!("/other/test.{MOCK_LANG_A}"));
+        manager.wait_ready_for_path(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_for_path_no_config() {
+        // Unconfigured language: returns immediately.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        manager
+            .wait_ready_for_path(Path::new("/tmp/test.xyz"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_all_mixed() -> Result<()> {
+        // Some healthy, some dead: returns after all settle.
+        let config = mockls_multi_server_config();
+        let bindings: Vec<String> = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers
+            .iter()
+            .map(|b| b.name.clone())
+            .collect();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+
+        // Spawn both servers.
+        let client_a = manager
+            .ensure_server(MOCK_LANG_A, &bindings[0], Path::new("/tmp"))
+            .await?;
+        let _client_b = manager
+            .ensure_server(MOCK_LANG_A, &bindings[1], Path::new("/tmp"))
+            .await?;
+
+        // Kill one server.
+        client_a.lock().await.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // wait_ready_all should still return (dead server doesn't block).
+        manager.wait_ready_all().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_and_wait_for_paths() -> Result<()> {
+        // Spawns new servers and returns after they're ready.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        assert!(manager.clients().await.is_empty());
+
+        let paths = vec![PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"))];
+        manager.ensure_and_wait_for_paths(&paths).await;
+
+        assert!(
+            has_language(&manager.clients().await, MOCK_LANG_A),
+            "ensure_and_wait_for_paths should spawn the server"
+        );
+        Ok(())
     }
 }
