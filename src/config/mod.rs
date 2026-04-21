@@ -8,11 +8,14 @@ mod parse;
 mod server;
 mod validate;
 
+mod commands;
+
 use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::Deserialize;
 
+pub use commands::{CommandsConfig, ResolvedCommands};
 pub use language::{LanguageConfig, ServerBinding};
 pub use parse::{SERVER_DEF_KEYS, config_sources};
 pub use server::ServerDef;
@@ -66,20 +69,22 @@ impl From<SeverityConfig> for crate::logging::Severity {
 }
 
 /// Overall configuration for Catenary.
-#[derive(Debug, Deserialize, Clone)]
+///
+/// This is the resolved form produced by config loading. TOML
+/// deserialization uses [`parse::RawConfig`] internally; per-layer
+/// `[commands]` sections are folded into `resolved_commands` during
+/// merge and the raw form is dropped.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Log retention in days (default: 7).
     /// 0 = no persistent logging (cleanup on exit).
     /// -1 = retain logs forever.
-    #[serde(default = "default_log_retention_days")]
     pub log_retention_days: i64,
 
     /// Language definitions keyed by language ID (e.g., "rust", "python").
-    #[serde(default)]
     pub language: HashMap<String, LanguageConfig>,
 
     /// Server definitions keyed by server name.
-    #[serde(default)]
     pub server: HashMap<String, ServerDef>,
 
     /// Notification delivery configuration.
@@ -88,29 +93,32 @@ pub struct Config {
     /// `unwrap_or_default()` at consumption sites to get the default
     /// threshold (`warn`). Kept as `Option` so layered merge can
     /// distinguish "absent" from "explicitly set to default".
-    #[serde(default)]
     pub notifications: Option<NotificationConfig>,
 
     /// Icon theme configuration.
     ///
     /// `None` when no source specified `[icons]`. Absent sections fall
     /// through to the earlier config layer.
-    #[serde(default)]
     pub icons: Option<IconConfig>,
 
     /// TUI configuration.
     ///
     /// `None` when no source specified `[tui]`. Absent sections fall
     /// through to the earlier config layer.
-    #[serde(default)]
     pub tui: Option<TuiConfig>,
 
     /// Per-tool configuration (budgets, maps options, etc.).
     ///
     /// `None` when no source specified `[tools]`. Absent sections fall
     /// through to the earlier config layer.
-    #[serde(default)]
     pub tools: Option<ToolsConfig>,
+
+    /// Merged command filter after layered resolution.
+    ///
+    /// Built incrementally during config loading. `None` when no source
+    /// specified `[commands]`. Each layer's `allow`/`deny`/`inherit`
+    /// semantics are applied in order.
+    pub resolved_commands: Option<ResolvedCommands>,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -353,11 +361,6 @@ impl Config {
         parse::load_from_sources(sources)
     }
 
-    /// Merge another config layer into this one. Later values override.
-    fn merge(&mut self, other: Self) {
-        parse::merge(self, other);
-    }
-
     /// Apply environment variable overrides for supported keys.
     fn apply_env_overrides(&mut self) {
         parse::apply_env_overrides(self);
@@ -388,6 +391,7 @@ impl Default for Config {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         }
     }
 }
@@ -1737,6 +1741,316 @@ extensions = ["xyz"]
         assert_eq!(tools.grep.budget, 6000);
         // glob uses defaults
         assert_eq!(tools.glob.budget, 2000);
+
+        Ok(())
+    }
+
+    // --- Commands config ---
+
+    #[test]
+    fn commands_config_parses() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[commands.deny]
+cat = "Use {read} instead"
+"git ls-files" = "Use {catenary_glob} instead"
+
+[commands.deny_when_first]
+grep = "Use {catenary_grep} instead"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let resolved = config
+            .resolved_commands
+            .expect("resolved_commands should be Some");
+        assert_eq!(resolved.deny.len(), 2);
+        assert_eq!(resolved.deny.get("cat").expect("cat"), "Use {read} instead",);
+        assert_eq!(
+            resolved.deny.get("git ls-files").expect("git ls-files"),
+            "Use {catenary_glob} instead",
+        );
+        assert_eq!(resolved.deny_when_first.len(), 1);
+        assert_eq!(
+            resolved.deny_when_first.get("grep").expect("grep"),
+            "Use {catenary_grep} instead",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn commands_config_absent() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.resolved_commands.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn commands_project_allow_removes_from_user() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+
+        let user = dir.path().join("user.toml");
+        fs::write(
+            &user,
+            r#"
+[commands.deny]
+cat = "Use {read}"
+tail = "Use {read}"
+cargo = "Use make"
+"#,
+        )?;
+
+        let project = dir.path().join("project.toml");
+        fs::write(
+            &project,
+            r#"
+[commands]
+allow = ["cargo"]
+
+[commands.deny]
+pip = "Use make"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[user, project])?;
+        let resolved = config
+            .resolved_commands
+            .expect("resolved_commands should be Some");
+        // cargo removed by project allow
+        assert!(!resolved.deny.contains_key("cargo"));
+        // cat and tail preserved from user
+        assert!(resolved.deny.contains_key("cat"));
+        assert!(resolved.deny.contains_key("tail"));
+        // pip added by project
+        assert!(resolved.deny.contains_key("pip"));
+        assert_eq!(resolved.deny.len(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn commands_absent_project_falls_through() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+
+        let user = dir.path().join("user.toml");
+        fs::write(
+            &user,
+            r#"
+[commands.deny]
+cat = "Use {read}"
+"#,
+        )?;
+
+        let project = dir.path().join("project.toml");
+        fs::write(&project, "")?;
+
+        let config = Config::load_from_sources(&[user, project])?;
+        let resolved = config
+            .resolved_commands
+            .expect("resolved_commands should be Some");
+        assert!(resolved.deny.contains_key("cat"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn commands_inherit_false_replaces() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+
+        let user = dir.path().join("user.toml");
+        fs::write(
+            &user,
+            r#"
+[commands.deny]
+cat = "Use {read}"
+tail = "Use {read}"
+"#,
+        )?;
+
+        let project = dir.path().join("project.toml");
+        fs::write(
+            &project,
+            r#"
+[commands]
+inherit = false
+
+[commands.deny]
+pip = "Use make"
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[user, project])?;
+        let resolved = config
+            .resolved_commands
+            .expect("resolved_commands should be Some");
+        // User's entries discarded
+        assert!(!resolved.deny.contains_key("cat"));
+        assert!(!resolved.deny.contains_key("tail"));
+        // Only project's entry
+        assert_eq!(resolved.deny.len(), 1);
+        assert!(resolved.deny.contains_key("pip"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn commands_bare_compound_collision_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[commands.deny]
+cargo = "Use make"
+"cargo test" = "Use make test"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("cargo") && err.contains("cargo test"),
+            "error should mention both keys: {err}",
+        );
+    }
+
+    #[test]
+    fn commands_cross_section_duplicate_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[commands.deny]
+grep = "Use {catenary_grep}"
+
+[commands.deny_when_first]
+grep = "Use {catenary_grep}"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(err.contains("grep"), "error should mention grep: {err}",);
+    }
+
+    #[test]
+    fn commands_inherit_false_with_allow_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[commands]
+inherit = false
+allow = ["cat"]
+
+[commands.deny]
+cat = "Use {read}"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("inherit = false") && err.contains("allow"),
+            "error should mention inherit=false + allow: {err}",
+        );
+    }
+
+    #[test]
+    fn commands_allow_deny_contradiction_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[commands]
+allow = ["cat"]
+
+[commands.deny]
+cat = "Use {read}"
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("cat") && err.contains("allow") && err.contains("deny"),
+            "error should mention contradictory cat: {err}",
+        );
+    }
+
+    #[test]
+    fn commands_three_layer_merge() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+
+        let user = dir.path().join("user.toml");
+        fs::write(
+            &user,
+            r#"
+[commands.deny]
+cat = "Use {read}"
+tail = "Use {read}"
+cargo = "Use make"
+
+[commands.deny_when_first]
+grep = "Use {catenary_grep}"
+"#,
+        )?;
+
+        let project = dir.path().join("project.toml");
+        fs::write(
+            &project,
+            r#"
+[commands]
+allow = ["cargo"]
+
+[commands.deny]
+pip = "Use make"
+"#,
+        )?;
+
+        let explicit = dir.path().join("explicit.toml");
+        fs::write(
+            &explicit,
+            r#"
+[commands]
+allow = ["tail"]
+"#,
+        )?;
+
+        let config = Config::load_from_sources(&[user, project, explicit])?;
+        let resolved = config
+            .resolved_commands
+            .expect("resolved_commands should be Some");
+        // cat: from user, never removed
+        assert!(resolved.deny.contains_key("cat"));
+        // tail: from user, removed by explicit
+        assert!(!resolved.deny.contains_key("tail"));
+        // cargo: from user, removed by project
+        assert!(!resolved.deny.contains_key("cargo"));
+        // pip: added by project
+        assert!(resolved.deny.contains_key("pip"));
+        // grep: from user, never removed
+        assert!(resolved.deny_when_first.contains_key("grep"));
 
         Ok(())
     }

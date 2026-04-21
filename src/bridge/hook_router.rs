@@ -617,7 +617,7 @@ mod tests {
             )
             .expect("insert session");
 
-        let config: Config = serde_json::from_str("{}").expect("empty config");
+        let config = Config::default();
         let logging = crate::logging::LoggingServer::new();
 
         // Toolbox requires a tokio runtime handle for async dispatch.
@@ -664,7 +664,7 @@ mod tests {
             )
             .expect("insert session");
 
-        let config: Config = serde_json::from_str("{}").expect("empty config");
+        let config = Config::default();
         let logging = crate::logging::LoggingServer::new();
 
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");

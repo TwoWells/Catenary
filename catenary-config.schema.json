@@ -51,6 +51,32 @@
           }
         }
       }
+    },
+    "commands": {
+      "type": "object",
+      "description": "Denylist-based command filtering. Commands not in the deny list are allowed.",
+      "properties": {
+        "inherit": {
+          "type": "boolean",
+          "description": "Inherit user config (project config only). When false, the project's deny sections replace the user's entirely.",
+          "default": true
+        },
+        "allow": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands to un-deny (project config only). Removes commands from the inherited deny and deny_when_first sets."
+        },
+        "deny": {
+          "type": "object",
+          "description": "Always-deny commands. Each key is a command name (or quoted 'command subcommand'), each value is a guidance message.",
+          "additionalProperties": { "type": "string" }
+        },
+        "deny_when_first": {
+          "type": "object",
+          "description": "Deny-when-first commands. Denied at pipe position 0, allowed mid-pipeline. Each key is a command name, each value is a guidance message.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
     }
   },
   "definitions": {

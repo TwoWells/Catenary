@@ -1056,6 +1056,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         }
     }
 
@@ -1128,6 +1129,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         }
     }
 
@@ -1163,6 +1165,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         }
     }
 
@@ -1202,6 +1205,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         }
     }
 
@@ -1241,6 +1245,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         }
     }
 
@@ -1293,6 +1298,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         }
     }
 
@@ -1478,6 +1484,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         };
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -2371,6 +2378,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         };
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -2425,6 +2433,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         };
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -2478,6 +2487,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         };
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));

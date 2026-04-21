@@ -3,13 +3,52 @@
 
 //! TOML deserialization, file reading, source merging, and env var overrides.
 
-use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{Config, LanguageConfig, ServerBinding, ServerDef, default_log_retention_days};
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+
+use super::commands::{self, CommandsConfig};
+use super::{
+    Config, IconConfig, LanguageConfig, NotificationConfig, ServerBinding, ServerDef, ToolsConfig,
+    TuiConfig, default_log_retention_days,
+};
 
 /// Embedded default classification config (lowest-priority layer).
 const DEFAULT_LANGUAGES: &str = include_str!("../../defaults/languages.toml");
+
+/// TOML deserialization target for a single config source.
+///
+/// Each TOML file is deserialized into this struct. The `commands` field
+/// is validated per-layer and folded into `Config::resolved_commands`
+/// during merge, then discarded — it never appears on the final `Config`.
+#[derive(Debug, Deserialize, Clone)]
+struct RawConfig {
+    #[serde(default = "default_log_retention_days")]
+    log_retention_days: i64,
+
+    #[serde(default)]
+    language: HashMap<String, LanguageConfig>,
+
+    #[serde(default)]
+    server: HashMap<String, ServerDef>,
+
+    #[serde(default)]
+    notifications: Option<NotificationConfig>,
+
+    #[serde(default)]
+    icons: Option<IconConfig>,
+
+    #[serde(default)]
+    tui: Option<TuiConfig>,
+
+    #[serde(default)]
+    tools: Option<ToolsConfig>,
+
+    #[serde(default)]
+    commands: Option<CommandsConfig>,
+}
 
 /// Load configuration from standard paths or a specific file.
 ///
@@ -84,14 +123,30 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     // Load embedded default classification config (lowest priority).
     let defaults =
         deserialize_source(DEFAULT_LANGUAGES).context("Failed to parse embedded default config")?;
-    config.merge(defaults);
+    merge(&mut config, defaults);
 
     for source in sources {
         let contents = std::fs::read_to_string(source)
             .with_context(|| format!("Failed to read config file: {}", source.display()))?;
         let layer = deserialize_source(&contents)
             .with_context(|| format!("Failed to parse config file: {}", source.display()))?;
-        config.merge(layer);
+
+        // Validate commands config per-layer (before merging destroys the raw form).
+        if let Some(ref cmds) = layer.commands {
+            let (errors, warnings) = commands::validate(cmds);
+            if !errors.is_empty() {
+                bail!(
+                    "Configuration errors in {}:\n{}",
+                    source.display(),
+                    errors.join("\n"),
+                );
+            }
+            for warning in warnings {
+                tracing::warn!(source = %source.display(), "{warning}");
+            }
+        }
+
+        merge(&mut config, layer);
     }
 
     config.apply_env_overrides();
@@ -140,7 +195,7 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
 /// Additionally, `[language.*]` entries containing inline server definition
 /// fields (`command`, `args`, `initialization_options`, `settings`) are
 /// rejected with a migration message — these fields now live in `[server.*]`.
-fn deserialize_source(contents: &str) -> Result<Config> {
+fn deserialize_source(contents: &str) -> Result<RawConfig> {
     let raw: toml::Value = toml::from_str(contents).context("Failed to parse TOML")?;
 
     let has_server = raw.get("server").is_some();
@@ -201,13 +256,14 @@ fn deserialize_source(contents: &str) -> Result<Config> {
     }
 
     // Both present or only language/neither: parse normally.
-    // The `server` field on Config maps to [server.*] as ServerDef entries.
-    let config: Config = toml::from_str(contents).context("Failed to deserialize configuration")?;
+    // The `server` field on RawConfig maps to [server.*] as ServerDef entries.
+    let config: RawConfig =
+        toml::from_str(contents).context("Failed to deserialize configuration")?;
 
     Ok(config)
 }
 
-/// Merge another config layer into this one. Later values override.
+/// Merge a raw config layer into the resolved config. Later values override.
 ///
 /// # Merge strategies
 ///
@@ -218,13 +274,17 @@ fn deserialize_source(contents: &str) -> Result<Config> {
 /// **Maps** (`language`, `server`): key-level merge. Later source wins
 /// per-key; keys absent from the later source are preserved.
 ///
-/// **Structured sections** (`notifications`, `icons`, `tui`): `Option<T>`
-/// on `Config`. `None` means the source did not mention the section;
-/// `Some` means it was present (even if all values match defaults). Merge
-/// only overwrites when the later source is `Some`, so an earlier source's
-/// explicit setting survives an unrelated later source. **All config
-/// sections should follow this pattern.**
-pub(super) fn merge(config: &mut Config, other: Config) {
+/// **Structured sections** (`notifications`, `icons`, `tui`, `tools`):
+/// `Option<T>` on `Config`. `None` means the source did not mention the
+/// section; `Some` means it was present (even if all values match defaults).
+/// Merge only overwrites when the later source is `Some`, so an earlier
+/// source's explicit setting survives an unrelated later source.
+///
+/// **Commands** (`commands`): layered merge via `ResolvedCommands::merge`.
+/// `allow` removes keys, `deny`/`deny_when_first` add/override keys,
+/// `inherit = false` replaces entirely. The raw `CommandsConfig` is
+/// consumed and not stored on `Config`.
+fn merge(config: &mut Config, other: RawConfig) {
     if other.log_retention_days != default_log_retention_days() {
         config.log_retention_days = other.log_retention_days;
     }
@@ -249,6 +309,12 @@ pub(super) fn merge(config: &mut Config, other: Config) {
     }
     if other.tools.is_some() {
         config.tools = other.tools;
+    }
+    if let Some(ref cmds) = other.commands {
+        config
+            .resolved_commands
+            .get_or_insert_with(super::ResolvedCommands::default)
+            .merge(cmds);
     }
 }
 
