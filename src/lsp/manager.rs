@@ -3343,6 +3343,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         };
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3401,6 +3402,7 @@ mod tests {
             icons: None,
             tui: None,
             tools: None,
+            resolved_commands: None,
         };
 
         let dir = tempfile::tempdir().expect("tempdir");

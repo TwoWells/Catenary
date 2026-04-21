@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::warn;
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
 use super::handler::{check_server_health, expand_tilde, resolve_path};
@@ -24,6 +24,7 @@ use super::symbols::{format_symbol_kind, is_outline_kind};
 use super::tool_server::ToolServer;
 use super::toolbox::ResolvedGlob;
 use crate::lsp::LspClientManager;
+use crate::lsp::server::LspServer;
 
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
@@ -113,11 +114,11 @@ impl ToolServer for GlobServer {
 
         // Wait for readiness and emit state-transition notifications.
         if let Some(ref fp) = file_path {
-            self.wait_for_server_ready(fp).await;
+            self.client_manager.wait_ready_for_path(fp).await;
             let touched: Vec<String> = self.language_for_path(fp).await.into_iter().collect();
             check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
         } else {
-            self.wait_for_all_servers_ready().await;
+            self.client_manager.wait_ready_all().await;
             let touched: Vec<String> = self
                 .client_manager
                 .clients()
@@ -144,43 +145,6 @@ impl ToolServer for GlobServer {
 }
 
 impl GlobServer {
-    /// Waits for the server handling the given path to be ready.
-    ///
-    /// Dead servers are non-fatal — the wait completes and the caller
-    /// uses [`check_server_health`] to detect the state.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Client lock held across wait_ready call"
-    )]
-    async fn wait_for_server_ready(&self, path: &Path) {
-        let Ok(client_mutex) = self.client_manager.get_client(path).await else {
-            return;
-        };
-
-        let client = client_mutex.lock().await;
-        let lang = client.language().to_string();
-        let is_ready = client.wait_ready().await;
-        drop(client);
-
-        if !is_ready {
-            debug!("[{lang}] server died \u{2014} tool will run in degraded mode");
-        }
-    }
-
-    /// Waits for all active LSP servers to be ready.
-    async fn wait_for_all_servers_ready(&self) {
-        let clients = self.client_manager.clients().await;
-
-        for (key, client_mutex) in clients {
-            if !client_mutex.lock().await.wait_ready().await {
-                debug!(
-                    "[{}] server died \u{2014} tool will run in degraded mode",
-                    key.language_id
-                );
-            }
-        }
-    }
-
     /// Returns the language ID for a file path.
     async fn language_for_path(&self, path: &Path) -> Option<String> {
         let client_mutex = self.client_manager.get_client(path).await.ok()?;
@@ -374,7 +338,7 @@ impl GlobServer {
 
         // Ensure servers exist for any new languages in matched files
         self.client_manager
-            .ensure_clients_for_paths(&matched_files)
+            .ensure_and_wait_for_paths(&matched_files)
             .await;
 
         let mut result = String::new();
@@ -404,32 +368,45 @@ impl GlobServer {
 
     /// Fetches depth-0 outline symbols for a file from LSP.
     ///
-    /// Returns `(name, kind_u32, 1-based line)` tuples. On LSP failure,
-    /// returns an error (callers typically use `.unwrap_or_default()`).
+    /// Uses priority chain dispatch: iterates servers in binding order,
+    /// returns the first non-empty result. Dispatch errors are logged
+    /// via `warn!()` and never surface in the tool result.
     async fn fetch_outline_symbols(
         &self,
         path: &Path,
         parent_id: Option<i64>,
     ) -> Result<OutlineSymbols> {
-        let (uri_str, client_mutex) = self
+        let servers = self
             .client_manager
-            .ensure_document_open(path, parent_id)
-            .await?;
-
-        let mut client = client_mutex.lock().await;
-        client.set_parent_id(parent_id);
-        let response = client.document_symbols(&uri_str).await;
-        drop(client);
-
-        self.client_manager
-            .close_document(&uri_str, &client_mutex)
+            .get_servers(path, LspServer::supports_document_symbols)
             .await;
 
-        let response = response?;
-        if response.is_null() {
+        if servers.is_empty() {
             return Ok(Vec::new());
         }
 
-        Ok(extract_outline_symbols(&response))
+        for client_mutex in &servers {
+            let uri = self
+                .client_manager
+                .open_document_on(path, client_mutex, parent_id)
+                .await?;
+
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            let response = client.document_symbols(&uri).await;
+            drop(client);
+
+            self.client_manager.close_document(&uri, client_mutex).await;
+
+            match response {
+                Ok(ref v) if !v.is_null() => return Ok(extract_outline_symbols(v)),
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(source = "lsp.dispatch", "document_symbols failed: {e}",);
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 }
