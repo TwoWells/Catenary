@@ -22,22 +22,26 @@ use serde_json::{Value, json};
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
 
-/// Isolates a subprocess from user-level directories.
+/// Isolates a subprocess from the user's environment.
 ///
 /// Sets `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` to the
 /// given root so the process uses the test's tempdir instead of
-/// `~/.config`, `~/.local/state`, or `~/.local/share`. Also clears
-/// `CATENARY_STATE_DIR` and `CATENARY_DATA_DIR` which are higher-priority
-/// overrides that would bypass the XDG vars if inherited from the shell.
+/// `~/.config`, `~/.local/state`, or `~/.local/share`. Clears all
+/// `CATENARY_*` env vars that could leak from the user's shell and
+/// override test-specific settings.
 ///
 /// All integration test subprocesses (bridge, `catenary install`, etc.)
-/// must call this.
+/// must call this. Callers set `CATENARY_SERVERS`, `CATENARY_ROOTS`, or
+/// `CATENARY_CONFIG` explicitly after this call.
 fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("XDG_CONFIG_HOME", root);
     cmd.env("XDG_STATE_HOME", root);
     cmd.env("XDG_DATA_HOME", root);
     cmd.env_remove("CATENARY_STATE_DIR");
     cmd.env_remove("CATENARY_DATA_DIR");
+    cmd.env_remove("CATENARY_CONFIG");
+    cmd.env_remove("CATENARY_SERVERS");
+    cmd.env_remove("CATENARY_ROOTS");
 }
 
 /// Helper to spawn the bridge and communicate with it
@@ -57,16 +61,13 @@ impl BridgeProcess {
     fn spawn_multi_root(lsp_commands: &[&str], roots: &[&str]) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
 
-        // Set servers via env var (semicolon-separated)
-        cmd.env("CATENARY_SERVERS", lsp_commands.join(";"));
-
-        // Set roots via env var
-        let roots_val = std::env::join_paths(roots).unwrap_or_default();
-        cmd.env("CATENARY_ROOTS", &roots_val);
-
+        // Clear inherited env first, then set test-specific values
         if let Some(first_root) = roots.first() {
             isolate_env(&mut cmd, first_root);
         }
+        cmd.env("CATENARY_SERVERS", lsp_commands.join(";"));
+        let roots_val = std::env::join_paths(roots).unwrap_or_default();
+        cmd.env("CATENARY_ROOTS", &roots_val);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -94,9 +95,9 @@ impl BridgeProcess {
     /// needs different flags.
     fn spawn_with_config(config_path: &std::path::Path, root: &str) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, root);
         cmd.env("CATENARY_CONFIG", config_path);
         cmd.env("CATENARY_ROOTS", root);
-        isolate_env(&mut cmd, root);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
