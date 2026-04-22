@@ -8,7 +8,6 @@
 //! and access any dependency through it.
 
 use anyhow::Result;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -193,18 +192,15 @@ impl Toolbox {
             path_validator.clone(),
         ));
 
-        let notified_offline = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let grep = GrepServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
-            notified_offline: notified_offline.clone(),
             ts_index: ts_index.clone(),
             budget: grep_budget,
         };
         let glob = GlobServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
-            notified_offline,
         };
         Self {
             grep,

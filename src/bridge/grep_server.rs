@@ -17,11 +17,10 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::filesystem_manager::FilesystemManager;
-use super::handler::{check_server_health, display_path};
+use super::handler::display_path;
 use super::tool_server::ToolServer;
 use crate::bucketing::{self, BucketEntry};
 use crate::lsp::LspClientManager;
-use crate::lsp::instance_key::InstanceKey;
 use crate::lsp::server::LspServer;
 use crate::ts::{TsIndex, TsSymbol, format_ts_kind};
 
@@ -68,7 +67,6 @@ enum HitClass {
 pub struct GrepServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
-    pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<InstanceKey>>>,
     pub(super) ts_index: Option<Arc<std::sync::Mutex<TsIndex>>>,
     pub(super) budget: usize,
 }
@@ -101,10 +99,6 @@ impl ToolServer for GrepServer {
                 dead_languages.insert(key.language_id.clone());
             }
         }
-
-        // Emit state-transition notifications.
-        let touched: Vec<InstanceKey> = clients.keys().cloned().collect();
-        check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
 
         // Split top-level alternation into independent arms
         let arms = split_alternation(&input.pattern);

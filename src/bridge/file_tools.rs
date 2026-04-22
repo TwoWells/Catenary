@@ -19,12 +19,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::filesystem_manager::{FilesystemManager, format_file_size};
-use super::handler::{check_server_health, expand_tilde, resolve_path};
+use super::handler::{expand_tilde, resolve_path};
 use super::symbols::{format_symbol_kind, is_outline_kind};
 use super::tool_server::ToolServer;
 use super::toolbox::ResolvedGlob;
 use crate::lsp::LspClientManager;
-use crate::lsp::instance_key::InstanceKey;
 use crate::lsp::server::LspServer;
 
 /// Input for the `glob` tool.
@@ -93,7 +92,6 @@ fn extract_outline_symbols(response: &Value) -> OutlineSymbols {
 pub struct GlobServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
-    pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<InstanceKey>>>,
 }
 
 impl ToolServer for GlobServer {
@@ -113,30 +111,11 @@ impl ToolServer for GlobServer {
             None
         };
 
-        // Wait for readiness and emit state-transition notifications.
+        // Wait for readiness before any LSP interaction.
         if let Some(ref fp) = file_path {
             self.client_manager.wait_ready_for_path(fp).await;
-            let clients = self.client_manager.clients().await;
-            let touched: Vec<InstanceKey> = clients
-                .keys()
-                .filter(|k| {
-                    self.fs_manager
-                        .language_id(fp)
-                        .is_some_and(|lang| lang == k.language_id)
-                })
-                .cloned()
-                .collect();
-            check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
         } else {
             self.client_manager.wait_ready_all().await;
-            let touched: Vec<InstanceKey> = self
-                .client_manager
-                .clients()
-                .await
-                .keys()
-                .cloned()
-                .collect();
-            check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
         }
 
         tracing::debug!("glob: {pattern}");

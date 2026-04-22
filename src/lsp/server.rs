@@ -389,13 +389,40 @@ impl LspServer {
     }
 
     /// Sets the lifecycle state and wakes waiters.
+    ///
+    /// On transition to a terminal state (`Dead` or `Failed`), emits a
+    /// `warn!()` notification that flows through `LoggingServer` →
+    /// `NotificationQueueSink` → `systemMessage`. Dedup is handled by
+    /// `NotificationQueueSink` — no per-tool tracking needed.
     pub(crate) fn set_lifecycle(&self, state: ServerLifecycle) {
         let mut lifecycle = self
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_terminal = lifecycle.is_terminal();
+        let is_terminal = state.is_terminal();
         *lifecycle = state;
         drop(lifecycle);
+
+        // Emit notification on first transition to terminal state.
+        if !was_terminal
+            && is_terminal
+            && let Some(key) = self.key()
+        {
+            tracing::warn!(
+                source = "lsp.lifecycle",
+                language = key.language_id.as_str(),
+                server = key.server.as_str(),
+                "Language server unavailable: {} ({}) \u{2014} \
+                 diagnostics unavailable for {} files. \
+                 grep and glob still work but without \
+                 language server enrichment.",
+                key.language_id,
+                key.server,
+                key.language_id,
+            );
+        }
+
         self.state_notify.notify_waiters();
     }
 
