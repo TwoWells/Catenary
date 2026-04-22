@@ -77,6 +77,11 @@ enum Command {
         /// servers for languages detected in this directory.
         path: Option<PathBuf>,
 
+        /// Root directory to check for `.catenary.toml` project config.
+        /// Defaults to the current working directory.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+
         /// Disable colored output.
         #[arg(long)]
         nocolor: bool,
@@ -221,11 +226,12 @@ async fn main() -> Result<()> {
         Some(Command::Status { id }) => cli::commands::run_status(&id),
         Some(Command::Doctor {
             path,
+            root,
             nocolor,
             diff,
         }) => {
             let roots: Vec<PathBuf> = path.into_iter().collect();
-            cli::doctor::run_doctor(&roots, nocolor, diff).await
+            cli::doctor::run_doctor(&roots, &root, nocolor, diff).await
         }
         Some(Command::Install { spec, list, remove }) => {
             if list {

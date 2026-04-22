@@ -43,25 +43,27 @@ fn match_file_changes(
         .collect()
 }
 
-/// Looks up an existing client instance by trying both `Scope::Workspace`
-/// and `Scope::Root(root)` keys. Returns `None` if no instance matches.
+/// Looks up an existing client instance by trying `Scope::Root(root)`
+/// first, then `Scope::Workspace`. Root-first ordering ensures that
+/// project-scoped instances (Rule A) take precedence over shared
+/// workspace instances when both exist for the same `(lang, server)`.
 fn find_instance(
     clients: &HashMap<InstanceKey, Arc<Mutex<LspClient>>>,
     lang: &str,
     server_name: &str,
     root: &Path,
 ) -> Option<Arc<Mutex<LspClient>>> {
-    let workspace_key =
-        InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::Workspace);
-    if let Some(client) = clients.get(&workspace_key) {
-        return Some(client.clone());
-    }
     let root_key = InstanceKey::new(
         lang.to_string(),
         server_name.to_string(),
         Scope::Root(root.to_path_buf()),
     );
-    clients.get(&root_key).cloned()
+    if let Some(client) = clients.get(&root_key) {
+        return Some(client.clone());
+    }
+    let workspace_key =
+        InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::Workspace);
+    clients.get(&workspace_key).cloned()
 }
 
 /// Tests whether a path matches a server's `file_patterns`.

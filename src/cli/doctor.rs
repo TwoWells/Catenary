@@ -41,7 +41,12 @@ const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `c
     clippy::too_many_lines,
     reason = "Doctor command has sequential output logic"
 )]
-pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Result<()> {
+pub async fn run_doctor(
+    roots: &[PathBuf],
+    project_root: &Path,
+    nocolor: bool,
+    show_diff: bool,
+) -> Result<()> {
     let colors = ColorConfig::new(nocolor);
 
     // Print version header
@@ -135,6 +140,9 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     if !validation_errors.is_empty() || !unreferenced.is_empty() || !dup_exts.is_empty() {
         println!();
     }
+
+    // ── Project config section ──────────────────────────────────────
+    doctor_check_project_config(&colors, project_root, &config);
 
     if config.language.is_empty() && config.server.is_empty() {
         println!("No language servers configured.");
@@ -387,6 +395,102 @@ fn doctor_check_config(colors: &ColorConfig) {
     if found_issues {
         println!();
     }
+}
+
+/// Check a project root for `.catenary.toml` and validate its contents.
+///
+/// Reports unsupported sections, parse errors, and orphan server definitions.
+/// Called with `--root` (defaults to cwd).
+fn doctor_check_project_config(
+    colors: &ColorConfig,
+    project_root: &Path,
+    user_config: &crate::config::Config,
+) {
+    let Ok(resolved) = project_root.canonicalize() else {
+        return;
+    };
+
+    let config_path = resolved.join(".catenary.toml");
+    if !config_path.exists() {
+        return;
+    }
+
+    println!(
+        "{} {}",
+        colors.bold("Project config:"),
+        config_path.display(),
+    );
+
+    match crate::config::load_project_config(&resolved) {
+        Ok(Some(pc)) => {
+            // Count entries
+            let lang_count = pc.language.len();
+            let server_count = pc.server.len();
+            println!(
+                "  {}",
+                colors.green(&format!(
+                    "✓ {lang_count} language{}, {server_count} server{}",
+                    if lang_count == 1 { "" } else { "s" },
+                    if server_count == 1 { "" } else { "s" },
+                )),
+            );
+
+            // Orphan server warnings
+            for (server_name, server_def) in &pc.server {
+                if server_def.command.is_empty() {
+                    continue;
+                }
+
+                let referenced_by_project = pc
+                    .language
+                    .values()
+                    .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+
+                let referenced_by_user = user_config
+                    .language
+                    .values()
+                    .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+
+                if !referenced_by_project && !referenced_by_user {
+                    println!(
+                        "  {}",
+                        colors.yellow(&format!(
+                            "⚠  [server.{server_name}] has a `command` but no \
+                             [language.*] references it"
+                        )),
+                    );
+                }
+            }
+
+            // Server ref validation — project language refs must resolve
+            // against the combined (user + project) server set.
+            for (lang_key, lang_config) in &pc.language {
+                for binding in &lang_config.servers {
+                    if !pc.server.contains_key(&binding.name)
+                        && !user_config.server.contains_key(&binding.name)
+                    {
+                        println!(
+                            "  {}",
+                            colors.red(&format!(
+                                "✗  [language.{lang_key}] references server '{}', \
+                                 but no [server.{}] is defined in project or user config",
+                                binding.name, binding.name,
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(None) => {} // No project config — already handled by the exists check above.
+        Err(e) => {
+            println!(
+                "  {}",
+                colors.red(&format!("✗ {}: {e:#}", config_path.display())),
+            );
+        }
+    }
+
+    println!();
 }
 
 /// Print migration guidance for a single old-format entry.
