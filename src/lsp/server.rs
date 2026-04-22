@@ -103,6 +103,13 @@ pub struct LspServer {
     /// Sole owner is the idle detection loop; all access via [`Self::sample_tree`].
     tree_monitor: Mutex<Option<catenary_proc::TreeMonitor>>,
 
+    // ── Dynamic registrations ────────────────────────────────
+    /// Whether the server has dynamically registered for
+    /// `workspace/didChangeConfiguration` notifications.
+    /// Set via `client/registerCapability`, cleared via
+    /// `client/unregisterCapability`.
+    wants_did_change_configuration: AtomicBool,
+
     // ── File watchers ─────────────────────────────────────────
     /// Registered file watcher patterns from `client/registerCapability`.
     /// Keyed by registration ID.
@@ -164,6 +171,7 @@ impl LspServer {
             scope: OnceLock::new(),
             settings,
             settings_per_root: Mutex::new(settings_per_root),
+            wants_did_change_configuration: AtomicBool::new(false),
             tree_monitor: Mutex::new(None),
             file_watchers: Mutex::new(HashMap::new()),
             connection: OnceLock::new(),
@@ -177,8 +185,13 @@ impl LspServer {
 
     /// Resolves a `workspace/configuration` item.
     ///
-    /// If `scope_uri` is provided and matches a root in
-    /// `settings_per_root`, deep-merges the per-root overlay over
+    /// Resolution order for the effective scope:
+    /// 1. Explicit `scopeUri` from the request item.
+    /// 2. Implicit root from `Scope::Root(r)` — root-scoped instances
+    ///    always resolve against their root's project config.
+    /// 3. No scope — returns user defaults.
+    ///
+    /// When a scope is resolved, deep-merges the per-root overlay over
     /// `settings` (user defaults). Otherwise returns the section
     /// resolved against `settings` alone.
     fn resolve_configuration(&self, section: Option<&str>, scope_uri: Option<&str>) -> Value {
@@ -191,12 +204,17 @@ impl LspServer {
             return resolve_section(self.settings.as_ref(), section);
         }
 
-        let Some(scope_uri) = scope_uri else {
+        // Determine effective scope path: explicit scopeUri, or
+        // implicit root for Root-scoped instances.
+        let implicit_root;
+        let scope_path = if let Some(uri) = scope_uri {
+            Path::new(uri.strip_prefix("file://").unwrap_or(uri))
+        } else if let Some(Scope::Root(r)) = self.scope() {
+            implicit_root = r.clone();
+            &implicit_root
+        } else {
             return resolve_section(self.settings.as_ref(), section);
         };
-
-        // Strip file:// prefix to get a path for longest-prefix match.
-        let scope_path = Path::new(scope_uri.strip_prefix("file://").unwrap_or(scope_uri));
 
         // Longest-prefix match against settings_per_root keys.
         let matched = per_root
@@ -761,6 +779,8 @@ impl LspServer {
         if let Ok(mut progress) = self.progress.lock() {
             progress.clear();
         }
+        self.wants_did_change_configuration
+            .store(false, Ordering::SeqCst);
         self.clear_file_watchers();
         self.diagnostics_notify.notify_waiters();
     }
@@ -799,6 +819,17 @@ impl LspServer {
         &self.state_notify
     }
 
+    // ── Dynamic registration accessors ────────────────────────────
+
+    /// Returns whether the server has dynamically registered for
+    /// `workspace/didChangeConfiguration` notifications.
+    ///
+    /// Used by the manager to decide whether to push configuration
+    /// changes to this server (e.g., on `/add-dir`).
+    pub fn wants_did_change_configuration(&self) -> bool {
+        self.wants_did_change_configuration.load(Ordering::SeqCst)
+    }
+
     // ── File watcher registration ────────────────────────────────
 
     /// Snapshots all registered file watcher patterns.
@@ -828,8 +859,8 @@ impl LspServer {
         map.clear();
     }
 
-    /// Parses `client/registerCapability` params and stores file
-    /// watcher registrations.
+    /// Parses `client/registerCapability` params and stores
+    /// registrations for supported methods.
     fn handle_register_capability(&self, params: &Value) {
         let Some(registrations) = params.get("registrations").and_then(Value::as_array) else {
             return;
@@ -845,6 +876,14 @@ impl LspServer {
                 debug!("registration entry missing 'method' field");
                 continue;
             };
+
+            if method == "workspace/didChangeConfiguration" {
+                self.wants_did_change_configuration
+                    .store(true, Ordering::SeqCst);
+                debug!("server registered for workspace/didChangeConfiguration");
+                continue;
+            }
+
             if method != "workspace/didChangeWatchedFiles" {
                 continue;
             }
@@ -920,6 +959,14 @@ impl LspServer {
                 debug!("unregistration entry missing 'method' field");
                 continue;
             };
+
+            if method == "workspace/didChangeConfiguration" {
+                self.wants_did_change_configuration
+                    .store(false, Ordering::SeqCst);
+                debug!("server unregistered from workspace/didChangeConfiguration");
+                continue;
+            }
+
             if method != "workspace/didChangeWatchedFiles" {
                 continue;
             }
@@ -1921,5 +1968,136 @@ mod tests {
         // Second item: no scopeUri — user defaults only
         assert_eq!(arr[1]["key"], "value");
         assert!(arr[1].get("override").is_none());
+    }
+
+    // ── Root-scoped implicit scope tests ─────────────────────────
+
+    #[test]
+    fn resolve_configuration_root_scope_implicit() {
+        let mut per_root = HashMap::new();
+        per_root.insert(
+            PathBuf::from("/project"),
+            json!({"ra": {"project_key": true}}),
+        );
+        let server = LspServer::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Some(json!({"ra": {"user_key": true}})),
+            per_root,
+        );
+        // Set scope to Root — simulates post-init for a legacy server
+        server.set_scope(Scope::Root(PathBuf::from("/project")));
+
+        // No scopeUri — Root-scoped server uses its root implicitly
+        let result = server.resolve_configuration(Some("ra"), None);
+        assert_eq!(result["user_key"], true);
+        assert_eq!(result["project_key"], true);
+    }
+
+    #[test]
+    fn resolve_configuration_workspace_scope_no_implicit() {
+        let mut per_root = HashMap::new();
+        per_root.insert(
+            PathBuf::from("/project"),
+            json!({"ra": {"project_key": true}}),
+        );
+        let server = LspServer::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Some(json!({"ra": {"user_key": true}})),
+            per_root,
+        );
+        server.set_scope(Scope::Workspace);
+
+        // No scopeUri — Workspace-scoped server has no implicit root
+        let result = server.resolve_configuration(Some("ra"), None);
+        assert_eq!(result["user_key"], true);
+        assert!(result.get("project_key").is_none());
+    }
+
+    #[test]
+    fn resolve_configuration_no_scope_set_yet() {
+        let mut per_root = HashMap::new();
+        per_root.insert(
+            PathBuf::from("/project"),
+            json!({"ra": {"project_key": true}}),
+        );
+        let server = LspServer::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Some(json!({"ra": {"user_key": true}})),
+            per_root,
+        );
+        // Scope not set (pre-init) — should return user defaults
+        let result = server.resolve_configuration(Some("ra"), None);
+        assert_eq!(result["user_key"], true);
+        assert!(result.get("project_key").is_none());
+    }
+
+    // ── didChangeConfiguration registration tests ───────────────
+
+    #[test]
+    fn register_did_change_configuration() {
+        let server = test_server();
+        assert!(!server.wants_did_change_configuration());
+
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "cfg-1",
+                    "method": "workspace/didChangeConfiguration"
+                }]}),
+            )
+            .expect("should succeed");
+
+        assert!(server.wants_did_change_configuration());
+    }
+
+    #[test]
+    fn unregister_did_change_configuration() {
+        let server = test_server();
+
+        // Register first
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "cfg-1",
+                    "method": "workspace/didChangeConfiguration"
+                }]}),
+            )
+            .expect("should succeed");
+        assert!(server.wants_did_change_configuration());
+
+        // Unregister
+        server
+            .on_request(
+                "client/unregisterCapability",
+                &json!({"unregisterations": [{
+                    "id": "cfg-1",
+                    "method": "workspace/didChangeConfiguration"
+                }]}),
+            )
+            .expect("should succeed");
+        assert!(!server.wants_did_change_configuration());
+    }
+
+    #[test]
+    fn on_shutdown_clears_config_registration() {
+        let server = test_server();
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [{
+                    "id": "cfg-1",
+                    "method": "workspace/didChangeConfiguration"
+                }]}),
+            )
+            .expect("should succeed");
+        assert!(server.wants_did_change_configuration());
+
+        server.on_shutdown();
+        assert!(!server.wants_did_change_configuration());
     }
 }
