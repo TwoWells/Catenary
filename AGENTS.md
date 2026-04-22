@@ -68,6 +68,7 @@ find-references, rename, and search without shell-based text scanning.
 - **Testing:**
   - All new features must include tests.
   - Integration tests in `tests/` often require real LSP servers (e.g., `rust-analyzer`).
+  - Integration test subprocesses (bridge, `catenary install`, etc.) must use `isolate_env(&mut cmd, root)` from `tests/mcp_integration.rs` to set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` to the test's tempdir. Without this, subprocesses write to the user's real `~/.config`, `~/.local/state`, or `~/.local/share`, causing races between parallel tests and across worktrees.
 
 ## Development Commands
 - **Build:** `cargo build`
