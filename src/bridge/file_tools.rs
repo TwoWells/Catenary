@@ -377,9 +377,8 @@ impl GlobServer {
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
             let response = client.document_symbols(&uri).await;
+            client.close_tracked_document(&uri).await;
             drop(client);
-
-            self.client_manager.close_document(&uri, client_mutex).await;
 
             match response {
                 Ok(ref v) if !v.is_null() => return Ok(extract_outline_symbols(v)),

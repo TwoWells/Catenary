@@ -168,8 +168,10 @@ impl DiagnosticsServer {
         let result = self.run_diagnostics_pipeline(client_mutex, &uri).await;
 
         // Always close and clear parent_id, even on pipeline failure.
-        self.client_manager.close_document(&uri, client_mutex).await;
-        client_mutex.lock().await.set_parent_id(None);
+        let mut client = client_mutex.lock().await;
+        client.close_tracked_document(&uri).await;
+        client.set_parent_id(None);
+        drop(client);
 
         result
     }

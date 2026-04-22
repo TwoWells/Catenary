@@ -254,7 +254,7 @@ impl Toolbox {
         self.path_validator.write().await.update_roots(roots);
 
         // Fire-and-forget: spawn_all is pre-warming, not a gate.
-        // Tool calls that need a server will trigger get_client on demand.
+        // Tool calls that need a server will trigger spawning on demand.
         let cm = self.client_manager.clone();
         tokio::spawn(async move { cm.spawn_all().await });
         Ok(())

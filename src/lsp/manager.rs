@@ -115,16 +115,6 @@ impl LspClientManager {
         &self.config
     }
 
-    /// Returns a reference to the internal document manager.
-    ///
-    /// Prefer [`ensure_document_open`](Self::ensure_document_open) for the
-    /// common case. This lower-level access is for callers that need custom
-    /// notification sequencing (e.g., `DiagnosticsServer` snapshots the
-    /// diagnostics generation before sending notifications).
-    pub const fn doc_manager(&self) -> &Mutex<DocumentManager> {
-        &self.doc_manager
-    }
-
     /// Spawns LSP servers for languages detected in the workspace.
     ///
     /// Walks workspace roots (respecting `.gitignore`), classifies files via
@@ -639,74 +629,12 @@ impl LspClientManager {
         Ok(client)
     }
 
-    /// Gets a client for a file path, detecting the language automatically.
-    ///
-    /// Uses [`FilesystemManager`] for language detection (extension, filename,
-    /// shebang) and [`FilesystemManager::resolve_root`] for scope-aware
-    /// instance lookup. Falls back to the raw file extension as a direct
-    /// config key for custom or test languages (e.g., `.yX4Za` → config key
-    /// `"yX4Za"`).
-    ///
-    /// Files outside all workspace roots return an explicit error — the agent
-    /// can use `/add-dir` to add the root. Tier 3 (single-file) support is
-    /// tracked in misc 28b.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - No language can be detected for the path.
-    /// - The file is outside all workspace roots.
-    /// - The detected language has no configured server.
-    /// - The server fails to spawn.
-    pub async fn get_client(&self, path: &Path) -> Result<Arc<Mutex<LspClient>>> {
-        // Detect language: primary (FilesystemManager) then fallback (raw extension).
-        let lang_id = self
-            .fs
-            .language_id(path)
-            .or_else(|| {
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| anyhow!("No LSP server configured for {}", path.display()))?;
-
-        // Resolve owning workspace root.
-        let root = self
-            .fs
-            .resolve_root(path)
-            .ok_or_else(|| anyhow!("File outside all workspace roots: {}", path.display()))?;
-
-        // Look up first server binding for the language.
-        let lang_config = self
-            .config
-            .resolve_language(&lang_id)
-            .ok_or_else(|| anyhow!("No LSP server configured for language '{lang_id}'"))?;
-        let server_name = &lang_config
-            .servers
-            .first()
-            .ok_or_else(|| anyhow!("No servers configured for language '{lang_id}'"))?
-            .name;
-
-        // Try existing instances: workspace-scoped first, then root-scoped.
-        {
-            let clients = self.clients.lock().await;
-            if let Some(found) = find_instance(&clients, &lang_id, server_name, &root) {
-                if found.lock().await.is_alive() {
-                    return Ok(found);
-                }
-                anyhow::bail!("LSP server '{server_name}' ({lang_id}) is dead");
-            }
-        }
-
-        // No instance found — spawn via ensure_server.
-        self.ensure_server(&lang_id, server_name, &root).await
-    }
-
     /// Opens a document on a specific client.
     ///
     /// Reads the file, checks per-client open state, sends `didOpen` or
-    /// `didChange` as appropriate. Also increments `DocumentManager` ref
-    /// count for backward compatibility (removed in 1c-05).
+    /// `didChange` as appropriate. Version tracking is handled by
+    /// [`DocumentManager`] (shared across clients); open/close state
+    /// is per-client via `LspClient::open_documents`.
     ///
     /// Used by request/response dispatch: the caller gets clients from
     /// [`get_servers`](Self::get_servers) and opens the document on each
@@ -731,8 +659,7 @@ impl LspClientManager {
         let canonical = path.canonicalize()?;
         let text = tokio::fs::read_to_string(&canonical).await?;
 
-        // Increment DocumentManager ref count (backward compat, removed in 1c-05).
-        let (_first_open, version) = doc_manager.open(&uri);
+        let version = doc_manager.open(&uri);
         drop(doc_manager);
 
         let mut client = client.lock().await;
@@ -759,68 +686,6 @@ impl LspClientManager {
 
         drop(client);
         Ok(uri)
-    }
-
-    /// Opens a document on all diagnostic-enabled servers for the file's
-    /// language binding.
-    ///
-    /// Uses [`get_servers`](Self::get_servers) with
-    /// [`LspServer::supports_diagnostics`] as the capability gate, then
-    /// filters by [`LanguageConfig::diagnostics_enabled`] (config-level
-    /// suppression). Opens the document on every remaining server.
-    ///
-    /// Returns `(uri, Vec of clients that have the document open)`.
-    /// Returns an empty Vec when no diagnostic-capable server is
-    /// available — callers should treat this the same as "no language
-    /// server." The URI is meaningless when the Vec is empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if document opening fails on any server.
-    pub async fn open_document_for_diagnostics(
-        &self,
-        path: &Path,
-        parent_id: Option<i64>,
-    ) -> Result<(String, Vec<Arc<Mutex<LspClient>>>)> {
-        let servers = self
-            .get_servers(path, LspServer::supports_diagnostics)
-            .await;
-
-        if servers.is_empty() {
-            return Ok((String::new(), Vec::new()));
-        }
-
-        // Config-level filter: diagnostics_enabled AND per-binding flag.
-        let lang_id = self.fs.language_id(path).or_else(|| {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_string)
-        });
-        let lang_config = lang_id
-            .as_deref()
-            .and_then(|id| self.config.resolve_language(id));
-
-        let mut clients = Vec::new();
-        for client in &servers {
-            let server_name = client.lock().await.server_name().to_string();
-            let enabled = lang_config
-                .as_ref()
-                .is_some_and(|lc| lc.diagnostics_enabled(&server_name));
-            if enabled {
-                clients.push(client.clone());
-            }
-        }
-
-        if clients.is_empty() {
-            return Ok((String::new(), Vec::new()));
-        }
-
-        let mut uri = String::new();
-        for client in &clients {
-            uri = self.open_document_on(path, client, parent_id).await?;
-        }
-
-        Ok((uri, clients))
     }
 
     /// Returns diagnostic-enabled servers for a file path without opening
@@ -859,55 +724,6 @@ impl LspClientManager {
         }
 
         clients
-    }
-
-    /// Closes a document on a specific client.
-    ///
-    /// Removes the URI from the client's per-client open tracking and sends
-    /// `didClose`. Also decrements `DocumentManager` ref count for backward
-    /// compatibility (removed in 1c-05).
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Lock ordering: doc_manager then client — both needed for close"
-    )]
-    pub async fn close_document(&self, uri: &str, client: &Arc<Mutex<LspClient>>) {
-        let mut client = client.lock().await;
-        if client.track_document_closed(uri) {
-            let _ = client.did_close(uri).await;
-        }
-        drop(client);
-
-        // Backward compat: decrement DocumentManager ref count (removed in 1c-05).
-        let mut dm = self.doc_manager.lock().await;
-        dm.close(uri);
-    }
-
-    /// Closes a document on multiple clients.
-    pub async fn close_document_all(&self, uri: &str, clients: &[Arc<Mutex<LspClient>>]) {
-        for client in clients {
-            self.close_document(uri, client).await;
-        }
-    }
-
-    /// Ensures a document is open and synced with its LSP server.
-    ///
-    /// Thin wrapper around [`get_client`](Self::get_client) +
-    /// [`open_document_on`](Self::open_document_on) for callers that
-    /// haven't migrated to the new document lifecycle yet. Removed in
-    /// 1c-05 cleanup.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if language detection fails, the server is dead,
-    /// or the document cannot be opened.
-    pub async fn ensure_document_open(
-        &self,
-        path: &Path,
-        parent_id: Option<i64>,
-    ) -> Result<(String, Arc<Mutex<LspClient>>)> {
-        let client = self.get_client(path).await?;
-        let uri = self.open_document_on(path, &client, parent_id).await?;
-        Ok((uri, client))
     }
 
     /// Spawns LSP servers for new languages detected in the given file paths.
@@ -1626,7 +1442,7 @@ mod tests {
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
 
-        // get_client spawns + initializes; mockls sends workspace/configuration
+        // ensure_first_server spawns + initializes; mockls sends workspace/configuration
         // during init. If Catenary responds correctly, initialization succeeds.
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
         assert!(client.lock().await.is_alive());
@@ -1728,190 +1544,6 @@ mod tests {
             manager.clients().await.is_empty(),
             "unconfigured languages should not trigger a spawn"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_client_resolves_language_from_path() -> Result<()> {
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        // A file with the mock language extension should resolve to the mock server
-        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
-        let client = manager.get_client(&path).await?;
-        assert!(client.lock().await.is_alive());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_client_unknown_language_errors() {
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        // A file with an unknown extension and no config key should error
-        let result = manager.get_client(Path::new("/tmp/test.xyz")).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_ensure_document_open_sends_did_open() -> Result<()> {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fs = test_fs_with_roots(&[]);
-        fs.set_roots(vec![dir.path().to_path_buf()]);
-
-        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
-
-        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
-        std::fs::write(&path, "content").expect("write");
-
-        let (uri, client_mutex) = manager.ensure_document_open(&path, None).await?;
-        assert!(uri.starts_with("file://"));
-        assert!(client_mutex.lock().await.is_alive());
-        Ok(())
-    }
-
-    // --- Scope-aware get_client tests ---
-
-    #[tokio::test]
-    async fn test_get_client_workspace_scope() -> Result<()> {
-        // File in root resolves to Scope::Workspace client when server
-        // supports workspace folders.
-        let manager = LspClientManager::new(
-            mockls_workspace_folders_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
-        let client = manager.get_client(&path).await?;
-        let key = client
-            .lock()
-            .await
-            .server()
-            .key()
-            .expect("key should be set");
-        assert_eq!(key.scope, Scope::Workspace);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_client_root_scope() -> Result<()> {
-        // File in root resolves to Scope::Root(root) client when server
-        // is legacy (no workspace folder support).
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
-        let client = manager.get_client(&path).await?;
-        let key = client
-            .lock()
-            .await
-            .server()
-            .key()
-            .expect("key should be set");
-        assert_eq!(key.scope, Scope::Root(PathBuf::from("/tmp")));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_client_multi_root_legacy() -> Result<()> {
-        // File in root A resolves to Scope::Root(A) instance,
-        // file in root B resolves to Scope::Root(B) instance.
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp", "/var"]),
-        );
-
-        let path_a = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
-        let client_a = manager.get_client(&path_a).await?;
-        let key_a = client_a
-            .lock()
-            .await
-            .server()
-            .key()
-            .expect("key should be set");
-        assert_eq!(key_a.scope, Scope::Root(PathBuf::from("/tmp")));
-
-        let path_b = PathBuf::from(format!("/var/test.{MOCK_LANG_A}"));
-        let client_b = manager.get_client(&path_b).await?;
-        let key_b = client_b
-            .lock()
-            .await
-            .server()
-            .key()
-            .expect("key should be set");
-        assert_eq!(key_b.scope, Scope::Root(PathBuf::from("/var")));
-
-        // Different Arc instances for different roots.
-        assert!(!Arc::ptr_eq(&client_a, &client_b));
-        assert_eq!(manager.clients().await.len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_client_unrooted_errors() {
-        // File outside all roots returns error.
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        let err_msg = manager
-            .get_client(Path::new(&format!("/other/test.{MOCK_LANG_A}")))
-            .await
-            .err()
-            .expect("should error for unrooted file")
-            .to_string();
-        assert!(
-            err_msg.contains("outside all workspace roots"),
-            "Error should mention workspace roots, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_client_spawns_on_miss() -> Result<()> {
-        // First call for a language in a root spawns via ensure_server.
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        assert!(manager.clients().await.is_empty());
-
-        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
-        let client = manager.get_client(&path).await?;
-        assert!(client.lock().await.is_alive());
-        assert_eq!(manager.clients().await.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_client_extension_fallback() -> Result<()> {
-        // Custom language detected via extension-as-config-key still works.
-        // The mock language extension IS the config key (MOCK_LANG_A).
-        let manager = LspClientManager::new(
-            mockls_config(),
-            test_logging(),
-            test_fs_with_roots(&["/tmp"]),
-        );
-
-        // FilesystemManager won't know this extension, but the extension
-        // fallback in get_client maps it to the config key.
-        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
-        let client = manager.get_client(&path).await?;
-        assert!(client.lock().await.is_alive());
         Ok(())
     }
 
@@ -3278,7 +2910,7 @@ mod tests {
         let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
         std::fs::write(&path, "content").expect("write");
 
-        let client = manager.get_client(&path).await?;
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
         let uri = manager.open_document_on(&path, &client, None).await?;
         assert!(uri.starts_with("file://"));
         assert!(
@@ -3299,7 +2931,7 @@ mod tests {
         let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
         std::fs::write(&path, "content").expect("write");
 
-        let client = manager.get_client(&path).await?;
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
         let uri1 = manager.open_document_on(&path, &client, None).await?;
         let uri2 = manager.open_document_on(&path, &client, None).await?;
         assert_eq!(uri1, uri2);
@@ -3310,162 +2942,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_document_for_diagnostics_multi_server() -> Result<()> {
-        // Two servers with diagnostics enabled: both receive didOpen.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fs = test_fs_with_roots(&[]);
-        fs.set_roots(vec![dir.path().to_path_buf()]);
-        let manager = LspClientManager::new(mockls_multi_server_config(), test_logging(), fs);
-
-        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
-        std::fs::write(&path, "content").expect("write");
-
-        // Spawn both servers.
-        manager
-            .ensure_clients_for_paths(std::slice::from_ref(&path))
-            .await;
-
-        let (uri, clients) = manager.open_document_for_diagnostics(&path, None).await?;
-        assert!(uri.starts_with("file://"));
-        assert_eq!(
-            clients.len(),
-            2,
-            "Both diagnostic-enabled servers should receive the open"
-        );
-        for c in &clients {
-            assert!(c.lock().await.is_document_open(&uri));
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_open_document_for_diagnostics_suppressed() -> Result<()> {
-        // Server with diagnostics = false in binding is skipped.
-        let bin = mockls_bin();
-        let server_diag = format!("mockls-{MOCK_LANG_A}-diag");
-        let server_nodiag = format!("mockls-{MOCK_LANG_A}-nodiag");
-        let mut server = HashMap::new();
-        for name in [&server_diag, &server_nodiag] {
-            server.insert(
-                name.clone(),
-                ServerDef {
-                    command: bin.to_string_lossy().to_string(),
-                    args: vec![MOCK_LANG_A.to_string()],
-                    initialization_options: None,
-                    settings: None,
-                    min_severity: None,
-                    file_patterns: Vec::new(),
-                    compiled_patterns: Vec::new(),
-                },
-            );
-        }
-        let mut language = HashMap::new();
-        language.insert(
-            MOCK_LANG_A.to_string(),
-            LanguageConfig {
-                servers: vec![
-                    ServerBinding::new(server_diag),
-                    ServerBinding {
-                        name: server_nodiag,
-                        diagnostics: false,
-                    },
-                ],
-                ..LanguageConfig::default()
-            },
-        );
-        let config = Config {
-            language,
-            server,
-            log_retention_days: 7,
-            notifications: None,
-            icons: None,
-            tui: None,
-            tools: None,
-            resolved_commands: None,
-        };
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fs = test_fs_with_roots(&[]);
-        fs.set_roots(vec![dir.path().to_path_buf()]);
-        let manager = LspClientManager::new(config, test_logging(), fs);
-
-        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
-        std::fs::write(&path, "content").expect("write");
-
-        manager
-            .ensure_clients_for_paths(std::slice::from_ref(&path))
-            .await;
-
-        let (_uri, clients) = manager.open_document_for_diagnostics(&path, None).await?;
-        assert_eq!(
-            clients.len(),
-            1,
-            "Only the diagnostic-enabled server should receive the open"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_open_document_for_diagnostics_language_level() -> Result<()> {
-        // Language with diagnostics = false: all servers skipped.
-        let bin = mockls_bin();
-        let server_name = format!("mockls-{MOCK_LANG_A}-lang-diag");
-        let mut server = HashMap::new();
-        server.insert(
-            server_name.clone(),
-            ServerDef {
-                command: bin.to_string_lossy().to_string(),
-                args: vec![MOCK_LANG_A.to_string()],
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
-            },
-        );
-        let mut language = HashMap::new();
-        language.insert(
-            MOCK_LANG_A.to_string(),
-            LanguageConfig {
-                servers: vec![ServerBinding::new(server_name)],
-                diagnostics: false,
-                ..LanguageConfig::default()
-            },
-        );
-        let config = Config {
-            language,
-            server,
-            log_retention_days: 7,
-            notifications: None,
-            icons: None,
-            tui: None,
-            tools: None,
-            resolved_commands: None,
-        };
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fs = test_fs_with_roots(&[]);
-        fs.set_roots(vec![dir.path().to_path_buf()]);
-        let manager = LspClientManager::new(config, test_logging(), fs);
-
-        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
-        std::fs::write(&path, "content").expect("write");
-
-        manager
-            .ensure_clients_for_paths(std::slice::from_ref(&path))
-            .await;
-
-        let (_uri, clients) = manager.open_document_for_diagnostics(&path, None).await?;
-        assert!(
-            clients.is_empty(),
-            "Language-level diagnostics=false should skip all servers"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_close_document_all() -> Result<()> {
-        // Closes document on all clients, didClose sent to each.
+    async fn test_close_tracked_document() -> Result<()> {
+        // close_tracked_document removes per-client tracking and sends didClose.
         let dir = tempfile::tempdir().expect("tempdir");
         let fs = test_fs_with_roots(&[]);
         fs.set_roots(vec![dir.path().to_path_buf()]);
@@ -3478,43 +2956,34 @@ mod tests {
             .ensure_clients_for_paths(std::slice::from_ref(&path))
             .await;
 
-        let (uri, clients) = manager.open_document_for_diagnostics(&path, None).await?;
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols)
+            .await;
+        assert_eq!(servers.len(), 2);
 
-        // Verify all clients have the document open
-        for c in &clients {
+        // Open document on both servers.
+        let mut uri = String::new();
+        for c in &servers {
+            uri = manager.open_document_on(&path, c, None).await?;
+        }
+
+        // Verify all clients have the document open.
+        for c in &servers {
             assert!(c.lock().await.is_document_open(&uri));
         }
 
-        // Close on all
-        manager.close_document_all(&uri, &clients).await;
+        // Close on each while holding the lock.
+        for c in &servers {
+            c.lock().await.close_tracked_document(&uri).await;
+        }
 
-        // Verify all clients no longer track the document
-        for c in &clients {
+        // Verify all clients no longer track the document.
+        for c in &servers {
             assert!(
                 !c.lock().await.is_document_open(&uri),
                 "Document should be closed on all clients"
             );
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_ensure_document_open_backward_compat() -> Result<()> {
-        // ensure_document_open still works as before (delegates to
-        // get_client + open_document_on).
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fs = test_fs_with_roots(&[]);
-        fs.set_roots(vec![dir.path().to_path_buf()]);
-        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
-
-        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
-        std::fs::write(&path, "content").expect("write");
-
-        let (uri, client) = manager.ensure_document_open(&path, None).await?;
-        assert!(uri.starts_with("file://"));
-        assert!(client.lock().await.is_alive());
-        // Per-client tracking should be in place.
-        assert!(client.lock().await.is_document_open(&uri));
         Ok(())
     }
 }

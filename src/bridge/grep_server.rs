@@ -423,8 +423,8 @@ impl GrepServer {
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
             let response = client.prepare_rename(&uri, line_0, col).await;
+            client.close_tracked_document(&uri).await;
             drop(client);
-            self.client_manager.close_document(&uri, client_mutex).await;
 
             match response {
                 Ok(v) if v.is_null() => return false, // null → keyword
@@ -512,12 +512,11 @@ impl GrepServer {
                 continue;
             };
 
-            let result = {
-                let mut client = client_mutex.lock().await;
-                client.set_parent_id(parent_id);
-                client.references(&uri, line_0, col, true).await
-            };
-            self.client_manager.close_document(&uri, client_mutex).await;
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            let result = client.references(&uri, line_0, col, true).await;
+            client.close_tracked_document(&uri).await;
+            drop(client);
 
             match result {
                 Ok(Value::Array(refs)) => {
@@ -597,8 +596,8 @@ impl GrepServer {
                     None
                 }
             };
+            client.close_tracked_document(&uri).await;
             drop(client);
-            self.client_manager.close_document(&uri, client_mutex).await;
 
             if let Some(calls) = result {
                 return calls;
@@ -630,12 +629,11 @@ impl GrepServer {
                 continue;
             };
 
-            let result = {
-                let mut client = client_mutex.lock().await;
-                client.set_parent_id(parent_id);
-                client.implementation(&uri, line_0, col).await
-            };
-            self.client_manager.close_document(&uri, client_mutex).await;
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            let result = client.implementation(&uri, line_0, col).await;
+            client.close_tracked_document(&uri).await;
+            drop(client);
 
             match result {
                 Ok(Value::Array(locs)) => {
@@ -712,8 +710,8 @@ impl GrepServer {
                     None
                 }
             };
+            client.close_tracked_document(&uri).await;
             drop(client);
-            self.client_manager.close_document(&uri, client_mutex).await;
 
             if let Some(types) = result {
                 return types;

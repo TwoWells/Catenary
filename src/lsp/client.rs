@@ -795,6 +795,17 @@ impl LspClient {
         self.open_documents.remove(uri)
     }
 
+    /// Closes a document while the caller holds the lock.
+    ///
+    /// Removes the URI from per-client tracking and sends `didClose`.
+    /// Eliminates the lock gap that would exist if the caller dropped
+    /// the guard and called a separate close method.
+    pub async fn close_tracked_document(&mut self, uri: &str) {
+        if self.open_documents.remove(uri) {
+            let _ = self.did_close(uri).await;
+        }
+    }
+
     /// Returns whether the server supports dynamic workspace folder changes.
     #[must_use]
     pub const fn supports_workspace_folders(&self) -> bool {
