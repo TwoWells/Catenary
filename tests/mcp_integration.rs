@@ -2811,14 +2811,15 @@ fn test_enrich_from_ts_true() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    install_mock_grammar(root)?;
-
     // .mock file with a function definition
     let file = dir.path().join("ts_true.mock");
     std::fs::write(&file, "fn my_symbol\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+
+    // Install mock grammar into the bridge's isolated data dir
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
