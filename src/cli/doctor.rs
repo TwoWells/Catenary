@@ -22,8 +22,11 @@ const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../../plugins/catenary/hooks/h
 /// Expected Gemini CLI hooks, embedded at compile time.
 const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
 
-/// Expected constrained-bash hook script, embedded at compile time.
-const CONSTRAINED_BASH_EXPECTED: &str = include_str!("../../scripts/constrained_bash.py");
+/// Migration guidance for users who still have the legacy Python script configured.
+const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `catenary hook pre-tool`. \
+     Remove the constrained_bash.py hook from your settings and use \
+     `[commands]` in your Catenary config instead. \
+     Run `catenary config` to generate a recommended template.";
 
 /// Run the doctor command: check language server health.
 ///
@@ -284,11 +287,12 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     check_gemini_hooks(&colors, show_diff);
     check_path_binary(&colors);
 
-    // Scripts health section
+    // Legacy script migration warnings
     println!();
-    println!("{}:", colors.bold("Scripts"));
-    check_constrained_bash_claude(&colors, show_diff);
-    check_constrained_bash_gemini(&colors, show_diff);
+    println!("{}:", colors.bold("Command filter"));
+    check_constrained_bash_claude(&colors);
+    check_constrained_bash_gemini(&colors);
+    check_command_filter_config(&colors, &config);
 
     // Grammars health section
     println!();
@@ -740,119 +744,70 @@ fn check_path_binary(colors: &ColorConfig) {
     }
 }
 
-/// Check the constrained-bash script referenced in `~/.claude/settings.json`.
-fn check_constrained_bash_claude(colors: &ColorConfig, show_diff: bool) {
-    let label = format!("{:<14}", "Claude Code");
+/// Check whether `~/.claude/settings.json` still references the legacy Python script.
+///
+/// If found, warns the user to remove it and migrate to `[commands]` config.
+fn check_constrained_bash_claude(colors: &ColorConfig) {
+    check_legacy_script(colors, "Claude Code", ".claude/settings.json");
+}
+
+/// Check whether `~/.gemini/settings.json` still references the legacy Python script.
+///
+/// If found, warns the user to remove it and migrate to `[commands]` config.
+fn check_constrained_bash_gemini(colors: &ColorConfig) {
+    check_legacy_script(colors, "Gemini CLI", ".gemini/settings.json");
+}
+
+/// Check a host CLI settings file for references to the legacy `constrained_bash.py`.
+fn check_legacy_script(colors: &ColorConfig, client: &str, settings_rel: &str) {
+    let label = format!("{client:<14}");
 
     let Ok(home_str) = std::env::var("HOME") else {
-        println!(
-            "  {label}{}",
-            colors.dim("- cannot determine home directory")
-        );
         return;
     };
     let home = PathBuf::from(home_str);
 
-    let settings_path = home.join(".claude/settings.json");
+    let settings_path = home.join(settings_rel);
     let Ok(settings_json) = std::fs::read_to_string(&settings_path) else {
-        println!("  {label}{}", colors.dim("- not configured"));
         return;
     };
 
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings_json) else {
-        println!("  {label}{}", colors.yellow("? cannot parse settings.json"));
         return;
     };
 
-    let Some(script_token) = find_script_path_in_json(&settings, "constrained_bash.py") else {
-        println!("  {label}{}", colors.dim("- not configured"));
-        return;
-    };
-
-    let script_path = expand_home(&script_token, &home);
-
-    match std::fs::read_to_string(&script_path) {
-        Ok(installed) => {
-            if installed == CONSTRAINED_BASH_EXPECTED {
-                println!("  {label}{}", colors.green("✓ up to date"));
-            } else if show_diff {
-                println!("  {label}{}", colors.red("✗ out of date"));
-                show_unified_diff(
-                    &installed,
-                    CONSTRAINED_BASH_EXPECTED,
-                    "installed",
-                    "expected",
-                );
-            } else {
-                println!(
-                    "  {label}{}",
-                    colors.red("✗ out of date (run catenary doctor --diff to see changes)"),
-                );
-            }
-        }
-        Err(_) => {
-            println!(
-                "  {label}{}",
-                colors.red(&format!("✗ not found at {}", script_path.display())),
-            );
-        }
+    if find_script_path_in_json(&settings, "constrained_bash.py").is_some() {
+        println!(
+            "  {label}{}",
+            colors.yellow("⚠  legacy constrained_bash.py detected"),
+        );
+        println!(
+            "  {label}{}",
+            colors.dim(&format!("  {CONSTRAINED_BASH_MIGRATION}")),
+        );
     }
 }
 
-/// Check the constrained-bash script referenced in `~/.gemini/settings.json`.
-fn check_constrained_bash_gemini(colors: &ColorConfig, show_diff: bool) {
-    let label = format!("{:<14}", "Gemini CLI");
-
-    let Ok(home_str) = std::env::var("HOME") else {
-        println!(
-            "  {label}{}",
-            colors.dim("- cannot determine home directory")
-        );
-        return;
-    };
-    let home = PathBuf::from(home_str);
-
-    let settings_path = home.join(".gemini/settings.json");
-    let Ok(settings_json) = std::fs::read_to_string(&settings_path) else {
-        println!("  {label}{}", colors.dim("- not configured"));
-        return;
-    };
-
-    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings_json) else {
-        println!("  {label}{}", colors.yellow("? cannot parse settings.json"));
-        return;
-    };
-
-    let Some(script_token) = find_script_path_in_json(&settings, "constrained_bash.py") else {
-        println!("  {label}{}", colors.dim("- not configured"));
-        return;
-    };
-
-    let script_path = expand_home(&script_token, &home);
-
-    match std::fs::read_to_string(&script_path) {
-        Ok(installed) => {
-            if installed == CONSTRAINED_BASH_EXPECTED {
-                println!("  {label}{}", colors.green("✓ up to date"));
-            } else if show_diff {
-                println!("  {label}{}", colors.red("✗ out of date"));
-                show_unified_diff(
-                    &installed,
-                    CONSTRAINED_BASH_EXPECTED,
-                    "installed",
-                    "expected",
-                );
-            } else {
-                println!(
-                    "  {label}{}",
-                    colors.red("✗ out of date (run catenary doctor --diff to see changes)"),
-                );
-            }
-        }
-        Err(_) => {
+/// Report the status of the built-in command filter configuration.
+fn check_command_filter_config(colors: &ColorConfig, config: &crate::config::Config) {
+    match &config.resolved_commands {
+        Some(resolved) => {
+            let total = resolved.deny.len() + resolved.deny_when_first.len();
             println!(
-                "  {label}{}",
-                colors.red(&format!("✗ not found at {}", script_path.display())),
+                "  {}",
+                colors.green(&format!(
+                    "✓ {total} command{} configured",
+                    if total == 1 { "" } else { "s" },
+                )),
+            );
+        }
+        None => {
+            println!(
+                "  {}",
+                colors.dim(
+                    "no [commands] section — all shell commands allowed. \
+                     Run `catenary config` to generate a recommended template.",
+                ),
             );
         }
     }
@@ -909,23 +864,6 @@ fn find_script_path_in_json(json: &serde_json::Value, needle: &str) -> Option<St
         }
         _ => None,
     }
-}
-
-/// Expand `$HOME/` and `~/` prefixes in a path string.
-fn expand_home(path_str: &str, home: &Path) -> PathBuf {
-    path_str
-        .strip_prefix("$HOME/")
-        .or_else(|| path_str.strip_prefix("~/"))
-        .map_or_else(
-            || {
-                if path_str == "$HOME" || path_str == "~" {
-                    home.to_path_buf()
-                } else {
-                    PathBuf::from(path_str)
-                }
-            },
-            |rest| home.join(rest),
-        )
 }
 
 /// Check grammar toolchain and installed grammars.

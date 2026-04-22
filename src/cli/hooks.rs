@@ -488,10 +488,12 @@ pub fn run_pre_agent(format: HostFormat) {
     }
 }
 
-/// Editing state enforcement (`PreToolUse` / `BeforeTool` hook handler).
+/// Editing state enforcement and command filtering (`PreToolUse` / `BeforeTool`
+/// hook handler).
 ///
-/// Sends a `pre-tool/enforce-editing` IPC request and formats any deny
-/// response for the host CLI.
+/// Checks shell commands against the configured denylist before forwarding
+/// to the session for editing state enforcement. Denied commands are rejected
+/// immediately without contacting the session.
 ///
 /// Silently succeeds on any error to avoid breaking the host CLI's flow.
 pub fn run_pre_tool(format: HostFormat) {
@@ -503,6 +505,20 @@ pub fn run_pre_tool(format: HostFormat) {
         return;
     };
 
+    let tool_name = hook_json
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // ── Command filter (runs before acquire lock checks) ──────────
+    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
+        && let Some(reason) = check_shell_command(&shell_cmd, format)
+    {
+        print!("{}", format_deny(&reason, format));
+        return;
+    }
+
+    // ── Editing state enforcement (IPC to session) ────────────────
     let Ok(conn) = db::open_and_migrate() else {
         return;
     };
@@ -515,10 +531,6 @@ pub fn run_pre_tool(format: HostFormat) {
         return;
     };
 
-    let tool_name = hook_json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
     let file_path = extract_file_path(&hook_json);
     let agent_id = extract_agent_id(&hook_json);
     let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
@@ -543,6 +555,49 @@ pub fn run_pre_tool(format: HostFormat) {
     {
         print!("{}", format_deny(reason, format));
     }
+}
+
+/// Extract the shell command string from hook JSON for Bash-like tools.
+///
+/// Returns `Some(command)` for Claude Code's `Bash` tool and Gemini CLI's
+/// `run_shell_command` tool. Returns `None` for all other tools.
+fn extract_shell_command(
+    hook_json: &serde_json::Value,
+    tool_name: &str,
+    format: HostFormat,
+) -> Option<String> {
+    let is_shell_tool = match format {
+        HostFormat::Claude => tool_name == "Bash",
+        HostFormat::Gemini => tool_name == "run_shell_command",
+    };
+    if !is_shell_tool {
+        return None;
+    }
+    let tool_input = hook_json
+        .get("tool_input")
+        .or_else(|| hook_json.get("args"));
+    tool_input
+        .and_then(|ti| ti.get("command"))
+        .and_then(|c| c.as_str())
+        .map(String::from)
+}
+
+/// Check a shell command against the configured denylist.
+///
+/// Loads the merged config, resolves template variables for the current
+/// client, and returns the guidance message if the command is denied.
+fn check_shell_command(cmd: &str, format: HostFormat) -> Option<String> {
+    let config = crate::config::Config::load().ok()?;
+    let resolved = config.resolved_commands?;
+    if resolved.deny.is_empty() && resolved.deny_when_first.is_empty() {
+        return None;
+    }
+    let client = match format {
+        HostFormat::Claude => "claude",
+        HostFormat::Gemini => "gemini",
+    };
+    crate::cli::command_filter::check_command(cmd, &resolved)
+        .map(|msg| crate::cli::command_filter::resolve_templates(&msg, client))
 }
 
 // ── Formatting helpers ──────────────────────────────────────────────────
@@ -728,5 +783,84 @@ mod tests {
             Some("─── background ───\n[err] pylsp crashed"),
         );
         Ok(())
+    }
+
+    // ── extract_shell_command tests ─────────────────────────────────
+
+    #[test]
+    fn extract_shell_command_claude_bash() {
+        let json = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "ls -la" }
+        });
+        assert_eq!(
+            extract_shell_command(&json, "Bash", HostFormat::Claude),
+            Some("ls -la".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_shell_command_gemini_run_shell() {
+        let json = serde_json::json!({
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": "make test" }
+        });
+        assert_eq!(
+            extract_shell_command(&json, "run_shell_command", HostFormat::Gemini),
+            Some("make test".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_shell_command_non_bash_returns_none() {
+        let json = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "src/main.rs" }
+        });
+        assert!(extract_shell_command(&json, "Edit", HostFormat::Claude).is_none());
+    }
+
+    #[test]
+    fn extract_shell_command_wrong_format_returns_none() {
+        // Bash tool name with Gemini format → not a shell tool
+        let json = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "ls" }
+        });
+        assert!(extract_shell_command(&json, "Bash", HostFormat::Gemini).is_none());
+    }
+
+    #[test]
+    fn extract_shell_command_gemini_args_fallback() {
+        let json = serde_json::json!({
+            "tool_name": "run_shell_command",
+            "args": { "command": "git status" }
+        });
+        assert_eq!(
+            extract_shell_command(&json, "run_shell_command", HostFormat::Gemini),
+            Some("git status".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_shell_command_missing_command_field() {
+        let json = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {}
+        });
+        assert!(extract_shell_command(&json, "Bash", HostFormat::Claude).is_none());
+    }
+
+    // ── check_shell_command tests ──���────────────────────────────────
+    //
+    // These test the integration function. Config loading in tests will
+    // produce an empty resolved_commands (no config files), so these
+    // verify the no-op path. The full deny/allow logic is tested in
+    // command_filter::tests and config::tests.
+
+    #[test]
+    fn check_shell_command_no_config_allows_all() {
+        // With no config files, resolved_commands is None → no denial.
+        assert!(check_shell_command("cat file.txt", HostFormat::Claude).is_none());
     }
 }
