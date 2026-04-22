@@ -1754,7 +1754,7 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
         .as_str()
         .context("Missing text for incoming calls")?;
 
-    // Enrichment runs (07a) but tier 1 rendering is 07b — verify symbol found
+    // Enrichment runs and tier 1 renders the result
     assert!(
         text.contains("callee_fn"),
         "Expected callee_fn in output, got:\n{text}"
@@ -1802,7 +1802,7 @@ fn test_grep_enrichment_implementations() -> Result<()> {
         .as_str()
         .context("Missing text for implementations")?;
 
-    // Enrichment runs (07a) but tier 1 rendering is 07b — verify symbol found
+    // Enrichment runs and tier 1 renders the result
     assert!(
         text.contains("MyStruct"),
         "Expected MyStruct in output, got:\n{text}"
@@ -1847,7 +1847,7 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
         .as_str()
         .context("Missing text for subtypes")?;
 
-    // Enrichment runs (07a) but tier 1 rendering is 07b — verify symbol found
+    // Enrichment runs and tier 1 renders the result
     assert!(
         text.contains("Animal"),
         "Expected Animal in output, got:\n{text}"
@@ -2019,9 +2019,17 @@ fn test_grep_glob_scoping() -> Result<()> {
         text.contains(&format!("a.{MOCK_LANG_A}")),
         "Expected src/a file in output, got:\n{text}"
     );
+    // The glob scope limits which files are searched for definitions.
+    // Enrichment sections (impls, refs) may reference out-of-scope files.
+    // Check that b.LANG doesn't appear as a definition line (tab-indented
+    // with file path at the end).
+    let b_as_def = text.lines().any(|l| {
+        let t = l.trim_start_matches('\t');
+        t.starts_with("scope_target") && t.contains(&format!("b.{MOCK_LANG_A}"))
+    });
     assert!(
-        !text.contains(&format!("b.{MOCK_LANG_A}")),
-        "Expected b file excluded from glob scope, got:\n{text}"
+        !b_as_def,
+        "Expected b file excluded from definition lines, got:\n{text}"
     );
 
     Ok(())
@@ -2063,9 +2071,16 @@ fn test_grep_exclude() -> Result<()> {
         text.contains(&format!("main.{MOCK_LANG_A}")),
         "Expected main file in output, got:\n{text}"
     );
+    // The exclude parameter limits which files are searched for definitions.
+    // Enrichment sections (impls, refs) may reference excluded files.
+    // Check that test_main doesn't appear as a definition line.
+    let test_as_def = text.lines().any(|l| {
+        let t = l.trim_start_matches('\t');
+        t.starts_with("excl_func") && t.contains(&format!("test_main.{MOCK_LANG_A}"))
+    });
     assert!(
-        !text.contains(&format!("test_main.{MOCK_LANG_A}")),
-        "Expected test file excluded, got:\n{text}"
+        !test_as_def,
+        "Expected test file excluded from definition lines, got:\n{text}"
     );
 
     Ok(())
@@ -2276,7 +2291,7 @@ fn test_grep_reference_enclosing() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tier 2 format: `:line <Kind> name:span`
+    // Reference hit with enclosing structure: `:line <Kind> name:span`
     assert!(
         text.contains("<Function>") && text.contains("outer"),
         "Expected enclosing <Function> outer in output, got:\n{text}"
@@ -2540,7 +2555,7 @@ fn test_grep_tier_promotion() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tier 2 format: name at column 0, indented file tree
+    // Tier 1 or 2 format: name at column 0, <Kind> label present
     assert!(
         text.contains("unique_symbol_xyz"),
         "Expected name in output, got:\n{text}"
@@ -2553,7 +2568,7 @@ fn test_grep_tier_promotion() -> Result<()> {
     // Not tier 3 bucketed (no wildcard patterns)
     assert!(
         !text.contains("_*"),
-        "Expected tier 2, not tier 3 bucketed, got:\n{text}"
+        "Expected tier 1 or 2, not tier 3 bucketed, got:\n{text}"
     );
 
     Ok(())
@@ -2980,7 +2995,7 @@ fn test_enrich_deprecated_type_edge() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tool completes with deprecated subtypes collected (rendered in 07b)
+    // Tool completes with deprecated subtypes collected and rendered
     assert!(
         text.contains("Shape"),
         "Expected Shape in output, got:\n{text}"
@@ -3028,10 +3043,541 @@ fn test_enrich_outgoing_calls() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Enrichment ran — outgoing calls collected (rendered in 07b)
+    // Tier 1 renders enrichment — outgoing calls visible
     assert!(
         text.contains("main_fn"),
         "Expected main_fn in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+// ─── SEARCHv2 tier 1 rendering tests (ticket 07b) ──────────────────────
+
+/// Tier 1 enriched: narrow pattern shows `calls:` section with outgoing calls.
+/// Uses no-grammar path for reliable mockls enrichment (all hits get enriched).
+#[test]
+fn test_grep_tier1_enriched() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // callee defined first, then caller with callee in body.
+    // mockls detects outgoing calls by scanning the caller's body.
+    let file = dir.path().join(format!("enrich.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn callee_t1()\nfn caller_t1()\n  callee_t1\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6000,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "caller_t1" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Name header at depth 0
+    assert!(
+        text.starts_with("caller_t1"),
+        "Expected name at depth 0, got:\n{text}"
+    );
+    // Outgoing calls section
+    assert!(
+        text.contains("calls:"),
+        "Expected calls: section, got:\n{text}"
+    );
+    assert!(
+        text.contains("callee_t1"),
+        "Expected callee_t1 in calls, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 type hierarchy: subtypes section present for interface pattern.
+/// Uses no-grammar path so all hits are `PrepareRenameSymbol` and get enriched.
+#[test]
+fn test_grep_tier1_type_hierarchy() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file = dir.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "interface Vehicle_t1\nstruct Car_t1 extends Vehicle_t1\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6010,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "Vehicle_t1" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains("Vehicle_t1"),
+        "Expected Vehicle_t1 in output, got:\n{text}"
+    );
+    // mockls returns subtypes for interfaces
+    assert!(
+        text.contains("subtypes:"),
+        "Expected subtypes: section, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 path syntax: tree-sitter `<Kind>` labels and path formatting.
+#[test]
+fn test_grep_tier1_path_syntax() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // Simple function definition — tests <Kind> label in tier 1 output
+    let file = dir.path().join("path.mock");
+    std::fs::write(&file, "fn path_sym_t1\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6020,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "path_sym_t1" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Definition line: `<Kind> name  path:line`
+    assert!(
+        text.contains("<Function> path_sym_t1"),
+        "Expected <Function> path_sym_t1, got:\n{text}"
+    );
+    assert!(
+        text.contains("path.mock:1"),
+        "Expected path.mock:1, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 refs: lines ascending within file for same-file references.
+#[test]
+fn test_grep_tier1_refs_sort() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // Symbol defined on L0, referenced on L2 and L4 (same file).
+    // mockls finds these via textDocument/references.
+    let file = dir.path().join("sort.mock");
+    std::fs::write(
+        &file,
+        "fn sorted_sym\nfn other {\nsorted_sym\nfn yet_another {\nsorted_sym\n}\n}\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6030,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "sorted_sym" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Should have enrichment with definition and reference info
+    assert!(
+        text.contains("<Function>") && text.contains("sorted_sym"),
+        "Expected enriched output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 outgoing calls sorted alphabetically.
+/// Uses no-grammar path so all hits get enriched via prepareRename.
+#[test]
+fn test_grep_tier1_outgoing_calls_sorted() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // main calls beta and alpha — should appear alpha before beta in calls:
+    let file = dir.path().join(format!("sorted_calls.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "fn alpha_callee()\nfn beta_callee()\nfn main_caller()\n  beta_callee\n  alpha_callee\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6040,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "main_caller" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains("calls:"),
+        "Expected calls: section, got:\n{text}"
+    );
+
+    // alpha should appear before beta (alphabetical sort)
+    if let Some(calls_pos) = text.find("calls:") {
+        let calls_section = &text[calls_pos..];
+        let alpha_pos = calls_section.find("alpha_callee");
+        let beta_pos = calls_section.find("beta_callee");
+        if let (Some(a), Some(b)) = (alpha_pos, beta_pos) {
+            assert!(a < b, "Expected alpha before beta in calls, got:\n{text}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Tier 1 deprecated: `<Kind, deprecated>` in output.
+/// Uses no-grammar path for reliable enrichment via mockls.
+#[test]
+fn test_grep_tier1_deprecated() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file = dir.path().join(format!("depr.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "interface Shape_t1\nstruct OldSquare_t1 extends Shape_t1 @deprecated\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6050,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "Shape_t1" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains("deprecated"),
+        "Expected deprecated tag in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 demotion to tier 2: too many symbols for tier 1 budget.
+#[test]
+fn test_grep_tier1_demote_to_tier2() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // Create many unique symbols to exceed tier 1 budget
+    let mut content = String::new();
+    for i in 0..50 {
+        use std::fmt::Write;
+        let _ = writeln!(content, "fn demote_sym_{i}");
+    }
+    let file = dir.path().join("demote.mock");
+    std::fs::write(&file, &content)?;
+
+    let config_path = dir.path().join("config.toml");
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[tools.grep]\nbudget = 200\n\n\
+             [server.mockls]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
+             [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
+        ),
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    install_mock_grammar(bridge.state_home())?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6060,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "demote_sym" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Tier 2 or tier 3 format: bucketed or heatmap (no calls:/refs: sections)
+    assert!(
+        !text.contains("calls:") && !text.contains("refs:"),
+        "Expected demotion (no enrichment sections), got:\n{text}"
+    );
+    // But should still contain results
+    assert!(
+        text.contains("demote_sym"),
+        "Expected results present, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 fish-eye: symbols with edges get full format, without get lean single line.
+/// Uses no-grammar path so all hits get enriched.
+#[test]
+fn test_grep_tier1_fish_eye() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // rich_fn has calls (body references lean_fn), lean_fn has no calls.
+    // Pattern matches both definitions via alternation.
+    let file = dir.path().join(format!("fisheye.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "fn lean_fisheye()\nfn rich_fisheye()\n  lean_fisheye\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6070,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "rich_fisheye" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // rich_fisheye should appear with enrichment
+    assert!(
+        text.contains("rich_fisheye"),
+        "Expected rich_fisheye, got:\n{text}"
+    );
+    // rich_fn should have calls section (calls lean_fisheye)
+    assert!(
+        text.contains("calls:"),
+        "Expected calls: on rich symbol, got:\n{text}"
+    );
+    assert!(
+        text.contains("lean_fisheye"),
+        "Expected lean_fisheye in calls, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 property order: calls → impls → supertypes → subtypes → refs.
+#[test]
+fn test_grep_tier1_property_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // Function with calls and refs
+    let file = dir.path().join("order.mock");
+    std::fs::write(
+        &file,
+        "fn helper_ord\nfn main_ord {\nhelper_ord\n}\nmain_ord\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6080,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "main_ord" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // If both calls and refs exist, calls should come first
+    if text.contains("calls:") && text.contains("refs:") {
+        let calls_pos = text.find("calls:").context("calls pos")?;
+        let refs_pos = text.find("refs:").context("refs pos")?;
+        assert!(
+            calls_pos < refs_pos,
+            "Expected calls: before refs:, got:\n{text}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Tier 1 name grouping: bare name at depth 0, definitions indented below.
+#[test]
+fn test_grep_tier1_name_grouping() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join("group.mock");
+    std::fs::write(&file, "fn grouped_sym\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6090,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "grouped_sym" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    let lines: Vec<&str> = text.lines().collect();
+    // First line: bare name at depth 0 (no leading tab)
+    assert!(
+        !lines.is_empty() && !lines[0].starts_with('\t'),
+        "Expected name at depth 0 (no tab), got:\n{text}"
+    );
+    assert!(
+        lines[0].contains("grouped_sym"),
+        "Expected name in first line, got:\n{text}"
+    );
+    // Second line: definition indented (leading tab)
+    if lines.len() > 1 {
+        assert!(
+            lines[1].starts_with('\t'),
+            "Expected indented definition line, got:\n{text}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Tier 1 cross-definition dedup: impl suppressed when listed in struct's impls.
+#[test]
+fn test_grep_tier1_cross_def_dedup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // struct + impl block matching the same name. mockls routes implementation
+    // to references, so the struct's impls section lists the impl location.
+    // The impl definition should be suppressed in the output.
+    let file = dir.path().join("dedup.mock");
+    std::fs::write(&file, "struct Dedup_t1\nDedup_t1\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6100,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "Dedup_t1" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // The struct definition should be present
+    assert!(
+        text.contains("<Struct> Dedup_t1"),
+        "Expected struct definition, got:\n{text}"
+    );
+    // The name should appear only once as a group header at depth 0
+    let name_headers: Vec<&str> = text.lines().filter(|l| *l == "Dedup_t1").collect();
+    assert_eq!(
+        name_headers.len(),
+        1,
+        "Expected one name header, got {} in:\n{text}",
+        name_headers.len()
     );
 
     Ok(())

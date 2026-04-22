@@ -65,7 +65,6 @@ enum HitClass {
 }
 
 /// Enrichment data for a single symbol from LSP queries.
-#[allow(dead_code, reason = "07b renders enrichment; 07a only collects")]
 pub(super) struct SymbolEnrichment {
     /// Reference lines grouped by file path (0-based line numbers).
     pub ref_lines: HashMap<String, HashSet<u32>>,
@@ -82,7 +81,6 @@ pub(super) struct SymbolEnrichment {
 }
 
 /// A call hierarchy edge (caller or callee).
-#[allow(dead_code, reason = "07b renders enrichment; 07a only collects")]
 pub(super) struct CallEdge {
     pub name: String,
     pub kind: u32,
@@ -93,11 +91,11 @@ pub(super) struct CallEdge {
 }
 
 /// A type hierarchy edge (supertype or subtype).
-#[allow(dead_code, reason = "07b renders enrichment; 07a only collects")]
 pub(super) struct TypeEdge {
     pub name: String,
     pub kind: u32,
-    pub container: Option<String>,
+    /// Container name from LSP `detail` field. Collected for future use.
+    pub _container: Option<String>,
     pub file: String,
     pub line: u32,
     pub deprecated: bool,
@@ -370,18 +368,30 @@ impl GrepServer {
             let tier2 = render_tier2(&hits, &self.fs_manager);
             if tier2.len() <= self.budget {
                 // Tier 2 fits — run enrichment for each symbol hit.
-                // (07b adds tier 1 rendering; for now we still emit tier 2.)
+                let mut enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = Vec::new();
                 for hit in &hits {
                     let (line_0, col, from_ts) = match &hit.classification {
                         HitClass::Symbol { symbol } => (symbol.line, hit.col, true),
                         HitClass::PrepareRenameSymbol => (hit.line, hit.col, false),
-                        _ => continue,
+                        _ => {
+                            enrichments.push((hit, None));
+                            continue;
+                        }
                     };
-                    let _ = self
+                    let enrichment = self
                         .enrich_at_position(&hit.file, line_0, col, from_ts, parent_id)
                         .await;
+                    enrichments.push((hit, enrichment));
                 }
-                tier2
+
+                // Try tier 1. If it fits, use it; otherwise fall back to tier 2.
+                render_tier1(
+                    &enrichments,
+                    self.ts_index.as_ref(),
+                    self.budget,
+                    &self.fs_manager,
+                )
+                .unwrap_or(tier2)
             } else {
                 render_tier3(&hits, self.budget, &self.fs_manager)
             }
@@ -845,6 +855,364 @@ fn select_and_render_tier(
 
     // Tier 2 doesn't fit — fall back to tier 3 (bucketed)
     render_tier3(hits, budget, fs_manager)
+}
+
+// ─── Tier 1: Enriched rendering ─────────────────────────────────────────
+
+/// Tier 1: Enriched rendering with navigation edges.
+///
+/// Returns `Some(output)` if the rendered result fits within `budget`,
+/// `None` if it exceeds the budget (caller falls back to tier 2).
+#[allow(
+    clippy::too_many_lines,
+    reason = "Tier 1 renders six navigation sections per symbol"
+)]
+fn render_tier1(
+    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
+    ts_index: Option<&Arc<std::sync::Mutex<TsIndex>>>,
+    budget: usize,
+    fs_manager: &FilesystemManager,
+) -> Option<String> {
+    use std::fmt::Write;
+
+    // Step 1: Group by bare name at depth 0.
+    let mut by_name: BTreeMap<String, Vec<(&GrepHit, &Option<SymbolEnrichment>)>> = BTreeMap::new();
+    for (hit, enrichment) in enrichments {
+        let name = match &hit.classification {
+            HitClass::Symbol { symbol } => symbol.name.clone(),
+            _ => hit.matched_text.clone(),
+        };
+        by_name.entry(name).or_default().push((hit, enrichment));
+    }
+
+    // Step 2: Cross-definition dedup.
+    //
+    // Suppress definitions whose location appears in another definition's
+    // `impls:` section. This prevents `<Impl> Foo` from appearing as a
+    // standalone definition when the struct's `impls:` already lists it.
+    // A definition is only suppressed if its dominator is not itself
+    // suppressed (prevents mutual suppression cycles).
+    let suppressed: HashSet<(String, u32)> = {
+        // Map each impl location → its dominator (the definition that lists it).
+        let mut impl_locs: HashMap<(String, u32), (String, u32)> = HashMap::new();
+        for (hit, enrichment) in enrichments {
+            let Some(e) = enrichment else { continue };
+            let hit_file = hit.file.to_string_lossy().to_string();
+            let hit_line = match &hit.classification {
+                HitClass::Symbol { symbol } => symbol.line,
+                _ => hit.line,
+            };
+            for (f, l) in &e.implementations {
+                impl_locs
+                    .entry((f.clone(), *l))
+                    .or_insert_with(|| (hit_file.clone(), hit_line));
+            }
+        }
+
+        // Only suppress if the dominator is not itself dominated (no cycles).
+        impl_locs
+            .keys()
+            .filter(|loc| {
+                let Some(dom) = impl_locs.get(loc) else {
+                    return true;
+                };
+                // If the dominator is also dominated by someone, skip
+                // suppression to avoid mutual elimination.
+                !impl_locs.contains_key(dom)
+            })
+            .cloned()
+            .collect()
+    };
+
+    // Step 4: Render each name group.
+    let mut output = String::new();
+
+    for (name, group) in &by_name {
+        let visible: Vec<&(&GrepHit, &Option<SymbolEnrichment>)> = group
+            .iter()
+            .filter(|(hit, _)| {
+                let hit_file = hit.file.to_string_lossy().to_string();
+                let hit_line = match &hit.classification {
+                    HitClass::Symbol { symbol } => symbol.line,
+                    _ => hit.line,
+                };
+                !suppressed.contains(&(hit_file, hit_line))
+            })
+            .collect();
+
+        if visible.is_empty() {
+            continue;
+        }
+
+        // Check if this name group has any definition-like hits (Symbol or PrepareRenameSymbol).
+        let has_definitions = visible.iter().any(|(hit, _)| {
+            matches!(
+                hit.classification,
+                HitClass::Symbol { .. } | HitClass::PrepareRenameSymbol
+            )
+        });
+
+        // Name-level grouping header at depth 0
+        let _ = writeln!(output, "{name}");
+
+        // If no definitions, render Reference hits with their enclosing structures
+        // (rg-only lines under the matched text heading).
+        if !has_definitions {
+            let by_dir_file = group_hits_by_dir_file(
+                &visible.iter().map(|(hit, _)| *hit).collect::<Vec<_>>(),
+                fs_manager,
+            );
+            for (dir, files) in &by_dir_file {
+                if !dir.is_empty() {
+                    let _ = writeln!(output, "\t{dir}");
+                }
+                for (file, file_hits) in files {
+                    let indent = if dir.is_empty() { "\t" } else { "\t\t" };
+                    let _ = writeln!(output, "{indent}{file}");
+                    for hit in file_hits {
+                        let line_1 = hit.line + 1;
+                        let hit_indent = if dir.is_empty() { "\t\t" } else { "\t\t\t" };
+                        let _ = writeln!(output, "{hit_indent}{}", format_hit_line(hit, line_1));
+                    }
+                }
+            }
+            continue;
+        }
+
+        for (hit, enrichment) in &visible {
+            let has_edges = enrichment.as_ref().is_some_and(|e| {
+                !e.outgoing_calls.is_empty()
+                    || !e.implementations.is_empty()
+                    || !e.supertypes.is_empty()
+                    || !e.subtypes.is_empty()
+                    || !e.ref_lines.is_empty()
+                    || !e.incoming_calls.is_empty()
+            });
+
+            let rel_path = display_path(&hit.file.to_string_lossy(), fs_manager);
+
+            // Definition line — only Symbol and PrepareRenameSymbol hits
+            match &hit.classification {
+                HitClass::Symbol { symbol } => {
+                    let kind = format_ts_kind(&symbol.kind);
+                    let scope_prefix = symbol
+                        .scope
+                        .as_ref()
+                        .zip(symbol.scope_kind.as_ref())
+                        .map_or_else(String::new, |(sn, sk)| {
+                            format!("<{}> {}/", format_ts_kind(sk), sn)
+                        });
+                    let line_1 = symbol.line + 1;
+                    let _ = writeln!(
+                        output,
+                        "\t{scope_prefix}<{kind}> {name}  {rel_path}:{line_1}"
+                    );
+                }
+                HitClass::PrepareRenameSymbol => {
+                    let line_1 = hit.line + 1;
+                    let _ = writeln!(output, "\t{name}  {rel_path}:{line_1}");
+                }
+                _ => continue,
+            }
+
+            // Fish-eye: symbols with no edges → lean single line (already rendered).
+            if !has_edges {
+                continue;
+            }
+
+            let Some(enrichment) = enrichment else {
+                continue;
+            };
+
+            // Build the set of labeled (file, line) pairs for ref dedup
+            let mut this_labeled: HashSet<(String, u32)> = HashSet::new();
+            for c in &enrichment.outgoing_calls {
+                this_labeled.insert((c.file.clone(), c.line));
+            }
+            for (f, l) in &enrichment.implementations {
+                this_labeled.insert((f.clone(), *l));
+            }
+            for t in &enrichment.supertypes {
+                this_labeled.insert((t.file.clone(), t.line));
+            }
+            for t in &enrichment.subtypes {
+                this_labeled.insert((t.file.clone(), t.line));
+            }
+
+            // calls: section — outgoing calls sorted alphabetically
+            if !enrichment.outgoing_calls.is_empty() {
+                let _ = writeln!(output, "\t\tcalls:");
+                let mut calls: Vec<&CallEdge> = enrichment.outgoing_calls.iter().collect();
+                calls.sort_by(|a, b| a.name.cmp(&b.name));
+                for c in &calls {
+                    let kind_label = crate::ts::lsp_kind_label(c.kind);
+                    let depr = if c.deprecated { ", deprecated" } else { "" };
+                    let container_prefix = c.container.as_ref().map_or_else(String::new, |cn| {
+                        // Look up container kind from ts_index if available
+                        let ck = ts_index
+                            .and_then(|idx| {
+                                let index = idx
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let path = PathBuf::from(&c.file);
+                                index.find_enclosing(&path, c.line).ok().flatten()
+                            })
+                            .map_or_else(String::new, |enc| {
+                                format!("<{}> ", format_ts_kind(&enc.kind))
+                            });
+                        format!("{ck}{cn}/")
+                    });
+                    let c_rel = display_path(&c.file, fs_manager);
+                    let line_1 = c.line + 1;
+                    let _ = writeln!(
+                        output,
+                        "\t\t\t{container_prefix}<{kind_label}{depr}> {}  {c_rel}:{line_1}",
+                        c.name
+                    );
+                }
+            }
+
+            // impls: section — grouped by file (alphabetical)
+            if !enrichment.implementations.is_empty() {
+                let _ = writeln!(output, "\t\timpls:");
+                let mut by_file: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+                for (f, l) in &enrichment.implementations {
+                    by_file.entry(f.clone()).or_default().push(*l);
+                }
+                for (file, lines) in &by_file {
+                    let mut lines = lines.clone();
+                    lines.sort_unstable();
+                    let f_rel = display_path(file, fs_manager);
+                    let _ = writeln!(output, "\t\t\t{f_rel}");
+                    for line_0 in &lines {
+                        let line_1 = line_0 + 1;
+                        // Look up enclosing structure from ts_index
+                        let enc_str = ts_index
+                            .and_then(|idx| {
+                                let index = idx
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let path = PathBuf::from(file);
+                                index.find_enclosing(&path, *line_0).ok().flatten()
+                            })
+                            .map_or_else(String::new, |enc| {
+                                let ek = format_ts_kind(&enc.kind);
+                                let span = format_span(enc.line, enc.end_line);
+                                format!(" <{ek}> {}{span}", enc.name)
+                            });
+                        let _ = writeln!(output, "\t\t\t\t:{line_1}{enc_str}");
+                    }
+                }
+            }
+
+            // supertypes: section
+            if !enrichment.supertypes.is_empty() {
+                let _ = writeln!(output, "\t\tsupertypes:");
+                for t in &enrichment.supertypes {
+                    let kind_label = crate::ts::lsp_kind_label(t.kind);
+                    let depr = if t.deprecated { ", deprecated" } else { "" };
+                    let t_rel = display_path(&t.file, fs_manager);
+                    let line_1 = t.line + 1;
+                    let _ = writeln!(
+                        output,
+                        "\t\t\t<{kind_label}{depr}> {}  {t_rel}:{line_1}",
+                        t.name
+                    );
+                }
+            }
+
+            // subtypes: section
+            if !enrichment.subtypes.is_empty() {
+                let _ = writeln!(output, "\t\tsubtypes:");
+                for t in &enrichment.subtypes {
+                    let kind_label = crate::ts::lsp_kind_label(t.kind);
+                    let depr = if t.deprecated { ", deprecated" } else { "" };
+                    let t_rel = display_path(&t.file, fs_manager);
+                    let line_1 = t.line + 1;
+                    let _ = writeln!(
+                        output,
+                        "\t\t\t<{kind_label}{depr}> {}  {t_rel}:{line_1}",
+                        t.name
+                    );
+                }
+            }
+
+            // refs: section — merge incoming calls, dedup against labeled sections
+            let mut ref_entries: BTreeMap<String, BTreeMap<u32, Option<TsSymbol>>> =
+                BTreeMap::new();
+
+            // Add textDocument/references lines
+            for (file, lines) in &enrichment.ref_lines {
+                for &line_0 in lines {
+                    if this_labeled.contains(&(file.clone(), line_0)) {
+                        continue;
+                    }
+                    let enc = ts_index.and_then(|idx| {
+                        let index = idx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let path = PathBuf::from(file);
+                        index.find_enclosing(&path, line_0).ok().flatten()
+                    });
+                    ref_entries
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(line_0, enc);
+                }
+            }
+
+            // Merge incoming calls into refs (dedup: same file + same line)
+            for caller in &enrichment.incoming_calls {
+                if this_labeled.contains(&(caller.file.clone(), caller.line)) {
+                    continue;
+                }
+                // Use the caller's line as the ref entry. Dedup: if already present, skip.
+                let file_entries = ref_entries.entry(caller.file.clone()).or_default();
+                file_entries.entry(caller.line).or_insert_with(|| {
+                    ts_index.and_then(|idx| {
+                        let index = idx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let path = PathBuf::from(&caller.file);
+                        index.find_enclosing(&path, caller.line).ok().flatten()
+                    })
+                });
+            }
+
+            if !ref_entries.is_empty() {
+                let _ = writeln!(output, "\t\trefs:");
+                for (file, lines) in &ref_entries {
+                    let f_rel = display_path(file, fs_manager);
+                    let _ = writeln!(output, "\t\t\t{f_rel}");
+                    for (&line_0, enc) in lines {
+                        let line_1 = line_0 + 1;
+                        let enc_str = enc.as_ref().map_or_else(String::new, |enc| {
+                            let ek = format_ts_kind(&enc.kind);
+                            let scope_prefix = enc
+                                .scope
+                                .as_ref()
+                                .zip(enc.scope_kind.as_ref())
+                                .map_or_else(String::new, |(sn, sk)| {
+                                    format!("<{}> {}/", format_ts_kind(sk), sn)
+                                });
+                            let span = format_span(enc.line, enc.end_line);
+                            format!(" {scope_prefix}<{ek}> {}{span}", enc.name)
+                        });
+                        let _ = writeln!(output, "\t\t\t\t:{line_1}{enc_str}");
+                    }
+                }
+            }
+        }
+    }
+
+    let trimmed_len = output.trim_end().len();
+    output.truncate(trimmed_len);
+
+    if output.len() <= budget {
+        Some(output)
+    } else {
+        None
+    }
 }
 
 /// Lower-bound estimate for tier 2 rendered size.
@@ -1393,7 +1761,7 @@ fn extract_type_edge(item: &Value) -> Option<TypeEdge> {
     Some(TypeEdge {
         name,
         kind,
-        container,
+        _container: container,
         file,
         line,
         deprecated,
