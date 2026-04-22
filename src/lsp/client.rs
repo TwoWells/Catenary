@@ -3,7 +3,7 @@
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -45,12 +45,13 @@ pub struct LspClient {
     server_version: Option<String>,
     /// Parent message ID for causation tracking (set before tool dispatch).
     parent_id: Option<i64>,
-    /// URIs of documents currently open on this client.
+    /// Per-client document state: URI → version.
     ///
-    /// Tracks per-client open state so that `open_document_on` sends
-    /// `didOpen` to a server that hasn't seen a document, even if
-    /// another server already has it open.
-    open_documents: HashSet<String>,
+    /// Tracks which documents are open on this client and their current
+    /// version number. Each client maintains independent versions so
+    /// that multi-server dispatch gives each server a clean monotonic
+    /// sequence starting at 1.
+    open_documents: HashMap<String, i32>,
 }
 
 impl LspClient {
@@ -138,7 +139,7 @@ impl LspClient {
             server_command: program.to_string(),
             server_version: None,
             parent_id: None,
-            open_documents: HashSet::new(),
+            open_documents: HashMap::new(),
         })
     }
 
@@ -780,19 +781,26 @@ impl LspClient {
     /// Returns whether this client has a document open by URI.
     #[must_use]
     pub fn is_document_open(&self, uri: &str) -> bool {
-        self.open_documents.contains(uri)
+        self.open_documents.contains_key(uri)
     }
 
-    /// Records a document as open on this client.
-    pub fn track_document_open(&mut self, uri: &str) {
-        self.open_documents.insert(uri.to_string());
-    }
-
-    /// Removes a document from this client's open set.
+    /// Registers an open and returns `(first_open, version)`.
     ///
-    /// Returns `true` if the document was tracked (and is now removed).
-    pub fn track_document_closed(&mut self, uri: &str) -> bool {
-        self.open_documents.remove(uri)
+    /// First open returns `(true, 1)` — caller sends `didOpen`.
+    /// Subsequent opens increment the version and return `(false, version)`
+    /// — caller sends `didChange`.
+    pub fn open_document(&mut self, uri: &str) -> (bool, i32) {
+        use std::collections::hash_map::Entry;
+        match self.open_documents.entry(uri.to_string()) {
+            Entry::Occupied(mut e) => {
+                *e.get_mut() += 1;
+                (false, *e.get())
+            }
+            Entry::Vacant(e) => {
+                e.insert(1);
+                (true, 1)
+            }
+        }
     }
 
     /// Closes a document while the caller holds the lock.
@@ -801,7 +809,7 @@ impl LspClient {
     /// Eliminates the lock gap that would exist if the caller dropped
     /// the guard and called a separate close method.
     pub async fn close_tracked_document(&mut self, uri: &str) {
-        if self.open_documents.remove(uri) {
+        if self.open_documents.remove(uri).is_some() {
             let _ = self.did_close(uri).await;
         }
     }

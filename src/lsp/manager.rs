@@ -9,7 +9,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::bridge::DocumentManager;
 use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::config::{Config, ServerBinding};
 use crate::logging::LoggingServer;
@@ -84,14 +83,13 @@ fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
 /// Manages the lifecycle of LSP clients, document state, and language detection.
 ///
 /// Single authority for LSP server spawning, caching, shutdown, and document
-/// lifecycle. Absorbs `DocumentManager` — document open/change tracking and
-/// LSP notifications are tightly coupled to server management.
+/// lifecycle. Document versioning and open/close tracking live on each
+/// [`LspClient`] — each server sees an independent monotonic version sequence.
 pub struct LspClientManager {
     config: Config,
     clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
     logging: LoggingServer,
     fs: Arc<FilesystemManager>,
-    doc_manager: Mutex<DocumentManager>,
 }
 
 impl LspClientManager {
@@ -106,7 +104,6 @@ impl LspClientManager {
             clients: Mutex::new(HashMap::new()),
             logging,
             fs,
-            doc_manager: Mutex::new(DocumentManager::new()),
         }
     }
 
@@ -632,9 +629,8 @@ impl LspClientManager {
     /// Opens a document on a specific client.
     ///
     /// Reads the file, checks per-client open state, sends `didOpen` or
-    /// `didChange` as appropriate. Version tracking is handled by
-    /// [`DocumentManager`] (shared across clients); open/close state
-    /// is per-client via `LspClient::open_documents`.
+    /// `didChange` as appropriate. Version tracking is per-client — each
+    /// server gets an independent monotonic sequence starting at 1.
     ///
     /// Used by request/response dispatch: the caller gets clients from
     /// [`get_servers`](Self::get_servers) and opens the document on each
@@ -654,13 +650,9 @@ impl LspClientManager {
         client: &Arc<Mutex<LspClient>>,
         parent_id: Option<i64>,
     ) -> Result<String> {
-        let mut doc_manager = self.doc_manager.lock().await;
-        let uri = doc_manager.uri_for_path(path)?;
         let canonical = path.canonicalize()?;
+        let uri = crate::lsp::lang::path_to_uri(&canonical);
         let text = tokio::fs::read_to_string(&canonical).await?;
-
-        let version = doc_manager.open(&uri);
-        drop(doc_manager);
 
         let mut client = client.lock().await;
         client.set_parent_id(parent_id);
@@ -673,15 +665,15 @@ impl LspClientManager {
             ));
         }
 
-        if client.is_document_open(&uri) {
-            client.did_change(&uri, version, &text).await?;
-        } else {
+        let (first_open, version) = client.open_document(&uri);
+        if first_open {
             let language_id = self
                 .fs
                 .language_id(path)
                 .unwrap_or_else(|| "plaintext".to_string());
             client.did_open(&uri, &language_id, version, &text).await?;
-            client.track_document_open(&uri);
+        } else {
+            client.did_change(&uri, version, &text).await?;
         }
 
         drop(client);

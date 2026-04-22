@@ -3,8 +3,6 @@
 
 /// Diagnostics pipeline for PostToolUse hook requests.
 pub mod diagnostics_server;
-/// Manages document lifecycle and sync between disk and LSP servers.
-mod document_manager;
 /// In-memory editing state manager.
 pub mod editing_manager;
 /// Glob tool handler: unified file/directory/pattern browsing.
@@ -27,7 +25,6 @@ pub mod tool_server;
 pub mod toolbox;
 
 pub use diagnostics_server::DiagnosticsServer;
-pub use document_manager::DocumentManager;
 pub use editing_manager::EditingManager;
 pub use handler::McpRouter;
 pub use hook_router::HookRouter;
