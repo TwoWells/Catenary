@@ -69,15 +69,16 @@ impl DiagnosticsServer {
     /// Processes a file change and returns diagnostics from all
     /// diagnostic-enabled servers.
     ///
-    /// Pipeline: path resolution → `open_document_for_diagnostics` (all
-    /// servers) → per-server settle + retrieve + filter → concatenate →
-    /// `close_document_all`.
+    /// Pipeline: path resolution → server selection → per-server
+    /// open + settle + retrieve + filter + close → concatenate.
+    ///
+    /// Each server's lifecycle is self-contained: if one server fails
+    /// at any stage (open, settle, retrieval), it is skipped and the
+    /// remaining servers still contribute diagnostics.
     ///
     /// # Errors
     ///
-    /// Returns an error if path resolution or document opening fails.
-    /// Individual server failures are logged and skipped — other servers'
-    /// diagnostics are still collected.
+    /// Returns an error if path resolution fails.
     pub async fn process_file(&self, file_path: &str, entry_id: i64) -> Result<DiagnosticsResult> {
         let path = resolve_path(file_path)?;
 
@@ -85,11 +86,8 @@ impl DiagnosticsServer {
         // file's directory, asking for diagnostics is a wasted round-trip.
         let canonical = self.path_validator.read().await.validate_read(&path)?;
 
-        // Open on all diagnostic-enabled servers
-        let (uri, clients) = self
-            .client_manager
-            .open_document_for_diagnostics(&canonical, Some(entry_id))
-            .await?;
+        // Get diagnostic-enabled servers without opening documents.
+        let clients = self.client_manager.diagnostic_servers(&canonical).await;
 
         if clients.is_empty() {
             return Ok(DiagnosticsResult {
@@ -98,24 +96,18 @@ impl DiagnosticsServer {
             });
         }
 
-        // Run pipeline per server, collect formatted output segments
+        // Run full pipeline per server (open → settle → retrieve → close).
         let mut all_segments: Vec<String> = Vec::new();
         let mut total_count = 0;
 
         for client_mutex in &clients {
-            let segment = self.process_file_on_server(client_mutex, &uri).await;
+            let segment = self
+                .process_file_on_server(client_mutex, &canonical, Some(entry_id))
+                .await;
             total_count += segment.count;
             if !segment.formatted.is_empty() {
                 all_segments.push(segment.formatted);
             }
-        }
-
-        // Close document on all servers
-        self.client_manager.close_document_all(&uri, &clients).await;
-
-        // Clear parent_id on all clients
-        for client_mutex in &clients {
-            client_mutex.lock().await.set_parent_id(None);
         }
 
         let content = if total_count == 0 {
@@ -130,13 +122,14 @@ impl DiagnosticsServer {
         })
     }
 
-    /// Runs the diagnostics pipeline on a single server.
+    /// Runs the full diagnostics pipeline on a single server.
     ///
-    /// Settles the server, retrieves diagnostics (push cache first, pull
-    /// fallback), applies per-server `min_severity` filtering and noise
-    /// filtering, collects quick-fixes, and formats the output.
+    /// Opens the document, settles the server, retrieves diagnostics
+    /// (push cache first, pull fallback), applies per-server
+    /// `min_severity` filtering and noise filtering, collects
+    /// quick-fixes, formats the output, and closes the document.
     ///
-    /// Returns empty results on server failure — errors are logged via
+    /// Returns empty results on any failure — errors are logged via
     /// `warn!()` and never reach the agent-facing tool result.
     #[allow(
         clippy::significant_drop_tightening,
@@ -147,6 +140,50 @@ impl DiagnosticsServer {
         reason = "Pipeline steps are sequential and cannot be split"
     )]
     async fn process_file_on_server(
+        &self,
+        client_mutex: &Arc<Mutex<LspClient>>,
+        path: &std::path::Path,
+        parent_id: Option<i64>,
+    ) -> ServerDiagnostics {
+        let empty = ServerDiagnostics::empty();
+
+        // Open document on this server. If the server died or the open
+        // fails for any reason, skip it — other servers still contribute.
+        let uri = match self
+            .client_manager
+            .open_document_on(path, client_mutex, parent_id)
+            .await
+        {
+            Ok(uri) => uri,
+            Err(e) => {
+                let name = client_mutex.lock().await.server_name().to_string();
+                warn!(
+                    server = %name,
+                    "document open failed, skipping server: {e}",
+                );
+                return empty;
+            }
+        };
+
+        let result = self.run_diagnostics_pipeline(client_mutex, &uri).await;
+
+        // Always close and clear parent_id, even on pipeline failure.
+        self.client_manager.close_document(&uri, client_mutex).await;
+        client_mutex.lock().await.set_parent_id(None);
+
+        result
+    }
+
+    /// Diagnostics pipeline after document open: settle → retrieve →
+    /// filter → format.
+    ///
+    /// Extracted so that [`Self::process_file_on_server`] always runs
+    /// the close path regardless of pipeline outcome.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Pipeline steps are sequential and cannot be split"
+    )]
+    async fn run_diagnostics_pipeline(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         uri: &str,
@@ -168,7 +205,7 @@ impl DiagnosticsServer {
         let cancel = CancellationToken::new();
 
         // Idle wait: ensure server has settled — covers processing of the
-        // didOpen/didChange sent by open_document_for_diagnostics.
+        // didOpen/didChange sent by open_document_on.
         let pre_detector = IdleDetector::unconditional();
         let pre_result = await_idle(&server, pre_detector, cancel.clone()).await;
         debug!(

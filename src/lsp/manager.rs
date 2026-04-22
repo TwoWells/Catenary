@@ -823,6 +823,44 @@ impl LspClientManager {
         Ok((uri, clients))
     }
 
+    /// Returns diagnostic-enabled servers for a file path without opening
+    /// the document.
+    ///
+    /// Applies both the capability gate ([`LspServer::supports_diagnostics`])
+    /// and the config-level filter ([`LanguageConfig::diagnostics_enabled`]).
+    /// Returns an empty Vec when no server qualifies.
+    pub async fn diagnostic_servers(&self, path: &Path) -> Vec<Arc<Mutex<LspClient>>> {
+        let servers = self
+            .get_servers(path, LspServer::supports_diagnostics)
+            .await;
+
+        if servers.is_empty() {
+            return Vec::new();
+        }
+
+        let lang_id = self.fs.language_id(path).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        });
+        let lang_config = lang_id
+            .as_deref()
+            .and_then(|id| self.config.resolve_language(id));
+
+        let mut clients = Vec::new();
+        for client in &servers {
+            let server_name = client.lock().await.server_name().to_string();
+            let enabled = lang_config
+                .as_ref()
+                .is_some_and(|lc| lc.diagnostics_enabled(&server_name));
+            if enabled {
+                clients.push(client.clone());
+            }
+        }
+
+        clients
+    }
+
     /// Closes a document on a specific client.
     ///
     /// Removes the URI from the client's per-client open tracking and sends
