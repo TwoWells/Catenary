@@ -94,8 +94,8 @@ pub(super) struct CallEdge {
 pub(super) struct TypeEdge {
     pub name: String,
     pub kind: u32,
-    /// Container name from LSP `detail` field. Collected for future use.
-    pub _container: Option<String>,
+    /// Container name from LSP `detail` field.
+    pub container: Option<String>,
     pub file: String,
     pub line: u32,
     pub deprecated: bool,
@@ -1129,11 +1129,15 @@ fn render_tier1(
                 for t in &enrichment.supertypes {
                     let kind_label = crate::ts::lsp_kind_label(t.kind);
                     let depr = if t.deprecated { ", deprecated" } else { "" };
+                    let container_prefix = t
+                        .container
+                        .as_ref()
+                        .map_or_else(String::new, |cn| format!("{cn}/"));
                     let t_rel = display_path(&t.file, fs_manager);
                     let line_1 = t.line + 1;
                     let _ = writeln!(
                         output,
-                        "\t\t\t<{kind_label}{depr}> {}  {t_rel}:{line_1}",
+                        "\t\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
                         t.name
                     );
                 }
@@ -1145,11 +1149,15 @@ fn render_tier1(
                 for t in &enrichment.subtypes {
                     let kind_label = crate::ts::lsp_kind_label(t.kind);
                     let depr = if t.deprecated { ", deprecated" } else { "" };
+                    let container_prefix = t
+                        .container
+                        .as_ref()
+                        .map_or_else(String::new, |cn| format!("{cn}/"));
                     let t_rel = display_path(&t.file, fs_manager);
                     let line_1 = t.line + 1;
                     let _ = writeln!(
                         output,
-                        "\t\t\t<{kind_label}{depr}> {}  {t_rel}:{line_1}",
+                        "\t\t\t{container_prefix}<{kind_label}{depr}> {}  {t_rel}:{line_1}",
                         t.name
                     );
                 }
@@ -1779,7 +1787,7 @@ fn extract_type_edge(item: &Value) -> Option<TypeEdge> {
     Some(TypeEdge {
         name,
         kind,
-        _container: container,
+        container,
         file,
         line,
         deprecated,
