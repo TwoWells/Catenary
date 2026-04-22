@@ -26,12 +26,18 @@ const MOCK_LANG_B: &str = "d5apI";
 ///
 /// Sets `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` to the
 /// given root so the process uses the test's tempdir instead of
-/// `~/.config`, `~/.local/state`, or `~/.local/share`. All integration
-/// test subprocesses (bridge, `catenary install`, etc.) must call this.
+/// `~/.config`, `~/.local/state`, or `~/.local/share`. Also clears
+/// `CATENARY_STATE_DIR` and `CATENARY_DATA_DIR` which are higher-priority
+/// overrides that would bypass the XDG vars if inherited from the shell.
+///
+/// All integration test subprocesses (bridge, `catenary install`, etc.)
+/// must call this.
 fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("XDG_CONFIG_HOME", root);
     cmd.env("XDG_STATE_HOME", root);
     cmd.env("XDG_DATA_HOME", root);
+    cmd.env_remove("CATENARY_STATE_DIR");
+    cmd.env_remove("CATENARY_DATA_DIR");
 }
 
 /// Helper to spawn the bridge and communicate with it
