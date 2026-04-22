@@ -17,9 +17,9 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Result of processing a file change through the diagnostics pipeline.
 pub struct DiagnosticsResult {
@@ -27,6 +27,24 @@ pub struct DiagnosticsResult {
     pub content: String,
     /// Number of diagnostics found.
     pub count: usize,
+}
+
+/// Per-server diagnostics result from [`DiagnosticsServer::process_file_on_server`].
+struct ServerDiagnostics {
+    /// Formatted diagnostic output for this server (empty if clean).
+    formatted: String,
+    /// Number of diagnostics from this server.
+    count: usize,
+}
+
+impl ServerDiagnostics {
+    /// Returns an empty result (server died or was skipped).
+    const fn empty() -> Self {
+        Self {
+            formatted: String::new(),
+            count: 0,
+        }
+    }
 }
 
 /// Handles `PostToolUse` hook requests: file-change notification with LSP
@@ -48,28 +66,18 @@ impl DiagnosticsServer {
         }
     }
 
-    /// Processes a file change and returns diagnostics.
+    /// Processes a file change and returns diagnostics from all
+    /// diagnostic-enabled servers.
     ///
-    /// Pipeline: lifecycle check → pre-idle → didOpen → probe → didSave →
-    /// post-idle → retrieve (push cache first, `[clean]` semantics) →
-    /// format → didClose.
+    /// Pipeline: path resolution → `open_document_for_diagnostics` (all
+    /// servers) → per-server settle + retrieve + filter → concatenate →
+    /// `close_document_all`.
     ///
     /// # Errors
     ///
-    /// Returns an error if path resolution, LSP client lookup, or document
-    /// sync fails.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Locks held across async operations by design"
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Pipeline steps are sequential and cannot be split"
-    )]
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "Client lock held across pipeline for exclusive access"
-    )]
+    /// Returns an error if path resolution or document opening fails.
+    /// Individual server failures are logged and skipped — other servers'
+    /// diagnostics are still collected.
     pub async fn process_file(&self, file_path: &str, entry_id: i64) -> Result<DiagnosticsResult> {
         let path = resolve_path(file_path)?;
 
@@ -77,78 +85,96 @@ impl DiagnosticsServer {
         // file's directory, asking for diagnostics is a wasted round-trip.
         let canonical = self.path_validator.read().await.validate_read(&path)?;
 
-        // Try to get the LSP client for this file's language
-        let Ok(client_mutex) = self.client_manager.get_client(&canonical).await else {
+        // Open on all diagnostic-enabled servers
+        let (uri, clients) = self
+            .client_manager
+            .open_document_for_diagnostics(&canonical, Some(entry_id))
+            .await?;
+
+        if clients.is_empty() {
             return Ok(DiagnosticsResult {
                 content: "[no language server]".into(),
                 count: 0,
             });
-        };
+        }
 
-        // Check lifecycle before opening the document (brief lock)
-        {
-            let client = client_mutex.lock().await;
-            match client.lifecycle() {
-                ServerLifecycle::Failed | ServerLifecycle::Dead => {
-                    return Ok(DiagnosticsResult {
-                        content: "[no language server]".into(),
-                        count: 0,
-                    });
-                }
-                _ => {}
+        // Run pipeline per server, collect formatted output segments
+        let mut all_segments: Vec<String> = Vec::new();
+        let mut total_count = 0;
+
+        for client_mutex in &clients {
+            let segment = self.process_file_on_server(client_mutex, &uri).await;
+            total_count += segment.count;
+            if !segment.formatted.is_empty() {
+                all_segments.push(segment.formatted);
             }
         }
 
-        // Tracked open: reads file, sends didOpen/didChange, manages
-        // per-client open state. Sets parent_id for causation tracking.
-        let uri = self
-            .client_manager
-            .open_document_on(&canonical, &client_mutex, Some(entry_id))
-            .await?;
+        // Close document on all servers
+        self.client_manager.close_document_all(&uri, &clients).await;
 
-        // Lock for the diagnostics pipeline
-        let client = client_mutex.lock().await;
-        let lang_id = client.language().to_string();
-        let result = self.process_file_inner(&client, &uri, &lang_id).await;
-        drop(client);
+        // Clear parent_id on all clients
+        for client_mutex in &clients {
+            client_mutex.lock().await.set_parent_id(None);
+        }
 
-        // Tracked close: sends didClose, manages per-client open state
-        self.client_manager
-            .close_document(&uri, &client_mutex)
-            .await;
+        let content = if total_count == 0 {
+            "[clean]".into()
+        } else {
+            all_segments.join("\n")
+        };
 
-        // Clear parent_id
-        client_mutex.lock().await.set_parent_id(None);
-
-        result
+        Ok(DiagnosticsResult {
+            content,
+            count: total_count,
+        })
     }
 
-    /// Inner pipeline after document open — extracted to ensure the outer
-    /// function always runs the close path.
+    /// Runs the diagnostics pipeline on a single server.
     ///
-    /// The document stimulus (`didOpen`/`didChange`) was already sent by
-    /// [`LspClientManager::open_document_on`] before this function is
-    /// called. The unconditional idle wait covers both prior server work
-    /// and processing of the stimulus. For `didSave` servers, a second
-    /// baseline+idle sequence gates on the flycheck.
+    /// Settles the server, retrieves diagnostics (push cache first, pull
+    /// fallback), applies per-server `min_severity` filtering and noise
+    /// filtering, collects quick-fixes, and formats the output.
+    ///
+    /// Returns empty results on server failure — errors are logged via
+    /// `warn!()` and never reach the agent-facing tool result.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "Client lock held across pipeline for exclusive access"
+    )]
     #[allow(
         clippy::too_many_lines,
         reason = "Pipeline steps are sequential and cannot be split"
     )]
-    async fn process_file_inner(
+    async fn process_file_on_server(
         &self,
-        client: &LspClient,
+        client_mutex: &Arc<Mutex<LspClient>>,
         uri: &str,
-        lang_id: &str,
-    ) -> Result<DiagnosticsResult> {
+    ) -> ServerDiagnostics {
+        let empty = ServerDiagnostics::empty();
+
+        let client = client_mutex.lock().await;
+        let server_name = client.server_name().to_string();
+
+        // Check lifecycle before settling
+        if matches!(
+            client.lifecycle(),
+            ServerLifecycle::Failed | ServerLifecycle::Dead
+        ) {
+            return empty;
+        }
+
         let server = client.server().clone();
         let cancel = CancellationToken::new();
 
         // Idle wait: ensure server has settled — covers processing of the
-        // didOpen/didChange sent by open_document_on plus any prior work.
+        // didOpen/didChange sent by open_document_for_diagnostics.
         let pre_detector = IdleDetector::unconditional();
         let pre_result = await_idle(&server, pre_detector, cancel.clone()).await;
-        debug!("idle result: {pre_result:?}");
+        debug!(
+            server = %server_name,
+            "idle result: {pre_result:?}",
+        );
 
         if pre_result == SettleResult::RootDied
             || matches!(
@@ -156,23 +182,15 @@ impl DiagnosticsServer {
                 ServerLifecycle::Failed | ServerLifecycle::Dead
             )
         {
-            return Ok(DiagnosticsResult {
-                content: "[no language server]".into(),
-                count: 0,
-            });
+            return empty;
         }
 
         // Health probe: verify the server can respond before continuing
         if client.lifecycle() == ServerLifecycle::Probing && !client.run_health_probe(uri).await {
-            return Ok(DiagnosticsResult {
-                content: "[no language server]".into(),
-                count: 0,
-            });
+            return empty;
         }
 
         // Trigger flycheck on servers that only run diagnostics on save.
-        // Uses a separate baseline+idle sequence because didSave is a
-        // second stimulus after the initial didOpen/didChange.
         if client.wants_did_save() {
             let baseline_ticks = {
                 let s = Arc::clone(&server);
@@ -183,11 +201,20 @@ impl DiagnosticsServer {
                 .unwrap_or(0)
             };
 
-            client.did_save(uri).await?;
+            if let Err(e) = client.did_save(uri).await {
+                warn!(
+                    server = %server_name,
+                    "didSave failed, skipping server: {e}",
+                );
+                return empty;
+            }
 
             let post_detector = IdleDetector::after_activity(baseline_ticks);
             let post_result = await_idle(&server, post_detector, cancel).await;
-            debug!("post-didSave idle result: {post_result:?}");
+            debug!(
+                server = %server_name,
+                "post-didSave idle result: {post_result:?}",
+            );
 
             if post_result == SettleResult::RootDied
                 || matches!(
@@ -195,10 +222,7 @@ impl DiagnosticsServer {
                     ServerLifecycle::Failed | ServerLifecycle::Dead
                 )
             {
-                return Ok(DiagnosticsResult {
-                    content: "[no language server]".into(),
-                    count: 0,
-                });
+                return empty;
             }
         }
 
@@ -217,14 +241,14 @@ impl DiagnosticsServer {
                     }
                 }
             } else {
-                // Healthy server settled with nothing to report
                 Vec::new()
             }
         };
 
-        // Extract filter context
+        // Extract filter context from this specific server
         let server_command = client.server_command().to_string();
         let server_version = client.server_version().map(str::to_string);
+        let lang_id = client.language().to_string();
 
         // Collect quick-fix code actions for each diagnostic
         let fixes = if !diagnostics.is_empty()
@@ -233,18 +257,20 @@ impl DiagnosticsServer {
                 .get("codeActionProvider")
                 .is_some_and(|v| !v.is_null())
         {
-            collect_quick_fixes(client, uri, &diagnostics).await
+            collect_quick_fixes(&client, uri, &diagnostics).await
         } else {
             Vec::new()
         };
 
-        // Apply severity threshold from server config
+        // Drop client lock before config access
+        drop(client);
+
+        // Per-server min_severity: look up by this server's config name
         let min_severity = {
             let config = self.client_manager.config();
             config
-                .resolve_language(lang_id)
-                .and_then(|lc| lc.servers.first())
-                .and_then(|binding| config.server.get(&binding.name))
+                .server
+                .get(&server_name)
                 .and_then(|sd| sd.min_severity.as_deref())
                 .and_then(crate::filter::parse_severity)
         };
@@ -275,8 +301,8 @@ impl DiagnosticsServer {
         let filter = crate::filter::get_filter(&server_command);
 
         let count = diagnostics.len();
-        let content = if diagnostics.is_empty() {
-            "[clean]".into()
+        let formatted = if diagnostics.is_empty() {
+            String::new()
         } else {
             format_diagnostics_compact(
                 &diagnostics,
@@ -284,11 +310,11 @@ impl DiagnosticsServer {
                 filter,
                 &server_command,
                 server_version.as_deref(),
-                lang_id,
+                &lang_id,
             )
         };
 
-        Ok(DiagnosticsResult { content, count })
+        ServerDiagnostics { formatted, count }
     }
 
     /// Processes multiple file changes and returns a combined diagnostics

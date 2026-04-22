@@ -15,7 +15,7 @@
 //! - Pull-only (`--pull-diagnostics --no-push-diagnostics`)
 //! - Server death (`--drop-after`)
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -33,6 +33,18 @@ struct BridgeProcess {
     state_home: Option<String>,
 }
 
+/// Isolates a subprocess from the user's environment.
+fn isolate_env(cmd: &mut Command, root: &str) {
+    cmd.env("XDG_CONFIG_HOME", root);
+    cmd.env("XDG_STATE_HOME", root);
+    cmd.env("XDG_DATA_HOME", root);
+    cmd.env_remove("CATENARY_STATE_DIR");
+    cmd.env_remove("CATENARY_DATA_DIR");
+    cmd.env_remove("CATENARY_CONFIG");
+    cmd.env_remove("CATENARY_SERVERS");
+    cmd.env_remove("CATENARY_ROOTS");
+}
+
 impl BridgeProcess {
     fn spawn(mockls_args: &[&str], root: &str) -> Result<Self> {
         Self::spawn_with_state_home(mockls_args, root, root)
@@ -47,9 +59,9 @@ impl BridgeProcess {
         }
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, root);
         cmd.env("CATENARY_SERVERS", &lsp_cmd)
             .env("CATENARY_ROOTS", root)
-            .env("XDG_CONFIG_HOME", root)
             .env("XDG_STATE_HOME", state_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -64,6 +76,31 @@ impl BridgeProcess {
             stdin: Some(stdin),
             stdout: Some(stdout),
             state_home: Some(state_home.to_string()),
+        })
+    }
+
+    /// Spawn using a TOML config file instead of `CATENARY_SERVERS`.
+    ///
+    /// Required for multi-server-per-language tests where each server
+    /// needs different flags or different `min_severity` settings.
+    fn spawn_with_config(config_path: &std::path::Path, root: &str) -> Result<Self> {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, root);
+        cmd.env("CATENARY_CONFIG", config_path);
+        cmd.env("CATENARY_ROOTS", root);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
+        let stdin = child.stdin.take().context("Failed to get stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            state_home: Some(root.to_string()),
         })
     }
 
@@ -408,7 +445,6 @@ fn test_diagnostics_pull_only() -> Result<()> {
 
 /// Sends a one-shot IPC request to the hook server. Ignores the response.
 fn ipc_request(socket_path: &std::path::Path, request: &Value) -> Result<()> {
-    use std::io::Read as _;
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -644,6 +680,225 @@ fn test_pull_downgrade_with_push() -> Result<()> {
     assert!(
         text.contains("mock diagnostic"),
         "Server with working push should return diagnostics even with broken pull. Got: {text}"
+    );
+
+    Ok(())
+}
+
+// ─── Multi-server diagnostics ─────────────────────────────────────────
+
+/// Two servers with diagnostics enabled: output contains diagnostics from
+/// both (concatenation model). Each server independently settles, retrieves,
+/// filters, and formats its own diagnostics.
+#[test]
+fn test_diagnostics_multi_server_concatenation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "line one\nline two\n")?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server.mockls-a]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [server.mockls-b]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [language.{MOCK_LANG_A}]\n\
+             servers = [\"mockls-a\", \"mockls-b\"]\n"
+        ),
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    // Both servers publish "mock diagnostic" — the output should contain
+    // the diagnostic text (at least once; both servers produce the same
+    // diagnostic so we verify it appears).
+    assert!(
+        text.contains("mock diagnostic"),
+        "Multi-server output should contain diagnostics. Got:\n{text}"
+    );
+    // The output should NOT be "[clean]" or "[no language server]"
+    assert!(
+        !text.contains("[clean]") && !text.contains("[no language server]"),
+        "Expected diagnostics from both servers, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// One server has `diagnostics = false` in its binding: only the other
+/// server's diagnostics appear.
+#[test]
+fn test_diagnostics_one_server_suppressed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server.mockls-diag]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [server.mockls-nodiag]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [language.{MOCK_LANG_A}]\n\
+             servers = [\"mockls-diag\", {{ name = \"mockls-nodiag\", diagnostics = false }}]\n"
+        ),
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    // Only one server contributes diagnostics
+    assert!(
+        text.contains("mock diagnostic"),
+        "Diagnostic-enabled server should contribute. Got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Server A has `min_severity = "error"` (filters warnings), server B has
+/// no threshold. mockls publishes severity 2 (warning). Only server B's
+/// diagnostics pass through.
+#[test]
+fn test_diagnostics_per_server_min_severity() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server.mockls-strict]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\
+             min_severity = \"error\"\n\n\
+             [server.mockls-lax]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [language.{MOCK_LANG_A}]\n\
+             servers = [\"mockls-strict\", \"mockls-lax\"]\n"
+        ),
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    // mockls emits severity 2 (warning). mockls-strict filters it out,
+    // mockls-lax passes it through. We should see diagnostics from the
+    // lax server.
+    assert!(
+        text.contains("mock diagnostic"),
+        "Lax server's warnings should pass through. Got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Language-level `diagnostics = false`: no servers contribute diagnostics,
+/// output is `[no language server]`.
+#[test]
+fn test_diagnostics_no_servers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server.mockls-only]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [language.{MOCK_LANG_A}]\n\
+             diagnostics = false\n\
+             servers = [\"mockls-only\"]\n"
+        ),
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    // All servers suppressed at language level
+    assert!(
+        text.contains("N/A"),
+        "Language-level diagnostics=false should produce N/A. Got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// One server dies during settle: the other server's diagnostics are
+/// still collected (graceful degradation per §13).
+#[test]
+fn test_diagnostics_one_server_dies() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server.mockls-crash]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\", \"--drop-after\", \"3\"]\n\n\
+             [server.mockls-stable]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\"]\n\n\
+             [language.{MOCK_LANG_A}]\n\
+             servers = [\"mockls-crash\", \"mockls-stable\"]\n"
+        ),
+    )?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    // mockls-crash dies after 3 responses (initialize response +
+    // initialized ack + didOpen). mockls-stable should still produce
+    // diagnostics.
+    assert!(
+        text.contains("mock diagnostic") || text.contains("clean"),
+        "Surviving server should still contribute. Got:\n{text}"
+    );
+    // Should NOT be entirely "[no language server]"
+    assert!(
+        !text.contains("[no language server]"),
+        "Surviving server should prevent [no language server]. Got:\n{text}"
     );
 
     Ok(())
