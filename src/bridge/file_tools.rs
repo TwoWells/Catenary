@@ -24,6 +24,7 @@ use super::symbols::{format_symbol_kind, is_outline_kind};
 use super::tool_server::ToolServer;
 use super::toolbox::ResolvedGlob;
 use crate::lsp::LspClientManager;
+use crate::lsp::instance_key::InstanceKey;
 use crate::lsp::server::LspServer;
 
 /// Input for the `glob` tool.
@@ -92,7 +93,7 @@ fn extract_outline_symbols(response: &Value) -> OutlineSymbols {
 pub struct GlobServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
-    pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<String>>>,
+    pub(super) notified_offline: Arc<std::sync::Mutex<HashSet<InstanceKey>>>,
 }
 
 impl ToolServer for GlobServer {
@@ -115,16 +116,25 @@ impl ToolServer for GlobServer {
         // Wait for readiness and emit state-transition notifications.
         if let Some(ref fp) = file_path {
             self.client_manager.wait_ready_for_path(fp).await;
-            let touched: Vec<String> = self.language_for_path(fp).await.into_iter().collect();
+            let clients = self.client_manager.clients().await;
+            let touched: Vec<InstanceKey> = clients
+                .keys()
+                .filter(|k| {
+                    self.fs_manager
+                        .language_id(fp)
+                        .is_some_and(|lang| lang == k.language_id)
+                })
+                .cloned()
+                .collect();
             check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
         } else {
             self.client_manager.wait_ready_all().await;
-            let touched: Vec<String> = self
+            let touched: Vec<InstanceKey> = self
                 .client_manager
                 .clients()
                 .await
                 .keys()
-                .map(|k| k.language_id.clone())
+                .cloned()
                 .collect();
             check_server_health(&self.client_manager, &touched, &self.notified_offline).await;
         }
@@ -145,12 +155,6 @@ impl ToolServer for GlobServer {
 }
 
 impl GlobServer {
-    /// Returns the language ID for a file path.
-    async fn language_for_path(&self, path: &Path) -> Option<String> {
-        let client_mutex = self.client_manager.get_client(path).await.ok()?;
-        Some(client_mutex.lock().await.language().to_string())
-    }
-
     /// File outline: header with line count + depth-0 outline symbols.
     ///
     /// Binary files show size instead of line count and skip LSP symbols.

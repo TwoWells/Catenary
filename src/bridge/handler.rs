@@ -14,9 +14,10 @@ use super::filesystem_manager::FilesystemManager;
 use super::tool_server::ToolServer;
 use super::toolbox::Toolbox;
 use crate::lsp::LspClientManager;
+use crate::lsp::instance_key::InstanceKey;
 use crate::mcp::{CallToolResult, Tool, ToolHandler};
 
-/// Checks server health for the given languages and emits one-time
+/// Checks server health for the given instances and emits one-time
 /// state-transition notifications via `tracing`.
 ///
 /// Queries each server's liveness, partitions into alive/dead, and
@@ -28,30 +29,33 @@ use crate::mcp::{CallToolResult, Tool, ToolHandler};
 /// `systemMessage` at stationary points (session start, agent stop).
 pub(super) async fn check_server_health(
     client_manager: &LspClientManager,
-    touched_servers: &[String],
-    notified_offline: &std::sync::Mutex<HashSet<String>>,
+    touched_instances: &[InstanceKey],
+    notified_offline: &std::sync::Mutex<HashSet<InstanceKey>>,
 ) {
     let mut alive = Vec::new();
     let mut dead = Vec::new();
 
-    // Classify each touched server by readiness (not just process liveness —
-    // a stuck server is alive but not ready)
+    // Classify each touched instance by readiness (not just process liveness —
+    // a stuck server is alive but not ready). Both `Healthy` and `Probing`
+    // mean the server is accepting requests — `Probing` just hasn't received
+    // a successful response yet.
     let clients = client_manager.clients().await;
-    for lang in touched_servers {
-        let ready = if let Some((_, c)) = clients.iter().find(|(k, _)| k.language_id == *lang) {
+    for key in touched_instances {
+        let ready = if let Some(c) = clients.get(key) {
             let client = c.lock().await;
             matches!(
                 client.lifecycle(),
                 crate::lsp::state::ServerLifecycle::Healthy
+                    | crate::lsp::state::ServerLifecycle::Probing
             )
         } else {
             false
         };
 
         if ready {
-            alive.push(lang.clone());
+            alive.push(key.clone());
         } else {
-            dead.push(lang.clone());
+            dead.push(key.clone());
         }
     }
 
@@ -61,28 +65,36 @@ pub(super) async fn check_server_health(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Recovery: previously unavailable, now alive
-    for lang in &alive {
-        if notified.remove(lang.as_str()) {
+    for key in &alive {
+        if notified.remove(key) {
             tracing::warn!(
                 source = "lsp.lifecycle",
-                language = lang.as_str(),
-                "Language server back online: {lang} \u{2014} \
+                language = key.language_id.as_str(),
+                server = key.server.as_str(),
+                "Language server back online: {} ({}) \u{2014} \
                  diagnostics and language server enrichment re-enabled for \
-                 {lang} files."
+                 {} files.",
+                key.language_id,
+                key.server,
+                key.language_id,
             );
         }
     }
 
     // Unavailable: newly dead or stuck, not yet reported
-    for lang in &dead {
-        if notified.insert(lang.clone()) {
+    for key in &dead {
+        if notified.insert(key.clone()) {
             tracing::warn!(
                 source = "lsp.lifecycle",
-                language = lang.as_str(),
-                "Language server unavailable: {lang} \u{2014} \
-                 diagnostics unavailable for {lang} files. \
+                language = key.language_id.as_str(),
+                server = key.server.as_str(),
+                "Language server unavailable: {} ({}) \u{2014} \
+                 diagnostics unavailable for {} files. \
                  grep and glob still work but without \
-                 language server enrichment."
+                 language server enrichment.",
+                key.language_id,
+                key.server,
+                key.language_id,
             );
         }
     }
@@ -305,5 +317,263 @@ impl ToolHandler for McpRouter {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+    use crate::bridge::filesystem_manager::FilesystemManager;
+    use crate::config::{Config, LanguageConfig, ServerBinding, ServerDef};
+    use crate::logging::LoggingServer;
+    use crate::lsp::instance_key::{InstanceKey, Scope};
+    use std::collections::HashMap;
+
+    const MOCK_LANG: &str = "hK9Qz";
+
+    fn test_logging() -> LoggingServer {
+        LoggingServer::new()
+    }
+
+    fn test_fs_with_roots(roots: &[&str]) -> Arc<FilesystemManager> {
+        let fs = Arc::new(FilesystemManager::new());
+        fs.set_roots(roots.iter().map(PathBuf::from).collect());
+        fs
+    }
+
+    fn mockls_bin() -> PathBuf {
+        let test_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .map(|p| p.join("mockls"));
+        test_exe.unwrap_or_else(|| PathBuf::from("mockls"))
+    }
+
+    fn single_server_config() -> Config {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG}");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG.to_string(), "--workspace-folders".to_string()],
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
+            },
+        );
+        Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        }
+    }
+
+    fn two_server_config() -> Config {
+        let bin = mockls_bin();
+        let server_a = format!("mockls-{MOCK_LANG}-a");
+        let server_b = format!("mockls-{MOCK_LANG}-b");
+        let mut server = HashMap::new();
+        for name in [&server_a, &server_b] {
+            server.insert(
+                name.clone(),
+                ServerDef {
+                    command: bin.to_string_lossy().to_string(),
+                    args: vec![MOCK_LANG.to_string(), "--workspace-folders".to_string()],
+                    initialization_options: None,
+                    settings: None,
+                    min_severity: None,
+                    file_patterns: Vec::new(),
+                    compiled_patterns: Vec::new(),
+                },
+            );
+        }
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_a), ServerBinding::new(server_b)],
+                ..LanguageConfig::default()
+            },
+        );
+        Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        }
+    }
+
+    // ─── check_server_health tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_check_multi_server_one_dead() {
+        // Two servers for the same language: one spawned (healthy via
+        // get_client), one fabricated key (not in client map → dead).
+        // Only the dead server should be reported offline.
+        let config = two_server_config();
+        let bindings: Vec<String> = config
+            .resolve_language(MOCK_LANG)
+            .expect("lang config")
+            .servers
+            .iter()
+            .map(|b| b.name.clone())
+            .collect();
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+
+        // Spawn a server via get_client (extension fallback: .hK9Qz → config key)
+        // and wait for it to become healthy before checking health.
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG}"));
+        manager
+            .get_client(&path)
+            .await
+            .expect("spawn via get_client");
+        manager.wait_ready_for_path(&path).await;
+
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1);
+        let healthy_key: InstanceKey = clients.keys().next().expect("one client").clone();
+
+        // Fabricate a key for the second (unspawned) server.
+        let dead_key =
+            InstanceKey::new(MOCK_LANG.to_string(), bindings[1].clone(), Scope::Workspace);
+
+        let notified = std::sync::Mutex::new(HashSet::<InstanceKey>::new());
+
+        check_server_health(
+            &manager,
+            &[healthy_key.clone(), dead_key.clone()],
+            &notified,
+        )
+        .await;
+
+        let set = notified.lock().expect("lock");
+        assert!(set.contains(&dead_key), "dead server should be reported");
+        assert!(
+            !set.contains(&healthy_key),
+            "healthy server should NOT be reported"
+        );
+        assert_eq!(set.len(), 1);
+        drop(set);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_recovery() {
+        // Pre-populate notified_offline with a server that is now healthy.
+        // check_server_health should remove it from the set.
+        let manager = LspClientManager::new(
+            single_server_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG}"));
+        manager
+            .get_client(&path)
+            .await
+            .expect("spawn via get_client");
+        manager.wait_ready_for_path(&path).await;
+
+        let clients = manager.clients().await;
+        let healthy_key: InstanceKey = clients.keys().next().expect("one client").clone();
+
+        // Pre-populate: this server was previously offline.
+        let notified = std::sync::Mutex::new(HashSet::from([healthy_key.clone()]));
+
+        check_server_health(&manager, std::slice::from_ref(&healthy_key), &notified).await;
+
+        let set = notified.lock().expect("lock");
+        assert!(
+            !set.contains(&healthy_key),
+            "recovered server should be removed from notified_offline"
+        );
+        assert!(set.is_empty());
+        drop(set);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_both_dead() {
+        // Two fabricated keys (neither in client map) → both reported.
+        let manager = LspClientManager::new(
+            two_server_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let key_a = InstanceKey::new(
+            MOCK_LANG.to_string(),
+            format!("mockls-{MOCK_LANG}-a"),
+            Scope::Workspace,
+        );
+        let key_b = InstanceKey::new(
+            MOCK_LANG.to_string(),
+            format!("mockls-{MOCK_LANG}-b"),
+            Scope::Workspace,
+        );
+
+        let notified = std::sync::Mutex::new(HashSet::<InstanceKey>::new());
+
+        check_server_health(&manager, &[key_a.clone(), key_b.clone()], &notified).await;
+
+        let set = notified.lock().expect("lock");
+        assert!(set.contains(&key_a), "first dead server should be reported");
+        assert!(
+            set.contains(&key_b),
+            "second dead server should be reported"
+        );
+        assert_eq!(set.len(), 2);
+        drop(set);
+    }
+
+    #[tokio::test]
+    async fn test_notified_offline_dedup_by_instance_key() {
+        // Calling twice with the same dead key should not produce
+        // duplicate entries — the second call is a no-op.
+        let manager = LspClientManager::new(
+            two_server_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let dead_key = InstanceKey::new(
+            MOCK_LANG.to_string(),
+            format!("mockls-{MOCK_LANG}-a"),
+            Scope::Workspace,
+        );
+
+        let notified = std::sync::Mutex::new(HashSet::<InstanceKey>::new());
+
+        // First call: inserts.
+        check_server_health(&manager, std::slice::from_ref(&dead_key), &notified).await;
+        assert_eq!(notified.lock().expect("lock").len(), 1);
+
+        // Second call: key already present, no duplicate.
+        check_server_health(&manager, std::slice::from_ref(&dead_key), &notified).await;
+        assert_eq!(notified.lock().expect("lock").len(), 1);
     }
 }
