@@ -776,6 +776,11 @@ impl MockServer {
         }))
     }
 
+    /// Returns null for declaration keywords (`fn`, `struct`, `class`, etc.)
+    /// and a range for everything else. The keyword list is specifically
+    /// words that introduce definitions — general keywords like `if`, `for`,
+    /// `while` are NOT filtered and will return a range via the
+    /// first-occurrence fallback.
     fn handle_prepare_rename(&self, params: &Value) -> Option<Value> {
         let (uri, line, col) = extract_position(params)?;
         let content = self.documents.get(uri)?;
