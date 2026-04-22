@@ -446,13 +446,9 @@ impl GrepServer {
     /// When `from_ts` is false (no-grammar path), calls `prepareRename` first
     /// to filter keywords.
     ///
-    /// Opens the document once on the first capable server and keeps it open
-    /// for all enrichment calls, closing at the end. This avoids rapid
-    /// `didOpen`/`didClose` cycling that can cause document lifecycle issues.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Single open/close cycle for all enrichment"
-    )]
+    /// Each LSP method uses its own priority chain dispatch via
+    /// [`fetch_references`], [`fetch_call_hierarchy`], etc. Different
+    /// servers may support different capabilities.
     async fn enrich_at_position(
         &self,
         path: &Path,
@@ -470,70 +466,110 @@ impl GrepServer {
             return None;
         }
 
-        // Use `supports_references` as the broadest capability to find the
-        // primary server. Most servers that support references also support
-        // the other enrichment capabilities.
+        let ref_lines = self.fetch_references(path, line_0, col, parent_id).await;
+        let (incoming_calls, outgoing_calls) = self
+            .fetch_call_hierarchy(path, line_0, col, parent_id)
+            .await;
+        let implementations = self
+            .fetch_implementations(path, line_0, col, parent_id)
+            .await;
+        let (supertypes, subtypes) = self
+            .fetch_type_hierarchy(path, line_0, col, parent_id)
+            .await;
+
+        Some(SymbolEnrichment {
+            ref_lines,
+            incoming_calls,
+            outgoing_calls,
+            implementations,
+            supertypes,
+            subtypes,
+        })
+    }
+
+    /// Fetches references via priority chain dispatch.
+    ///
+    /// Opens the document on the first capable server, makes the call,
+    /// and closes. Tries the next server on error.
+    async fn fetch_references(
+        &self,
+        path: &Path,
+        line_0: u32,
+        col: u32,
+        parent_id: Option<i64>,
+    ) -> HashMap<String, HashSet<u32>> {
         let servers = self
             .client_manager
             .get_servers(path, LspServer::supports_references)
             .await;
 
-        if servers.is_empty() {
-            return Some(SymbolEnrichment {
-                ref_lines: HashMap::new(),
-                incoming_calls: Vec::new(),
-                outgoing_calls: Vec::new(),
-                implementations: Vec::new(),
-                supertypes: Vec::new(),
-                subtypes: Vec::new(),
-            });
-        }
+        for client_mutex in &servers {
+            let Ok(uri) = self
+                .client_manager
+                .open_document_on(path, client_mutex, parent_id)
+                .await
+            else {
+                continue;
+            };
 
-        let client_mutex = &servers[0];
-        let Ok(uri) = self
-            .client_manager
-            .open_document_on(path, client_mutex, parent_id)
-            .await
-        else {
-            return Some(SymbolEnrichment {
-                ref_lines: HashMap::new(),
-                incoming_calls: Vec::new(),
-                outgoing_calls: Vec::new(),
-                implementations: Vec::new(),
-                supertypes: Vec::new(),
-                subtypes: Vec::new(),
-            });
-        };
+            let result = {
+                let mut client = client_mutex.lock().await;
+                client.set_parent_id(parent_id);
+                client.references(&uri, line_0, col, true).await
+            };
+            self.client_manager.close_document(&uri, client_mutex).await;
 
-        // --- references ---
-        let ref_lines = {
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
-            match client.references(&uri, line_0, col, true).await {
+            match result {
                 Ok(Value::Array(refs)) => {
-                    let mut map: HashMap<String, HashSet<u32>> = HashMap::new();
+                    let mut ref_lines: HashMap<String, HashSet<u32>> = HashMap::new();
                     for r in &refs {
                         if let Some(file) = extract_location_path(r)
                             && let Some(line) = extract_start_line(r)
                         {
-                            map.entry(file).or_default().insert(line);
+                            ref_lines.entry(file).or_default().insert(line);
                         }
                     }
-                    map
+                    return ref_lines;
                 }
-                Ok(_) => HashMap::new(),
+                Ok(_) => {}
                 Err(e) => {
                     warn!(source = "lsp.dispatch", "references failed: {e}");
-                    HashMap::new()
                 }
             }
-        };
+        }
 
-        // --- call hierarchy ---
-        let (incoming_calls, outgoing_calls) = {
+        HashMap::new()
+    }
+
+    /// Fetches incoming and outgoing calls via priority chain dispatch.
+    ///
+    /// Opens the document, runs the full prepare → incoming → outgoing
+    /// sequence on a single server, then closes.
+    async fn fetch_call_hierarchy(
+        &self,
+        path: &Path,
+        line_0: u32,
+        col: u32,
+        parent_id: Option<i64>,
+    ) -> (Vec<CallEdge>, Vec<CallEdge>) {
+        let servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_call_hierarchy)
+            .await;
+
+        for client_mutex in &servers {
+            let Ok(uri) = self
+                .client_manager
+                .open_document_on(path, client_mutex, parent_id)
+                .await
+            else {
+                continue;
+            };
+
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
-            let result = match client.prepare_call_hierarchy(&uri, line_0, col).await {
+            let prepare = client.prepare_call_hierarchy(&uri, line_0, col).await;
+            let result = match prepare {
                 Ok(Value::Array(ref items)) if !items.is_empty() => {
                     let item = &items[0];
                     let incoming = match client.incoming_calls(item).await {
@@ -550,47 +586,107 @@ impl GrepServer {
                             .collect(),
                         _ => Vec::new(),
                     };
-                    (incoming, outgoing)
+                    Some((incoming, outgoing))
                 }
-                Ok(_) => (Vec::new(), Vec::new()),
+                Ok(_) => None,
                 Err(e) => {
                     warn!(
                         source = "lsp.dispatch",
                         "prepare_call_hierarchy failed: {e}"
                     );
-                    (Vec::new(), Vec::new())
+                    None
                 }
             };
             drop(client);
-            result
-        };
+            self.client_manager.close_document(&uri, client_mutex).await;
 
-        // --- implementations ---
-        let implementations = {
-            let mut client = client_mutex.lock().await;
-            client.set_parent_id(parent_id);
-            match client.implementation(&uri, line_0, col).await {
-                Ok(Value::Array(locs)) => locs
-                    .iter()
-                    .filter_map(|loc| {
-                        let file = extract_location_path(loc)?;
-                        let line = extract_start_line(loc)?;
-                        Some((file, line))
-                    })
-                    .collect(),
-                Ok(_) => Vec::new(),
+            if let Some(calls) = result {
+                return calls;
+            }
+        }
+
+        (Vec::new(), Vec::new())
+    }
+
+    /// Fetches implementation locations via priority chain dispatch.
+    async fn fetch_implementations(
+        &self,
+        path: &Path,
+        line_0: u32,
+        col: u32,
+        parent_id: Option<i64>,
+    ) -> Vec<(String, u32)> {
+        let servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_implementation)
+            .await;
+
+        for client_mutex in &servers {
+            let Ok(uri) = self
+                .client_manager
+                .open_document_on(path, client_mutex, parent_id)
+                .await
+            else {
+                continue;
+            };
+
+            let result = {
+                let mut client = client_mutex.lock().await;
+                client.set_parent_id(parent_id);
+                client.implementation(&uri, line_0, col).await
+            };
+            self.client_manager.close_document(&uri, client_mutex).await;
+
+            match result {
+                Ok(Value::Array(locs)) => {
+                    return locs
+                        .iter()
+                        .filter_map(|loc| {
+                            let file = extract_location_path(loc)?;
+                            let line = extract_start_line(loc)?;
+                            Some((file, line))
+                        })
+                        .collect();
+                }
+                Ok(_) => {}
                 Err(e) => {
                     warn!(source = "lsp.dispatch", "implementation failed: {e}");
-                    Vec::new()
                 }
             }
-        };
+        }
 
-        // --- type hierarchy ---
-        let (supertypes, subtypes) = {
+        Vec::new()
+    }
+
+    /// Fetches supertypes and subtypes via priority chain dispatch.
+    ///
+    /// Opens the document, runs the full prepare → supertypes → subtypes
+    /// sequence on a single server, then closes.
+    async fn fetch_type_hierarchy(
+        &self,
+        path: &Path,
+        line_0: u32,
+        col: u32,
+        parent_id: Option<i64>,
+    ) -> (Vec<TypeEdge>, Vec<TypeEdge>) {
+        let servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_type_hierarchy)
+            .await;
+
+        for client_mutex in &servers {
+            let Ok(uri) = self
+                .client_manager
+                .open_document_on(path, client_mutex, parent_id)
+                .await
+            else {
+                continue;
+            };
+
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
-            let result = match client.prepare_type_hierarchy(&uri, line_0, col).await {
+            let prepare = client.prepare_type_hierarchy(&uri, line_0, col).await;
+            let result = match prepare {
                 Ok(Value::Array(ref items)) if !items.is_empty() => {
                     let item = &items[0];
                     let supertypes = match client.supertypes(item).await {
@@ -605,32 +701,26 @@ impl GrepServer {
                         }
                         _ => Vec::new(),
                     };
-                    (supertypes, subtypes)
+                    Some((supertypes, subtypes))
                 }
-                Ok(_) => (Vec::new(), Vec::new()),
+                Ok(_) => None,
                 Err(e) => {
                     warn!(
                         source = "lsp.dispatch",
                         "prepare_type_hierarchy failed: {e}"
                     );
-                    (Vec::new(), Vec::new())
+                    None
                 }
             };
             drop(client);
-            result
-        };
+            self.client_manager.close_document(&uri, client_mutex).await;
 
-        // Close the document once, after all enrichment calls.
-        self.client_manager.close_document(&uri, client_mutex).await;
+            if let Some(types) = result {
+                return types;
+            }
+        }
 
-        Some(SymbolEnrichment {
-            ref_lines,
-            incoming_calls,
-            outgoing_calls,
-            implementations,
-            supertypes,
-            subtypes,
-        })
+        (Vec::new(), Vec::new())
     }
 
     /// Searches workspace roots for pattern matches using the `grep-*` crates
