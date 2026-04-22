@@ -68,7 +68,7 @@ tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = "0.7"
-tree-sitter = "0.24"
+tree-sitter = "0.26"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 unicode-width = "0.2"

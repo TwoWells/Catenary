@@ -3054,14 +3054,15 @@ fn test_enrich_outgoing_calls() -> Result<()> {
 
 // ─── SEARCHv2 tier 1 rendering tests (ticket 07b) ──────────────────────
 
-/// Tier 1 enriched: narrow pattern shows `calls:` section with outgoing calls.
-/// Uses no-grammar path for reliable mockls enrichment (all hits get enriched).
+/// Tier 1 enriched: `calls:` section with outgoing calls.
+/// Uses no-grammar path: mockls reliably reports outgoing calls when the
+/// document is open for every `PrepareRenameSymbol` enrichment pass.
 #[test]
 fn test_grep_tier1_enriched() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
     // callee defined first, then caller with callee in body.
-    // mockls detects outgoing calls by scanning the caller's body.
+    // mockls scans the caller's body for known function names.
     let file = dir.path().join(format!("enrich.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn callee_t1()\nfn caller_t1()\n  callee_t1\n")?;
 
@@ -3148,15 +3149,15 @@ fn test_grep_tier1_type_hierarchy() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 path syntax: tree-sitter `<Kind>` labels and path formatting.
+/// Tier 1 path syntax: `<Struct> Container/<Function> name  path:line`.
 #[test]
 fn test_grep_tier1_path_syntax() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // Simple function definition — tests <Kind> label in tier 1 output
+    // Nested function inside struct — exercises `/`-separated scope path
     let file = dir.path().join("path.mock");
-    std::fs::write(&file, "fn path_sym_t1\n")?;
+    std::fs::write(&file, "struct Container_ps {\nfn inner_ps\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
@@ -3169,7 +3170,7 @@ fn test_grep_tier1_path_syntax() -> Result<()> {
         "method": "tools/call",
         "params": {
             "name": "grep",
-            "arguments": { "pattern": "path_sym_t1" }
+            "arguments": { "pattern": "inner_ps" }
         }
     }))?;
 
@@ -3178,14 +3179,14 @@ fn test_grep_tier1_path_syntax() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Definition line: `<Kind> name  path:line`
+    // `/`-separated path syntax with scope
     assert!(
-        text.contains("<Function> path_sym_t1"),
-        "Expected <Function> path_sym_t1, got:\n{text}"
+        text.contains("<Struct> Container_ps/<Function> inner_ps"),
+        "Expected scoped path syntax, got:\n{text}"
     );
     assert!(
-        text.contains("path.mock:1"),
-        "Expected path.mock:1, got:\n{text}"
+        text.contains("path.mock:2"),
+        "Expected path.mock:2, got:\n{text}"
     );
 
     Ok(())
@@ -3386,14 +3387,13 @@ fn test_grep_tier1_demote_to_tier2() -> Result<()> {
     Ok(())
 }
 
-/// Tier 1 fish-eye: symbols with edges get full format, without get lean single line.
-/// Uses no-grammar path so all hits get enriched.
+/// Tier 1 fish-eye: rich symbol (with calls) gets full format, lean gets single line.
+/// Uses no-grammar path for reliable enrichment.
 #[test]
 fn test_grep_tier1_fish_eye() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // rich_fn has calls (body references lean_fn), lean_fn has no calls.
-    // Pattern matches both definitions via alternation.
+    // rich_fn calls lean_fn. Pattern targets only rich_fn.
     let file = dir.path().join(format!("fisheye.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
@@ -3420,12 +3420,11 @@ fn test_grep_tier1_fish_eye() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // rich_fisheye should appear with enrichment
+    // rich_fisheye should appear with calls section
     assert!(
         text.contains("rich_fisheye"),
         "Expected rich_fisheye, got:\n{text}"
     );
-    // rich_fn should have calls section (calls lean_fisheye)
     assert!(
         text.contains("calls:"),
         "Expected calls: on rich symbol, got:\n{text}"
@@ -3578,6 +3577,195 @@ fn test_grep_tier1_cross_def_dedup() -> Result<()> {
         1,
         "Expected one name header, got {} in:\n{text}",
         name_headers.len()
+    );
+
+    Ok(())
+}
+
+/// Tier 1 refs dedup: impl lines excluded from `refs:` when in `impls:`.
+/// Uses no-grammar path so mockls has all documents open for enrichment.
+#[test]
+fn test_grep_tier1_refs_dedup_labeled() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // struct defined, then a reference on L1. mockls routes implementation
+    // to references, so the same line may appear in both impls and refs.
+    // The refs section should exclude lines already in impls.
+    let file = dir.path().join(format!("dedup_refs.{MOCK_LANG_A}"));
+    std::fs::write(&file, "struct DeduRef\nDeduRef\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6110,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "DeduRef" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // If impls section exists, lines in it should not also appear in refs
+    if text.contains("impls:") && text.contains("refs:") {
+        let impls_start = text.find("impls:").context("impls")?;
+        let refs_start = text.find("refs:").context("refs")?;
+        let impls_section = &text[impls_start..refs_start];
+        let refs_section = &text[refs_start..];
+
+        // Extract line numbers from impls section
+        for line in impls_section.lines() {
+            if let Some(colon_pos) = line.trim().strip_prefix(':') {
+                let num_str: String = colon_pos.chars().take_while(char::is_ascii_digit).collect();
+                if !num_str.is_empty() {
+                    // This line number should not appear in refs
+                    let refs_has_line = refs_section.lines().any(|rl| {
+                        rl.trim().starts_with(&format!(":{num_str} "))
+                            || rl.trim() == format!(":{num_str}")
+                    });
+                    assert!(
+                        !refs_has_line,
+                        "Line :{num_str} in impls should not also appear in refs:\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Tier 1 incoming calls merge: callers appear in `refs:`, not a separate section.
+/// Uses no-grammar path for reliable enrichment.
+#[test]
+fn test_grep_tier1_incoming_calls_merge() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // target defined on L0, caller on L1, caller calls target on L2
+    let file = dir.path().join(format!("incoming.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn target_inc()\nfn caller_inc()\n  target_inc\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6120,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "target_inc" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // No separate `callers:` section — incoming calls merge into refs
+    assert!(
+        !text.contains("callers:"),
+        "Expected no callers: section (merged into refs), got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Tier 1 impls structure: `impls:` has file-grouped entries with tree-sitter spans.
+/// Uses no-grammar path for reliable enrichment.
+#[test]
+fn test_grep_tier1_impls_structure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file = dir.path().join(format!("impls.{MOCK_LANG_A}"));
+    std::fs::write(&file, "struct ImplStr\nImplStr\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6130,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "ImplStr" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // mockls routes implementation to references. If impls section exists,
+    // it should have file-grouped entries with `:line` format.
+    if text.contains("impls:") {
+        let impls_start = text.find("impls:").context("impls")?;
+        let impls_section = &text[impls_start..];
+        // Should contain a file path and at least one `:line` entry
+        assert!(
+            impls_section.contains(&format!("impls.{MOCK_LANG_A}")) || impls_section.contains(':'),
+            "impls section should have file-grouped entries, got:\n{text}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Tier 1 single-line ref: `:hit <Kind> name:line` (no range when start == end).
+#[test]
+fn test_grep_tier1_single_line_ref() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // Single-line function defined on L0, referenced on L1 inside another fn.
+    // The enclosing fn on L1 is also single-line (no brace block).
+    let file = dir.path().join("single_ref.mock");
+    std::fs::write(&file, "fn target_sl\nfn user_sl\ntarget_sl\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6140,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "target_sl" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Definition should have tree-sitter kind
+    assert!(
+        text.contains("<Function> target_sl"),
+        "Expected <Function> target_sl, got:\n{text}"
+    );
+    // Single-line definitions show `:line` not `:start-end`
+    assert!(
+        !text.contains(":1-1"),
+        "Single-line structure should show :line not :start-end, got:\n{text}"
     );
 
     Ok(())

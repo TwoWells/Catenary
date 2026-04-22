@@ -887,14 +887,18 @@ fn render_tier1(
 
     // Step 2: Cross-definition dedup.
     //
-    // Suppress definitions whose location appears in another definition's
-    // `impls:` section. This prevents `<Impl> Foo` from appearing as a
-    // standalone definition when the struct's `impls:` already lists it.
-    // A definition is only suppressed if its dominator is not itself
-    // suppressed (prevents mutual suppression cycles).
+    // Suppress definitions whose location appears in any labeled section
+    // (calls, impls, supertypes, subtypes) of another enriched definition.
+    // If the agent already sees a location in a labeled section, repeating
+    // it as a standalone definition is noise.
+    //
+    // Cycle guard: if A appears in B's labeled section AND B appears in
+    // A's, neither is suppressed — they're peers, not parent/child.
     let suppressed: HashSet<(String, u32)> = {
-        // Map each impl location → its dominator (the definition that lists it).
-        let mut impl_locs: HashMap<(String, u32), (String, u32)> = HashMap::new();
+        // Map each labeled location → its dominator (the definition whose
+        // section lists it). First writer wins — if two definitions both
+        // list the same location, the first one encountered dominates.
+        let mut labeled_locs: HashMap<(String, u32), (String, u32)> = HashMap::new();
         for (hit, enrichment) in enrichments {
             let Some(e) = enrichment else { continue };
             let hit_file = hit.file.to_string_lossy().to_string();
@@ -902,23 +906,37 @@ fn render_tier1(
                 HitClass::Symbol { symbol } => symbol.line,
                 _ => hit.line,
             };
+            let dominator = (hit_file, hit_line);
+            for c in &e.outgoing_calls {
+                labeled_locs
+                    .entry((c.file.clone(), c.line))
+                    .or_insert_with(|| dominator.clone());
+            }
             for (f, l) in &e.implementations {
-                impl_locs
+                labeled_locs
                     .entry((f.clone(), *l))
-                    .or_insert_with(|| (hit_file.clone(), hit_line));
+                    .or_insert_with(|| dominator.clone());
+            }
+            for t in &e.supertypes {
+                labeled_locs
+                    .entry((t.file.clone(), t.line))
+                    .or_insert_with(|| dominator.clone());
+            }
+            for t in &e.subtypes {
+                labeled_locs
+                    .entry((t.file.clone(), t.line))
+                    .or_insert_with(|| dominator.clone());
             }
         }
 
         // Only suppress if the dominator is not itself dominated (no cycles).
-        impl_locs
+        labeled_locs
             .keys()
             .filter(|loc| {
-                let Some(dom) = impl_locs.get(loc) else {
+                let Some(dom) = labeled_locs.get(loc) else {
                     return true;
                 };
-                // If the dominator is also dominated by someone, skip
-                // suppression to avoid mutual elimination.
-                !impl_locs.contains_key(dom)
+                !labeled_locs.contains_key(dom)
             })
             .cloned()
             .collect()

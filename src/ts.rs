@@ -873,6 +873,127 @@ mod tests {
         assert!(!index.has_children(&workspace.path().join("test.mock"), "my_method"));
     }
 
+    /// Brace-delimited blocks: functions inside struct blocks get correct scope.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_brace_block_scoping() {
+        let (_data_dir, grammar_base) = install_mock_grammar();
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(
+            workspace.path().join("scoped.mock"),
+            "fn callee\nfn caller {\ncallee\n}\n",
+        )
+        .expect("write test file");
+
+        let index =
+            TsIndex::build_with_grammar_dir(&[workspace.path().to_path_buf()], &grammar_base)
+                .expect("build index");
+
+        let results = index.query(".*", None).expect("query all");
+        let names: Vec<&str> = results.iter().map(|(_, s)| s.name.as_str()).collect();
+        assert!(names.contains(&"callee"), "expected callee: {names:?}");
+        assert!(names.contains(&"caller"), "expected caller: {names:?}");
+
+        let caller = results
+            .iter()
+            .find(|(_, s)| s.name == "caller")
+            .expect("caller");
+        assert_eq!(caller.1.line, 1, "caller should be at line 1");
+        // caller with block should span multiple lines
+        assert!(
+            caller.1.end_line > caller.1.line,
+            "caller block should span multiple lines: end_line={}",
+            caller.1.end_line
+        );
+    }
+
+    /// Nested definition: function inside struct block gets scope.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_nested_definition_scope() {
+        let (_data_dir, grammar_base) = install_mock_grammar();
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(
+            workspace.path().join("nested.mock"),
+            "struct Outer {\nfn inner\n}\n",
+        )
+        .expect("write test file");
+
+        let index =
+            TsIndex::build_with_grammar_dir(&[workspace.path().to_path_buf()], &grammar_base)
+                .expect("build index");
+
+        let results = index.query(".*", None).expect("query all");
+        let all_names: Vec<(&str, &str, u32, u32)> = results
+            .iter()
+            .map(|(_, s)| (s.name.as_str(), s.kind.as_str(), s.line, s.end_line))
+            .collect();
+
+        // Verify Outer struct spans the full block (line 0 to line 2)
+        let outer = results
+            .iter()
+            .find(|(_, s)| s.name == "Outer")
+            .expect("Outer");
+        assert_eq!(outer.1.kind, "struct");
+        assert_eq!(outer.1.line, 0, "Outer should start at line 0");
+        assert!(
+            outer.1.end_line >= 2,
+            "Outer should span to at least line 2 (closing brace), got end_line={}",
+            outer.1.end_line
+        );
+
+        assert!(
+            results.iter().any(|(_, s)| s.name == "inner"),
+            "inner not found, all symbols: {all_names:?}"
+        );
+        let inner = results
+            .iter()
+            .find(|(_, s)| s.name == "inner")
+            .expect("inner");
+        assert_eq!(inner.1.line, 1, "inner should be at line 1");
+        assert_eq!(
+            inner.1.scope.as_deref(),
+            Some("Outer"),
+            "inner should be scoped by Outer"
+        );
+        assert_eq!(
+            inner.1.scope_kind.as_deref(),
+            Some("struct"),
+            "scope kind should be struct"
+        );
+    }
+
+    /// Reproduce the exact content from the `tier1_enriched` integration test.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_brace_block_with_reference() {
+        let (_data_dir, grammar_base) = install_mock_grammar();
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        // Same content as test_grep_tier1_enriched
+        std::fs::write(
+            workspace.path().join("enrich.mock"),
+            "fn callee_t1\nfn caller_t1 {\ncallee_t1\n}\n",
+        )
+        .expect("write test file");
+
+        let index =
+            TsIndex::build_with_grammar_dir(&[workspace.path().to_path_buf()], &grammar_base)
+                .expect("build index");
+
+        let results = index.query("caller_t1", None).expect("query");
+        assert!(
+            !results.is_empty(),
+            "expected caller_t1 in index, got empty"
+        );
+        let (_, sym) = &results[0];
+        assert_eq!(sym.name, "caller_t1");
+        assert_eq!(sym.kind, "function");
+        assert_eq!(sym.line, 1, "caller_t1 should be at line 1");
+    }
+
     // --- Query and update tests ---
 
     /// Build a `TsIndex` with the mock grammar over a workspace directory.

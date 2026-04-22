@@ -1,4 +1,14 @@
 {
+  "metadata": {
+    "version": "0.0.1",
+    "license": "MIT",
+    "authors": [
+      { "name": "Test" }
+    ],
+    "links": {
+      "repository": "https://github.com/test/tree-sitter-mock"
+    }
+  },
   "grammars": [
     {
       "name": "mock",

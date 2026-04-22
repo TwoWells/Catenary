@@ -612,6 +612,10 @@ mod tests {
         let language = catenary_ts::load_grammar(&lib_path, "tree_sitter_mock")
             .expect("load_grammar should succeed");
 
-        assert_eq!(language.version(), 14, "grammar version should be 14");
+        assert!(
+            language.abi_version() >= 14,
+            "grammar ABI version should be at least 14, got {}",
+            language.abi_version()
+        );
     }
 }
