@@ -11,354 +11,19 @@
 //! These tests spawn the actual bridge binary and communicate with it
 //! via stdin/stdout using the MCP protocol.
 
-use std::io::{BufRead, BufReader, Read, Write};
+mod common;
+
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use serde_json::json;
+
+use common::{BridgeProcess, isolate_env, mockls_lsp_arg};
 
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
-
-/// Isolates a subprocess from the user's environment.
-///
-/// Sets `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` to the
-/// given root so the process uses the test's tempdir instead of
-/// `~/.config`, `~/.local/state`, or `~/.local/share`. Clears all
-/// `CATENARY_*` env vars that could leak from the user's shell and
-/// override test-specific settings.
-///
-/// All integration test subprocesses (bridge, `catenary install`, etc.)
-/// must call this. Callers set `CATENARY_SERVERS`, `CATENARY_ROOTS`, or
-/// `CATENARY_CONFIG` explicitly after this call.
-fn isolate_env(cmd: &mut Command, root: &str) {
-    cmd.env("XDG_CONFIG_HOME", root);
-    cmd.env("XDG_STATE_HOME", root);
-    cmd.env("XDG_DATA_HOME", root);
-    cmd.env_remove("CATENARY_STATE_DIR");
-    cmd.env_remove("CATENARY_DATA_DIR");
-    cmd.env_remove("CATENARY_CONFIG");
-    cmd.env_remove("CATENARY_SERVERS");
-    cmd.env_remove("CATENARY_ROOTS");
-}
-
-/// Helper to spawn the bridge and communicate with it
-struct BridgeProcess {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: Option<BufReader<std::process::ChildStdout>>,
-    stderr: Option<std::process::ChildStderr>,
-    state_home: Option<String>,
-}
-
-impl BridgeProcess {
-    fn spawn(lsp_commands: &[&str], root: &str) -> Result<Self> {
-        Self::spawn_multi_root(lsp_commands, &[root])
-    }
-
-    fn spawn_multi_root(lsp_commands: &[&str], roots: &[&str]) -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-
-        // Clear inherited env first, then set test-specific values
-        if let Some(first_root) = roots.first() {
-            isolate_env(&mut cmd, first_root);
-        }
-        cmd.env("CATENARY_SERVERS", lsp_commands.join(";"));
-        let roots_val = std::env::join_paths(roots).unwrap_or_default();
-        cmd.env("CATENARY_ROOTS", &roots_val);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-        let stderr = child.stderr.take();
-
-        let state_home = roots.first().map(std::string::ToString::to_string);
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            stderr,
-            state_home,
-        })
-    }
-
-    /// Spawn using a TOML config file instead of `CATENARY_SERVERS`.
-    ///
-    /// Required for multi-server-per-language tests where each server
-    /// needs different flags.
-    fn spawn_with_config(config_path: &std::path::Path, root: &str) -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        isolate_env(&mut cmd, root);
-        cmd.env("CATENARY_CONFIG", config_path);
-        cmd.env("CATENARY_ROOTS", root);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-        let stderr = child.stderr.take();
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            stderr,
-            state_home: Some(root.to_string()),
-        })
-    }
-
-    fn send(&mut self, request: &Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        let stdin = self.stdin.as_mut().context("Stdin already closed")?;
-        writeln!(stdin, "{json}").context("Failed to write to stdin")?;
-        stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let stdout = self.stdout.as_mut().context("Stdout already closed")?;
-        let n = stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        if n == 0 {
-            // EOF — bridge process died. Capture stderr and exit status.
-            let mut stderr_buf = String::new();
-            if let Some(ref mut stderr) = self.stderr {
-                let _ = stderr.read_to_string(&mut stderr_buf);
-            }
-            let status = self.child.try_wait().ok().flatten();
-            bail!(
-                "bridge process closed stdout (EOF). exit status: {status:?}, stderr:\n{stderr_buf}"
-            );
-        }
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "integration-test",
-                    "version": "1.0.0"
-                }
-            }
-        }))?;
-
-        let response = self.recv()?;
-        if response.get("result").is_none() {
-            bail!("Initialize failed: {response:?}");
-        }
-
-        // Send initialized notification
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))?;
-
-        // Small delay for notification processing
-        std::thread::sleep(Duration::from_millis(100));
-        Ok(())
-    }
-
-    /// Initializes with `roots.listChanged` capability.
-    ///
-    /// After sending `notifications/initialized`, reads the server's
-    /// `roots/list` request from stdout and responds with the given roots.
-    fn initialize_with_roots(&mut self, roots: &[&str]) -> Result<()> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "roots": { "listChanged": true }
-                },
-                "clientInfo": {
-                    "name": "integration-test",
-                    "version": "1.0.0"
-                }
-            }
-        }))?;
-
-        let response = self.recv()?;
-        if response.get("result").is_none() {
-            bail!("Initialize failed: {response:?}");
-        }
-
-        // Send initialized notification — this triggers the roots/list request
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))?;
-
-        // The server should send us a roots/list request
-        let roots_request = self.recv()?;
-        let method = roots_request
-            .get("method")
-            .and_then(|m| m.as_str())
-            .ok_or_else(|| anyhow!("Expected roots/list request, got: {roots_request:?}"))?;
-        if method != "roots/list" {
-            bail!("Expected roots/list, got {method}");
-        }
-        let request_id = roots_request
-            .get("id")
-            .ok_or_else(|| anyhow!("roots/list request missing id"))?
-            .clone();
-
-        // Respond with the provided roots
-        let root_objects: Vec<Value> = roots
-            .iter()
-            .map(|r| json!({"uri": format!("file://{r}")}))
-            .collect();
-
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": { "roots": root_objects }
-        }))?;
-
-        // Small delay for processing
-        std::thread::sleep(Duration::from_millis(100));
-        Ok(())
-    }
-
-    /// Enters editing mode, accumulates a file, then calls `done_editing`
-    /// via MCP to retrieve diagnostics from the tool result.
-    fn call_diagnostics(&mut self, file: &str) -> Result<String> {
-        let state_home = self
-            .state_home
-            .as_ref()
-            .context("state_home not set")?
-            .clone();
-        let sessions_dir = PathBuf::from(&state_home).join("catenary").join("sessions");
-        let socket_path = find_notify_socket(&sessions_dir)?;
-
-        // Enter editing mode via IPC
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/enforce-editing",
-                "tool_name": "start_editing",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Accumulate file via IPC
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "post-tool/diagnostics",
-                "file": file,
-                "tool": "Edit",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Call done_editing via MCP
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 9000,
-            "method": "tools/call",
-            "params": {
-                "name": "done_editing",
-                "arguments": {}
-            }
-        }))?;
-
-        let response = self.recv()?;
-        let text = response
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        Ok(text)
-    }
-}
-
-/// Sends a one-shot IPC request to the hook server. Ignores the response.
-fn ipc_request(socket_path: &std::path::Path, request: &Value) -> Result<()> {
-    use std::io::Read as _;
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    writeln!(stream, "{request}").context("write to notify socket")?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    Ok(())
-}
-
-/// Scans the sessions directory for a `notify.sock` file.
-fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
-            for entry in entries.flatten() {
-                let sock = entry.path().join("notify.sock");
-                if sock.exists() {
-                    return Ok(sock);
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            bail!(
-                "No notify.sock found in {} within 5s",
-                sessions_dir.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-impl Drop for BridgeProcess {
-    #[allow(clippy::print_stderr, reason = "dump bridge logs on test failure")]
-    fn drop(&mut self) {
-        // If the test is panicking, dump bridge stderr for diagnostics.
-        // This runs before we close stdin so the bridge is still alive
-        // and may have buffered log output.
-        if std::thread::panicking()
-            && let Some(ref mut stderr) = self.stderr
-        {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
-            if !buf.is_empty() {
-                eprintln!("--- bridge stderr (test panicked) ---\n{buf}--- end bridge stderr ---");
-            }
-        }
-
-        // Closing stdin signals the server to shut down gracefully
-        self.stdin.take();
-
-        // Wait for the process to exit naturally (up to 2 seconds)
-        for _ in 0..20 {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
-        // If still alive after timeout, kill it
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 #[test]
 fn test_mcp_initialize() -> Result<()> {
@@ -490,32 +155,12 @@ fn test_mcp_ping() -> Result<()> {
 
 #[test]
 fn test_client_info_stored_in_session() -> Result<()> {
-    let state_dir = tempfile::tempdir().context("Failed to create state dir")?;
+    let dir = tempfile::tempdir().context("Failed to create temp dir")?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
 
-    // Spawn bridge with isolated state dir so `catenary list` only sees this session
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-    cmd.env("CATENARY_SERVERS", &lsp)
-        .env("CATENARY_ROOTS", state_dir.path())
-        .env("XDG_CONFIG_HOME", state_dir.path())
-        .env("XDG_STATE_HOME", state_dir.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
 
-    let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-    let stdin = child.stdin.take().context("Failed to get stdin")?;
-    let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-    let stderr = child.stderr.take();
-    let mut bridge = BridgeProcess {
-        child,
-        stdin: Some(stdin),
-        stdout: Some(stdout),
-        stderr,
-        state_home: Some(state_dir.path().to_string_lossy().into_owned()),
-    };
-
-    // Send initialize with specific client info
+    // Send initialize with specific client info (not bridge.initialize())
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -536,10 +181,10 @@ fn test_client_info_stored_in_session() -> Result<()> {
     // Small delay to allow session update
     std::thread::sleep(Duration::from_millis(200));
 
-    // Run catenary list with the same isolated state dir
+    // Run catenary list with the bridge's isolated state dir
     let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
         .arg("list")
-        .env("XDG_STATE_HOME", state_dir.path())
+        .env("XDG_STATE_HOME", bridge.state_home())
         .output()
         .context("Failed to run catenary list")?;
 
@@ -972,16 +617,6 @@ fn install_mock_grammar(state_home: &str) -> Result<()> {
         bail!("catenary install failed: {stderr}");
     }
     Ok(())
-}
-
-/// Build a `CATENARY_SERVERS` spec for `BridgeProcess::spawn` using mockls.
-fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
-    let bin = env!("CARGO_BIN_EXE_mockls");
-    if flags.is_empty() {
-        format!("{lang}:{bin} {lang}")
-    } else {
-        format!("{lang}:{bin} {lang} {flags}")
-    }
 }
 
 #[test]
@@ -2565,9 +2200,6 @@ fn test_grep_kind_brackets() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // Install mock grammar into the test's state dir
-    install_mock_grammar(root)?;
-
     // Create a .mock file — the mock grammar parses `fn name` and `struct name`
     let file = dir.path().join("kinds.mock");
     std::fs::write(&file, "fn my_func\nstruct MyStruct\n")?;
@@ -2575,6 +2207,9 @@ fn test_grep_kind_brackets() -> Result<()> {
     // No LSP needed for tree-sitter classification — use mockls as a no-op server
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+
+    // Install mock grammar into the bridge's isolated data dir
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2617,14 +2252,13 @@ fn test_grep_reference_enclosing() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    install_mock_grammar(root)?;
-
     // fn outer spans lines 0-2, "target" on line 1 is enclosed by it
     let file = dir.path().join("enclosing.mock");
     std::fs::write(&file, "fn outer {\ntarget\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2681,7 +2315,9 @@ fn test_grep_parent_id_threading() -> Result<()> {
     let _response = bridge.recv()?;
 
     // Open the database and verify parent_id threading
-    let db_path = PathBuf::from(root).join("catenary").join("catenary.db");
+    let db_path = PathBuf::from(bridge.state_home())
+        .join("catenary")
+        .join("catenary.db");
     let conn =
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open test database")?;
@@ -2741,7 +2377,9 @@ fn test_glob_parent_id_threading() -> Result<()> {
     let _response = bridge.recv()?;
 
     // Open the database and verify parent_id threading
-    let db_path = PathBuf::from(root).join("catenary").join("catenary.db");
+    let db_path = PathBuf::from(bridge.state_home())
+        .join("catenary")
+        .join("catenary.db");
     let conn =
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open test database")?;
@@ -2782,8 +2420,6 @@ fn test_grep_tier2_structure_heatmap() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    install_mock_grammar(root)?;
-
     // Create multiple .mock files with definitions and references
     let tests_dir = dir.path().join("tests");
     std::fs::create_dir(&tests_dir)?;
@@ -2794,6 +2430,7 @@ fn test_grep_tier2_structure_heatmap() -> Result<()> {
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2880,13 +2517,12 @@ fn test_grep_tier_promotion() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    install_mock_grammar(root)?;
-
     let file = dir.path().join("narrow.mock");
     std::fs::write(&file, "fn unique_symbol_xyz\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2929,14 +2565,13 @@ fn test_grep_single_line_structure() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    install_mock_grammar(root)?;
-
     // Single-line definition (no brace block)
     let file = dir.path().join("single.mock");
     std::fs::write(&file, "fn one_liner\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -2973,13 +2608,12 @@ fn test_grep_no_blank_lines() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    install_mock_grammar(root)?;
-
     let file = dir.path().join("multi.mock");
     std::fs::write(&file, "fn alpha_one\nfn beta_two\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({

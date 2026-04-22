@@ -8,130 +8,17 @@
 )]
 //! Integration tests for CLI list, monitor, config, and doctor commands.
 
-use std::io::{BufRead, BufReader, Write};
+mod common;
+
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use serde_json::{Value, json};
+use anyhow::{Context, Result};
+use serde_json::json;
 
-/// Isolates a subprocess from the user's environment.
-fn isolate_env(cmd: &mut Command, root: &str) {
-    cmd.env("XDG_CONFIG_HOME", root);
-    cmd.env("XDG_STATE_HOME", root);
-    cmd.env("XDG_DATA_HOME", root);
-    cmd.env_remove("CATENARY_STATE_DIR");
-    cmd.env_remove("CATENARY_DATA_DIR");
-    cmd.env_remove("CATENARY_CONFIG");
-    cmd.env_remove("CATENARY_SERVERS");
-    cmd.env_remove("CATENARY_ROOTS");
-}
-
-/// Helper to spawn the bridge and discover readiness via MCP initialize.
-struct ServerProcess {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
-    state_dir: tempfile::TempDir,
-}
-
-impl ServerProcess {
-    fn spawn() -> Result<Self> {
-        let state_dir = tempfile::tempdir().context("Failed to create state tempdir")?;
-
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        // Isolate from user-level config and state.
-        // XDG_CONFIG_HOME must be an absolute path — the dirs crate
-        // ignores relative paths and falls back to ~/.config.
-        cmd.env("CATENARY_ROOTS", ".");
-        cmd.env("XDG_CONFIG_HOME", state_dir.path());
-        cmd.env("CATENARY_STATE_DIR", state_dir.path());
-        cmd.env_remove("CATENARY_CONFIG");
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = cmd.spawn().context("Failed to spawn server")?;
-
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
-            state_dir,
-        })
-    }
-
-    /// Sends an MCP `initialize` request and reads the response.
-    ///
-    /// Proves the server is running and the session exists in the DB.
-    /// Returns the full instance ID queried from the database.
-    fn wait_ready(&mut self) -> Result<String> {
-        let init_request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "test", "version": "0.0.0" }
-            }
-        });
-        self.send(&init_request)?;
-        let _response = self.recv()?;
-
-        // Discover the full instance ID via raw SQL query — the isolated
-        // state dir guarantees exactly one session. The `--format json`
-        // output is untruncated, unlike `catenary list`.
-        let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
-            .arg("query")
-            .arg("--sql")
-            .arg("SELECT id FROM sessions LIMIT 1")
-            .arg("--format")
-            .arg("json")
-            .env("CATENARY_STATE_DIR", self.state_dir.path())
-            .output()
-            .context("Failed to run query command")?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // JSON format outputs an array of objects: [{"id":"..."}]
-        let parsed: Vec<Value> = serde_json::from_str(stdout.trim())
-            .with_context(|| format!("Failed to parse query JSON: {stdout}"))?;
-        let id = parsed
-            .first()
-            .and_then(|obj| obj["id"].as_str())
-            .ok_or_else(|| anyhow!("No 'id' field in query output: {stdout}"))?
-            .to_string();
-
-        Ok(id)
-    }
-
-    fn send(&mut self, request: &Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        writeln!(self.stdin, "{json}").context("Failed to write to stdin")?;
-        self.stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-}
-
-impl Drop for ServerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+use common::{ServerProcess, isolate_env};
 
 #[test]
 fn test_list_shows_row_numbers() -> Result<()> {

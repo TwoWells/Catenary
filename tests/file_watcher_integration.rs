@@ -13,150 +13,33 @@
 //! Uses mockls with `--register-file-watchers` and `--notification-log`
 //! to capture and verify notification delivery.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+mod common;
+
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
+
+use common::{BridgeProcess, mockls_lsp_arg};
 
 const MOCK_LANG_A: &str = "yX4Za";
 
-// ── Bridge process helper ───────────────────────────────────────────
-
-struct BridgeProcess {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: Option<BufReader<std::process::ChildStdout>>,
-    stderr: Option<std::process::ChildStderr>,
-    /// Temp dir for XDG state/config, kept alive for the bridge lifetime.
-    _state_dir: tempfile::TempDir,
+/// Initializes the bridge with extra delay for `registerCapability` processing.
+fn initialize_with_registration(bridge: &mut BridgeProcess) -> Result<()> {
+    bridge.initialize()?;
+    // Allow time for mockls to send registerCapability and for the
+    // bridge to process the registration.
+    std::thread::sleep(Duration::from_millis(200));
+    Ok(())
 }
 
-impl BridgeProcess {
-    fn spawn(lsp_commands: &[&str], root: &str) -> Result<Self> {
-        // Isolate state/config from the workspace root so bridge-created
-        // files (notify.sock, DB, etc.) don't appear in the filesystem diff.
-        let state_dir = tempfile::tempdir().context("Failed to create state dir")?;
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.env("CATENARY_SERVERS", lsp_commands.join(";"));
-        cmd.env("CATENARY_ROOTS", root);
-        cmd.env("XDG_CONFIG_HOME", state_dir.path());
-        cmd.env("XDG_STATE_HOME", state_dir.path());
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-        let stderr = child.stderr.take();
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            stderr,
-            _state_dir: state_dir,
-        })
-    }
-
-    fn send(&mut self, request: &Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        let stdin = self.stdin.as_mut().context("Stdin already closed")?;
-        writeln!(stdin, "{json}").context("Failed to write to stdin")?;
-        stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let stdout = self.stdout.as_mut().context("Stdout already closed")?;
-        let n = stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        if n == 0 {
-            let mut stderr_buf = String::new();
-            if let Some(ref mut stderr) = self.stderr {
-                let _ = stderr.read_to_string(&mut stderr_buf);
-            }
-            let status = self.child.try_wait().ok().flatten();
-            bail!(
-                "bridge process closed stdout (EOF). exit status: {status:?}, stderr:\n{stderr_buf}"
-            );
-        }
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "file-watcher-test",
-                    "version": "1.0.0"
-                }
-            }
-        }))?;
-
-        let response = self.recv()?;
-        if response.get("result").is_none() {
-            bail!("Initialize failed: {response:?}");
-        }
-
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))?;
-
-        // Allow time for mockls to process initialized + send registerCapability
-        // and for the bridge to process the registration.
-        std::thread::sleep(Duration::from_millis(300));
-        Ok(())
-    }
-
-    /// Calls `grep` to trigger `notify_file_changes()` at the tool boundary.
-    /// The search itself doesn't matter — we just need the diff to run.
-    fn trigger_file_watch_diff(&mut self) -> Result<Value> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 100,
-            "method": "tools/call",
-            "params": {
-                "name": "grep",
-                "arguments": { "pattern": "NONEXISTENT_PATTERN_FOR_DIFF_TRIGGER" }
-            }
-        }))?;
-        self.recv()
-    }
-}
-
-impl Drop for BridgeProcess {
-    fn drop(&mut self) {
-        self.stdin.take();
-        for _ in 0..20 {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = self.child.kill();
-    }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────
-
-fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
-    let bin = env!("CARGO_BIN_EXE_mockls");
-    if flags.is_empty() {
-        format!("{lang}:{bin} {lang}")
-    } else {
-        format!("{lang}:{bin} {lang} {flags}")
-    }
+/// Calls `grep` to trigger `notify_file_changes()` at the tool boundary.
+/// The search itself doesn't matter — we just need the diff to run.
+fn trigger_file_watch_diff(bridge: &mut BridgeProcess) -> Result<Value> {
+    bridge.call_tool(
+        "grep",
+        &json!({ "pattern": "NONEXISTENT_PATTERN_FOR_DIFF_TRIGGER" }),
+    )
 }
 
 /// Reads the JSONL notification log and returns all `didChangeWatchedFiles`
@@ -233,10 +116,10 @@ fn noop_diff_sends_no_notification() -> Result<()> {
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
+    initialize_with_registration(&mut bridge)?;
 
     // No filesystem changes — just trigger a diff
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -266,13 +149,13 @@ fn new_file_sends_created_event() -> Result<()> {
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
+    initialize_with_registration(&mut bridge)?;
 
     // Create a new file after seed
     let new_file = dir.path().join(format!("new_module.{MOCK_LANG_A}"));
     std::fs::write(&new_file, "fn new_thing()\n")?;
 
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -304,12 +187,12 @@ fn deleted_file_sends_deleted_event() -> Result<()> {
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
+    initialize_with_registration(&mut bridge)?;
 
     // Delete the file
     std::fs::remove_file(&doomed_file)?;
 
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -338,12 +221,12 @@ fn new_directory_sends_created_event() -> Result<()> {
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
+    initialize_with_registration(&mut bridge)?;
 
     // Create a new subdirectory
     std::fs::create_dir(dir.path().join("subdir"))?;
 
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -378,7 +261,7 @@ fn branch_switch_sends_batched_notification() -> Result<()> {
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
+    initialize_with_registration(&mut bridge)?;
 
     // Simulate branch switch: delete a, modify b, create c
     std::fs::remove_file(&file_a)?;
@@ -386,7 +269,7 @@ fn branch_switch_sends_batched_notification() -> Result<()> {
     let file_c = dir.path().join(format!("c.{MOCK_LANG_A}"));
     std::fs::write(&file_c, "fn c()\n")?;
 
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -427,7 +310,7 @@ fn module_rename_sends_delete_and_create() -> Result<()> {
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
+    initialize_with_registration(&mut bridge)?;
 
     // Rename: foo.ext → foo/mod.ext
     let foo_dir = dir.path().join("foo");
@@ -435,7 +318,7 @@ fn module_rename_sends_delete_and_create() -> Result<()> {
     let mod_file = foo_dir.join(format!("mod.{MOCK_LANG_A}"));
     std::fs::rename(&foo_file, &mod_file)?;
 
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -471,18 +354,18 @@ fn watch_kind_delete_only_filters_creates() -> Result<()> {
     );
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
+    initialize_with_registration(&mut bridge)?;
 
     // Create a new file — should NOT trigger (kind=4 is Delete only)
     let new_file = dir.path().join(format!("new.{MOCK_LANG_A}"));
     std::fs::write(&new_file, "fn new()\n")?;
 
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     // Now delete a file — should trigger
     std::fs::remove_file(&doomed_file)?;
 
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     drop(bridge);
     std::thread::sleep(Duration::from_millis(200));
@@ -533,29 +416,10 @@ fn ra_module_rename_resolves_after_notification() -> Result<()> {
         "pub fn hello() -> &'static str { \"hello\" }\n",
     )?;
 
-    let lsp_arg = "rust:rust-analyzer";
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-    cmd.env("CATENARY_SERVERS", lsp_arg);
-    cmd.env("CATENARY_ROOTS", dir.path());
-    cmd.env("XDG_CONFIG_HOME", state_dir.path());
-    cmd.env("XDG_STATE_HOME", state_dir.path());
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-    let stdin = child.stdin.take().context("stdin")?;
-    let stdout = BufReader::new(child.stdout.take().context("stdout")?);
-    let stderr = child.stderr.take();
-
-    let mut bridge = BridgeProcess {
-        child,
-        stdin: Some(stdin),
-        stdout: Some(stdout),
-        stderr,
-        _state_dir: state_dir,
-    };
-    bridge.initialize()?;
+    drop(state_dir); // not needed — BridgeProcess manages its own state dir
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&["rust:rust-analyzer"], root)?;
+    initialize_with_registration(&mut bridge)?;
 
     // Wait for rust-analyzer to index — poll with grep until symbols resolve.
     let mut indexed = false;
@@ -590,7 +454,7 @@ fn ra_module_rename_resolves_after_notification() -> Result<()> {
     std::fs::rename(src_dir.join("foo.rs"), foo_dir.join("mod.rs"))?;
 
     // Trigger diff → didChangeWatchedFiles
-    let _ = bridge.trigger_file_watch_diff()?;
+    let _ = trigger_file_watch_diff(&mut bridge)?;
 
     // Give rust-analyzer time to process the notification and re-index.
     std::thread::sleep(Duration::from_secs(5));

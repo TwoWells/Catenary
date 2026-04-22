@@ -8,112 +8,29 @@
 )]
 //! Integration tests for the `glob` tool (directory/file/pattern modes).
 
+mod common;
+
 use anyhow::{Context, Result};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+
+use common::BridgeProcess;
 
 const MOCK_LANG_A: &str = "yX4Za";
 
-/// Helper to spawn the bridge
-struct BridgeProcess {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: Option<BufReader<std::process::ChildStdout>>,
+/// Spawns a bridge with an optional custom LSP arg.
+///
+/// If `lsp_args` is `None`, uses mockls for `MOCK_LANG_A`.
+fn spawn_bridge(root: &str, lsp_args: Option<&str>) -> Result<BridgeProcess> {
+    let default_lsp = common::mockls_lsp_arg(MOCK_LANG_A, "");
+    let lsp = lsp_args.unwrap_or(&default_lsp);
+    BridgeProcess::spawn(&[lsp], root)
 }
 
-impl BridgeProcess {
-    fn spawn(root: &str, lsp_args: Option<&str>) -> Result<Self> {
-        Self::spawn_multi_root(&[root], lsp_args)
-    }
-
-    fn spawn_multi_root(roots: &[&str], lsp_args: Option<&str>) -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        let servers = lsp_args.map_or_else(
-            || {
-                let bin = env!("CARGO_BIN_EXE_mockls");
-                format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}")
-            },
-            str::to_string,
-        );
-        cmd.env("CATENARY_SERVERS", &servers);
-
-        // Set roots via env var
-        let roots_val = std::env::join_paths(roots).unwrap_or_default();
-        cmd.env("CATENARY_ROOTS", &roots_val);
-
-        // Isolate from user-level config and state
-        if let Some(first_root) = roots.first() {
-            cmd.env("XDG_CONFIG_HOME", first_root);
-            cmd.env("XDG_STATE_HOME", first_root);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-        })
-    }
-
-    fn send(&mut self, request: &serde_json::Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        let stdin = self.stdin.as_mut().context("Stdin already closed")?;
-        writeln!(stdin, "{json}").context("Failed to write to stdin")?;
-        stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<serde_json::Value> {
-        let mut line = String::new();
-        let stdout = self.stdout.as_mut().context("Stdout already closed")?;
-        stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "test", "version": "1.0" }
-            }
-        }))?;
-        let _ = self.recv()?;
-        self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
-        Ok(())
-    }
-}
-
-impl Drop for BridgeProcess {
-    fn drop(&mut self) {
-        // Closing stdin signals the server to shut down gracefully
-        self.stdin.take();
-
-        // Wait for the process to exit naturally (up to 2 seconds)
-        for _ in 0..20 {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
-        // If still alive after timeout, kill it
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+/// Spawns a bridge with multiple roots and an optional custom LSP arg.
+fn spawn_bridge_multi_root(roots: &[&str], lsp_args: Option<&str>) -> Result<BridgeProcess> {
+    let default_lsp = common::mockls_lsp_arg(MOCK_LANG_A, "");
+    let lsp = lsp_args.unwrap_or(&default_lsp);
+    BridgeProcess::spawn_multi_root(&[lsp], roots)
 }
 
 #[test]
@@ -123,7 +40,7 @@ fn test_glob_directory_basic() -> Result<()> {
     std::fs::create_dir(temp.path().join("subdir"))?;
     std::fs::write(temp.path().join("subdir/file2.rs"), "fn main() {}")?;
 
-    let mut bridge = BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, None)?;
+    let mut bridge = spawn_bridge(temp.path().to_str().context("invalid path")?, None)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -163,7 +80,7 @@ fn test_glob_directory_symbols() -> Result<()> {
     let script = temp.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(&script, "struct Config\nenum Mode\nconst MAX_SIZE\n")?;
 
-    let mut bridge = BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, None)?;
+    let mut bridge = spawn_bridge(temp.path().to_str().context("invalid path")?, None)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -213,8 +130,7 @@ fn test_glob_file_outline() -> Result<()> {
     let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     let lsp = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A}");
 
-    let mut bridge =
-        BridgeProcess::spawn(temp.path().to_str().context("invalid path")?, Some(&lsp))?;
+    let mut bridge = spawn_bridge(temp.path().to_str().context("invalid path")?, Some(&lsp))?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -297,7 +213,7 @@ fn test_glob_directory_explicit_path() -> Result<()> {
     let root_a = dir_a.path().to_str().context("invalid path A")?;
     let root_b = dir_b.path().to_str().context("invalid path B")?;
 
-    let mut bridge = BridgeProcess::spawn_multi_root(&[root_a, root_b], None)?;
+    let mut bridge = spawn_bridge_multi_root(&[root_a, root_b], None)?;
     bridge.initialize()?;
 
     // Request glob with explicit path pointing to root A only

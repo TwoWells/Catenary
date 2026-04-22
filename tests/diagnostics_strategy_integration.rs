@@ -15,202 +15,22 @@
 //! - Pull-only (`--pull-diagnostics --no-push-diagnostics`)
 //! - Server death (`--drop-after`)
 
-use std::io::{BufRead, BufReader, Read as _, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+mod common;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{Context, Result};
+
+use common::BridgeProcess;
 
 const MOCK_LANG_A: &str = "yX4Za";
 
-/// Helper to spawn the bridge with mockls and communicate via MCP.
-struct BridgeProcess {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: Option<BufReader<std::process::ChildStdout>>,
-    state_home: Option<String>,
-}
-
-/// Isolates a subprocess from the user's environment.
-fn isolate_env(cmd: &mut Command, root: &str) {
-    cmd.env("XDG_CONFIG_HOME", root);
-    cmd.env("XDG_STATE_HOME", root);
-    cmd.env("XDG_DATA_HOME", root);
-    cmd.env_remove("CATENARY_STATE_DIR");
-    cmd.env_remove("CATENARY_DATA_DIR");
-    cmd.env_remove("CATENARY_CONFIG");
-    cmd.env_remove("CATENARY_SERVERS");
-    cmd.env_remove("CATENARY_ROOTS");
-}
-
-impl BridgeProcess {
-    fn spawn(mockls_args: &[&str], root: &str) -> Result<Self> {
-        Self::spawn_with_state_home(mockls_args, root, root)
-    }
-
-    fn spawn_with_state_home(mockls_args: &[&str], root: &str, state_home: &str) -> Result<Self> {
-        let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-        let mut lsp_cmd = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A}");
-        for arg in mockls_args {
-            lsp_cmd.push(' ');
-            lsp_cmd.push_str(arg);
-        }
-
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        isolate_env(&mut cmd, root);
-        cmd.env("CATENARY_SERVERS", &lsp_cmd)
-            .env("CATENARY_ROOTS", root)
-            .env("XDG_STATE_HOME", state_home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            state_home: Some(state_home.to_string()),
-        })
-    }
-
-    /// Spawn using a TOML config file instead of `CATENARY_SERVERS`.
-    ///
-    /// Required for multi-server-per-language tests where each server
-    /// needs different flags or different `min_severity` settings.
-    fn spawn_with_config(config_path: &std::path::Path, root: &str) -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        isolate_env(&mut cmd, root);
-        cmd.env("CATENARY_CONFIG", config_path);
-        cmd.env("CATENARY_ROOTS", root);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            state_home: Some(root.to_string()),
-        })
-    }
-
-    fn send(&mut self, request: &Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        let stdin = self.stdin.as_mut().context("Stdin already closed")?;
-        writeln!(stdin, "{json}").context("Failed to write to stdin")?;
-        stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let stdout = self.stdout.as_mut().context("Stdout already closed")?;
-        stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "diag-strategy-test",
-                    "version": "1.0.0"
-                }
-            }
-        }))?;
-
-        let response = self.recv()?;
-        if response.get("result").is_none() {
-            bail!("Initialize failed: {response:?}");
-        }
-
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))?;
-
-        std::thread::sleep(Duration::from_millis(200));
-        Ok(())
-    }
-
-    /// Enters editing mode, accumulates a file, then calls `done_editing`
-    /// via MCP to retrieve diagnostics from the tool result. Exercises the
-    /// full diagnostics pipeline through the MCP tool path.
-    fn call_diagnostics(&mut self, file: &str) -> Result<String> {
-        let state_home = self
-            .state_home
-            .as_ref()
-            .context("state_home not set")?
-            .clone();
-        let sessions_dir = PathBuf::from(&state_home).join("catenary").join("sessions");
-        let socket_path = find_notify_socket(&sessions_dir)?;
-
-        // Enter editing mode via IPC
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/enforce-editing",
-                "tool_name": "start_editing",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Accumulate file via IPC
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "post-tool/diagnostics",
-                "file": file,
-                "tool": "Edit",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Call done_editing via MCP
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 9000,
-            "method": "tools/call",
-            "params": {
-                "name": "done_editing",
-                "arguments": {}
-            }
-        }))?;
-
-        let response = self.recv()?;
-        let text = response
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        Ok(text)
-    }
-}
-
-impl Drop for BridgeProcess {
-    fn drop(&mut self) {
-        // Close stdin to signal shutdown
-        self.stdin.take();
-        let _ = self.child.wait();
-    }
+/// Spawns a bridge with mockls configured for `MOCK_LANG_A`.
+///
+/// Wraps [`common::BridgeProcess::spawn`] to accept mockls flags
+/// instead of fully-formed `CATENARY_SERVERS` specs.
+fn spawn_mockls(mockls_args: &[&str], root: &str) -> Result<BridgeProcess> {
+    let flags = mockls_args.join(" ");
+    let lsp = common::mockls_lsp_arg(MOCK_LANG_A, &flags);
+    BridgeProcess::spawn(&[&lsp], root)
 }
 
 /// Default mockls: publishes diagnostics on didOpen/didChange without
@@ -223,7 +43,7 @@ fn test_diagnostics_default_mockls() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(&[], dir.path().to_str().context("path")?)?;
+    let mut bridge = spawn_mockls(&[], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
@@ -244,8 +64,7 @@ fn test_diagnostics_version_path() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge =
-        BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
+    let mut bridge = spawn_mockls(&["--publish-version"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
@@ -270,7 +89,7 @@ fn test_diagnostics_token_monitor_path() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &["--progress-on-change"],
         dir.path().to_str().context("path")?,
     )?;
@@ -301,8 +120,7 @@ fn test_diagnostics_server_death() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge =
-        BridgeProcess::spawn(&["--drop-after", "2"], dir.path().to_str().context("path")?)?;
+    let mut bridge = spawn_mockls(&["--drop-after", "2"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
     // Server will die during or before diagnostics processing
@@ -335,7 +153,7 @@ fn test_diagnostics_no_code_actions() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &["--publish-version", "--no-code-actions"],
         dir.path().to_str().context("path")?,
     )?;
@@ -364,7 +182,7 @@ fn test_diagnostics_multi_fix() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &["--publish-version", "--multi-fix"],
         dir.path().to_str().context("path")?,
     )?;
@@ -400,8 +218,7 @@ fn test_diagnostics_refactor_filtered() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge =
-        BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
+    let mut bridge = spawn_mockls(&["--publish-version"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
@@ -427,7 +244,7 @@ fn test_diagnostics_pull_only() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &["--pull-diagnostics", "--no-push-diagnostics"],
         dir.path().to_str().context("path")?,
     )?;
@@ -443,41 +260,6 @@ fn test_diagnostics_pull_only() -> Result<()> {
     Ok(())
 }
 
-/// Sends a one-shot IPC request to the hook server. Ignores the response.
-fn ipc_request(socket_path: &std::path::Path, request: &Value) -> Result<()> {
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    writeln!(stream, "{request}").context("write to notify socket")?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    Ok(())
-}
-
-/// Scans the sessions directory for a `notify.sock` file.
-fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
-    // Poll briefly for the socket to appear (bridge may still be starting)
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
-            for entry in entries.flatten() {
-                let sock = entry.path().join("notify.sock");
-                if sock.exists() {
-                    return Ok(sock);
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            bail!(
-                "No notify.sock found in {} within 5s",
-                sessions_dir.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 /// Verifies that quick-fix code actions from the LSP server appear as
 /// `fix:` lines in the hook diagnostics output.
 ///
@@ -489,8 +271,7 @@ fn test_diagnostics_code_action_enrichment() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge =
-        BridgeProcess::spawn(&["--publish-version"], dir.path().to_str().context("path")?)?;
+    let mut bridge = spawn_mockls(&["--publish-version"], dir.path().to_str().context("path")?)?;
     bridge.initialize()?;
 
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
@@ -523,7 +304,7 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     std::fs::write(&file, "echo hello\n")?;
 
     let mockc_bin = env!("CARGO_BIN_EXE_mockc");
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &[
             "--publish-version",
             "--advertise-save",
@@ -564,7 +345,7 @@ fn test_diagnostics_no_push_no_pull_returns_clean() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &["--progress-on-change", "--no-push-diagnostics"],
         dir.path().to_str().context("path")?,
     )?;
@@ -592,7 +373,7 @@ fn test_near_threshold_flycheck() -> Result<()> {
     std::fs::write(&file, "echo hello\n")?;
 
     let mockc_bin = env!("CARGO_BIN_EXE_mockc");
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &[
             "--publish-version",
             "--advertise-save",
@@ -636,7 +417,7 @@ fn test_pull_downgrade_no_push() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &["--pull-diagnostics", "--fail-pull", "--no-push-diagnostics"],
         dir.path().to_str().context("path")?,
     )?;
@@ -668,7 +449,7 @@ fn test_pull_downgrade_with_push() -> Result<()> {
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
 
-    let mut bridge = BridgeProcess::spawn(
+    let mut bridge = spawn_mockls(
         &["--pull-diagnostics", "--fail-pull", "--publish-version"],
         dir.path().to_str().context("path")?,
     )?;

@@ -19,101 +19,29 @@
 //! 3. Without the grace period, `wait_for_diagnostics_update` would
 //!    short-circuit and return 0 diagnostics.
 
-use anyhow::{Context, Result, bail};
-use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
-use std::process::Stdio;
+mod common;
+
+use anyhow::{Context, Result};
 use std::time::Duration;
-use tempfile::tempdir;
+
+use common::BridgeProcess;
 
 const MOCK_LANG_A: &str = "yX4Za";
-
-/// Sends a one-shot IPC request to the hook server. Ignores the response.
-fn ipc_request(socket_path: &std::path::Path, request: &serde_json::Value) -> Result<()> {
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    writeln!(stream, "{request}").context("write to notify socket")?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(())
-}
-
-/// Scans the sessions directory for a `notify.sock` file.
-fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
-            for entry in entries.flatten() {
-                let sock = entry.path().join("notify.sock");
-                if sock.exists() {
-                    return Ok(sock);
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            bail!(
-                "No notify.sock found in {} within 5s",
-                sessions_dir.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
 
 #[test]
 fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
     // 1. Create workspace with a test file
-    let dir = tempdir()?;
-    let state_dir = tempdir()?;
+    let dir = tempfile::tempdir()?;
     let file_path = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file_path, "echo hello\n")?;
 
     // 2. Start Catenary with mockls using --publish-version (versioned diagnostics)
-    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
-    let lsp_arg = format!("{MOCK_LANG_A}:{mockls_bin} {MOCK_LANG_A} --publish-version");
+    let lsp = common::mockls_lsp_arg(MOCK_LANG_A, "--publish-version");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_catenary"))
-        .env("CATENARY_SERVERS", &lsp_arg)
-        .env("CATENARY_ROOTS", dir.path())
-        .env("XDG_CONFIG_HOME", dir.path())
-        .env("XDG_STATE_HOME", state_dir.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("Failed to start catenary")?;
-
-    let stdin = child.stdin.as_mut().context("Failed to get stdin")?;
-    let stdout = child.stdout.as_mut().context("Failed to get stdout")?;
-    let mut reader = BufReader::new(stdout);
-
-    // 3. Initialize MCP
-    let init_req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test", "version": "1.0" }
-        }
-    });
-    writeln!(stdin, "{init_req}").context("Failed to write init request")?;
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .context("Failed to read init response")?;
-
-    let initialized_notif = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    });
-    writeln!(stdin, "{initialized_notif}").context("Failed to write initialized notification")?;
-
-    // 4. Wait past the warmup period.
+    // 3. Wait past the warmup period.
     //
     // During this time the LSP is running but has no open files,
     // so it never publishes diagnostics. After warmup expires,
@@ -121,61 +49,14 @@ fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
     // Wait long enough that the server is past any early-spawn window.
     std::thread::sleep(Duration::from_secs(11));
 
-    // 5. Request diagnostics via start_editing → accumulate → done_editing MCP.
+    // 4. Request diagnostics via start_editing → accumulate → done_editing MCP.
     //
     // This is the first file interaction. Without the post-warmup grace
     // period, wait_for_diagnostics_update would short-circuit and return
     // empty because has_published_diagnostics is false.
-    let sessions_dir = state_dir.path().join("catenary").join("sessions");
-    let socket_path = find_notify_socket(&sessions_dir)?;
+    let text = bridge.call_diagnostics(file_path.to_str().context("file path")?)?;
 
-    let file_str = file_path.to_str().context("invalid path")?;
-
-    // Enter editing mode via IPC
-    ipc_request(
-        &socket_path,
-        &json!({
-            "method": "pre-tool/enforce-editing",
-            "tool_name": "start_editing",
-            "agent_id": ""
-        }),
-    )?;
-
-    // Accumulate file via IPC
-    ipc_request(
-        &socket_path,
-        &json!({
-            "method": "post-tool/diagnostics",
-            "file": file_str,
-            "tool": "Edit",
-            "agent_id": ""
-        }),
-    )?;
-
-    // Call done_editing via MCP
-    let done_req = json!({
-        "jsonrpc": "2.0",
-        "id": 9000,
-        "method": "tools/call",
-        "params": {
-            "name": "done_editing",
-            "arguments": {}
-        }
-    });
-    writeln!(stdin, "{done_req}").context("write done_editing request")?;
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .context("read done_editing response")?;
-
-    let response: serde_json::Value =
-        serde_json::from_str(&line).context("parse done_editing response")?;
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-
-    // 6. Verify the response contains diagnostics.
+    // 5. Verify the response contains diagnostics.
     //
     // mockls with --publish-version publishes diagnostics after didOpen,
     // so the grace period should catch them.
@@ -184,8 +65,5 @@ fn test_diagnostics_on_first_open_past_warmup() -> Result<()> {
         "Expected mock diagnostics from mockls, got: {text}"
     );
 
-    // Cleanup
-    let _ = child.kill();
-    let _ = child.wait();
     Ok(())
 }

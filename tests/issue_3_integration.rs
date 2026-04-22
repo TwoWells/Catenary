@@ -16,174 +16,13 @@
 //! (LSP sleeping while subprocess burns CPU), replacing the original
 //! rust-analyzer test that was flaky under load.
 
-use anyhow::{Context, Result, bail};
-use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+mod common;
+
+use anyhow::{Context, Result};
+
+use common::BridgeProcess;
 
 const MOCK_LANG_A: &str = "yX4Za";
-
-/// Helper matching the `BridgeProcess` pattern in other test files.
-struct BridgeProcess {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: Option<BufReader<std::process::ChildStdout>>,
-    state_home: String,
-}
-
-impl BridgeProcess {
-    fn spawn(lsp: &str, root: &str) -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.env("CATENARY_SERVERS", lsp)
-            .env("CATENARY_ROOTS", root)
-            .env("XDG_CONFIG_HOME", root)
-            .env("XDG_STATE_HOME", root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            state_home: root.to_string(),
-        })
-    }
-
-    fn send(&mut self, request: &serde_json::Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        let stdin = self.stdin.as_mut().context("Stdin already closed")?;
-        writeln!(stdin, "{json}").context("Failed to write to stdin")?;
-        stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<serde_json::Value> {
-        let mut line = String::new();
-        let stdout = self.stdout.as_mut().context("Stdout already closed")?;
-        stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "test", "version": "1.0" }
-            }
-        }))?;
-        let _ = self.recv()?;
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))?;
-        std::thread::sleep(Duration::from_millis(100));
-        Ok(())
-    }
-
-    /// Enters editing mode, accumulates a file, then calls `done_editing`
-    /// via MCP to retrieve diagnostics from the tool result.
-    fn call_diagnostics(&mut self, file: &str) -> Result<String> {
-        let sessions_dir = PathBuf::from(&self.state_home)
-            .join("catenary")
-            .join("sessions");
-        let socket_path = find_notify_socket(&sessions_dir)?;
-
-        // Enter editing mode via IPC
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/enforce-editing",
-                "tool_name": "start_editing",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Accumulate file via IPC
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "post-tool/diagnostics",
-                "file": file,
-                "tool": "Edit",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Call done_editing via MCP
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 9000,
-            "method": "tools/call",
-            "params": {
-                "name": "done_editing",
-                "arguments": {}
-            }
-        }))?;
-
-        let response = self.recv()?;
-        let text = response
-            .pointer("/result/content/0/text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        Ok(text)
-    }
-}
-
-impl Drop for BridgeProcess {
-    fn drop(&mut self) {
-        self.stdin.take();
-        let _ = self.child.wait();
-    }
-}
-
-/// Sends a one-shot IPC request to the hook server. Ignores the response.
-fn ipc_request(socket_path: &std::path::Path, request: &serde_json::Value) -> Result<()> {
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(socket_path).context("connect to notify socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    writeln!(stream, "{request}").context("write to notify socket")?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    Ok(())
-}
-
-/// Scans the sessions directory for a `notify.sock` file.
-fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
-            for entry in entries.flatten() {
-                let sock = entry.path().join("notify.sock");
-                if sock.exists() {
-                    return Ok(sock);
-                }
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            bail!(
-                "No notify.sock found in {} within 5s",
-                sessions_dir.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
 
 /// Simulates the flycheck pattern: file change → diagnostics request.
 ///
@@ -209,7 +48,7 @@ fn test_lsp_diagnostics_waits_for_analysis_after_change() -> Result<()> {
     );
 
     let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&lsp, root)?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
     // First diagnostics call — opens the file, triggers didOpen diagnostics

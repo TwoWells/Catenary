@@ -8,179 +8,32 @@
 )]
 //! Integration tests for the `glob` tool.
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+mod common;
+
+use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{Context, Result};
+use serde_json::json;
+
+use common::BridgeProcess;
 
 const MOCK_LANG_A: &str = "yX4Za";
 
-/// Helper to spawn the bridge and communicate with it.
-struct BridgeProcess {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: Option<BufReader<std::process::ChildStdout>>,
+/// Spawns the bridge without any LSP servers configured.
+fn spawn_no_lsp(root: &str) -> Result<BridgeProcess> {
+    BridgeProcess::spawn(&[], root)
 }
 
-impl BridgeProcess {
-    fn spawn(root: &str) -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        // Isolate from user-level config and state
-        cmd.env("CATENARY_ROOTS", root);
-        cmd.env("XDG_CONFIG_HOME", root);
-        cmd.env("XDG_STATE_HOME", root);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        std::thread::sleep(Duration::from_millis(200));
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-        })
-    }
-
-    fn spawn_with_real_lsp(lsp_arg: &str, root: &str) -> Result<Self> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.env("CATENARY_SERVERS", lsp_arg);
-        cmd.env("CATENARY_ROOTS", root);
-        cmd.env("XDG_CONFIG_HOME", root);
-        cmd.env("XDG_STATE_HOME", root);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        std::thread::sleep(Duration::from_millis(200));
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-        })
-    }
-
-    fn spawn_with_lsp(root: &str) -> Result<Self> {
-        let bin = env!("CARGO_BIN_EXE_mockls");
-        let lsp = format!("{MOCK_LANG_A}:{bin} {MOCK_LANG_A}");
-
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
-        cmd.env("CATENARY_SERVERS", lsp);
-        cmd.env("CATENARY_ROOTS", root);
-        cmd.env("XDG_CONFIG_HOME", root);
-        cmd.env("XDG_STATE_HOME", root);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = cmd.spawn().context("Failed to spawn bridge")?;
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to get stdout")?);
-
-        std::thread::sleep(Duration::from_millis(200));
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-        })
-    }
-
-    fn send(&mut self, request: &Value) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        let stdin = self.stdin.as_mut().context("Stdin already closed")?;
-        writeln!(stdin, "{json}").context("Failed to write to stdin")?;
-        stdin.flush().context("Failed to flush stdin")?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let stdout = self.stdout.as_mut().context("Stdout already closed")?;
-        stdout
-            .read_line(&mut line)
-            .context("Failed to read from stdout")?;
-        serde_json::from_str(&line).context("Failed to parse JSON response")
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "file-tools-test",
-                    "version": "1.0.0"
-                }
-            }
-        }))?;
-
-        let response = self.recv()?;
-        if response.get("result").is_none() {
-            bail!("Initialize failed: {response:?}");
-        }
-
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))?;
-
-        std::thread::sleep(Duration::from_millis(100));
-        Ok(())
-    }
-
-    fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 100,
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": args
-            }
-        }))?;
-
-        let response = self.recv()?;
-        let result = response
-            .get("result")
-            .context("No result in response")?
-            .clone();
-        Ok(result)
-    }
-
-    fn call_tool_text(&mut self, name: &str, args: &Value) -> Result<String> {
-        let result = self.call_tool(name, args)?;
-        let content = result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|item| item.get("text"))
-            .and_then(|t| t.as_str())
-            .context("No text content in result")?;
-        Ok(content.to_string())
-    }
+/// Spawns the bridge with a real LSP server argument.
+fn spawn_with_real_lsp(lsp_arg: &str, root: &str) -> Result<BridgeProcess> {
+    BridgeProcess::spawn(&[lsp_arg], root)
 }
 
-impl Drop for BridgeProcess {
-    fn drop(&mut self) {
-        // Close stdin to trigger shutdown
-        self.stdin.take();
-        let _ = self.child.wait();
-    }
+/// Spawns the bridge with mockls configured for `MOCK_LANG_A`.
+fn spawn_with_lsp(root: &str) -> Result<BridgeProcess> {
+    let lsp = common::mockls_lsp_arg(MOCK_LANG_A, "");
+    BridgeProcess::spawn(&[&lsp], root)
 }
 
 #[test]
@@ -190,7 +43,7 @@ fn test_glob_directory_basic() -> Result<()> {
     std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
 
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -212,7 +65,7 @@ fn test_glob_outside_root() -> Result<()> {
     let outside = tempfile::tempdir()?;
     std::fs::write(outside.path().join("hello.txt"), "hi")?;
 
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let result = bridge.call_tool(
@@ -241,7 +94,7 @@ fn test_glob_outside_root() -> Result<()> {
 fn test_tools_list_includes_glob() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -297,7 +150,7 @@ fn test_glob_directory_symlink() -> Result<()> {
         dir.path().join("link.txt"),
     )?;
 
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -322,7 +175,7 @@ fn test_glob_file_outline() -> Result<()> {
         "struct Config\nenum Mode\nconst MAX_SIZE\nfn helper\n",
     )?;
 
-    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_with_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -356,7 +209,7 @@ fn test_glob_pattern_matching() -> Result<()> {
     std::fs::write(dir.path().join("lib.rs"), "pub mod lib;")?;
     std::fs::write(dir.path().join("readme.md"), "# Readme")?;
 
-    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_with_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.rs" }))?;
@@ -377,7 +230,7 @@ fn test_glob_alternation() -> Result<()> {
     std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
     std::fs::write(dir.path().join("readme.md"), "# Readme")?;
 
-    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_with_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text("glob", &json!({ "pattern": "*.{rs,toml}" }))?;
@@ -400,7 +253,7 @@ fn test_glob_line_counts() -> Result<()> {
     std::fs::write(dir.path().join("three.txt"), "line1\nline2\nline3\n")?;
     std::fs::write(dir.path().join("one.txt"), "single\n")?;
 
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -438,7 +291,7 @@ fn test_glob_gitignored_section() -> Result<()> {
     std::fs::create_dir(dir.path().join("build"))?;
     std::fs::write(dir.path().join("build/output.bin"), "binary")?;
 
-    let mut bridge = BridgeProcess::spawn(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -474,7 +327,7 @@ fn test_glob_pattern_detection() -> Result<()> {
     std::fs::write(&script, "struct Config\nenum Mode\n")?;
     std::fs::create_dir(dir.path().join("subdir"))?;
 
-    let mut bridge = BridgeProcess::spawn_with_lsp(&dir.path().to_string_lossy())?;
+    let mut bridge = spawn_with_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     // File path → outline format (shows line count + symbols)
@@ -543,10 +396,7 @@ fn test_lua_glob_file_outline() -> Result<()> {
          return M\n",
     )?;
 
-    let mut bridge = BridgeProcess::spawn_with_real_lsp(
-        "lua:lua-language-server",
-        &dir.path().to_string_lossy(),
-    )?;
+    let mut bridge = spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     // lua-language-server needs a moment to start; poll until symbols appear
@@ -607,10 +457,7 @@ fn test_lua_glob_pattern() -> Result<()> {
     // Non-lua file that should not match
     std::fs::write(dir.path().join("conky/conky.conf"), "-- config\n")?;
 
-    let mut bridge = BridgeProcess::spawn_with_real_lsp(
-        "lua:lua-language-server",
-        &dir.path().to_string_lossy(),
-    )?;
+    let mut bridge = spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     // Give lua-language-server time to start
@@ -661,10 +508,7 @@ fn test_lua_glob_directory() -> Result<()> {
     std::fs::write(dir.path().join("config.json"), "{\"key\": \"value\"}\n")?;
     std::fs::write(dir.path().join("notes.txt"), "some notes\n")?;
 
-    let mut bridge = BridgeProcess::spawn_with_real_lsp(
-        "lua:lua-language-server",
-        &dir.path().to_string_lossy(),
-    )?;
+    let mut bridge = spawn_with_real_lsp("lua:lua-language-server", &dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
     // Give lua-language-server time to start
