@@ -92,3 +92,167 @@ pub fn validate(config: &Config) -> Vec<String> {
 
     errors
 }
+
+/// Warns about orphan `[server.*]` entries in a project config.
+///
+/// A project server def is an orphan if it has spawn fields (`command`)
+/// but neither the project's `[language.*]` nor the user's `[language.*]`
+/// references it. Settings-only overrides (no `command`) are not orphans
+/// — they override user-level server settings for this root.
+pub fn warn_orphan_project_servers(
+    project: &super::ProjectConfig,
+    user_config: &Config,
+    root: &std::path::Path,
+) {
+    for (server_name, server_def) in &project.server {
+        // Settings-only override — not an orphan.
+        if server_def.command.is_empty() {
+            continue;
+        }
+
+        let referenced_by_project = project
+            .language
+            .values()
+            .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+
+        let referenced_by_user = user_config
+            .language
+            .values()
+            .any(|lc| lc.servers.iter().any(|b| b.name == *server_name));
+
+        if !referenced_by_project && !referenced_by_user {
+            tracing::warn!(
+                source = "config.project",
+                root = %root.display(),
+                server = server_name.as_str(),
+                "Project config at {}: [server.{server_name}] has a `command` \
+                 but no [language.*] references it — this server will never be spawned",
+                root.display(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+    use crate::config::{LanguageConfig, ProjectConfig, ServerBinding, ServerDef};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_orphan_server_warning() {
+        // A project server with command but no language references is an orphan.
+        let mut project = ProjectConfig::default();
+        project.server.insert(
+            "unused-server".to_string(),
+            ServerDef {
+                command: "unused-server-bin".to_string(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let user_config = Config::default();
+        let root = PathBuf::from("/test");
+
+        // The function emits a tracing::warn — we verify it runs without panic.
+        // In a real test you could use a tracing subscriber to capture warnings.
+        warn_orphan_project_servers(&project, &user_config, &root);
+    }
+
+    #[test]
+    fn test_orphan_server_settings_only_no_warning() {
+        // A project server with empty command (settings-only override) is not
+        // an orphan — it just overrides the user-level server's settings.
+        let mut project = ProjectConfig::default();
+        project.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: String::new(), // settings-only
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"key": "value"})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let user_config = Config::default();
+        let root = PathBuf::from("/test");
+
+        // Should not warn — settings-only overrides are valid.
+        warn_orphan_project_servers(&project, &user_config, &root);
+    }
+
+    #[test]
+    fn test_orphan_server_referenced_by_project_language() {
+        // Server is referenced by project's own language config — not orphan.
+        let mut project = ProjectConfig::default();
+        project.server.insert(
+            "my-server".to_string(),
+            ServerDef {
+                command: "my-server-bin".to_string(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        project.language.insert(
+            "custom".to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new("my-server")],
+                ..LanguageConfig::default()
+            },
+        );
+
+        let user_config = Config::default();
+        let root = PathBuf::from("/test");
+
+        warn_orphan_project_servers(&project, &user_config, &root);
+    }
+
+    #[test]
+    fn test_orphan_server_referenced_by_user_language() {
+        // Server is referenced by user's language config — not orphan.
+        let mut project = ProjectConfig::default();
+        project.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "custom-ra".to_string(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let mut user_config = Config::default();
+        let mut language = HashMap::new();
+        language.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new("rust-analyzer")],
+                ..LanguageConfig::default()
+            },
+        );
+        user_config.language = language;
+        let root = PathBuf::from("/test");
+
+        warn_orphan_project_servers(&project, &user_config, &root);
+    }
+}

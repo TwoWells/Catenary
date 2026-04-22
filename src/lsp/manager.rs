@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::bridge::filesystem_manager::FilesystemManager;
-use crate::config::{Config, ServerBinding};
+use crate::config::{Config, ServerBinding, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{FileChange, GlobPattern, LspGlob, WatchKind};
@@ -87,6 +87,10 @@ fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
 /// [`LspClient`] — each server sees an independent monotonic version sequence.
 pub struct LspClientManager {
     config: Config,
+    /// Per-root project configs from `.catenary.toml`. Keyed by root path.
+    /// Uses `std::sync::Mutex` — reads are fast, non-contended, and must
+    /// not be held across `.await` points.
+    project_configs: std::sync::Mutex<HashMap<PathBuf, crate::config::ProjectConfig>>,
     clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
     logging: LoggingServer,
     fs: Arc<FilesystemManager>,
@@ -101,6 +105,7 @@ impl LspClientManager {
     pub fn new(config: Config, logging: LoggingServer, fs: Arc<FilesystemManager>) -> Self {
         Self {
             config,
+            project_configs: std::sync::Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             logging,
             fs,
@@ -124,6 +129,10 @@ impl LspClientManager {
     /// servers, spawns a separate `Scope::Root` instance per root.
     pub async fn spawn_all(&self) {
         let roots = self.fs.roots();
+
+        // Load project configs for all roots.
+        self.load_project_configs_for_roots(&roots);
+
         let configured_keys: HashSet<&str> =
             self.config.language.keys().map(String::as_str).collect();
         let relevant = self.fs.detect_workspace_languages(&roots, &configured_keys);
@@ -218,6 +227,12 @@ impl LspClientManager {
         roots.retain(|r| r != root);
         self.fs.set_roots(roots);
 
+        // Remove project config for the removed root.
+        self.project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(root);
+
         // Notify workspace-capable servers about the removal.
         let clients = self.clients.lock().await.clone();
         for (key, client_mutex) in &clients {
@@ -279,6 +294,18 @@ impl LspClientManager {
             to_add.len(),
             to_remove.len()
         );
+
+        // Update project configs: load for added roots, remove for removed.
+        self.load_project_configs_for_roots(&to_add);
+        if !to_remove.is_empty() {
+            let mut configs = self
+                .project_configs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for removed in &to_remove {
+                configs.remove(removed);
+            }
+        }
 
         let added_folders: Vec<(String, String)> = to_add
             .iter()
@@ -935,6 +962,140 @@ impl LspClientManager {
             changes.len(),
             notified
         );
+    }
+
+    /// Whether a language is project-scoped in the given root.
+    ///
+    /// Rule A: returns `true` if the root's project config has a
+    /// `[language.{lang}]` entry. This triggers tier 1 — an
+    /// isolated per-root instance.
+    #[must_use]
+    pub fn is_project_scoped(&self, lang: &str, root: &Path) -> bool {
+        let configs = self
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        configs
+            .get(root)
+            .is_some_and(|pc| pc.language.contains_key(lang))
+    }
+
+    /// Returns the effective `ServerDef` for a server in a root.
+    ///
+    /// Deep-merges the root's project `[server.{name}]` (if any)
+    /// over the user-level `[server.{name}]`. Returns user-level
+    /// def unchanged if no project override exists.
+    #[must_use]
+    pub fn effective_server_def(&self, server_name: &str, root: &Path) -> Option<ServerDef> {
+        let user_def = self.config.server.get(server_name)?;
+
+        let project_def = self
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .and_then(|pc| pc.server.get(server_name))
+            .cloned();
+
+        let Some(project_def) = project_def else {
+            return Some(user_def.clone());
+        };
+
+        // Field-level merge: project fields override user fields when
+        // present. Settings use deep_merge for nested object merging.
+        let mut merged = user_def.clone();
+        if !project_def.command.is_empty() {
+            merged.command.clone_from(&project_def.command);
+            merged.args.clone_from(&project_def.args);
+        }
+        if project_def.initialization_options.is_some() {
+            merged
+                .initialization_options
+                .clone_from(&project_def.initialization_options);
+        }
+        if project_def.min_severity.is_some() {
+            merged.min_severity.clone_from(&project_def.min_severity);
+        }
+        if !project_def.file_patterns.is_empty() {
+            merged.file_patterns.clone_from(&project_def.file_patterns);
+            merged
+                .compiled_patterns
+                .clone_from(&project_def.compiled_patterns);
+        }
+        if let Some(ref project_settings) = project_def.settings {
+            if let Some(ref user_settings) = user_def.settings {
+                merged.settings = Some(crate::config::merge::deep_merge(
+                    user_settings,
+                    project_settings,
+                ));
+            } else {
+                merged.settings = Some(project_settings.clone());
+            }
+        }
+
+        Some(merged)
+    }
+
+    /// Returns the effective settings `Value` for a server in a root.
+    ///
+    /// Deep-merges the root's project `[server.{name}].settings`
+    /// over the user-level `[server.{name}].settings`.
+    #[must_use]
+    pub fn effective_settings(&self, server_name: &str, root: &Path) -> Option<serde_json::Value> {
+        let user_settings = self
+            .config
+            .server
+            .get(server_name)
+            .and_then(|d| d.settings.clone());
+
+        let project_settings = self
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .and_then(|pc| pc.server.get(server_name))
+            .and_then(|d| d.settings.clone());
+
+        match (user_settings, project_settings) {
+            (Some(user), Some(project)) => Some(crate::config::merge::deep_merge(&user, &project)),
+            (None, Some(project)) => Some(project),
+            (Some(user), None) => Some(user),
+            (None, None) => None,
+        }
+    }
+
+    /// Loads project configs for the given roots.
+    ///
+    /// For each root, discovers `.catenary.toml` via [`crate::config::load_project_config`]
+    /// and stores the result. Errors are logged and skipped — a broken
+    /// project config should not prevent other roots from loading.
+    fn load_project_configs_for_roots(&self, roots: &[PathBuf]) {
+        for root in roots {
+            match crate::config::load_project_config(root) {
+                Ok(Some(pc)) => {
+                    info!(
+                        source = "config.project",
+                        root = %root.display(),
+                        "Loaded project config from {}",
+                        root.join(".catenary.toml").display(),
+                    );
+                    crate::config::validate::warn_orphan_project_servers(&pc, &self.config, root);
+                    self.project_configs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(root.clone(), pc);
+                }
+                Ok(None) => {} // No project config — fine.
+                Err(e) => {
+                    warn!(
+                        source = "config.project",
+                        root = %root.display(),
+                        "Failed to load project config from {}: {e}",
+                        root.join(".catenary.toml").display(),
+                    );
+                }
+            }
+        }
     }
 
     /// Shuts down all active clients.
@@ -2977,5 +3138,239 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // --- Project config infrastructure tests ---
+
+    #[test]
+    fn test_is_project_scoped_with_language() {
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.language.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new("rust-analyzer")],
+                ..LanguageConfig::default()
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        assert!(manager.is_project_scoped("rust", &root));
+    }
+
+    #[test]
+    fn test_is_project_scoped_without_language() {
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: String::new(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"key": "value"})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        assert!(!manager.is_project_scoped("rust", &root));
+    }
+
+    #[test]
+    fn test_is_project_scoped_no_config() {
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        assert!(!manager.is_project_scoped("rust", &root));
+    }
+
+    #[test]
+    fn test_effective_server_def_merge() {
+        let mut config = test_config();
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                args: vec!["--log-level".to_string(), "info".to_string()],
+                initialization_options: None,
+                settings: Some(serde_json::json!({"check": {"command": "clippy"}, "cargo": {"features": ["a"]}})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        // Project config only overrides settings.
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: String::new(), // empty = inherit from user
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"check": {"command": "check"}, "new_key": true})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        let merged = manager
+            .effective_server_def("rust-analyzer", &root)
+            .expect("should exist");
+
+        // command/args inherited from user
+        assert_eq!(merged.command, "rust-analyzer");
+        assert_eq!(merged.args, vec!["--log-level", "info"]);
+
+        // settings deep-merged
+        let settings = merged.settings.expect("settings");
+        assert_eq!(settings["check"]["command"], "check"); // project overrides
+        assert_eq!(settings["cargo"]["features"], serde_json::json!(["a"])); // user preserved
+        assert_eq!(settings["new_key"], true); // project adds
+    }
+
+    #[test]
+    fn test_effective_server_def_full_override() {
+        let mut config = test_config();
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                args: vec!["--log-level".to_string(), "info".to_string()],
+                initialization_options: None,
+                settings: Some(serde_json::json!({"key": "user"})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "custom-ra".to_string(),
+                args: vec!["--custom".to_string()],
+                initialization_options: None,
+                settings: Some(serde_json::json!({"key": "project"})),
+                min_severity: Some("warning".to_string()),
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        let merged = manager
+            .effective_server_def("rust-analyzer", &root)
+            .expect("should exist");
+
+        assert_eq!(merged.command, "custom-ra");
+        assert_eq!(merged.args, vec!["--custom"]);
+        assert_eq!(merged.min_severity.as_deref(), Some("warning"));
+        assert_eq!(merged.settings.expect("settings")["key"], "project");
+    }
+
+    #[test]
+    fn test_effective_server_def_no_project() {
+        let mut config = test_config();
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            ServerDef {
+                command: "rust-analyzer".to_string(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"key": "user"})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        let def = manager
+            .effective_server_def("rust-analyzer", &root)
+            .expect("should exist");
+
+        assert_eq!(def.command, "rust-analyzer");
+        assert_eq!(def.settings.expect("settings")["key"], "user");
+    }
+
+    #[test]
+    fn test_effective_settings_merge() {
+        let mut config = test_config();
+        config.server.insert(
+            "ra".to_string(),
+            ServerDef {
+                command: "ra".to_string(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"a": 1, "b": {"c": 2}})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let root = PathBuf::from("/project");
+
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.server.insert(
+            "ra".to_string(),
+            ServerDef {
+                command: String::new(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"b": {"d": 3}})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), pc);
+
+        let settings = manager
+            .effective_settings("ra", &root)
+            .expect("should exist");
+        assert_eq!(settings["a"], 1);
+        assert_eq!(settings["b"]["c"], 2);
+        assert_eq!(settings["b"]["d"], 3);
     }
 }

@@ -4,9 +4,10 @@
 //! Configuration handling for language servers and session settings.
 
 mod language;
+pub(crate) mod merge;
 mod parse;
 mod server;
-mod validate;
+pub(crate) mod validate;
 
 mod commands;
 
@@ -17,7 +18,7 @@ use serde::Deserialize;
 
 pub use commands::{CommandsConfig, ResolvedCommands};
 pub use language::{LanguageConfig, ServerBinding};
-pub use parse::{SERVER_DEF_KEYS, config_sources};
+pub use parse::{ProjectConfig, SERVER_DEF_KEYS, config_sources, load_project_config};
 pub use server::ServerDef;
 
 /// Notification delivery configuration.
@@ -322,9 +323,12 @@ impl Config {
     ///
     /// Sources are loaded in order, with later sources overriding earlier ones:
     /// 1. User config (`~/.config/catenary/config.toml`)
-    /// 2. Project-local config (`.catenary.toml`, searching upward from cwd)
-    /// 3. Explicit file (if provided)
-    /// 4. Environment variable overrides
+    /// 2. Explicit file (if provided via `CATENARY_CONFIG`)
+    /// 3. Environment variable overrides
+    ///
+    /// Project-local config (`.catenary.toml`) is not loaded here — it is
+    /// discovered per-root by [`load_project_config`] and stored on
+    /// `LspClientManager`.
     ///
     /// # Errors
     ///

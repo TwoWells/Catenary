@@ -13,16 +13,17 @@ use std::path::{Path, PathBuf};
 /// Routing scope for an LSP server instance.
 ///
 /// Determines how the instance is bound to workspace roots.
-/// All four variants are defined upfront; only `Workspace` and
-/// `Root` are constructed in 1b. `Project` is used starting in
-/// 1d (per-root config). `SingleFile` in misc 28b (tier 3).
+/// `Workspace` and `Root` are the primary variants. `Root` covers
+/// both legacy per-root instances (capability-driven) and
+/// project-scoped instances (Rule A from per-root config).
+/// `SingleFile` in misc 28b (tier 3).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scope {
-    /// Tier 1 — project-scoped, always root-bound.
-    Project(PathBuf),
-    /// Tier 2 — multi-root capable, shared across roots.
+    /// Multi-root capable, shared across roots.
     Workspace,
-    /// Tier 2 — legacy server, one instance per root.
+    /// One instance per root — used for both legacy servers
+    /// (no `workspaceFolders` support) and project-scoped
+    /// instances (Rule A: root has `[language.*]` in `.catenary.toml`).
     Root(PathBuf),
     /// Tier 3 — single-file mode (misc 28b).
     SingleFile,
@@ -35,7 +36,6 @@ impl Scope {
     #[must_use]
     pub const fn kind_str(&self) -> &str {
         match self {
-            Self::Project(_) => "project",
             Self::Workspace => "workspace",
             Self::Root(_) => "root",
             Self::SingleFile => "single_file",
@@ -44,12 +44,11 @@ impl Scope {
 
     /// Returns the root path for scopes that have one.
     ///
-    /// `Project` and `Root` carry a path; `Workspace` and `SingleFile`
-    /// do not.
+    /// `Root` carries a path; `Workspace` and `SingleFile` do not.
     #[must_use]
     pub fn root_path(&self) -> Option<&Path> {
         match self {
-            Self::Project(p) | Self::Root(p) => Some(p),
+            Self::Root(p) => Some(p),
             Self::Workspace | Self::SingleFile => None,
         }
     }
@@ -58,7 +57,6 @@ impl Scope {
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Project(p) => write!(f, "project({})", p.display()),
             Self::Workspace => write!(f, "workspace"),
             Self::Root(p) => write!(f, "root({})", p.display()),
             Self::SingleFile => write!(f, "single_file"),
@@ -160,14 +158,6 @@ mod tests {
         );
         assert_ne!(key5, key6);
 
-        // Project scope
-        let key7 = InstanceKey::new(
-            "rust".to_string(),
-            "rust-analyzer".to_string(),
-            Scope::Project(PathBuf::from("/project")),
-        );
-        assert_ne!(key5, key7); // Root != Project even with same path
-
         // SingleFile scope
         let key8 = InstanceKey::new(
             "rust".to_string(),
@@ -193,20 +183,12 @@ mod tests {
         );
         assert_eq!(key.to_string(), "python:pyright:root(/home/user/project)");
 
-        let key = InstanceKey::new(
-            "toml".to_string(),
-            "taplo".to_string(),
-            Scope::Project(PathBuf::from("/workspace")),
-        );
-        assert_eq!(key.to_string(), "toml:taplo:project(/workspace)");
-
         let key = InstanceKey::new("text".to_string(), "ltex".to_string(), Scope::SingleFile);
         assert_eq!(key.to_string(), "text:ltex:single_file");
     }
 
     #[test]
     fn test_scope_kind_str() {
-        assert_eq!(Scope::Project(PathBuf::from("/p")).kind_str(), "project");
         assert_eq!(Scope::Workspace.kind_str(), "workspace");
         assert_eq!(Scope::Root(PathBuf::from("/r")).kind_str(), "root");
         assert_eq!(Scope::SingleFile.kind_str(), "single_file");
@@ -214,9 +196,6 @@ mod tests {
 
     #[test]
     fn test_scope_root_path() {
-        let project = Scope::Project(PathBuf::from("/project"));
-        assert_eq!(project.root_path(), Some(Path::new("/project")));
-
         let root = Scope::Root(PathBuf::from("/root"));
         assert_eq!(root.root_path(), Some(Path::new("/root")));
 

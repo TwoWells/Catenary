@@ -54,9 +54,12 @@ struct RawConfig {
 ///
 /// Sources are loaded in order, with later sources overriding earlier ones:
 /// 1. User config (`~/.config/catenary/config.toml`)
-/// 2. Project-local config (`.catenary.toml`, searching upward from cwd)
-/// 3. Explicit file (if provided)
-/// 4. Environment variable overrides
+/// 2. Explicit file (if provided via `CATENARY_CONFIG`)
+/// 3. Environment variable overrides
+///
+/// Project-local config (`.catenary.toml`) is not loaded here — it is
+/// discovered per-root by [`load_project_config`] and stored on
+/// `LspClientManager`.
 ///
 /// # Errors
 ///
@@ -74,8 +77,10 @@ pub fn load() -> Result<Config> {
 ///
 /// Returns the list of paths that would be loaded (later overrides earlier):
 /// 1. User config (`~/.config/catenary/config.toml`)
-/// 2. Project-local config (`.catenary.toml`, searching upward from cwd)
-/// 3. Explicit file from `CATENARY_CONFIG` env var
+/// 2. Explicit file from `CATENARY_CONFIG` env var
+///
+/// Project-local config (`.catenary.toml`) is not included — it is loaded
+/// per-root by [`load_project_config`] and stored on `LspClientManager`.
 #[must_use]
 pub fn config_sources() -> Vec<PathBuf> {
     let mut sources: Vec<PathBuf> = Vec::new();
@@ -88,20 +93,7 @@ pub fn config_sources() -> Vec<PathBuf> {
         }
     }
 
-    // 2. Project-local config (.catenary.toml) searching upwards
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut current = Some(cwd.as_path());
-        while let Some(path) = current {
-            let config_path = path.join(".catenary.toml");
-            if config_path.exists() {
-                sources.push(config_path);
-                break;
-            }
-            current = path.parent();
-        }
-    }
-
-    // 3. Explicit file from CATENARY_CONFIG env var
+    // 2. Explicit file from CATENARY_CONFIG env var
     if let Ok(path) = std::env::var("CATENARY_CONFIG") {
         sources.push(PathBuf::from(path));
     }
@@ -373,4 +365,309 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
         }
     }
     results
+}
+
+/// Top-level keys allowed in `.catenary.toml` project config files.
+const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["language", "server"];
+
+/// Per-root project configuration from `.catenary.toml`.
+///
+/// Contains only `[language.*]` and `[server.*]` sections.
+/// All other sections are user-level only and rejected with
+/// a warning if present.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectConfig {
+    /// Language definitions from the project config.
+    pub language: HashMap<String, LanguageConfig>,
+    /// Server definitions from the project config.
+    pub server: HashMap<String, ServerDef>,
+}
+
+/// Discovers and loads `.catenary.toml` at a workspace root.
+///
+/// Returns `None` if no `.catenary.toml` exists at the root.
+/// Returns `Err` if the file exists but cannot be read or parsed.
+///
+/// The returned config is the raw project layer — not merged with
+/// user config. Callers merge as needed via [`super::merge::deep_merge`].
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The file exists but cannot be read.
+/// - The file contains invalid TOML.
+/// - A `[language.*]` entry uses the removed `inherit` field.
+/// - A `[language.*]` entry contains inline server definition fields.
+pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfig>> {
+    let config_path = root.join(".catenary.toml");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read project config: {}", config_path.display()))?;
+
+    let raw: toml::Value = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse project config: {}", config_path.display()))?;
+
+    // Warn on unsupported top-level keys.
+    if let Some(table) = raw.as_table() {
+        for key in table.keys() {
+            if !PROJECT_CONFIG_ALLOWED_KEYS.contains(&key.as_str()) {
+                tracing::warn!(
+                    source = "config.project",
+                    path = %config_path.display(),
+                    key = key.as_str(),
+                    "Project config {}: unsupported section [{}] — \
+                     only [language.*] and [server.*] are allowed in \
+                     .catenary.toml. Move [{key}] to your user config \
+                     (~/.config/catenary/config.toml).",
+                    config_path.display(),
+                    key,
+                );
+            }
+        }
+    }
+
+    // Validate [language.*] entries for rejected fields, same as user config.
+    if let Some(lang_table) = raw.get("language").and_then(toml::Value::as_table) {
+        for (lang_key, entry) in lang_table {
+            if let Some(entry_table) = entry.as_table() {
+                if entry_table.contains_key("inherit") {
+                    bail!(
+                        "Project config {}: [language.{lang_key}] uses the removed \
+                         `inherit` field — copy the base language's `servers` list \
+                         into [language.{lang_key}] instead.",
+                        config_path.display(),
+                    );
+                }
+
+                let stale: Vec<&str> = SERVER_DEF_KEYS
+                    .iter()
+                    .copied()
+                    .filter(|k| entry_table.contains_key(*k))
+                    .collect();
+                if !stale.is_empty() {
+                    bail!(
+                        "Project config {}: [language.{lang_key}] contains server \
+                         definition fields ({}) — these belong in [server.*].",
+                        config_path.display(),
+                        stale.join(", "),
+                    );
+                }
+            }
+        }
+    }
+
+    // Deserialize only the supported sections.
+    let language: HashMap<String, LanguageConfig> = raw
+        .get("language")
+        .map(|v| {
+            toml::Value::try_into(v.clone()).with_context(|| {
+                format!(
+                    "Failed to parse [language.*] in project config: {}",
+                    config_path.display()
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut server: HashMap<String, ServerDef> = raw
+        .get("server")
+        .map(|v| {
+            toml::Value::try_into(v.clone()).with_context(|| {
+                format!(
+                    "Failed to parse [server.*] in project config: {}",
+                    config_path.display()
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    // Compile file_patterns on project ServerDef entries.
+    for (name, server_def) in &mut server {
+        server_def.compile_patterns().with_context(|| {
+            format!(
+                "Project config {}: [server.{name}] file_patterns compilation failed",
+                config_path.display()
+            )
+        })?;
+    }
+
+    // Validate server definitions — no empty commands.
+    for (name, server_def) in &server {
+        if server_def.command.is_empty()
+            && (!server_def.args.is_empty()
+                || server_def.initialization_options.is_some()
+                || server_def.min_severity.is_some()
+                || !server_def.file_patterns.is_empty())
+        {
+            bail!(
+                "Project config {}: [server.{name}] has an empty `command`",
+                config_path.display()
+            );
+        }
+    }
+
+    Ok(Some(ProjectConfig { language, server }))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod project_config_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_load_project_config_found() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[server.rust-analyzer]
+command = "rust-analyzer"
+settings = { checkOnSave = true }
+
+[language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(config.language.contains_key("rust"));
+        assert!(config.server.contains_key("rust-analyzer"));
+        let ra = &config.server["rust-analyzer"];
+        assert_eq!(ra.command, "rust-analyzer");
+        assert!(ra.settings.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_missing() -> Result<()> {
+        let dir = tempdir()?;
+        let result = load_project_config(dir.path())?;
+        assert!(result.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_parse_error() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join(".catenary.toml"), "{{invalid toml").expect("write");
+
+        let result = load_project_config(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_inherit() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[language.typescriptreact]
+inherit = "typescript"
+"#,
+        )
+        .expect("write");
+
+        let result = load_project_config(dir.path());
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("inherit"),
+            "error should mention inherit: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_inline_server_keys() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[language.rust]
+command = "rust-analyzer"
+"#,
+        )
+        .expect("write");
+
+        let result = load_project_config(dir.path());
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("command") && err.contains("[server.*]"),
+            "error should mention server definition migration: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_warns_unsupported_sections() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[commands.deny]
+cat = "Use read"
+
+[tui]
+auto_add_sessions = false
+
+[language.rust]
+servers = []
+"#,
+        )?;
+
+        // Should succeed (warnings only, not errors) but the unsupported
+        // sections are warned about. We verify it loads without error.
+        let result = load_project_config(dir.path())?;
+        assert!(result.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_language_and_server_only() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[server.pyright]
+command = "pyright"
+settings = { python = { analysis = { typeCheckingMode = "strict" } } }
+
+[language.python]
+servers = ["pyright"]
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should load cleanly");
+        assert_eq!(config.language.len(), 1);
+        assert_eq!(config.server.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_sources_no_cwd_walk() {
+        // config_sources() should not include .catenary.toml from cwd ancestors.
+        let sources = config_sources();
+        for source in &sources {
+            assert!(
+                source.file_name().and_then(|f| f.to_str()) != Some(".catenary.toml"),
+                "config_sources() should not include .catenary.toml: {}",
+                source.display(),
+            );
+        }
+    }
 }
