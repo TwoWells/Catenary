@@ -22,6 +22,18 @@ use serde_json::{Value, json};
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
 
+/// Isolates a subprocess from user-level directories.
+///
+/// Sets `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` to the
+/// given root so the process uses the test's tempdir instead of
+/// `~/.config`, `~/.local/state`, or `~/.local/share`. All integration
+/// test subprocesses (bridge, `catenary install`, etc.) must call this.
+fn isolate_env(cmd: &mut Command, root: &str) {
+    cmd.env("XDG_CONFIG_HOME", root);
+    cmd.env("XDG_STATE_HOME", root);
+    cmd.env("XDG_DATA_HOME", root);
+}
+
 /// Helper to spawn the bridge and communicate with it
 struct BridgeProcess {
     child: std::process::Child,
@@ -46,11 +58,8 @@ impl BridgeProcess {
         let roots_val = std::env::join_paths(roots).unwrap_or_default();
         cmd.env("CATENARY_ROOTS", &roots_val);
 
-        // Isolate from user-level config and data directories
         if let Some(first_root) = roots.first() {
-            cmd.env("XDG_CONFIG_HOME", first_root);
-            cmd.env("XDG_STATE_HOME", first_root);
-            cmd.env("XDG_DATA_HOME", first_root);
+            isolate_env(&mut cmd, first_root);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -81,9 +90,7 @@ impl BridgeProcess {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         cmd.env("CATENARY_CONFIG", config_path);
         cmd.env("CATENARY_ROOTS", root);
-        cmd.env("XDG_CONFIG_HOME", root);
-        cmd.env("XDG_STATE_HOME", root);
-        cmd.env("XDG_DATA_HOME", root);
+        isolate_env(&mut cmd, root);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -948,14 +955,11 @@ fn install_mock_grammar(state_home: &str) -> Result<()> {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("test_assets")
         .join("mock_grammar");
-    let output = Command::new(env!("CARGO_BIN_EXE_catenary"))
-        .arg("install")
-        .arg(fixture.to_str().context("fixture path")?)
-        .env("XDG_STATE_HOME", state_home)
-        .env("XDG_CONFIG_HOME", state_home)
-        .env("XDG_DATA_HOME", state_home)
-        .output()
-        .context("failed to run catenary install")?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    cmd.arg("install")
+        .arg(fixture.to_str().context("fixture path")?);
+    isolate_env(&mut cmd, state_home);
+    let output = cmd.output().context("failed to run catenary install")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("catenary install failed: {stderr}");
