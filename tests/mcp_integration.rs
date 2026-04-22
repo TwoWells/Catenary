@@ -312,7 +312,21 @@ fn find_notify_socket(sessions_dir: &std::path::Path) -> Result<PathBuf> {
 }
 
 impl Drop for BridgeProcess {
+    #[allow(clippy::print_stderr, reason = "dump bridge logs on test failure")]
     fn drop(&mut self) {
+        // If the test is panicking, dump bridge stderr for diagnostics.
+        // This runs before we close stdin so the bridge is still alive
+        // and may have buffered log output.
+        if std::thread::panicking()
+            && let Some(ref mut stderr) = self.stderr
+        {
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf);
+            if !buf.is_empty() {
+                eprintln!("--- bridge stderr (test panicked) ---\n{buf}--- end bridge stderr ---");
+            }
+        }
+
         // Closing stdin signals the server to shut down gracefully
         self.stdin.take();
 
