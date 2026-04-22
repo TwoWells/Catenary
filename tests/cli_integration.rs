@@ -6,7 +6,7 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Integration tests for CLI list and monitor commands.
+//! Integration tests for CLI list, monitor, config, and doctor commands.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -15,6 +15,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
+
+/// Isolates a subprocess from the user's environment.
+fn isolate_env(cmd: &mut Command, root: &str) {
+    cmd.env("XDG_CONFIG_HOME", root);
+    cmd.env("XDG_STATE_HOME", root);
+    cmd.env("XDG_DATA_HOME", root);
+    cmd.env_remove("CATENARY_STATE_DIR");
+    cmd.env_remove("CATENARY_DATA_DIR");
+    cmd.env_remove("CATENARY_CONFIG");
+    cmd.env_remove("CATENARY_SERVERS");
+    cmd.env_remove("CATENARY_ROOTS");
+}
 
 /// Helper to spawn the bridge and discover readiness via MCP initialize.
 struct ServerProcess {
@@ -588,6 +600,136 @@ fn test_monitor_uses_arrows() -> Result<()> {
     assert!(
         found_outgoing_arrow,
         "Should use ← arrow for outgoing messages"
+    );
+    Ok(())
+}
+
+// ── catenary config ─────────────────────────────────────────────
+
+#[test]
+fn test_config_outputs_valid_toml() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.arg("config");
+
+    let output = cmd.output().context("Failed to run catenary config")?;
+    assert!(output.status.success(), "catenary config should exit 0");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    toml::from_str::<toml::Value>(&stdout)
+        .with_context(|| format!("catenary config output is not valid TOML:\n{stdout}"))?;
+    Ok(())
+}
+
+#[test]
+fn test_config_contains_deny_sections() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.arg("config");
+
+    let output = cmd.output().context("Failed to run catenary config")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("[commands.deny]"),
+        "output should contain [commands.deny]"
+    );
+    assert!(
+        stdout.contains("[commands.deny_when_first]"),
+        "output should contain [commands.deny_when_first]"
+    );
+    Ok(())
+}
+
+// ── catenary doctor suggestions ─────────────────────────────────
+
+#[test]
+fn test_doctor_suggests_config_when_no_config_file() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.arg("doctor").arg("--nocolor");
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Suggestions section should appear at the bottom
+    assert!(
+        stdout.contains("Suggestions:"),
+        "doctor should show Suggestions section when no config exists, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("catenary config"),
+        "doctor should suggest `catenary config`, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("No config file found"),
+        "doctor should mention missing config file, got:\n{stdout}"
+    );
+
+    // Suggestions should be the last section
+    let suggestions_pos = stdout
+        .rfind("Suggestions:")
+        .context("Suggestions: not found")?;
+    let grammars_pos = stdout.rfind("Grammars:").context("Grammars: not found")?;
+    assert!(
+        suggestions_pos > grammars_pos,
+        "Suggestions should appear after Grammars"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_doctor_no_suggestions_when_config_with_commands() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[commands.deny]\ncat = \"Use read\"\n",
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.arg("doctor").arg("--nocolor");
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("Suggestions:"),
+        "doctor should not show Suggestions when config with commands exists, got:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_doctor_suggests_commands_when_config_exists_without_commands() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(config_dir.join("config.toml"), "# no commands section\n")?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.arg("doctor").arg("--nocolor");
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("Suggestions:"),
+        "doctor should show Suggestions when config has no [commands], got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("No [commands] section"),
+        "doctor should mention missing [commands] section, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("No config file found"),
+        "should not say config file is missing when it exists, got:\n{stdout}"
     );
     Ok(())
 }

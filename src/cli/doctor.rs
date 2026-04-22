@@ -299,6 +299,16 @@ pub async fn run_doctor(roots: &[PathBuf], nocolor: bool, show_diff: bool) -> Re
     println!("{}:", colors.bold("Grammars"));
     check_grammars(&colors);
 
+    // Actionable suggestions at the very bottom so they aren't buried
+    let suggestions = collect_suggestions(&config, dirs::config_dir());
+    if !suggestions.is_empty() {
+        println!();
+        println!("{}:", colors.bold("Suggestions"));
+        for suggestion in &suggestions {
+            println!("  {}", colors.dim(suggestion));
+        }
+    }
+
     Ok(())
 }
 
@@ -438,6 +448,46 @@ fn print_migration(
         println!("    {k} = {v}");
     }
     println!();
+}
+
+/// Return the user config file path if it exists on disk.
+///
+/// Uses `config_base` as the parent directory (e.g. `~/.config`).
+/// Returns `None` when the base is unknown or the file doesn't exist.
+fn user_config_path_in(config_base: Option<PathBuf>) -> Option<PathBuf> {
+    let path = config_base?.join("catenary").join("config.toml");
+    if path.exists() { Some(path) } else { None }
+}
+
+/// Collect actionable suggestions based on current config state.
+///
+/// `config_base` is the platform config directory (from `dirs::config_dir()`).
+fn collect_suggestions(
+    config: &crate::config::Config,
+    config_base: Option<PathBuf>,
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    if user_config_path_in(config_base.clone()).is_none() {
+        let target = config_base
+            .map(|d| d.join("catenary").join("config.toml"))
+            .map_or_else(
+                || "~/.config/catenary/config.toml".to_string(),
+                |p| p.display().to_string(),
+            );
+        suggestions.push(format!(
+            "No config file found. Run `catenary config > {target}` \
+             to generate a recommended starting config.",
+        ));
+    } else if config.resolved_commands.is_none() {
+        suggestions.push(
+            "No [commands] section in config — all shell commands allowed. \
+             Run `catenary config` to see a recommended template."
+                .to_string(),
+        );
+    }
+
+    suggestions
 }
 
 /// Checks whether a binary can be found on `$PATH`.
@@ -804,10 +854,7 @@ fn check_command_filter_config(colors: &ColorConfig, config: &crate::config::Con
         None => {
             println!(
                 "  {}",
-                colors.dim(
-                    "no [commands] section — all shell commands allowed. \
-                     Run `catenary config` to generate a recommended template.",
-                ),
+                colors.dim("no [commands] section — all shell commands allowed"),
             );
         }
     }
@@ -937,11 +984,133 @@ pub(crate) fn check_grammars_installed(colors: &ColorConfig) {
 mod tests {
     use super::*;
     use crate::cli::ColorConfig;
+    use std::fs;
 
     #[test]
     fn test_doctor_grammar_section_no_grammars() {
         let colors = ColorConfig::new(true);
         // Should not panic on empty/default grammar directory
         check_grammars_installed(&colors);
+    }
+
+    // ── user_config_path_in tests ───────────────────────────────
+
+    #[test]
+    fn config_path_none_when_base_is_none() {
+        assert!(user_config_path_in(None).is_none());
+    }
+
+    #[test]
+    fn config_path_none_when_file_absent() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        assert!(user_config_path_in(Some(tmp.path().to_path_buf())).is_none());
+    }
+
+    #[test]
+    fn config_path_some_when_file_exists() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let config_dir = tmp.path().join("catenary");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_file = config_dir.join("config.toml");
+        fs::write(&config_file, "# empty").expect("write config");
+
+        let result = user_config_path_in(Some(tmp.path().to_path_buf()));
+        assert_eq!(result.expect("should find config file"), config_file,);
+    }
+
+    // ── collect_suggestions tests ───────────────────────────────
+
+    #[test]
+    fn suggestions_no_config_file() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let config = crate::config::Config::default();
+        let suggestions = collect_suggestions(&config, Some(tmp.path().to_path_buf()));
+
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.contains("No config file found")),
+            "should mention missing config file",
+        );
+        assert!(
+            suggestions.iter().any(|s| s.contains("catenary config")),
+            "should suggest `catenary config`",
+        );
+    }
+
+    #[test]
+    fn suggestions_config_exists_but_no_commands() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let config_dir = tmp.path().join("catenary");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(config_dir.join("config.toml"), "# no commands").expect("write config");
+
+        let config = crate::config::Config::default();
+        let suggestions = collect_suggestions(&config, Some(tmp.path().to_path_buf()));
+
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.contains("No [commands] section")),
+            "should mention missing [commands] section",
+        );
+        assert!(
+            !suggestions
+                .iter()
+                .any(|s| s.contains("No config file found")),
+            "should not mention missing config file when file exists",
+        );
+    }
+
+    #[test]
+    fn suggestions_empty_when_fully_configured() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let config_dir = tmp.path().join("catenary");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[commands.deny]\ncat = \"test\"",
+        )
+        .expect("write config");
+
+        let mut config = crate::config::Config::default();
+        config.resolved_commands = Some(crate::config::ResolvedCommands::default());
+        let suggestions = collect_suggestions(&config, Some(tmp.path().to_path_buf()));
+
+        assert!(
+            suggestions.is_empty(),
+            "should have no suggestions when config file and commands exist",
+        );
+    }
+
+    #[test]
+    fn suggestions_no_config_file_includes_path() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let config = crate::config::Config::default();
+        let suggestions = collect_suggestions(&config, Some(tmp.path().to_path_buf()));
+
+        let expected_path = tmp
+            .path()
+            .join("catenary")
+            .join("config.toml")
+            .display()
+            .to_string();
+        assert!(
+            suggestions.iter().any(|s| s.contains(&expected_path)),
+            "suggestion should include the platform-resolved config path",
+        );
+    }
+
+    #[test]
+    fn suggestions_none_base_falls_back() {
+        let config = crate::config::Config::default();
+        let suggestions = collect_suggestions(&config, None);
+
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.contains("~/.config/catenary/config.toml")),
+            "should fall back to ~/.config path when config_dir is None",
+        );
     }
 }

@@ -67,6 +67,9 @@ enum Command {
         id: String,
     },
 
+    /// Output a recommended annotated config template.
+    Config,
+
     /// Check language server health. Tests all configured servers by default.
     /// Pass a path to scope to a specific workspace.
     Doctor {
@@ -205,6 +208,10 @@ async fn main() -> Result<()> {
             }
         }
         Some(Command::List) => cli::commands::run_list(),
+        Some(Command::Config) => {
+            cli::config_template::print_template();
+            Ok(())
+        }
         Some(Command::Monitor {
             id,
             raw,
@@ -528,5 +535,13 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::SessionStart { .. }));
+    }
+
+    #[test]
+    fn test_cli_config_subcommand() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "config"]);
+        let args = args.expect("config subcommand should parse");
+        assert!(matches!(args.command, Some(Command::Config)));
     }
 }
