@@ -47,6 +47,7 @@ pub struct GrepInput {
 struct GrepHit {
     file: PathBuf,
     line: u32,
+    col: u32,
     matched_text: String,
     classification: HitClass,
 }
@@ -61,6 +62,45 @@ enum HitClass {
     PrepareRenameSymbol,
     /// Keyword filtered out via `prepareRename` (will be dropped).
     Keyword,
+}
+
+/// Enrichment data for a single symbol from LSP queries.
+#[allow(dead_code, reason = "07b renders enrichment; 07a only collects")]
+pub(super) struct SymbolEnrichment {
+    /// Reference lines grouped by file path (0-based line numbers).
+    pub ref_lines: HashMap<String, HashSet<u32>>,
+    /// Incoming call edges (callers of this symbol).
+    pub incoming_calls: Vec<CallEdge>,
+    /// Outgoing call edges (callees of this symbol).
+    pub outgoing_calls: Vec<CallEdge>,
+    /// Implementation locations: `(file_path, line_0)`.
+    pub implementations: Vec<(String, u32)>,
+    /// Supertype edges.
+    pub supertypes: Vec<TypeEdge>,
+    /// Subtype edges.
+    pub subtypes: Vec<TypeEdge>,
+}
+
+/// A call hierarchy edge (caller or callee).
+#[allow(dead_code, reason = "07b renders enrichment; 07a only collects")]
+pub(super) struct CallEdge {
+    pub name: String,
+    pub kind: u32,
+    pub container: Option<String>,
+    pub file: String,
+    pub line: u32,
+    pub deprecated: bool,
+}
+
+/// A type hierarchy edge (supertype or subtype).
+#[allow(dead_code, reason = "07b renders enrichment; 07a only collects")]
+pub(super) struct TypeEdge {
+    pub name: String,
+    pub kind: u32,
+    pub container: Option<String>,
+    pub file: String,
+    pub line: u32,
+    pub deprecated: bool,
 }
 
 /// Grep tool server: ripgrep + tree-sitter index pipeline with LSP enrichment.
@@ -236,6 +276,7 @@ impl GrepServer {
             for (&line_1, texts) in line_map {
                 let line_0 = line_1 - 1;
                 let matched_text = texts.first().map(|(t, _)| t.clone()).unwrap_or_default();
+                let col = texts.first().map_or(0, |(_, c)| *c);
 
                 if has_grammar {
                     // Check if this line is a definition
@@ -243,6 +284,7 @@ impl GrepServer {
                         hits.push(GrepHit {
                             file: file_path.clone(),
                             line: line_0,
+                            col,
                             matched_text: matched_text.clone(),
                             classification: HitClass::Symbol {
                                 symbol: TsSymbol {
@@ -268,6 +310,7 @@ impl GrepServer {
                         hits.push(GrepHit {
                             file: file_path.clone(),
                             line: line_0,
+                            col,
                             matched_text,
                             classification: HitClass::Reference { enclosing },
                         });
@@ -284,12 +327,12 @@ impl GrepServer {
                         hits.push(GrepHit {
                             file: file_path.clone(),
                             line: line_0,
+                            col,
                             matched_text,
                             classification: HitClass::Reference { enclosing: None },
                         });
                     } else {
                         // Server alive — use prepareRename for keyword discrimination
-                        let col = texts.first().map_or(0, |(_, c)| *c);
                         let is_symbol = self
                             .prepare_rename_check(&file_path, line_0, col, parent_id)
                             .await;
@@ -297,6 +340,7 @@ impl GrepServer {
                             hits.push(GrepHit {
                                 file: file_path.clone(),
                                 line: line_0,
+                                col,
                                 matched_text,
                                 classification: HitClass::PrepareRenameSymbol,
                             });
@@ -304,6 +348,7 @@ impl GrepServer {
                             hits.push(GrepHit {
                                 file: file_path.clone(),
                                 line: line_0,
+                                col,
                                 matched_text,
                                 classification: HitClass::Keyword,
                             });
@@ -320,7 +365,29 @@ impl GrepServer {
             return Ok(String::new());
         }
 
-        let output = select_and_render_tier(&hits, self.budget, &self.fs_manager);
+        // Promote-from-bottom tier selection with enrichment.
+        let output = if estimate_tier2_lower_bound(&hits, &self.fs_manager) <= self.budget {
+            let tier2 = render_tier2(&hits, &self.fs_manager);
+            if tier2.len() <= self.budget {
+                // Tier 2 fits — run enrichment for each symbol hit.
+                // (07b adds tier 1 rendering; for now we still emit tier 2.)
+                for hit in &hits {
+                    let (line_0, col, from_ts) = match &hit.classification {
+                        HitClass::Symbol { symbol } => (symbol.line, hit.col, true),
+                        HitClass::PrepareRenameSymbol => (hit.line, hit.col, false),
+                        _ => continue,
+                    };
+                    let _ = self
+                        .enrich_at_position(&hit.file, line_0, col, from_ts, parent_id)
+                        .await;
+                }
+                tier2
+            } else {
+                render_tier3(&hits, self.budget, &self.fs_manager)
+            }
+        } else {
+            render_tier3(&hits, self.budget, &self.fs_manager)
+        };
         Ok(output)
     }
 
@@ -370,6 +437,200 @@ impl GrepServer {
 
         // No capable server or all errored — can't distinguish, assume symbol
         true
+    }
+
+    /// Enriches a symbol at a position with LSP data.
+    ///
+    /// Sends all enrichment queries (references, call hierarchy, implementations,
+    /// type hierarchy) for every symbol. The server decides what returns results.
+    /// When `from_ts` is false (no-grammar path), calls `prepareRename` first
+    /// to filter keywords.
+    ///
+    /// Opens the document once on the first capable server and keeps it open
+    /// for all enrichment calls, closing at the end. This avoids rapid
+    /// `didOpen`/`didClose` cycling that can cause document lifecycle issues.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Single open/close cycle for all enrichment"
+    )]
+    async fn enrich_at_position(
+        &self,
+        path: &Path,
+        line_0: u32,
+        col: u32,
+        from_ts: bool,
+        parent_id: Option<i64>,
+    ) -> Option<SymbolEnrichment> {
+        // If !from_ts, check prepareRename first. Null → keyword, return None.
+        if !from_ts
+            && !self
+                .prepare_rename_check(path, line_0, col, parent_id)
+                .await
+        {
+            return None;
+        }
+
+        // Use `supports_references` as the broadest capability to find the
+        // primary server. Most servers that support references also support
+        // the other enrichment capabilities.
+        let servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_references)
+            .await;
+
+        if servers.is_empty() {
+            return Some(SymbolEnrichment {
+                ref_lines: HashMap::new(),
+                incoming_calls: Vec::new(),
+                outgoing_calls: Vec::new(),
+                implementations: Vec::new(),
+                supertypes: Vec::new(),
+                subtypes: Vec::new(),
+            });
+        }
+
+        let client_mutex = &servers[0];
+        let Ok(uri) = self
+            .client_manager
+            .open_document_on(path, client_mutex, parent_id)
+            .await
+        else {
+            return Some(SymbolEnrichment {
+                ref_lines: HashMap::new(),
+                incoming_calls: Vec::new(),
+                outgoing_calls: Vec::new(),
+                implementations: Vec::new(),
+                supertypes: Vec::new(),
+                subtypes: Vec::new(),
+            });
+        };
+
+        // --- references ---
+        let ref_lines = {
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            match client.references(&uri, line_0, col, true).await {
+                Ok(Value::Array(refs)) => {
+                    let mut map: HashMap<String, HashSet<u32>> = HashMap::new();
+                    for r in &refs {
+                        if let Some(file) = extract_location_path(r)
+                            && let Some(line) = extract_start_line(r)
+                        {
+                            map.entry(file).or_default().insert(line);
+                        }
+                    }
+                    map
+                }
+                Ok(_) => HashMap::new(),
+                Err(e) => {
+                    warn!(source = "lsp.dispatch", "references failed: {e}");
+                    HashMap::new()
+                }
+            }
+        };
+
+        // --- call hierarchy ---
+        let (incoming_calls, outgoing_calls) = {
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            let result = match client.prepare_call_hierarchy(&uri, line_0, col).await {
+                Ok(Value::Array(ref items)) if !items.is_empty() => {
+                    let item = &items[0];
+                    let incoming = match client.incoming_calls(item).await {
+                        Ok(Value::Array(calls)) => calls
+                            .iter()
+                            .filter_map(|c| extract_call_edge(c.get("from")?))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let outgoing = match client.outgoing_calls(item).await {
+                        Ok(Value::Array(calls)) => calls
+                            .iter()
+                            .filter_map(|c| extract_call_edge(c.get("to")?))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    (incoming, outgoing)
+                }
+                Ok(_) => (Vec::new(), Vec::new()),
+                Err(e) => {
+                    warn!(
+                        source = "lsp.dispatch",
+                        "prepare_call_hierarchy failed: {e}"
+                    );
+                    (Vec::new(), Vec::new())
+                }
+            };
+            drop(client);
+            result
+        };
+
+        // --- implementations ---
+        let implementations = {
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            match client.implementation(&uri, line_0, col).await {
+                Ok(Value::Array(locs)) => locs
+                    .iter()
+                    .filter_map(|loc| {
+                        let file = extract_location_path(loc)?;
+                        let line = extract_start_line(loc)?;
+                        Some((file, line))
+                    })
+                    .collect(),
+                Ok(_) => Vec::new(),
+                Err(e) => {
+                    warn!(source = "lsp.dispatch", "implementation failed: {e}");
+                    Vec::new()
+                }
+            }
+        };
+
+        // --- type hierarchy ---
+        let (supertypes, subtypes) = {
+            let mut client = client_mutex.lock().await;
+            client.set_parent_id(parent_id);
+            let result = match client.prepare_type_hierarchy(&uri, line_0, col).await {
+                Ok(Value::Array(ref items)) if !items.is_empty() => {
+                    let item = &items[0];
+                    let supertypes = match client.supertypes(item).await {
+                        Ok(Value::Array(types)) => {
+                            types.iter().filter_map(extract_type_edge).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let subtypes = match client.subtypes(item).await {
+                        Ok(Value::Array(types)) => {
+                            types.iter().filter_map(extract_type_edge).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    (supertypes, subtypes)
+                }
+                Ok(_) => (Vec::new(), Vec::new()),
+                Err(e) => {
+                    warn!(
+                        source = "lsp.dispatch",
+                        "prepare_type_hierarchy failed: {e}"
+                    );
+                    (Vec::new(), Vec::new())
+                }
+            };
+            drop(client);
+            result
+        };
+
+        // Close the document once, after all enrichment calls.
+        self.client_manager.close_document(&uri, client_mutex).await;
+
+        Some(SymbolEnrichment {
+            ref_lines,
+            incoming_calls,
+            outgoing_calls,
+            implementations,
+            supertypes,
+            subtypes,
+        })
     }
 
     /// Searches workspace roots for pattern matches using the `grep-*` crates
@@ -473,12 +734,11 @@ impl GrepServer {
 
 // ─── Tier selection and rendering ────────────────────────────────────────
 
-/// Promote-from-bottom tier selection.
+/// Promote-from-bottom tier selection (pure rendering, no enrichment).
 ///
-/// 1. Estimate tier 2 size cheaply. If clearly over budget → skip to tier 3.
-/// 2. Render tier 2 (structure heatmap). If it fits → use tier 2.
-///    (Ticket 07a adds: if tier 2 fits, try enrichment for tier 1.)
-/// 3. Fall back to tier 3 (bucketed). Always fits after degradation.
+/// Used by unit tests. The async `run` method inlines this logic with
+/// enrichment calls (07a).
+#[cfg(test)]
 fn select_and_render_tier(
     hits: &[GrepHit],
     budget: usize,
@@ -977,6 +1237,81 @@ fn split_alternation(pattern: &str) -> Vec<String> {
     arms
 }
 
+// ─── LSP JSON extraction helpers ────────────────────────────────────────
+
+/// Extracts a file path from an LSP Location's `uri` field.
+///
+/// Strips the `file://` prefix from a `file://` URI. Returns `None`
+/// for non-file URIs or missing fields.
+fn extract_location_path(location: &Value) -> Option<String> {
+    location
+        .get("uri")?
+        .as_str()?
+        .strip_prefix("file://")
+        .map(str::to_string)
+}
+
+/// Extracts the start line (0-based) from an LSP Location's range.
+fn extract_start_line(location: &Value) -> Option<u32> {
+    u32::try_from(location.get("range")?.get("start")?.get("line")?.as_u64()?).ok()
+}
+
+/// Extracts a [`CallEdge`] from a `CallHierarchyItem` JSON value.
+fn extract_call_edge(item: &Value) -> Option<CallEdge> {
+    let name = item.get("name")?.as_str()?.to_string();
+    let kind = u32::try_from(item.get("kind")?.as_u64()?).ok()?;
+    let container = item
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let file = item
+        .get("uri")?
+        .as_str()?
+        .strip_prefix("file://")
+        .map(str::to_string)?;
+    let line = u32::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
+    let deprecated = item
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| tags.iter().any(|t| t.as_u64() == Some(1)));
+    Some(CallEdge {
+        name,
+        kind,
+        container,
+        file,
+        line,
+        deprecated,
+    })
+}
+
+/// Extracts a [`TypeEdge`] from a `TypeHierarchyItem` JSON value.
+fn extract_type_edge(item: &Value) -> Option<TypeEdge> {
+    let name = item.get("name")?.as_str()?.to_string();
+    let kind = u32::try_from(item.get("kind")?.as_u64()?).ok()?;
+    let container = item
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let file = item
+        .get("uri")?
+        .as_str()?
+        .strip_prefix("file://")
+        .map(str::to_string)?;
+    let line = u32::try_from(item.get("range")?.get("start")?.get("line")?.as_u64()?).ok()?;
+    let deprecated = item
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| tags.iter().any(|t| t.as_u64() == Some(1)));
+    Some(TypeEdge {
+        name,
+        kind,
+        container,
+        file,
+        line,
+        deprecated,
+    })
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1046,6 +1381,7 @@ mod tests {
         GrepHit {
             file: PathBuf::from(file),
             line,
+            col: 0,
             matched_text: name.to_string(),
             classification: HitClass::Symbol {
                 symbol: TsSymbol {
@@ -1072,6 +1408,7 @@ mod tests {
         GrepHit {
             file: PathBuf::from(file),
             line,
+            col: 0,
             matched_text: name.to_string(),
             classification: HitClass::Symbol {
                 symbol: TsSymbol {
@@ -1099,6 +1436,7 @@ mod tests {
         GrepHit {
             file: PathBuf::from(file),
             line,
+            col: 0,
             matched_text: text.to_string(),
             classification: HitClass::Reference {
                 enclosing: Some(TsSymbol {
@@ -1118,6 +1456,7 @@ mod tests {
         GrepHit {
             file: PathBuf::from(file),
             line,
+            col: 0,
             matched_text: text.to_string(),
             classification: HitClass::Reference { enclosing: None },
         }
@@ -1128,6 +1467,7 @@ mod tests {
         GrepHit {
             file: PathBuf::from(file),
             line,
+            col: 0,
             matched_text: text.to_string(),
             classification: HitClass::PrepareRenameSymbol,
         }
@@ -1431,6 +1771,7 @@ mod tests {
         let hit = GrepHit {
             file: PathBuf::from("/project/src/main.rs"),
             line: 42,
+            col: 0,
             matched_text: "CONST_VAL".to_string(),
             classification: HitClass::Symbol {
                 symbol: TsSymbol {
@@ -1462,6 +1803,7 @@ mod tests {
         let hit = GrepHit {
             file: PathBuf::from("/project/src/main.rs"),
             line: 10,
+            col: 0,
             matched_text: "my_func".to_string(),
             classification: HitClass::Symbol {
                 symbol: TsSymbol {

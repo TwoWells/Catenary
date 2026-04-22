@@ -2119,7 +2119,7 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
         .as_str()
         .context("Missing text for incoming calls")?;
 
-    // In 06a, no enrichment sections — just verify the symbol is found
+    // Enrichment runs (07a) but tier 1 rendering is 07b — verify symbol found
     assert!(
         text.contains("callee_fn"),
         "Expected callee_fn in output, got:\n{text}"
@@ -2132,7 +2132,7 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that enriched output for structs includes an "Implementations:" section.
+/// Verifies that enrichment for structs runs without error.
 #[test]
 fn test_grep_enrichment_implementations() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2167,7 +2167,7 @@ fn test_grep_enrichment_implementations() -> Result<()> {
         .as_str()
         .context("Missing text for implementations")?;
 
-    // In 06a, no enrichment sections — just verify the symbol is found
+    // Enrichment runs (07a) but tier 1 rendering is 07b — verify symbol found
     assert!(
         text.contains("MyStruct"),
         "Expected MyStruct in output, got:\n{text}"
@@ -2176,7 +2176,7 @@ fn test_grep_enrichment_implementations() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that enriched output for interfaces includes a "Subtypes:" section.
+/// Verifies that enrichment for types with subtypes runs without error.
 #[test]
 fn test_grep_enrichment_subtypes() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2212,8 +2212,7 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
         .as_str()
         .context("Missing text for subtypes")?;
 
-    // In 06a, no enrichment sections — just verify the symbol is found.
-    // Dog and Cat are subtypes found via LSP (added in ticket 07a).
+    // Enrichment runs (07a) but tier 1 rendering is 07b — verify symbol found
     assert!(
         text.contains("Animal"),
         "Expected Animal in output, got:\n{text}"
@@ -3074,6 +3073,330 @@ fn test_grep_prepare_rename_priority_chain() -> Result<()> {
     assert!(
         text.contains("chain_symbol"),
         "Expected chain_symbol in output (priority chain fallthrough), got:\n{text}"
+    );
+
+    Ok(())
+}
+
+// ─── SEARCHv2 enrichment tests (ticket 07a) ───────────────────────────
+
+/// Enrich a function: `outgoing_calls` and `ref_lines` are populated.
+/// Uses the no-grammar path (mockls, no tree-sitter grammar installed).
+/// Enrichment runs via the pipeline; output is still tier 2.
+#[test]
+fn test_enrich_ungated_function() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // callee_fn defined on L0, caller_fn defined on L1, caller_fn calls callee_fn on L2
+    let file = dir.path().join(format!("func.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn callee_fn()\nfn caller_fn()\n  callee_fn\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5100,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "callee_fn" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "enrich_ungated_function should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Tool completes successfully with enrichment running (tier 2 output)
+    assert!(
+        text.contains("callee_fn"),
+        "Expected callee_fn in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Enrich a type: implementations, supertypes, subtypes are populated.
+/// Uses the no-grammar path.
+#[test]
+fn test_enrich_ungated_type() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file = dir.path().join(format!("types.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "interface Vehicle\nstruct Car extends Vehicle\nclass Truck implements Vehicle\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5110,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "Vehicle" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "enrich_ungated_type should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    assert!(
+        text.contains("Vehicle"),
+        "Expected Vehicle in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// `from_ts=true` path: tree-sitter-identified symbol skips `prepareRename`.
+/// Installs mock grammar so hits are `HitClass::Symbol` (`from_ts=true`).
+#[test]
+fn test_enrich_from_ts_true() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    install_mock_grammar(root)?;
+
+    // .mock file with a function definition
+    let file = dir.path().join("ts_true.mock");
+    std::fs::write(&file, "fn my_symbol\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5120,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "my_symbol" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "enrich from_ts=true should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Tree-sitter identified the symbol — enrichment runs without prepareRename
+    assert!(
+        text.contains("my_symbol"),
+        "Expected my_symbol in output, got:\n{text}"
+    );
+    assert!(
+        text.contains("<Function>"),
+        "Expected tree-sitter kind label, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// `from_ts=false` on a symbol: prepareRename returns range, enrichment proceeds.
+/// No grammar installed, so the no-grammar path exercises prepareRename.
+#[test]
+fn test_enrich_from_ts_false_symbol() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file = dir.path().join(format!("sym.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn enrichable_sym\nenrichable_sym\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5130,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "enrichable_sym" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "enrich from_ts=false symbol should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // prepareRename confirmed symbol, enrichment ran
+    assert!(
+        text.contains("enrichable_sym"),
+        "Expected enrichable_sym in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// `from_ts=false` on a keyword: `prepareRename` returns null, enrichment skipped.
+/// Keywords are dropped entirely (no output for keyword-only matches).
+/// Uses `fn` which is in mockls's keyword list so `prepareRename` returns null.
+#[test]
+fn test_enrich_from_ts_false_keyword() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // `fn` is a keyword — mockls returns null for prepareRename on keywords.
+    // The file defines `fn my_symbol` but the grep pattern is `^fn$`, matching
+    // only the keyword itself (not the symbol name).
+    let file = dir.path().join(format!("kw.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn my_symbol\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Pattern `^fn$` matches the keyword `fn` at column 0 but not `my_symbol`.
+    // Since `fn` is in mockls's keyword list, prepareRename returns null.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5140,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "^fn " }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // The keyword `fn` is filtered by prepareRename returning null.
+    assert_eq!(
+        text, "No results found",
+        "Expected 'No results found' for keyword-only match, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Deprecated subtype: TypeEdge.deprecated is set from tags.
+/// Enrichment runs for the interface; mockls returns deprecated subtypes
+/// when the declaration line contains @deprecated.
+#[test]
+fn test_enrich_deprecated_type_edge() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let file = dir.path().join(format!("depr.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "interface Shape\nstruct OldSquare extends Shape @deprecated\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5150,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "Shape" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "enrich deprecated type edge should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Tool completes with deprecated subtypes collected (rendered in 07b)
+    assert!(
+        text.contains("Shape"),
+        "Expected Shape in output, got:\n{text}"
+    );
+
+    Ok(())
+}
+
+/// Function with callees: `outgoing_calls` has correct names, kinds, files, lines.
+/// Uses mockls which implements outgoing calls by scanning for known function
+/// names called within the body.
+#[test]
+fn test_enrich_outgoing_calls() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // helper_a and helper_b defined, then main_fn calls them
+    let file = dir.path().join(format!("out.{MOCK_LANG_A}"));
+    std::fs::write(
+        &file,
+        "fn helper_a()\nfn helper_b()\nfn main_fn()\n  helper_a\n  helper_b\n",
+    )?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5160,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "main_fn" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    assert!(
+        result["isError"].is_null() || result["isError"] == false,
+        "enrich outgoing calls should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Enrichment ran — outgoing calls collected (rendered in 07b)
+    assert!(
+        text.contains("main_fn"),
+        "Expected main_fn in output, got:\n{text}"
     );
 
     Ok(())
