@@ -46,10 +46,11 @@ impl BridgeProcess {
         let roots_val = std::env::join_paths(roots).unwrap_or_default();
         cmd.env("CATENARY_ROOTS", &roots_val);
 
-        // Isolate from user-level config
+        // Isolate from user-level config and data directories
         if let Some(first_root) = roots.first() {
             cmd.env("XDG_CONFIG_HOME", first_root);
             cmd.env("XDG_STATE_HOME", first_root);
+            cmd.env("XDG_DATA_HOME", first_root);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -82,6 +83,7 @@ impl BridgeProcess {
         cmd.env("CATENARY_ROOTS", root);
         cmd.env("XDG_CONFIG_HOME", root);
         cmd.env("XDG_STATE_HOME", root);
+        cmd.env("XDG_DATA_HOME", root);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -937,10 +939,11 @@ fn test_no_roots_request_without_capability() -> Result<()> {
 // These tests use mockls instead of real language servers, so they always
 // run regardless of installed toolchains.
 
-/// Pre-installs the mock tree-sitter grammar into a test's isolated state dir.
+/// Pre-installs the mock tree-sitter grammar into a test's isolated data dir.
 ///
-/// Runs `catenary install <fixture_path>` with `XDG_STATE_HOME` pointing at
-/// the test root so the bridge process finds the grammar at startup.
+/// Runs `catenary install <fixture_path>` with `XDG_DATA_HOME` pointing at
+/// the test root so the grammar is written to the test's own directory,
+/// not the user's `~/.local/share/catenary/grammars/`.
 fn install_mock_grammar(state_home: &str) -> Result<()> {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("test_assets")
@@ -950,6 +953,7 @@ fn install_mock_grammar(state_home: &str) -> Result<()> {
         .arg(fixture.to_str().context("fixture path")?)
         .env("XDG_STATE_HOME", state_home)
         .env("XDG_CONFIG_HOME", state_home)
+        .env("XDG_DATA_HOME", state_home)
         .output()
         .context("failed to run catenary install")?;
     if !output.status.success() {
