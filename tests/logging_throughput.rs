@@ -95,6 +95,7 @@ async fn spawn_initialized_client(
         MOCK_LANG_A,
         logging,
         None,
+        std::collections::HashMap::new(),
     )?;
 
     client.initialize(&[dir.path().to_path_buf()], None).await?;

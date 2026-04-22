@@ -104,7 +104,7 @@ pub fn initialize(
                 "workspaceFolders": true,
                 "configuration": true,
                 "didChangeConfiguration": {
-                    "dynamicRegistration": false
+                    "dynamicRegistration": true
                 },
                 "didChangeWatchedFiles": {
                     "dynamicRegistration": true,
@@ -380,7 +380,7 @@ mod tests {
                     "workspaceFolders": true,
                     "configuration": true,
                     "didChangeConfiguration": {
-                        "dynamicRegistration": false
+                        "dynamicRegistration": true
                     },
                     "didChangeWatchedFiles": {
                         "dynamicRegistration": true,
@@ -411,7 +411,7 @@ mod tests {
     fn initialize_capabilities_advertise_did_change_configuration() {
         let ours = initialize(1, &[("file:///ws", "ws")], None);
         let dcc = &ours["capabilities"]["workspace"]["didChangeConfiguration"];
-        assert_eq!(dcc["dynamicRegistration"], json!(false));
+        assert_eq!(dcc["dynamicRegistration"], json!(true));
     }
 
     #[test]

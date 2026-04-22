@@ -378,7 +378,12 @@ mod tests {
     use catenary_proc::{TreeSample, TreeSnapshot};
 
     fn test_server() -> LspServer {
-        LspServer::new("test".to_string(), "test-server".to_string(), None)
+        LspServer::new(
+            "test".to_string(),
+            "test-server".to_string(),
+            None,
+            std::collections::HashMap::new(),
+        )
     }
 
     // ── IdleDetector unit tests ─────────────────────────────────────

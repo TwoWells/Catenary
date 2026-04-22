@@ -57,6 +57,9 @@ pub struct LspClient {
 impl LspClient {
     /// Spawns the LSP server process and starts the response reader task.
     ///
+    /// `settings_per_root` carries per-root project config overlays for
+    /// `Scope::Workspace` instances. Pass an empty map for `Scope::Root`.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -69,6 +72,7 @@ impl LspClient {
         server_name: &str,
         logging: LoggingServer,
         settings: Option<serde_json::Value>,
+        settings_per_root: HashMap<PathBuf, serde_json::Value>,
     ) -> Result<Self> {
         Self::spawn_inner(
             program,
@@ -78,6 +82,7 @@ impl LspClient {
             logging,
             Stdio::inherit(),
             settings,
+            settings_per_root,
         )
     }
 
@@ -101,9 +106,14 @@ impl LspClient {
             logging,
             Stdio::null(),
             None,
+            HashMap::new(),
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private constructor threading spawn parameters"
+    )]
     fn spawn_inner(
         program: &str,
         args: &[&str],
@@ -112,11 +122,13 @@ impl LspClient {
         logging: LoggingServer,
         stderr: Stdio,
         settings: Option<serde_json::Value>,
+        settings_per_root: HashMap<PathBuf, serde_json::Value>,
     ) -> Result<Self> {
         let server = Arc::new(LspServer::new(
             language_id.to_string(),
             server_name.to_string(),
             settings,
+            settings_per_root,
         ));
 
         let connection = super::connection::Connection::new(

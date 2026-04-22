@@ -218,6 +218,7 @@ async fn lsp_request_scope_chain() -> Result<()> {
         MOCK_LANG_A,
         server.clone(),
         None,
+        std::collections::HashMap::new(),
     )?;
     client.initialize(&[dir.path().to_path_buf()], None).await?;
 
@@ -285,6 +286,7 @@ async fn pair_merge_still_works() -> Result<()> {
         MOCK_LANG_A,
         server.clone(),
         None,
+        std::collections::HashMap::new(),
     )?;
     client.initialize(&[dir.path().to_path_buf()], None).await?;
 

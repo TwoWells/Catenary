@@ -580,6 +580,11 @@ impl LspClientManager {
             server_def.args.join(" ")
         );
 
+        // Build per-root settings map from project configs.
+        // Workspace instances use this for scopeUri resolution;
+        // root instances won't have scopeUri requests for other roots.
+        let settings_per_root = self.collect_per_root_settings(server_name, &roots);
+
         let args: Vec<&str> = server_def
             .args
             .iter()
@@ -592,6 +597,7 @@ impl LspClientManager {
             server_name,
             self.logging.clone(),
             server_def.settings.clone(),
+            settings_per_root,
         )?;
 
         client
@@ -1064,6 +1070,34 @@ impl LspClientManager {
             (Some(user), None) => Some(user),
             (None, None) => None,
         }
+    }
+
+    /// Collects per-root settings overrides for a server.
+    ///
+    /// Returns a map from root path to the project-config settings overlay
+    /// for roots whose `.catenary.toml` has `[server.{name}.settings]`.
+    /// Empty entries (roots without project config or without settings for
+    /// this server) are omitted.
+    fn collect_per_root_settings(
+        &self,
+        server_name: &str,
+        roots: &[PathBuf],
+    ) -> HashMap<PathBuf, serde_json::Value> {
+        let configs = self
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = HashMap::new();
+        for root in roots {
+            if let Some(settings) = configs
+                .get(root)
+                .and_then(|pc| pc.server.get(server_name))
+                .and_then(|d| d.settings.clone())
+            {
+                map.insert(root.clone(), settings);
+            }
+        }
+        map
     }
 
     /// Loads project configs for the given roots.
@@ -3374,5 +3408,81 @@ mod tests {
         assert_eq!(settings["a"], 1);
         assert_eq!(settings["b"]["c"], 2);
         assert_eq!(settings["b"]["d"], 3);
+    }
+
+    #[test]
+    fn test_collect_per_root_settings() {
+        let mut config = test_config();
+        config.server.insert(
+            "ra".to_string(),
+            ServerDef {
+                command: "ra".to_string(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"base": true})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let root_a = PathBuf::from("/project-a");
+        let root_b = PathBuf::from("/project-b");
+
+        // root_a has project config with settings for "ra"
+        let mut pc_a = crate::config::ProjectConfig::default();
+        pc_a.server.insert(
+            "ra".to_string(),
+            ServerDef {
+                command: String::new(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: Some(serde_json::json!({"override_a": true})),
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        // root_b has project config but no settings for "ra"
+        let pc_b = crate::config::ProjectConfig::default();
+
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root_a.clone(), pc_a);
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root_b.clone(), pc_b);
+
+        let per_root = manager.collect_per_root_settings("ra", &[root_a.clone(), root_b]);
+        // Only root_a has settings — root_b omitted
+        assert_eq!(per_root.len(), 1);
+        assert!(per_root.contains_key(&root_a));
+        assert_eq!(per_root[&root_a]["override_a"], true);
+    }
+
+    #[test]
+    fn test_collect_per_root_settings_no_configs() {
+        let mut config = test_config();
+        config.server.insert(
+            "ra".to_string(),
+            ServerDef {
+                command: "ra".to_string(),
+                args: Vec::new(),
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+        let per_root = manager.collect_per_root_settings("ra", &[PathBuf::from("/root")]);
+        assert!(per_root.is_empty());
     }
 }
