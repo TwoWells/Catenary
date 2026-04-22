@@ -456,9 +456,10 @@ impl GrepServer {
     /// When `from_ts` is false (no-grammar path), calls `prepareRename` first
     /// to filter keywords.
     ///
-    /// Each LSP method uses its own priority chain dispatch via
-    /// [`fetch_references`], [`fetch_call_hierarchy`], etc. Different
-    /// servers may support different capabilities.
+    /// Opens the document once on the union of all capability-filtered servers,
+    /// runs all four enrichment methods (skipping their per-method open/close),
+    /// then closes the document on each server. This avoids `didClose` between
+    /// methods causing the server to evict document state.
     async fn enrich_at_position(
         &self,
         path: &Path,
@@ -476,16 +477,77 @@ impl GrepServer {
             return None;
         }
 
-        let ref_lines = self.fetch_references(path, line_0, col, parent_id).await;
+        // Collect the union of servers across all enrichment capabilities.
+        let ref_servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_references)
+            .await;
+        let call_servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_call_hierarchy)
+            .await;
+        let impl_servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_implementation)
+            .await;
+        let type_servers = self
+            .client_manager
+            .get_servers(path, LspServer::supports_type_hierarchy)
+            .await;
+
+        let mut all_servers = Vec::new();
+        for server in ref_servers
+            .iter()
+            .chain(call_servers.iter())
+            .chain(impl_servers.iter())
+            .chain(type_servers.iter())
+        {
+            if !all_servers.iter().any(|s| Arc::ptr_eq(s, server)) {
+                all_servers.push(Arc::clone(server));
+            }
+        }
+
+        // Open the document once on each server.
+        let mut uri_opt: Option<String> = None;
+        let mut opened_servers = Vec::new();
+        for server in &all_servers {
+            match self
+                .client_manager
+                .open_document_on(path, server, parent_id)
+                .await
+            {
+                Ok(u) => {
+                    uri_opt = Some(u);
+                    opened_servers.push(Arc::clone(server));
+                }
+                Err(e) => {
+                    debug!(source = "lsp.dispatch", "enrichment open failed: {e}");
+                }
+            }
+        }
+
+        let pre_uri = uri_opt.as_deref();
+
+        // Run all enrichment methods with the document already open.
+        let ref_lines = self
+            .fetch_references(path, line_0, col, parent_id, pre_uri)
+            .await;
         let (incoming_calls, outgoing_calls) = self
-            .fetch_call_hierarchy(path, line_0, col, parent_id)
+            .fetch_call_hierarchy(path, line_0, col, parent_id, pre_uri)
             .await;
         let implementations = self
-            .fetch_implementations(path, line_0, col, parent_id)
+            .fetch_implementations(path, line_0, col, parent_id, pre_uri)
             .await;
         let (supertypes, subtypes) = self
-            .fetch_type_hierarchy(path, line_0, col, parent_id)
+            .fetch_type_hierarchy(path, line_0, col, parent_id, pre_uri)
             .await;
+
+        // Close the document once on each server.
+        if let Some(ref uri) = uri_opt {
+            for server in &opened_servers {
+                server.lock().await.close_tracked_document(uri).await;
+            }
+        }
 
         Some(SymbolEnrichment {
             ref_lines,
@@ -499,14 +561,16 @@ impl GrepServer {
 
     /// Fetches references via priority chain dispatch.
     ///
-    /// Opens the document on the first capable server, makes the call,
-    /// and closes. Tries the next server on error.
+    /// When `pre_opened_uri` is `Some`, the document is already open on
+    /// all servers — skips `open_document_on` / `close_document`. When
+    /// `None`, each server attempt opens and closes independently.
     async fn fetch_references(
         &self,
         path: &Path,
         line_0: u32,
         col: u32,
         parent_id: Option<i64>,
+        pre_opened_uri: Option<&str>,
     ) -> HashMap<String, HashSet<u32>> {
         let servers = self
             .client_manager
@@ -514,18 +578,27 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
-            let Ok(uri) = self
-                .client_manager
-                .open_document_on(path, client_mutex, parent_id)
-                .await
-            else {
-                continue;
+            let owned_uri;
+            let uri: &str = if let Some(u) = pre_opened_uri {
+                u
+            } else {
+                let Ok(u) = self
+                    .client_manager
+                    .open_document_on(path, client_mutex, parent_id)
+                    .await
+                else {
+                    continue;
+                };
+                owned_uri = u;
+                &owned_uri
             };
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
-            let result = client.references(&uri, line_0, col, true).await;
-            client.close_tracked_document(&uri).await;
+            let result = client.references(uri, line_0, col, true).await;
+            if pre_opened_uri.is_none() {
+                client.close_tracked_document(uri).await;
+            }
             drop(client);
 
             match result {
@@ -552,14 +625,16 @@ impl GrepServer {
 
     /// Fetches incoming and outgoing calls via priority chain dispatch.
     ///
-    /// Opens the document, runs the full prepare → incoming → outgoing
-    /// sequence on a single server, then closes.
+    /// When `pre_opened_uri` is `Some`, the document is already open —
+    /// skips open/close. Otherwise opens, runs the full prepare →
+    /// incoming → outgoing sequence on a single server, then closes.
     async fn fetch_call_hierarchy(
         &self,
         path: &Path,
         line_0: u32,
         col: u32,
         parent_id: Option<i64>,
+        pre_opened_uri: Option<&str>,
     ) -> (Vec<CallEdge>, Vec<CallEdge>) {
         let servers = self
             .client_manager
@@ -567,17 +642,24 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
-            let Ok(uri) = self
-                .client_manager
-                .open_document_on(path, client_mutex, parent_id)
-                .await
-            else {
-                continue;
+            let owned_uri;
+            let uri: &str = if let Some(u) = pre_opened_uri {
+                u
+            } else {
+                let Ok(u) = self
+                    .client_manager
+                    .open_document_on(path, client_mutex, parent_id)
+                    .await
+                else {
+                    continue;
+                };
+                owned_uri = u;
+                &owned_uri
             };
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
-            let prepare = client.prepare_call_hierarchy(&uri, line_0, col).await;
+            let prepare = client.prepare_call_hierarchy(uri, line_0, col).await;
             let result = match prepare {
                 Ok(Value::Array(ref items)) if !items.is_empty() => {
                     let item = &items[0];
@@ -606,7 +688,9 @@ impl GrepServer {
                     None
                 }
             };
-            client.close_tracked_document(&uri).await;
+            if pre_opened_uri.is_none() {
+                client.close_tracked_document(uri).await;
+            }
             drop(client);
 
             if let Some(calls) = result {
@@ -618,12 +702,16 @@ impl GrepServer {
     }
 
     /// Fetches implementation locations via priority chain dispatch.
+    ///
+    /// When `pre_opened_uri` is `Some`, the document is already open —
+    /// skips open/close.
     async fn fetch_implementations(
         &self,
         path: &Path,
         line_0: u32,
         col: u32,
         parent_id: Option<i64>,
+        pre_opened_uri: Option<&str>,
     ) -> Vec<(String, u32)> {
         let servers = self
             .client_manager
@@ -631,18 +719,27 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
-            let Ok(uri) = self
-                .client_manager
-                .open_document_on(path, client_mutex, parent_id)
-                .await
-            else {
-                continue;
+            let owned_uri;
+            let uri: &str = if let Some(u) = pre_opened_uri {
+                u
+            } else {
+                let Ok(u) = self
+                    .client_manager
+                    .open_document_on(path, client_mutex, parent_id)
+                    .await
+                else {
+                    continue;
+                };
+                owned_uri = u;
+                &owned_uri
             };
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
-            let result = client.implementation(&uri, line_0, col).await;
-            client.close_tracked_document(&uri).await;
+            let result = client.implementation(uri, line_0, col).await;
+            if pre_opened_uri.is_none() {
+                client.close_tracked_document(uri).await;
+            }
             drop(client);
 
             match result {
@@ -668,14 +765,16 @@ impl GrepServer {
 
     /// Fetches supertypes and subtypes via priority chain dispatch.
     ///
-    /// Opens the document, runs the full prepare → supertypes → subtypes
-    /// sequence on a single server, then closes.
+    /// When `pre_opened_uri` is `Some`, the document is already open —
+    /// skips open/close. Otherwise opens, runs the full prepare →
+    /// supertypes → subtypes sequence on a single server, then closes.
     async fn fetch_type_hierarchy(
         &self,
         path: &Path,
         line_0: u32,
         col: u32,
         parent_id: Option<i64>,
+        pre_opened_uri: Option<&str>,
     ) -> (Vec<TypeEdge>, Vec<TypeEdge>) {
         let servers = self
             .client_manager
@@ -683,17 +782,24 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
-            let Ok(uri) = self
-                .client_manager
-                .open_document_on(path, client_mutex, parent_id)
-                .await
-            else {
-                continue;
+            let owned_uri;
+            let uri: &str = if let Some(u) = pre_opened_uri {
+                u
+            } else {
+                let Ok(u) = self
+                    .client_manager
+                    .open_document_on(path, client_mutex, parent_id)
+                    .await
+                else {
+                    continue;
+                };
+                owned_uri = u;
+                &owned_uri
             };
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
-            let prepare = client.prepare_type_hierarchy(&uri, line_0, col).await;
+            let prepare = client.prepare_type_hierarchy(uri, line_0, col).await;
             let result = match prepare {
                 Ok(Value::Array(ref items)) if !items.is_empty() => {
                     let item = &items[0];
@@ -720,7 +826,9 @@ impl GrepServer {
                     None
                 }
             };
-            client.close_tracked_document(&uri).await;
+            if pre_opened_uri.is_none() {
+                client.close_tracked_document(uri).await;
+            }
             drop(client);
 
             if let Some(types) = result {

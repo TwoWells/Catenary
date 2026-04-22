@@ -78,6 +78,27 @@ impl BridgeProcess {
         })
     }
 
+    /// Spawns with `CATENARY_SERVERS`, a single workspace root, and the
+    /// mock grammar pre-installed before the bridge starts. This avoids
+    /// the race between `TsIndex::build()` and post-spawn grammar
+    /// installation — the grammar is guaranteed to be available when the
+    /// tree-sitter index is built during startup.
+    pub fn spawn_with_grammar(
+        lsp_commands: &[&str],
+        root: &str,
+        grammar_setup: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<Self> {
+        Self::spawn_with_setup(
+            |cmd| {
+                if !lsp_commands.is_empty() {
+                    cmd.env("CATENARY_SERVERS", lsp_commands.join(";"));
+                }
+                cmd.env("CATENARY_ROOTS", root);
+            },
+            grammar_setup,
+        )
+    }
+
     /// Spawns using a TOML config file instead of `CATENARY_SERVERS`.
     ///
     /// Required for multi-server-per-language tests where each server
@@ -109,12 +130,25 @@ impl BridgeProcess {
     /// set `CATENARY_*` vars (after `isolate_env` cleared them), then
     /// redirects stderr and starts the process.
     fn spawn_with(configure: impl FnOnce(&mut Command)) -> Result<Self> {
+        Self::spawn_with_setup(configure, |_| Ok(()))
+    }
+
+    /// Like [`spawn_with`], but runs `setup` on the isolated state dir
+    /// before the subprocess starts. Use this to install grammars or
+    /// write config files that must be present when the bridge builds
+    /// its tree-sitter index during startup.
+    fn spawn_with_setup(
+        configure: impl FnOnce(&mut Command),
+        setup: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<Self> {
         let state_dir = tempfile::tempdir().context("Failed to create state dir")?;
         let state_home = state_dir
             .path()
             .to_str()
             .context("state dir path")?
             .to_string();
+
+        setup(&state_home)?;
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
         isolate_env(&mut cmd, &state_home);
@@ -537,4 +571,82 @@ pub fn mockls_lsp_arg(lang: &str, flags: &str) -> String {
     } else {
         format!("{lang}:{bin} {lang} {flags}")
     }
+}
+
+/// Installs the mock tree-sitter grammar for a given file extension.
+///
+/// Copies the `test_assets/mock_grammar` fixture to a temp dir, rewrites
+/// `tree-sitter.json` with the requested extension and scope, then runs
+/// `catenary install`. The grammar `name` stays `"mock"` so the compiled
+/// library exports the same `tree_sitter_mock` symbol — only the scope
+/// and file-types change.
+///
+/// Call multiple times with different extensions to set up multi-grammar
+/// tests:
+///
+/// ```ignore
+/// BridgeProcess::spawn_with_grammar(&[&lsp_a, &lsp_b], root, |sh| {
+///     install_mock_grammar_for(sh, "mock")?;
+///     install_mock_grammar_for(sh, "mockb")
+/// })?;
+/// ```
+pub fn install_mock_grammar_for(state_home: &str, ext: &str) -> Result<()> {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_assets")
+        .join("mock_grammar");
+
+    let tmp = tempfile::tempdir().context("failed to create temp dir for grammar")?;
+    copy_dir_all(&fixture, tmp.path())?;
+
+    // Rewrite tree-sitter.json with the requested extension/scope.
+    let ts_json = tmp.path().join("tree-sitter.json");
+    std::fs::write(
+        &ts_json,
+        format!(
+            concat!(
+                "{{\n",
+                "  \"metadata\": {{ \"version\": \"0.0.1\", \"license\": \"MIT\",\n",
+                "    \"authors\": [{{ \"name\": \"Test\" }}],\n",
+                "    \"links\": {{ \"repository\": ",
+                "\"https://github.com/test/tree-sitter-mock\" }}\n",
+                "  }},\n",
+                "  \"grammars\": [{{\n",
+                "    \"name\": \"mock\",\n",
+                "    \"scope\": \"source.{ext}\",\n",
+                "    \"file-types\": [\"{ext}\"],\n",
+                "    \"injection-regex\": \"{ext}\"\n",
+                "  }}]\n",
+                "}}\n"
+            ),
+            ext = ext
+        ),
+    )
+    .context("failed to write tree-sitter.json")?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    cmd.arg("install")
+        .arg(tmp.path().to_str().context("tmp path")?);
+    isolate_env(&mut cmd, state_home);
+    let output = cmd.output().context("failed to run catenary install")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("catenary install for .{ext} failed: {stderr}");
+    }
+    Ok(())
+}
+
+/// Recursively copies a directory tree.
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src).context("read_dir")? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
