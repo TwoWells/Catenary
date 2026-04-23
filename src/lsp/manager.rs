@@ -161,35 +161,16 @@ impl LspClientManager {
                     continue;
                 };
 
-                // Spawn for first_root: project-scoped or normal.
-                let client = if self.is_project_scoped(lang, first_root) {
-                    match self
-                        .spawn_project_scoped(&binding.name, lang, first_root)
-                        .await
-                    {
-                        Ok((_key, c)) => c,
-                        Err(e) => {
-                            warn!(
-                                source = "lsp.lifecycle",
-                                language = lang.as_str(),
-                                server = binding.name.as_str(),
-                                "Failed to spawn project-scoped LSP server for {lang}: {e}",
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    match self.ensure_server(lang, &binding.name, first_root).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!(
-                                source = "lsp.lifecycle",
-                                language = lang.as_str(),
-                                server = binding.name.as_str(),
-                                "Failed to spawn LSP server for {lang}: {e}",
-                            );
-                            continue;
-                        }
+                let client = match self.ensure_server(lang, &binding.name, first_root).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(
+                            source = "lsp.lifecycle",
+                            language = lang.as_str(),
+                            server = binding.name.as_str(),
+                            "Failed to spawn LSP server for {lang}: {e}",
+                        );
+                        continue;
                     }
                 };
 
@@ -277,12 +258,7 @@ impl LspClientManager {
                     "Server does not support workspaceFolders — spawning per-root instances",
                 );
                 for root in &roots[1..] {
-                    let result = if self.is_project_scoped(lang, root) {
-                        self.spawn_project_scoped(server_name, lang, root).await
-                    } else {
-                        self.spawn(server_name, lang, root).await
-                    };
-                    if let Err(e) = result {
+                    if let Err(e) = self.ensure_server(lang, server_name, root).await {
                         warn!(
                             source = "lsp.lifecycle",
                             language = lang,
@@ -716,21 +692,12 @@ impl LspClientManager {
         self.wait_ready_all().await;
     }
 
-    /// Spawns a server process, runs `initialize`, constructs the final
-    /// `InstanceKey` from discovered capabilities, and inserts into the
-    /// clients map.
+    /// Spawns with capability-driven scope (no project-scope check).
     ///
-    /// Uses capability-driven scope: servers that advertise workspace
-    /// folder support get `Scope::Workspace`; others get
-    /// `Scope::Root(root)`.
-    ///
-    /// Holds the clients lock across the entire spawn+init sequence to
-    /// prevent double-spawns. Pre-fetches roots before acquiring the
-    /// clients lock to avoid lock ordering issues.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the server fails to spawn or initialize.
+    /// Production code should use [`Self::ensure_server`] which handles
+    /// project-scope routing. This wrapper exists for tests that need
+    /// explicit scope control.
+    #[cfg(test)]
     async fn spawn(
         &self,
         server_name: &str,
@@ -883,11 +850,13 @@ impl LspClientManager {
     /// Get-then-spawn composition.
     ///
     /// Looks up an existing instance by trying both `Scope::Workspace` and
-    /// `Scope::Root(root)` keys. On miss, calls [`Self::spawn`]. Dead
-    /// servers are left as tombstones — a server that crashes will not be
-    /// restarted. Intentional restarts (e.g. after `sync_roots`) go through
-    /// [`Self::shutdown_instance`] which removes the entry so a fresh spawn
-    /// can occur.
+    /// `Scope::Root(root)` keys. On miss, spawns with the correct scope:
+    /// project-scoped roots (Rule A) get `spawn_project_scoped`, others
+    /// get capability-driven scope via `spawn`. Dead servers are left as
+    /// tombstones — a server that crashes will not be restarted.
+    /// Intentional restarts (e.g. after `sync_roots`) go through
+    /// [`Self::shutdown_instance`] which removes the entry so a fresh
+    /// spawn can occur.
     ///
     /// # Errors
     ///
@@ -901,10 +870,24 @@ impl LspClientManager {
         server_name: &str,
         root: &Path,
     ) -> Result<Arc<Mutex<LspClient>>> {
-        // Fast path: check both possible scope keys.
+        let project_scoped = self.is_project_scoped(lang, root);
+
+        // Fast path: check for an existing instance. Project-scoped
+        // roots only check the exact Root(root) key — a workspace
+        // instance must not prevent spawning the isolated instance.
         {
             let clients = self.clients.lock().await;
-            if let Some(found) = find_instance(&clients, lang, server_name, root) {
+            let existing = if project_scoped {
+                let root_key = InstanceKey::new(
+                    lang.to_string(),
+                    server_name.to_string(),
+                    Scope::Root(root.to_path_buf()),
+                );
+                clients.get(&root_key).cloned()
+            } else {
+                find_instance(&clients, lang, server_name, root)
+            };
+            if let Some(found) = existing {
                 if found.lock().await.is_alive() {
                     return Ok(found);
                 }
@@ -912,8 +895,11 @@ impl LspClientManager {
             }
         }
 
-        // Miss — spawn (spawn handles its own double-check).
-        let (_key, client) = self.spawn(server_name, lang, root).await?;
+        // Miss — spawn with correct scope (spawn_inner handles its
+        // own double-check).
+        let (_key, client) = self
+            .spawn_inner(server_name, lang, root, project_scoped)
+            .await?;
         Ok(client)
     }
 
@@ -1066,14 +1052,7 @@ impl LspClientManager {
         info!("Mid-session server spawn for: {}", sorted.join(", "));
 
         for (lang, server_name, root) in &to_spawn {
-            let result = if self.is_project_scoped(lang, root) {
-                self.spawn_project_scoped(server_name, lang, root)
-                    .await
-                    .map(drop)
-            } else {
-                self.ensure_server(lang, server_name, root).await.map(drop)
-            };
-            if let Err(e) = result {
+            if let Err(e) = self.ensure_server(lang, server_name, root).await {
                 warn!(
                     source = "lsp.lifecycle",
                     language = lang.as_str(),
@@ -1174,29 +1153,19 @@ impl LspClientManager {
             };
             for (server_name, is_workspace) in servers {
                 for root in added_roots {
-                    if self.is_project_scoped(lang, root) {
-                        // Rule A: spawn isolated project-scoped instance.
-                        if let Err(e) = self.spawn_project_scoped(server_name, lang, root).await {
-                            warn!(
-                                source = "lsp.lifecycle",
-                                language = lang.as_str(),
-                                "Failed to spawn project-scoped instance for {lang} at {}: {e}",
-                                root.display(),
-                            );
-                        }
-                    } else if !is_workspace {
-                        // Legacy server: spawn per-root instance.
-                        if let Err(e) = self.spawn(server_name, lang, root).await {
-                            warn!(
-                                source = "lsp.lifecycle",
-                                language = lang.as_str(),
-                                "Failed to spawn per-root instance for {lang} at {}: {e}",
-                                root.display(),
-                            );
-                        }
+                    // Workspace-capable + non-project-scoped: already
+                    // covered by the workspace instance (folder add
+                    // sent in sync_roots).
+                    if (self.is_project_scoped(lang, root) || !is_workspace)
+                        && let Err(e) = self.ensure_server(lang, server_name, root).await
+                    {
+                        warn!(
+                            source = "lsp.lifecycle",
+                            language = lang.as_str(),
+                            "Failed to spawn instance for {lang} at {}: {e}",
+                            root.display(),
+                        );
                     }
-                    // Workspace-capable + non-project-scoped: already covered
-                    // by the workspace instance (folder add sent in sync_roots).
                 }
             }
         }
