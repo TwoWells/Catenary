@@ -243,6 +243,18 @@ impl LspServer {
             .insert(root, settings);
     }
 
+    /// Removes per-root settings for a workspace root.
+    ///
+    /// Called by the manager when a root is removed. Subsequent
+    /// `scopeUri` resolution for this root will fall back to
+    /// user-level defaults.
+    pub fn remove_root_settings(&self, root: &Path) {
+        self.settings_per_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(root);
+    }
+
     // ── Identity accessors ──────────────────────────────────────────
 
     /// Returns the language identifier.
@@ -1951,6 +1963,26 @@ mod tests {
         let result = server.resolve_configuration(Some("rust-analyzer"), Some("file:///root"));
         assert_eq!(result["base"], true);
         assert_eq!(result["added"], true);
+    }
+
+    #[test]
+    fn remove_root_settings_reverts_to_defaults() {
+        let server = LspServer::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Some(json!({"ra": {"base": true}})),
+            HashMap::new(),
+        );
+        server.set_root_settings(PathBuf::from("/root"), json!({"ra": {"added": true}}));
+        // Per-root settings are visible
+        let result = server.resolve_configuration(Some("ra"), Some("file:///root"));
+        assert_eq!(result["added"], true);
+
+        // Remove per-root settings — reverts to user defaults
+        server.remove_root_settings(Path::new("/root"));
+        let result = server.resolve_configuration(Some("ra"), Some("file:///root"));
+        assert_eq!(result["base"], true);
+        assert!(result.get("added").is_none());
     }
 
     #[test]

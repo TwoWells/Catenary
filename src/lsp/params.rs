@@ -180,6 +180,16 @@ pub fn did_change_workspace_folders(added: &[(&str, &str)], removed: &[(&str, &s
     })
 }
 
+/// Builds `DidChangeConfigurationParams` with empty settings.
+///
+/// Pull-model servers will send `workspace/configuration` requests to
+/// retrieve updated settings. The empty payload is the standard trigger
+/// per the LSP spec.
+#[must_use]
+pub fn did_change_configuration() -> Value {
+    json!({ "settings": {} })
+}
+
 /// Builds `DidChangeWatchedFilesParams`.
 ///
 /// `changes` is a slice of `(uri, FileChangeType as u8)` pairs.
@@ -524,6 +534,12 @@ mod tests {
     fn did_change_watched_files_empty() {
         let ours = did_change_watched_files(&[]);
         assert_eq!(ours, json!({ "changes": [] }));
+    }
+
+    #[test]
+    fn did_change_configuration_golden() {
+        let ours = did_change_configuration();
+        assert_eq!(ours, json!({ "settings": {} }));
     }
 
     #[test]

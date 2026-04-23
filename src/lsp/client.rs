@@ -418,6 +418,23 @@ impl LspClient {
         .await
     }
 
+    /// Sends `workspace/didChangeConfiguration` notification.
+    ///
+    /// Payload is `{ settings: {} }` — servers that care will pull
+    /// updated config via `workspace/configuration` requests, which
+    /// are now answered with `scopeUri`-resolved settings (from 1d-01).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification fails.
+    pub async fn did_change_configuration(&self) -> Result<()> {
+        self.notify(
+            "workspace/didChangeConfiguration",
+            params::did_change_configuration(),
+        )
+        .await
+    }
+
     /// Notifies the LSP server that workspace folders changed.
     ///
     /// # Errors
