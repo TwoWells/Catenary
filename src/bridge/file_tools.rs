@@ -152,7 +152,7 @@ impl DirNode {
         }
     }
 
-    /// Renders the tree with tab indentation (tier 1: maps + flags).
+    /// Renders the tree with tab indentation (tier 1: maps + flags + dedup).
     fn render_tier1(
         &self,
         out: &mut String,
@@ -160,37 +160,96 @@ impl DirNode {
         outline: &HashMap<PathBuf, Vec<TsSymbol>>,
         children_sets: &HashMap<PathBuf, HashSet<String>>,
         sa_paths: &HashSet<PathBuf>,
+        ts_index: &TsIndex,
     ) {
         let indent: String = "\t".repeat(depth);
+        let sym_indent = format!("{indent}\t");
 
         for (name, child) in &self.dirs {
             let _ = writeln!(out, "{indent}{name}/");
-            child.render_tier1(out, depth + 1, outline, children_sets, sa_paths);
+            child.render_tier1(out, depth + 1, outline, children_sets, sa_paths, ts_index);
         }
 
-        let mut sorted: Vec<&FileNode> = self.files.iter().collect();
-        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut sorted: Vec<(usize, &FileNode)> = self.files.iter().enumerate().collect();
+        sorted.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
-        for file in sorted {
-            let has_map = outline.contains_key(&file.abs_path);
-            let mut flags = Vec::new();
-            if sa_paths.contains(&file.abs_path) && !has_map {
-                flags.push("symbols available");
-            }
-            if file.is_gitignored {
-                flags.push("gitignored");
-            }
-            if file.is_snapshot {
-                flags.push("snapshot");
-            }
-            render_file_node(out, file, &indent, &flags);
+        // Build MapItems for files that have outline data (map-eligible).
+        let eligible: Vec<(usize, MapItem<'_>)> = sorted
+            .iter()
+            .filter(|(_, f)| outline.contains_key(&f.abs_path))
+            .map(|&(i, f)| {
+                (
+                    i,
+                    MapItem {
+                        name: &f.name,
+                        abs_path: &f.abs_path,
+                        line_count: f.line_count,
+                    },
+                )
+            })
+            .collect();
 
-            if let Some(syms) = has_map.then(|| outline.get(&file.abs_path)).flatten() {
-                let cs = children_sets.get(&file.abs_path);
-                let sym_indent = format!("{indent}\t");
-                for sym in syms {
-                    render_symbol_line(out, sym, cs, &sym_indent);
+        let map_items: Vec<MapItem<'_>> = eligible
+            .iter()
+            .map(|(_, mi)| MapItem {
+                name: mi.name,
+                abs_path: mi.abs_path,
+                line_count: mi.line_count,
+            })
+            .collect();
+
+        let (shared_groups, individual_map_indices) = compute_dedup(&map_items, outline, ts_index);
+
+        // Build lookup: original file index → shared group index.
+        let mut file_to_group: HashMap<usize, usize> = HashMap::new();
+        for (gi, (mi_indices, _)) in shared_groups.iter().enumerate() {
+            for &mi in mi_indices {
+                file_to_group.insert(eligible[mi].0, gi);
+            }
+        }
+        let individual_files: HashSet<usize> = individual_map_indices
+            .iter()
+            .map(|&mi| eligible[mi].0)
+            .collect();
+
+        let mut rendered_groups: HashSet<usize> = HashSet::new();
+
+        for &(fi, file) in &sorted {
+            if let Some(&gi) = file_to_group.get(&fi) {
+                if rendered_groups.contains(&gi) {
+                    continue;
                 }
+                rendered_groups.insert(gi);
+
+                let (mi_indices, bounding) = &shared_groups[gi];
+                render_shared_group(out, &map_items, mi_indices, bounding, &indent, &sym_indent);
+            } else if individual_files.contains(&fi) {
+                let mut flags = Vec::new();
+                if file.is_gitignored {
+                    flags.push("gitignored");
+                }
+                if file.is_snapshot {
+                    flags.push("snapshot");
+                }
+                render_file_node(out, file, &indent, &flags);
+                if let Some(syms) = outline.get(&file.abs_path) {
+                    let cs = children_sets.get(&file.abs_path);
+                    render_individual_map(out, syms, cs, &sym_indent);
+                }
+            } else {
+                // Non-eligible file: flags only.
+                let has_map = outline.contains_key(&file.abs_path);
+                let mut flags = Vec::new();
+                if sa_paths.contains(&file.abs_path) && !has_map {
+                    flags.push("symbols available");
+                }
+                if file.is_gitignored {
+                    flags.push("gitignored");
+                }
+                if file.is_snapshot {
+                    flags.push("snapshot");
+                }
+                render_file_node(out, file, &indent, &flags);
             }
         }
     }
@@ -715,7 +774,7 @@ impl GlobServer {
                     let sa_paths = build_sa_paths(&matched_files, idx);
 
                     let mut tier1 = String::new();
-                    root_node.render_tier1(&mut tier1, 0, &outline, &children_sets, &sa_paths);
+                    root_node.render_tier1(&mut tier1, 0, &outline, &children_sets, &sa_paths, idx);
                     if tier1.len() <= self.budget {
                         return Ok(tier1);
                     }
@@ -836,6 +895,15 @@ fn render_symbol_line(
 
 // ─── Structure deduplication ──────────────────────────────────────────
 
+/// Minimum data needed for structure deduplication. Both `GlobEntry`
+/// (directory listings) and `FileNode` (glob pattern trees) provide
+/// these fields.
+struct MapItem<'a> {
+    name: &'a str,
+    abs_path: &'a Path,
+    line_count: Option<usize>,
+}
+
 /// Fingerprint: sorted `(kind, name)` pairs as a single string key.
 fn make_fingerprint(syms: &[TsSymbol]) -> String {
     let mut pairs: Vec<(&str, &str)> = syms
@@ -859,26 +927,25 @@ struct BoundingSymbol {
     has_children: bool,
 }
 
-/// A shared dedup group: (entry indices, bounding symbols).
+/// A shared dedup group: (item indices into the `MapItem` slice, bounding symbols).
 type SharedGroup = (Vec<usize>, Vec<BoundingSymbol>);
 
-/// Computes structure dedup groups for map-eligible directory entries.
+/// Computes structure dedup groups for a set of map-eligible items.
 ///
 /// Returns `(shared_groups, individual_indices)` where shared groups
-/// are entries with identical fingerprints (≥2 files) and individuals
-/// are unique.
+/// are items with identical fingerprints (≥2 files) and individuals
+/// are unique. Indices are into the `items` slice.
 fn compute_dedup(
-    eligible_indices: &[usize],
-    entries: &[GlobEntry],
+    items: &[MapItem<'_>],
     outline: &HashMap<PathBuf, Vec<TsSymbol>>,
     ts_index: &TsIndex,
 ) -> (Vec<SharedGroup>, Vec<usize>) {
     // Group by fingerprint.
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-    for &idx in eligible_indices {
-        if let Some(syms) = outline.get(&entries[idx].abs_path) {
+    for (i, item) in items.iter().enumerate() {
+        if let Some(syms) = outline.get(item.abs_path) {
             let fp = make_fingerprint(syms);
-            groups.entry(fp).or_default().push(idx);
+            groups.entry(fp).or_default().push(i);
         }
     }
 
@@ -890,15 +957,15 @@ fn compute_dedup(
             individual.push(indices[0]);
         } else {
             // Compute bounding ranges using the first file as representative.
-            let rep = &entries[indices[0]];
-            let rep_syms = outline.get(&rep.abs_path);
+            let rep_path = items[indices[0]].abs_path;
+            let rep_syms = outline.get(rep_path);
             let bounding = rep_syms.map_or_else(Vec::new, |syms| {
                 syms.iter()
                     .map(|sym| {
                         let mut min_l = sym.line;
                         let mut max_e = sym.end_line;
                         for &other_idx in &indices[1..] {
-                            if let Some(other_syms) = outline.get(&entries[other_idx].abs_path) {
+                            if let Some(other_syms) = outline.get(items[other_idx].abs_path) {
                                 for s in other_syms {
                                     if s.kind == sym.kind && s.name == sym.name {
                                         min_l = min_l.min(s.line);
@@ -912,7 +979,7 @@ fn compute_dedup(
                             kind: sym.kind.clone(),
                             min_line: min_l,
                             max_end_line: max_e,
-                            has_children: ts_index.has_children(&rep.abs_path, &sym.name),
+                            has_children: ts_index.has_children(rep_path, &sym.name),
                         }
                     })
                     .collect()
@@ -922,6 +989,50 @@ fn compute_dedup(
     }
 
     (shared, individual)
+}
+
+/// Renders a shared dedup group: file list + "common structure" header
+/// + bounding symbols.
+fn render_shared_group(
+    out: &mut String,
+    items: &[MapItem<'_>],
+    group_indices: &[usize],
+    bounding: &[BoundingSymbol],
+    indent: &str,
+    sym_indent: &str,
+) {
+    for &gi in group_indices {
+        let item = &items[gi];
+        if let Some(lc) = item.line_count {
+            let _ = writeln!(out, "{indent}{}  ({lc} lines)", item.name);
+        } else {
+            let _ = writeln!(out, "{indent}{}", item.name);
+        }
+    }
+    let _ = writeln!(out, "{indent}common structure (ranges are bounding):");
+    for sym in bounding {
+        let trailing = if sym.has_children { "/" } else { "" };
+        let kind_label = format_ts_kind(&sym.kind);
+        let _ = writeln!(
+            out,
+            "{sym_indent}:{}-{} <{kind_label}> {}{trailing}",
+            sym.min_line + 1,
+            sym.max_end_line + 1,
+            sym.name,
+        );
+    }
+}
+
+/// Renders an individual file's outline symbols.
+fn render_individual_map(
+    out: &mut String,
+    syms: &[TsSymbol],
+    children_set: Option<&HashSet<String>>,
+    sym_indent: &str,
+) {
+    for sym in syms {
+        render_symbol_line(out, sym, children_set, sym_indent);
+    }
 }
 
 // ─── Tier selection and rendering ─────────────────────────────────────
@@ -1059,21 +1170,31 @@ fn render_dir_listing_with_maps(
         .collect();
     files.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
-    // Structure deduplication.
-    let (shared_groups, individual_indices) =
-        compute_dedup(eligible_indices, entries, outline, ts_index);
+    // Build MapItems from eligible entries.
+    let map_items: Vec<MapItem<'_>> = eligible_indices
+        .iter()
+        .map(|&i| MapItem {
+            name: &entries[i].name,
+            abs_path: &entries[i].abs_path,
+            line_count: entries[i].line_count,
+        })
+        .collect();
 
-    // Build lookup: entry index → group index (for shared groups).
+    let (shared_groups, individual_map_indices) = compute_dedup(&map_items, outline, ts_index);
+
+    // Lookup tables: entry index → shared group, entry index → individual.
     let mut entry_to_group: HashMap<usize, usize> = HashMap::new();
-    for (gi, (indices, _)) in shared_groups.iter().enumerate() {
-        for &idx in indices {
-            entry_to_group.insert(idx, gi);
+    for (gi, (mi_indices, _)) in shared_groups.iter().enumerate() {
+        for &mi in mi_indices {
+            entry_to_group.insert(eligible_indices[mi], gi);
         }
     }
+    let individual_entries: HashSet<usize> = individual_map_indices
+        .iter()
+        .map(|&mi| eligible_indices[mi])
+        .collect();
 
-    let individual_set: HashSet<usize> = individual_indices.iter().copied().collect();
     let mut rendered_groups: HashSet<usize> = HashSet::new();
-
     let mut result = String::new();
 
     for d in &dirs {
@@ -1081,44 +1202,23 @@ fn render_dir_listing_with_maps(
     }
 
     for &(idx, f) in &files {
-        // Check if this file is part of a shared dedup group.
         if let Some(&gi) = entry_to_group.get(&idx) {
             if rendered_groups.contains(&gi) {
-                continue; // Already rendered with the group.
+                continue;
             }
             rendered_groups.insert(gi);
 
-            let (group_indices, bounding) = &shared_groups[gi];
-            // Render group: list files, then shared map.
-            for &gidx in group_indices {
-                let gf = &entries[gidx];
-                let flags = compute_entry_flags(gf, ts_opt, 0, maps_deny, fs_manager, true);
-                render_entry_line(&mut result, gf, &flags);
-            }
-            let _ = writeln!(result, "common structure (ranges are bounding):");
-            for sym in bounding {
-                let trailing = if sym.has_children { "/" } else { "" };
-                let kind_label = format_ts_kind(&sym.kind);
-                let _ = writeln!(
-                    result,
-                    "\t:{}-{} <{kind_label}> {}{trailing}",
-                    sym.min_line + 1,
-                    sym.max_end_line + 1,
-                    sym.name,
-                );
-            }
-        } else if individual_set.contains(&idx) {
-            // Individual map.
+            let (mi_indices, bounding) = &shared_groups[gi];
+            render_shared_group(&mut result, &map_items, mi_indices, bounding, "", "\t");
+        } else if individual_entries.contains(&idx) {
             let flags = compute_entry_flags(f, ts_opt, 0, maps_deny, fs_manager, true);
             render_entry_line(&mut result, f, &flags);
             if let Some(syms) = outline.get(&f.abs_path) {
                 let cs = children_sets.get(&f.abs_path);
-                for sym in syms {
-                    render_symbol_line(&mut result, sym, cs, "\t");
-                }
+                render_individual_map(&mut result, syms, cs, "\t");
             }
         } else {
-            // Non-eligible file: render with flags (may have [symbols available]).
+            // Non-eligible file.
             let has_sa = has_grammar_available(&f.abs_path, ts_opt)
                 && is_maps_denied(&f.abs_path, maps_deny, fs_manager);
             let mut flags = Vec::new();
@@ -1134,7 +1234,7 @@ fn render_dir_listing_with_maps(
             if f.is_broken_symlink {
                 flags.push("broken");
             }
-            render_entry_line_raw(&mut result, f, &flags);
+            render_entry_line(&mut result, f, &flags);
         }
     }
 
@@ -1212,11 +1312,6 @@ fn render_entry_line(out: &mut String, entry: &GlobEntry, flags: &[&str]) {
     } else {
         let _ = writeln!(out, "{}{flag_str}", entry.name);
     }
-}
-
-/// Renders a `GlobEntry` line with explicit flags (no flag computation).
-fn render_entry_line_raw(out: &mut String, entry: &GlobEntry, flags: &[&str]) {
-    render_entry_line(out, entry, flags);
 }
 
 // ─── Bucketed rendering (tier 3) ──────────────────────────────────────

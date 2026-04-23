@@ -1442,3 +1442,81 @@ fn test_glob_dedup_mixed() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_glob_tree_dedup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Two subdirectories, each with identical files.
+    // group_a: 3 files with same structure → shared map.
+    // group_b: 2 files with different structure → individual maps.
+    let group_a = dir.path().join("group_a");
+    let group_b = dir.path().join("group_b");
+    std::fs::create_dir_all(&group_a)?;
+    std::fs::create_dir_all(&group_b)?;
+
+    let shared = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
+    for i in 0..3 {
+        std::fs::write(group_a.join(format!("proto_{i}.mock")), shared)?;
+    }
+    std::fs::write(
+        group_b.join("handler.mock"),
+        "fn process\nstruct Config\n\n\n\n\n\n\n\n\n",
+    )?;
+    std::fs::write(
+        group_b.join("router.mock"),
+        "fn dispatch\nstruct Route\n\n\n\n\n\n\n\n\n",
+    )?;
+
+    let config = "[tools.glob]\nmaps_threshold = 5\nbudget = 5000\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.mock" }))?;
+
+    // group_a should have dedup (3 identical files).
+    assert!(
+        text.contains("common structure"),
+        "group_a should have shared dedup map: {text}"
+    );
+    assert!(
+        text.contains("ranges are bounding"),
+        "Should note bounding ranges: {text}"
+    );
+    // group_b should have individual maps (different structures).
+    assert!(
+        text.contains("process") && text.contains("dispatch"),
+        "group_b should have individual symbols: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_tree_dedup_per_directory() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Two directories with IDENTICAL file structures — dedup should NOT
+    // merge across directories. Each directory gets its own shared map.
+    let dir_a = dir.path().join("dir_a");
+    let dir_b = dir.path().join("dir_b");
+    std::fs::create_dir_all(&dir_a)?;
+    std::fs::create_dir_all(&dir_b)?;
+
+    let content = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
+    for i in 0..3 {
+        std::fs::write(dir_a.join(format!("file_{i}.mock")), content)?;
+        std::fs::write(dir_b.join(format!("file_{i}.mock")), content)?;
+    }
+
+    let config = "[tools.glob]\nmaps_threshold = 5\nbudget = 5000\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.mock" }))?;
+
+    // Count occurrences of "common structure" — should be 2 (one per dir).
+    let dedup_count = text.matches("common structure").count();
+    assert_eq!(
+        dedup_count, 2,
+        "Should have separate dedup per directory (expected 2, got {dedup_count}): {text}"
+    );
+    Ok(())
+}
