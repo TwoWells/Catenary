@@ -625,6 +625,53 @@ impl TsIndex {
             .collect())
     }
 
+    /// Query depth-0 (outline) symbols for a batch of files.
+    ///
+    /// Returns symbols with `scope IS NULL` grouped by file path,
+    /// ordered by line number within each file. Used by the glob tool
+    /// for defensive maps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn query_outline_batch(&self, files: &[&Path]) -> Result<HashMap<PathBuf, Vec<TsSymbol>>> {
+        if files.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders: String = (0..files.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
+             FROM symbols \
+             WHERE file_path IN ({placeholders}) AND scope IS NULL \
+             ORDER BY file_path, line"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).context("prepare outline batch")?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(files.len());
+        for f in files {
+            params.push(Box::new(f.to_string_lossy().to_string()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(AsRef::as_ref).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), Self::row_to_symbol)
+            .context("execute outline batch")?;
+
+        let mut result: HashMap<PathBuf, Vec<TsSymbol>> = HashMap::new();
+        for row in rows {
+            let (path_str, sym) = row.context("read outline row")?;
+            result.entry(PathBuf::from(path_str)).or_default().push(sym);
+        }
+
+        Ok(result)
+    }
+
     /// Finds the innermost symbol enclosing a line in a file.
     ///
     /// Returns the tightest definition (smallest span) containing the given

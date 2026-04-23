@@ -880,3 +880,565 @@ fn test_lua_glob_directory() -> Result<()> {
 
     Ok(())
 }
+
+// ─── New 08b tests ────────────────────────────────────────────────────
+
+/// The mock grammar extension used for 08b tests (`.mock`).
+///
+/// Uses "mock" instead of `MOCK_LANG_A` because the grammar
+/// installation for the mock extension is proven in `mcp_integration` tests.
+const MOCK_EXT: &str = "mock";
+
+/// Helper: spawns bridge with mock grammar and optional config written to `XDG_CONFIG_HOME`.
+fn spawn_with_grammar_and_config(root: &str, config_toml: Option<&str>) -> Result<BridgeProcess> {
+    BridgeProcess::spawn_with_grammar(&[], root, |state_home| {
+        common::install_mock_grammar_for(state_home, MOCK_EXT)?;
+        if let Some(toml) = config_toml {
+            let config_dir = std::path::PathBuf::from(state_home).join("catenary");
+            std::fs::create_dir_all(&config_dir)?;
+            std::fs::write(config_dir.join("config.toml"), toml)?;
+        }
+        Ok(())
+    })
+}
+
+/// Generates a file with N lines of mock language definitions.
+fn gen_mock_content(n: usize) -> String {
+    use std::fmt::Write;
+    let mut content = String::new();
+    for i in 0..n {
+        if i % 2 == 0 {
+            let _ = writeln!(content, "fn func_{i}");
+        } else {
+            let _ = writeln!(content, "struct Struct_{i}");
+        }
+    }
+    content
+}
+
+#[test]
+fn test_glob_defensive_maps() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // File with few symbols but enough lines to cross threshold (set to 5).
+    std::fs::write(
+        dir.path().join(format!("big.{MOCK_EXT}")),
+        "fn alpha\nfn beta\nstruct Gamma\n\n\n\n\n\n\n\n",
+    )?;
+    // Small file < threshold.
+    std::fs::write(dir.path().join(format!("small.{MOCK_EXT}")), "fn tiny\n")?;
+
+    let config = "[tools.glob]\nmaps_threshold = 5\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Big file should have a map with symbols.
+    assert!(
+        text.contains("<Function>") || text.contains("<Struct>"),
+        "Big file should have defensive map symbols: {text}"
+    );
+    // Small file should NOT have symbols (under threshold).
+    assert!(
+        text.contains(&format!("small.{MOCK_EXT}")),
+        "Should list small file: {text}"
+    );
+    let small_line = text.lines().find(|l| l.contains("small.")).unwrap_or("");
+    assert!(
+        !small_line.contains('<'),
+        "Small file should not have symbols: {small_line}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_no_maps_needed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // All files under 200 lines.
+    std::fs::write(
+        dir.path().join(format!("a.{MOCK_EXT}")),
+        "fn alpha\nfn beta\n",
+    )?;
+    std::fs::write(dir.path().join(format!("b.{MOCK_EXT}")), "struct Gamma\n")?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    assert!(!text.contains('<'), "No symbols should appear: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_glob_tier2_flags() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // File with many symbols to push tier 1 over budget.
+    std::fs::write(
+        dir.path().join(format!("big.{MOCK_EXT}")),
+        gen_mock_content(250),
+    )?;
+    // Threshold of 5 so file qualifies for maps. Budget of 1000 so maps don't fit.
+    let config = "[tools.glob]\nbudget = 1000\nmaps_threshold = 5\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    assert!(
+        text.contains("[symbols available]"),
+        "Should show [symbols available] flag in tier 2: {text}"
+    );
+    // Should NOT have symbol lines (maps not rendered in tier 2).
+    assert!(
+        !text.contains("<Function>") && !text.contains("<Struct>"),
+        "Should not show symbols in tier 2: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_maps_deny() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("big.{MOCK_EXT}")),
+        "fn alpha\nfn beta\n\n\n\n\n\n\n\n\n",
+    )?;
+    // Deny all mock files from maps. Threshold of 5 so file qualifies.
+    let config = format!("[tools.glob]\nmaps_threshold = 5\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Should NOT have symbol lines (denied by maps_deny).
+    assert!(
+        !text.contains("<Function>") && !text.contains("<Struct>"),
+        "Maps-denied file should not have symbols: {text}"
+    );
+    // Should have [symbols available] since grammar IS installed.
+    assert!(
+        text.contains("[symbols available]"),
+        "Should show [symbols available] flag: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_trailing_slash() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // A file with nested definitions: Outer has children → trailing /.
+    // Pad with empty lines to cross threshold.
+    std::fs::write(
+        dir.path().join(format!("nested.{MOCK_EXT}")),
+        "struct Outer {\nfn inner\n}\nfn leaf\n\n\n\n\n\n\n",
+    )?;
+
+    let config = "[tools.glob]\nmaps_threshold = 5\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Container symbols should have trailing /.
+    assert!(
+        text.contains("<Struct> Outer/"),
+        "Container should have trailing /: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_single_file_map() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("tiny.mock");
+    // Small file — single files bypass threshold.
+    std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
+
+    // Use "mock" extension (proven to work in mcp_integration tests).
+    let mut bridge = BridgeProcess::spawn_with_grammar(&[], &dir.path().to_string_lossy(), |sh| {
+        common::install_mock_grammar_for(sh, "mock")
+    })?;
+    bridge.initialize()?;
+
+    // Verify tree-sitter index works via grep first.
+    let grep_text = bridge.call_tool_text("grep", &json!({ "pattern": "alpha" }))?;
+    assert!(
+        grep_text.contains("alpha"),
+        "grep should find symbol (proving tree-sitter index works): {grep_text}"
+    );
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": file.to_str().context("file path")? }),
+    )?;
+
+    // Read stderr for diagnostics on failure.
+    let stderr = bridge
+        .stderr_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
+    // Single file should get a map regardless of size.
+    assert!(
+        text.contains("<Function>") || text.contains("<Struct>"),
+        "Single file should have map.\nglob output: {text}\nstderr:\n{stderr}"
+    );
+    assert!(text.contains("alpha"), "Should show symbol names: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_glob_single_file_denied() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("denied.{MOCK_EXT}"));
+    std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
+
+    let config = format!("[tools.glob]\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": file.to_str().context("file path")? }),
+    )?;
+
+    // maps_deny blocks the map even for single files.
+    assert!(
+        !text.contains("<Function>") && !text.contains("<Struct>"),
+        "Denied single file should not have map: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_glob_symlink_broken() -> Result<()> {
+    use std::os::unix::fs as unix_fs;
+
+    let dir = tempfile::tempdir()?;
+    unix_fs::symlink(
+        dir.path().join("nonexistent.txt"),
+        dir.path().join("broken_link.txt"),
+    )?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    assert!(
+        text.contains("[broken]"),
+        "Broken symlink should show [broken] flag: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_snapshot_flag() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("handler.catenary_snapshot_5.rs"),
+        "old content",
+    )?;
+    std::fs::write(dir.path().join("handler.rs"), "fn main() {}")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    assert!(
+        text.contains("[snapshot]"),
+        "Snapshot file should show [snapshot] flag: {text}"
+    );
+    // Snapshot file should NOT have line count.
+    let snapshot_line = text
+        .lines()
+        .find(|l| l.contains("catenary_snapshot"))
+        .unwrap_or("");
+    assert!(
+        !snapshot_line.contains("lines)"),
+        "Snapshot file should not show line count: {snapshot_line}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_gitignored_flag() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .context("git init")?;
+
+    std::fs::write(dir.path().join(".gitignore"), "*.log\n")?;
+    std::fs::write(dir.path().join("app.txt"), "content")?;
+    std::fs::write(dir.path().join("debug.log"), "log data")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().to_string_lossy().to_string(),
+            "include_gitignored": true,
+            "include_hidden": true
+        }),
+    )?;
+
+    assert!(
+        text.contains("[gitignored]"),
+        "Gitignored file should show [gitignored] flag: {text}"
+    );
+    // The gitignored flag should be on the .log file.
+    let log_line = text.lines().find(|l| l.contains("debug.log")).unwrap_or("");
+    assert!(
+        log_line.contains("[gitignored]"),
+        "debug.log should have [gitignored]: {log_line}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_composing_flags() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .context("git init")?;
+
+    // A file that is gitignored, has grammar, but maps are denied.
+    // maps_deny blocks the map → [symbols available].
+    // include_gitignored → [gitignored]. Both compose.
+    std::fs::write(dir.path().join(".gitignore"), format!("*.{MOCK_EXT}\n"))?;
+    std::fs::write(
+        dir.path().join(format!("big.{MOCK_EXT}")),
+        "fn alpha\nfn beta\n\n\n\n\n\n\n\n\n",
+    )?;
+
+    let config = format!("[tools.glob]\nmaps_threshold = 5\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().to_string_lossy().to_string(),
+            "include_gitignored": true,
+            "include_hidden": true
+        }),
+    )?;
+
+    // Should have composed flags.
+    let big_line = text
+        .lines()
+        .find(|l| l.contains(&format!("big.{MOCK_EXT}")))
+        .unwrap_or("");
+    assert!(
+        big_line.contains("symbols available") && big_line.contains("gitignored"),
+        "Should compose flags: {big_line}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_paging() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("huge.{MOCK_EXT}"));
+    // Many symbols to exceed budget in single-file mode.
+    std::fs::write(&file, gen_mock_content(500))?;
+
+    let config = "[tools.glob]\nbudget = 1000\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    // First page.
+    let text1 = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": file.to_str().context("file path")? }),
+    )?;
+
+    assert!(
+        text1.contains("[cursor:"),
+        "First page should have cursor: {text1}"
+    );
+
+    // Extract cursor token.
+    let cursor_line = text1
+        .lines()
+        .find(|l| l.contains("[cursor:"))
+        .context("No cursor line found")?;
+    let token = cursor_line
+        .trim()
+        .strip_prefix("[cursor: ")
+        .and_then(|s| s.strip_suffix(']'))
+        .context("Failed to parse cursor token")?;
+
+    // Second page.
+    let text2 = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": file.to_str().context("file path")?,
+            "cursor": token
+        }),
+    )?;
+
+    // Second page should have different symbols.
+    assert!(
+        !text2.is_empty(),
+        "Second page should have content: {text2}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_no_grammar() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Large file but no grammar installed.
+    let content = (0..300).fold(String::new(), |mut s, i| {
+        use std::fmt::Write;
+        let _ = writeln!(s, "line {i}");
+        s
+    });
+    std::fs::write(dir.path().join("big.txt"), &content)?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Should show line count but no symbols and no [symbols available].
+    assert!(text.contains("300 lines"), "Should show line count: {text}");
+    assert!(!text.contains('['), "Should not have flags: {text}");
+    assert!(!text.contains('<'), "Should not have symbols: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_glob_budget_minimum() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for i in 0..40 {
+        std::fs::write(
+            dir.path().join(format!("item_{i:03}.txt")),
+            format!("line {i}\n"),
+        )?;
+    }
+
+    // Budget below minimum of 1000 should be clamped.
+    let config = "[tools.glob]\nbudget = 500\n";
+    let config_dir = tempfile::tempdir()?;
+    let config_path = config_dir.path().join("config.toml");
+    std::fs::write(&config_path, config)?;
+
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, &dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Output should fit within clamped budget (1000) + tolerance.
+    assert!(
+        text.len() <= 1200,
+        "Output should be clamped budget-constrained: len={}, text:\n{text}",
+        text.len()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_structure_dedup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Multiple files with identical symbol sets crossing threshold.
+    let content = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
+    for i in 0..5 {
+        std::fs::write(dir.path().join(format!("proto_{i:03}.{MOCK_EXT}")), content)?;
+    }
+
+    let config = "[tools.glob]\nmaps_threshold = 5\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Should show "common structure" for deduplicated group.
+    assert!(
+        text.contains("common structure"),
+        "Should show shared map: {text}"
+    );
+    // Should show "ranges are bounding" parenthetical.
+    assert!(
+        text.contains("ranges are bounding"),
+        "Should note bounding ranges: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_dedup_mixed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Shared structure files.
+    let shared = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
+    for i in 0..3 {
+        std::fs::write(dir.path().join(format!("shared_{i}.{MOCK_EXT}")), shared)?;
+    }
+    // Unique file with different symbols.
+    std::fs::write(
+        dir.path().join(format!("unique.{MOCK_EXT}")),
+        "fn unique_func\nstruct UniqueType\n\n\n\n\n\n\n\n\n",
+    )?;
+
+    let config = "[tools.glob]\nmaps_threshold = 5\nbudget = 5000\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Should show both shared map and individual map.
+    assert!(
+        text.contains("common structure"),
+        "Should have shared map: {text}"
+    );
+    assert!(
+        text.contains("unique_func"),
+        "Should show individual map symbols: {text}"
+    );
+    Ok(())
+}

@@ -184,6 +184,10 @@ impl Toolbox {
             .tools
             .as_ref()
             .map_or(2000, |t| t.glob.budget as usize);
+        let glob_config = config
+            .tools
+            .as_ref()
+            .map_or_else(crate::config::GlobConfig::default, |t| t.glob.clone());
 
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let client_manager = Arc::new(LspClientManager::new(
@@ -203,10 +207,27 @@ impl Toolbox {
             ts_index: ts_index.clone(),
             budget: grep_budget,
         };
+        let maps_deny: Vec<globset::GlobMatcher> = glob_config
+            .maps_deny
+            .iter()
+            .filter_map(|pat| {
+                let effective = if pat.contains('/') {
+                    pat.clone()
+                } else {
+                    format!("**/{pat}")
+                };
+                globset::Glob::new(&effective)
+                    .ok()
+                    .map(|g| g.compile_matcher())
+            })
+            .collect();
         let glob = GlobServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
+            ts_index: ts_index.clone(),
             budget: glob_budget,
+            maps_threshold: glob_config.maps_threshold,
+            maps_deny,
         };
         Self {
             grep,
