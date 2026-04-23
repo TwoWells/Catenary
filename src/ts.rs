@@ -46,6 +46,8 @@ pub enum ScopeFilter<'a> {
     ChildrenOf(&'a str),
     /// Symbols at any depth (no scope constraint).
     AnyDepth,
+    /// Symbols within a line span (for `**` after a matched container).
+    WithinSpan(u32, u32),
 }
 
 /// Free-text grammar scopes where symbol names can contain `/` or `<>`.
@@ -847,34 +849,31 @@ impl TsIndex {
 
         let mut conditions = vec![format!("file_path IN ({placeholders})")];
 
+        // Count extra params added by the scope filter so subsequent
+        // positional params are numbered correctly.
+        let scope_extra: usize = match scope {
+            ScopeFilter::TopLevel | ScopeFilter::AnyDepth => 0,
+            ScopeFilter::ChildrenOf(_) => 1,
+            ScopeFilter::WithinSpan(_, _) => 2,
+        };
+
         match scope {
             ScopeFilter::TopLevel => conditions.push("scope IS NULL".to_string()),
-            ScopeFilter::ChildrenOf(name) => {
+            ScopeFilter::ChildrenOf(_) => {
                 conditions.push(format!("scope = ?{}", files.len() + 1));
-                let _ = name; // used via params below
             }
-            ScopeFilter::AnyDepth => {} // no scope constraint
+            ScopeFilter::AnyDepth => {}
+            ScopeFilter::WithinSpan(_, _) => {
+                let base = files.len() + 1;
+                conditions.push(format!("line >= ?{base}"));
+                conditions.push(format!("line <= ?{}", base + 1));
+            }
         }
 
-        conditions.push(format!(
-            "name GLOB ?{}",
-            files.len()
-                + match scope {
-                    ScopeFilter::ChildrenOf(_) => 2,
-                    _ => 1,
-                }
-        ));
+        conditions.push(format!("name GLOB ?{}", files.len() + scope_extra + 1));
 
-        if let Some(kind) = kind_filter {
-            let _ = kind; // used via params below
-            conditions.push(format!(
-                "kind = ?{}",
-                files.len()
-                    + match scope {
-                        ScopeFilter::ChildrenOf(_) => 3,
-                        _ => 2,
-                    }
-            ));
+        if let Some(_kind) = kind_filter {
+            conditions.push(format!("kind = ?{}", files.len() + scope_extra + 2));
         }
 
         if deprecated_only {
@@ -893,8 +892,15 @@ impl TsIndex {
         for f in files {
             params.push(Box::new(f.to_string_lossy().to_string()));
         }
-        if let ScopeFilter::ChildrenOf(name) = scope {
-            params.push(Box::new(name.to_string()));
+        match scope {
+            ScopeFilter::ChildrenOf(name) => {
+                params.push(Box::new(name.to_string()));
+            }
+            ScopeFilter::WithinSpan(start, end) => {
+                params.push(Box::new(*start));
+                params.push(Box::new(*end));
+            }
+            _ => {}
         }
         params.push(Box::new(name_glob.to_string()));
         if let Some(kind) = kind_filter {

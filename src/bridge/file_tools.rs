@@ -486,8 +486,16 @@ impl ToolServer for GlobServer {
 
         // Branch: into pipeline or normal glob pipeline.
         if let Some(ref into_str) = input.into {
+            let after_line = input.cursor.as_deref().map(decode_cursor).transpose()?;
             let files = self.resolve_files(&path, &pattern, &input, exclude.as_ref())?;
-            let output = self.handle_into(&files, into_str)?;
+            // For glob patterns, compute a root for relative path display.
+            let display_root = if !path.is_file() && !path.is_dir() {
+                // Glob pattern: use workspace roots for relative paths.
+                self.client_manager.roots().into_iter().next()
+            } else {
+                None
+            };
+            let output = self.handle_into(&files, into_str, after_line, display_root.as_deref())?;
             return Ok(Value::String(output));
         }
 
@@ -1035,7 +1043,13 @@ impl GlobServer {
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
     )]
-    fn handle_into(&self, files: &[PathBuf], into: &str) -> Result<String> {
+    fn handle_into(
+        &self,
+        files: &[PathBuf],
+        into: &str,
+        after_line: Option<u32>,
+        display_root: Option<&Path>,
+    ) -> Result<String> {
         let Some(ref ts_arc) = self.ts_index else {
             return Err(anyhow!("`into` requires a tree-sitter index"));
         };
@@ -1103,7 +1117,9 @@ impl GlobServer {
 
                 for (ci, parent) in prev_syms.iter().enumerate() {
                     let scope_filter = if seg.is_recursive {
-                        ScopeFilter::AnyDepth
+                        // `**` after a matched symbol: constrain to the
+                        // parent's span so we only find descendants.
+                        ScopeFilter::WithinSpan(parent.line, parent.end_line)
                     } else {
                         ScopeFilter::ChildrenOf(&parent.name)
                     };
@@ -1145,8 +1161,16 @@ impl GlobServer {
             return Ok("No matching symbols found".to_string());
         }
 
-        // Render results with tier selection.
-        let result = render_into_results(&matched_files, &current, &chains, &idx, self.budget);
+        // Render results with tier selection and paging.
+        let result = render_into_results(
+            &matched_files,
+            &current,
+            &chains,
+            &idx,
+            self.budget,
+            after_line,
+            display_root,
+        );
 
         Ok(result)
     }
@@ -1674,6 +1698,9 @@ fn render_entry_line(out: &mut String, entry: &GlobEntry, flags: &[&str]) {
 /// 1. Full — target symbols with children and spans.
 /// 2. Degraded — target symbols with spans only, no children.
 /// 3. Bucketed — glob patterns grouping files that contain the symbol.
+///
+/// Structure deduplication: files with identical target children sets
+/// are grouped under one representative, same as defensive map dedup.
 #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
 fn render_into_results(
     files: &[&PathBuf],
@@ -1681,6 +1708,8 @@ fn render_into_results(
     chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
     ts_index: &TsIndex,
     budget: usize,
+    after_line: Option<u32>,
+    display_root: Option<&Path>,
 ) -> String {
     // Tier 3 (bucketed): file names with counts.
     let file_names: Vec<String> = files
@@ -1690,18 +1719,150 @@ fn render_into_results(
     let tier3 = render_bucketed(&file_names, budget);
 
     // Tier 2 (degraded): target symbols with spans, no children.
-    let tier2 = render_into_tier2(files, chains, ts_index);
+    let tier2 = render_into_tier2(files, chains, ts_index, display_root);
     if tier2.len() > budget {
         return tier3;
     }
 
-    // Tier 1 (full): target symbols with children.
-    let tier1 = render_into_tier1(files, targets, chains, ts_index);
+    // Compute structure dedup for tier 1.
+    let dedup = compute_into_dedup(files, targets, chains, ts_index);
+
+    // Tier 1 (full): target symbols with children + dedup.
+    let tier1 = render_into_tier1(files, targets, chains, ts_index, &dedup, display_root);
     if tier1.len() <= budget {
         return tier1;
     }
 
+    // Tier 1 exceeds budget — page if single file.
+    if files.len() == 1 {
+        return page_into_output(&tier1, budget, after_line);
+    }
+
     tier2
+}
+
+/// Pages `into` output for single-file results that exceed budget.
+fn page_into_output(full: &str, budget: usize, after_line: Option<u32>) -> String {
+    let lines: Vec<&str> = full.lines().collect();
+
+    // Skip lines up to cursor position.
+    let start = after_line.map_or(0, |al| {
+        lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .strip_prefix(':')
+                    .and_then(|r| r.split_once('-'))
+                    .and_then(|(s, _)| s.parse::<u32>().ok())
+                    .is_some_and(|line_num| line_num > al)
+            })
+            .unwrap_or(lines.len())
+    });
+
+    let mut out = String::new();
+    let mut last_line_num: Option<u32> = None;
+
+    for &line in &lines[start..] {
+        let candidate = format!("{line}\n");
+        if !out.is_empty() && out.len() + candidate.len() > budget {
+            if let Some(ll) = last_line_num {
+                let _ = writeln!(out, "[cursor: {}]", encode_cursor(ll));
+            }
+            return out;
+        }
+        out.push_str(&candidate);
+
+        // Track the 1-based line number from `:N-M` spans.
+        if let Some(num) = line
+            .trim_start()
+            .strip_prefix(':')
+            .and_then(|r| r.split_once('-'))
+            .and_then(|(s, _)| s.parse::<u32>().ok())
+        {
+            last_line_num = Some(num);
+        }
+    }
+
+    out
+}
+
+/// Fingerprint for `into` structure dedup: target names + children (kind, name).
+fn compute_into_dedup(
+    files: &[&PathBuf],
+    targets: &HashMap<PathBuf, Vec<TsSymbol>>,
+    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
+    ts_index: &TsIndex,
+) -> IntoDedup {
+    let mut fingerprints: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for (i, &path) in files.iter().enumerate() {
+        let Some(file_targets) = targets.get(path) else {
+            continue;
+        };
+        let Some(file_chains) = chains.get(path) else {
+            continue;
+        };
+        if file_chains.is_empty() {
+            continue;
+        }
+
+        // Build fingerprint from target children.
+        let children_set = build_children_set_for_file(ts_index, path);
+        let mut fp_parts: Vec<String> = Vec::new();
+
+        for target in file_targets {
+            let children = ts_index
+                .query_scoped(
+                    &[path.as_path()],
+                    &ScopeFilter::ChildrenOf(&target.name),
+                    "*",
+                    None,
+                    false,
+                )
+                .ok()
+                .and_then(|m| m.get(path).cloned())
+                .unwrap_or_default();
+
+            let mut child_pairs: Vec<(&str, &str)> = children
+                .iter()
+                .map(|c| (c.kind.as_str(), c.name.as_str()))
+                .collect();
+            child_pairs.sort_unstable();
+
+            let target_fp = format!(
+                "{}\x00{}\x01{}",
+                target.kind,
+                target.name,
+                child_pairs
+                    .iter()
+                    .map(|(k, n)| format!("{k}\x02{n}"))
+                    .collect::<Vec<_>>()
+                    .join("\x03")
+            );
+            fp_parts.push(target_fp);
+        }
+
+        // Also include chain depth to avoid merging different navigation paths.
+        let chain_depth = file_chains.iter().map(Vec::len).max().unwrap_or(0);
+        let fp = format!("{chain_depth}\x04{}", fp_parts.join("\x05"));
+
+        fingerprints.entry(fp).or_default().push(i);
+
+        let _ = children_set; // used above in query_scoped
+    }
+
+    let shared: Vec<Vec<usize>> = fingerprints
+        .into_values()
+        .filter(|indices| indices.len() >= 2)
+        .collect();
+
+    IntoDedup { shared }
+}
+
+/// Structure dedup result for `into`.
+struct IntoDedup {
+    /// Groups of file indices with identical target children.
+    shared: Vec<Vec<usize>>,
 }
 
 /// Renders `into` tier 2 (degraded): target symbols at their chain
@@ -1710,6 +1871,7 @@ fn render_into_tier2(
     files: &[&PathBuf],
     chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
     ts_index: &TsIndex,
+    display_root: Option<&Path>,
 ) -> String {
     let mut out = String::new();
 
@@ -1721,12 +1883,7 @@ fn render_into_tier2(
             continue;
         }
 
-        // File header.
-        let display = path.file_name().map_or_else(
-            || path.to_string_lossy().to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
-        let _ = writeln!(out, "{display}");
+        let _ = writeln!(out, "{}", into_display_name(path, display_root));
 
         // Build children set for trailing `/` detection.
         let children_set = build_children_set_for_file(ts_index, path);
@@ -1739,15 +1896,42 @@ fn render_into_tier2(
 }
 
 /// Renders `into` tier 1 (full): target symbols with children shown.
+///
+/// Applies structure dedup: files with identical target children are
+/// grouped under one representative with bounding ranges.
 fn render_into_tier1(
     files: &[&PathBuf],
     targets: &HashMap<PathBuf, Vec<TsSymbol>>,
     chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
     ts_index: &TsIndex,
+    dedup: &IntoDedup,
+    display_root: Option<&Path>,
 ) -> String {
     let mut out = String::new();
+    let mut rendered_in_group: HashSet<usize> = HashSet::new();
 
-    for &path in files {
+    // Render shared groups first: list files, then show one representative.
+    for group in &dedup.shared {
+        for &fi in group {
+            let _ = writeln!(out, "{}", into_display_name(files[fi], display_root));
+            rendered_in_group.insert(fi);
+        }
+
+        // Render using the first file as representative.
+        let rep = files[group[0]];
+        if let Some(file_chains) = chains.get(rep) {
+            let children_set = build_children_set_for_file(ts_index, rep);
+            let _ = writeln!(out, "common structure (ranges are bounding):");
+            render_chains_merged(&mut out, file_chains, &children_set, true, ts_index, rep);
+        }
+    }
+
+    // Render individual files.
+    for (i, &path) in files.iter().enumerate() {
+        if rendered_in_group.contains(&i) {
+            continue;
+        }
+
         let Some(file_chains) = chains.get(path) else {
             continue;
         };
@@ -1758,20 +1942,15 @@ fn render_into_tier1(
         let file_targets = targets.get(path);
 
         // File header.
-        let display = path.file_name().map_or_else(
-            || path.to_string_lossy().to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
+        let display = into_display_name(path, display_root);
 
         // Special case: single-segment into="*" style — show line count.
         let show_line_count =
             file_chains.iter().all(|c| c.len() == 1) && file_targets.is_some_and(|t| t.len() > 2);
         if show_line_count {
-            let metadata = std::fs::metadata(path).ok();
-            let line_count = metadata.as_ref().and_then(|_| {
-                let content = std::fs::read_to_string(path).ok()?;
-                Some(content.lines().count())
-            });
+            let line_count = std::fs::read_to_string(path)
+                .ok()
+                .map(|content| content.lines().count());
             if let Some(lc) = line_count {
                 let _ = writeln!(out, "{display}  ({lc} lines)");
             } else {
@@ -2005,6 +2184,22 @@ fn query_with_alternation(
     }
 
     Ok(merged)
+}
+
+/// Computes the display name for a file in `into` output.
+///
+/// With a `display_root`, shows the relative path (for glob patterns).
+/// Without, shows just the file name (for single file / directory).
+fn into_display_name(path: &Path, display_root: Option<&Path>) -> String {
+    if let Some(root) = display_root
+        && let Ok(rel) = path.strip_prefix(root)
+    {
+        return rel.to_string_lossy().to_string();
+    }
+    path.file_name().map_or_else(
+        || path.to_string_lossy().to_string(),
+        |n| n.to_string_lossy().to_string(),
+    )
 }
 
 /// Builds a children set (names that appear as scope) for a single file.

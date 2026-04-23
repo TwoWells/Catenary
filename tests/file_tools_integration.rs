@@ -1956,3 +1956,140 @@ fn test_into_alternation() -> Result<()> {
     assert!(!text.contains("Other"), "Should not match Other: {text}");
     Ok(())
 }
+
+#[test]
+fn test_into_subtree() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Outer has nested children; ** should show full subtree.
+    std::fs::write(
+        dir.path().join(format!("sub.{MOCK_EXT}")),
+        "struct Outer {\nfn inner_a\nfn inner_b\n}\nfn top_level\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("sub.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "Outer/**"
+        }),
+    )?;
+
+    assert!(
+        text.contains("inner_a"),
+        "Should show inner_a in subtree: {text}"
+    );
+    assert!(
+        text.contains("inner_b"),
+        "Should show inner_b in subtree: {text}"
+    );
+    // top_level is OUTSIDE Outer — should NOT appear.
+    assert!(
+        !text.contains("top_level"),
+        "Should not show top_level (outside Outer span): {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_with_exclude() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("keep.{MOCK_EXT}")),
+        "struct Handler {\nfn method\n}\n",
+    )?;
+    std::fs::write(
+        dir.path().join(format!("fixture_skip.{MOCK_EXT}")),
+        "struct Handler {\nfn method\n}\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().to_string_lossy().to_string(),
+            "into": "Handler",
+            "exclude": "fixture_*"
+        }),
+    )?;
+
+    assert!(
+        text.contains("method"),
+        "Should show method from keep file: {text}"
+    );
+    assert!(
+        !text.contains("fixture"),
+        "Should exclude fixture file: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_dedup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Multiple files with identical children under Handler.
+    let content = "struct Handler {\nfn method_a\nfn method_b\n}\n";
+    for i in 0..4 {
+        std::fs::write(dir.path().join(format!("proto_{i}.{MOCK_EXT}")), content)?;
+    }
+
+    let config = "[tools.glob]\nbudget = 5000\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().to_string_lossy().to_string(),
+            "into": "Handler"
+        }),
+    )?;
+
+    // Should show shared structure once, not repeated per file.
+    assert!(
+        text.contains("common structure"),
+        "Should deduplicate identical children: {text}"
+    );
+    // method_a should appear only once (in the shared map).
+    let method_count = text.matches("method_a").count();
+    assert_eq!(
+        method_count, 1,
+        "method_a should appear once in shared map (got {method_count}): {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_glob_pattern() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sub = dir.path().join("src");
+    std::fs::create_dir_all(&sub)?;
+    std::fs::write(
+        sub.join(format!("a.{MOCK_EXT}")),
+        "struct Handler {\nfn handle_a\n}\n",
+    )?;
+    std::fs::write(
+        sub.join(format!("b.{MOCK_EXT}")),
+        "struct Handler {\nfn handle_b\n}\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": format!("src/**/*.{MOCK_EXT}"),
+            "into": "Handler"
+        }),
+    )?;
+
+    // Should show results from both files.
+    assert!(text.contains("handle_a"), "Should show handle_a: {text}");
+    assert!(text.contains("handle_b"), "Should show handle_b: {text}");
+    Ok(())
+}
