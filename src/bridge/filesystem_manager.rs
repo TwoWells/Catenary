@@ -67,6 +67,9 @@ pub enum FileKind {
 ///
 /// Built once from `Config` and stored in [`FilesystemManager`].
 /// Classification precedence: shebang > filename > extension.
+///
+/// Also used for per-root overrides from `.catenary.toml` project
+/// configs via [`from_project_config`](Self::from_project_config).
 #[derive(Debug, Default)]
 pub struct ClassificationTables {
     /// File extension (without dot) → language ID.
@@ -121,6 +124,60 @@ impl ClassificationTables {
         }
 
         tables
+    }
+
+    /// Builds classification tables from a project config's language entries.
+    ///
+    /// Only includes entries that have classification fields set.
+    /// Entries with only `servers` (no `extensions`/`filenames`/`shebangs`)
+    /// are skipped — they don't affect classification.
+    #[must_use]
+    pub fn from_project_config(languages: &HashMap<String, crate::config::LanguageConfig>) -> Self {
+        let mut tables = Self::default();
+
+        let mut keys: Vec<&str> = languages.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        for lang_id in keys {
+            let Some(lc) = languages.get(lang_id) else {
+                continue;
+            };
+            if !lc.has_classification() {
+                continue;
+            }
+            if let Some(ref exts) = lc.extensions {
+                for ext in exts {
+                    tables
+                        .extensions
+                        .entry(ext.clone())
+                        .or_insert_with(|| lang_id.to_string());
+                }
+            }
+            if let Some(ref fnames) = lc.filenames {
+                for fname in fnames {
+                    tables
+                        .filenames
+                        .entry(fname.clone())
+                        .or_insert_with(|| lang_id.to_string());
+                }
+            }
+            if let Some(ref shebangs) = lc.shebangs {
+                for shebang in shebangs {
+                    tables
+                        .shebangs
+                        .entry(shebang.clone())
+                        .or_insert_with(|| lang_id.to_string());
+                }
+            }
+        }
+
+        tables
+    }
+
+    /// Returns `true` if any classification entries exist.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.extensions.is_empty() && self.filenames.is_empty() && self.shebangs.is_empty()
     }
 
     /// Looks up language ID by filename (exact match).
@@ -200,6 +257,7 @@ pub struct FilesystemManager {
     cache: std::sync::Mutex<HashMap<PathBuf, CachedEntry>>,
     roots: std::sync::Mutex<Vec<PathBuf>>,
     classification: ClassificationTables,
+    per_root_classification: std::sync::Mutex<HashMap<PathBuf, ClassificationTables>>,
 }
 
 /// Cache entry storing classification results keyed by mtime.
@@ -217,6 +275,7 @@ impl Default for FilesystemManager {
             cache: std::sync::Mutex::new(HashMap::new()),
             roots: std::sync::Mutex::new(Vec::new()),
             classification: ClassificationTables::default(),
+            per_root_classification: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -238,6 +297,7 @@ impl FilesystemManager {
             cache: std::sync::Mutex::new(HashMap::new()),
             roots: std::sync::Mutex::new(Vec::new()),
             classification,
+            per_root_classification: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -272,12 +332,29 @@ impl FilesystemManager {
         // for extensionless scripts — `language_id()` short-circuits on
         // filename/extension before reaching `classify()`.
         let kind = scan_file(path, metadata).map_or(FileKind::Binary, |scan| {
-            let language_id = scan
-                .shebang_interpreter
-                .as_deref()
-                .and_then(|interp| self.classification.lookup_shebang(interp))
-                .map(str::to_string)
-                .or_else(|| self.classification.classify_path(path));
+            // Per-root shebang → per-root path → global shebang → global path.
+            let language_id = root
+                .as_ref()
+                .and_then(|r| {
+                    let per_root = self
+                        .per_root_classification
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    per_root.get(r).and_then(|tables| {
+                        scan.shebang_interpreter
+                            .as_deref()
+                            .and_then(|interp| tables.lookup_shebang(interp))
+                            .map(str::to_string)
+                            .or_else(|| tables.classify_path(path))
+                    })
+                })
+                .or_else(|| {
+                    scan.shebang_interpreter
+                        .as_deref()
+                        .and_then(|interp| self.classification.lookup_shebang(interp))
+                        .map(str::to_string)
+                        .or_else(|| self.classification.classify_path(path))
+                });
             FileKind::Text {
                 lines: scan.lines,
                 language_id,
@@ -318,18 +395,28 @@ impl FilesystemManager {
 
     /// Returns the LSP language identifier for a file path, or `None` if unknown.
     ///
-    /// Checks filename and extension first (no I/O). Falls back to full
-    /// classification (including shebang detection) only for files that
-    /// don't match any filename or extension rule. This is intentional:
-    /// shebangs identify the interpreter for executable scripts and are
-    /// only meaningful for extensionless files where there is no other
-    /// signal. A `.py` file is Python regardless of its shebang.
+    /// Checks per-root classification tables first (if the file is in a
+    /// known root), then falls back to global tables. Within each table
+    /// set: filename/extension first (no I/O), then shebang detection.
     pub fn language_id(&self, path: &Path) -> Option<String> {
-        // Fast path: filename/extension (no I/O)
+        // Per-root fast path: filename/extension (no I/O).
+        if let Some(root) = self.resolve_root(path) {
+            let per_root = self
+                .per_root_classification
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(tables) = per_root.get(&root)
+                && let Some(lang) = tables.classify_path(path)
+            {
+                return Some(lang);
+            }
+        }
+        // Global fast path: filename/extension (no I/O).
         if let Some(lang) = self.classification.classify_path(path) {
             return Some(lang);
         }
-        // Slow path: shebang detection for extensionless files
+        // Slow path: shebang detection for extensionless files.
+        // Per-root shebang is checked inside `classify`.
         let metadata = std::fs::metadata(path).ok()?;
         self.classify(path, &metadata)
             .language_id()
@@ -365,6 +452,25 @@ impl FilesystemManager {
         }
     }
 
+    /// Sets per-root classification tables from a project config.
+    ///
+    /// Called by the manager during `spawn_all` and `sync_roots`.
+    /// Replaces any existing per-root tables for the given root.
+    pub fn set_root_classification(&self, root: PathBuf, tables: ClassificationTables) {
+        if let Ok(mut per_root) = self.per_root_classification.lock() {
+            per_root.insert(root, tables);
+        }
+    }
+
+    /// Removes per-root classification tables for a root.
+    ///
+    /// Called when a root is removed.
+    pub fn remove_root_classification(&self, root: &Path) {
+        if let Ok(mut per_root) = self.per_root_classification.lock() {
+            per_root.remove(root);
+        }
+    }
+
     /// Scans workspace roots and returns the set of language keys that have
     /// matching files present among `configured_keys`.
     ///
@@ -395,14 +501,9 @@ impl FilesystemManager {
 
                 let path = entry.path();
 
-                // Fast path: filename/extension (no I/O beyond the walk).
+                // Fast path: per-root then global filename/extension (no I/O).
                 // Slow path: full classification (shebang detection).
-                let lang = self.classification.classify_path(path).or_else(|| {
-                    let metadata = entry.metadata().ok()?;
-                    self.classify(path, &metadata)
-                        .language_id()
-                        .map(str::to_string)
-                });
+                let lang = self.language_id(path);
 
                 if let Some(ref lang) = lang {
                     if configured_keys.contains(lang.as_str()) {
@@ -1372,6 +1473,307 @@ mod tests {
         assert!(
             changes.iter().any(|c| c.path.ends_with("visible.rs")),
             "visible file should appear in diff, got: {changes:?}",
+        );
+    }
+
+    // --- Per-root classification ---
+
+    /// Builds a `LanguageConfig` with classification fields for testing.
+    fn lang_config_with_exts(exts: &[&str]) -> crate::config::LanguageConfig {
+        crate::config::LanguageConfig {
+            extensions: Some(exts.iter().map(|s| (*s).to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn lang_config_with_filenames(names: &[&str]) -> crate::config::LanguageConfig {
+        crate::config::LanguageConfig {
+            filenames: Some(names.iter().map(|s| (*s).to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn lang_config_with_shebangs(interps: &[&str]) -> crate::config::LanguageConfig {
+        crate::config::LanguageConfig {
+            shebangs: Some(interps.iter().map(|s| (*s).to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_from_project_config_basic() {
+        let mut languages = HashMap::new();
+        languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        assert_eq!(
+            tables.classify_path(Path::new("foo.pkg")),
+            Some("pkgbuild".to_string()),
+        );
+        assert!(!tables.is_empty());
+    }
+
+    #[test]
+    fn test_from_project_config_skips_no_classification() {
+        let mut languages = HashMap::new();
+        // Entry with only servers, no classification fields.
+        languages.insert("rust".to_string(), crate::config::LanguageConfig::default());
+        let tables = ClassificationTables::from_project_config(&languages);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_per_root_classification_override() {
+        let root_a = PathBuf::from("/projects/a");
+        let root_b = PathBuf::from("/projects/b");
+
+        let mgr = default_mgr();
+        mgr.set_roots(vec![root_a.clone(), root_b]);
+
+        // Root A maps .pkg → pkgbuild.
+        let mut languages = HashMap::new();
+        languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root_a, tables);
+
+        // File in root A: .pkg → pkgbuild.
+        assert_eq!(
+            mgr.language_id(Path::new("/projects/a/foo.pkg")),
+            Some("pkgbuild".to_string()),
+        );
+        // File in root B: .pkg → no match (not globally mapped).
+        assert_eq!(mgr.language_id(Path::new("/projects/b/foo.pkg")), None);
+    }
+
+    #[test]
+    fn test_per_root_classification_fallback() {
+        let root_a = PathBuf::from("/projects/a");
+
+        let mgr = default_mgr();
+        mgr.set_roots(vec![root_a]);
+
+        // Root A has no per-root tables.
+        // .rs → rust from global tables.
+        assert_eq!(
+            mgr.language_id(Path::new("/projects/a/foo.rs")),
+            Some("rust".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_per_root_filename_classification() {
+        let root_a = PathBuf::from("/projects/a");
+
+        let mgr = default_mgr();
+        mgr.set_roots(vec![root_a.clone()]);
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "custom".to_string(),
+            lang_config_with_filenames(&["Taskfile"]),
+        );
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root_a, tables);
+
+        assert_eq!(
+            mgr.language_id(Path::new("/projects/a/Taskfile")),
+            Some("custom".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_per_root_shebang_classification() {
+        let root_a = tempfile::tempdir().expect("tempdir");
+        let mgr = default_mgr();
+        mgr.set_roots(vec![root_a.path().to_path_buf()]);
+
+        let mut languages = HashMap::new();
+        languages.insert("custom".to_string(), lang_config_with_shebangs(&["deno"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root_a.path().to_path_buf(), tables);
+
+        // Extensionless file with deno shebang in root A → custom.
+        let path = root_a.path().join("script");
+        std::fs::write(&path, "#!/usr/bin/env deno\nconsole.log('hi')\n").expect("write");
+
+        assert_eq!(mgr.language_id(&path), Some("custom".to_string()),);
+    }
+
+    #[test]
+    fn test_per_root_precedence_over_global() {
+        let root_a = PathBuf::from("/projects/a");
+
+        let mgr = default_mgr();
+        mgr.set_roots(vec![root_a.clone()]);
+
+        // Root A maps .sh → custom-shell (global maps .sh → shellscript).
+        let mut languages = HashMap::new();
+        languages.insert("custom-shell".to_string(), lang_config_with_exts(&["sh"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root_a, tables);
+
+        assert_eq!(
+            mgr.language_id(Path::new("/projects/a/test.sh")),
+            Some("custom-shell".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_unrooted_file_uses_global() {
+        let root_a = PathBuf::from("/projects/a");
+
+        let mgr = default_mgr();
+        mgr.set_roots(vec![root_a.clone()]);
+
+        // Set per-root tables for root A.
+        let mut languages = HashMap::new();
+        languages.insert("custom".to_string(), lang_config_with_exts(&["xyz"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root_a, tables);
+
+        // File outside all roots uses global classification only.
+        assert_eq!(
+            mgr.language_id(Path::new("/other/path/foo.rs")),
+            Some("rust".to_string()),
+        );
+        // Per-root extension not visible for unrooted files.
+        assert_eq!(mgr.language_id(Path::new("/other/path/foo.xyz")), None);
+    }
+
+    #[test]
+    fn test_set_root_classification() {
+        let root = PathBuf::from("/projects/a");
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![root.clone()]);
+
+        // No per-root tables initially.
+        assert_eq!(mgr.language_id(Path::new("/projects/a/foo.pkg")), None);
+
+        // Set per-root tables.
+        let mut languages = HashMap::new();
+        languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root, tables);
+
+        assert_eq!(
+            mgr.language_id(Path::new("/projects/a/foo.pkg")),
+            Some("pkgbuild".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_remove_root_classification() {
+        let root = PathBuf::from("/projects/a");
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![root.clone()]);
+
+        let mut languages = HashMap::new();
+        languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root.clone(), tables);
+
+        assert_eq!(
+            mgr.language_id(Path::new("/projects/a/foo.pkg")),
+            Some("pkgbuild".to_string()),
+        );
+
+        // Remove per-root tables — falls back to global (None).
+        mgr.remove_root_classification(&root);
+        assert_eq!(mgr.language_id(Path::new("/projects/a/foo.pkg")), None);
+    }
+
+    #[test]
+    fn test_detect_workspace_languages_per_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mgr = FilesystemManager::new();
+        mgr.set_roots(vec![root.path().to_path_buf()]);
+
+        // Create a file with a custom extension.
+        std::fs::write(root.path().join("build.pkg"), "content\n").expect("write");
+
+        // Set per-root classification: .pkg → pkgbuild.
+        let mut languages = HashMap::new();
+        languages.insert("pkgbuild".to_string(), lang_config_with_exts(&["pkg"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root.path().to_path_buf(), tables);
+
+        let configured: HashSet<&str> = std::iter::once("pkgbuild").collect();
+        let detected = mgr.detect_workspace_languages(&[root.path().to_path_buf()], &configured);
+
+        assert!(
+            detected.contains("pkgbuild"),
+            "per-root classification should be picked up by detection, got: {detected:?}",
+        );
+    }
+
+    #[test]
+    fn test_seed_with_per_root_classification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write");
+
+        let mgr = default_mgr();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+
+        // Set per-root classification.
+        let mut languages = HashMap::new();
+        languages.insert("custom".to_string(), lang_config_with_exts(&["xyz"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(dir.path().to_path_buf(), tables);
+
+        // Seed + diff should be clean.
+        mgr.seed();
+        let changes = mgr.diff();
+        assert!(changes.is_empty(), "diff after seed should be empty");
+    }
+
+    #[test]
+    fn test_diff_with_per_root_classification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write");
+
+        let mgr = default_mgr();
+        mgr.set_roots(vec![dir.path().to_path_buf()]);
+
+        let mut languages = HashMap::new();
+        languages.insert("custom".to_string(), lang_config_with_exts(&["xyz"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(dir.path().to_path_buf(), tables);
+
+        mgr.seed();
+
+        // Create a file with the per-root extension.
+        std::fs::write(dir.path().join("new.xyz"), "content\n").expect("write");
+        let changes = mgr.diff();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path.ends_with("new.xyz") && c.change_type == FileChangeType::Created),
+            "new file should appear in diff, got: {changes:?}",
+        );
+    }
+
+    #[test]
+    fn test_classify_uses_per_root_shebang() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mgr = default_mgr();
+        mgr.set_roots(vec![root.path().to_path_buf()]);
+
+        // Per-root: deno → custom.
+        let mut languages = HashMap::new();
+        languages.insert("custom".to_string(), lang_config_with_shebangs(&["deno"]));
+        let tables = ClassificationTables::from_project_config(&languages);
+        mgr.set_root_classification(root.path().to_path_buf(), tables);
+
+        let path = root.path().join("script");
+        std::fs::write(&path, "#!/usr/bin/env deno\nconsole.log('hi')\n").expect("write");
+
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let info = mgr.classify(&path, &metadata);
+        assert_eq!(
+            info.kind,
+            FileKind::Text {
+                lines: 2,
+                language_id: Some("custom".to_string()),
+            }
         );
     }
 

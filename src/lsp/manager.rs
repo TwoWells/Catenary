@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::bridge::filesystem_manager::FilesystemManager;
+use crate::bridge::filesystem_manager::{ClassificationTables, FilesystemManager};
 use crate::config::{Config, ServerBinding, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
@@ -132,8 +132,10 @@ impl LspClientManager {
     pub async fn spawn_all(&self) {
         let roots = self.fs.roots();
 
-        // Load project configs for all roots.
+        // Load project configs for all roots and set per-root
+        // classification tables before detection runs.
         self.load_project_configs_for_roots(&roots);
+        self.set_per_root_classification(&roots);
 
         let configured_keys: HashSet<&str> =
             self.config.language.keys().map(String::as_str).collect();
@@ -434,11 +436,12 @@ impl LspClientManager {
         roots.retain(|r| r != root);
         self.fs.set_roots(roots);
 
-        // Remove project config for the removed root.
+        // Remove project config and classification tables for the removed root.
         self.project_configs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(root);
+        self.fs.remove_root_classification(root);
 
         // Notify workspace-capable servers about the removal and
         // clean up per-root settings.
@@ -506,6 +509,7 @@ impl LspClientManager {
 
         // Update project configs: load for added roots, remove for removed.
         self.load_project_configs_for_roots(&to_add);
+        self.set_per_root_classification(&to_add);
         if !to_remove.is_empty() {
             let mut configs = self
                 .project_configs
@@ -513,6 +517,10 @@ impl LspClientManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for removed in &to_remove {
                 configs.remove(removed);
+            }
+            drop(configs);
+            for removed in &to_remove {
+                self.fs.remove_root_classification(removed);
             }
         }
 
@@ -1359,6 +1367,28 @@ impl LspClientManager {
             }
         }
         map
+    }
+
+    /// Feeds per-root classification tables to `FilesystemManager`.
+    ///
+    /// For each root with a loaded project config that has classification
+    /// fields, builds a [`ClassificationTables`] and stores it on the
+    /// filesystem manager. Must be called after
+    /// [`load_project_configs_for_roots`](Self::load_project_configs_for_roots)
+    /// and before [`FilesystemManager::detect_workspace_languages`].
+    fn set_per_root_classification(&self, roots: &[PathBuf]) {
+        let configs = self
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for root in roots {
+            if let Some(pc) = configs.get(root) {
+                let tables = ClassificationTables::from_project_config(&pc.language);
+                if !tables.is_empty() {
+                    self.fs.set_root_classification(root.clone(), tables);
+                }
+            }
+        }
     }
 
     /// Loads project configs for the given roots.
