@@ -17,8 +17,6 @@ mod handler;
 mod hook_router;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
-/// Shared symbol types and helpers for handler and file_tools.
-mod symbols;
 /// Transformation layer trait between protocol boundaries and LSP.
 pub mod tool_server;
 /// Shared container for tool servers and cross-tool infrastructure.

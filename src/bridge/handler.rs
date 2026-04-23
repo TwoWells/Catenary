@@ -117,13 +117,25 @@ impl ToolHandler for McpRouter {
             Tool {
                 name: "glob".to_string(),
                 title: Some("Glob".to_string()),
-                description: Some("Browse the workspace. Auto-detects intent: file path → symbol outline, directory path → listing with symbols, glob pattern → matching files with symbols. Always shows outline-level symbols (structs, classes, enums, interfaces, modules, constants).".to_string()),
+                description: Some("Browse the workspace.\n\nPATTERN (required)\n  File path      single file with line count (src/main.rs)\n  Directory      immediate children (src/bridge/)\n  Glob pattern   recursive file tree (src/**/*.rs)\n\n  Glob syntax:\n    *        any characters within a path segment\n    **       zero or more path segments\n    ?        single character\n    {a,b}    alternation\n    [abc]    character class\n\n  Directory output shows immediate children. Glob pattern output\n  renders a nested directory tree \u{2014} directories as structural nodes,\n  files indented under their parent.\n\nEXCLUDE\n  Glob pattern to filter out matching entries from the results.\n  Patterns without a path separator match the filename anywhere\n  in the tree (e.g. exclude=\"test_*\" excludes all test_* files).\n\n  Examples:\n    pattern=\"src/**/*.rs\" exclude=\"test_*\"\n    pattern=\"src/\" exclude=\"*.json\"\n\nOUTPUT\n  Output fits a fixed character budget to protect your context\n  window. Large directories are bucketed into drillable glob\n  patterns. Each bucket is a valid glob pattern you can pass\n  back to narrow results.\n\nINCLUDE_GITIGNORED (default: false)\n  Include files and directories ignored by .gitignore.\n\nINCLUDE_HIDDEN (default: false)\n  Include hidden files and directories (dotfiles).".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "pattern": {
                             "type": "string",
                             "description": "A file path, directory path, or glob pattern (e.g., 'src/', 'src/main.rs', '**/*.rs')"
+                        },
+                        "exclude": {
+                            "type": "string",
+                            "description": "Glob pattern to exclude from results"
+                        },
+                        "include_gitignored": {
+                            "type": "boolean",
+                            "description": "Include files ignored by .gitignore (default: false)"
+                        },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "description": "Include hidden files and directories (default: false)"
                         }
                     },
                     "required": ["pattern"]

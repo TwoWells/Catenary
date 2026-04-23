@@ -180,6 +180,10 @@ impl Toolbox {
             .tools
             .as_ref()
             .map_or(4000, |t| t.grep.budget as usize);
+        let glob_budget = config
+            .tools
+            .as_ref()
+            .map_or(2000, |t| t.glob.budget as usize);
 
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let client_manager = Arc::new(LspClientManager::new(
@@ -201,6 +205,7 @@ impl Toolbox {
         let glob = GlobServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
+            budget: glob_budget,
         };
         Self {
             grep,

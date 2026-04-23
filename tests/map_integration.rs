@@ -105,19 +105,18 @@ fn test_glob_directory_symbols() -> Result<()> {
         content.contains(&format!("types.{MOCK_LANG_A}")),
         "Should list the file, got:\n{content}"
     );
+    // Tier 2: file listing with line counts (no symbols until 08b).
     assert!(
-        content.contains("Config"),
-        "Should contain Config symbol, got:\n{content}"
-    );
-    assert!(
-        content.contains("Mode"),
-        "Should contain Mode symbol, got:\n{content}"
+        content.contains("(3 lines)"),
+        "Should show line count, got:\n{content}"
     );
     Ok(())
 }
 
-/// Verifies that glob returns outline symbols for a single file,
-/// filtering to outline kinds only.
+/// Verifies that glob returns a line count header for a single file.
+///
+/// Symbols (defensive maps) are added in 08b. For now, only the
+/// header with line count is shown.
 #[test]
 fn test_glob_file_outline() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -151,52 +150,16 @@ fn test_glob_file_outline() -> Result<()> {
         .as_str()
         .context("Missing text in content")?;
 
-    // Outline kinds should be present
-    assert!(
-        content.contains("Config"),
-        "Should contain Config symbol, got:\n{content}"
-    );
-    assert!(
-        content.contains("Struct"),
-        "Config should have Struct kind, got:\n{content}"
-    );
-    assert!(
-        content.contains("Mode"),
-        "Should contain Mode symbol, got:\n{content}"
-    );
-    assert!(
-        content.contains("Enum"),
-        "Mode should have Enum kind, got:\n{content}"
-    );
-    assert!(
-        content.contains("MAX_SIZE"),
-        "Should contain MAX_SIZE symbol, got:\n{content}"
-    );
-    assert!(
-        content.contains("Constant"),
-        "MAX_SIZE should have Constant kind, got:\n{content}"
-    );
-
-    // Function kind should be excluded from outline
-    assert!(
-        !content.contains("do_work"),
-        "Function 'do_work' should be excluded from outline, got:\n{content}"
-    );
-
-    // Line numbers should be present
-    assert!(
-        content.contains("L1"),
-        "Should contain L1 line number, got:\n{content}"
-    );
-    assert!(
-        content.contains("L2"),
-        "Should contain L2 line number, got:\n{content}"
-    );
-
     // Line count header
     assert!(
         content.contains("(4 lines)"),
         "Should show line count, got:\n{content}"
+    );
+
+    // No symbols in output (maps added in 08b).
+    assert!(
+        !content.contains("Config"),
+        "Should not contain symbols yet, got:\n{content}"
     );
     Ok(())
 }

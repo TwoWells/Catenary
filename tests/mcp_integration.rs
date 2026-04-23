@@ -314,16 +314,13 @@ fn test_multi_root_glob_file() -> Result<()> {
     let text_a = result_a["content"][0]["text"]
         .as_str()
         .context("Missing text for symbols A")?;
+    // Glob file mode: line count header (no symbols until 08b).
     assert!(
-        text_a.contains("AlphaType"),
-        "Should contain AlphaType, got: {text_a}"
-    );
-    assert!(
-        text_a.contains("BetaMode"),
-        "Should contain BetaMode, got: {text_a}"
+        text_a.contains("(2 lines)"),
+        "Should show line count for root A file, got: {text_a}"
     );
 
-    // Get outline from root B file
+    // Get header from root B file
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 721,
@@ -346,12 +343,8 @@ fn test_multi_root_glob_file() -> Result<()> {
         .as_str()
         .context("Missing text for symbols B")?;
     assert!(
-        text_b.contains("GammaType"),
-        "Should contain GammaType, got: {text_b}"
-    );
-    assert!(
-        text_b.contains("DeltaMode"),
-        "Should contain DeltaMode, got: {text_b}"
+        text_b.contains("(2 lines)"),
+        "Should show line count for root B file, got: {text_b}"
     );
 
     Ok(())
@@ -2347,8 +2340,8 @@ fn test_grep_parent_id_threading() -> Result<()> {
     Ok(())
 }
 
-/// Verify that LSP messages triggered by glob carry the MCP tool call's
-/// `parent_id` in the database (misc 30: `parent_id` threading).
+/// Verify that glob no longer produces LSP messages (filesystem-only
+/// since 08a — defensive maps with LSP symbols added in 08b).
 #[test]
 fn test_glob_parent_id_threading() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2369,39 +2362,16 @@ fn test_glob_parent_id_threading() -> Result<()> {
             "arguments": { "pattern": test_file.to_str().context("path")? }
         }
     }))?;
-    let _response = bridge.recv()?;
+    let response = bridge.recv()?;
+    let result = &response["result"];
+    let content = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
 
-    // Open the database and verify parent_id threading
-    let db_path = PathBuf::from(bridge.state_home())
-        .join("catenary")
-        .join("catenary.db");
-    let conn =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .context("open test database")?;
-
-    // Find the correlation ID of the tools/call MCP request.
-    let tool_call_corr_id: i64 = conn
-        .query_row(
-            "SELECT request_id FROM messages \
-             WHERE type = 'mcp' AND method = 'tools/call' \
-             AND request_id IS NOT NULL LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .context("find tools/call correlation ID")?;
-
-    // LSP messages from the glob pipeline should carry this parent_id
-    let lsp_with_parent: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE type = 'lsp' AND parent_id = ?1",
-            [tool_call_corr_id],
-            |row| row.get(0),
-        )
-        .context("count LSP messages with parent_id")?;
-
+    // Glob returns line count header only (no LSP calls).
     assert!(
-        lsp_with_parent > 0,
-        "Expected LSP messages with parent_id={tool_call_corr_id} from glob, found 0"
+        content.contains("(2 lines)"),
+        "Should show line count, got: {content}"
     );
 
     Ok(())
