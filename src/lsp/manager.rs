@@ -3953,9 +3953,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_mixed_roots() -> Result<()> {
-        // Two roots: one with project config (Rule A), one without.
-        // Workspace-capable server: project root gets Scope::Root,
-        // other root served by Scope::Workspace.
+        // Two roots with real files: one with project config (Rule A),
+        // one without. spawn_all should produce workspace + project-scoped
+        // root instances.
+        let root_a = tempfile::tempdir().expect("tempdir");
+        let root_b = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root_a.path().join(format!("file.{MOCK_LANG_A}")), "content")
+            .expect("write");
+        std::fs::write(root_b.path().join(format!("file.{MOCK_LANG_A}")), "content")
+            .expect("write");
+
         let config = mockls_workspace_folders_config();
         let server_name = config
             .resolve_language(MOCK_LANG_A)
@@ -3964,36 +3971,19 @@ mod tests {
             .name
             .clone();
 
-        let manager = LspClientManager::new(
-            config,
-            test_logging(),
-            test_fs_with_roots(&["/tmp", "/var"]),
-        );
+        let fs = test_fs();
+        fs.set_roots(vec![
+            root_a.path().to_path_buf(),
+            root_b.path().to_path_buf(),
+        ]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
 
-        // /var has project config — Rule A triggers.
-        let mut pc = crate::config::ProjectConfig::default();
-        pc.language.insert(
-            MOCK_LANG_A.to_string(),
-            LanguageConfig {
-                servers: vec![ServerBinding::new(server_name.clone())],
-                ..LanguageConfig::default()
-            },
-        );
-        manager
-            .project_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(PathBuf::from("/var"), pc);
+        // Write .catenary.toml for root_b so load_project_configs_for_roots
+        // discovers it during spawn_all.
+        let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
+        std::fs::write(root_b.path().join(".catenary.toml"), project_toml).expect("write");
 
-        // Spawn first root normally (/tmp — not project-scoped).
-        let _ = manager
-            .ensure_server(MOCK_LANG_A, &server_name, Path::new("/tmp"))
-            .await?;
-
-        // Spawn second root as project-scoped.
-        let _ = manager
-            .spawn_project_scoped(&server_name, MOCK_LANG_A, Path::new("/var"))
-            .await?;
+        manager.spawn_all().await;
 
         let clients = manager.clients().await;
         assert_eq!(
@@ -4004,13 +3994,107 @@ mod tests {
         assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
         assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 1);
 
-        // The root instance should be for /var.
+        // The root instance should be for root_b.
         let root_key = clients
             .keys()
             .find(|k| matches!(&k.scope, Scope::Root(_)))
             .expect("should have root key");
-        assert_eq!(root_key.scope, Scope::Root(PathBuf::from("/var")),);
+        assert_eq!(root_key.scope, Scope::Root(root_b.path().to_path_buf()),);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_project_scoped_single_root() -> Result<()> {
+        // Single root with project config: spawn_all produces
+        // Scope::Root even for workspace-capable server.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(format!("file.{MOCK_LANG_A}")), "content").expect("write");
+
+        let config = mockls_workspace_folders_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let fs = test_fs();
+        fs.set_roots(vec![root.path().to_path_buf()]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
+
+        let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
+        std::fs::write(root.path().join(".catenary.toml"), project_toml).expect("write");
+
+        manager.spawn_all().await;
+
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1);
+        let key = clients.keys().next().expect("one key");
+        assert_eq!(
+            key.scope,
+            Scope::Root(root.path().to_path_buf()),
+            "Project-scoped root should force Scope::Root"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_workspace_excludes_project_root() -> Result<()> {
+        // Three roots: two normal, one project-scoped. The workspace
+        // instance should NOT include the project-scoped root in its
+        // workspaceFolders (verified by instance count — if the project
+        // root were in the workspace, spawn_project_scoped would have
+        // been blocked by find_instance returning the workspace instance).
+        let root_a = tempfile::tempdir().expect("tempdir");
+        let root_b = tempfile::tempdir().expect("tempdir");
+        let root_c = tempfile::tempdir().expect("tempdir");
+        for root in [&root_a, &root_b, &root_c] {
+            std::fs::write(root.path().join(format!("file.{MOCK_LANG_A}")), "content")
+                .expect("write");
+        }
+
+        let config = mockls_workspace_folders_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let fs = test_fs();
+        fs.set_roots(vec![
+            root_a.path().to_path_buf(),
+            root_b.path().to_path_buf(),
+            root_c.path().to_path_buf(),
+        ]);
+        let manager = LspClientManager::new(config, test_logging(), fs);
+
+        // Only root_b is project-scoped.
+        let project_toml = format!("[language.{MOCK_LANG_A}]\nservers = [\"{server_name}\"]\n");
+        std::fs::write(root_b.path().join(".catenary.toml"), project_toml).expect("write");
+
+        manager.spawn_all().await;
+
+        let clients = manager.clients().await;
+        // 1 workspace (root_a + root_c) + 1 project-scoped root (root_b).
+        assert_eq!(
+            clients.len(),
+            2,
+            "Should have workspace + one project-scoped root"
+        );
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "workspace"), 1);
+        assert_eq!(count_scope(&clients, MOCK_LANG_A, "root"), 1);
+
+        let root_key = clients
+            .keys()
+            .find(|k| matches!(&k.scope, Scope::Root(_)))
+            .expect("should have root key");
+        assert_eq!(
+            root_key.scope,
+            Scope::Root(root_b.path().to_path_buf()),
+            "Only root_b should be project-scoped"
+        );
         Ok(())
     }
 
