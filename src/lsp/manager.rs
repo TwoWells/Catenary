@@ -1066,7 +1066,14 @@ impl LspClientManager {
         info!("Mid-session server spawn for: {}", sorted.join(", "));
 
         for (lang, server_name, root) in &to_spawn {
-            if let Err(e) = self.ensure_server(lang, server_name, root).await {
+            let result = if self.is_project_scoped(lang, root) {
+                self.spawn_project_scoped(server_name, lang, root)
+                    .await
+                    .map(drop)
+            } else {
+                self.ensure_server(lang, server_name, root).await.map(drop)
+            };
+            if let Err(e) = result {
                 warn!(
                     source = "lsp.lifecycle",
                     language = lang.as_str(),
@@ -2050,6 +2057,72 @@ mod tests {
             count_scope(&clients, MOCK_LANG_A, "root"),
             2,
             "Should have two root-scoped instances"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clients_project_scoped() -> Result<()> {
+        // ensure_clients_for_paths should use spawn_project_scoped for
+        // roots with project config, producing Scope::Root even when
+        // the server supports workspace folders.
+        let config = mockls_workspace_folders_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+
+        // Add project config with [language.{MOCK_LANG_A}] (Rule A).
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
+            },
+        );
+        manager
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(PathBuf::from("/tmp"), pc);
+
+        let paths = vec![PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"))];
+        manager.ensure_clients_for_paths(&paths).await;
+
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1);
+        assert_eq!(
+            count_scope(&clients, MOCK_LANG_A, "root"),
+            1,
+            "project-scoped root should produce Scope::Root, not Scope::Workspace"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clients_non_project_uses_capability() -> Result<()> {
+        // Without project config, a workspace-capable server should
+        // get Scope::Workspace via the normal ensure_server path.
+        let manager = LspClientManager::new(
+            mockls_workspace_folders_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+
+        let paths = vec![PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"))];
+        manager.ensure_clients_for_paths(&paths).await;
+
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1);
+        assert_eq!(
+            count_scope(&clients, MOCK_LANG_A, "workspace"),
+            1,
+            "workspace-capable server without project config should be Scope::Workspace"
         );
         Ok(())
     }
