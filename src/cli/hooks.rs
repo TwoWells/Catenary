@@ -534,6 +534,7 @@ pub fn run_pre_tool(format: HostFormat) {
     let file_path = extract_file_path(&hook_json);
     let agent_id = extract_agent_id(&hook_json);
     let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+    let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
 
     let mut request = serde_json::json!({
         "method": "pre-tool/enforce-editing",
@@ -542,6 +543,9 @@ pub fn run_pre_tool(format: HostFormat) {
     });
     if let Some(path) = &file_path {
         request["file_path"] = serde_json::json!(path);
+    }
+    if let Some(cmd) = &shell_cmd {
+        request["command"] = serde_json::json!(cmd);
     }
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);

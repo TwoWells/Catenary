@@ -301,6 +301,66 @@ pub fn check_command(cmd: &str, rules: &ResolvedCommands) -> Option<String> {
     None
 }
 
+/// Extract all command names from a shell command string.
+///
+/// Reuses the same parsing infrastructure as [`check_command`]: heredoc
+/// stripping, echo separator removal, sequential/pipe splitting, subshell
+/// recursion, env-var prefix skipping, and full-path stripping. Returns the
+/// bare command names (e.g., `rm`, `cp`) found at each pipeline position.
+///
+/// Used by editing enforcement to decide whether a Bash tool call contains
+/// only filesystem-manipulation commands.
+#[must_use]
+pub fn extract_command_names(cmd: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_command_names(cmd, &mut names);
+    names
+}
+
+/// Recursive helper for [`extract_command_names`].
+fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
+    let cmd_string = strip_heredoc_bodies(cmd);
+    let cmd_string = strip_echo_separators(&cmd_string);
+
+    let sequential = quote_aware_split(&cmd_string, &SEQ_SPLIT_RE);
+    for seq in sequential {
+        let stages = pipe_split(seq);
+        for segment in &stages {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+
+            // Recursively process $(), <(), and `` substitutions.
+            for m in SUBSHELL_RE.captures_iter(segment) {
+                let inner = m
+                    .get(1)
+                    .or_else(|| m.get(2))
+                    .or_else(|| m.get(3))
+                    .map_or("", |g| g.as_str().trim());
+                collect_command_names(inner, names);
+            }
+
+            let tokens = shell_split(segment);
+            let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            if token_refs.is_empty() {
+                continue;
+            }
+
+            let Some(cmd_idx) = find_command(&token_refs) else {
+                continue;
+            };
+
+            let name = std::path::Path::new(token_refs[cmd_idx])
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(token_refs[cmd_idx]);
+
+            names.push(name.to_string());
+        }
+    }
+}
+
 /// Resolve template variables in guidance messages for a specific client.
 ///
 /// Replaces `{read}`, `{edit}`, `{catenary_grep}`, `{catenary_glob}` with
@@ -1187,5 +1247,49 @@ mod tests {
     fn pipe_split_quoted_pipe() {
         let parts = pipe_split("git commit -m \"a | b\"");
         assert_eq!(parts, vec!["git commit -m \"a | b\""]);
+    }
+
+    // ── extract_command_names tests ─────────────────────────────────
+
+    #[test]
+    fn extract_names_simple() {
+        let names = extract_command_names("rm -rf target/");
+        assert_eq!(names, vec!["rm"]);
+    }
+
+    #[test]
+    fn extract_names_chained() {
+        let names = extract_command_names("mkdir -p src/new && touch src/new/mod.rs");
+        assert_eq!(names, vec!["mkdir", "touch"]);
+    }
+
+    #[test]
+    fn extract_names_pipeline() {
+        let names = extract_command_names("find . -name '*.rs' | grep test");
+        assert_eq!(names, vec!["find", "grep"]);
+    }
+
+    #[test]
+    fn extract_names_full_path() {
+        let names = extract_command_names("/usr/bin/cp a b");
+        assert_eq!(names, vec!["cp"]);
+    }
+
+    #[test]
+    fn extract_names_env_prefix() {
+        let names = extract_command_names("LANG=C rm foo.rs");
+        assert_eq!(names, vec!["rm"]);
+    }
+
+    #[test]
+    fn extract_names_subshell() {
+        let names = extract_command_names("rm $(cat files.txt)");
+        assert_eq!(names, vec!["cat", "rm"]);
+    }
+
+    #[test]
+    fn extract_names_empty() {
+        let names = extract_command_names("");
+        assert!(names.is_empty());
     }
 }

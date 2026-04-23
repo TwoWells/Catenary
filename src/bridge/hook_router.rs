@@ -36,6 +36,32 @@ fn is_read_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Read" | "NotebookRead" | "read_file")
 }
 
+/// Returns `true` if the tool is a shell tool (Bash or `run_shell_command`).
+fn is_bash_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Bash" | "run_shell_command")
+}
+
+/// Filesystem-manipulation commands allowed during editing mode.
+///
+/// These commands modify the filesystem without producing code changes that
+/// need LSP diagnostics. Blocking them during editing forces the agent to
+/// exit editing mode mid-refactor just to delete a removed module file.
+const FILESYSTEM_COMMANDS: &[&str] = &["rm", "cp", "mv", "mkdir", "rmdir", "touch", "chmod", "ln"];
+
+/// Returns `true` if a shell command contains only filesystem operations.
+///
+/// Uses the command parsing infrastructure from [`crate::cli::command_filter`]
+/// (pipeline splitting, subshell recursion, env-var prefix stripping) to
+/// extract every command name, then checks that each one is in the
+/// [`FILESYSTEM_COMMANDS`] allowlist.
+fn is_filesystem_only_bash(command: &str) -> bool {
+    let names = crate::cli::command_filter::extract_command_names(command);
+    !names.is_empty()
+        && names
+            .iter()
+            .all(|n| FILESYSTEM_COMMANDS.contains(&n.as_str()))
+}
+
 /// Returns `true` if the tool is always allowed during editing mode.
 ///
 /// Catenary editing tools (`start_editing`, `done_editing`) must be allowed
@@ -125,6 +151,7 @@ impl HookRouter {
             HookRequest::PreToolEnforceEditing {
                 tool_name,
                 file_path,
+                command,
                 agent_id,
                 session_id,
             } => {
@@ -133,6 +160,7 @@ impl HookRouter {
                     result: self.handle_enforce_editing(
                         &tool_name,
                         file_path.as_deref(),
+                        command.as_deref(),
                         &agent_id,
                     ),
                     system_message: None,
@@ -193,9 +221,10 @@ impl HookRouter {
 
     /// Editing state enforcement: deny or allow a tool call.
     ///
-    /// If the agent is in editing mode, only Edit/Read/Write and Catenary
-    /// editing tools are allowed. If the agent is not in editing mode,
-    /// Edit/Write requires `start_editing` first.
+    /// If the agent is in editing mode, only Edit/Read/Write, Catenary
+    /// editing tools, and filesystem-only Bash commands are allowed. If the
+    /// agent is not in editing mode, Edit/Write requires `start_editing`
+    /// first.
     ///
     /// When the tool is `start_editing`, enters editing mode as a side effect
     /// (the MCP tool is a trigger — the hook owns the state transition
@@ -204,6 +233,7 @@ impl HookRouter {
         &self,
         tool_name: &str,
         file_path: Option<&str>,
+        command: Option<&str>,
         agent_id: &str,
     ) -> Option<HookResult> {
         // start_editing: enter editing mode and allow unconditionally.
@@ -218,6 +248,7 @@ impl HookRouter {
             if is_allowed_during_editing(tool_name)
                 || is_read_tool(tool_name)
                 || is_edit_tool(tool_name)
+                || (is_bash_tool(tool_name) && command.is_some_and(is_filesystem_only_bash))
             {
                 None
             } else {
@@ -417,7 +448,7 @@ mod tests {
     fn test_hook_enforce_editing_deny() {
         let router = test_router();
         // No editing state — Edit should be denied
-        let result = router.handle_enforce_editing("Edit", None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny, got {result:?}");
         };
@@ -428,7 +459,7 @@ mod tests {
     fn test_hook_enforce_editing_allow() {
         let router = test_router();
         // Enter editing mode through the hook handler
-        let result = router.handle_enforce_editing(START_EDITING, None, "");
+        let result = router.handle_enforce_editing(START_EDITING, None, None, "");
         assert!(result.is_none(), "start_editing should allow");
         assert!(
             router.toolbox.editing.is_editing(""),
@@ -436,15 +467,15 @@ mod tests {
         );
 
         // Edit tool — should allow during editing mode
-        let result = router.handle_enforce_editing("Edit", None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, "");
         assert!(result.is_none(), "expected allow, got {result:?}");
 
         // Read tool — always allowed during editing
-        let result = router.handle_enforce_editing("Read", None, "");
+        let result = router.handle_enforce_editing("Read", None, None, "");
         assert!(result.is_none(), "expected allow for Read, got {result:?}");
 
         // Non-edit, non-read tool while editing — should deny
-        let result = router.handle_enforce_editing("Bash", None, "");
+        let result = router.handle_enforce_editing("Bash", None, None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for Bash, got {result:?}");
         };
@@ -454,7 +485,7 @@ mod tests {
     #[test]
     fn test_hook_file_accumulation() {
         let (router, root) = test_router_with_root();
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         let main_rs = format!("{}/src/main.rs", root.display());
 
@@ -475,7 +506,7 @@ mod tests {
     fn test_hook_require_release_block() {
         let router = test_router();
         // Enter editing mode through the hook handler
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         let result = router.handle_require_release("", false);
         let Some(HookResult::Block(reason)) = result else {
@@ -496,7 +527,7 @@ mod tests {
     fn test_hook_require_release_retry() {
         let router = test_router();
         // Enter editing mode through the hook handler
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         // stop_hook_active = true → always allow regardless of state
         let result = router.handle_require_release("", true);
@@ -513,8 +544,8 @@ mod tests {
     fn test_hook_clear_editing() {
         let router = test_router();
         // Enter editing mode for two agents through the hook handler
-        router.handle_enforce_editing(START_EDITING, None, "");
-        router.handle_enforce_editing(START_EDITING, None, "agent-b");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "agent-b");
 
         let result = router.handle_clear_editing();
         assert_eq!(result, Some(HookResult::Cleared(2)));
@@ -534,7 +565,7 @@ mod tests {
         let router = test_router();
         // Edit on a file outside workspace roots while not editing →
         // should allow (no diagnostics will come for out-of-root files).
-        let result = router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), "");
+        let result = router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, "");
         assert!(
             result.is_none(),
             "out-of-root edit should be allowed without start_editing, got {result:?}"
@@ -546,7 +577,7 @@ mod tests {
         let (router, root) = test_router_with_root();
         // Edit on a file inside workspace roots while not editing → deny.
         let in_root = format!("{}/src/main.rs", root.display());
-        let result = router.handle_enforce_editing("Edit", Some(&in_root), "");
+        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, "");
         let Some(HookResult::Deny(reason)) = result else {
             unreachable!("expected Deny for in-root edit, got {result:?}");
         };
@@ -557,7 +588,7 @@ mod tests {
     fn test_enforce_editing_no_file_path_still_denies() {
         let router = test_router();
         // Edit with no file path (e.g., host didn't supply it) → deny.
-        let result = router.handle_enforce_editing("Edit", None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, "");
         let Some(HookResult::Deny(_)) = result else {
             unreachable!("expected Deny when file_path is None, got {result:?}");
         };
@@ -566,7 +597,7 @@ mod tests {
     #[test]
     fn test_file_accumulation_skips_out_of_root() {
         let router = test_router();
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         // File outside workspace roots — should not be accumulated.
         router.handle_file_accumulation("/outside/some/file.rs", "", Some("Edit"));
@@ -580,12 +611,112 @@ mod tests {
     #[test]
     fn test_file_accumulation_keeps_in_root() {
         let (router, root) = test_router_with_root();
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         let in_root = format!("{}/src/main.rs", root.display());
         router.handle_file_accumulation(&in_root, "", Some("Edit"));
         let files = router.toolbox.editing.drain_files("");
         assert_eq!(files.len(), 1, "in-root file should be accumulated");
+    }
+
+    // ── Filesystem Bash allowlist tests ──────────────────────────────────
+
+    #[test]
+    fn test_is_bash_tool() {
+        assert!(is_bash_tool("Bash"));
+        assert!(is_bash_tool("run_shell_command"));
+        assert!(!is_bash_tool("Edit"));
+        assert!(!is_bash_tool("Read"));
+        assert!(!is_bash_tool("bash")); // case-sensitive
+    }
+
+    #[test]
+    fn test_is_filesystem_only_bash() {
+        // Single filesystem commands
+        assert!(is_filesystem_only_bash("rm -rf target/"));
+        assert!(is_filesystem_only_bash("cp src/old.rs src/new.rs"));
+        assert!(is_filesystem_only_bash("mv foo.rs bar.rs"));
+        assert!(is_filesystem_only_bash("mkdir -p src/new_module"));
+        assert!(is_filesystem_only_bash("rmdir empty_dir"));
+        assert!(is_filesystem_only_bash("touch src/mod.rs"));
+        assert!(is_filesystem_only_bash("chmod +x script.sh"));
+
+        // Chained filesystem commands
+        assert!(is_filesystem_only_bash(
+            "rm src/old.rs && mkdir -p src/new/"
+        ));
+        assert!(is_filesystem_only_bash("cp a.rs b.rs; mv c.rs d.rs"));
+
+        // Full paths stripped to bare names
+        assert!(is_filesystem_only_bash("/bin/rm foo.rs"));
+        assert!(is_filesystem_only_bash("/usr/bin/cp a b"));
+
+        // With env var prefixes
+        assert!(is_filesystem_only_bash("LANG=C rm foo.rs"));
+
+        // Non-filesystem commands — must deny
+        assert!(!is_filesystem_only_bash("cargo build"));
+        assert!(!is_filesystem_only_bash("cat src/main.rs"));
+        assert!(!is_filesystem_only_bash("rm foo.rs && cargo test"));
+
+        // Mixed: one filesystem + one non-filesystem
+        assert!(!is_filesystem_only_bash("rm foo.rs && grep bar baz.rs"));
+
+        // Subshell with non-filesystem command
+        assert!(!is_filesystem_only_bash("rm $(cat files.txt)"));
+
+        // Empty command
+        assert!(!is_filesystem_only_bash(""));
+    }
+
+    #[test]
+    fn test_enforce_editing_allows_filesystem_bash() {
+        let router = test_router();
+        router.handle_enforce_editing(START_EDITING, None, None, "");
+
+        // Filesystem-only Bash — should allow during editing
+        let result = router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), "");
+        assert!(
+            result.is_none(),
+            "filesystem-only Bash should be allowed during editing, got {result:?}"
+        );
+
+        // Gemini CLI shell tool with filesystem command
+        let result = router.handle_enforce_editing(
+            "run_shell_command",
+            None,
+            Some("mkdir -p src/new_module"),
+            "",
+        );
+        assert!(
+            result.is_none(),
+            "filesystem-only run_shell_command should be allowed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_enforce_editing_denies_non_filesystem_bash() {
+        let router = test_router();
+        router.handle_enforce_editing(START_EDITING, None, None, "");
+
+        // Non-filesystem Bash — should deny during editing
+        let result = router.handle_enforce_editing("Bash", None, Some("cargo build"), "");
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("expected Deny for non-filesystem Bash, got {result:?}");
+        };
+        assert!(reason.contains("done_editing"));
+    }
+
+    #[test]
+    fn test_enforce_editing_denies_bash_without_command() {
+        let router = test_router();
+        router.handle_enforce_editing(START_EDITING, None, None, "");
+
+        // Bash without command string — cannot verify, must deny
+        let result = router.handle_enforce_editing("Bash", None, None, "");
+        let Some(HookResult::Deny(_)) = result else {
+            unreachable!("expected Deny for Bash without command, got {result:?}");
+        };
     }
 
     // ── Test helpers ────────────────────────────────────────────────────
@@ -767,7 +898,7 @@ mod tests {
     fn dispatch_stop_block_preserves_notifications() {
         let router = test_router();
         // Enter editing mode so stop blocks.
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         crate::logging::Sink::handle(
             router.toolbox.notifications.as_ref(),
@@ -805,6 +936,7 @@ mod tests {
             crate::hook::HookRequest::PreToolEnforceEditing {
                 tool_name: "Read".to_string(),
                 file_path: None,
+                command: None,
                 agent_id: String::new(),
                 session_id: None,
             },
@@ -818,7 +950,7 @@ mod tests {
     fn dispatch_stop_block_then_allow_drains_accumulated() {
         let router = test_router();
         // Enter editing mode so stop blocks.
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         // Enqueue a notification before the first stop.
         crate::logging::Sink::handle(
@@ -871,7 +1003,7 @@ mod tests {
     #[test]
     fn dispatch_stop_dedup_persists_across_blocked_cycle() {
         let router = test_router();
-        router.handle_enforce_editing(START_EDITING, None, "");
+        router.handle_enforce_editing(START_EDITING, None, None, "");
 
         // Enqueue a notification.
         crate::logging::Sink::handle(

@@ -90,6 +90,11 @@ pub(crate) enum HookRequest {
         /// `start_editing` gate.
         #[serde(default)]
         file_path: Option<String>,
+        /// Shell command string for Bash/`run_shell_command` tools.
+        /// Used during editing mode to allow filesystem-only commands
+        /// (`rm`, `cp`, `mv`, etc.) without requiring `done_editing`.
+        #[serde(default)]
+        command: Option<String>,
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,
@@ -452,6 +457,7 @@ mod tests {
         let HookRequest::PreToolEnforceEditing {
             tool_name,
             file_path,
+            command,
             agent_id,
             session_id,
         } = req
@@ -460,8 +466,17 @@ mod tests {
         };
         assert_eq!(tool_name, "Edit");
         assert_eq!(file_path.as_deref(), Some("/tmp/foo.rs"));
+        assert!(command.is_none());
         assert_eq!(agent_id, "");
         assert_eq!(session_id.as_deref(), Some("abc123"));
+
+        // pre-tool/enforce-editing with command (Bash tool)
+        let json = r#"{"method": "pre-tool/enforce-editing", "tool_name": "Bash", "command": "rm -rf target/", "agent_id": ""}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("enforce-editing with command");
+        let HookRequest::PreToolEnforceEditing { command, .. } = req else {
+            unreachable!("expected PreToolEnforceEditing");
+        };
+        assert_eq!(command.as_deref(), Some("rm -rf target/"));
 
         // post-tool/diagnostics with optional fields
         let json =
