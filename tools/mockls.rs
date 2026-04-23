@@ -193,6 +193,12 @@ struct Args {
     /// `--register-file-watchers`.
     #[arg(long)]
     watcher_kind: Option<u8>,
+
+    /// Include the number of currently-open documents in the diagnostic
+    /// message. Enables tests to verify that the batch pipeline opens all
+    /// files before settling (batch: "N open" vs sequential: "1 open").
+    #[arg(long)]
+    report_open_count: bool,
 }
 
 /// A JSON-RPC request.
@@ -576,7 +582,18 @@ impl MockServer {
                     self.rebuild_imports();
 
                     if !self.args.no_push_diagnostics && !self.args.diagnostics_on_save {
-                        self.publish_diagnostics(uri);
+                        if self.args.report_open_count {
+                            // Simulate cross-file reanalysis: re-publish
+                            // diagnostics for all open documents so every
+                            // file's cached diagnostics reflect the current
+                            // open count.
+                            let uris: Vec<String> = self.documents.keys().cloned().collect();
+                            for u in &uris {
+                                self.publish_diagnostics(u);
+                            }
+                        } else {
+                            self.publish_diagnostics(uri);
+                        }
                     }
                 }
             }
@@ -1415,6 +1432,12 @@ impl MockServer {
             .unwrap_or_default();
 
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
+        let message = if self.args.report_open_count {
+            let n = self.documents.len();
+            format!("mockls: mock diagnostic ({line_count} lines, {n} open)")
+        } else {
+            format!("mockls: mock diagnostic ({line_count} lines)")
+        };
 
         serde_json::json!({
             "kind": "full",
@@ -1425,7 +1448,7 @@ impl MockServer {
                 },
                 "severity": 2,
                 "source": "mockls",
-                "message": format!("mockls: mock diagnostic ({line_count} lines)")
+                "message": message
             }]
         })
     }
@@ -1571,14 +1594,25 @@ impl MockServer {
         // Capture line count at publish time so delayed publications
         // reflect the content that triggered them, not later edits.
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
+        let open_count = if self.args.report_open_count {
+            Some(self.documents.len())
+        } else {
+            None
+        };
 
         if delay > 0 {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(delay));
-                send_diagnostics_notification(&writer, &uri_owned, version, line_count);
+                send_diagnostics_notification(&writer, &uri_owned, version, line_count, open_count);
             });
         } else {
-            send_diagnostics_notification(&self.writer, &uri_owned, version, line_count);
+            send_diagnostics_notification(
+                &self.writer,
+                &uri_owned,
+                version,
+                line_count,
+                open_count,
+            );
         }
     }
 
@@ -1639,6 +1673,11 @@ impl MockServer {
         let publish_version = self.args.publish_version;
         let diagnostics_delay = self.args.diagnostics_delay;
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
+        let open_count = if self.args.report_open_count {
+            Some(self.documents.len())
+        } else {
+            None
+        };
         let version = if publish_version {
             Some(self.versions.get(uri).copied().unwrap_or(1))
         } else {
@@ -1680,7 +1719,7 @@ impl MockServer {
             }
 
             if !no_diagnostics {
-                send_diagnostics_notification(&writer, &uri_owned, version, line_count);
+                send_diagnostics_notification(&writer, &uri_owned, version, line_count, open_count);
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -1711,6 +1750,11 @@ impl MockServer {
         let publish_version = self.args.publish_version;
         let flycheck_ticks = self.args.flycheck_ticks;
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
+        let open_count = if self.args.report_open_count {
+            Some(self.documents.len())
+        } else {
+            None
+        };
         let version = if publish_version {
             Some(self.versions.get(uri).copied().unwrap_or(1))
         } else {
@@ -1763,7 +1807,7 @@ impl MockServer {
 
             // Publish diagnostics after subprocess completes
             if !no_diagnostics {
-                send_diagnostics_notification(&writer, &uri_owned, version, line_count);
+                send_diagnostics_notification(&writer, &uri_owned, version, line_count, open_count);
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -1896,7 +1940,12 @@ fn send_diagnostics_notification(
     uri: &str,
     version: Option<i32>,
     line_count: usize,
+    open_count: Option<usize>,
 ) {
+    let message = open_count.map_or_else(
+        || format!("mockls: mock diagnostic ({line_count} lines)"),
+        |n| format!("mockls: mock diagnostic ({line_count} lines, {n} open)"),
+    );
     let mut params = serde_json::json!({
         "uri": uri,
         "diagnostics": [{
@@ -1906,7 +1955,7 @@ fn send_diagnostics_notification(
             },
             "severity": 2,
             "source": "mockls",
-            "message": format!("mockls: mock diagnostic ({line_count} lines)")
+            "message": message
         }]
     });
 
@@ -2239,6 +2288,7 @@ mod tests {
             register_file_watchers: false,
             watcher_glob: "**/*".to_string(),
             watcher_kind: None,
+            report_open_count: false,
         }
     }
 

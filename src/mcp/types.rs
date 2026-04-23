@@ -281,9 +281,14 @@ pub struct RootsListResult {
 
 impl CallToolResult {
     /// Creates a successful tool result with text content.
+    ///
+    /// Trailing whitespace is stripped — `writeln!`-based pipelines
+    /// produce trailing newlines that are noise in MCP tool results.
     pub fn text(text: impl Into<String>) -> Self {
+        let raw = text.into();
+        let trimmed = raw.trim_end().to_string();
         Self {
-            content: vec![ToolContent::Text { text: text.into() }],
+            content: vec![ToolContent::Text { text: trimmed }],
             is_error: None,
         }
     }

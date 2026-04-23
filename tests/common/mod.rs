@@ -349,6 +349,58 @@ impl BridgeProcess {
         Ok(text)
     }
 
+    /// Enters editing mode, accumulates multiple files, then calls
+    /// `done_editing` via MCP to retrieve batched diagnostics.
+    pub fn call_diagnostics_multi(&mut self, files: &[&str]) -> Result<String> {
+        let sessions_dir = PathBuf::from(&self.state_home)
+            .join("catenary")
+            .join("sessions");
+        let socket_path = find_notify_socket(&sessions_dir)?;
+
+        // Enter editing mode via IPC
+        ipc_request(
+            &socket_path,
+            &json!({
+                "method": "pre-tool/enforce-editing",
+                "tool_name": "start_editing",
+                "agent_id": ""
+            }),
+        )?;
+
+        // Accumulate all files via IPC
+        for file in files {
+            ipc_request(
+                &socket_path,
+                &json!({
+                    "method": "post-tool/diagnostics",
+                    "file": file,
+                    "tool": "Edit",
+                    "agent_id": ""
+                }),
+            )?;
+        }
+
+        // Call done_editing via MCP
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 9001,
+            "method": "tools/call",
+            "params": {
+                "name": "done_editing",
+                "arguments": {}
+            }
+        }))?;
+
+        let response = self.recv()?;
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        Ok(text)
+    }
+
     /// Calls an MCP tool and returns the raw result object.
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
         self.send(&json!({

@@ -194,6 +194,7 @@ impl Toolbox {
         let diagnostics = Arc::new(DiagnosticsServer::new(
             client_manager.clone(),
             path_validator.clone(),
+            fs_manager.clone(),
         ));
 
         let grep = GrepServer {
