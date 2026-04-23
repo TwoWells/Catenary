@@ -254,7 +254,10 @@ impl ClassificationTables {
 /// Also owns the workspace root list for longest-prefix root resolution
 /// and the classification lookup tables built from config.
 pub struct FilesystemManager {
-    cache: std::sync::Mutex<HashMap<PathBuf, CachedEntry>>,
+    /// Cache keyed by `(file_path, owning_root)`. The root component
+    /// ensures that root changes (add/remove) cause cache misses,
+    /// preventing stale `language_id` from per-root classification.
+    cache: std::sync::Mutex<HashMap<(PathBuf, Option<PathBuf>), CachedEntry>>,
     roots: std::sync::Mutex<Vec<PathBuf>>,
     classification: ClassificationTables,
     per_root_classification: std::sync::Mutex<HashMap<PathBuf, ClassificationTables>>,
@@ -304,18 +307,19 @@ impl FilesystemManager {
     /// Classifies a file, using the cache when possible.
     ///
     /// Returns a [`FileInfo`] with binary/text classification, line count,
-    /// and language ID. Cache is keyed by absolute path + mtime. On mtime
-    /// change the entry is re-scanned.
+    /// and language ID. Cache is keyed by `(path, owning_root)` + mtime.
+    /// On mtime change the entry is re-scanned.
     ///
     /// Classification precedence: shebang > filename > extension.
     pub fn classify(&self, path: &Path, metadata: &std::fs::Metadata) -> FileInfo {
         let mtime = mtime_secs(metadata);
         let size = metadata.len();
         let root = self.resolve_root(path);
+        let cache_key = (path.to_path_buf(), root.clone());
 
         // Check cache — skip unclassified (seed-only) entries.
         if let Ok(cache) = self.cache.lock()
-            && let Some(entry) = cache.get(path)
+            && let Some(entry) = cache.get(&cache_key)
             && entry.mtime == mtime
             && let Some(ref kind) = entry.kind
         {
@@ -364,7 +368,7 @@ impl FilesystemManager {
         // Update cache
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(
-                path.to_path_buf(),
+                cache_key,
                 CachedEntry {
                     mtime,
                     kind: Some(kind.clone()),
@@ -432,11 +436,7 @@ impl FilesystemManager {
         let Ok(roots) = self.roots.lock() else {
             return None;
         };
-        roots
-            .iter()
-            .filter(|root| path.starts_with(root))
-            .max_by_key(|root| root.as_os_str().len())
-            .cloned()
+        resolve_root_in(&roots, path)
     }
 
     /// Returns a snapshot of the current workspace roots.
@@ -548,9 +548,10 @@ impl FilesystemManager {
                 let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
                 let path = entry.into_path();
                 if let Ok(meta) = std::fs::metadata(&path) {
+                    let resolved = resolve_root_in(&roots, &path);
                     let kind = if is_dir { Some(FileKind::Folder) } else { None };
                     entries.insert(
-                        path,
+                        (path, resolved),
                         CachedEntry {
                             mtime: mtime_secs(&meta),
                             kind,
@@ -582,8 +583,8 @@ impl FilesystemManager {
             return Vec::new();
         };
 
-        // Walk all roots, collecting current (path, mtime, is_dir) tuples.
-        let mut current: HashMap<PathBuf, (u64, bool)> = HashMap::new();
+        // Walk all roots, collecting current (path, root, mtime, is_dir).
+        let mut current: HashMap<(PathBuf, Option<PathBuf>), (u64, bool)> = HashMap::new();
         for root in roots.iter() {
             if !root.exists() {
                 continue;
@@ -593,7 +594,8 @@ impl FilesystemManager {
                 let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
                 let path = entry.into_path();
                 if let Ok(meta) = std::fs::metadata(&path) {
-                    current.insert(path, (mtime_secs(&meta), is_dir));
+                    let resolved = resolve_root_in(&roots, &path);
+                    current.insert((path, resolved), (mtime_secs(&meta), is_dir));
                 }
             }
         }
@@ -601,54 +603,57 @@ impl FilesystemManager {
 
         let mut changes = Vec::new();
 
-        // Detect created and changed.
-        for (path, (mtime, _)) in &current {
-            match cache.get(path) {
-                None => changes.push(FileChange {
-                    path: path.clone(),
-                    change_type: FileChangeType::Created,
-                }),
-                Some(entry) if entry.mtime != *mtime => changes.push(FileChange {
-                    path: path.clone(),
-                    change_type: FileChangeType::Changed,
-                }),
+        // Detect created and changed, updating cache inline.
+        for (key, (mtime, is_dir)) in &current {
+            match cache.get(key) {
+                None => {
+                    changes.push(FileChange {
+                        path: key.0.clone(),
+                        change_type: FileChangeType::Created,
+                    });
+                    let kind = if *is_dir {
+                        Some(FileKind::Folder)
+                    } else {
+                        None
+                    };
+                    cache.insert(
+                        key.clone(),
+                        CachedEntry {
+                            mtime: *mtime,
+                            kind,
+                        },
+                    );
+                }
+                Some(entry) if entry.mtime != *mtime => {
+                    changes.push(FileChange {
+                        path: key.0.clone(),
+                        change_type: FileChangeType::Changed,
+                    });
+                    if let Some(entry) = cache.get_mut(key) {
+                        entry.mtime = *mtime;
+                        entry.kind = if *is_dir {
+                            Some(FileKind::Folder)
+                        } else {
+                            None
+                        };
+                    }
+                }
                 _ => {}
             }
         }
 
         // Detect deleted.
-        let deleted: Vec<PathBuf> = cache
+        let deleted: Vec<(PathBuf, Option<PathBuf>)> = cache
             .keys()
-            .filter(|p| !current.contains_key(*p))
+            .filter(|k| !current.contains_key(*k))
             .cloned()
             .collect();
-        for path in &deleted {
+        for key in &deleted {
             changes.push(FileChange {
-                path: path.clone(),
+                path: key.0.clone(),
                 change_type: FileChangeType::Deleted,
             });
-            cache.remove(path);
-        }
-
-        // Update cache for created and changed entries.
-        for change in &changes {
-            match change.change_type {
-                FileChangeType::Created => {
-                    if let Some(&(mtime, is_dir)) = current.get(&change.path) {
-                        let kind = if is_dir { Some(FileKind::Folder) } else { None };
-                        cache.insert(change.path.clone(), CachedEntry { mtime, kind });
-                    }
-                }
-                FileChangeType::Changed => {
-                    if let Some(entry) = cache.get_mut(&change.path)
-                        && let Some(&(mtime, is_dir)) = current.get(&change.path)
-                    {
-                        entry.mtime = mtime;
-                        entry.kind = if is_dir { Some(FileKind::Folder) } else { None };
-                    }
-                }
-                FileChangeType::Deleted => {} // Already removed above.
-            }
+            cache.remove(key);
         }
 
         changes
@@ -662,21 +667,28 @@ impl FilesystemManager {
     /// Used by `done_editing` to prevent the next [`diff`](Self::diff) from
     /// reporting edited files as `Changed`.
     pub fn mark_current(&self, paths: &[PathBuf]) {
+        // Resolve roots before locking cache to maintain lock ordering
+        // (roots → cache), consistent with diff() which holds both.
+        let keys: Vec<(PathBuf, Option<PathBuf>)> = paths
+            .iter()
+            .map(|p| (p.clone(), self.resolve_root(p)))
+            .collect();
+
         let Ok(mut cache) = self.cache.lock() else {
             return;
         };
-        for path in paths {
-            match std::fs::metadata(path) {
+        for key in keys {
+            match std::fs::metadata(&key.0) {
                 Ok(meta) => {
                     let mtime = mtime_secs(&meta);
-                    if let Some(entry) = cache.get_mut(path) {
+                    if let Some(entry) = cache.get_mut(&key) {
                         entry.mtime = mtime;
                     } else {
-                        cache.insert(path.clone(), CachedEntry { mtime, kind: None });
+                        cache.insert(key, CachedEntry { mtime, kind: None });
                     }
                 }
                 Err(_) => {
-                    cache.remove(path);
+                    cache.remove(&key);
                 }
             }
         }
@@ -699,6 +711,19 @@ pub fn format_file_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Resolves the owning workspace root for a path from a roots slice.
+///
+/// Returns the longest-prefix match, or `None` if the path is outside
+/// all roots. Used by methods that already hold the roots lock to avoid
+/// re-locking.
+fn resolve_root_in(roots: &[PathBuf], path: &Path) -> Option<PathBuf> {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.as_os_str().len())
+        .cloned()
 }
 
 /// Extracts mtime as seconds since epoch (cross-platform).
@@ -1439,10 +1464,10 @@ mod tests {
         let cache = mgr.cache.lock().expect("lock");
         let has_secret = cache
             .keys()
-            .any(|p| p.to_string_lossy().contains("secret.rs"));
+            .any(|(p, _)| p.to_string_lossy().contains("secret.rs"));
         let has_visible = cache
             .keys()
-            .any(|p| p.to_string_lossy().contains("visible.rs"));
+            .any(|(p, _)| p.to_string_lossy().contains("visible.rs"));
         drop(cache);
         assert!(!has_secret, "gitignored file should not be in cache");
         assert!(has_visible, "visible file should be in cache");
