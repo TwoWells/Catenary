@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -104,11 +104,10 @@ pub struct LspServer {
     tree_monitor: Mutex<Option<catenary_proc::TreeMonitor>>,
 
     // ── Dynamic registrations ────────────────────────────────
-    /// Whether the server has dynamically registered for
-    /// `workspace/didChangeConfiguration` notifications.
-    /// Set via `client/registerCapability`, cleared via
-    /// `client/unregisterCapability`.
-    wants_did_change_configuration: AtomicBool,
+    /// Registration IDs for `workspace/didChangeConfiguration`.
+    /// Tracked per-ID so selective unregistration works correctly
+    /// when a server holds multiple registrations.
+    config_change_registrations: Mutex<HashSet<String>>,
 
     // ── File watchers ─────────────────────────────────────────
     /// Registered file watcher patterns from `client/registerCapability`.
@@ -171,7 +170,7 @@ impl LspServer {
             scope: OnceLock::new(),
             settings,
             settings_per_root: Mutex::new(settings_per_root),
-            wants_did_change_configuration: AtomicBool::new(false),
+            config_change_registrations: Mutex::new(HashSet::new()),
             tree_monitor: Mutex::new(None),
             file_watchers: Mutex::new(HashMap::new()),
             connection: OnceLock::new(),
@@ -206,12 +205,10 @@ impl LspServer {
 
         // Determine effective scope path: explicit scopeUri, or
         // implicit root for Root-scoped instances.
-        let implicit_root;
-        let scope_path = if let Some(uri) = scope_uri {
+        let scope_path: &Path = if let Some(uri) = scope_uri {
             Path::new(uri.strip_prefix("file://").unwrap_or(uri))
         } else if let Some(Scope::Root(r)) = self.scope() {
-            implicit_root = r.clone();
-            &implicit_root
+            r
         } else {
             return resolve_section(self.settings.as_ref(), section);
         };
@@ -779,8 +776,10 @@ impl LspServer {
         if let Ok(mut progress) = self.progress.lock() {
             progress.clear();
         }
-        self.wants_did_change_configuration
-            .store(false, Ordering::SeqCst);
+        self.config_change_registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.clear_file_watchers();
         self.diagnostics_notify.notify_waiters();
     }
@@ -821,13 +820,17 @@ impl LspServer {
 
     // ── Dynamic registration accessors ────────────────────────────
 
-    /// Returns whether the server has dynamically registered for
-    /// `workspace/didChangeConfiguration` notifications.
+    /// Returns whether the server has any active dynamic registrations
+    /// for `workspace/didChangeConfiguration` notifications.
     ///
     /// Used by the manager to decide whether to push configuration
     /// changes to this server (e.g., on `/add-dir`).
     pub fn wants_did_change_configuration(&self) -> bool {
-        self.wants_did_change_configuration.load(Ordering::SeqCst)
+        !self
+            .config_change_registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     // ── File watcher registration ────────────────────────────────
@@ -878,8 +881,15 @@ impl LspServer {
             };
 
             if method == "workspace/didChangeConfiguration" {
-                self.wants_did_change_configuration
-                    .store(true, Ordering::SeqCst);
+                let id = reg
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.config_change_registrations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id);
                 debug!("server registered for workspace/didChangeConfiguration");
                 continue;
             }
@@ -961,9 +971,13 @@ impl LspServer {
             };
 
             if method == "workspace/didChangeConfiguration" {
-                self.wants_did_change_configuration
-                    .store(false, Ordering::SeqCst);
-                debug!("server unregistered from workspace/didChangeConfiguration");
+                if let Some(id) = unreg.get("id").and_then(Value::as_str) {
+                    self.config_change_registrations
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(id);
+                    debug!("server unregistered from workspace/didChangeConfiguration");
+                }
                 continue;
             }
 
@@ -2076,6 +2090,48 @@ mod tests {
                 "client/unregisterCapability",
                 &json!({"unregisterations": [{
                     "id": "cfg-1",
+                    "method": "workspace/didChangeConfiguration"
+                }]}),
+            )
+            .expect("should succeed");
+        assert!(!server.wants_did_change_configuration());
+    }
+
+    #[test]
+    fn unregister_did_change_configuration_selective() {
+        let server = test_server();
+
+        // Register two IDs
+        server
+            .on_request(
+                "client/registerCapability",
+                &json!({"registrations": [
+                    {"id": "cfg-1", "method": "workspace/didChangeConfiguration"},
+                    {"id": "cfg-2", "method": "workspace/didChangeConfiguration"}
+                ]}),
+            )
+            .expect("should succeed");
+        assert!(server.wants_did_change_configuration());
+
+        // Unregister only one
+        server
+            .on_request(
+                "client/unregisterCapability",
+                &json!({"unregisterations": [{
+                    "id": "cfg-1",
+                    "method": "workspace/didChangeConfiguration"
+                }]}),
+            )
+            .expect("should succeed");
+        // Still registered via cfg-2
+        assert!(server.wants_did_change_configuration());
+
+        // Unregister the second
+        server
+            .on_request(
+                "client/unregisterCapability",
+                &json!({"unregisterations": [{
+                    "id": "cfg-2",
                     "method": "workspace/didChangeConfiguration"
                 }]}),
             )
