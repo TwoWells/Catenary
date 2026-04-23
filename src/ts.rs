@@ -20,6 +20,7 @@ use streaming_iterator::StreamingIterator;
 use tracing::info;
 
 /// A symbol extracted from the tree-sitter index.
+#[derive(Clone)]
 pub struct TsSymbol {
     /// Symbol name.
     pub name: String,
@@ -33,7 +34,22 @@ pub struct TsSymbol {
     pub scope: Option<String>,
     /// Container kind (enclosing definition's capture suffix).
     pub scope_kind: Option<String>,
+    /// Whether the symbol has a `@deprecated` annotation.
+    pub deprecated: bool,
 }
+
+/// Scope filter for symbol queries used by the `into` pipeline.
+pub enum ScopeFilter<'a> {
+    /// Top-level symbols only (scope IS NULL).
+    TopLevel,
+    /// Children of a specific scope name.
+    ChildrenOf(&'a str),
+    /// Symbols at any depth (no scope constraint).
+    AnyDepth,
+}
+
+/// Free-text grammar scopes where symbol names can contain `/` or `<>`.
+const FREE_TEXT_SCOPES: &[&str] = &["markdown", "rst", "asciidoc"];
 
 /// Workspace-wide tree-sitter index backed by in-memory `SQLite`.
 ///
@@ -263,6 +279,12 @@ fn parse_file(
             (Some(n.to_string()), Some(k.to_string()))
         });
 
+        // Detect @deprecated by checking the source text of the definition line.
+        let deprecated = source
+            .lines()
+            .nth(def.start_line as usize)
+            .is_some_and(|line| line.contains("@deprecated"));
+
         symbols.push(TsSymbol {
             name: def.name.clone(),
             kind: def.kind.clone(),
@@ -270,6 +292,7 @@ fn parse_file(
             end_line: def.end_line,
             scope: scope_name,
             scope_kind,
+            deprecated,
         });
 
         scope_stack.push((&def.name, &def.kind, def.end_byte));
@@ -361,9 +384,11 @@ impl TsIndex {
                 end_line    INTEGER NOT NULL,
                 scope       TEXT,
                 scope_kind  TEXT,
+                deprecated  INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (file_path, line)
             );
             CREATE INDEX idx_symbols_name ON symbols(name);
+            CREATE INDEX idx_symbols_scope ON symbols(file_path, scope);
             CREATE TABLE file_parse_state (
                 file_path   TEXT PRIMARY KEY,
                 mtime_ns    INTEGER NOT NULL,
@@ -444,8 +469,8 @@ impl TsIndex {
                 for sym in symbols {
                     tx.execute(
                         "INSERT INTO symbols \
-                         (file_path, name, kind, line, end_line, scope, scope_kind) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         (file_path, name, kind, line, end_line, scope, scope_kind, deprecated) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         rusqlite::params![
                             file_path,
                             sym.name,
@@ -454,6 +479,7 @@ impl TsIndex {
                             sym.end_line,
                             sym.scope,
                             sym.scope_kind,
+                            sym.deprecated,
                         ],
                     )
                     .with_context(|| {
@@ -534,8 +560,8 @@ impl TsIndex {
         for sym in &symbols {
             tx.execute(
                 "INSERT INTO symbols \
-                 (file_path, name, kind, line, end_line, scope, scope_kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (file_path, name, kind, line, end_line, scope, scope_kind, deprecated) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     path_str.as_ref() as &str,
                     sym.name,
@@ -544,6 +570,7 @@ impl TsIndex {
                     sym.end_line,
                     sym.scope,
                     sym.scope_kind,
+                    sym.deprecated,
                 ],
             )
             .with_context(|| format!("failed to insert symbol {} in {}", sym.name, path_str))?;
@@ -581,7 +608,7 @@ impl TsIndex {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
+                    "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
                      FROM symbols WHERE name REGEXP ?1 AND file_path IN ({placeholders})"
                 );
                 let mut stmt = self.conn.prepare(&sql).context("failed to prepare query")?;
@@ -606,7 +633,7 @@ impl TsIndex {
                 let mut stmt = self
                     .conn
                     .prepare(
-                        "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
+                        "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
                          FROM symbols WHERE name REGEXP ?1",
                     )
                     .context("failed to prepare query")?;
@@ -645,7 +672,7 @@ impl TsIndex {
             .join(", ");
 
         let sql = format!(
-            "SELECT file_path, name, kind, line, end_line, scope, scope_kind \
+            "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
              FROM symbols \
              WHERE file_path IN ({placeholders}) AND scope IS NULL \
              ORDER BY file_path, line"
@@ -683,7 +710,7 @@ impl TsIndex {
     pub fn find_enclosing(&self, file_path: &Path, line_0: u32) -> Result<Option<TsSymbol>> {
         let path_str = file_path.to_string_lossy();
         let mut stmt = self.conn.prepare(
-            "SELECT name, kind, line, end_line, scope, scope_kind \
+            "SELECT name, kind, line, end_line, scope, scope_kind, deprecated \
              FROM symbols \
              WHERE file_path = ?1 AND line <= ?2 AND end_line >= ?2 \
              ORDER BY (end_line - line) ASC \
@@ -701,6 +728,7 @@ impl TsIndex {
                         end_line: row.get(3)?,
                         scope: row.get(4)?,
                         scope_kind: row.get(5)?,
+                        deprecated: row.get::<_, i32>(6).unwrap_or(0) != 0,
                     })
                 },
             )
@@ -710,6 +738,9 @@ impl TsIndex {
     }
 
     /// Map a database row to a `(file_path, TsSymbol)` pair.
+    ///
+    /// Expected column order:
+    /// `file_path, name, kind, line, end_line, scope, scope_kind, deprecated`
     fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, TsSymbol)> {
         Ok((
             row.get(0)?,
@@ -720,6 +751,7 @@ impl TsIndex {
                 end_line: row.get(4)?,
                 scope: row.get(5)?,
                 scope_kind: row.get(6)?,
+                deprecated: row.get::<_, i32>(7).unwrap_or(0) != 0,
             },
         ))
     }
@@ -786,6 +818,119 @@ impl TsIndex {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap_or(false)
+    }
+
+    /// Query symbols filtered by scope, name glob, kind, and deprecated status.
+    ///
+    /// Used by the `into` pipeline for segment-by-segment symbol tree navigation.
+    /// Results are grouped by file path and ordered by line number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn query_scoped(
+        &self,
+        files: &[&Path],
+        scope: &ScopeFilter<'_>,
+        name_glob: &str,
+        kind_filter: Option<&str>,
+        deprecated_only: bool,
+    ) -> Result<HashMap<PathBuf, Vec<TsSymbol>>> {
+        if files.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders: String = (0..files.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut conditions = vec![format!("file_path IN ({placeholders})")];
+
+        match scope {
+            ScopeFilter::TopLevel => conditions.push("scope IS NULL".to_string()),
+            ScopeFilter::ChildrenOf(name) => {
+                conditions.push(format!("scope = ?{}", files.len() + 1));
+                let _ = name; // used via params below
+            }
+            ScopeFilter::AnyDepth => {} // no scope constraint
+        }
+
+        conditions.push(format!(
+            "name GLOB ?{}",
+            files.len()
+                + match scope {
+                    ScopeFilter::ChildrenOf(_) => 2,
+                    _ => 1,
+                }
+        ));
+
+        if let Some(kind) = kind_filter {
+            let _ = kind; // used via params below
+            conditions.push(format!(
+                "kind = ?{}",
+                files.len()
+                    + match scope {
+                        ScopeFilter::ChildrenOf(_) => 3,
+                        _ => 2,
+                    }
+            ));
+        }
+
+        if deprecated_only {
+            conditions.push("deprecated = 1".to_string());
+        }
+
+        let sql = format!(
+            "SELECT file_path, name, kind, line, end_line, scope, scope_kind, deprecated \
+             FROM symbols WHERE {} ORDER BY file_path, line",
+            conditions.join(" AND ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql).context("prepare scoped query")?;
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for f in files {
+            params.push(Box::new(f.to_string_lossy().to_string()));
+        }
+        if let ScopeFilter::ChildrenOf(name) = scope {
+            params.push(Box::new(name.to_string()));
+        }
+        params.push(Box::new(name_glob.to_string()));
+        if let Some(kind) = kind_filter {
+            params.push(Box::new(kind.to_string()));
+        }
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(AsRef::as_ref).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), Self::row_to_symbol)
+            .context("execute scoped query")?;
+
+        let mut result: HashMap<PathBuf, Vec<TsSymbol>> = HashMap::new();
+        for row in rows {
+            let (path_str, sym) = row.context("read scoped query row")?;
+            result.entry(PathBuf::from(path_str)).or_default().push(sym);
+        }
+
+        Ok(result)
+    }
+
+    /// Check whether a file's language is a free-text grammar (markdown, etc.).
+    ///
+    /// Free-text grammars have symbol names that can contain `/` or `<>`,
+    /// making `/`-separated multi-segment `into` paths ambiguous. These
+    /// grammars use flat name matching only.
+    #[must_use]
+    pub fn is_free_text_grammar(&self, path: &Path) -> bool {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let Some(scope) = self.ext_to_scope.get(ext) else {
+            return false;
+        };
+        FREE_TEXT_SCOPES.iter().any(|&ft| scope.contains(ft))
     }
 }
 

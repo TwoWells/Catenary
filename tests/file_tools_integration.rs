@@ -1520,3 +1520,439 @@ fn test_glob_tree_dedup_per_directory() -> Result<()> {
     );
     Ok(())
 }
+
+// ─── 08c into tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_into_impl() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // struct Outer with nested fn inner — "Outer" has children.
+    std::fs::write(
+        dir.path().join(format!("handler.{MOCK_EXT}")),
+        "struct Outer {\nfn method_a\nfn method_b\n}\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("handler.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "Outer"
+        }),
+    )?;
+
+    // Should show Outer as target with children.
+    assert!(
+        text.contains("<Struct> Outer/"),
+        "Should show Outer container: {text}"
+    );
+    assert!(
+        text.contains("method_a"),
+        "Should show method_a child: {text}"
+    );
+    assert!(
+        text.contains("method_b"),
+        "Should show method_b child: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_leaf() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("leaf.{MOCK_EXT}")),
+        "fn standalone\nfn other\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("leaf.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "standalone"
+        }),
+    )?;
+
+    assert!(
+        text.contains("standalone"),
+        "Should show the leaf symbol: {text}"
+    );
+    assert!(
+        text.contains("no nested definitions"),
+        "Should show 'no nested definitions' for leaf: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_nonexistent() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(format!("exist.{MOCK_EXT}")), "fn real\n")?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("exist.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "NoSuchThing"
+        }),
+    )?;
+
+    assert!(
+        text.contains("No matching symbols found"),
+        "Should report no matches: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_disambiguation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Two struct blocks with the same name — both should appear.
+    std::fs::write(
+        dir.path().join(format!("disamb.{MOCK_EXT}")),
+        "struct Handler {\nfn method_a\n}\nstruct Handler {\nfn method_b\n}\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("disamb.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "Handler"
+        }),
+    )?;
+
+    assert!(
+        text.contains("method_a"),
+        "Should show children from first block: {text}"
+    );
+    assert!(
+        text.contains("method_b"),
+        "Should show children from second block: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_wildcard() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("wild.{MOCK_EXT}")),
+        "fn alpha\nstruct Beta\nfn gamma\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("wild.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "*"
+        }),
+    )?;
+
+    assert!(text.contains("alpha"), "Should show alpha: {text}");
+    assert!(text.contains("Beta"), "Should show Beta: {text}");
+    assert!(text.contains("gamma"), "Should show gamma: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_into_prefix() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("prefix.{MOCK_EXT}")),
+        "fn test_a\nfn test_b\nfn other\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("prefix.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "test_*"
+        }),
+    )?;
+
+    assert!(text.contains("test_a"), "Should match test_a: {text}");
+    assert!(text.contains("test_b"), "Should match test_b: {text}");
+    assert!(!text.contains("other"), "Should not match other: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_into_multi_segment() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Outer contains test_a and helper — multi-segment filters children.
+    std::fs::write(
+        dir.path().join(format!("multi.{MOCK_EXT}")),
+        "struct Outer {\nfn test_a\nfn helper\n}\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("multi.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "Outer/test_*"
+        }),
+    )?;
+
+    assert!(
+        text.contains("Outer"),
+        "Should show intermediate container: {text}"
+    );
+    assert!(text.contains("test_a"), "Should match test_a: {text}");
+    assert!(!text.contains("helper"), "Should not match helper: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_into_recursive() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // test_deep is nested inside Outer — ** should find it.
+    std::fs::write(
+        dir.path().join(format!("deep.{MOCK_EXT}")),
+        "struct Outer {\nfn test_deep\nfn other\n}\nfn test_top\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("deep.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "**/test_*"
+        }),
+    )?;
+
+    assert!(
+        text.contains("test_deep"),
+        "Should find test_deep at any depth: {text}"
+    );
+    assert!(
+        text.contains("test_top"),
+        "Should find test_top at depth-0: {text}"
+    );
+    assert!(!text.contains("other"), "Should not match other: {text}");
+    Ok(())
+}
+
+#[test]
+fn test_into_kind_qualified() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("kinds.{MOCK_EXT}")),
+        "fn alpha\nstruct Beta\nfn gamma\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("kinds.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "<Function> *"
+        }),
+    )?;
+
+    assert!(text.contains("alpha"), "Should match fn alpha: {text}");
+    assert!(text.contains("gamma"), "Should match fn gamma: {text}");
+    assert!(
+        !text.contains("Beta"),
+        "Should not match struct Beta: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_directory() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Two files in a directory — into across both.
+    std::fs::write(
+        dir.path().join(format!("a.{MOCK_EXT}")),
+        "struct Handler {\nfn handle_a\n}\n",
+    )?;
+    std::fs::write(
+        dir.path().join(format!("b.{MOCK_EXT}")),
+        "struct Handler {\nfn handle_b\n}\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().to_string_lossy().to_string(),
+            "into": "Handler"
+        }),
+    )?;
+
+    // Should show results from both files.
+    assert!(
+        text.contains("handle_a"),
+        "Should show handle_a from a.mock: {text}"
+    );
+    assert!(
+        text.contains("handle_b"),
+        "Should show handle_b from b.mock: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_zero_matches_multi() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(format!("x.{MOCK_EXT}")), "fn real\n")?;
+    std::fs::write(dir.path().join(format!("y.{MOCK_EXT}")), "fn actual\n")?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().to_string_lossy().to_string(),
+            "into": "NoSuchSymbol"
+        }),
+    )?;
+
+    assert!(
+        text.contains("No matching symbols found"),
+        "Should report no matches: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_bypasses_maps_deny() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("denied.{MOCK_EXT}"));
+    std::fs::write(&file, "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n")?;
+
+    // maps_deny blocks the defensive map.
+    let config = format!("[tools.glob]\nmaps_threshold = 5\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    bridge.initialize()?;
+
+    // Without into — should show [symbols available], no map.
+    let text_no_into = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+    assert!(
+        text_no_into.contains("[symbols available]"),
+        "Should show [symbols available] flag: {text_no_into}"
+    );
+    assert!(
+        !text_no_into.contains("<Function>"),
+        "Should NOT have map symbols: {text_no_into}"
+    );
+
+    // With into="*" — should show full map regardless of maps_deny.
+    let text_into = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": file.to_str().context("file path")?,
+            "into": "*"
+        }),
+    )?;
+    assert!(
+        text_into.contains("alpha"),
+        "into should bypass maps_deny and show symbols: {text_into}"
+    );
+    assert!(
+        text_into.contains("Beta"),
+        "into should show Beta: {text_into}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_deprecated() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("depr.{MOCK_EXT}")),
+        "fn current\nfn old_func @deprecated\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    // into="*" should show the deprecated tag.
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("depr.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "*"
+        }),
+    )?;
+
+    assert!(
+        text.contains("deprecated"),
+        "Should show deprecated tag: {text}"
+    );
+    assert!(text.contains("old_func"), "Should show old_func: {text}");
+
+    // Filter by deprecated tag.
+    let text_filtered = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("depr.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "<*, deprecated> *"
+        }),
+    )?;
+
+    assert!(
+        text_filtered.contains("old_func"),
+        "Should match deprecated symbol: {text_filtered}"
+    );
+    assert!(
+        !text_filtered.contains("current"),
+        "Should not match non-deprecated: {text_filtered}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_into_alternation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(format!("alt.{MOCK_EXT}")),
+        "fn Config\nfn Settings\nfn Other\n",
+    )?;
+
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "pattern": dir.path().join(format!("alt.{MOCK_EXT}")).to_string_lossy().to_string(),
+            "into": "{Config,Settings}"
+        }),
+    )?;
+
+    assert!(text.contains("Config"), "Should match Config: {text}");
+    assert!(text.contains("Settings"), "Should match Settings: {text}");
+    assert!(!text.contains("Other"), "Should not match Other: {text}");
+    Ok(())
+}

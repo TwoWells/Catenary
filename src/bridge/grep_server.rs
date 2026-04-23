@@ -251,17 +251,7 @@ impl GrepServer {
         let mut def_lookup: HashMap<(String, u32), TsSymbol> = HashMap::new();
         for (path, sym) in &ts_symbols {
             let path_str = path.to_string_lossy().to_string();
-            def_lookup.insert(
-                (path_str, sym.line),
-                TsSymbol {
-                    name: sym.name.clone(),
-                    kind: sym.kind.clone(),
-                    line: sym.line,
-                    end_line: sym.end_line,
-                    scope: sym.scope.clone(),
-                    scope_kind: sym.scope_kind.clone(),
-                },
-            );
+            def_lookup.insert((path_str, sym.line), sym.clone());
         }
 
         // Step 4: Classify each rg hit.
@@ -285,14 +275,7 @@ impl GrepServer {
                             col,
                             matched_text: matched_text.clone(),
                             classification: HitClass::Symbol {
-                                symbol: TsSymbol {
-                                    name: sym.name.clone(),
-                                    kind: sym.kind.clone(),
-                                    line: sym.line,
-                                    end_line: sym.end_line,
-                                    scope: sym.scope.clone(),
-                                    scope_kind: sym.scope_kind.clone(),
-                                },
+                                symbol: sym.clone(),
                             },
                         });
                     } else {
@@ -1980,6 +1963,7 @@ mod tests {
                     end_line: line + 10,
                     scope: None,
                     scope_kind: None,
+                    deprecated: false,
                 },
             },
         }
@@ -2007,6 +1991,7 @@ mod tests {
                     end_line: line + 10,
                     scope: Some(scope.to_string()),
                     scope_kind: Some(scope_kind.to_string()),
+                    deprecated: false,
                 },
             },
         }
@@ -2035,6 +2020,7 @@ mod tests {
                     end_line: enc_end,
                     scope: None,
                     scope_kind: None,
+                    deprecated: false,
                 }),
             },
         }
@@ -2370,6 +2356,7 @@ mod tests {
                     end_line: 42, // single-line
                     scope: None,
                     scope_kind: None,
+                    deprecated: false,
                 },
             },
         };
@@ -2402,6 +2389,7 @@ mod tests {
                     end_line: 30,
                     scope: None,
                     scope_kind: None,
+                    deprecated: false,
                 },
             },
         };

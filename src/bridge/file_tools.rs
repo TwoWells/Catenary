@@ -29,7 +29,7 @@ use super::tool_server::ToolServer;
 use super::toolbox::ResolvedGlob;
 use crate::bucketing::{self, BucketEntry};
 use crate::lsp::LspClientManager;
-use crate::ts::{TsIndex, TsSymbol, format_ts_kind};
+use crate::ts::{ScopeFilter, TsIndex, TsSymbol, format_ts_kind};
 
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
@@ -80,6 +80,141 @@ struct GlobEntry {
     /// True if this is a `.catenary_snapshot_*` sidecar file.
     is_snapshot: bool,
 }
+
+// ─── Into types ──────────────────────────────────────────────────────
+
+/// A parsed segment from an `into` path.
+struct IntoSegment {
+    /// Kind filter (e.g., `"function"`, `"*"` for any, or `None`).
+    kind: Option<String>,
+    /// Tag filters (e.g., `["deprecated"]`).
+    tags: Vec<String>,
+    /// Glob pattern on the symbol name.
+    name_pattern: String,
+    /// True for `**` recursive match segments.
+    is_recursive: bool,
+}
+
+/// Parses an `into` path into segments.
+///
+/// If `is_free_text` (markdown, rst, etc.): the entire string is one
+/// segment with no `/`-separated parsing — symbol names can contain `/`.
+///
+/// Otherwise: split on `/`. Each segment:
+/// 1. If starts with `<`: extract comma-separated labels up to `>`.
+///    First label is kind (or `*` for any). Subsequent are tags.
+///    Remainder after `> ` is the name pattern.
+/// 2. If the segment is `**`: recursive match marker.
+/// 3. Otherwise: entire segment is the name pattern.
+fn parse_into(into: &str, is_free_text: bool) -> Vec<IntoSegment> {
+    if is_free_text {
+        return vec![IntoSegment {
+            kind: None,
+            tags: Vec::new(),
+            name_pattern: into.to_string(),
+            is_recursive: false,
+        }];
+    }
+
+    let raw: Vec<&str> = into.split('/').filter(|s| !s.is_empty()).collect();
+    let mut segments = Vec::new();
+    let mut i = 0;
+
+    while i < raw.len() {
+        let seg = raw[i];
+
+        if seg == "**" {
+            // `**` merges with the following segment as AnyDepth.
+            // `**/X` → AnyDepth query for X.
+            // `**` alone → AnyDepth query for `*`.
+            if i + 1 < raw.len() {
+                let next = raw[i + 1];
+                let mut parsed = parse_single_segment(next);
+                parsed.is_recursive = true;
+                segments.push(parsed);
+                i += 2;
+            } else {
+                segments.push(IntoSegment {
+                    kind: None,
+                    tags: Vec::new(),
+                    name_pattern: "*".to_string(),
+                    is_recursive: true,
+                });
+                i += 1;
+            }
+            continue;
+        }
+
+        segments.push(parse_single_segment(seg));
+        i += 1;
+    }
+
+    segments
+}
+
+/// Parses a single `into` segment (without `**` handling).
+fn parse_single_segment(seg: &str) -> IntoSegment {
+    if let Some(rest) = seg.strip_prefix('<')
+        && let Some((qualifiers, name)) = rest.split_once("> ")
+    {
+        let mut parts = qualifiers.split(',').map(str::trim);
+        let kind_raw = parts.next().unwrap_or("*");
+        let kind = if kind_raw == "*" {
+            None
+        } else {
+            Some(kind_raw.to_lowercase())
+        };
+        let tags: Vec<String> = parts.map(str::to_lowercase).collect();
+        return IntoSegment {
+            kind,
+            tags,
+            name_pattern: name.to_string(),
+            is_recursive: false,
+        };
+    }
+
+    IntoSegment {
+        kind: None,
+        tags: Vec::new(),
+        name_pattern: seg.to_string(),
+        is_recursive: false,
+    }
+}
+
+/// Expands `{a,b}` alternation in a glob pattern into separate patterns.
+///
+/// `SQLite` GLOB doesn't support `{a,b}` syntax. This function expands
+/// it into separate patterns that are queried individually and merged.
+/// Returns a single-element vec if no alternation is present.
+fn expand_alternation(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_string()];
+    };
+    let Some(close) = pattern[open..].find('}') else {
+        return vec![pattern.to_string()];
+    };
+    let close = open + close;
+
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let alternatives = pattern[open + 1..close].split(',');
+
+    alternatives
+        .map(|alt| format!("{prefix}{alt}{suffix}"))
+        .collect()
+}
+
+/// Converts a kind filter from display format back to the capture suffix
+/// stored in the index. `"Impl"` → `"implementation"`, others lowercase.
+fn kind_to_capture(kind: &str) -> String {
+    if kind.eq_ignore_ascii_case("impl") {
+        "implementation".to_string()
+    } else {
+        kind.to_lowercase()
+    }
+}
+
+// ─── Tree types ──────────────────────────────────────────────────────
 
 /// A directory node in the tree structure for glob pattern results.
 struct DirNode {
@@ -325,11 +460,6 @@ impl ToolServer for GlobServer {
         let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        // Stub: into not yet implemented (wired in 08c).
-        if input.into.is_some() {
-            return Err(anyhow!("`into` is not yet implemented"));
-        }
-
         let pattern = expand_tilde(&input.pattern);
         let path = resolve_path(&pattern)?;
 
@@ -353,6 +483,13 @@ impl ToolServer for GlobServer {
                     .map_err(|e| anyhow!("Invalid exclude pattern: {e}"))
             })
             .transpose()?;
+
+        // Branch: into pipeline or normal glob pipeline.
+        if let Some(ref into_str) = input.into {
+            let files = self.resolve_files(&path, &pattern, &input, exclude.as_ref())?;
+            let output = self.handle_into(&files, into_str)?;
+            return Ok(Value::String(output));
+        }
 
         // Decode cursor if provided.
         let after_line = input.cursor.as_deref().map(decode_cursor).transpose()?;
@@ -797,6 +934,221 @@ impl GlobServer {
                 |lc| (Some(lc), None),
             )
         })
+    }
+
+    /// Resolves the pattern to a list of file paths for the `into` pipeline.
+    fn resolve_files(
+        &self,
+        path: &Path,
+        pattern: &str,
+        input: &GlobInput,
+        exclude: Option<&globset::GlobMatcher>,
+    ) -> Result<Vec<PathBuf>> {
+        if path.is_file() || path.is_symlink() {
+            return Ok(vec![path.to_path_buf()]);
+        }
+
+        if path.is_dir() {
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
+
+            let walker = WalkBuilder::new(&canonical)
+                .max_depth(Some(1))
+                .git_ignore(!input.include_gitignored)
+                .hidden(!input.include_hidden)
+                .build();
+
+            let mut files = Vec::new();
+            for entry in walker.flatten() {
+                let entry_path = entry.into_path();
+                if entry_path == canonical {
+                    continue;
+                }
+                let meta = entry_path.symlink_metadata().ok();
+                let is_file = meta
+                    .as_ref()
+                    .is_some_and(|m| m.is_file() || m.file_type().is_symlink());
+                if !is_file {
+                    continue;
+                }
+                let name = entry_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if let Some(matcher) = exclude
+                    && matcher.is_match(&name)
+                {
+                    continue;
+                }
+                files.push(entry_path);
+            }
+            return Ok(files);
+        }
+
+        // Glob pattern.
+        let resolved = ResolvedGlob::new(pattern)?;
+        let search_roots = if let Some(override_root) = resolved.override_root() {
+            vec![override_root.to_path_buf()]
+        } else {
+            let roots = self.client_manager.roots();
+            if roots.is_empty() {
+                vec![std::env::current_dir()?]
+            } else {
+                roots
+            }
+        };
+
+        let mut matched: Vec<PathBuf> = Vec::new();
+        for root in &search_roots {
+            let walker = WalkBuilder::new(root)
+                .git_ignore(!input.include_gitignored)
+                .hidden(!input.include_hidden)
+                .build();
+            for entry in walker.flatten() {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
+                }
+                let entry_path = entry.path();
+                if resolved.is_match(entry_path, root) {
+                    if let Some(matcher) = exclude
+                        && matcher.is_match(entry_path.strip_prefix(root).unwrap_or(entry_path))
+                    {
+                        continue;
+                    }
+                    matched.push(entry_path.to_path_buf());
+                }
+            }
+        }
+        matched.sort();
+        matched.dedup();
+        Ok(matched)
+    }
+
+    /// Handles glob with the `into` parameter: structural symbol navigation.
+    ///
+    /// Navigates the symbol tree segment by segment, shows target symbols
+    /// with their children (or "no nested definitions" for leaves).
+    /// `maps_deny` does NOT apply — `into` is explicit navigation.
+    #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "guard must live for all index queries"
+    )]
+    fn handle_into(&self, files: &[PathBuf], into: &str) -> Result<String> {
+        let Some(ref ts_arc) = self.ts_index else {
+            return Err(anyhow!("`into` requires a tree-sitter index"));
+        };
+        let idx = ts_arc.lock().map_err(|e| anyhow!("lock error: {e}"))?;
+
+        if files.is_empty() {
+            return Ok("No matches found".to_string());
+        }
+
+        // Ensure the index is fresh for all files.
+        let _ = idx.ensure_fresh(files);
+
+        // Detect free-text grammar from the first file with a grammar.
+        let is_free_text = files.iter().any(|f| idx.is_free_text_grammar(f));
+
+        let segments = parse_into(into, is_free_text);
+        if segments.is_empty() {
+            return Ok("No matching symbols found".to_string());
+        }
+
+        // Walk segments to find target symbols.
+        // State: per-file, a list of (scope_name, matched_symbol) pairs
+        // representing the navigation context.
+        let file_refs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+
+        // First segment: depth-0 matching.
+        let first = &segments[0];
+        let scope = if first.is_recursive {
+            ScopeFilter::AnyDepth
+        } else {
+            ScopeFilter::TopLevel
+        };
+        let kind_filter = first.kind.as_ref().map(|k| kind_to_capture(k));
+        let deprecated_only = first.tags.iter().any(|t| t == "deprecated");
+
+        let mut current: HashMap<PathBuf, Vec<TsSymbol>> = query_with_alternation(
+            &idx,
+            &file_refs,
+            &scope,
+            &first.name_pattern,
+            kind_filter.as_deref(),
+            deprecated_only,
+        )?;
+
+        // Track the chain of intermediate symbols for rendering.
+        let mut chains: HashMap<PathBuf, Vec<Vec<TsSymbol>>> = HashMap::new();
+
+        // Initialize chains from first segment matches.
+        for (path, syms) in &current {
+            let file_chains: Vec<Vec<TsSymbol>> = syms.iter().map(|s| vec![s.clone()]).collect();
+            chains.insert(path.clone(), file_chains);
+        }
+
+        // Subsequent segments: children of previous matches.
+        for seg in &segments[1..] {
+            let mut next: HashMap<PathBuf, Vec<TsSymbol>> = HashMap::new();
+            let mut next_chains: HashMap<PathBuf, Vec<Vec<TsSymbol>>> = HashMap::new();
+
+            let seg_kind = seg.kind.as_ref().map(|k| kind_to_capture(k));
+            let seg_deprecated = seg.tags.iter().any(|t| t == "deprecated");
+
+            for (path, prev_syms) in &current {
+                let prev_file_chains = chains.get(path).cloned().unwrap_or_default();
+                let path_ref: &Path = path;
+
+                for (ci, parent) in prev_syms.iter().enumerate() {
+                    let scope_filter = if seg.is_recursive {
+                        ScopeFilter::AnyDepth
+                    } else {
+                        ScopeFilter::ChildrenOf(&parent.name)
+                    };
+
+                    let matches = query_with_alternation(
+                        &idx,
+                        &[path_ref],
+                        &scope_filter,
+                        &seg.name_pattern,
+                        seg_kind.as_deref(),
+                        seg_deprecated,
+                    )?;
+
+                    if let Some(syms) = matches.get(path) {
+                        let existing = next.entry(path.clone()).or_default();
+                        let existing_chains = next_chains.entry(path.clone()).or_default();
+
+                        for sym in syms {
+                            existing.push(sym.clone());
+                            let mut chain = prev_file_chains.get(ci).cloned().unwrap_or_default();
+                            chain.push(sym.clone());
+                            existing_chains.push(chain);
+                        }
+                    }
+                }
+            }
+
+            current = next;
+            chains = next_chains;
+        }
+
+        // Filter to files with matches.
+        let matched_files: Vec<&PathBuf> = files
+            .iter()
+            .filter(|f| current.get(*f).is_some_and(|v| !v.is_empty()))
+            .collect();
+
+        if matched_files.is_empty() {
+            return Ok("No matching symbols found".to_string());
+        }
+
+        // Render results with tier selection.
+        let result = render_into_results(&matched_files, &current, &chains, &idx, self.budget);
+
+        Ok(result)
     }
 }
 
@@ -1312,6 +1664,364 @@ fn render_entry_line(out: &mut String, entry: &GlobEntry, flags: &[&str]) {
     } else {
         let _ = writeln!(out, "{}{flag_str}", entry.name);
     }
+}
+
+// ─── Into rendering ──────────────────────────────────────────────────
+
+/// Renders `into` results with promote-from-bottom tier selection.
+///
+/// Three tiers:
+/// 1. Full — target symbols with children and spans.
+/// 2. Degraded — target symbols with spans only, no children.
+/// 3. Bucketed — glob patterns grouping files that contain the symbol.
+#[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
+fn render_into_results(
+    files: &[&PathBuf],
+    targets: &HashMap<PathBuf, Vec<TsSymbol>>,
+    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
+    ts_index: &TsIndex,
+    budget: usize,
+) -> String {
+    // Tier 3 (bucketed): file names with counts.
+    let file_names: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    let tier3 = render_bucketed(&file_names, budget);
+
+    // Tier 2 (degraded): target symbols with spans, no children.
+    let tier2 = render_into_tier2(files, chains, ts_index);
+    if tier2.len() > budget {
+        return tier3;
+    }
+
+    // Tier 1 (full): target symbols with children.
+    let tier1 = render_into_tier1(files, targets, chains, ts_index);
+    if tier1.len() <= budget {
+        return tier1;
+    }
+
+    tier2
+}
+
+/// Renders `into` tier 2 (degraded): target symbols at their chain
+/// positions, no children expansion.
+fn render_into_tier2(
+    files: &[&PathBuf],
+    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
+    ts_index: &TsIndex,
+) -> String {
+    let mut out = String::new();
+
+    for &path in files {
+        let Some(file_chains) = chains.get(path) else {
+            continue;
+        };
+        if file_chains.is_empty() {
+            continue;
+        }
+
+        // File header.
+        let display = path.file_name().map_or_else(
+            || path.to_string_lossy().to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        let _ = writeln!(out, "{display}");
+
+        // Build children set for trailing `/` detection.
+        let children_set = build_children_set_for_file(ts_index, path);
+
+        // Merge chains into a tree for dedup rendering.
+        render_chains_merged(&mut out, file_chains, &children_set, false, ts_index, path);
+    }
+
+    out
+}
+
+/// Renders `into` tier 1 (full): target symbols with children shown.
+fn render_into_tier1(
+    files: &[&PathBuf],
+    targets: &HashMap<PathBuf, Vec<TsSymbol>>,
+    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
+    ts_index: &TsIndex,
+) -> String {
+    let mut out = String::new();
+
+    for &path in files {
+        let Some(file_chains) = chains.get(path) else {
+            continue;
+        };
+        if file_chains.is_empty() {
+            continue;
+        }
+
+        let file_targets = targets.get(path);
+
+        // File header.
+        let display = path.file_name().map_or_else(
+            || path.to_string_lossy().to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+
+        // Special case: single-segment into="*" style — show line count.
+        let show_line_count =
+            file_chains.iter().all(|c| c.len() == 1) && file_targets.is_some_and(|t| t.len() > 2);
+        if show_line_count {
+            let metadata = std::fs::metadata(path).ok();
+            let line_count = metadata.as_ref().and_then(|_| {
+                let content = std::fs::read_to_string(path).ok()?;
+                Some(content.lines().count())
+            });
+            if let Some(lc) = line_count {
+                let _ = writeln!(out, "{display}  ({lc} lines)");
+            } else {
+                let _ = writeln!(out, "{display}");
+            }
+        } else {
+            let _ = writeln!(out, "{display}");
+        }
+
+        // Build children set for trailing `/` detection.
+        let children_set = build_children_set_for_file(ts_index, path);
+
+        // Merge chains and render with children expansion.
+        render_chains_merged(&mut out, file_chains, &children_set, true, ts_index, path);
+    }
+
+    out
+}
+
+/// Renders merged chains for a single file.
+///
+/// Chains sharing prefix symbols are merged to avoid duplicate output.
+/// If `expand_children` is true, the deepest target's children are shown.
+fn render_chains_merged(
+    out: &mut String,
+    chains: &[Vec<TsSymbol>],
+    children_set: &HashSet<String>,
+    expand_children: bool,
+    ts_index: &TsIndex,
+    file_path: &Path,
+) {
+    if chains.is_empty() {
+        return;
+    }
+
+    let max_depth = chains.iter().map(Vec::len).max().unwrap_or(0);
+
+    if max_depth == 0 {
+        return;
+    }
+
+    // For single-depth chains (single segment `into`), render targets
+    // directly. For multi-depth, render the tree structure.
+    if max_depth == 1 {
+        // All chains have exactly one symbol (the target).
+        let mut seen_lines: HashSet<u32> = HashSet::new();
+        for chain in chains {
+            let sym = &chain[0];
+            if !seen_lines.insert(sym.line) {
+                continue;
+            }
+            render_into_symbol(out, sym, children_set, "\t");
+
+            if expand_children {
+                render_target_children(out, sym, children_set, ts_index, file_path, "\t\t");
+            }
+        }
+        return;
+    }
+
+    // Multi-depth: build and render a tree.
+    // Group by first symbol, then recurse.
+    render_chain_tree(
+        out,
+        chains,
+        0,
+        children_set,
+        expand_children,
+        ts_index,
+        file_path,
+        1,
+    );
+}
+
+/// Recursively renders a chain tree at the given depth level.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recursive tree rendering needs full context"
+)]
+fn render_chain_tree(
+    out: &mut String,
+    chains: &[Vec<TsSymbol>],
+    depth: usize,
+    children_set: &HashSet<String>,
+    expand_children: bool,
+    ts_index: &TsIndex,
+    file_path: &Path,
+    indent_level: usize,
+) {
+    // Group chains by the symbol at this depth (keyed by line number).
+    let mut groups: BTreeMap<u32, Vec<&Vec<TsSymbol>>> = BTreeMap::new();
+    for chain in chains {
+        if depth < chain.len() {
+            groups.entry(chain[depth].line).or_default().push(chain);
+        }
+    }
+
+    let indent: String = "\t".repeat(indent_level);
+
+    for group_chains in groups.values() {
+        let sym = &group_chains[0][depth];
+        let is_last_in_chain = group_chains.iter().all(|c| depth + 1 >= c.len());
+
+        render_into_symbol(out, sym, children_set, &indent);
+
+        if is_last_in_chain {
+            // This is a target (last segment match). Show children.
+            if expand_children {
+                let child_indent = format!("{indent}\t");
+                render_target_children(out, sym, children_set, ts_index, file_path, &child_indent);
+            }
+        } else {
+            // Recurse to the next depth level.
+            let sub_chains: Vec<&Vec<TsSymbol>> = group_chains
+                .iter()
+                .filter(|c| depth + 1 < c.len())
+                .copied()
+                .collect();
+            let owned: Vec<Vec<TsSymbol>> = sub_chains.iter().map(|c| (*c).clone()).collect();
+            render_chain_tree(
+                out,
+                &owned,
+                depth + 1,
+                children_set,
+                expand_children,
+                ts_index,
+                file_path,
+                indent_level + 1,
+            );
+        }
+    }
+}
+
+/// Renders a single symbol line for `into` output.
+fn render_into_symbol(
+    out: &mut String,
+    sym: &TsSymbol,
+    children_set: &HashSet<String>,
+    indent: &str,
+) {
+    let kind_label = format_ts_kind(&sym.kind);
+    let trailing = if children_set.contains(&sym.name) {
+        "/"
+    } else {
+        ""
+    };
+    let deprecated = if sym.deprecated { ", deprecated" } else { "" };
+    let _ = writeln!(
+        out,
+        "{indent}:{}-{} <{kind_label}{deprecated}> {}{trailing}",
+        sym.line + 1,
+        sym.end_line + 1,
+        sym.name,
+    );
+}
+
+/// Renders the children of a target symbol (or "no nested definitions").
+fn render_target_children(
+    out: &mut String,
+    target: &TsSymbol,
+    children_set: &HashSet<String>,
+    ts_index: &TsIndex,
+    file_path: &Path,
+    indent: &str,
+) {
+    if !children_set.contains(&target.name) {
+        // Leaf symbol — no nested definitions.
+        let _ = writeln!(
+            out,
+            "{indent}(no nested definitions \u{2014} read :{}-{})",
+            target.line + 1,
+            target.end_line + 1,
+        );
+        return;
+    }
+
+    // Query children of this target.
+    let children = ts_index
+        .query_scoped(
+            &[file_path],
+            &ScopeFilter::ChildrenOf(&target.name),
+            "*",
+            None,
+            false,
+        )
+        .ok()
+        .and_then(|m| m.get(&file_path.to_path_buf()).cloned())
+        .unwrap_or_default();
+
+    for child in &children {
+        render_into_symbol(out, child, children_set, indent);
+    }
+}
+
+/// Queries symbols with `{a,b}` alternation support.
+///
+/// `SQLite` GLOB doesn't support `{a,b}` syntax. This function expands
+/// alternation patterns and merges results from multiple queries.
+fn query_with_alternation(
+    ts_index: &TsIndex,
+    files: &[&Path],
+    scope: &ScopeFilter<'_>,
+    name_pattern: &str,
+    kind_filter: Option<&str>,
+    deprecated_only: bool,
+) -> Result<HashMap<PathBuf, Vec<TsSymbol>>> {
+    let patterns = expand_alternation(name_pattern);
+
+    if patterns.len() == 1 {
+        return ts_index.query_scoped(files, scope, &patterns[0], kind_filter, deprecated_only);
+    }
+
+    let mut merged: HashMap<PathBuf, Vec<TsSymbol>> = HashMap::new();
+    let mut seen: HashSet<(PathBuf, u32)> = HashSet::new();
+
+    for pat in &patterns {
+        let results = ts_index.query_scoped(files, scope, pat, kind_filter, deprecated_only)?;
+        for (path, syms) in results {
+            let entry = merged.entry(path.clone()).or_default();
+            for sym in syms {
+                if seen.insert((path.clone(), sym.line)) {
+                    entry.push(sym);
+                }
+            }
+        }
+    }
+
+    // Sort by line within each file.
+    for syms in merged.values_mut() {
+        syms.sort_by_key(|s| s.line);
+    }
+
+    Ok(merged)
+}
+
+/// Builds a children set (names that appear as scope) for a single file.
+fn build_children_set_for_file(ts_index: &TsIndex, path: &Path) -> HashSet<String> {
+    ts_index
+        .query(".*", Some(&[path.to_path_buf()]))
+        .ok()
+        .map(|all| {
+            let mut cs = HashSet::new();
+            for (_, s) in &all {
+                if let Some(ref scope) = s.scope {
+                    cs.insert(scope.clone());
+                }
+            }
+            cs
+        })
+        .unwrap_or_default()
 }
 
 // ─── Bucketed rendering (tier 3) ──────────────────────────────────────
