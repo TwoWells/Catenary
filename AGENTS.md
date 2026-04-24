@@ -96,6 +96,12 @@ These commands automatically:
 To complete the release, push the changes and tags:
 `git push && git push --tags`
 
+Pushing the tag triggers the CD workflow (binary builds + crates.io
+publish) and a docs rebuild. The docs workflow builds stable docs
+from the latest `v*` tag, so any docs changes on `main` only reach
+`/stable/` after a tagged release. Dev docs at `/dev/` update on
+every push to `main`.
+
 ### Pre-release checklist
 Before running `make release-*`:
 1. Ensure `git push` has been run so local `main` matches `origin/main`.
