@@ -208,7 +208,7 @@ impl Toolbox {
             budget: grep_budget,
         };
         let outline_suppress: Vec<globset::GlobMatcher> = glob_config
-            .outline_suppress_patterns
+            .outline_suppress
             .iter()
             .filter_map(|pat| {
                 let effective = if pat.contains('/') {

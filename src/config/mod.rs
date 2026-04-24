@@ -302,7 +302,7 @@ pub struct GlobConfig {
     pub outline_threshold: usize,
     /// Glob patterns whose outlines are suppressed from automatic display.
     /// Symbols remain available via `into`.
-    pub outline_suppress_patterns: Vec<String>,
+    pub outline_suppress: Vec<String>,
 }
 
 impl Default for GlobConfig {
@@ -310,7 +310,7 @@ impl Default for GlobConfig {
         Self {
             budget: 2000,
             outline_threshold: 200,
-            outline_suppress_patterns: Vec::new(),
+            outline_suppress: Vec::new(),
         }
     }
 }
@@ -1705,17 +1705,17 @@ extensions = ["xyz"]
     }
 
     #[test]
-    fn test_glob_outline_suppress_patterns() -> anyhow::Result<()> {
+    fn test_glob_outline_suppress() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "[tools.glob]\noutline_suppress_patterns = [\"**/*.json\", \"**/fixtures/**\"]\n",
+            "[tools.glob]\noutline_suppress = [\"**/*.json\", \"**/fixtures/**\"]\n",
         )?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.glob.outline_suppress_patterns.len(), 2);
+        assert_eq!(tools.glob.outline_suppress.len(), 2);
 
         Ok(())
     }

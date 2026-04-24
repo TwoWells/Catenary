@@ -1007,16 +1007,15 @@ fn test_glob_tier2_flags() -> Result<()> {
 }
 
 #[test]
-fn test_glob_outline_suppress_patterns() -> Result<()> {
+fn test_glob_outline_suppress() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(
         dir.path().join(format!("big.{MOCK_EXT}")),
         "fn alpha\nfn beta\n\n\n\n\n\n\n\n\n",
     )?;
     // Deny all mock files from maps. Threshold of 5 so file qualifies.
-    let config = format!(
-        "[tools.glob]\noutline_threshold = 5\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n"
-    );
+    let config =
+        format!("[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1025,7 +1024,7 @@ fn test_glob_outline_suppress_patterns() -> Result<()> {
         &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
     )?;
 
-    // Should NOT have symbol lines (denied by outline_suppress_patterns).
+    // Should NOT have symbol lines (denied by outline_suppress).
     assert!(
         !text.contains("<Function>") && !text.contains("<Struct>"),
         "Maps-denied file should not have symbols: {text}"
@@ -1111,7 +1110,7 @@ fn test_glob_single_file_denied() -> Result<()> {
     let file = dir.path().join(format!("denied.{MOCK_EXT}"));
     std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
 
-    let config = format!("[tools.glob]\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n");
+    let config = format!("[tools.glob]\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1120,7 +1119,7 @@ fn test_glob_single_file_denied() -> Result<()> {
         &json!({ "pattern": file.to_str().context("file path")? }),
     )?;
 
-    // outline_suppress_patterns blocks the map even for single files.
+    // outline_suppress blocks the map even for single files.
     assert!(
         !text.contains("<Function>") && !text.contains("<Struct>"),
         "Denied single file should not have map: {text}"
@@ -1237,7 +1236,7 @@ fn test_glob_composing_flags() -> Result<()> {
         .context("git init")?;
 
     // A file that is gitignored, has grammar, but maps are denied.
-    // outline_suppress_patterns blocks the map → [symbols available].
+    // outline_suppress blocks the map → [symbols available].
     // include_gitignored → [gitignored]. Both compose.
     std::fs::write(dir.path().join(".gitignore"), format!("*.{MOCK_EXT}\n"))?;
     std::fs::write(
@@ -1245,9 +1244,8 @@ fn test_glob_composing_flags() -> Result<()> {
         "fn alpha\nfn beta\n\n\n\n\n\n\n\n\n",
     )?;
 
-    let config = format!(
-        "[tools.glob]\noutline_threshold = 5\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n"
-    );
+    let config =
+        format!("[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1847,15 +1845,14 @@ fn test_into_zero_matches_multi() -> Result<()> {
 }
 
 #[test]
-fn test_into_bypasses_outline_suppress_patterns() -> Result<()> {
+fn test_into_bypasses_outline_suppress() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("denied.{MOCK_EXT}"));
     std::fs::write(&file, "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n")?;
 
-    // outline_suppress_patterns blocks the defensive map.
-    let config = format!(
-        "[tools.glob]\noutline_threshold = 5\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n"
-    );
+    // outline_suppress blocks the defensive map.
+    let config =
+        format!("[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1873,7 +1870,7 @@ fn test_into_bypasses_outline_suppress_patterns() -> Result<()> {
         "Should NOT have map symbols: {text_no_into}"
     );
 
-    // With into="*" — should show full map regardless of outline_suppress_patterns.
+    // With into="*" — should show full map regardless of outline_suppress.
     let text_into = bridge.call_tool_text(
         "glob",
         &json!({
@@ -1883,7 +1880,7 @@ fn test_into_bypasses_outline_suppress_patterns() -> Result<()> {
     )?;
     assert!(
         text_into.contains("alpha"),
-        "into should bypass outline_suppress_patterns and show symbols: {text_into}"
+        "into should bypass outline_suppress and show symbols: {text_into}"
     );
     assert!(
         text_into.contains("Beta"),

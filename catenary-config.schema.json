@@ -42,7 +42,7 @@
               "default": 200,
               "minimum": 1
             },
-            "outline_suppress_patterns": {
+            "outline_suppress": {
               "type": "array",
               "items": { "type": "string" },
               "description": "Glob patterns whose outlines are suppressed from automatic display. Symbols remain available via into.",
