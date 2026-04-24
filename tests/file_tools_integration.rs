@@ -927,7 +927,7 @@ fn test_glob_defensive_maps() -> Result<()> {
     // Small file < threshold.
     std::fs::write(dir.path().join(format!("small.{MOCK_EXT}")), "fn tiny\n")?;
 
-    let config = "[tools.glob]\nmaps_threshold = 5\n";
+    let config = "[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -985,7 +985,7 @@ fn test_glob_tier2_flags() -> Result<()> {
         gen_mock_content(250),
     )?;
     // Threshold of 5 so file qualifies for maps. Budget of 1000 so maps don't fit.
-    let config = "[tools.glob]\nbudget = 1000\nmaps_threshold = 5\n";
+    let config = "[tools.glob]\nbudget = 1000\noutline_threshold = 5\n";
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -1007,14 +1007,16 @@ fn test_glob_tier2_flags() -> Result<()> {
 }
 
 #[test]
-fn test_glob_maps_deny() -> Result<()> {
+fn test_glob_outline_suppress_patterns() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(
         dir.path().join(format!("big.{MOCK_EXT}")),
         "fn alpha\nfn beta\n\n\n\n\n\n\n\n\n",
     )?;
     // Deny all mock files from maps. Threshold of 5 so file qualifies.
-    let config = format!("[tools.glob]\nmaps_threshold = 5\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    let config = format!(
+        "[tools.glob]\noutline_threshold = 5\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n"
+    );
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1023,7 +1025,7 @@ fn test_glob_maps_deny() -> Result<()> {
         &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
     )?;
 
-    // Should NOT have symbol lines (denied by maps_deny).
+    // Should NOT have symbol lines (denied by outline_suppress_patterns).
     assert!(
         !text.contains("<Function>") && !text.contains("<Struct>"),
         "Maps-denied file should not have symbols: {text}"
@@ -1046,7 +1048,7 @@ fn test_glob_trailing_slash() -> Result<()> {
         "struct Outer {\nfn inner\n}\nfn leaf\n\n\n\n\n\n\n",
     )?;
 
-    let config = "[tools.glob]\nmaps_threshold = 5\n";
+    let config = "[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -1109,7 +1111,7 @@ fn test_glob_single_file_denied() -> Result<()> {
     let file = dir.path().join(format!("denied.{MOCK_EXT}"));
     std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
 
-    let config = format!("[tools.glob]\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    let config = format!("[tools.glob]\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n");
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1118,7 +1120,7 @@ fn test_glob_single_file_denied() -> Result<()> {
         &json!({ "pattern": file.to_str().context("file path")? }),
     )?;
 
-    // maps_deny blocks the map even for single files.
+    // outline_suppress_patterns blocks the map even for single files.
     assert!(
         !text.contains("<Function>") && !text.contains("<Struct>"),
         "Denied single file should not have map: {text}"
@@ -1235,7 +1237,7 @@ fn test_glob_composing_flags() -> Result<()> {
         .context("git init")?;
 
     // A file that is gitignored, has grammar, but maps are denied.
-    // maps_deny blocks the map → [symbols available].
+    // outline_suppress_patterns blocks the map → [symbols available].
     // include_gitignored → [gitignored]. Both compose.
     std::fs::write(dir.path().join(".gitignore"), format!("*.{MOCK_EXT}\n"))?;
     std::fs::write(
@@ -1243,7 +1245,9 @@ fn test_glob_composing_flags() -> Result<()> {
         "fn alpha\nfn beta\n\n\n\n\n\n\n\n\n",
     )?;
 
-    let config = format!("[tools.glob]\nmaps_threshold = 5\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    let config = format!(
+        "[tools.glob]\noutline_threshold = 5\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n"
+    );
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1386,7 +1390,7 @@ fn test_glob_structure_dedup() -> Result<()> {
         std::fs::write(dir.path().join(format!("proto_{i:03}.{MOCK_EXT}")), content)?;
     }
 
-    let config = "[tools.glob]\nmaps_threshold = 5\n";
+    let config = "[tools.glob]\noutline_threshold = 5\n";
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -1422,7 +1426,7 @@ fn test_glob_dedup_mixed() -> Result<()> {
         "fn unique_func\nstruct UniqueType\n\n\n\n\n\n\n\n\n",
     )?;
 
-    let config = "[tools.glob]\nmaps_threshold = 5\nbudget = 5000\n";
+    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -1467,7 +1471,7 @@ fn test_glob_tree_dedup() -> Result<()> {
         "fn dispatch\nstruct Route\n\n\n\n\n\n\n\n\n",
     )?;
 
-    let config = "[tools.glob]\nmaps_threshold = 5\nbudget = 5000\n";
+    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -1506,7 +1510,7 @@ fn test_glob_tree_dedup_per_directory() -> Result<()> {
         std::fs::write(dir_b.join(format!("file_{i}.mock")), content)?;
     }
 
-    let config = "[tools.glob]\nmaps_threshold = 5\nbudget = 5000\n";
+    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
@@ -1843,13 +1847,15 @@ fn test_into_zero_matches_multi() -> Result<()> {
 }
 
 #[test]
-fn test_into_bypasses_maps_deny() -> Result<()> {
+fn test_into_bypasses_outline_suppress_patterns() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("denied.{MOCK_EXT}"));
     std::fs::write(&file, "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n")?;
 
-    // maps_deny blocks the defensive map.
-    let config = format!("[tools.glob]\nmaps_threshold = 5\nmaps_deny = [\"**/*.{MOCK_EXT}\"]\n");
+    // outline_suppress_patterns blocks the defensive map.
+    let config = format!(
+        "[tools.glob]\noutline_threshold = 5\noutline_suppress_patterns = [\"**/*.{MOCK_EXT}\"]\n"
+    );
     let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
@@ -1867,7 +1873,7 @@ fn test_into_bypasses_maps_deny() -> Result<()> {
         "Should NOT have map symbols: {text_no_into}"
     );
 
-    // With into="*" — should show full map regardless of maps_deny.
+    // With into="*" — should show full map regardless of outline_suppress_patterns.
     let text_into = bridge.call_tool_text(
         "glob",
         &json!({
@@ -1877,7 +1883,7 @@ fn test_into_bypasses_maps_deny() -> Result<()> {
     )?;
     assert!(
         text_into.contains("alpha"),
-        "into should bypass maps_deny and show symbols: {text_into}"
+        "into should bypass outline_suppress_patterns and show symbols: {text_into}"
     );
     assert!(
         text_into.contains("Beta"),

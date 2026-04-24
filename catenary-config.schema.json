@@ -36,16 +36,16 @@
               "default": 2000,
               "minimum": 1000
             },
-            "maps_threshold": {
+            "outline_threshold": {
               "type": "integer",
-              "description": "Minimum line count for defensive maps.",
+              "description": "Minimum line count for defensive outlines.",
               "default": 200,
               "minimum": 1
             },
-            "maps_deny": {
+            "outline_suppress_patterns": {
               "type": "array",
               "items": { "type": "string" },
-              "description": "Glob patterns excluded from defensive maps.",
+              "description": "Glob patterns whose outlines are suppressed from automatic display. Symbols remain available via into.",
               "default": []
             }
           }

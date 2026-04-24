@@ -245,7 +245,7 @@ impl Default for TuiConfig {
 ///
 /// [tools.glob]
 /// budget = 2000
-/// maps_threshold = 200
+/// outline_threshold = 200
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -298,18 +298,19 @@ impl Default for GrepConfig {
 pub struct GlobConfig {
     /// Output budget in characters. Default: 2000, min: 1000.
     pub budget: u32,
-    /// Minimum line count for defensive maps. Default: 200.
-    pub maps_threshold: usize,
-    /// Glob patterns excluded from defensive maps (not from `into`).
-    pub maps_deny: Vec<String>,
+    /// Minimum line count for defensive outlines. Default: 200.
+    pub outline_threshold: usize,
+    /// Glob patterns whose outlines are suppressed from automatic display.
+    /// Symbols remain available via `into`.
+    pub outline_suppress_patterns: Vec<String>,
 }
 
 impl Default for GlobConfig {
     fn default() -> Self {
         Self {
             budget: 2000,
-            maps_threshold: 200,
-            maps_deny: Vec::new(),
+            outline_threshold: 200,
+            outline_suppress_patterns: Vec::new(),
         }
     }
 }
@@ -1691,30 +1692,30 @@ extensions = ["xyz"]
     }
 
     #[test]
-    fn test_glob_maps_threshold() -> anyhow::Result<()> {
+    fn test_glob_outline_threshold() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[tools.glob]\nmaps_threshold = 500\n")?;
+        fs::write(&path, "[tools.glob]\noutline_threshold = 500\n")?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.glob.maps_threshold, 500);
+        assert_eq!(tools.glob.outline_threshold, 500);
 
         Ok(())
     }
 
     #[test]
-    fn test_glob_maps_deny() -> anyhow::Result<()> {
+    fn test_glob_outline_suppress_patterns() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "[tools.glob]\nmaps_deny = [\"**/*.json\", \"**/fixtures/**\"]\n",
+            "[tools.glob]\noutline_suppress_patterns = [\"**/*.json\", \"**/fixtures/**\"]\n",
         )?;
 
         let config = Config::load_from_sources(&[path])?;
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.glob.maps_deny.len(), 2);
+        assert_eq!(tools.glob.outline_suppress_patterns.len(), 2);
 
         Ok(())
     }

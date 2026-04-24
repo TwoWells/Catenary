@@ -285,8 +285,8 @@ impl DirNode {
         out: &mut String,
         depth: usize,
         ts_index: Option<&TsIndex>,
-        maps_threshold: usize,
-        maps_deny: &[globset::GlobMatcher],
+        outline_threshold: usize,
+        outline_suppress: &[globset::GlobMatcher],
         fs_manager: &FilesystemManager,
     ) {
         let indent: String = "\t".repeat(depth);
@@ -297,8 +297,8 @@ impl DirNode {
                 out,
                 depth + 1,
                 ts_index,
-                maps_threshold,
-                maps_deny,
+                outline_threshold,
+                outline_suppress,
                 fs_manager,
             );
         }
@@ -307,8 +307,14 @@ impl DirNode {
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
         for file in sorted {
-            let flags =
-                compute_tree_flags(file, ts_index, maps_threshold, maps_deny, fs_manager, false);
+            let flags = compute_tree_flags(
+                file,
+                ts_index,
+                outline_threshold,
+                outline_suppress,
+                fs_manager,
+                false,
+            );
             render_file_node(out, file, &indent, &flags);
         }
     }
@@ -525,8 +531,8 @@ fn render_file_node(out: &mut String, file: &FileNode, indent: &str, flags: &[&s
 fn compute_tree_flags<'a>(
     file: &FileNode,
     ts_index: Option<&TsIndex>,
-    maps_threshold: usize,
-    maps_deny: &[globset::GlobMatcher],
+    outline_threshold: usize,
+    outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
     map_rendered: bool,
 ) -> Vec<&'a str> {
@@ -535,8 +541,8 @@ fn compute_tree_flags<'a>(
     if !map_rendered
         && !file.is_snapshot
         && has_grammar_available(&file.abs_path, ts_index)
-        && (file.line_count.is_some_and(|lc| lc >= maps_threshold)
-            || is_maps_denied(&file.abs_path, maps_deny, fs_manager))
+        && (file.line_count.is_some_and(|lc| lc >= outline_threshold)
+            || is_outline_suppressed(&file.abs_path, outline_suppress, fs_manager))
     {
         flags.push("symbols available");
     }
@@ -559,8 +565,8 @@ pub struct GlobServer {
     pub(super) fs_manager: Arc<FilesystemManager>,
     pub(super) ts_index: Option<Arc<Mutex<TsIndex>>>,
     pub(super) budget: usize,
-    pub(super) maps_threshold: usize,
-    pub(super) maps_deny: Vec<globset::GlobMatcher>,
+    pub(super) outline_threshold: usize,
+    pub(super) outline_suppress: Vec<globset::GlobMatcher>,
 }
 
 impl ToolServer for GlobServer {
@@ -623,8 +629,8 @@ impl ToolServer for GlobServer {
 impl GlobServer {
     /// Single file: header with defensive map (if grammar installed).
     ///
-    /// Single files bypass `maps_threshold` — they get a map unless the
-    /// grammar is not installed or the path matches `maps_deny`. Pages
+    /// Single files bypass `outline_threshold` — they get a map unless the
+    /// grammar is not installed or the path matches `outline_suppress`. Pages
     /// when the map exceeds budget.
     #[allow(
         clippy::significant_drop_tightening,
@@ -663,7 +669,9 @@ impl GlobServer {
         let Ok(idx) = ts_arc.lock() else {
             return result;
         };
-        if !idx.has_grammar_for(path) || is_maps_denied(path, &self.maps_deny, &self.fs_manager) {
+        if !idx.has_grammar_for(path)
+            || is_outline_suppressed(path, &self.outline_suppress, &self.fs_manager)
+        {
             return result;
         }
 
@@ -853,8 +861,8 @@ impl GlobServer {
             &entries,
             self.budget,
             ts_guard.as_deref(),
-            self.maps_threshold,
-            &self.maps_deny,
+            self.outline_threshold,
+            &self.outline_suppress,
             &self.fs_manager,
         ))
     }
@@ -988,8 +996,8 @@ impl GlobServer {
             &mut tier2,
             0,
             ts_ref,
-            self.maps_threshold,
-            &self.maps_deny,
+            self.outline_threshold,
+            &self.outline_suppress,
             &self.fs_manager,
         );
         if tier2.len() > self.budget {
@@ -1005,8 +1013,8 @@ impl GlobServer {
                     is_map_eligible(
                         p,
                         &matched_files,
-                        self.maps_threshold,
-                        &self.maps_deny,
+                        self.outline_threshold,
+                        &self.outline_suppress,
                         idx,
                         &self.fs_manager,
                     )
@@ -1142,7 +1150,7 @@ impl GlobServer {
     ///
     /// Navigates the symbol tree segment by segment, shows target symbols
     /// with their children (or "no nested definitions" for leaves).
-    /// `maps_deny` does NOT apply — `into` is explicit navigation.
+    /// `outline_suppress` does NOT apply — `into` is explicit navigation.
     #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
     #[allow(
         clippy::significant_drop_tightening,
@@ -1284,25 +1292,25 @@ impl GlobServer {
 /// Returns `true` if a file is eligible for defensive maps in a directory listing.
 fn is_map_eligible_entry(
     entry: &GlobEntry,
-    maps_threshold: usize,
-    maps_deny: &[globset::GlobMatcher],
+    outline_threshold: usize,
+    outline_suppress: &[globset::GlobMatcher],
     ts_index: &TsIndex,
     fs_manager: &FilesystemManager,
 ) -> bool {
     !entry.is_dir
         && !entry.is_broken_symlink
         && !entry.is_snapshot
-        && entry.line_count.is_some_and(|lc| lc >= maps_threshold)
+        && entry.line_count.is_some_and(|lc| lc >= outline_threshold)
         && ts_index.has_grammar_for(&entry.abs_path)
-        && !is_maps_denied(&entry.abs_path, maps_deny, fs_manager)
+        && !is_outline_suppressed(&entry.abs_path, outline_suppress, fs_manager)
 }
 
 /// Returns `true` if a matched file in a glob pattern tree is map-eligible.
 fn is_map_eligible(
     path: &Path,
     _matched_files: &[(PathBuf, PathBuf, bool)],
-    maps_threshold: usize,
-    maps_deny: &[globset::GlobMatcher],
+    outline_threshold: usize,
+    outline_suppress: &[globset::GlobMatcher],
     ts_index: &TsIndex,
     fs_manager: &FilesystemManager,
 ) -> bool {
@@ -1317,9 +1325,9 @@ fn is_map_eligible(
         .unwrap_or_default();
 
     !is_snapshot(&name)
-        && line_count.is_some_and(|lc| lc >= maps_threshold)
+        && line_count.is_some_and(|lc| lc >= outline_threshold)
         && ts_index.has_grammar_for(path)
-        && !is_maps_denied(path, maps_deny, fs_manager)
+        && !is_outline_suppressed(path, outline_suppress, fs_manager)
 }
 
 /// Returns `true` if a grammar is installed for the file's language.
@@ -1327,20 +1335,20 @@ fn has_grammar_available(path: &Path, ts_index: Option<&TsIndex>) -> bool {
     ts_index.is_some_and(|idx| idx.has_grammar_for(path))
 }
 
-/// Returns `true` if the file matches any `maps_deny` pattern.
-fn is_maps_denied(
+/// Returns `true` if the file matches any `outline_suppress` pattern.
+fn is_outline_suppressed(
     abs_path: &Path,
-    maps_deny: &[globset::GlobMatcher],
+    outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
 ) -> bool {
-    if maps_deny.is_empty() {
+    if outline_suppress.is_empty() {
         return false;
     }
     let rel = fs_manager
         .resolve_root(abs_path)
         .and_then(|root| abs_path.strip_prefix(&root).ok().map(Path::to_path_buf))
         .unwrap_or_else(|| abs_path.to_path_buf());
-    maps_deny.iter().any(|pat| pat.is_match(&rel))
+    outline_suppress.iter().any(|pat| pat.is_match(&rel))
 }
 
 /// Returns `true` if the filename matches the snapshot sidecar pattern.
@@ -1526,8 +1534,8 @@ fn select_dir_tier(
     entries: &[GlobEntry],
     budget: usize,
     ts_index: Option<&TsIndex>,
-    maps_threshold: usize,
-    maps_deny: &[globset::GlobMatcher],
+    outline_threshold: usize,
+    outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
 ) -> String {
     // Collect file names for bucketing.
@@ -1541,8 +1549,13 @@ fn select_dir_tier(
     let tier3 = render_bucketed(&file_names, budget);
 
     // 2. Tier 2 (file listing with flags).
-    let tier2 =
-        render_dir_listing_with_flags(entries, ts_index, maps_threshold, maps_deny, fs_manager);
+    let tier2 = render_dir_listing_with_flags(
+        entries,
+        ts_index,
+        outline_threshold,
+        outline_suppress,
+        fs_manager,
+    );
     if tier2.len() > budget {
         return tier3;
     }
@@ -1555,7 +1568,9 @@ fn select_dir_tier(
     let eligible_indices: Vec<usize> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| is_map_eligible_entry(e, maps_threshold, maps_deny, idx, fs_manager))
+        .filter(|(_, e)| {
+            is_map_eligible_entry(e, outline_threshold, outline_suppress, idx, fs_manager)
+        })
         .map(|(i, _)| i)
         .collect();
 
@@ -1589,7 +1604,7 @@ fn select_dir_tier(
         &children_sets,
         idx,
         ts_index,
-        maps_deny,
+        outline_suppress,
         fs_manager,
     );
 
@@ -1600,8 +1615,8 @@ fn select_dir_tier(
 fn render_dir_listing_with_flags(
     entries: &[GlobEntry],
     ts_index: Option<&TsIndex>,
-    maps_threshold: usize,
-    maps_deny: &[globset::GlobMatcher],
+    outline_threshold: usize,
+    outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
 ) -> String {
     let mut dirs: Vec<&GlobEntry> = entries.iter().filter(|e| e.is_dir).collect();
@@ -1617,7 +1632,14 @@ fn render_dir_listing_with_flags(
     }
 
     for f in &files {
-        let flags = compute_entry_flags(f, ts_index, maps_threshold, maps_deny, fs_manager, false);
+        let flags = compute_entry_flags(
+            f,
+            ts_index,
+            outline_threshold,
+            outline_suppress,
+            fs_manager,
+            false,
+        );
         render_entry_line(&mut result, f, &flags);
     }
 
@@ -1636,7 +1658,7 @@ fn render_dir_listing_with_maps(
     children_sets: &HashMap<PathBuf, HashSet<String>>,
     ts_index: &TsIndex,
     ts_opt: Option<&TsIndex>,
-    maps_deny: &[globset::GlobMatcher],
+    outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
 ) -> String {
     let mut dirs: Vec<&GlobEntry> = entries.iter().filter(|e| e.is_dir).collect();
@@ -1690,7 +1712,7 @@ fn render_dir_listing_with_maps(
             let (mi_indices, bounding) = &shared_groups[gi];
             render_shared_group(&mut result, &map_items, mi_indices, bounding, "", "\t");
         } else if individual_entries.contains(&idx) {
-            let flags = compute_entry_flags(f, ts_opt, 0, maps_deny, fs_manager, true);
+            let flags = compute_entry_flags(f, ts_opt, 0, outline_suppress, fs_manager, true);
             render_entry_line(&mut result, f, &flags);
             if let Some(syms) = outline.get(&f.abs_path) {
                 let cs = children_sets.get(&f.abs_path);
@@ -1699,7 +1721,7 @@ fn render_dir_listing_with_maps(
         } else {
             // Non-eligible file.
             let has_sa = has_grammar_available(&f.abs_path, ts_opt)
-                && is_maps_denied(&f.abs_path, maps_deny, fs_manager);
+                && is_outline_suppressed(&f.abs_path, outline_suppress, fs_manager);
             let mut flags = Vec::new();
             if has_sa {
                 flags.push("symbols available");
@@ -1724,8 +1746,8 @@ fn render_dir_listing_with_maps(
 fn compute_entry_flags<'a>(
     entry: &GlobEntry,
     ts_index: Option<&TsIndex>,
-    maps_threshold: usize,
-    maps_deny: &[globset::GlobMatcher],
+    outline_threshold: usize,
+    outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
     map_rendered: bool,
 ) -> Vec<&'a str> {
@@ -1743,14 +1765,14 @@ fn compute_entry_flags<'a>(
 
     if !map_rendered
         && has_grammar_available(&entry.abs_path, ts_index)
-        && entry.line_count.is_some_and(|lc| lc >= maps_threshold)
+        && entry.line_count.is_some_and(|lc| lc >= outline_threshold)
     {
         flags.push("symbols available");
     }
 
     if map_rendered
         && has_grammar_available(&entry.abs_path, ts_index)
-        && is_maps_denied(&entry.abs_path, maps_deny, fs_manager)
+        && is_outline_suppressed(&entry.abs_path, outline_suppress, fs_manager)
     {
         flags.push("symbols available");
     }

@@ -207,8 +207,8 @@ impl Toolbox {
             ts_index: ts_index.clone(),
             budget: grep_budget,
         };
-        let maps_deny: Vec<globset::GlobMatcher> = glob_config
-            .maps_deny
+        let outline_suppress: Vec<globset::GlobMatcher> = glob_config
+            .outline_suppress_patterns
             .iter()
             .filter_map(|pat| {
                 let effective = if pat.contains('/') {
@@ -226,8 +226,8 @@ impl Toolbox {
             fs_manager: fs_manager.clone(),
             ts_index: ts_index.clone(),
             budget: glob_budget,
-            maps_threshold: glob_config.maps_threshold,
-            maps_deny,
+            outline_threshold: glob_config.outline_threshold,
+            outline_suppress,
         };
         Self {
             grep,

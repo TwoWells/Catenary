@@ -112,7 +112,7 @@ sed = "Use {edit} instead"
 
 # [tools.glob]
 # budget = 2000
-# maps_threshold = 200
+# outline_threshold = 200
 "#;
 
 /// Print the recommended config template to stdout.
