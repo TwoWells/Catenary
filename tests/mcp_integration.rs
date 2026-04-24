@@ -3790,3 +3790,124 @@ fn test_grep_tier1_single_line_ref() -> Result<()> {
 
     Ok(())
 }
+
+// ─── Cancellation tests ──────────────────────────────────────────────
+
+/// Sends `notifications/cancelled` while a `tools/call` is in progress.
+///
+/// Uses `--response-delay 2000` so the LSP server takes 2 seconds per
+/// response, giving the reader thread time to process the cancellation
+/// before the tool call completes. Verifies:
+/// 1. The response is JSON-RPC error −32800 (`RequestCancelled`).
+/// 2. The bridge is still functional afterward (responds to `ping`).
+#[test]
+fn test_mcp_cancel_inflight_tool_call() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    // Create a file so grep has something to match.
+    let file = dir.path().join(format!("cancel_test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn cancel_target\ncancel_target\n")?;
+
+    // --response-delay 2000: every LSP response takes 2s, so the grep
+    // tool call blocks long enough for cancellation to arrive.
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --response-delay 2000");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Send tools/call — this blocks the bridge's main loop.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 9900,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "cancel_target" }
+        }
+    }))?;
+
+    // Immediately send cancellation — the reader thread processes this
+    // while call_tool is blocked waiting on slow LSP responses.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 9900, "reason": "integration test" }
+    }))?;
+
+    let response = bridge.recv()?;
+
+    // Should be a JSON-RPC error with code -32800.
+    assert!(
+        response.get("error").is_some(),
+        "expected error response, got: {response}"
+    );
+    assert_eq!(
+        response["error"]["code"], -32800,
+        "expected -32800 RequestCancelled, got: {response}"
+    );
+
+    // Bridge should still be functional after cancellation.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 9901,
+        "method": "ping"
+    }))?;
+    let ping_response = bridge.recv()?;
+    assert!(
+        ping_response.get("result").is_some(),
+        "bridge should respond to ping after cancellation: {ping_response}"
+    );
+
+    Ok(())
+}
+
+/// Cancellation for a request that already completed is a no-op.
+///
+/// The bridge should not crash or return an error when it receives
+/// `notifications/cancelled` for a request that already has a response.
+#[test]
+fn test_mcp_cancel_already_completed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Send a fast tool call and wait for completion.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 9910,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "nonexistent_xyz" }
+        }
+    }))?;
+    let response = bridge.recv()?;
+    assert!(
+        response.get("result").is_some(),
+        "grep should succeed: {response}"
+    );
+
+    // Now send cancellation for the already-completed request.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 9910 }
+    }))?;
+
+    // Bridge should still work — send another tool call.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 9911,
+        "method": "ping"
+    }))?;
+    let ping_response = bridge.recv()?;
+    assert!(
+        ping_response.get("result").is_some(),
+        "bridge should respond after late cancellation: {ping_response}"
+    );
+
+    Ok(())
+}

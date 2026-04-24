@@ -200,8 +200,9 @@ impl<H: ToolHandler> McpServer<H> {
         while let Ok(line) = rx.recv() {
             trace!("Received: {}", line);
 
-            // Log incoming message
-            let (correlation_id, method) =
+            // Log incoming message and extract request ID for
+            // cancellation pre-registration.
+            let (correlation_id, method, mcp_request_id) =
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                     let method = json
                         .get("method")
@@ -217,13 +218,27 @@ impl<H: ToolHandler> McpServer<H> {
                         &json.to_string(),
                         "incoming",
                     );
-                    (id.0, method)
+                    // Extract request ID for requests (has both `id` and `method`).
+                    let rid = if json.get("method").is_some() {
+                        json.get("id")
+                            .and_then(|v| serde_json::from_value::<RequestId>(v.clone()).ok())
+                    } else {
+                        None
+                    };
+                    (id.0, method, rid)
                 } else {
-                    (0, String::new())
+                    (0, String::new(), None)
                 };
 
             self.current_correlation_id = correlation_id;
             self.dispatch_message(&line, &mut writer, correlation_id, &method)?;
+
+            // Clean up the cancel token after dispatch completes.
+            if let Some(ref rid) = mcp_request_id
+                && let Ok(mut map) = self.cancel_map.lock()
+            {
+                map.remove(rid);
+            }
 
             // Check if the hook server requested a roots refresh
             if self.refresh_roots.swap(false, Ordering::Acquire) {
@@ -261,16 +276,26 @@ impl<H: ToolHandler> McpServer<H> {
                         continue;
                     }
 
-                    // Detect notifications/cancelled and trigger the
-                    // matching token before forwarding the message. This
-                    // ensures the token fires while the main loop is still
-                    // blocked inside `call_tool`.
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&trimmed)
-                        && json.get("method").and_then(|m| m.as_str())
+                    // Pre-register cancel tokens and trigger cancellations
+                    // on the same thread to eliminate the race between
+                    // "request arrives" and "cancellation arrives".
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&trimmed) {
+                        if json.get("method").and_then(|m| m.as_str())
                             == Some("notifications/cancelled")
-                        && json.get("id").is_none()
-                    {
-                        Self::trigger_cancellation(&json, cancel_map);
+                            && json.get("id").is_none()
+                        {
+                            Self::trigger_cancellation(&json, cancel_map);
+                        } else if json.get("id").is_some()
+                            && json.get("method").is_some()
+                            && let Ok(rid) = serde_json::from_value::<RequestId>(json["id"].clone())
+                        {
+                            // Request: pre-register a cancel token so a
+                            // subsequent cancellation (possibly the very
+                            // next line) can find it immediately.
+                            if let Ok(mut map) = cancel_map.lock() {
+                                map.entry(rid).or_insert_with(CancellationToken::new);
+                            }
+                        }
                     }
 
                     if tx.send(trimmed).is_err() {
@@ -510,23 +535,20 @@ impl<H: ToolHandler> McpServer<H> {
 
         debug!("Calling tool: {}", params.name);
 
-        // Register a cancellation token so the reader thread can
-        // trigger it if `notifications/cancelled` arrives for this
-        // request while the tool call is in progress.
-        let cancel = CancellationToken::new();
-        if let Ok(mut map) = self.cancel_map.lock() {
-            map.insert(request.id.clone(), cancel.clone());
-        }
+        // Look up the cancel token pre-registered by the run() loop.
+        // If the map was poisoned or the entry is missing (shouldn't
+        // happen), fall back to a token that never fires.
+        let cancel = self
+            .cancel_map
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&request.id).cloned())
+            .unwrap_or_default();
 
         let parent_id = Some(self.current_correlation_id);
         let result = self
             .handler
             .call_tool(&params.name, params.arguments, parent_id, &cancel);
-
-        // Clean up regardless of outcome.
-        if let Ok(mut map) = self.cancel_map.lock() {
-            map.remove(&request.id);
-        }
 
         match result {
             Ok(result) => Ok(Response::success(request.id, result)?),
