@@ -176,6 +176,12 @@ impl GrepServer {
     /// For each file without cached symbols, opens the document on the
     /// server, requests `documentSymbol`, and feeds the response to the
     /// index.
+    ///
+    /// Not deduplicated against concurrent callers — if parallel MCP tool
+    /// calls request the same file, both will do the LSP round-trip. The
+    /// index write is serialized by `Mutex` so the result is correct, just
+    /// redundant. To optimize: add a `pending: Mutex<HashSet<PathBuf>>` to
+    /// `SymbolIndex` and skip files already in-flight.
     async fn ensure_symbols(&self, files: &[PathBuf]) {
         let Some(ref idx_arc) = self.symbol_index else {
             return;
