@@ -49,7 +49,7 @@ same server to get full coverage for `.jsx` files:
 
 ```toml
 [language.javascriptreact]
-servers = ["typescript-language-server"]
+servers = ["tsserver"]
 ```
 
 ## Links

@@ -40,6 +40,30 @@ servers = ["bash-ls"]
 - Provides completions for commands, variables, and functions
 - Integrates with [ShellCheck](https://www.shellcheck.net/) for linting (install separately)
 
+## Multi-server: PKGBUILD Files
+
+For PKGBUILD and other packaging scripts, combine `bash-language-server`
+with [termux-language-server](termux.md) for enhanced support:
+
+```toml
+[server.bash-ls]
+command = "bash-language-server"
+args = ["start"]
+
+[server.termux-ls]
+command = "termux-language-server"
+args = ["--stdio"]
+file_patterns = ["PKGBUILD", "*.ebuild"]
+
+[language.shellscript]
+servers = ["termux-ls", "bash-ls"]
+```
+
+`termux-ls` is tried first for PKGBUILD and ebuild files, with
+`bash-ls` filling in for methods termux doesn't handle. See
+[Dispatch Filtering](../configuration.md#dispatch-filtering)
+for details on `file_patterns`.
+
 ## Optional: ShellCheck Integration
 
 For better diagnostics, install ShellCheck:

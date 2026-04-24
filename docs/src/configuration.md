@@ -5,7 +5,7 @@ Catenary loads configuration from multiple sources, in order of priority
 
 1. **Defaults**: `log_retention_days = 7`.
 2. **User config**: `~/.config/catenary/config.toml`.
-3. **Project config**: `.catenary.toml` in the current directory or any parent (searches upward).
+3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `/add-dir`). Scoped to `[language.*]` and `[server.*]` sections only — all other sections are user-level.
 4. **Explicit file**: `--config <path>`.
 5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_LOG_RETENTION_DAYS=30`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 
@@ -105,12 +105,166 @@ When pyright sends `workspace/configuration` with
 
 Items with no matching path receive `{}`.
 
+### Diagnostic Severity
+
+`min_severity` on `[server.*]` filters which diagnostics are delivered to
+agents. Valid values: `"error"`, `"warning"`, `"information"`, `"hint"`.
+When absent, all severities are delivered.
+
+```toml
+[server.marksman]
+command = "marksman"
+args = ["server"]
+min_severity = "warning"
+```
+
+### Multi-server Bindings
+
+The `servers` list on `[language.*]` supports multiple servers. List order
+defines dispatch priority — for request/response methods, Catenary tries
+each server in order and returns the first non-empty result.
+
+```toml
+[language.shellscript]
+servers = ["termux-ls", "bash-ls"]
+```
+
+To suppress diagnostics from a specific server, use inline-table syntax:
+
+```toml
+[language.shellscript]
+servers = [
+    "termux-ls",
+    { name = "bash-ls", diagnostics = false },
+]
+```
+
+Bare strings expand to `{ name = "...", diagnostics = true }`.
+
+To suppress all diagnostics for a language, set `diagnostics = false` on the
+language entry:
+
+```toml
+[language.markdown]
+servers = ["marksman"]
+diagnostics = false
+```
+
+Precedence: `language.diagnostics AND binding.diagnostics`. Either `false`
+suppresses delivery.
+
+| `[language.*].diagnostics` | Per-binding `diagnostics` | Effective |
+|---|---|---|
+| unset / `true` | unset / `true` | deliver |
+| `false` | any | suppress (language-wide) |
+| unset / `true` | `false` | suppress (per-server) |
+
+### Dispatch Filtering
+
+`file_patterns` on `[server.*]` narrows which files a server handles
+within its language. Patterns match against the filename (not the full path).
+Servers without `file_patterns` handle all files for their language.
+
+```toml
+[server.termux-ls]
+command = "termux-language-server"
+args = ["--stdio"]
+file_patterns = ["PKGBUILD", "*.ebuild"]
+
+[server.bash-ls]
+command = "bash-language-server"
+args = ["start"]
+
+[language.shellscript]
+servers = ["termux-ls", "bash-ls"]
+```
+
+Here, `termux-ls` only receives PKGBUILD and `*.ebuild` files.
+`bash-ls` has no `file_patterns`, so it handles all shellscript files.
+For a PKGBUILD file, both servers are active — `termux-ls` is tried
+first (higher priority), with `bash-ls` as fallback.
+
+### Custom Languages
+
+Define a custom language by adding a `[language.*]` entry with
+classification fields and a server binding:
+
+```toml
+[language.pkgbuild]
+filenames = ["PKGBUILD"]
+servers = ["termux-ls"]
+```
+
+Classification fields:
+
+- `extensions` — file extensions without the dot (e.g., `["sh", "bash"]`)
+- `filenames` — exact filename matches (e.g., `["PKGBUILD", "Makefile"]`)
+- `shebangs` — interpreter basenames for `#!` detection (e.g., `["bash", "sh"]`)
+
+Setting a field replaces the default value (if any). Fields not specified
+inherit from the default classification. Setting a field to an empty list
+clears the default.
+
+Classification precedence (highest first): shebang > filename > extension.
+
+## Project Configuration
+
+Place a `.catenary.toml` in a workspace root to override language and
+server configuration for that root. Only `[language.*]` and `[server.*]`
+sections are allowed — all other sections (`[commands]`, `[notifications]`,
+`[icons]`, etc.) are user-level and belong in `~/.config/catenary/config.toml`.
+
+Project config is discovered when roots are added (at startup or via
+`/add-dir`). Changes to `.catenary.toml` require restarting the session.
+
+### Merge Semantics
+
+Project config is deep-merged with user config at the key level:
+
+- **Scalars replace** — `command`, `args`, `min_severity`.
+- **Tables deep-merge by key** — a project `[server.rust]` with just
+  `settings` inherits `command` and `args` from the user's `[server.rust]`.
+- **Arrays replace** — `servers`, `file_patterns`, `extensions`,
+  `filenames`, `shebangs`.
+
+### Example
+
+Override rust-analyzer settings for a specific project:
+
+```toml
+# .catenary.toml (in project root)
+[server.rust.settings.rust-analyzer]
+check.targets = ["aarch64-unknown-linux-gnu"]
+cargo.features = ["embedded"]
+```
+
+This merges with the user's `[server.rust]` definition — the project
+inherits `command`, `args`, and `initialization_options` from user config,
+and overrides only the `settings` subtree.
+
+### Tier Promotion
+
+Adding a `[language.*]` entry in project config promotes that language
+to a project-scoped server instance — a separate process bound to this
+root. Without a `[language.*]` entry, the user's shared server instance
+serves this root with `scopeUri`-merged settings.
+
+```toml
+# .catenary.toml — promotes rust to a project-scoped instance
+[language.rust]
+servers = ["rust"]
+
+[server.rust.settings.rust-analyzer]
+cargo.features = ["embedded"]
+```
+
 ## Language IDs
 
 The `[language.<language-id>]` key in the language section must match the LSP language identifier.
 Catenary auto-detects languages from file extensions, filenames, and
 shebangs (`#!` lines in extensionless scripts). Any language with an LSP
 server works — this table covers what Catenary recognises automatically.
+To extend or override these defaults, see [Custom Languages](#custom-languages).
 
 ### By extension
 
