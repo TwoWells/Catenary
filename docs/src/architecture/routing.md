@@ -129,7 +129,7 @@ semantics.
 
 ### Request/response — priority chain
 
-For methods like `textDocument/hover`, `textDocument/definition`, and
+For methods like `textDocument/definition` and
 `textDocument/references`, the `servers` list order in `[language.*]`
 defines priority. Dispatch iterates servers in that order:
 

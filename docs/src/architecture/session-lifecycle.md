@@ -112,8 +112,8 @@ call follows this sequence:
    the right server(s) for each file, wait for readiness, open
    documents, send LSP requests, and collect responses. Multi-server
    languages use priority-chain dispatch for request/response methods
-   (first capable server wins) and union dispatch for list methods
-   (results merged with deduplication).
+   (first non-empty result wins) and diagnostic concatenation (all
+   enabled servers contribute).
 
 4. **Result return.** The tool server returns a structured result
    through MCP.
