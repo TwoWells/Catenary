@@ -142,8 +142,10 @@ Key responsibilities:
 
 ### LspClient — high-level operations
 
-`LspClient` owns a `Connection` and an `Arc<LspServer>`. It provides
-typed methods that compose connection sends with server state:
+`LspClient` owns an `Arc<LspServer>` and accesses the `Connection`
+through it (`server.request()` delegates to `connection().request()`).
+It provides typed methods that compose connection sends with server
+state:
 
 ```rust
 pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Value>
