@@ -3,13 +3,16 @@ name: Deploy Docs
 on:
   push:
     branches: [main]
+    tags: ['v*']
     paths:
       - 'docs/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: "pages"
@@ -18,19 +21,51 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup mdBook
-        uses: peaceiris/actions-mdbook@v2
-        with:
-          mdbook-version: 'latest'
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/latest/download/mdbook-v0.4.44-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          echo "$PWD" >> "$GITHUB_PATH"
 
-      - name: Build docs
-        run: mdbook build docs
+      - name: Prepare site directory
+        run: mkdir -p site/stable site/dev
+
+      - name: Build stable docs (latest tag)
+        run: |
+          LATEST_TAG=$(git tag --sort=-v:refname | head -1)
+          echo "Building stable docs from $LATEST_TAG"
+          git checkout "$LATEST_TAG" -- docs/
+          mdbook build docs
+          cp -r docs/book/* site/stable/
+          git checkout HEAD -- docs/
+
+      - name: Build dev docs (current ref)
+        run: |
+          mdbook build docs
+          cp -r docs/book/* site/dev/
+
+      - name: Create root redirect
+        run: |
+          cat > site/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html>
+            <head><meta http-equiv="refresh" content="0; url=stable/"></head>
+            <body><a href="stable/">Redirecting to stable docs…</a></body>
+          </html>
+          HTML
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
 
       - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: docs/book
+        id: deployment
+        uses: actions/deploy-pages@v4
