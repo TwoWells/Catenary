@@ -204,6 +204,86 @@ fn expand_alternation(pattern: &str) -> Vec<String> {
         .collect()
 }
 
+/// A node in the display tree for `into` output rendering.
+///
+/// Handles both flat (single directory) and nested (multi-directory)
+/// output automatically based on the file set structure.
+struct IntoDisplayNode {
+    dirs: BTreeMap<String, Self>,
+    files: Vec<PathBuf>,
+}
+
+impl IntoDisplayNode {
+    const fn new() -> Self {
+        Self {
+            dirs: BTreeMap::new(),
+            files: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, components: &[&str], abs_path: PathBuf) {
+        if components.len() <= 1 {
+            self.files.push(abs_path);
+        } else {
+            let dir = self
+                .dirs
+                .entry(components[0].to_owned())
+                .or_insert_with(Self::new);
+            dir.insert(&components[1..], abs_path);
+        }
+    }
+
+    /// Returns true if this tree has any directory structure (needs nesting).
+    fn has_dirs(&self) -> bool {
+        !self.dirs.is_empty()
+    }
+}
+
+/// Builds a display tree from file paths, stripping their common prefix.
+///
+/// Returns `(common_prefix_display, tree)`. The common prefix is shown
+/// as a header when the tree has directory structure.
+fn build_into_display_tree(files: &[&PathBuf]) -> (Option<String>, IntoDisplayNode) {
+    if files.is_empty() {
+        return (None, IntoDisplayNode::new());
+    }
+
+    // Convert all paths to owned string components for comparison.
+    let paths_lossy: Vec<String> = files
+        .iter()
+        .map(|f| f.to_string_lossy().to_string())
+        .collect();
+    let all_components: Vec<Vec<&str>> =
+        paths_lossy.iter().map(|s| s.split('/').collect()).collect();
+
+    // Find the common directory prefix (excluding filename).
+    let first = &all_components[0];
+    let mut common_len = 0;
+    'outer: for i in 0..first.len().saturating_sub(1) {
+        for comps in &all_components {
+            if i >= comps.len() || comps[i] != first[i] {
+                break 'outer;
+            }
+        }
+        common_len = i + 1;
+    }
+
+    let mut tree = IntoDisplayNode::new();
+    for (fi, comps) in all_components.iter().enumerate() {
+        let rel: Vec<&str> = comps[common_len..].to_vec();
+        tree.insert(&rel, files[fi].clone());
+    }
+
+    // Show the common prefix as a header when the tree has subdirectories.
+    let prefix = if common_len > 0 && tree.has_dirs() {
+        Some(format!("{}/", first[..common_len].join("/")))
+    } else {
+        None
+    };
+
+    (prefix, tree)
+}
+
 /// Converts a kind filter from display format back to the capture suffix
 /// stored in the index. `"Impl"` → `"implementation"`, others lowercase.
 fn kind_to_capture(kind: &str) -> String {
@@ -488,14 +568,7 @@ impl ToolServer for GlobServer {
         if let Some(ref into_str) = input.into {
             let after_line = input.cursor.as_deref().map(decode_cursor).transpose()?;
             let files = self.resolve_files(&path, &pattern, &input, exclude.as_ref())?;
-            // For glob patterns, compute a root for relative path display.
-            let display_root = if !path.is_file() && !path.is_dir() {
-                // Glob pattern: use workspace roots for relative paths.
-                self.client_manager.roots().into_iter().next()
-            } else {
-                None
-            };
-            let output = self.handle_into(&files, into_str, after_line, display_root.as_deref())?;
+            let output = self.handle_into(&files, into_str, after_line)?;
             return Ok(Value::String(output));
         }
 
@@ -1048,7 +1121,6 @@ impl GlobServer {
         files: &[PathBuf],
         into: &str,
         after_line: Option<u32>,
-        display_root: Option<&Path>,
     ) -> Result<String> {
         let Some(ref ts_arc) = self.ts_index else {
             return Err(anyhow!("`into` requires a tree-sitter index"));
@@ -1169,7 +1241,6 @@ impl GlobServer {
             &idx,
             self.budget,
             after_line,
-            display_root,
         );
 
         Ok(result)
@@ -1709,8 +1780,10 @@ fn render_into_results(
     ts_index: &TsIndex,
     budget: usize,
     after_line: Option<u32>,
-    display_root: Option<&Path>,
 ) -> String {
+    // Build display tree for proper directory structure.
+    let (prefix, tree) = build_into_display_tree(files);
+
     // Tier 3 (bucketed): file names with counts.
     let file_names: Vec<String> = files
         .iter()
@@ -1719,7 +1792,7 @@ fn render_into_results(
     let tier3 = render_bucketed(&file_names, budget);
 
     // Tier 2 (degraded): target symbols with spans, no children.
-    let tier2 = render_into_tier2(files, chains, ts_index, display_root);
+    let tier2 = render_into_tree(&tree, prefix.as_deref(), chains, ts_index, false);
     if tier2.len() > budget {
         return tier3;
     }
@@ -1728,14 +1801,22 @@ fn render_into_results(
     let dedup = compute_into_dedup(files, targets, chains, ts_index);
 
     // Tier 1 (full): target symbols with children + dedup.
-    let tier1 = render_into_tier1(files, targets, chains, ts_index, &dedup, display_root);
-    if tier1.len() <= budget {
-        return tier1;
-    }
-
-    // Tier 1 exceeds budget — page if single file.
-    if files.len() == 1 {
-        return page_into_output(&tier1, budget, after_line);
+    if dedup.shared.is_empty() {
+        // No dedup needed — render tree with children.
+        let tier1 = render_into_tree(&tree, prefix.as_deref(), chains, ts_index, true);
+        if tier1.len() <= budget {
+            return tier1;
+        }
+        if files.len() == 1 {
+            return page_into_output(&tier1, budget, after_line);
+        }
+    } else {
+        // Dedup groups exist — render flat with dedup (tree + dedup
+        // interaction is complex; flat rendering is correct).
+        let tier1 = render_into_tier1_dedup(files, targets, chains, ts_index, &dedup);
+        if tier1.len() <= budget {
+            return tier1;
+        }
     }
 
     tier2
@@ -1865,73 +1946,158 @@ struct IntoDedup {
     shared: Vec<Vec<usize>>,
 }
 
-/// Renders `into` tier 2 (degraded): target symbols at their chain
-/// positions, no children expansion.
-fn render_into_tier2(
-    files: &[&PathBuf],
+/// Renders `into` output using the display tree for proper nesting.
+///
+/// When `expand_children` is false, renders tier 2 (no children).
+/// When true, renders tier 1 (with children expansion).
+fn render_into_tree(
+    node: &IntoDisplayNode,
+    prefix: Option<&str>,
     chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
     ts_index: &TsIndex,
-    display_root: Option<&Path>,
+    expand_children: bool,
 ) -> String {
     let mut out = String::new();
 
-    for &path in files {
-        let Some(file_chains) = chains.get(path) else {
+    if let Some(pfx) = prefix {
+        let _ = writeln!(out, "{pfx}");
+        render_into_tree_node(&mut out, node, chains, ts_index, expand_children, 1);
+    } else {
+        render_into_tree_node(&mut out, node, chains, ts_index, expand_children, 0);
+    }
+
+    out
+}
+
+/// Recursively renders an `IntoDisplayNode` with directory nesting.
+fn render_into_tree_node(
+    out: &mut String,
+    node: &IntoDisplayNode,
+    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
+    ts_index: &TsIndex,
+    expand_children: bool,
+    depth: usize,
+) {
+    let indent: String = "\t".repeat(depth);
+
+    // Render subdirectories first.
+    for (name, child) in &node.dirs {
+        let _ = writeln!(out, "{indent}{name}/");
+        render_into_tree_node(out, child, chains, ts_index, expand_children, depth + 1);
+    }
+
+    // Render files.
+    let mut sorted: Vec<&PathBuf> = node.files.iter().collect();
+    sorted.sort();
+
+    for path in sorted {
+        let Some(file_chains) = chains.get(path.as_path()) else {
             continue;
         };
         if file_chains.is_empty() {
             continue;
         }
 
-        let _ = writeln!(out, "{}", into_display_name(path, display_root));
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let _ = writeln!(out, "{indent}{name}");
 
-        // Build children set for trailing `/` detection.
         let children_set = build_children_set_for_file(ts_index, path);
+        let sym_depth = depth + 1;
 
-        // Merge chains into a tree for dedup rendering.
-        render_chains_merged(&mut out, file_chains, &children_set, false, ts_index, path);
+        render_chains_at_depth(
+            out,
+            file_chains,
+            &children_set,
+            expand_children,
+            ts_index,
+            path,
+            sym_depth,
+        );
     }
-
-    out
 }
 
-/// Renders `into` tier 1 (full): target symbols with children shown.
+/// Renders chains at a specific indentation depth.
+fn render_chains_at_depth(
+    out: &mut String,
+    file_chains: &[Vec<TsSymbol>],
+    children_set: &HashSet<String>,
+    expand_children: bool,
+    ts_index: &TsIndex,
+    file_path: &Path,
+    base_depth: usize,
+) {
+    let max_chain = file_chains.iter().map(Vec::len).max().unwrap_or(0);
+    if max_chain == 0 {
+        return;
+    }
+
+    if max_chain == 1 {
+        let mut seen_lines: HashSet<u32> = HashSet::new();
+        let indent: String = "\t".repeat(base_depth);
+        let child_indent: String = "\t".repeat(base_depth + 1);
+        for chain in file_chains {
+            let sym = &chain[0];
+            if !seen_lines.insert(sym.line) {
+                continue;
+            }
+            render_into_symbol(out, sym, children_set, &indent);
+            if expand_children {
+                render_target_children(out, sym, children_set, ts_index, file_path, &child_indent);
+            }
+        }
+        return;
+    }
+
+    render_chain_tree(
+        out,
+        file_chains,
+        0,
+        children_set,
+        expand_children,
+        ts_index,
+        file_path,
+        base_depth,
+    );
+}
+
+/// Renders `into` tier 1 with structure dedup (flat, no tree nesting).
 ///
-/// Applies structure dedup: files with identical target children are
-/// grouped under one representative with bounding ranges.
-fn render_into_tier1(
+/// Used when dedup groups exist — tree structure would fragment the groups.
+fn render_into_tier1_dedup(
     files: &[&PathBuf],
     targets: &HashMap<PathBuf, Vec<TsSymbol>>,
     chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
     ts_index: &TsIndex,
     dedup: &IntoDedup,
-    display_root: Option<&Path>,
 ) -> String {
     let mut out = String::new();
     let mut rendered_in_group: HashSet<usize> = HashSet::new();
 
-    // Render shared groups first: list files, then show one representative.
     for group in &dedup.shared {
         for &fi in group {
-            let _ = writeln!(out, "{}", into_display_name(files[fi], display_root));
+            let name = files[fi]
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let _ = writeln!(out, "{name}");
             rendered_in_group.insert(fi);
         }
 
-        // Render using the first file as representative.
         let rep = files[group[0]];
         if let Some(file_chains) = chains.get(rep) {
             let children_set = build_children_set_for_file(ts_index, rep);
             let _ = writeln!(out, "common structure (ranges are bounding):");
-            render_chains_merged(&mut out, file_chains, &children_set, true, ts_index, rep);
+            render_chains_at_depth(&mut out, file_chains, &children_set, true, ts_index, rep, 1);
         }
     }
 
-    // Render individual files.
     for (i, &path) in files.iter().enumerate() {
         if rendered_in_group.contains(&i) {
             continue;
         }
-
         let Some(file_chains) = chains.get(path) else {
             continue;
         };
@@ -1940,89 +2106,39 @@ fn render_into_tier1(
         }
 
         let file_targets = targets.get(path);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
 
-        // File header.
-        let display = into_display_name(path, display_root);
-
-        // Special case: single-segment into="*" style — show line count.
         let show_line_count =
             file_chains.iter().all(|c| c.len() == 1) && file_targets.is_some_and(|t| t.len() > 2);
         if show_line_count {
-            let line_count = std::fs::read_to_string(path)
+            let lc = std::fs::read_to_string(path)
                 .ok()
-                .map(|content| content.lines().count());
-            if let Some(lc) = line_count {
-                let _ = writeln!(out, "{display}  ({lc} lines)");
+                .map(|c| c.lines().count());
+            if let Some(lc) = lc {
+                let _ = writeln!(out, "{name}  ({lc} lines)");
             } else {
-                let _ = writeln!(out, "{display}");
+                let _ = writeln!(out, "{name}");
             }
         } else {
-            let _ = writeln!(out, "{display}");
+            let _ = writeln!(out, "{name}");
         }
 
-        // Build children set for trailing `/` detection.
         let children_set = build_children_set_for_file(ts_index, path);
-
-        // Merge chains and render with children expansion.
-        render_chains_merged(&mut out, file_chains, &children_set, true, ts_index, path);
+        render_chains_at_depth(
+            &mut out,
+            file_chains,
+            &children_set,
+            true,
+            ts_index,
+            path,
+            1,
+        );
     }
 
     out
-}
-
-/// Renders merged chains for a single file.
-///
-/// Chains sharing prefix symbols are merged to avoid duplicate output.
-/// If `expand_children` is true, the deepest target's children are shown.
-fn render_chains_merged(
-    out: &mut String,
-    chains: &[Vec<TsSymbol>],
-    children_set: &HashSet<String>,
-    expand_children: bool,
-    ts_index: &TsIndex,
-    file_path: &Path,
-) {
-    if chains.is_empty() {
-        return;
-    }
-
-    let max_depth = chains.iter().map(Vec::len).max().unwrap_or(0);
-
-    if max_depth == 0 {
-        return;
-    }
-
-    // For single-depth chains (single segment `into`), render targets
-    // directly. For multi-depth, render the tree structure.
-    if max_depth == 1 {
-        // All chains have exactly one symbol (the target).
-        let mut seen_lines: HashSet<u32> = HashSet::new();
-        for chain in chains {
-            let sym = &chain[0];
-            if !seen_lines.insert(sym.line) {
-                continue;
-            }
-            render_into_symbol(out, sym, children_set, "\t");
-
-            if expand_children {
-                render_target_children(out, sym, children_set, ts_index, file_path, "\t\t");
-            }
-        }
-        return;
-    }
-
-    // Multi-depth: build and render a tree.
-    // Group by first symbol, then recurse.
-    render_chain_tree(
-        out,
-        chains,
-        0,
-        children_set,
-        expand_children,
-        ts_index,
-        file_path,
-        1,
-    );
 }
 
 /// Recursively renders a chain tree at the given depth level.
@@ -2184,22 +2300,6 @@ fn query_with_alternation(
     }
 
     Ok(merged)
-}
-
-/// Computes the display name for a file in `into` output.
-///
-/// With a `display_root`, shows the relative path (for glob patterns).
-/// Without, shows just the file name (for single file / directory).
-fn into_display_name(path: &Path, display_root: Option<&Path>) -> String {
-    if let Some(root) = display_root
-        && let Ok(rel) = path.strip_prefix(root)
-    {
-        return rel.to_string_lossy().to_string();
-    }
-    path.file_name().map_or_else(
-        || path.to_string_lossy().to_string(),
-        |n| n.to_string_lossy().to_string(),
-    )
 }
 
 /// Builds a children set (names that appear as scope) for a single file.
