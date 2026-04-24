@@ -1993,6 +1993,46 @@ fn test_into_bypasses_outline_suppress() -> Result<()> {
 }
 
 #[test]
+fn test_glob_deprecated_tag() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // File with a deprecated symbol — mockls sets tags: [1] for @deprecated.
+    let file = dir.path().join(format!("depr_map.{MOCK_EXT}"));
+    std::fs::write(
+        &file,
+        "fn active_fn\nfn old_fn @deprecated\nstruct Current\n",
+    )?;
+
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    // Single-file glob — should render a defensive map with deprecated tags.
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": file.to_str().context("file path")? }),
+    )?;
+
+    // Deprecated symbol should show `<Kind, deprecated>`.
+    assert!(
+        text.contains("<Function, deprecated>"),
+        "Deprecated symbol should show <Kind, deprecated>: {text}"
+    );
+    assert!(
+        text.contains("old_fn"),
+        "Should show deprecated symbol name: {text}"
+    );
+    // Non-deprecated symbols should NOT have the tag.
+    assert!(
+        text.contains("<Function> active_fn"),
+        "Non-deprecated symbol should not have tag: {text}"
+    );
+    assert!(
+        text.contains("<Struct> Current"),
+        "Non-deprecated struct should not have tag: {text}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_into_deprecated() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(

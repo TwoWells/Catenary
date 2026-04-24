@@ -1427,7 +1427,7 @@ fn is_snapshot(name: &str) -> bool {
 
 // ─── Symbol rendering ─────────────────────────────────────────────────
 
-/// Renders a single symbol line: `:start-end <Kind> Name[/]`.
+/// Renders a single symbol line: `:start-end <Kind[, deprecated]> Name[/]`.
 fn render_symbol_line(
     out: &mut String,
     sym: &Symbol,
@@ -1440,9 +1440,10 @@ fn render_symbol_line(
     } else {
         ""
     };
+    let deprecated = if sym.deprecated { ", deprecated" } else { "" };
     let _ = writeln!(
         out,
-        "{indent}:{}-{} <{kind_label}> {}{trailing}",
+        "{indent}:{}-{} <{kind_label}{deprecated}> {}{trailing}",
         sym.line + 1,
         sym.end_line + 1,
         sym.name,
