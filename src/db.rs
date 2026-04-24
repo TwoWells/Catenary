@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Resolve the Catenary state directory.
 ///
@@ -133,6 +133,9 @@ pub fn open_and_migrate_at(path: &Path) -> Result<Connection> {
             if version < 8 {
                 migrate_v7_to_v8(&conn)?;
             }
+            if version < 9 {
+                migrate_v8_to_v9(&conn)?;
+            }
         }
     } else {
         create_schema(&conn)?;
@@ -168,7 +171,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
-         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '8');
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '9');
 
          CREATE TABLE IF NOT EXISTS sessions (
              id             TEXT PRIMARY KEY,
@@ -205,17 +208,19 @@ fn create_schema(conn: &Connection) -> Result<()> {
              session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
              timestamp   TEXT NOT NULL,
              type        TEXT NOT NULL,
+             level       TEXT NOT NULL DEFAULT 'info',
              method      TEXT NOT NULL,
              server      TEXT NOT NULL,
              client      TEXT NOT NULL,
-             request_id  INTEGER REFERENCES messages(id),
-             parent_id   INTEGER REFERENCES messages(id),
+             request_id  INTEGER,
+             parent_id   INTEGER,
              payload     TEXT NOT NULL,
              created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          );
 
          CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
          CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(type);
+         CREATE INDEX IF NOT EXISTS idx_messages_level ON messages(level);
          CREATE INDEX IF NOT EXISTS idx_messages_request_id ON messages(request_id);
          CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id);
 
@@ -481,6 +486,71 @@ fn migrate_v7_to_v8(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates the database from schema version 8 to 9.
+///
+/// Adds a `level` column (tracing severity: `debug`/`info`/`warn`/`error`)
+/// to the `messages` table and drops the foreign-key constraints on
+/// `request_id` / `parent_id`. Those columns hold in-process monotonic
+/// correlation IDs from `LoggingServer::next_id()`, not ROWIDs, so the FK
+/// constraints caused every protocol message INSERT to fail.
+///
+/// `SQLite` does not support `ALTER TABLE … DROP CONSTRAINT`, so the table
+/// is recreated. Existing trace-event rows (whose `type` was a severity
+/// string) get `type = 'internal'` and `level` set to the old `type` value.
+/// Protocol rows keep their `type` and receive `level = 'info'`.
+///
+/// # Errors
+///
+/// Returns an error if the table recreation or version update fails.
+fn migrate_v8_to_v9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         CREATE TABLE messages_new (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             timestamp   TEXT NOT NULL,
+             type        TEXT NOT NULL,
+             level       TEXT NOT NULL DEFAULT 'info',
+             method      TEXT NOT NULL,
+             server      TEXT NOT NULL,
+             client      TEXT NOT NULL,
+             request_id  INTEGER,
+             parent_id   INTEGER,
+             payload     TEXT NOT NULL,
+             created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         );
+
+         INSERT INTO messages_new
+             (id, session_id, timestamp, type, level, method, server, client,
+              request_id, parent_id, payload, created_at)
+         SELECT
+             id, session_id, timestamp,
+             CASE WHEN type IN ('lsp','mcp','hook') THEN type ELSE 'internal' END,
+             CASE WHEN type IN ('lsp','mcp','hook') THEN 'info' ELSE type END,
+             method, server, client,
+             request_id, parent_id,
+             payload, created_at
+         FROM messages;
+
+         DROP TABLE messages;
+         ALTER TABLE messages_new RENAME TO messages;
+
+         CREATE INDEX idx_messages_session ON messages(session_id);
+         CREATE INDEX idx_messages_type ON messages(type);
+         CREATE INDEX idx_messages_level ON messages(level);
+         CREATE INDEX idx_messages_request_id ON messages(request_id);
+         CREATE INDEX idx_messages_parent_id ON messages(parent_id);
+
+         UPDATE meta SET value = '9' WHERE key = 'schema_version';
+
+         COMMIT;",
+    )
+    .context("failed to migrate schema from v8 to v9")?;
+
+    Ok(())
+}
+
 /// Reads the current schema version from the `meta` table.
 ///
 /// # Errors
@@ -567,7 +637,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 8, "schema version should be 8");
+        assert_eq!(version, 9, "schema version should be 9");
     }
 
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -635,7 +705,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 8, "schema version should be 8 after migration");
+        assert_eq!(version, 9, "schema version should be 9 after migration");
 
         for table in &["grammars", "symbols", "file_parse_state"] {
             assert!(
@@ -676,7 +746,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 8, "schema version should be 8 after migration");
+        assert_eq!(version, 9, "schema version should be 9 after migration");
 
         // Verify client_session_id column exists by inserting a row that uses it.
         conn.execute(
@@ -728,7 +798,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 8, "schema version should be 8 after migration");
+        assert_eq!(version, 9, "schema version should be 9 after migration");
 
         assert!(
             table_exists(&conn, "messages"),
@@ -761,10 +831,30 @@ mod tests {
 
         let conn = open_at(&path).expect("open_at failed");
         conn.execute_batch(
-            "BEGIN IMMEDIATE;
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta (key, value) VALUES ('schema_version', '4');
-             COMMIT;",
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, pid INTEGER NOT NULL,
+                 display_name TEXT NOT NULL, started_at TEXT NOT NULL,
+                 ended_at TEXT, alive INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 timestamp   TEXT NOT NULL,
+                 type        TEXT NOT NULL,
+                 method      TEXT NOT NULL,
+                 server      TEXT NOT NULL,
+                 client      TEXT NOT NULL,
+                 request_id  INTEGER REFERENCES messages(id),
+                 parent_id   INTEGER REFERENCES messages(id),
+                 payload     TEXT NOT NULL,
+                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
         )
         .expect("failed to create v4 schema");
         drop(conn);
@@ -772,7 +862,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 8, "schema version should be 8 after migration");
+        assert_eq!(version, 9, "schema version should be 9 after migration");
 
         // Editing tables should be dropped by v6→v7
         assert!(
@@ -794,9 +884,28 @@ mod tests {
         // Create a v6 database with editing tables
         let conn = open_at(&path).expect("open_at failed");
         conn.execute_batch(
-            "BEGIN IMMEDIATE;
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta (key, value) VALUES ('schema_version', '6');
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, pid INTEGER NOT NULL,
+                 display_name TEXT NOT NULL, started_at TEXT NOT NULL,
+                 ended_at TEXT, alive INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 timestamp   TEXT NOT NULL,
+                 type        TEXT NOT NULL,
+                 method      TEXT NOT NULL,
+                 server      TEXT NOT NULL,
+                 client      TEXT NOT NULL,
+                 request_id  INTEGER REFERENCES messages(id),
+                 parent_id   INTEGER REFERENCES messages(id),
+                 payload     TEXT NOT NULL,
+                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
              CREATE TABLE editing_state (
                  session_id  TEXT NOT NULL,
                  agent_id    TEXT NOT NULL DEFAULT '',
@@ -813,7 +922,8 @@ mod tests {
              VALUES ('s1', '', '2026-01-01T00:00:00Z');
              INSERT INTO editing_files (session_id, agent_id, file_path)
              VALUES ('s1', '', '/src/main.rs');
-             COMMIT;",
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
         )
         .expect("failed to create v6 schema");
         drop(conn);
@@ -821,7 +931,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 8, "schema version should be 8 after migration");
+        assert_eq!(version, 9, "schema version should be 9 after migration");
 
         assert!(
             !table_exists(&conn, "editing_state"),
@@ -842,7 +952,8 @@ mod tests {
         // Create a v7 database with old language_servers schema.
         let conn = open_at(&path).expect("open_at failed");
         conn.execute_batch(
-            "BEGIN IMMEDIATE;
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta (key, value) VALUES ('schema_version', '7');
              CREATE TABLE sessions (
@@ -856,6 +967,19 @@ mod tests {
                  ended_at       TEXT,
                  alive          INTEGER NOT NULL DEFAULT 1
              );
+             CREATE TABLE messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 timestamp   TEXT NOT NULL,
+                 type        TEXT NOT NULL,
+                 method      TEXT NOT NULL,
+                 server      TEXT NOT NULL,
+                 client      TEXT NOT NULL,
+                 request_id  INTEGER REFERENCES messages(id),
+                 parent_id   INTEGER REFERENCES messages(id),
+                 payload     TEXT NOT NULL,
+                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
              CREATE TABLE language_servers (
                  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                  name        TEXT NOT NULL,
@@ -866,7 +990,8 @@ mod tests {
              VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
              INSERT INTO language_servers (session_id, name, state)
              VALUES ('s1', 'rust', 'ready');
-             COMMIT;",
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
         )
         .expect("failed to create v7 schema");
         drop(conn);
@@ -874,7 +999,7 @@ mod tests {
         let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
 
         let version = current_schema_version(&conn).expect("failed to read schema version");
-        assert_eq!(version, 8, "schema version should be 8 after migration");
+        assert_eq!(version, 9, "schema version should be 9 after migration");
 
         // Old data should be gone (table was recreated).
         let count: i64 = conn
@@ -943,5 +1068,264 @@ mod tests {
             )
             .expect("query count");
         assert_eq!(count, 2, "should have two entries for same language");
+    }
+
+    /// Helper: create a v8 database with sessions and messages tables
+    /// matching the pre-migration schema (FK constraints, no level column).
+    #[allow(clippy::expect_used, reason = "test helper")]
+    fn create_v8_db(conn: &Connection) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '8');
+             CREATE TABLE sessions (
+                 id             TEXT PRIMARY KEY,
+                 pid            INTEGER NOT NULL,
+                 display_name   TEXT NOT NULL,
+                 client_name    TEXT,
+                 client_version TEXT,
+                 client_session_id TEXT,
+                 started_at     TEXT NOT NULL,
+                 ended_at       TEXT,
+                 alive          INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 timestamp   TEXT NOT NULL,
+                 type        TEXT NOT NULL,
+                 method      TEXT NOT NULL,
+                 server      TEXT NOT NULL,
+                 client      TEXT NOT NULL,
+                 request_id  INTEGER REFERENCES messages(id),
+                 parent_id   INTEGER REFERENCES messages(id),
+                 payload     TEXT NOT NULL,
+                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             CREATE INDEX idx_messages_session ON messages(session_id);
+             CREATE INDEX idx_messages_type ON messages(type);
+             CREATE INDEX idx_messages_request_id ON messages(request_id);
+             CREATE INDEX idx_messages_parent_id ON messages(parent_id);
+             INSERT INTO sessions (id, pid, display_name, started_at)
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect("failed to create v8 schema");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_migrate_v8_to_v9_adds_level_column() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+        let conn = open_at(&path).expect("open_at failed");
+        create_v8_db(&conn);
+
+        // Insert rows with old-style types: trace events use severity as type.
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO messages (session_id, timestamp, type, method, server, client, payload)
+             VALUES ('s1', '2026-01-01T00:00:01Z', 'debug', 'internal', '', '', '{}');
+             INSERT INTO messages (session_id, timestamp, type, method, server, client, payload)
+             VALUES ('s1', '2026-01-01T00:00:02Z', 'warn', 'internal', '', '', '{}');
+             INSERT INTO messages (session_id, timestamp, type, method, server, client, payload)
+             VALUES ('s1', '2026-01-01T00:00:03Z', 'lsp', 'textDocument/hover', 'ra', 'catenary', '{}');
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect("insert test rows");
+        drop(conn);
+
+        let conn = open_and_migrate_at(&path).expect("migration failed");
+        let version = current_schema_version(&conn).expect("read version");
+        assert_eq!(version, 9, "schema version should be 9");
+
+        // Trace event: type was 'debug' → type='internal', level='debug'
+        let (typ, level): (String, String) = conn
+            .query_row(
+                "SELECT type, level FROM messages WHERE timestamp = '2026-01-01T00:00:01Z'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query debug row");
+        assert_eq!(typ, "internal");
+        assert_eq!(level, "debug");
+
+        // Trace event: type was 'warn' → type='internal', level='warn'
+        let (typ, level): (String, String) = conn
+            .query_row(
+                "SELECT type, level FROM messages WHERE timestamp = '2026-01-01T00:00:02Z'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query warn row");
+        assert_eq!(typ, "internal");
+        assert_eq!(level, "warn");
+
+        // Protocol event: type was 'lsp' → type='lsp', level='info'
+        let (typ, level): (String, String) = conn
+            .query_row(
+                "SELECT type, level FROM messages WHERE timestamp = '2026-01-01T00:00:03Z'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query lsp row");
+        assert_eq!(typ, "lsp");
+        assert_eq!(level, "info");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_migrate_v8_to_v9_drops_fk_constraints() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+        let conn = open_at(&path).expect("open_at failed");
+        create_v8_db(&conn);
+        drop(conn);
+
+        let conn = open_and_migrate_at(&path).expect("migration failed");
+
+        // Insert a row with request_id = 99999 (no matching ROWID).
+        // Before the migration this would fail with FK constraint violation.
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, level, method, server, client, \
+              request_id, parent_id, payload) \
+             VALUES ('s1', '2026-01-01T00:00:00Z', 'lsp', 'info', \
+                     'textDocument/hover', 'ra', 'catenary', 99999, 88888, '{}')",
+            [],
+        )
+        .expect("insert with non-matching request_id should succeed after FK drop");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_migrate_v8_to_v9_preserves_data() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+        let conn = open_at(&path).expect("open_at failed");
+        create_v8_db(&conn);
+
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO messages (session_id, timestamp, type, method, server, client, request_id, parent_id, payload)
+             VALUES ('s1', '2026-01-01T00:00:01Z', 'lsp', 'textDocument/definition', 'ra', 'catenary', 42, 10, '{\"result\":null}');
+             INSERT INTO messages (session_id, timestamp, type, method, server, client, payload)
+             VALUES ('s1', '2026-01-01T00:00:02Z', 'error', 'spawn_failed', 'ra', '', '{\"msg\":\"boom\"}');
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect("insert test rows");
+        drop(conn);
+
+        let conn = open_and_migrate_at(&path).expect("migration failed");
+
+        // Protocol row: data preserved, correlation IDs intact.
+        let (method, server, req_id, par_id, payload): (
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT method, server, request_id, parent_id, payload \
+                 FROM messages WHERE timestamp = '2026-01-01T00:00:01Z'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("query protocol row");
+        assert_eq!(method, "textDocument/definition");
+        assert_eq!(server, "ra");
+        assert_eq!(req_id, Some(42));
+        assert_eq!(par_id, Some(10));
+        assert_eq!(payload, "{\"result\":null}");
+
+        // Trace row: data preserved, type/level split correct.
+        let (typ, level, method, payload): (String, String, String, String) = conn
+            .query_row(
+                "SELECT type, level, method, payload \
+                 FROM messages WHERE timestamp = '2026-01-01T00:00:02Z'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query trace row");
+        assert_eq!(typ, "internal");
+        assert_eq!(level, "error");
+        assert_eq!(method, "spawn_failed");
+        assert_eq!(payload, "{\"msg\":\"boom\"}");
+    }
+
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn test_fresh_install_has_level_column() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("test.db");
+        let conn = open_and_migrate_at(&path).expect("open_and_migrate_at failed");
+
+        // Insert a session for FK.
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert session");
+
+        // Insert a message with explicit level.
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, level, method, server, client, payload) \
+             VALUES ('s1', '2026-01-01T00:00:00Z', 'lsp', 'debug', \
+                     'textDocument/hover', 'ra', 'catenary', '{}')",
+            [],
+        )
+        .expect("insert with level column should succeed");
+
+        let level: String = conn
+            .query_row(
+                "SELECT level FROM messages WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query level");
+        assert_eq!(level, "debug");
+
+        // Default level should be 'info'.
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, method, server, client, payload) \
+             VALUES ('s1', '2026-01-01T00:00:01Z', 'mcp', \
+                     'tools/call', '', 'catenary', '{}')",
+            [],
+        )
+        .expect("insert without explicit level");
+
+        let default_level: String = conn
+            .query_row(
+                "SELECT level FROM messages WHERE timestamp = '2026-01-01T00:00:01Z'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query default level");
+        assert_eq!(default_level, "info");
+
+        // request_id with non-matching ROWID should succeed (no FK).
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, method, server, client, \
+              request_id, parent_id, payload) \
+             VALUES ('s1', '2026-01-01T00:00:02Z', 'lsp', 'info', \
+                     'textDocument/hover', 'ra', 77777, 66666, '{}')",
+            [],
+        )
+        .expect("non-matching correlation IDs should succeed on fresh schema");
     }
 }
