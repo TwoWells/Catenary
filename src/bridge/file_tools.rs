@@ -98,25 +98,13 @@ struct IntoSegment {
 
 /// Parses an `into` path into segments.
 ///
-/// If `is_free_text` (markdown, rst, etc.): the entire string is one
-/// segment with no `/`-separated parsing — symbol names can contain `/`.
-///
-/// Otherwise: split on `/`. Each segment:
+/// Split on `/`. Each segment:
 /// 1. If starts with `<`: extract comma-separated labels up to `>`.
 ///    First label is kind (or `*` for any). Subsequent are tags.
 ///    Remainder after `> ` is the name pattern.
 /// 2. If the segment is `**`: recursive match marker.
 /// 3. Otherwise: entire segment is the name pattern.
-fn parse_into(into: &str, is_free_text: bool) -> Vec<IntoSegment> {
-    if is_free_text {
-        return vec![IntoSegment {
-            kind: None,
-            tags: Vec::new(),
-            name_pattern: into.to_string(),
-            is_recursive: false,
-        }];
-    }
-
+fn parse_into(into: &str) -> Vec<IntoSegment> {
     let raw: Vec<&str> = into.split('/').filter(|s| !s.is_empty()).collect();
     let mut segments = Vec::new();
     let mut i = 0;
@@ -1242,11 +1230,7 @@ impl GlobServer {
             return Ok("No matches found".to_string());
         }
 
-        // Free-text grammar detection removed with tree-sitter — documentSymbol
-        // provides structured symbols regardless of grammar type.
-        let is_free_text = false;
-
-        let segments = parse_into(into, is_free_text);
+        let segments = parse_into(into);
         if segments.is_empty() {
             return Ok("No matching symbols found".to_string());
         }
