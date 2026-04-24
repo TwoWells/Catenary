@@ -126,8 +126,7 @@ impl ColorConfig {
 /// Get the terminal width, defaulting to 80 if unable to detect.
 #[must_use]
 pub fn terminal_width() -> usize {
-    crossterm::terminal::size()
-        .map_or(80, |(w, _)| w as usize)
+    crossterm::terminal::size().map_or(80, |(w, _)| w as usize)
 }
 
 /// Truncate a string to `max_len` characters, adding "..." if truncated.

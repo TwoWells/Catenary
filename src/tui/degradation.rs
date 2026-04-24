@@ -174,7 +174,9 @@ pub fn compute_degradation(
         1
     };
     let available_height = height.saturating_sub(1); // bottom border/hints row
-    let per_panel_height = available_height.checked_div(rows).unwrap_or(available_height);
+    let per_panel_height = available_height
+        .checked_div(rows)
+        .unwrap_or(available_height);
 
     // Hint drop level spans full terminal width.
     let hint_avail = width.saturating_sub(6); // chrome: ──┤ ... ├──┘
