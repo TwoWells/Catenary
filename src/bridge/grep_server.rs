@@ -413,6 +413,10 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
+            if cancel.is_cancelled() {
+                break;
+            }
+
             let Ok(uri) = self
                 .client_manager
                 .open_document_on(path, client_mutex, parent_id)
@@ -437,7 +441,7 @@ impl GrepServer {
             }
         }
 
-        // No capable server or all errored — can't distinguish, assume symbol
+        // No capable server, all errored, or cancelled — assume symbol
         true
     }
 
@@ -522,24 +526,44 @@ impl GrepServer {
         let pre_uri = uri_opt.as_deref();
 
         // Run all enrichment methods with the document already open.
+        // Check cancellation between each method so we don't burn
+        // through fetch attempts after the token has already fired.
         let ref_lines = self
             .fetch_references(path, line_0, col, parent_id, pre_uri, cancel)
             .await;
-        let (incoming_calls, outgoing_calls) = self
-            .fetch_call_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
-            .await;
-        let implementations = self
-            .fetch_implementations(path, line_0, col, parent_id, pre_uri, cancel)
-            .await;
-        let (supertypes, subtypes) = self
-            .fetch_type_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
-            .await;
+
+        let (incoming_calls, outgoing_calls) = if cancel.is_cancelled() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.fetch_call_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
+                .await
+        };
+
+        let implementations = if cancel.is_cancelled() {
+            Vec::new()
+        } else {
+            self.fetch_implementations(path, line_0, col, parent_id, pre_uri, cancel)
+                .await
+        };
+
+        let (supertypes, subtypes) = if cancel.is_cancelled() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.fetch_type_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
+                .await
+        };
 
         // Close the document once on each server.
         if let Some(ref uri) = uri_opt {
             for server in &opened_servers {
                 server.lock().await.close_tracked_document(uri).await;
             }
+        }
+
+        // If cancelled, return None so the caller's is_cancelled()
+        // check triggers immediately.
+        if cancel.is_cancelled() {
+            return None;
         }
 
         Some(SymbolEnrichment {
@@ -572,6 +596,10 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
+            if cancel.is_cancelled() {
+                break;
+            }
+
             let owned_uri;
             let uri: &str = if let Some(u) = pre_opened_uri {
                 u
@@ -638,6 +666,10 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
+            if cancel.is_cancelled() {
+                break;
+            }
+
             let owned_uri;
             let uri: &str = if let Some(u) = pre_opened_uri {
                 u
@@ -717,6 +749,10 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
+            if cancel.is_cancelled() {
+                break;
+            }
+
             let owned_uri;
             let uri: &str = if let Some(u) = pre_opened_uri {
                 u
@@ -782,6 +818,10 @@ impl GrepServer {
             .await;
 
         for client_mutex in &servers {
+            if cancel.is_cancelled() {
+                break;
+            }
+
             let owned_uri;
             let uri: &str = if let Some(u) = pre_opened_uri {
                 u
