@@ -37,6 +37,10 @@ pub fn format_ago(started: chrono::DateTime<chrono::Utc>) -> String {
 // ── Single message formatters ────────────────────────────────────────────
 
 /// Build a styled [`Line`] for a protocol message.
+///
+/// Icons are intentionally omitted — single messages are raw protocol
+/// records. Icons appear only in collapsed run headers where they
+/// replace the method name as an at-a-glance category signal.
 #[must_use]
 pub fn format_message_styled(
     msg: &SessionMessage,
@@ -47,11 +51,19 @@ pub fn format_message_styled(
     let ts_span = Span::styled(format!("{ts}  "), theme.timestamp);
 
     match msg.r#type.as_str() {
-        "lsp" => Line::from(vec![
-            ts_span,
-            Span::styled(format!("[{}] ", msg.server), theme.accent),
-            Span::styled(msg.method.clone(), theme.text),
-        ]),
+        "lsp" => {
+            let mut spans = vec![
+                ts_span,
+                Span::styled(format!("[{}] ", msg.server), theme.accent),
+                Span::styled(msg.method.clone(), theme.text),
+            ];
+            if msg.method == "$/progress"
+                && let Some(detail) = progress_suffix(&msg.payload)
+            {
+                spans.push(Span::styled(format!(" ({detail})"), theme.muted));
+            }
+            Line::from(spans)
+        }
         "mcp" => {
             if msg.method == "tools/call" {
                 let tool_name = msg
@@ -130,7 +142,17 @@ pub fn format_message_plain(msg: &SessionMessage) -> String {
     let ts = msg.timestamp.format("%H:%M:%S");
 
     match msg.r#type.as_str() {
-        "lsp" => format!("{ts} [{}] {}", msg.server, msg.method),
+        "lsp" => {
+            let detail = if msg.method == "$/progress" {
+                progress_suffix(&msg.payload)
+            } else {
+                None
+            };
+            detail.map_or_else(
+                || format!("{ts} [{}] {}", msg.server, msg.method),
+                |d| format!("{ts} [{}] {} ({d})", msg.server, msg.method),
+            )
+        }
         "mcp" => {
             if msg.method == "tools/call" {
                 let tool_name = msg
@@ -495,6 +517,39 @@ pub fn format_pair_plain(request: &SessionMessage, response: &SessionMessage) ->
 
 // ── Progress detail ──────────────────────────────────────────────────────
 
+/// Extract payload detail from a single `$/progress` message as a
+/// parenthesized suffix to append after the method name.
+///
+/// Includes title, message, and percentage when present. Returns `None`
+/// when the payload has no extractable detail.
+fn progress_suffix(payload: &serde_json::Value) -> Option<String> {
+    let value = payload.get("value")?;
+    let kind = value.get("kind").and_then(|k| k.as_str());
+    let title = value.get("title").and_then(|t| t.as_str());
+    let message = value.get("message").and_then(|m| m.as_str());
+    let pct = value.get("percentage").and_then(serde_json::Value::as_u64);
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = title {
+        parts.push(t.to_string());
+    }
+    if let Some(m) = message {
+        parts.push(m.to_string());
+    }
+    if let Some(p) = pct {
+        parts.push(format!("{p}%"));
+    }
+    if kind == Some("end") && parts.is_empty() {
+        parts.push("done".to_string());
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
 /// Format the detail portion of a collapsed progress run.
 ///
 /// Combines message count with an optional percentage range.
@@ -513,7 +568,9 @@ fn format_progress_detail(count: usize, first_pct: Option<u64>, last_pct: Option
 ///
 /// Category-specific rendering for progress, sync, lifecycle, log, and
 /// MCP init runs. Falls back to generic `method (N messages)` for
-/// protocol-level runs.
+/// protocol-level runs. Icons appear here (not in single-message
+/// formatters) — collapsed headers are summaries where an icon earns
+/// its space as an at-a-glance category signal.
 ///
 /// Uses the last message's timestamp (most recent in the run).
 #[must_use]
@@ -1140,6 +1197,111 @@ mod tests {
         let plain = format_message_plain(&hook_msg);
         assert!(plain.contains("main.rs"));
         assert!(plain.contains("3 diagnostics"));
+    }
+
+    // ── Progress single-message tests ──────────────────────────────────
+
+    #[test]
+    fn test_format_message_progress_begin() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "lsp",
+            "$/progress",
+            "rust-analyzer",
+            serde_json::json!({
+                "token": "wid/1",
+                "value": {"kind": "begin", "title": "Indexing", "percentage": 0}
+            }),
+        );
+        let styled = format_message_styled(&msg, &icons, &theme);
+        let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("$/progress"), "styled should contain method");
+        assert!(text.contains("Indexing"), "styled should contain title");
+        assert!(text.contains("0%"), "styled should contain percentage");
+
+        let plain = format_message_plain(&msg);
+        assert!(plain.contains("$/progress"), "plain should contain method");
+        assert!(plain.contains("Indexing"), "plain should contain title");
+        assert!(plain.contains("0%"), "plain should contain percentage");
+    }
+
+    #[test]
+    fn test_format_message_progress_report() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let msg = make_message_with_payload(
+            "lsp",
+            "$/progress",
+            "rust-analyzer",
+            serde_json::json!({
+                "token": "wid/1",
+                "value": {"kind": "report", "message": "42/100 crates", "percentage": 42}
+            }),
+        );
+        let styled = format_message_styled(&msg, &icons, &theme);
+        let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("$/progress"), "styled should contain method");
+        assert!(
+            text.contains("42/100 crates"),
+            "styled should contain message"
+        );
+        assert!(text.contains("42%"), "styled should contain percentage");
+
+        let plain = format_message_plain(&msg);
+        assert!(plain.contains("$/progress"), "plain should contain method");
+        assert!(
+            plain.contains("42/100 crates"),
+            "plain should contain message"
+        );
+        assert!(plain.contains("42%"), "plain should contain percentage");
+    }
+
+    #[test]
+    fn test_format_message_progress_end() {
+        let msg = make_message_with_payload(
+            "lsp",
+            "$/progress",
+            "rust-analyzer",
+            serde_json::json!({
+                "token": "wid/1",
+                "value": {"kind": "end"}
+            }),
+        );
+        let plain = format_message_plain(&msg);
+        assert!(plain.contains("$/progress"), "should contain method");
+        assert!(plain.contains("done"), "end should show done");
+    }
+
+    #[test]
+    fn test_format_message_progress_begin_with_message() {
+        let msg = make_message_with_payload(
+            "lsp",
+            "$/progress",
+            "rust-analyzer",
+            serde_json::json!({
+                "token": "wid/1",
+                "value": {"kind": "begin", "title": "Indexing", "message": "starting"}
+            }),
+        );
+        let plain = format_message_plain(&msg);
+        assert!(plain.contains("Indexing"), "should contain title");
+        assert!(plain.contains("starting"), "should contain message");
+    }
+
+    #[test]
+    fn test_format_message_progress_empty_value() {
+        let msg = make_message_with_payload(
+            "lsp",
+            "$/progress",
+            "rust-analyzer",
+            serde_json::json!({"token": "wid/1"}),
+        );
+        let plain = format_message_plain(&msg);
+        assert!(
+            plain.contains("$/progress"),
+            "empty value should fall back to method name"
+        );
     }
 
     // ── Collapsed rendering tests ────────────────────────────────────────
