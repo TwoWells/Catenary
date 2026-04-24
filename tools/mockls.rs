@@ -166,17 +166,6 @@ struct Args {
     #[arg(long)]
     no_empty_query: bool,
 
-    /// Cap `workspace/symbol("")` results to N (simulates truncation).
-    /// Non-empty queries and hover return full results.
-    #[arg(long)]
-    symbol_limit: Option<usize>,
-
-    /// Return the literal word under the cursor for hover, without resolving
-    /// keywords to the following symbol name. Simulates real LSP behavior where
-    /// hovering on `fn` returns keyword docs, not the function's signature.
-    #[arg(long)]
-    literal_keyword_hover: bool,
-
     /// Send `client/registerCapability` after `initialized` to register a
     /// file watcher. The glob pattern defaults to `**/*`; override with
     /// `--watcher-glob`.
@@ -779,11 +768,7 @@ impl MockServer {
     fn handle_hover(&self, params: &Value) -> Option<Value> {
         let (uri, line, col) = extract_position(params)?;
         let content = self.documents.get(uri)?;
-        let word = if self.args.literal_keyword_hover {
-            extract_word(content, line, col)?
-        } else {
-            extract_symbol_name(content, line, col)?
-        };
+        let word = extract_symbol_name(content, line, col)?;
 
         Some(serde_json::json!({
             "contents": {
@@ -1543,13 +1528,6 @@ impl MockServer {
             }
         }
 
-        // Simulate truncation: cap empty-query results to --symbol-limit N
-        if query.is_empty()
-            && let Some(limit) = self.args.symbol_limit
-        {
-            all_symbols.truncate(limit);
-        }
-
         Value::Array(all_symbols)
     }
 
@@ -2283,8 +2261,6 @@ mod tests {
             multi_fix: false,
             resolve_provider: false,
             no_empty_query: false,
-            symbol_limit: None,
-            literal_keyword_hover: false,
             register_file_watchers: false,
             watcher_glob: "**/*".to_string(),
             watcher_kind: None,

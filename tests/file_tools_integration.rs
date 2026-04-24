@@ -181,10 +181,10 @@ fn test_glob_file_header() -> Result<()> {
     // File header with line count
     assert!(text.contains("(4 lines)"), "Should show line count: {text}");
 
-    // No symbols in output (maps not implemented in 08a)
+    // No symbols: bridge has no LSP servers and no grammar installed
     assert!(
         !text.contains("Config"),
-        "Should not show symbols yet: {text}"
+        "Should not show symbols without grammar: {text}"
     );
     Ok(())
 }
@@ -1149,6 +1149,121 @@ fn test_glob_symlink_broken() -> Result<()> {
     assert!(
         text.contains("[broken]"),
         "Broken symlink should show [broken] flag: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_glob_symlink_valid() -> Result<()> {
+    use std::os::unix::fs as unix_fs;
+
+    let dir = tempfile::tempdir()?;
+    let target = dir.path().join("real_file.txt");
+    std::fs::write(&target, "line one\nline two\nline three\n")?;
+
+    unix_fs::symlink(&target, dir.path().join("valid_link.txt"))?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Valid symlink should show -> with resolved target path
+    assert!(
+        text.contains("valid_link.txt ->"),
+        "Valid symlink should show arrow: {text}"
+    );
+    // Should show target's line count
+    assert!(
+        text.contains("3 lines"),
+        "Valid symlink should show target line count: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_maps_deny_partial() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let assets = dir.path().join("test_assets");
+    std::fs::create_dir_all(&assets)?;
+
+    // Files inside test_assets/ — should be denied maps
+    std::fs::write(
+        assets.join(format!("denied.{MOCK_EXT}")),
+        "fn denied_fn\nstruct DeniedType\n\n\n\n\n\n\n\n\n",
+    )?;
+    // File outside test_assets/ — should still get maps
+    std::fs::write(
+        dir.path().join(format!("allowed.{MOCK_EXT}")),
+        "fn allowed_fn\nstruct AllowedType\n\n\n\n\n\n\n\n\n",
+    )?;
+
+    let config = "[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"test_assets/**\"]\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // File outside test_assets/ should have a map
+    assert!(
+        text.contains("allowed_fn") || text.contains("AllowedType"),
+        "File outside deny path should have map symbols: {text}"
+    );
+    // File inside test_assets/ should NOT have a map (denied)
+    let denied_line = text.lines().find(|l| l.contains("denied.")).unwrap_or("");
+    assert!(
+        !denied_line.contains('<'),
+        "Denied file should not have map symbols: {denied_line}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_glob_bounding_ranges() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Multiple files with identical symbol names/kinds but different line spans.
+    // alpha is at different positions in each file.
+    std::fs::write(
+        dir.path().join(format!("early.{MOCK_EXT}")),
+        "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n",
+    )?;
+    // Pad with extra lines so alpha starts later
+    std::fs::write(
+        dir.path().join(format!("late.{MOCK_EXT}")),
+        "\n\n\n\nfn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n",
+    )?;
+    // Third file for the dedup group
+    std::fs::write(
+        dir.path().join(format!("mid.{MOCK_EXT}")),
+        "\n\nfn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n",
+    )?;
+
+    let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
+    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "pattern": dir.path().to_string_lossy().to_string() }),
+    )?;
+
+    // Should show "common structure" for deduplicated group
+    assert!(
+        text.contains("common structure"),
+        "Should show shared map: {text}"
+    );
+    // Should note that ranges are bounding
+    assert!(
+        text.contains("ranges are bounding"),
+        "Should note bounding ranges: {text}"
     );
     Ok(())
 }

@@ -944,25 +944,50 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that search degrades gracefully when LSP methods fail.
-/// `--fail-on workspace/symbol` makes workspace/symbol return `InternalError`.
-/// Search should still return ripgrep file matches, and the rg-bootstrapped
-/// enrichment path should recover symbols via hover even when the symbol
-/// universe is unavailable.
+/// No-grammar path: `prepareRename` filters keywords, ripgrep produces
+/// heatmap output without kind labels or structure context.
 #[test]
 fn test_search_graceful_degradation() -> Result<()> {
     let dir = tempfile::tempdir()?;
+    // "fn" is a declaration keyword — prepareRename should filter it.
+    // "greet" is a symbol name — prepareRename should accept it.
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn greet()\ngreet\n")?;
 
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots --fail-on workspace/symbol");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let root = dir.path().to_str().context("root path")?;
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
+    // Search for the keyword "fn" — should be filtered by prepareRename.
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "fn" }
+        }
+    }))?;
+
+    let response = bridge.recv()?;
+    assert!(
+        response["result"]["isError"] != true,
+        "grep should succeed: {response:?}"
+    );
+    let text_fn = response["result"]["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+    // No grammar → no <Kind> labels
+    assert!(
+        !text_fn.contains("<Function>"),
+        "No-grammar path should not have kind labels, got: {text_fn}"
+    );
+
+    // Search for "greet" — a symbol, not a keyword.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
         "method": "tools/call",
         "params": {
             "name": "grep",
@@ -971,21 +996,22 @@ fn test_search_graceful_degradation() -> Result<()> {
     }))?;
 
     let response = bridge.recv()?;
-    assert!(
-        response["result"]["isError"] != true,
-        "Search should succeed even when workspace/symbol fails: {response:?}"
-    );
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .context("Missing search text")?;
-    // Should still find via ripgrep (no dependency on workspace/symbol)
+        .context("Missing text")?;
+    // rg-only heatmap: symbol found via ripgrep, file reference present
     assert!(
         text.contains("greet"),
-        "Search should find greet via ripgrep, got: {text}"
+        "Should find greet via ripgrep, got: {text}"
     );
     assert!(
         text.contains(&format!("test.{MOCK_LANG_A}")),
-        "Search should find test file via ripgrep, got: {text}"
+        "Should show file reference, got: {text}"
+    );
+    // No kind labels without a grammar
+    assert!(
+        !text.contains("<Function>"),
+        "No-grammar path should not have kind labels, got: {text}"
     );
 
     Ok(())
@@ -1333,29 +1359,43 @@ fn test_grep_alternation() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that broad search with many symbols produces flat output.
-/// (Output budget and tier selection are in ticket 06b.)
+/// Budget-driven tier demotion: broad pattern exceeding `budget` at tier 1
+/// demotes to tier 2 structure heatmap with no LSP enrichment.
 #[test]
 fn test_grep_enrichment_threshold_broad() -> Result<()> {
     let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("root path")?;
 
-    // Create 11 unique functions to exceed GREP_ENRICHMENT_THRESHOLD (10)
-    let test_file = dir.path().join(format!("many.{MOCK_LANG_A}"));
+    // Create many unique symbols to exceed tier 1 budget
+    let mut content = String::new();
+    for i in 0..30 {
+        use std::fmt::Write;
+        let _ = writeln!(content, "fn zz_broad_{i}");
+    }
+    // Add references so rg finds hits
+    for i in 0..30 {
+        use std::fmt::Write;
+        let _ = writeln!(content, "zz_broad_{i}");
+    }
+    let test_file = dir.path().join("many.mock");
+    std::fs::write(&test_file, &content)?;
+
+    // Small budget forces tier demotion
+    let config_path = dir.path().join("config.toml");
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
     std::fs::write(
-        &test_file,
-        "fn zz_broad_one()\nfn zz_broad_two()\nfn zz_broad_three()\n\
-         fn zz_broad_four()\nfn zz_broad_five()\nfn zz_broad_six()\n\
-         fn zz_broad_seven()\nfn zz_broad_eight()\nfn zz_broad_nine()\n\
-         fn zz_broad_ten()\nfn zz_broad_eleven()\n\
-         zz_broad_one\nzz_broad_two\nzz_broad_three\n\
-         zz_broad_four\nzz_broad_five\nzz_broad_six\n\
-         zz_broad_seven\nzz_broad_eight\nzz_broad_nine\n\
-         zz_broad_ten\nzz_broad_eleven\n",
+        &config_path,
+        format!(
+            "[tools.grep]\nbudget = 200\n\n\
+             [server.mockls]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
+             [language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
+        ),
     )?;
 
-    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    let mut bridge = BridgeProcess::spawn_with_config(&config_path, root)?;
+    install_mock_grammar(bridge.state_home())?;
     bridge.initialize()?;
 
     bridge.send(&json!({
@@ -1364,7 +1404,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         "method": "tools/call",
         "params": {
             "name": "grep",
-            "arguments": { "pattern": "zz_broad_one|zz_broad_two|zz_broad_three|zz_broad_four|zz_broad_five|zz_broad_six|zz_broad_seven|zz_broad_eight|zz_broad_nine|zz_broad_ten|zz_broad_eleven" }
+            "arguments": { "pattern": "zz_broad" }
         }
     }))?;
 
@@ -1378,18 +1418,19 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         .as_str()
         .context("Missing text for broad search")?;
 
-    // All 11 symbols should appear in the flat output
+    // Tier 2: structure heatmap — no LSP enrichment sections
     assert!(
-        text.contains("zz_broad_one"),
-        "Expected zz_broad_one in output, got: {text}"
+        !text.contains("calls:") && !text.contains("refs:"),
+        "Tier 2 should have no enrichment sections, got: {text}"
     );
+    // Should still contain results
     assert!(
-        text.contains("zz_broad_eleven"),
-        "Expected zz_broad_eleven in output, got: {text}"
+        text.contains("zz_broad"),
+        "Expected results present, got: {text}"
     );
-    // Each should have file:line references
+    // Should reference the file
     assert!(
-        text.contains(&format!("many.{MOCK_LANG_A}")),
+        text.contains("many.mock"),
         "Expected file reference, got: {text}"
     );
 
@@ -1589,10 +1630,9 @@ fn test_grep_two_defs_same_name_per_heading_refs() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that `fetch_symbols_by_queries` handles `OneOf::Right` (URI-only)
-/// symbols via resolve. Uses `--no-empty-query` to force the fallback path
-/// (universe returns empty, per-query lookup fires) combined with
-/// `--resolve-provider` so per-query results need resolve.
+/// Verifies that URI-only (`OneOf::Right`) workspace/symbol results are
+/// resolved via `workspaceSymbol/resolve`. Uses `--no-empty-query` to force
+/// per-query lookup combined with `--resolve-provider` so results need resolve.
 #[test]
 fn test_grep_resolve_fallback_path() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1833,83 +1873,56 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
     Ok(())
 }
 
-/// Diagnostic test: does the rg bootstrap path recover methods that
-/// `workspace/symbol("")` from rust-analyzer truncates?
-///
-/// Creates a small Rust workspace with a struct + method, spawns the bridge
-/// with real rust-analyzer, and greps for the method name. The symbol
-/// universe typically truncates impl methods, but the rg-bootstrapped
-/// enrichment should recover them via hover at the rg hit position,
-/// producing a `## [Function]` or `## [Method]` heading with enrichment.
-///
-/// Run with: `make test T=ra_symbol_universe`
-/// Requires: rust-analyzer on PATH.
+/// Tree-sitter index finds methods inside impl blocks with correct kind
+/// and enclosing scope. No bootstrap or workspace/symbol needed.
 #[test]
-#[ignore = "requires rust-analyzer; diagnostic test for symbol universe coverage"]
-fn test_ra_symbol_universe_includes_methods() -> Result<()> {
-    use std::io::Write as _;
-
+fn test_ts_index_finds_methods() -> Result<()> {
     let dir = tempfile::tempdir()?;
-
-    // Minimal Cargo.toml so rust-analyzer treats this as a real project
-    let cargo_toml = dir.path().join("Cargo.toml");
-    std::fs::write(
-        &cargo_toml,
-        "[package]\nname = \"ra-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )?;
-
-    let src_dir = dir.path().join("src");
-    std::fs::create_dir(&src_dir)?;
-    let lib_rs = src_dir.join("lib.rs");
-    std::fs::write(
-        &lib_rs,
-        "pub struct ZzTestWidget {\n    value: u32,\n}\n\n\
-         impl ZzTestWidget {\n    \
-             pub fn zz_widget_method(&self) -> u32 {\n        \
-                 self.value\n    \
-             }\n\
-         }\n",
-    )?;
-
-    let lsp_arg = "rust:rust-analyzer".to_string();
     let root = dir.path().to_str().context("root path")?;
-    let mut bridge = BridgeProcess::spawn(&[&lsp_arg], root)?;
+
+    // Struct with a method inside it — tree-sitter should find the method
+    // with kind "method" and the enclosing struct name as scope.
+    let file = dir.path().join("widget.mock");
+    std::fs::write(&file, "struct Widget {\nfn widget_method\n}\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
-    // rust-analyzer needs time to index; poll with short sleeps
-    let mut text = String::new();
-    for attempt in 0..30 {
-        std::thread::sleep(Duration::from_secs(2));
-
-        bridge.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 5000 + attempt,
-            "method": "tools/call",
-            "params": {
-                "name": "grep",
-                "arguments": { "pattern": "zz_widget_method" }
-            }
-        }))?;
-
-        let response = bridge.recv()?;
-        let result = &response["result"];
-        if let Some(t) = result["content"][0]["text"].as_str()
-            && t.contains("zz_widget_method")
-        {
-            text = t.to_string();
-            break;
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5000,
+        "method": "tools/call",
+        "params": {
+            "name": "grep",
+            "arguments": { "pattern": "widget_method" }
         }
-    }
+    }))?;
 
-    // Flush stderr so we can see the output in test logs
-    let _ = writeln!(
-        std::io::stderr(),
-        "\n=== ra_symbol_universe output ===\n{text}\n=== end ==="
-    );
-
+    let response = bridge.recv()?;
+    let result = &response["result"];
     assert!(
-        text.contains("zz_widget_method"),
-        "Expected 'zz_widget_method' in output, got:\n{text}"
+        result["isError"].is_null() || result["isError"] == false,
+        "grep should succeed: {response:?}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Missing text")?;
+
+    // Tree-sitter index should find the method with kind label
+    assert!(
+        text.contains("widget_method"),
+        "Expected widget_method in output, got:\n{text}"
+    );
+    // Method should have a kind label from tree-sitter
+    assert!(
+        text.contains("<Function>") || text.contains("<Method>"),
+        "Expected kind label for method, got:\n{text}"
+    );
+    // Method should be scoped under Widget
+    assert!(
+        text.contains("Widget"),
+        "Expected enclosing struct scope, got:\n{text}"
     );
 
     Ok(())
@@ -2777,10 +2790,7 @@ fn test_enrich_from_ts_true() -> Result<()> {
     std::fs::write(&file, "fn my_symbol\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-
-    // Install mock grammar into the bridge's isolated data dir
-    install_mock_grammar(bridge.state_home())?;
+    let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
     bridge.send(&json!({
