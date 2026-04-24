@@ -51,8 +51,35 @@ jobs:
 
       - name: Build dev docs (current ref)
         run: |
+          cat > docs/src/dev-banner.css <<'CSS'
+          .dev-banner {
+            background: #d97706;
+            color: #fff;
+            text-align: center;
+            padding: 0.5em;
+            font-size: 0.9em;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+          }
+          .dev-banner a { color: #fff; text-decoration: underline; }
+          CSS
+          cat > docs/src/dev-banner.js <<'JS'
+          (function() {
+            var banner = document.createElement('div');
+            banner.className = 'dev-banner';
+            banner.innerHTML = 'You are reading unreleased documentation. <a href="/stable/">Click here for the latest release.</a>';
+            document.body.prepend(banner);
+          })();
+          JS
+          cat >> docs/book.toml <<'TOML'
+          additional-css = ["src/dev-banner.css"]
+          additional-js = ["src/dev-banner.js"]
+          TOML
           mdbook build docs
           cp -r docs/book/* site/dev/
+          git checkout HEAD -- docs/book.toml
+          rm -f docs/src/dev-banner.css docs/src/dev-banner.js
 
       - name: Create root redirect
         run: |
