@@ -127,8 +127,7 @@ impl ColorConfig {
 #[must_use]
 pub fn terminal_width() -> usize {
     crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(80)
+        .map_or(80, |(w, _)| w as usize)
 }
 
 /// Truncate a string to `max_len` characters, adding "..." if truncated.

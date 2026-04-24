@@ -1948,7 +1948,7 @@ grep = "Use {catenary_grep}"
         let result = Config::load_from_sources(&[path]);
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
-        assert!(err.contains("grep"), "error should mention grep: {err}",);
+        assert!(err.contains("grep"), "error should mention grep: {err}");
     }
 
     #[test]

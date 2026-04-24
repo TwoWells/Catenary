@@ -49,7 +49,7 @@ fn notify_connect(endpoint: &std::path::Path) -> Option<std::os::unix::net::Unix
         return None;
     }
     let stream = std::os::unix::net::UnixStream::connect(endpoint).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_read_timeout(Some(Duration::from_mins(1)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     Some(stream)
 }

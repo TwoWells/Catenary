@@ -203,7 +203,7 @@ impl LspClient {
         debug!("Running health probe on {uri}");
 
         let result = tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             self.request("textDocument/documentSymbol", params::document_symbols(uri)),
         )
         .await;
