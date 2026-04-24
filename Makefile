@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny docs test test-ignored test-scripts release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny mdbook rustdoc test test-ignored test-scripts release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -37,8 +37,12 @@ check:
 	@cargo deny --log-level error check
 	@cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
+# Build the mdbook user-facing docs
+mdbook:
+	@mdbook build docs
+
 # Build internal rustdoc (includes private items)
-docs:
+rustdoc:
 	@cargo doc --document-private-items --no-deps --quiet
 
 # Run cargo-deny license and advisory checks
