@@ -91,20 +91,6 @@ enum Command {
         diff: bool,
     },
 
-    /// Install, list, or remove tree-sitter grammars.
-    Install {
-        /// Grammar spec: name, owner/repo, or full URL.
-        spec: Option<String>,
-
-        /// List installed grammars.
-        #[arg(long)]
-        list: bool,
-
-        /// Remove a grammar by scope.
-        #[arg(long)]
-        remove: Option<String>,
-    },
-
     /// Hook subcommands (invoked by host CLI hooks).
     Hook {
         #[command(subcommand)]
@@ -232,17 +218,6 @@ async fn main() -> Result<()> {
         }) => {
             let roots: Vec<PathBuf> = path.into_iter().collect();
             cli::doctor::run_doctor(&roots, &root, nocolor, diff).await
-        }
-        Some(Command::Install { spec, list, remove }) => {
-            if list {
-                catenary_mcp::install::list_grammars()
-            } else if let Some(scope) = remove {
-                catenary_mcp::install::remove_grammar(&scope)
-            } else if let Some(spec) = spec {
-                catenary_mcp::install::install_grammar(&spec)
-            } else {
-                catenary_mcp::install::list_grammars()
-            }
         }
         Some(Command::Hook { command }) => {
             match command {

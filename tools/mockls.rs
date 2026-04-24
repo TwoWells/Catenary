@@ -2136,44 +2136,43 @@ fn extract_types(content: &str) -> HashMap<String, String> {
 }
 
 /// Extract symbol definitions from content.
+///
+/// Produces hierarchical `DocumentSymbol` responses: definitions that end
+/// with `{` open a brace block. Subsequent definitions before the matching
+/// `}` become `children` of the opening symbol, and the opener's `range.end`
+/// is extended to the closing brace line. Definitions without `{` remain
+/// single-line.
 fn extract_symbols(content: &str) -> Vec<Value> {
-    let mut symbols = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result = Vec::new();
+    let mut stack: Vec<(Value, Vec<Value>)> = Vec::new(); // (parent_sym, children)
 
-    for (line_idx, line_text) in content.lines().enumerate() {
+    for (line_idx, line_text) in lines.iter().enumerate() {
         let trimmed = line_text.trim_start();
-        let (kind_num, prefix_len) = if trimmed.starts_with("fn ") {
-            (12, 3)
-        } else if trimmed.starts_with("function ") {
-            (12, 9)
-        } else if trimmed.starts_with("def ") {
-            (12, 4)
-        } else if trimmed.starts_with("let ") {
-            (13, 4)
-        } else if trimmed.starts_with("const ") {
-            (14, 6)
-        } else if trimmed.starts_with("var ") {
-            (13, 4)
-        } else if trimmed.starts_with("struct ") {
-            (23, 7)
-        } else if trimmed.starts_with("class ") {
-            (5, 6)
-        } else if trimmed.starts_with("enum ") {
-            (10, 5)
-        } else if trimmed.starts_with("interface ") {
-            (11, 10)
-        } else if trimmed.starts_with("trait ") {
-            (11, 6)
-        } else if trimmed.starts_with("mod ") {
-            (2, 4)
-        } else if trimmed.starts_with("module ") {
-            (2, 7)
-        } else if trimmed.starts_with("type ") {
-            (26, 5)
-        } else if trimmed.starts_with("method ") {
-            (6, 7)
-        } else if trimmed.starts_with("field ") {
-            (8, 6)
-        } else {
+
+        // Handle closing brace: pop the stack and finalize the parent.
+        if trimmed.starts_with('}') {
+            if let Some((mut parent, children)) = stack.pop() {
+                // Extend parent range to this closing brace line.
+                if let Some(range) = parent.get_mut("range") {
+                    range["end"]["line"] = serde_json::json!(line_idx);
+                    range["end"]["character"] = serde_json::json!(line_text.len());
+                }
+                if !children.is_empty() {
+                    parent["children"] = Value::Array(children);
+                }
+                // Push finalized parent to the outer scope.
+                if let Some(outer) = stack.last_mut() {
+                    outer.1.push(parent);
+                } else {
+                    result.push(parent);
+                }
+            }
+            continue;
+        }
+
+        let parsed = parse_symbol_line(trimmed);
+        let Some((kind_num, prefix_len)) = parsed else {
             continue;
         };
 
@@ -2205,10 +2204,69 @@ fn extract_symbols(content: &str) -> Vec<Value> {
         if trimmed.contains("@deprecated") {
             sym["tags"] = serde_json::json!([1]);
         }
-        symbols.push(sym);
+
+        // Check if this line opens a brace block.
+        if trimmed.contains('{') && !trimmed.contains('}') {
+            stack.push((sym, Vec::new()));
+        } else if let Some(outer) = stack.last_mut() {
+            outer.1.push(sym);
+        } else {
+            result.push(sym);
+        }
     }
 
-    symbols
+    // Drain any unclosed blocks (malformed input).
+    while let Some((mut parent, children)) = stack.pop() {
+        if !children.is_empty() {
+            parent["children"] = Value::Array(children);
+        }
+        if let Some(outer) = stack.last_mut() {
+            outer.1.push(parent);
+        } else {
+            result.push(parent);
+        }
+    }
+
+    result
+}
+
+/// Parses a keyword prefix from a trimmed line, returning `(SymbolKind, prefix_len)`.
+fn parse_symbol_line(trimmed: &str) -> Option<(u32, usize)> {
+    if trimmed.starts_with("fn ") {
+        Some((12, 3))
+    } else if trimmed.starts_with("function ") {
+        Some((12, 9))
+    } else if trimmed.starts_with("def ") {
+        Some((12, 4))
+    } else if trimmed.starts_with("let ") {
+        Some((13, 4))
+    } else if trimmed.starts_with("const ") {
+        Some((14, 6))
+    } else if trimmed.starts_with("var ") {
+        Some((13, 4))
+    } else if trimmed.starts_with("struct ") {
+        Some((23, 7))
+    } else if trimmed.starts_with("class ") {
+        Some((5, 6))
+    } else if trimmed.starts_with("enum ") {
+        Some((10, 5))
+    } else if trimmed.starts_with("interface ") {
+        Some((11, 10))
+    } else if trimmed.starts_with("trait ") {
+        Some((11, 6))
+    } else if trimmed.starts_with("mod ") {
+        Some((2, 4))
+    } else if trimmed.starts_with("module ") {
+        Some((2, 7))
+    } else if trimmed.starts_with("type ") {
+        Some((26, 5))
+    } else if trimmed.starts_with("method ") {
+        Some((6, 7))
+    } else if trimmed.starts_with("field ") {
+        Some((8, 6))
+    } else {
+        None
+    }
 }
 
 fn main() {

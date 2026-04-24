@@ -13,7 +13,6 @@ use anyhow::Result;
 
 use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::cli::ColorConfig;
-use crate::install;
 use crate::lsp;
 
 /// Expected Claude Code hooks, embedded at compile time.
@@ -301,11 +300,6 @@ pub async fn run_doctor(
     check_constrained_bash_claude(&colors);
     check_constrained_bash_gemini(&colors);
     check_command_filter_config(&colors, &config);
-
-    // Grammars health section
-    println!();
-    println!("{}:", colors.bold("Grammars"));
-    check_grammars(&colors);
 
     // Actionable suggestions at the very bottom so they aren't buried
     let suggestions = collect_suggestions(&config, dirs::config_dir());
@@ -1017,69 +1011,6 @@ fn find_script_path_in_json(json: &serde_json::Value, needle: &str) -> Option<St
     }
 }
 
-/// Check grammar toolchain and installed grammars.
-fn check_grammars(colors: &ColorConfig) {
-    check_grammars_compiler(colors);
-    check_grammars_dir(colors);
-    check_grammars_installed(colors);
-}
-
-/// Check whether a C compiler is available for grammar compilation.
-fn check_grammars_compiler(colors: &ColorConfig) {
-    let cc_name = install::c_compiler_name();
-    if binary_exists(&cc_name) {
-        println!("  {}", colors.green(&format!("✓ {cc_name} found")));
-    } else {
-        println!(
-            "  {}",
-            colors.red("✗ C compiler not found — catenary install requires a C compiler"),
-        );
-    }
-}
-
-/// Print the grammar data directory path and whether it exists.
-fn check_grammars_dir(colors: &ColorConfig) {
-    let gdir = install::grammar_dir();
-    if gdir.exists() {
-        println!("  {}", gdir.display());
-    } else {
-        println!(
-            "  {}",
-            colors.dim(&format!("{} (not yet created)", gdir.display())),
-        );
-    }
-}
-
-/// List installed grammars and verify their files exist on disk.
-pub(crate) fn check_grammars_installed(colors: &ColorConfig) {
-    let grammars = install::scan_grammars().unwrap_or_default();
-
-    if grammars.is_empty() {
-        println!("  {}", colors.dim("(none installed)"));
-        return;
-    }
-
-    let grammar_base = install::grammar_dir();
-    for meta in &grammars {
-        let scope = &meta.scope;
-        let scope_dir = grammar_base.join(scope);
-        let lib_filename = format!("parser.{}", std::env::consts::DLL_EXTENSION);
-        let lib_ok = scope_dir.join(&lib_filename).exists();
-        let tags_ok = scope_dir.join("tags.scm").exists();
-
-        if lib_ok && tags_ok {
-            println!("  {}", colors.green(&format!("✓ {scope}")));
-        } else if !lib_ok {
-            println!(
-                "  {}",
-                colors.red(&format!("✗ {scope} — missing {lib_filename}")),
-            );
-        } else {
-            println!("  {}", colors.red(&format!("✗ {scope} — missing tags.scm")));
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1087,15 +1018,7 @@ pub(crate) fn check_grammars_installed(colors: &ColorConfig) {
 )]
 mod tests {
     use super::*;
-    use crate::cli::ColorConfig;
     use std::fs;
-
-    #[test]
-    fn test_doctor_grammar_section_no_grammars() {
-        let colors = ColorConfig::new(true);
-        // Should not panic on empty/default grammar directory
-        check_grammars_installed(&colors);
-    }
 
     // ── user_config_path_in tests ───────────────────────────────
 

@@ -560,10 +560,12 @@ fn test_doctor_suggests_config_when_no_config_file() -> Result<()> {
     let suggestions_pos = stdout
         .rfind("Suggestions:")
         .context("Suggestions: not found")?;
-    let grammars_pos = stdout.rfind("Grammars:").context("Grammars: not found")?;
+    let filter_pos = stdout
+        .rfind("Command filter:")
+        .context("Command filter: not found")?;
     assert!(
-        suggestions_pos > grammars_pos,
-        "Suggestions should appear after Grammars"
+        suggestions_pos > filter_pos,
+        "Suggestions should appear after Command filter"
     );
     Ok(())
 }

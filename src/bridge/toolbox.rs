@@ -26,7 +26,7 @@ use crate::logging::LoggingServer;
 use crate::logging::notification_queue::NotificationQueueSink;
 use crate::lsp::LspClientManager;
 use crate::lsp::glob::LspGlob;
-use crate::ts::TsIndex;
+use crate::symbol_index::SymbolIndex;
 
 /// A resolved glob pattern that handles tilde expansion and absolute paths.
 ///
@@ -128,8 +128,8 @@ pub struct Toolbox {
     pub logging: LoggingServer,
     /// Notification queue for draining into `systemMessage`.
     pub notifications: Arc<NotificationQueueSink>,
-    /// Tree-sitter symbol index (shared with grep).
-    pub ts_index: Option<Arc<std::sync::Mutex<TsIndex>>>,
+    /// Symbol index populated from `documentSymbol` responses (shared with grep).
+    pub symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     /// Catenary instance ID (unique per process invocation).
     pub instance_id: Arc<str>,
     /// Tokio runtime handle for blocking dispatch.
@@ -170,10 +170,10 @@ impl Toolbox {
         fs_manager.set_roots(roots.clone());
         fs_manager.seed();
 
-        // Build tree-sitter index (in-memory, no database dependency).
-        let ts_index = TsIndex::build(&roots)
+        // Build symbol index (in-memory, populated lazily from documentSymbol).
+        let symbol_index = SymbolIndex::new()
             .map(|idx| Arc::new(std::sync::Mutex::new(idx)))
-            .map_err(|e| tracing::info!("tree-sitter index unavailable: {e}"))
+            .map_err(|e| tracing::info!("symbol index unavailable: {e}"))
             .ok();
 
         let grep_budget = config
@@ -204,7 +204,7 @@ impl Toolbox {
         let grep = GrepServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
-            ts_index: ts_index.clone(),
+            symbol_index: symbol_index.clone(),
             budget: grep_budget,
         };
         let outline_suppress: Vec<globset::GlobMatcher> = glob_config
@@ -224,7 +224,7 @@ impl Toolbox {
         let glob = GlobServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
-            ts_index: ts_index.clone(),
+            symbol_index: symbol_index.clone(),
             budget: glob_budget,
             outline_threshold: glob_config.outline_threshold,
             outline_suppress,
@@ -239,7 +239,7 @@ impl Toolbox {
             path_validator,
             logging,
             notifications,
-            ts_index,
+            symbol_index,
             instance_id,
             runtime,
         }

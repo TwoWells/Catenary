@@ -22,7 +22,7 @@ use super::tool_server::ToolServer;
 use crate::bucketing::{self, BucketEntry};
 use crate::lsp::LspClientManager;
 use crate::lsp::server::LspServer;
-use crate::ts::{TsIndex, TsSymbol, format_ts_kind};
+use crate::symbol_index::{Symbol, SymbolIndex, format_symbol_kind};
 
 /// Input for grep tool.
 #[derive(Debug, Deserialize)]
@@ -55,9 +55,9 @@ struct GrepHit {
 /// Classification of a ripgrep hit against the tree-sitter index.
 enum HitClass {
     /// rg hit at a tree-sitter definition line.
-    Symbol { symbol: TsSymbol },
+    Symbol { symbol: Symbol },
     /// rg hit at a non-definition line, with optional enclosing structure.
-    Reference { enclosing: Option<TsSymbol> },
+    Reference { enclosing: Option<Symbol> },
     /// Symbol identified via `prepareRename` (no-grammar path).
     PrepareRenameSymbol,
     /// Keyword filtered out via `prepareRename` (will be dropped).
@@ -105,7 +105,7 @@ pub(super) struct TypeEdge {
 pub struct GrepServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
-    pub(super) ts_index: Option<Arc<std::sync::Mutex<TsIndex>>>,
+    pub(super) symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     pub(super) budget: usize,
 }
 
@@ -171,7 +171,49 @@ impl ToolServer for GrepServer {
 }
 
 impl GrepServer {
-    /// Grep pipeline: ripgrep + tree-sitter index + hit classification.
+    /// Ensures the symbol index is populated for the given files.
+    ///
+    /// For each file without cached symbols, opens the document on the
+    /// server, requests `documentSymbol`, and feeds the response to the
+    /// index.
+    async fn ensure_symbols(&self, files: &[PathBuf]) {
+        let Some(ref idx_arc) = self.symbol_index else {
+            return;
+        };
+        let needs_populate: Vec<PathBuf> = {
+            let Ok(idx) = idx_arc.lock() else { return };
+            files
+                .iter()
+                .filter(|p| p.is_file() && !idx.has_symbols_for(p))
+                .cloned()
+                .collect()
+        };
+
+        for path in &needs_populate {
+            let servers = self
+                .client_manager
+                .get_servers(path, LspServer::supports_document_symbols)
+                .await;
+            let Some(server) = servers.first() else {
+                continue;
+            };
+            let Ok(uri) = self
+                .client_manager
+                .open_document_on(path, server, None)
+                .await
+            else {
+                continue;
+            };
+            let Ok(response) = server.lock().await.document_symbols(&uri).await else {
+                continue;
+            };
+            if let Ok(idx) = idx_arc.lock() {
+                let _ = idx.populate_from_document_symbols(path, &response);
+            }
+        }
+    }
+
+    /// Grep pipeline: ripgrep + symbol index + hit classification.
     #[allow(clippy::too_many_lines, reason = "Core grep orchestration")]
     async fn run(
         &self,
@@ -226,23 +268,21 @@ impl GrepServer {
             .ensure_and_wait_for_paths(&rg_paths)
             .await;
 
-        // Step 3: Tree-sitter index freshness check and query.
-        let (ts_symbols, grammar_files) = if let Some(ref index_mutex) = self.ts_index {
+        // Step 2b: Populate symbol index for matched files.
+        self.ensure_symbols(&rg_paths).await;
+
+        // Step 3: Symbol index query.
+        let (ts_symbols, grammar_files) = if let Some(ref index_mutex) = self.symbol_index {
             let index = index_mutex
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let re_pattern = format!("(?i){}", &input.pattern);
-            if let Err(e) = index.ensure_fresh(&rg_paths) {
-                debug!("tree-sitter freshness check failed: {e}");
-            }
-            // query() and find_enclosing() use throwaway read connections,
-            // so we only hold the lock for ensure_fresh (writes).
             let ts_syms = index
                 .query(&re_pattern, Some(&rg_paths))
                 .unwrap_or_default();
             let gf: HashSet<String> = rg_paths
                 .iter()
-                .filter(|p| index.has_grammar_for(p))
+                .filter(|p| index.has_symbols_for(p))
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
             drop(index);
@@ -251,8 +291,8 @@ impl GrepServer {
             (Vec::new(), HashSet::new())
         };
 
-        // Build lookup: (file_path, line) → TsSymbol for definitions
-        let mut def_lookup: HashMap<(String, u32), TsSymbol> = HashMap::new();
+        // Build lookup: (file_path, line) → Symbol for definitions
+        let mut def_lookup: HashMap<(String, u32), Symbol> = HashMap::new();
         for (path, sym) in &ts_symbols {
             let path_str = path.to_string_lossy().to_string();
             def_lookup.insert((path_str, sym.line), sym.clone());
@@ -285,7 +325,7 @@ impl GrepServer {
                     } else {
                         // Non-definition line — find enclosing structure via SQL.
                         // find_enclosing opens a throwaway read connection internally.
-                        let enclosing = self.ts_index.as_ref().and_then(|idx| {
+                        let enclosing = self.symbol_index.as_ref().and_then(|idx| {
                             idx.lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .find_enclosing(&file_path, line_0)
@@ -377,7 +417,7 @@ impl GrepServer {
                 // Try tier 1. If it fits, use it; otherwise fall back to tier 2.
                 render_tier1(
                     &enrichments,
-                    self.ts_index.as_ref(),
+                    self.symbol_index.as_ref(),
                     self.budget,
                     &self.fs_manager,
                 )
@@ -1018,7 +1058,7 @@ fn select_and_render_tier(
 )]
 fn render_tier1(
     enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
-    ts_index: Option<&Arc<std::sync::Mutex<TsIndex>>>,
+    symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     budget: usize,
     fs_manager: &FilesystemManager,
 ) -> Option<String> {
@@ -1161,13 +1201,13 @@ fn render_tier1(
             // Definition line — only Symbol and PrepareRenameSymbol hits
             match &hit.classification {
                 HitClass::Symbol { symbol } => {
-                    let kind = format_ts_kind(&symbol.kind);
+                    let kind = format_symbol_kind(&symbol.kind);
                     let scope_prefix = symbol
                         .scope
                         .as_ref()
                         .zip(symbol.scope_kind.as_ref())
                         .map_or_else(String::new, |(sn, sk)| {
-                            format!("<{}> {}/", format_ts_kind(sk), sn)
+                            format!("<{}> {}/", format_symbol_kind(sk), sn)
                         });
                     let line_1 = symbol.line + 1;
                     let _ = writeln!(
@@ -1212,11 +1252,11 @@ fn render_tier1(
                 let mut calls: Vec<&CallEdge> = enrichment.outgoing_calls.iter().collect();
                 calls.sort_by(|a, b| a.name.cmp(&b.name));
                 for c in &calls {
-                    let kind_label = crate::ts::lsp_kind_label(c.kind);
+                    let kind_label = crate::symbol_index::lsp_kind_label(c.kind);
                     let depr = if c.deprecated { ", deprecated" } else { "" };
                     let container_prefix = c.container.as_ref().map_or_else(String::new, |cn| {
-                        // Look up container kind from ts_index if available
-                        let ck = ts_index
+                        // Look up container kind from symbol_index if available
+                        let ck = symbol_index
                             .and_then(|idx| {
                                 let index = idx
                                     .lock()
@@ -1225,7 +1265,7 @@ fn render_tier1(
                                 index.find_enclosing(&path, c.line).ok().flatten()
                             })
                             .map_or_else(String::new, |enc| {
-                                format!("<{}> ", format_ts_kind(&enc.kind))
+                                format!("<{}> ", format_symbol_kind(&enc.kind))
                             });
                         format!("{ck}{cn}/")
                     });
@@ -1253,8 +1293,8 @@ fn render_tier1(
                     let _ = writeln!(output, "\t\t\t{f_rel}");
                     for line_0 in &lines {
                         let line_1 = line_0 + 1;
-                        // Look up enclosing structure from ts_index
-                        let enc_str = ts_index
+                        // Look up enclosing structure from symbol_index
+                        let enc_str = symbol_index
                             .and_then(|idx| {
                                 let index = idx
                                     .lock()
@@ -1263,7 +1303,7 @@ fn render_tier1(
                                 index.find_enclosing(&path, *line_0).ok().flatten()
                             })
                             .map_or_else(String::new, |enc| {
-                                let ek = format_ts_kind(&enc.kind);
+                                let ek = format_symbol_kind(&enc.kind);
                                 let span = format_span(enc.line, enc.end_line);
                                 format!(" <{ek}> {}{span}", enc.name)
                             });
@@ -1276,7 +1316,7 @@ fn render_tier1(
             if !enrichment.supertypes.is_empty() {
                 let _ = writeln!(output, "\t\tsupertypes:");
                 for t in &enrichment.supertypes {
-                    let kind_label = crate::ts::lsp_kind_label(t.kind);
+                    let kind_label = crate::symbol_index::lsp_kind_label(t.kind);
                     let depr = if t.deprecated { ", deprecated" } else { "" };
                     let container_prefix = t
                         .container
@@ -1296,7 +1336,7 @@ fn render_tier1(
             if !enrichment.subtypes.is_empty() {
                 let _ = writeln!(output, "\t\tsubtypes:");
                 for t in &enrichment.subtypes {
-                    let kind_label = crate::ts::lsp_kind_label(t.kind);
+                    let kind_label = crate::symbol_index::lsp_kind_label(t.kind);
                     let depr = if t.deprecated { ", deprecated" } else { "" };
                     let container_prefix = t
                         .container
@@ -1313,8 +1353,7 @@ fn render_tier1(
             }
 
             // refs: section — merge incoming calls, dedup against labeled sections
-            let mut ref_entries: BTreeMap<String, BTreeMap<u32, Option<TsSymbol>>> =
-                BTreeMap::new();
+            let mut ref_entries: BTreeMap<String, BTreeMap<u32, Option<Symbol>>> = BTreeMap::new();
 
             // Add textDocument/references lines
             for (file, lines) in &enrichment.ref_lines {
@@ -1322,7 +1361,7 @@ fn render_tier1(
                     if this_labeled.contains(&(file.clone(), line_0)) {
                         continue;
                     }
-                    let enc = ts_index.and_then(|idx| {
+                    let enc = symbol_index.and_then(|idx| {
                         let index = idx
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1344,7 +1383,7 @@ fn render_tier1(
                 // Use the caller's line as the ref entry. Dedup: if already present, skip.
                 let file_entries = ref_entries.entry(caller.file.clone()).or_default();
                 file_entries.entry(caller.line).or_insert_with(|| {
-                    ts_index.and_then(|idx| {
+                    symbol_index.and_then(|idx| {
                         let index = idx
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1362,13 +1401,13 @@ fn render_tier1(
                     for (&line_0, enc) in lines {
                         let line_1 = line_0 + 1;
                         let enc_str = enc.as_ref().map_or_else(String::new, |enc| {
-                            let ek = format_ts_kind(&enc.kind);
+                            let ek = format_symbol_kind(&enc.kind);
                             let scope_prefix = enc
                                 .scope
                                 .as_ref()
                                 .zip(enc.scope_kind.as_ref())
                                 .map_or_else(String::new, |(sn, sk)| {
-                                    format!("<{}> {}/", format_ts_kind(sk), sn)
+                                    format!("<{}> {}/", format_symbol_kind(sk), sn)
                                 });
                             let span = format_span(enc.line, enc.end_line);
                             format!(" {scope_prefix}<{ek}> {}{span}", enc.name)
@@ -1646,13 +1685,13 @@ const fn count_digits(n: usize) -> usize {
 fn format_hit_line(hit: &GrepHit, line_1: u32) -> String {
     match &hit.classification {
         HitClass::Symbol { symbol } => {
-            let kind = format_ts_kind(&symbol.kind);
+            let kind = format_symbol_kind(&symbol.kind);
             let scope_prefix = symbol
                 .scope
                 .as_ref()
                 .zip(symbol.scope_kind.as_ref())
                 .map_or_else(String::new, |(sn, sk)| {
-                    format!("<{}> {}/", format_ts_kind(sk), sn)
+                    format!("<{}> {}/", format_symbol_kind(sk), sn)
                 });
             let span = format_span(symbol.line, symbol.end_line);
             format!(":{line_1} {scope_prefix}<{kind}> {}{span}", symbol.name)
@@ -1660,13 +1699,13 @@ fn format_hit_line(hit: &GrepHit, line_1: u32) -> String {
         HitClass::Reference {
             enclosing: Some(enc),
         } => {
-            let enc_kind = format_ts_kind(&enc.kind);
+            let enc_kind = format_symbol_kind(&enc.kind);
             let scope_prefix = enc
                 .scope
                 .as_ref()
                 .zip(enc.scope_kind.as_ref())
                 .map_or_else(String::new, |(sn, sk)| {
-                    format!("<{}> {}/", format_ts_kind(sk), sn)
+                    format!("<{}> {}/", format_symbol_kind(sk), sn)
                 });
             let span = format_span(enc.line, enc.end_line);
             format!(":{line_1} {scope_prefix}<{enc_kind}> {}{span}", enc.name)
@@ -2014,7 +2053,7 @@ mod tests {
             col: 0,
             matched_text: name.to_string(),
             classification: HitClass::Symbol {
-                symbol: TsSymbol {
+                symbol: Symbol {
                     name: name.to_string(),
                     kind: kind.to_string(),
                     line,
@@ -2042,7 +2081,7 @@ mod tests {
             col: 0,
             matched_text: name.to_string(),
             classification: HitClass::Symbol {
-                symbol: TsSymbol {
+                symbol: Symbol {
                     name: name.to_string(),
                     kind: kind.to_string(),
                     line,
@@ -2071,7 +2110,7 @@ mod tests {
             col: 0,
             matched_text: text.to_string(),
             classification: HitClass::Reference {
-                enclosing: Some(TsSymbol {
+                enclosing: Some(Symbol {
                     name: enc_name.to_string(),
                     kind: enc_kind.to_string(),
                     line: enc_start,
@@ -2407,7 +2446,7 @@ mod tests {
             col: 0,
             matched_text: "CONST_VAL".to_string(),
             classification: HitClass::Symbol {
-                symbol: TsSymbol {
+                symbol: Symbol {
                     name: "CONST_VAL".to_string(),
                     kind: "constant".to_string(),
                     line: 42,
@@ -2440,7 +2479,7 @@ mod tests {
             col: 0,
             matched_text: "my_func".to_string(),
             classification: HitClass::Symbol {
-                symbol: TsSymbol {
+                symbol: Symbol {
                     name: "my_func".to_string(),
                     kind: "function".to_string(),
                     line: 10,

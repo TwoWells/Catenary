@@ -11,7 +11,7 @@
 //! Three tiers with promote-from-bottom selection:
 //! - Tier 3: bucketed glob patterns with counts (always fits)
 //! - Tier 2: file listing with entry flags (`[symbols available]`, etc.)
-//! - Tier 1: file listing with defensive maps from tree-sitter index
+//! - Tier 1: file listing with defensive maps from symbol index
 
 use anyhow::{Result, anyhow};
 use globset::Glob;
@@ -29,7 +29,8 @@ use super::tool_server::ToolServer;
 use super::toolbox::ResolvedGlob;
 use crate::bucketing::{self, BucketEntry};
 use crate::lsp::LspClientManager;
-use crate::ts::{ScopeFilter, TsIndex, TsSymbol, format_ts_kind};
+use crate::lsp::server::LspServer;
+use crate::symbol_index::{ScopeFilter, Symbol, SymbolIndex, format_symbol_kind};
 
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
@@ -284,7 +285,7 @@ impl DirNode {
         &self,
         out: &mut String,
         depth: usize,
-        ts_index: Option<&TsIndex>,
+        symbol_index: Option<&SymbolIndex>,
         outline_threshold: usize,
         outline_suppress: &[globset::GlobMatcher],
         fs_manager: &FilesystemManager,
@@ -296,7 +297,7 @@ impl DirNode {
             child.render_tier2(
                 out,
                 depth + 1,
-                ts_index,
+                symbol_index,
                 outline_threshold,
                 outline_suppress,
                 fs_manager,
@@ -309,7 +310,7 @@ impl DirNode {
         for file in sorted {
             let flags = compute_tree_flags(
                 file,
-                ts_index,
+                symbol_index,
                 outline_threshold,
                 outline_suppress,
                 fs_manager,
@@ -324,17 +325,24 @@ impl DirNode {
         &self,
         out: &mut String,
         depth: usize,
-        outline: &HashMap<PathBuf, Vec<TsSymbol>>,
+        outline: &HashMap<PathBuf, Vec<Symbol>>,
         children_sets: &HashMap<PathBuf, HashSet<String>>,
         sa_paths: &HashSet<PathBuf>,
-        ts_index: &TsIndex,
+        symbol_index: &SymbolIndex,
     ) {
         let indent: String = "\t".repeat(depth);
         let sym_indent = format!("{indent}\t");
 
         for (name, child) in &self.dirs {
             let _ = writeln!(out, "{indent}{name}/");
-            child.render_tier1(out, depth + 1, outline, children_sets, sa_paths, ts_index);
+            child.render_tier1(
+                out,
+                depth + 1,
+                outline,
+                children_sets,
+                sa_paths,
+                symbol_index,
+            );
         }
 
         let mut sorted: Vec<(usize, &FileNode)> = self.files.iter().enumerate().collect();
@@ -365,7 +373,8 @@ impl DirNode {
             })
             .collect();
 
-        let (shared_groups, individual_map_indices) = compute_dedup(&map_items, outline, ts_index);
+        let (shared_groups, individual_map_indices) =
+            compute_dedup(&map_items, outline, symbol_index);
 
         // Build lookup: original file index → shared group index.
         let mut file_to_group: HashMap<usize, usize> = HashMap::new();
@@ -426,15 +435,15 @@ impl DirNode {
         &self,
         out: &mut String,
         depth: usize,
-        chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
-        ts_index: &TsIndex,
+        chains: &HashMap<PathBuf, Vec<Vec<Symbol>>>,
+        symbol_index: &SymbolIndex,
         expand_children: bool,
     ) {
         let indent: String = "\t".repeat(depth);
 
         for (name, child) in &self.dirs {
             let _ = writeln!(out, "{indent}{name}/");
-            child.render_into(out, depth + 1, chains, ts_index, expand_children);
+            child.render_into(out, depth + 1, chains, symbol_index, expand_children);
         }
 
         let mut sorted: Vec<&FileNode> = self.files.iter().collect();
@@ -450,13 +459,13 @@ impl DirNode {
 
             let _ = writeln!(out, "{indent}{}", file.name);
 
-            let children_set = build_children_set_for_file(ts_index, &file.abs_path);
+            let children_set = build_children_set_for_file(symbol_index, &file.abs_path);
             render_chains_at_depth(
                 out,
                 file_chains,
                 &children_set,
                 expand_children,
-                ts_index,
+                symbol_index,
                 &file.abs_path,
                 depth + 1,
             );
@@ -530,7 +539,7 @@ fn render_file_node(out: &mut String, file: &FileNode, indent: &str, flags: &[&s
 /// Computes flags for a `FileNode` in tree rendering (tier 2).
 fn compute_tree_flags<'a>(
     file: &FileNode,
-    ts_index: Option<&TsIndex>,
+    symbol_index: Option<&SymbolIndex>,
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
@@ -540,7 +549,7 @@ fn compute_tree_flags<'a>(
 
     if !map_rendered
         && !file.is_snapshot
-        && has_grammar_available(&file.abs_path, ts_index)
+        && has_symbols_available(&file.abs_path, symbol_index)
         && (file.line_count.is_some_and(|lc| lc >= outline_threshold)
             || is_outline_suppressed(&file.abs_path, outline_suppress, fs_manager))
     {
@@ -563,7 +572,7 @@ fn compute_tree_flags<'a>(
 pub struct GlobServer {
     pub(super) client_manager: Arc<LspClientManager>,
     pub(super) fs_manager: Arc<FilesystemManager>,
-    pub(super) ts_index: Option<Arc<Mutex<TsIndex>>>,
+    pub(super) symbol_index: Option<Arc<Mutex<SymbolIndex>>>,
     pub(super) budget: usize,
     pub(super) outline_threshold: usize,
     pub(super) outline_suppress: Vec<globset::GlobMatcher>,
@@ -607,6 +616,8 @@ impl ToolServer for GlobServer {
         if let Some(ref into_str) = input.into {
             let after_line = input.cursor.as_deref().map(decode_cursor).transpose()?;
             let files = self.resolve_files(&path, &pattern, &input, exclude.as_ref())?;
+            self.client_manager.ensure_and_wait_for_paths(&files).await;
+            self.ensure_symbols(&files).await;
             let output = self.handle_into(&files, into_str, after_line)?;
             return Ok(Value::String(output));
         }
@@ -616,11 +627,17 @@ impl ToolServer for GlobServer {
 
         // Run pipeline.
         let output = if path.is_file() || path.is_symlink() {
+            self.client_manager
+                .ensure_and_wait_for_paths(std::slice::from_ref(&path))
+                .await;
+            self.ensure_symbols(std::slice::from_ref(&path)).await;
             self.handle_glob_file(&path, after_line)
         } else if path.is_dir() {
-            self.handle_glob_dir(&path, &input, exclude.as_ref())?
+            self.handle_glob_dir(&path, &input, exclude.as_ref())
+                .await?
         } else {
-            self.handle_glob_pattern(&pattern, &input, exclude.as_ref())?
+            self.handle_glob_pattern(&pattern, &input, exclude.as_ref())
+                .await?
         };
 
         Ok(Value::String(output))
@@ -628,7 +645,49 @@ impl ToolServer for GlobServer {
 }
 
 impl GlobServer {
-    /// Single file: header with defensive map (if grammar installed).
+    /// Ensures the symbol index is populated for the given files.
+    ///
+    /// For each file without cached symbols, opens the document on the
+    /// server, requests `documentSymbol`, and feeds the response to the
+    /// index.
+    async fn ensure_symbols(&self, files: &[PathBuf]) {
+        let Some(ref idx_arc) = self.symbol_index else {
+            return;
+        };
+        let needs_populate: Vec<PathBuf> = {
+            let Ok(idx) = idx_arc.lock() else { return };
+            files
+                .iter()
+                .filter(|p| p.is_file() && !idx.has_symbols_for(p))
+                .cloned()
+                .collect()
+        };
+
+        for path in &needs_populate {
+            let servers = self
+                .client_manager
+                .get_servers(path, LspServer::supports_document_symbols)
+                .await;
+            let Some(server) = servers.first() else {
+                continue;
+            };
+            let Ok(uri) = self
+                .client_manager
+                .open_document_on(path, server, None)
+                .await
+            else {
+                continue;
+            };
+            let Ok(response) = server.lock().await.document_symbols(&uri).await else {
+                continue;
+            };
+            if let Ok(idx) = idx_arc.lock() {
+                let _ = idx.populate_from_document_symbols(path, &response);
+            }
+        }
+    }
+
+    /// Single file: header with defensive map (if symbols available).
     ///
     /// Single files bypass `outline_threshold` — they get a map unless the
     /// grammar is not installed or the path matches `outline_suppress`. Pages
@@ -663,23 +722,19 @@ impl GlobServer {
             let _ = writeln!(result, "{display}  ({})", format_file_size(size));
         }
 
-        // Single-file map: bypass threshold, check grammar + deny only.
-        let Some(ref ts_arc) = self.ts_index else {
+        // Single-file map: bypass threshold, check symbols + deny only.
+        let Some(ref ts_arc) = self.symbol_index else {
             return result;
         };
         let Ok(idx) = ts_arc.lock() else {
             return result;
         };
-        if !idx.has_grammar_for(path)
+        if !idx.has_symbols_for(path)
             || is_outline_suppressed(path, &self.outline_suppress, &self.fs_manager)
         {
             return result;
         }
 
-        // Ensure fresh and query outline.
-        if idx.ensure_fresh(&[path.to_path_buf()]).is_err() {
-            return result;
-        }
         let Ok(outline) = idx.query_outline_batch(&[path]) else {
             return result;
         };
@@ -688,7 +743,7 @@ impl GlobServer {
         };
 
         // Apply cursor: skip symbols at or before `after_line`.
-        let filtered: Vec<&TsSymbol> = syms
+        let filtered: Vec<&Symbol> = syms
             .iter()
             .filter(|s| after_line.is_none_or(|al| s.line > al))
             .collect();
@@ -736,7 +791,7 @@ impl GlobServer {
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
     )]
-    fn handle_glob_dir(
+    async fn handle_glob_dir(
         &self,
         dir: &Path,
         input: &GlobInput,
@@ -857,7 +912,18 @@ impl GlobServer {
             return Ok("Directory is empty".to_string());
         }
 
-        let ts_guard = self.ts_index.as_ref().and_then(|m| m.lock().ok());
+        // Populate symbol index for eligible files.
+        let file_paths: Vec<PathBuf> = entries
+            .iter()
+            .filter(|e| !e.is_dir && !e.is_broken_symlink && !e.is_snapshot)
+            .map(|e| e.abs_path.clone())
+            .collect();
+        self.client_manager
+            .ensure_and_wait_for_paths(&file_paths)
+            .await;
+        self.ensure_symbols(&file_paths).await;
+
+        let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
         Ok(select_dir_tier(
             &entries,
             self.budget,
@@ -877,7 +943,7 @@ impl GlobServer {
         clippy::significant_drop_tightening,
         reason = "guard must live for all index queries"
     )]
-    fn handle_glob_pattern(
+    async fn handle_glob_pattern(
         &self,
         pattern: &str,
         input: &GlobInput,
@@ -984,8 +1050,15 @@ impl GlobServer {
             );
         }
 
+        // Populate symbol index for matched files.
+        let abs_paths: Vec<PathBuf> = matched_files.iter().map(|(p, _, _)| p.clone()).collect();
+        self.client_manager
+            .ensure_and_wait_for_paths(&abs_paths)
+            .await;
+        self.ensure_symbols(&abs_paths).await;
+
         // Tier selection: promote from bottom.
-        let ts_guard = self.ts_index.as_ref().and_then(|m| m.lock().ok());
+        let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
         let ts_ref = ts_guard.as_deref();
 
         // 1. Tier 3 (bucketed) — always fits.
@@ -1023,20 +1096,17 @@ impl GlobServer {
                 .map(PathBuf::as_path)
                 .collect();
 
-            if !eligible.is_empty() {
-                let _ =
-                    idx.ensure_fresh(&eligible.iter().map(|p| p.to_path_buf()).collect::<Vec<_>>());
-                if let Ok(outline) = idx.query_outline_batch(&eligible)
-                    && !outline.is_empty()
-                {
-                    let children_sets = build_children_sets(idx, &eligible);
-                    let sa_paths = build_sa_paths(&matched_files, idx);
+            if !eligible.is_empty()
+                && let Ok(outline) = idx.query_outline_batch(&eligible)
+                && !outline.is_empty()
+            {
+                let children_sets = build_children_sets(idx, &eligible);
+                let sa_paths = build_sa_paths(&matched_files, idx);
 
-                    let mut tier1 = String::new();
-                    root_node.render_tier1(&mut tier1, 0, &outline, &children_sets, &sa_paths, idx);
-                    if tier1.len() <= self.budget {
-                        return Ok(tier1);
-                    }
+                let mut tier1 = String::new();
+                root_node.render_tier1(&mut tier1, 0, &outline, &children_sets, &sa_paths, idx);
+                if tier1.len() <= self.budget {
+                    return Ok(tier1);
                 }
             }
         }
@@ -1163,8 +1233,8 @@ impl GlobServer {
         into: &str,
         after_line: Option<u32>,
     ) -> Result<String> {
-        let Some(ref ts_arc) = self.ts_index else {
-            return Err(anyhow!("`into` requires a tree-sitter index"));
+        let Some(ref ts_arc) = self.symbol_index else {
+            return Err(anyhow!("`into` requires a symbol index"));
         };
         let idx = ts_arc.lock().map_err(|e| anyhow!("lock error: {e}"))?;
 
@@ -1172,11 +1242,9 @@ impl GlobServer {
             return Ok("No matches found".to_string());
         }
 
-        // Ensure the index is fresh for all files.
-        let _ = idx.ensure_fresh(files);
-
-        // Detect free-text grammar from the first file with a grammar.
-        let is_free_text = files.iter().any(|f| idx.is_free_text_grammar(f));
+        // Free-text grammar detection removed with tree-sitter — documentSymbol
+        // provides structured symbols regardless of grammar type.
+        let is_free_text = false;
 
         let segments = parse_into(into, is_free_text);
         if segments.is_empty() {
@@ -1198,7 +1266,7 @@ impl GlobServer {
         let kind_filter = first.kind.as_ref().map(|k| kind_to_capture(k));
         let deprecated_only = first.tags.iter().any(|t| t == "deprecated");
 
-        let mut current: HashMap<PathBuf, Vec<TsSymbol>> = query_with_alternation(
+        let mut current: HashMap<PathBuf, Vec<Symbol>> = query_with_alternation(
             &idx,
             &file_refs,
             &scope,
@@ -1208,18 +1276,18 @@ impl GlobServer {
         )?;
 
         // Track the chain of intermediate symbols for rendering.
-        let mut chains: HashMap<PathBuf, Vec<Vec<TsSymbol>>> = HashMap::new();
+        let mut chains: HashMap<PathBuf, Vec<Vec<Symbol>>> = HashMap::new();
 
         // Initialize chains from first segment matches.
         for (path, syms) in &current {
-            let file_chains: Vec<Vec<TsSymbol>> = syms.iter().map(|s| vec![s.clone()]).collect();
+            let file_chains: Vec<Vec<Symbol>> = syms.iter().map(|s| vec![s.clone()]).collect();
             chains.insert(path.clone(), file_chains);
         }
 
         // Subsequent segments: children of previous matches.
         for seg in &segments[1..] {
-            let mut next: HashMap<PathBuf, Vec<TsSymbol>> = HashMap::new();
-            let mut next_chains: HashMap<PathBuf, Vec<Vec<TsSymbol>>> = HashMap::new();
+            let mut next: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
+            let mut next_chains: HashMap<PathBuf, Vec<Vec<Symbol>>> = HashMap::new();
 
             let seg_kind = seg.kind.as_ref().map(|k| kind_to_capture(k));
             let seg_deprecated = seg.tags.iter().any(|t| t == "deprecated");
@@ -1295,14 +1363,14 @@ fn is_map_eligible_entry(
     entry: &GlobEntry,
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
-    ts_index: &TsIndex,
+    symbol_index: &SymbolIndex,
     fs_manager: &FilesystemManager,
 ) -> bool {
     !entry.is_dir
         && !entry.is_broken_symlink
         && !entry.is_snapshot
         && entry.line_count.is_some_and(|lc| lc >= outline_threshold)
-        && ts_index.has_grammar_for(&entry.abs_path)
+        && symbol_index.has_symbols_for(&entry.abs_path)
         && !is_outline_suppressed(&entry.abs_path, outline_suppress, fs_manager)
 }
 
@@ -1312,7 +1380,7 @@ fn is_map_eligible(
     _matched_files: &[(PathBuf, PathBuf, bool)],
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
-    ts_index: &TsIndex,
+    symbol_index: &SymbolIndex,
     fs_manager: &FilesystemManager,
 ) -> bool {
     let metadata = std::fs::metadata(path).ok();
@@ -1327,13 +1395,13 @@ fn is_map_eligible(
 
     !is_snapshot(&name)
         && line_count.is_some_and(|lc| lc >= outline_threshold)
-        && ts_index.has_grammar_for(path)
+        && symbol_index.has_symbols_for(path)
         && !is_outline_suppressed(path, outline_suppress, fs_manager)
 }
 
-/// Returns `true` if a grammar is installed for the file's language.
-fn has_grammar_available(path: &Path, ts_index: Option<&TsIndex>) -> bool {
-    ts_index.is_some_and(|idx| idx.has_grammar_for(path))
+/// Returns `true` if symbols are cached for the file in the index.
+fn has_symbols_available(path: &Path, symbol_index: Option<&SymbolIndex>) -> bool {
+    symbol_index.is_some_and(|idx| idx.has_symbols_for(path))
 }
 
 /// Returns `true` if the file matches any `outline_suppress` pattern.
@@ -1362,11 +1430,11 @@ fn is_snapshot(name: &str) -> bool {
 /// Renders a single symbol line: `:start-end <Kind> Name[/]`.
 fn render_symbol_line(
     out: &mut String,
-    sym: &TsSymbol,
+    sym: &Symbol,
     children_set: Option<&HashSet<String>>,
     indent: &str,
 ) {
-    let kind_label = format_ts_kind(&sym.kind);
+    let kind_label = format_symbol_kind(&sym.kind);
     let trailing = if children_set.is_some_and(|cs| cs.contains(&sym.name)) {
         "/"
     } else {
@@ -1393,7 +1461,7 @@ struct MapItem<'a> {
 }
 
 /// Fingerprint: sorted `(kind, name)` pairs as a single string key.
-fn make_fingerprint(syms: &[TsSymbol]) -> String {
+fn make_fingerprint(syms: &[Symbol]) -> String {
     let mut pairs: Vec<(&str, &str)> = syms
         .iter()
         .map(|s| (s.kind.as_str(), s.name.as_str()))
@@ -1425,8 +1493,8 @@ type SharedGroup = (Vec<usize>, Vec<BoundingSymbol>);
 /// are unique. Indices are into the `items` slice.
 fn compute_dedup(
     items: &[MapItem<'_>],
-    outline: &HashMap<PathBuf, Vec<TsSymbol>>,
-    ts_index: &TsIndex,
+    outline: &HashMap<PathBuf, Vec<Symbol>>,
+    symbol_index: &SymbolIndex,
 ) -> (Vec<SharedGroup>, Vec<usize>) {
     // Group by fingerprint.
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1467,7 +1535,7 @@ fn compute_dedup(
                             kind: sym.kind.clone(),
                             min_line: min_l,
                             max_end_line: max_e,
-                            has_children: ts_index.has_children(rep_path, &sym.name),
+                            has_children: symbol_index.has_children(rep_path, &sym.name),
                         }
                     })
                     .collect()
@@ -1500,7 +1568,7 @@ fn render_shared_group(
     let _ = writeln!(out, "{indent}common structure (ranges are bounding):");
     for sym in bounding {
         let trailing = if sym.has_children { "/" } else { "" };
-        let kind_label = format_ts_kind(&sym.kind);
+        let kind_label = format_symbol_kind(&sym.kind);
         let _ = writeln!(
             out,
             "{sym_indent}:{}-{} <{kind_label}> {}{trailing}",
@@ -1514,7 +1582,7 @@ fn render_shared_group(
 /// Renders an individual file's outline symbols.
 fn render_individual_map(
     out: &mut String,
-    syms: &[TsSymbol],
+    syms: &[Symbol],
     children_set: Option<&HashSet<String>>,
     sym_indent: &str,
 ) {
@@ -1534,7 +1602,7 @@ fn render_individual_map(
 fn select_dir_tier(
     entries: &[GlobEntry],
     budget: usize,
-    ts_index: Option<&TsIndex>,
+    symbol_index: Option<&SymbolIndex>,
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
@@ -1552,7 +1620,7 @@ fn select_dir_tier(
     // 2. Tier 2 (file listing with flags).
     let tier2 = render_dir_listing_with_flags(
         entries,
-        ts_index,
+        symbol_index,
         outline_threshold,
         outline_suppress,
         fs_manager,
@@ -1562,7 +1630,7 @@ fn select_dir_tier(
     }
 
     // 3. Tier 1 (file listing with maps).
-    let Some(idx) = ts_index else {
+    let Some(idx) = symbol_index else {
         return tier2;
     };
 
@@ -1580,14 +1648,11 @@ fn select_dir_tier(
     }
 
     // Ensure fresh for all eligible files.
-    let fresh_paths: Vec<PathBuf> = eligible_indices
-        .iter()
-        .map(|&i| entries[i].abs_path.clone())
-        .collect();
-    let _ = idx.ensure_fresh(&fresh_paths);
-
     // Query outline symbols.
-    let eligible_refs: Vec<&Path> = fresh_paths.iter().map(PathBuf::as_path).collect();
+    let eligible_refs: Vec<&Path> = eligible_indices
+        .iter()
+        .map(|&i| entries[i].abs_path.as_path())
+        .collect();
     let Ok(outline) = idx.query_outline_batch(&eligible_refs) else {
         return tier2;
     };
@@ -1604,7 +1669,7 @@ fn select_dir_tier(
         &outline,
         &children_sets,
         idx,
-        ts_index,
+        symbol_index,
         outline_suppress,
         fs_manager,
     );
@@ -1615,7 +1680,7 @@ fn select_dir_tier(
 /// Renders a flat directory listing with entry flags (tier 2).
 fn render_dir_listing_with_flags(
     entries: &[GlobEntry],
-    ts_index: Option<&TsIndex>,
+    symbol_index: Option<&SymbolIndex>,
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
@@ -1635,7 +1700,7 @@ fn render_dir_listing_with_flags(
     for f in &files {
         let flags = compute_entry_flags(
             f,
-            ts_index,
+            symbol_index,
             outline_threshold,
             outline_suppress,
             fs_manager,
@@ -1655,10 +1720,10 @@ fn render_dir_listing_with_flags(
 fn render_dir_listing_with_maps(
     entries: &[GlobEntry],
     eligible_indices: &[usize],
-    outline: &HashMap<PathBuf, Vec<TsSymbol>>,
+    outline: &HashMap<PathBuf, Vec<Symbol>>,
     children_sets: &HashMap<PathBuf, HashSet<String>>,
-    ts_index: &TsIndex,
-    ts_opt: Option<&TsIndex>,
+    symbol_index: &SymbolIndex,
+    ts_opt: Option<&SymbolIndex>,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
 ) -> String {
@@ -1682,7 +1747,7 @@ fn render_dir_listing_with_maps(
         })
         .collect();
 
-    let (shared_groups, individual_map_indices) = compute_dedup(&map_items, outline, ts_index);
+    let (shared_groups, individual_map_indices) = compute_dedup(&map_items, outline, symbol_index);
 
     // Lookup tables: entry index → shared group, entry index → individual.
     let mut entry_to_group: HashMap<usize, usize> = HashMap::new();
@@ -1721,7 +1786,7 @@ fn render_dir_listing_with_maps(
             }
         } else {
             // Non-eligible file.
-            let has_sa = has_grammar_available(&f.abs_path, ts_opt)
+            let has_sa = has_symbols_available(&f.abs_path, ts_opt)
                 && is_outline_suppressed(&f.abs_path, outline_suppress, fs_manager);
             let mut flags = Vec::new();
             if has_sa {
@@ -1746,7 +1811,7 @@ fn render_dir_listing_with_maps(
 /// Computes entry flags for a `GlobEntry`.
 fn compute_entry_flags<'a>(
     entry: &GlobEntry,
-    ts_index: Option<&TsIndex>,
+    symbol_index: Option<&SymbolIndex>,
     outline_threshold: usize,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
@@ -1765,14 +1830,14 @@ fn compute_entry_flags<'a>(
     }
 
     if !map_rendered
-        && has_grammar_available(&entry.abs_path, ts_index)
+        && has_symbols_available(&entry.abs_path, symbol_index)
         && entry.line_count.is_some_and(|lc| lc >= outline_threshold)
     {
         flags.push("symbols available");
     }
 
     if map_rendered
-        && has_grammar_available(&entry.abs_path, ts_index)
+        && has_symbols_available(&entry.abs_path, symbol_index)
         && is_outline_suppressed(&entry.abs_path, outline_suppress, fs_manager)
     {
         flags.push("symbols available");
@@ -1830,9 +1895,9 @@ fn render_entry_line(out: &mut String, entry: &GlobEntry, flags: &[&str]) {
 #[allow(clippy::too_many_lines, reason = "sequential pipeline steps")]
 fn render_into_results(
     files: &[&PathBuf],
-    targets: &HashMap<PathBuf, Vec<TsSymbol>>,
-    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
-    ts_index: &TsIndex,
+    targets: &HashMap<PathBuf, Vec<Symbol>>,
+    chains: &HashMap<PathBuf, Vec<Vec<Symbol>>>,
+    symbol_index: &SymbolIndex,
     budget: usize,
     after_line: Option<u32>,
 ) -> String {
@@ -1847,18 +1912,18 @@ fn render_into_results(
     let tier3 = render_bucketed(&file_names, budget);
 
     // Tier 2 (degraded): target symbols with spans, no children.
-    let tier2 = render_into_with_prefix(&tree, prefix.as_deref(), chains, ts_index, false);
+    let tier2 = render_into_with_prefix(&tree, prefix.as_deref(), chains, symbol_index, false);
     if tier2.len() > budget {
         return tier3;
     }
 
     // Compute structure dedup for tier 1.
-    let dedup = compute_into_dedup(files, targets, chains, ts_index);
+    let dedup = compute_into_dedup(files, targets, chains, symbol_index);
 
     // Tier 1 (full): target symbols with children + dedup.
     if dedup.shared.is_empty() {
         // No dedup needed — render tree with children.
-        let tier1 = render_into_with_prefix(&tree, prefix.as_deref(), chains, ts_index, true);
+        let tier1 = render_into_with_prefix(&tree, prefix.as_deref(), chains, symbol_index, true);
         if tier1.len() <= budget {
             return tier1;
         }
@@ -1868,7 +1933,7 @@ fn render_into_results(
     } else {
         // Dedup groups exist — render flat with dedup (tree + dedup
         // interaction is complex; flat rendering is correct).
-        let tier1 = render_into_tier1_dedup(files, targets, chains, ts_index, &dedup);
+        let tier1 = render_into_tier1_dedup(files, targets, chains, symbol_index, &dedup);
         if tier1.len() <= budget {
             return tier1;
         }
@@ -1925,9 +1990,9 @@ fn page_into_output(full: &str, budget: usize, after_line: Option<u32>) -> Strin
 /// Fingerprint for `into` structure dedup: target names + children (kind, name).
 fn compute_into_dedup(
     files: &[&PathBuf],
-    targets: &HashMap<PathBuf, Vec<TsSymbol>>,
-    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
-    ts_index: &TsIndex,
+    targets: &HashMap<PathBuf, Vec<Symbol>>,
+    chains: &HashMap<PathBuf, Vec<Vec<Symbol>>>,
+    symbol_index: &SymbolIndex,
 ) -> IntoDedup {
     let mut fingerprints: HashMap<String, Vec<usize>> = HashMap::new();
 
@@ -1943,11 +2008,11 @@ fn compute_into_dedup(
         }
 
         // Build fingerprint from target children.
-        let children_set = build_children_set_for_file(ts_index, path);
+        let children_set = build_children_set_for_file(symbol_index, path);
         let mut fp_parts: Vec<String> = Vec::new();
 
         for target in file_targets {
-            let children = ts_index
+            let children = symbol_index
                 .query_scoped(
                     &[path.as_path()],
                     &ScopeFilter::ChildrenOf(&target.name),
@@ -2005,17 +2070,17 @@ struct IntoDedup {
 fn render_into_with_prefix(
     tree: &DirNode,
     prefix: Option<&str>,
-    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
-    ts_index: &TsIndex,
+    chains: &HashMap<PathBuf, Vec<Vec<Symbol>>>,
+    symbol_index: &SymbolIndex,
     expand_children: bool,
 ) -> String {
     let mut out = String::new();
 
     if let Some(pfx) = prefix {
         let _ = writeln!(out, "{pfx}");
-        tree.render_into(&mut out, 1, chains, ts_index, expand_children);
+        tree.render_into(&mut out, 1, chains, symbol_index, expand_children);
     } else {
-        tree.render_into(&mut out, 0, chains, ts_index, expand_children);
+        tree.render_into(&mut out, 0, chains, symbol_index, expand_children);
     }
 
     out
@@ -2024,10 +2089,10 @@ fn render_into_with_prefix(
 /// Renders chains at a specific indentation depth.
 fn render_chains_at_depth(
     out: &mut String,
-    file_chains: &[Vec<TsSymbol>],
+    file_chains: &[Vec<Symbol>],
     children_set: &HashSet<String>,
     expand_children: bool,
-    ts_index: &TsIndex,
+    symbol_index: &SymbolIndex,
     file_path: &Path,
     base_depth: usize,
 ) {
@@ -2047,7 +2112,14 @@ fn render_chains_at_depth(
             }
             render_into_symbol(out, sym, children_set, &indent);
             if expand_children {
-                render_target_children(out, sym, children_set, ts_index, file_path, &child_indent);
+                render_target_children(
+                    out,
+                    sym,
+                    children_set,
+                    symbol_index,
+                    file_path,
+                    &child_indent,
+                );
             }
         }
         return;
@@ -2059,7 +2131,7 @@ fn render_chains_at_depth(
         0,
         children_set,
         expand_children,
-        ts_index,
+        symbol_index,
         file_path,
         base_depth,
     );
@@ -2070,9 +2142,9 @@ fn render_chains_at_depth(
 /// Used when dedup groups exist — tree structure would fragment the groups.
 fn render_into_tier1_dedup(
     files: &[&PathBuf],
-    targets: &HashMap<PathBuf, Vec<TsSymbol>>,
-    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
-    ts_index: &TsIndex,
+    targets: &HashMap<PathBuf, Vec<Symbol>>,
+    chains: &HashMap<PathBuf, Vec<Vec<Symbol>>>,
+    symbol_index: &SymbolIndex,
     dedup: &IntoDedup,
 ) -> String {
     let mut out = String::new();
@@ -2090,9 +2162,17 @@ fn render_into_tier1_dedup(
 
         let rep = files[group[0]];
         if let Some(file_chains) = chains.get(rep) {
-            let children_set = build_children_set_for_file(ts_index, rep);
+            let children_set = build_children_set_for_file(symbol_index, rep);
             let _ = writeln!(out, "common structure (ranges are bounding):");
-            render_chains_at_depth(&mut out, file_chains, &children_set, true, ts_index, rep, 1);
+            render_chains_at_depth(
+                &mut out,
+                file_chains,
+                &children_set,
+                true,
+                symbol_index,
+                rep,
+                1,
+            );
         }
     }
 
@@ -2128,13 +2208,13 @@ fn render_into_tier1_dedup(
             let _ = writeln!(out, "{name}");
         }
 
-        let children_set = build_children_set_for_file(ts_index, path);
+        let children_set = build_children_set_for_file(symbol_index, path);
         render_chains_at_depth(
             &mut out,
             file_chains,
             &children_set,
             true,
-            ts_index,
+            symbol_index,
             path,
             1,
         );
@@ -2150,16 +2230,16 @@ fn render_into_tier1_dedup(
 )]
 fn render_chain_tree(
     out: &mut String,
-    chains: &[Vec<TsSymbol>],
+    chains: &[Vec<Symbol>],
     depth: usize,
     children_set: &HashSet<String>,
     expand_children: bool,
-    ts_index: &TsIndex,
+    symbol_index: &SymbolIndex,
     file_path: &Path,
     indent_level: usize,
 ) {
     // Group chains by the symbol at this depth (keyed by line number).
-    let mut groups: BTreeMap<u32, Vec<&Vec<TsSymbol>>> = BTreeMap::new();
+    let mut groups: BTreeMap<u32, Vec<&Vec<Symbol>>> = BTreeMap::new();
     for chain in chains {
         if depth < chain.len() {
             groups.entry(chain[depth].line).or_default().push(chain);
@@ -2178,23 +2258,30 @@ fn render_chain_tree(
             // This is a target (last segment match). Show children.
             if expand_children {
                 let child_indent = format!("{indent}\t");
-                render_target_children(out, sym, children_set, ts_index, file_path, &child_indent);
+                render_target_children(
+                    out,
+                    sym,
+                    children_set,
+                    symbol_index,
+                    file_path,
+                    &child_indent,
+                );
             }
         } else {
             // Recurse to the next depth level.
-            let sub_chains: Vec<&Vec<TsSymbol>> = group_chains
+            let sub_chains: Vec<&Vec<Symbol>> = group_chains
                 .iter()
                 .filter(|c| depth + 1 < c.len())
                 .copied()
                 .collect();
-            let owned: Vec<Vec<TsSymbol>> = sub_chains.iter().map(|c| (*c).clone()).collect();
+            let owned: Vec<Vec<Symbol>> = sub_chains.iter().map(|c| (*c).clone()).collect();
             render_chain_tree(
                 out,
                 &owned,
                 depth + 1,
                 children_set,
                 expand_children,
-                ts_index,
+                symbol_index,
                 file_path,
                 indent_level + 1,
             );
@@ -2205,11 +2292,11 @@ fn render_chain_tree(
 /// Renders a single symbol line for `into` output.
 fn render_into_symbol(
     out: &mut String,
-    sym: &TsSymbol,
+    sym: &Symbol,
     children_set: &HashSet<String>,
     indent: &str,
 ) {
-    let kind_label = format_ts_kind(&sym.kind);
+    let kind_label = format_symbol_kind(&sym.kind);
     let trailing = if children_set.contains(&sym.name) {
         "/"
     } else {
@@ -2228,9 +2315,9 @@ fn render_into_symbol(
 /// Renders the children of a target symbol (or "no nested definitions").
 fn render_target_children(
     out: &mut String,
-    target: &TsSymbol,
+    target: &Symbol,
     children_set: &HashSet<String>,
-    ts_index: &TsIndex,
+    symbol_index: &SymbolIndex,
     file_path: &Path,
     indent: &str,
 ) {
@@ -2246,7 +2333,7 @@ fn render_target_children(
     }
 
     // Query children of this target.
-    let children = ts_index
+    let children = symbol_index
         .query_scoped(
             &[file_path],
             &ScopeFilter::ChildrenOf(&target.name),
@@ -2268,24 +2355,24 @@ fn render_target_children(
 /// `SQLite` GLOB doesn't support `{a,b}` syntax. This function expands
 /// alternation patterns and merges results from multiple queries.
 fn query_with_alternation(
-    ts_index: &TsIndex,
+    symbol_index: &SymbolIndex,
     files: &[&Path],
     scope: &ScopeFilter<'_>,
     name_pattern: &str,
     kind_filter: Option<&str>,
     deprecated_only: bool,
-) -> Result<HashMap<PathBuf, Vec<TsSymbol>>> {
+) -> Result<HashMap<PathBuf, Vec<Symbol>>> {
     let patterns = expand_alternation(name_pattern);
 
     if patterns.len() == 1 {
-        return ts_index.query_scoped(files, scope, &patterns[0], kind_filter, deprecated_only);
+        return symbol_index.query_scoped(files, scope, &patterns[0], kind_filter, deprecated_only);
     }
 
-    let mut merged: HashMap<PathBuf, Vec<TsSymbol>> = HashMap::new();
+    let mut merged: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
     let mut seen: HashSet<(PathBuf, u32)> = HashSet::new();
 
     for pat in &patterns {
-        let results = ts_index.query_scoped(files, scope, pat, kind_filter, deprecated_only)?;
+        let results = symbol_index.query_scoped(files, scope, pat, kind_filter, deprecated_only)?;
         for (path, syms) in results {
             let entry = merged.entry(path.clone()).or_default();
             for sym in syms {
@@ -2305,8 +2392,8 @@ fn query_with_alternation(
 }
 
 /// Builds a children set (names that appear as scope) for a single file.
-fn build_children_set_for_file(ts_index: &TsIndex, path: &Path) -> HashSet<String> {
-    ts_index
+fn build_children_set_for_file(symbol_index: &SymbolIndex, path: &Path) -> HashSet<String> {
+    symbol_index
         .query(".*", Some(&[path.to_path_buf()]))
         .ok()
         .map(|all| {
@@ -2381,11 +2468,14 @@ fn decode_cursor(token: &str) -> Result<u32> {
 ///
 /// For each file, collects the set of symbol names that are used as
 /// `scope` by other symbols — these are containers that get trailing `/`.
-fn build_children_sets(ts_index: &TsIndex, files: &[&Path]) -> HashMap<PathBuf, HashSet<String>> {
+fn build_children_sets(
+    symbol_index: &SymbolIndex,
+    files: &[&Path],
+) -> HashMap<PathBuf, HashSet<String>> {
     let mut result = HashMap::new();
     for &path in files {
         let mut cs = HashSet::new();
-        if let Ok(all) = ts_index.query(".*", Some(&[path.to_path_buf()])) {
+        if let Ok(all) = symbol_index.query(".*", Some(&[path.to_path_buf()])) {
             for (_, s) in &all {
                 if let Some(ref scope) = s.scope {
                     cs.insert(scope.clone());
@@ -2402,11 +2492,11 @@ fn build_children_sets(ts_index: &TsIndex, files: &[&Path]) -> HashMap<PathBuf, 
 /// Builds the set of paths that have grammars available (for `[symbols available]`).
 fn build_sa_paths(
     matched_files: &[(PathBuf, PathBuf, bool)],
-    ts_index: &TsIndex,
+    symbol_index: &SymbolIndex,
 ) -> HashSet<PathBuf> {
     matched_files
         .iter()
-        .filter(|(p, _, _)| ts_index.has_grammar_for(p))
+        .filter(|(p, _, _)| symbol_index.has_symbols_for(p))
         .map(|(p, _, _)| p.clone())
         .collect()
 }

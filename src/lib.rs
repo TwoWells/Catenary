@@ -20,8 +20,6 @@ pub mod db;
 pub mod filter;
 /// IPC server for host CLI hook integration (diagnostics and root sync).
 pub mod hook;
-/// Grammar installation, listing, and removal for tree-sitter integration.
-pub mod install;
 /// Multi-sink tracing dispatcher for Catenary telemetry.
 pub mod logging;
 /// LSP client implementation and server management.
@@ -30,7 +28,7 @@ pub mod lsp;
 pub mod mcp;
 /// Session management and event broadcasting.
 pub mod session;
-/// Tree-sitter index for workspace-wide symbol extraction.
-pub mod ts;
+/// Symbol index for workspace-wide symbol extraction.
+pub mod symbol_index;
 /// Interactive TUI for session browsing and event tailing.
 pub mod tui;

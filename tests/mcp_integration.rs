@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
-use common::{BridgeProcess, install_mock_grammar_for, mockls_lsp_arg};
+use common::{BridgeProcess, mockls_lsp_arg};
 
 const MOCK_LANG_A: &str = "yX4Za";
 const MOCK_LANG_B: &str = "d5apI";
@@ -591,9 +591,16 @@ fn test_no_roots_request_without_capability() -> Result<()> {
 // These tests use mockls instead of real language servers, so they always
 // run regardless of installed toolchains.
 
-/// Pre-installs the mock tree-sitter grammar for `.mock` files.
-fn install_mock_grammar(state_home: &str) -> Result<()> {
-    install_mock_grammar_for(state_home, "mock")
+/// No-op: grammar installation removed. Symbols come from
+/// `documentSymbol` via mockls. Kept as a callback for
+/// `spawn_with_grammar` compatibility.
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "callback signature requires Result"
+)]
+fn install_mock_grammar(_state_home: &str) -> Result<()> {
+    Ok(())
 }
 
 #[test]
@@ -944,13 +951,11 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
     Ok(())
 }
 
-/// No-grammar path: `prepareRename` filters keywords, ripgrep produces
-/// heatmap output without kind labels or structure context.
+/// Symbol source present: `documentSymbol` provides kind labels and
+/// structure context even without a grammar installation step.
 #[test]
 fn test_search_graceful_degradation() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // "fn" is a declaration keyword — prepareRename should filter it.
-    // "greet" is a symbol name — prepareRename should accept it.
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn greet()\ngreet\n")?;
 
@@ -959,7 +964,8 @@ fn test_search_graceful_degradation() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Search for the keyword "fn" — should be filtered by prepareRename.
+    // Search for "fn" — the line is a symbol definition (from documentSymbol),
+    // so the hit is classified as a symbol.
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -978,10 +984,10 @@ fn test_search_graceful_degradation() -> Result<()> {
     let text_fn = response["result"]["content"][0]["text"]
         .as_str()
         .context("Missing text")?;
-    // No grammar → no <Kind> labels
+    // With documentSymbol, kind labels are present
     assert!(
-        !text_fn.contains("<Function>"),
-        "No-grammar path should not have kind labels, got: {text_fn}"
+        text_fn.contains("<Function>"),
+        "documentSymbol path should have kind labels, got: {text_fn}"
     );
 
     // Search for "greet" — a symbol, not a keyword.
@@ -1008,10 +1014,10 @@ fn test_search_graceful_degradation() -> Result<()> {
         text.contains(&format!("test.{MOCK_LANG_A}")),
         "Should show file reference, got: {text}"
     );
-    // No kind labels without a grammar
+    // With documentSymbol, kind labels are present
     assert!(
-        !text.contains("<Function>"),
-        "No-grammar path should not have kind labels, got: {text}"
+        text.contains("<Function>"),
+        "documentSymbol path should have kind labels, got: {text}"
     );
 
     Ok(())
@@ -1377,7 +1383,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         use std::fmt::Write;
         let _ = writeln!(content, "zz_broad_{i}");
     }
-    let test_file = dir.path().join("many.mock");
+    let test_file = dir.path().join(format!("many.{MOCK_LANG_A}"));
     std::fs::write(&test_file, &content)?;
 
     // Small budget forces tier demotion
@@ -1429,8 +1435,9 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
         "Expected results present, got: {text}"
     );
     // Should reference the file
+    let expected_file = format!("many.{MOCK_LANG_A}");
     assert!(
-        text.contains("many.mock"),
+        text.contains(&expected_file),
         "Expected file reference, got: {text}"
     );
 
@@ -1882,7 +1889,7 @@ fn test_ts_index_finds_methods() -> Result<()> {
 
     // Struct with a method inside it — tree-sitter should find the method
     // with kind "method" and the enclosing struct name as scope.
-    let file = dir.path().join("widget.mock");
+    let file = dir.path().join(format!("widget.{MOCK_LANG_A}"));
     std::fs::write(&file, "struct Widget {\nfn widget_method\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -2198,18 +2205,16 @@ fn test_grep_prepare_rename_keyword() -> Result<()> {
     Ok(())
 }
 
-/// Tree-sitter kind labels use `<Kind>` angle brackets.
-/// Requires the mock grammar to be installed so tree-sitter can classify symbols.
+/// Symbol kind labels use `<Kind>` angle brackets from `documentSymbol`.
 #[test]
 fn test_grep_kind_brackets() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // Create a .mock file — the mock grammar parses `fn name` and `struct name`
-    let file = dir.path().join("kinds.mock");
+    // File with matching language extension so documentSymbol populates the index
+    let file = dir.path().join(format!("kinds.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn my_func\nstruct MyStruct\n")?;
 
-    // No LSP needed for tree-sitter classification — use mockls as a no-op server
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
@@ -2255,7 +2260,7 @@ fn test_grep_reference_enclosing() -> Result<()> {
     let root = dir.path().to_str().context("root path")?;
 
     // fn outer spans lines 0-2, "target" on line 1 is enclosed by it
-    let file = dir.path().join("enclosing.mock");
+    let file = dir.path().join(format!("enclosing.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn outer {\ntarget\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -2401,9 +2406,9 @@ fn test_grep_tier2_structure_heatmap() -> Result<()> {
     // Create multiple .mock files with definitions and references
     let tests_dir = dir.path().join("tests");
     std::fs::create_dir(&tests_dir)?;
-    let file_a = tests_dir.join("alpha.mock");
+    let file_a = tests_dir.join(format!("alpha.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn test_alpha {\ntest_alpha\n}\n")?;
-    let file_b = tests_dir.join("beta.mock");
+    let file_b = tests_dir.join(format!("beta.{MOCK_LANG_A}"));
     std::fs::write(&file_b, "fn test_beta {\ntest_alpha\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -2494,7 +2499,7 @@ fn test_grep_tier_promotion() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    let file = dir.path().join("narrow.mock");
+    let file = dir.path().join(format!("narrow.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn unique_symbol_xyz\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -2542,7 +2547,7 @@ fn test_grep_single_line_structure() -> Result<()> {
     let root = dir.path().to_str().context("root path")?;
 
     // Single-line definition (no brace block)
-    let file = dir.path().join("single.mock");
+    let file = dir.path().join(format!("single.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn one_liner\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -2583,7 +2588,7 @@ fn test_grep_no_blank_lines() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    let file = dir.path().join("multi.mock");
+    let file = dir.path().join(format!("multi.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn alpha_one\nfn beta_two\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -2778,15 +2783,16 @@ fn test_enrich_ungated_type() -> Result<()> {
     Ok(())
 }
 
-/// `from_ts=true` path: tree-sitter-identified symbol skips `prepareRename`.
-/// Installs mock grammar so hits are `HitClass::Symbol` (`from_ts=true`).
+/// Symbol-identified enrichment: `documentSymbol`-identified symbol
+/// skips `prepareRename`. Uses matching extension so the server can
+/// provide `documentSymbol` data.
 #[test]
 fn test_enrich_from_ts_true() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    // .mock file with a function definition
-    let file = dir.path().join("ts_true.mock");
+    // File with matching language extension
+    let file = dir.path().join(format!("ts_true.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn my_symbol\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -2813,14 +2819,14 @@ fn test_enrich_from_ts_true() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Tree-sitter identified the symbol — enrichment runs without prepareRename
+    // documentSymbol identified the symbol — enrichment runs without prepareRename
     assert!(
         text.contains("my_symbol"),
         "Expected my_symbol in output, got:\n{text}"
     );
     assert!(
         text.contains("<Function>"),
-        "Expected tree-sitter kind label, got:\n{text}"
+        "Expected symbol kind label, got:\n{text}"
     );
 
     Ok(())
@@ -2869,16 +2875,17 @@ fn test_enrich_from_ts_false_symbol() -> Result<()> {
     Ok(())
 }
 
-/// `from_ts=false` on a keyword: `prepareRename` returns null, enrichment skipped.
-/// Keywords are dropped entirely (no output for keyword-only matches).
-/// Uses `fn` which is in mockls's keyword list so `prepareRename` returns null.
+/// Keyword matching on a line that IS a symbol definition: with
+/// `documentSymbol`-based indexing, the hit at the keyword position
+/// is classified as a symbol definition (the line has a symbol), so
+/// the symbol appears in output rather than being filtered.
 #[test]
 fn test_enrich_from_ts_false_keyword() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
-    // `fn` is a keyword — mockls returns null for prepareRename on keywords.
-    // The file defines `fn my_symbol` but the grep pattern is `^fn$`, matching
-    // only the keyword itself (not the symbol name).
+    // File with a function definition — `documentSymbol` will report
+    // `my_symbol` at line 0. A grep for `^fn ` hits line 0, which the
+    // symbol index recognizes as a definition line.
     let file = dir.path().join(format!("kw.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn my_symbol\n")?;
 
@@ -2887,8 +2894,6 @@ fn test_enrich_from_ts_false_keyword() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Pattern `^fn$` matches the keyword `fn` at column 0 but not `my_symbol`.
-    // Since `fn` is in mockls's keyword list, prepareRename returns null.
     bridge.send(&json!({
         "jsonrpc": "2.0",
         "id": 5140,
@@ -2904,10 +2909,11 @@ fn test_enrich_from_ts_false_keyword() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // The keyword `fn` is filtered by prepareRename returning null.
-    assert_eq!(
-        text, "No results found",
-        "Expected 'No results found' for keyword-only match, got:\n{text}"
+    // The line is a symbol definition — the index identifies it, so
+    // the symbol appears in output (not filtered as keyword).
+    assert!(
+        text.contains("my_symbol"),
+        "Expected my_symbol in output, got:\n{text}"
     );
 
     Ok(())
@@ -3018,10 +3024,10 @@ fn test_grep_tier1_grammar_path_calls() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    let file = dir.path().join("gpcalls.mock");
+    let file = dir.path().join(format!("gpcalls.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn helper_gp\nfn main_gp {\nhelper_gp\n}\n")?;
 
-    let lsp = mockls_lsp_arg("mock", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
@@ -3066,10 +3072,10 @@ fn test_grep_tier1_enriched() -> Result<()> {
 
     // callee defined first, then caller with callee in body.
     // mockls scans the caller's body for known function names.
-    let file = dir.path().join("enrich.mock");
+    let file = dir.path().join(format!("enrich.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn callee_t1\nfn caller_t1 {\ncallee_t1\n}\n")?;
 
-    let lsp = mockls_lsp_arg("mock", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
@@ -3119,13 +3125,13 @@ fn test_grep_tier1_type_hierarchy() -> Result<()> {
 
     // Use `struct` for both — the mock grammar only supports fn/struct.
     // mockls still handles `extends` for type hierarchy on structs.
-    let file = dir.path().join("types.mock");
+    let file = dir.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
         "struct Vehicle_t1\nstruct Car_t1 extends Vehicle_t1\n",
     )?;
 
-    let lsp = mockls_lsp_arg("mock", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
@@ -3169,7 +3175,7 @@ fn test_grep_tier1_path_syntax() -> Result<()> {
     let root = dir.path().to_str().context("root path")?;
 
     // Nested function inside struct — exercises `/`-separated scope path
-    let file = dir.path().join("path.mock");
+    let file = dir.path().join(format!("path.{MOCK_LANG_A}"));
     std::fs::write(&file, "struct Container_ps {\nfn inner_ps\n}\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -3196,9 +3202,10 @@ fn test_grep_tier1_path_syntax() -> Result<()> {
         text.contains("<Struct> Container_ps/<Function> inner_ps"),
         "Expected scoped path syntax, got:\n{text}"
     );
+    let expected_path = format!("path.{MOCK_LANG_A}:2");
     assert!(
-        text.contains("path.mock:2"),
-        "Expected path.mock:2, got:\n{text}"
+        text.contains(&expected_path),
+        "Expected {expected_path}, got:\n{text}"
     );
 
     Ok(())
@@ -3212,7 +3219,7 @@ fn test_grep_tier1_refs_sort() -> Result<()> {
 
     // Symbol defined on L0, referenced on L2 and L4 (same file).
     // mockls finds these via textDocument/references.
-    let file = dir.path().join("sort.mock");
+    let file = dir.path().join(format!("sort.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
         "fn sorted_sym\nfn other {\nsorted_sym\nfn yet_another {\nsorted_sym\n}\n}\n",
@@ -3253,13 +3260,13 @@ fn test_grep_tier1_outgoing_calls_sorted() -> Result<()> {
     let root = dir.path().to_str().context("root path")?;
 
     // main calls beta and alpha — should appear alpha before beta in calls:
-    let file = dir.path().join("sorted_calls.mock");
+    let file = dir.path().join(format!("sorted_calls.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
         "fn alpha_callee\nfn beta_callee\nfn main_caller {\nbeta_callee\nalpha_callee\n}\n",
     )?;
 
-    let lsp = mockls_lsp_arg("mock", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
@@ -3308,13 +3315,13 @@ fn test_grep_tier1_deprecated() -> Result<()> {
     let root = dir.path().to_str().context("root path")?;
 
     // Use `struct` for both — the mock grammar only supports fn/struct.
-    let file = dir.path().join("depr.mock");
+    let file = dir.path().join(format!("depr.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
         "struct Shape_t1\nstruct OldSquare_t1 extends Shape_t1 @deprecated\n",
     )?;
 
-    let lsp = mockls_lsp_arg("mock", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
@@ -3358,7 +3365,7 @@ fn test_grep_tier1_demote_to_tier2() -> Result<()> {
         use std::fmt::Write;
         let _ = writeln!(content, "fn demote_sym_{i}");
     }
-    let file = dir.path().join("demote.mock");
+    let file = dir.path().join(format!("demote.{MOCK_LANG_A}"));
     std::fs::write(&file, &content)?;
 
     let config_path = dir.path().join("config.toml");
@@ -3414,13 +3421,13 @@ fn test_grep_tier1_fish_eye() -> Result<()> {
     let root = dir.path().to_str().context("root path")?;
 
     // rich_fn calls lean_fn. Pattern targets only rich_fn.
-    let file = dir.path().join("fisheye.mock");
+    let file = dir.path().join(format!("fisheye.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
         "fn lean_fisheye\nfn rich_fisheye {\nlean_fisheye\n}\n",
     )?;
 
-    let lsp = mockls_lsp_arg("mock", "--scan-roots");
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
     let mut bridge = BridgeProcess::spawn_with_grammar(&[&lsp], root, install_mock_grammar)?;
     bridge.initialize()?;
 
@@ -3468,7 +3475,7 @@ fn test_grep_tier1_property_order() -> Result<()> {
     let root = dir.path().to_str().context("root path")?;
 
     // Function with calls and refs
-    let file = dir.path().join("order.mock");
+    let file = dir.path().join(format!("order.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
         "fn helper_ord\nfn main_ord {\nhelper_ord\n}\nmain_ord\n",
@@ -3512,7 +3519,7 @@ fn test_grep_tier1_name_grouping() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
-    let file = dir.path().join("group.mock");
+    let file = dir.path().join(format!("group.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn grouped_sym\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -3564,7 +3571,7 @@ fn test_grep_tier1_cross_def_dedup() -> Result<()> {
     // struct + impl block matching the same name. mockls routes implementation
     // to references, so the struct's impls section lists the impl location.
     // The impl definition should be suppressed in the output.
-    let file = dir.path().join("dedup.mock");
+    let file = dir.path().join(format!("dedup.{MOCK_LANG_A}"));
     std::fs::write(&file, "struct Dedup_t1\nDedup_t1\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");
@@ -3755,7 +3762,7 @@ fn test_grep_tier1_single_line_ref() -> Result<()> {
 
     // Single-line function defined on L0, referenced on L1 inside another fn.
     // The enclosing fn on L1 is also single-line (no brace block).
-    let file = dir.path().join("single_ref.mock");
+    let file = dir.path().join(format!("single_ref.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn target_sl\nfn user_sl\ntarget_sl\n")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "--scan-roots");

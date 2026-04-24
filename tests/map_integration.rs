@@ -156,10 +156,10 @@ fn test_glob_file_outline() -> Result<()> {
         "Should show line count, got:\n{content}"
     );
 
-    // No symbols in output (maps added in 08b).
+    // Symbols from documentSymbol should appear as a defensive map.
     assert!(
-        !content.contains("Config"),
-        "Should not contain symbols yet, got:\n{content}"
+        content.contains("Config"),
+        "Should show symbols from documentSymbol, got:\n{content}"
     );
     Ok(())
 }

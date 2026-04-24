@@ -883,16 +883,13 @@ fn test_lua_glob_directory() -> Result<()> {
 
 // ─── New 08b tests ────────────────────────────────────────────────────
 
-/// The mock grammar extension used for 08b tests (`.mock`).
-///
-/// Uses "mock" instead of `MOCK_LANG_A` because the grammar
-/// installation for the mock extension is proven in `mcp_integration` tests.
+/// The mock language extension used for 08b tests (`.mock`).
 const MOCK_EXT: &str = "mock";
 
-/// Helper: spawns bridge with mock grammar and optional config written to `XDG_CONFIG_HOME`.
-fn spawn_with_grammar_and_config(root: &str, config_toml: Option<&str>) -> Result<BridgeProcess> {
-    BridgeProcess::spawn_with_grammar(&[], root, |state_home| {
-        common::install_mock_grammar_for(state_home, MOCK_EXT)?;
+/// Helper: spawns bridge with mockls for `.mock` files and optional config.
+fn spawn_with_mockls_and_config(root: &str, config_toml: Option<&str>) -> Result<BridgeProcess> {
+    let lsp = common::mockls_lsp_arg("mock", "");
+    BridgeProcess::spawn_with_grammar(&[&lsp], root, |state_home| {
         if let Some(toml) = config_toml {
             let config_dir = std::path::PathBuf::from(state_home).join("catenary");
             std::fs::create_dir_all(&config_dir)?;
@@ -928,7 +925,7 @@ fn test_glob_defensive_maps() -> Result<()> {
     std::fs::write(dir.path().join(format!("small.{MOCK_EXT}")), "fn tiny\n")?;
 
     let config = "[tools.glob]\noutline_threshold = 5\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -964,7 +961,7 @@ fn test_glob_no_maps_needed() -> Result<()> {
     )?;
     std::fs::write(dir.path().join(format!("b.{MOCK_EXT}")), "struct Gamma\n")?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -986,7 +983,7 @@ fn test_glob_tier2_flags() -> Result<()> {
     )?;
     // Threshold of 5 so file qualifies for maps. Budget of 1000 so maps don't fit.
     let config = "[tools.glob]\nbudget = 1000\noutline_threshold = 5\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1016,7 +1013,7 @@ fn test_glob_outline_suppress() -> Result<()> {
     // Deny all mock files from maps. Threshold of 5 so file qualifies.
     let config =
         format!("[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1048,7 +1045,7 @@ fn test_glob_trailing_slash() -> Result<()> {
     )?;
 
     let config = "[tools.glob]\noutline_threshold = 5\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1071,18 +1068,9 @@ fn test_glob_single_file_map() -> Result<()> {
     // Small file — single files bypass threshold.
     std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
 
-    // Use "mock" extension (proven to work in mcp_integration tests).
-    let mut bridge = BridgeProcess::spawn_with_grammar(&[], &dir.path().to_string_lossy(), |sh| {
-        common::install_mock_grammar_for(sh, "mock")
-    })?;
+    // Use mockls for .mock files.
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
-
-    // Verify tree-sitter index works via grep first.
-    let grep_text = bridge.call_tool_text("grep", &json!({ "pattern": "alpha" }))?;
-    assert!(
-        grep_text.contains("alpha"),
-        "grep should find symbol (proving tree-sitter index works): {grep_text}"
-    );
 
     let text = bridge.call_tool_text(
         "glob",
@@ -1111,7 +1099,7 @@ fn test_glob_single_file_denied() -> Result<()> {
     std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
 
     let config = format!("[tools.glob]\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1203,7 +1191,7 @@ fn test_glob_maps_deny_partial() -> Result<()> {
     )?;
 
     let config = "[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"test_assets/**\"]\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1247,7 +1235,7 @@ fn test_glob_bounding_ranges() -> Result<()> {
     )?;
 
     let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1361,7 +1349,7 @@ fn test_glob_composing_flags() -> Result<()> {
 
     let config =
         format!("[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1393,7 +1381,7 @@ fn test_glob_paging() -> Result<()> {
     std::fs::write(&file, gen_mock_content(500))?;
 
     let config = "[tools.glob]\nbudget = 1000\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     // First page.
@@ -1504,7 +1492,7 @@ fn test_glob_structure_dedup() -> Result<()> {
     }
 
     let config = "[tools.glob]\noutline_threshold = 5\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1540,7 +1528,7 @@ fn test_glob_dedup_mixed() -> Result<()> {
     )?;
 
     let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1585,7 +1573,7 @@ fn test_glob_tree_dedup() -> Result<()> {
     )?;
 
     let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.mock" }))?;
@@ -1624,7 +1612,7 @@ fn test_glob_tree_dedup_per_directory() -> Result<()> {
     }
 
     let config = "[tools.glob]\noutline_threshold = 5\nbudget = 5000\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text("glob", &json!({ "pattern": "**/*.mock" }))?;
@@ -1649,7 +1637,7 @@ fn test_into_impl() -> Result<()> {
         "struct Outer {\nfn method_a\nfn method_b\n}\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1684,7 +1672,7 @@ fn test_into_leaf() -> Result<()> {
         "fn standalone\nfn other\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1711,7 +1699,7 @@ fn test_into_nonexistent() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join(format!("exist.{MOCK_EXT}")), "fn real\n")?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1738,7 +1726,7 @@ fn test_into_disambiguation() -> Result<()> {
         "struct Handler {\nfn method_a\n}\nstruct Handler {\nfn method_b\n}\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1768,7 +1756,7 @@ fn test_into_wildcard() -> Result<()> {
         "fn alpha\nstruct Beta\nfn gamma\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1793,7 +1781,7 @@ fn test_into_prefix() -> Result<()> {
         "fn test_a\nfn test_b\nfn other\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1819,7 +1807,7 @@ fn test_into_multi_segment() -> Result<()> {
         "struct Outer {\nfn test_a\nfn helper\n}\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1848,7 +1836,7 @@ fn test_into_recursive() -> Result<()> {
         "struct Outer {\nfn test_deep\nfn other\n}\nfn test_top\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1879,7 +1867,7 @@ fn test_into_kind_qualified() -> Result<()> {
         "fn alpha\nstruct Beta\nfn gamma\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1912,7 +1900,7 @@ fn test_into_directory() -> Result<()> {
         "struct Handler {\nfn handle_b\n}\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1941,7 +1929,7 @@ fn test_into_zero_matches_multi() -> Result<()> {
     std::fs::write(dir.path().join(format!("x.{MOCK_EXT}")), "fn real\n")?;
     std::fs::write(dir.path().join(format!("y.{MOCK_EXT}")), "fn actual\n")?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -1968,7 +1956,7 @@ fn test_into_bypasses_outline_suppress() -> Result<()> {
     // outline_suppress blocks the defensive map.
     let config =
         format!("[tools.glob]\noutline_threshold = 5\noutline_suppress = [\"**/*.{MOCK_EXT}\"]\n");
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(&config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(&config))?;
     bridge.initialize()?;
 
     // Without into — should show [symbols available], no map.
@@ -2012,7 +2000,7 @@ fn test_into_deprecated() -> Result<()> {
         "fn current\nfn old_func @deprecated\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     // into="*" should show the deprecated tag.
@@ -2058,7 +2046,7 @@ fn test_into_alternation() -> Result<()> {
         "fn Config\nfn Settings\nfn Other\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -2084,7 +2072,7 @@ fn test_into_subtree() -> Result<()> {
         "struct Outer {\nfn inner_a\nfn inner_b\n}\nfn top_level\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -2123,7 +2111,7 @@ fn test_into_with_exclude() -> Result<()> {
         "struct Handler {\nfn method\n}\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -2156,7 +2144,7 @@ fn test_into_dedup() -> Result<()> {
     }
 
     let config = "[tools.glob]\nbudget = 5000\n";
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), Some(config))?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), Some(config))?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
@@ -2195,7 +2183,7 @@ fn test_into_glob_pattern() -> Result<()> {
         "struct Handler {\nfn handle_b\n}\n",
     )?;
 
-    let mut bridge = spawn_with_grammar_and_config(&dir.path().to_string_lossy(), None)?;
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
     let text = bridge.call_tool_text(
