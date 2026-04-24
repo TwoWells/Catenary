@@ -204,86 +204,6 @@ fn expand_alternation(pattern: &str) -> Vec<String> {
         .collect()
 }
 
-/// A node in the display tree for `into` output rendering.
-///
-/// Handles both flat (single directory) and nested (multi-directory)
-/// output automatically based on the file set structure.
-struct IntoDisplayNode {
-    dirs: BTreeMap<String, Self>,
-    files: Vec<PathBuf>,
-}
-
-impl IntoDisplayNode {
-    const fn new() -> Self {
-        Self {
-            dirs: BTreeMap::new(),
-            files: Vec::new(),
-        }
-    }
-
-    fn insert(&mut self, components: &[&str], abs_path: PathBuf) {
-        if components.len() <= 1 {
-            self.files.push(abs_path);
-        } else {
-            let dir = self
-                .dirs
-                .entry(components[0].to_owned())
-                .or_insert_with(Self::new);
-            dir.insert(&components[1..], abs_path);
-        }
-    }
-
-    /// Returns true if this tree has any directory structure (needs nesting).
-    fn has_dirs(&self) -> bool {
-        !self.dirs.is_empty()
-    }
-}
-
-/// Builds a display tree from file paths, stripping their common prefix.
-///
-/// Returns `(common_prefix_display, tree)`. The common prefix is shown
-/// as a header when the tree has directory structure.
-fn build_into_display_tree(files: &[&PathBuf]) -> (Option<String>, IntoDisplayNode) {
-    if files.is_empty() {
-        return (None, IntoDisplayNode::new());
-    }
-
-    // Convert all paths to owned string components for comparison.
-    let paths_lossy: Vec<String> = files
-        .iter()
-        .map(|f| f.to_string_lossy().to_string())
-        .collect();
-    let all_components: Vec<Vec<&str>> =
-        paths_lossy.iter().map(|s| s.split('/').collect()).collect();
-
-    // Find the common directory prefix (excluding filename).
-    let first = &all_components[0];
-    let mut common_len = 0;
-    'outer: for i in 0..first.len().saturating_sub(1) {
-        for comps in &all_components {
-            if i >= comps.len() || comps[i] != first[i] {
-                break 'outer;
-            }
-        }
-        common_len = i + 1;
-    }
-
-    let mut tree = IntoDisplayNode::new();
-    for (fi, comps) in all_components.iter().enumerate() {
-        let rel: Vec<&str> = comps[common_len..].to_vec();
-        tree.insert(&rel, files[fi].clone());
-    }
-
-    // Show the common prefix as a header when the tree has subdirectories.
-    let prefix = if common_len > 0 && tree.has_dirs() {
-        Some(format!("{}/", first[..common_len].join("/")))
-    } else {
-        None
-    };
-
-    (prefix, tree)
-}
-
 /// Converts a kind filter from display format back to the capture suffix
 /// stored in the index. `"Impl"` → `"implementation"`, others lowercase.
 fn kind_to_capture(kind: &str) -> String {
@@ -331,6 +251,32 @@ impl DirNode {
                 .or_insert_with(Self::new);
             dir.insert(&components[1..], file);
         }
+    }
+
+    /// Inserts a bare path (no metadata) for `into` display trees.
+    fn insert_path(&mut self, components: &[&str], abs_path: PathBuf) {
+        if components.len() <= 1 {
+            let name = components.first().unwrap_or(&"").to_string();
+            self.files.push(FileNode {
+                name,
+                abs_path,
+                line_count: None,
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            });
+        } else {
+            let dir = self
+                .dirs
+                .entry(components[0].to_owned())
+                .or_insert_with(Self::new);
+            dir.insert_path(&components[1..], abs_path);
+        }
+    }
+
+    /// Returns true if this tree has any subdirectories.
+    fn has_dirs(&self) -> bool {
+        !self.dirs.is_empty()
     }
 
     /// Renders the tree with tab indentation (tier 2: flags, no maps).
@@ -468,6 +414,92 @@ impl DirNode {
             }
         }
     }
+
+    /// Renders the tree for `into` output with symbol chains at each file.
+    fn render_into(
+        &self,
+        out: &mut String,
+        depth: usize,
+        chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
+        ts_index: &TsIndex,
+        expand_children: bool,
+    ) {
+        let indent: String = "\t".repeat(depth);
+
+        for (name, child) in &self.dirs {
+            let _ = writeln!(out, "{indent}{name}/");
+            child.render_into(out, depth + 1, chains, ts_index, expand_children);
+        }
+
+        let mut sorted: Vec<&FileNode> = self.files.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for file in sorted {
+            let Some(file_chains) = chains.get(&file.abs_path) else {
+                continue;
+            };
+            if file_chains.is_empty() {
+                continue;
+            }
+
+            let _ = writeln!(out, "{indent}{}", file.name);
+
+            let children_set = build_children_set_for_file(ts_index, &file.abs_path);
+            render_chains_at_depth(
+                out,
+                file_chains,
+                &children_set,
+                expand_children,
+                ts_index,
+                &file.abs_path,
+                depth + 1,
+            );
+        }
+    }
+}
+
+/// Builds a `DirNode` display tree from file paths, stripping their
+/// common directory prefix.
+///
+/// Returns `(common_prefix_header, tree)`. The prefix header is `Some`
+/// when the tree has directory structure and the paths share a common
+/// ancestor — it is rendered as the root line before the tree.
+fn build_display_tree(files: &[&PathBuf]) -> (Option<String>, DirNode) {
+    if files.is_empty() {
+        return (None, DirNode::new());
+    }
+
+    let paths_lossy: Vec<String> = files
+        .iter()
+        .map(|f| f.to_string_lossy().to_string())
+        .collect();
+    let all_components: Vec<Vec<&str>> =
+        paths_lossy.iter().map(|s| s.split('/').collect()).collect();
+
+    let first = &all_components[0];
+    let mut common_len = 0;
+    'outer: for i in 0..first.len().saturating_sub(1) {
+        for comps in &all_components {
+            if i >= comps.len() || comps[i] != first[i] {
+                break 'outer;
+            }
+        }
+        common_len = i + 1;
+    }
+
+    let mut tree = DirNode::new();
+    for (fi, comps) in all_components.iter().enumerate() {
+        let rel: Vec<&str> = comps[common_len..].to_vec();
+        tree.insert_path(&rel, files[fi].clone());
+    }
+
+    let prefix = if common_len > 0 && tree.has_dirs() {
+        Some(format!("{}/", first[..common_len].join("/")))
+    } else {
+        None
+    };
+
+    (prefix, tree)
 }
 
 /// Renders a single `FileNode` line with optional flags.
@@ -1782,7 +1814,7 @@ fn render_into_results(
     after_line: Option<u32>,
 ) -> String {
     // Build display tree for proper directory structure.
-    let (prefix, tree) = build_into_display_tree(files);
+    let (prefix, tree) = build_display_tree(files);
 
     // Tier 3 (bucketed): file names with counts.
     let file_names: Vec<String> = files
@@ -1792,7 +1824,7 @@ fn render_into_results(
     let tier3 = render_bucketed(&file_names, budget);
 
     // Tier 2 (degraded): target symbols with spans, no children.
-    let tier2 = render_into_tree(&tree, prefix.as_deref(), chains, ts_index, false);
+    let tier2 = render_into_with_prefix(&tree, prefix.as_deref(), chains, ts_index, false);
     if tier2.len() > budget {
         return tier3;
     }
@@ -1803,7 +1835,7 @@ fn render_into_results(
     // Tier 1 (full): target symbols with children + dedup.
     if dedup.shared.is_empty() {
         // No dedup needed — render tree with children.
-        let tier1 = render_into_tree(&tree, prefix.as_deref(), chains, ts_index, true);
+        let tier1 = render_into_with_prefix(&tree, prefix.as_deref(), chains, ts_index, true);
         if tier1.len() <= budget {
             return tier1;
         }
@@ -1946,12 +1978,9 @@ struct IntoDedup {
     shared: Vec<Vec<usize>>,
 }
 
-/// Renders `into` output using the display tree for proper nesting.
-///
-/// When `expand_children` is false, renders tier 2 (no children).
-/// When true, renders tier 1 (with children expansion).
-fn render_into_tree(
-    node: &IntoDisplayNode,
+/// Renders `into` output using the display tree with optional prefix header.
+fn render_into_with_prefix(
+    tree: &DirNode,
     prefix: Option<&str>,
     chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
     ts_index: &TsIndex,
@@ -1961,62 +1990,12 @@ fn render_into_tree(
 
     if let Some(pfx) = prefix {
         let _ = writeln!(out, "{pfx}");
-        render_into_tree_node(&mut out, node, chains, ts_index, expand_children, 1);
+        tree.render_into(&mut out, 1, chains, ts_index, expand_children);
     } else {
-        render_into_tree_node(&mut out, node, chains, ts_index, expand_children, 0);
+        tree.render_into(&mut out, 0, chains, ts_index, expand_children);
     }
 
     out
-}
-
-/// Recursively renders an `IntoDisplayNode` with directory nesting.
-fn render_into_tree_node(
-    out: &mut String,
-    node: &IntoDisplayNode,
-    chains: &HashMap<PathBuf, Vec<Vec<TsSymbol>>>,
-    ts_index: &TsIndex,
-    expand_children: bool,
-    depth: usize,
-) {
-    let indent: String = "\t".repeat(depth);
-
-    // Render subdirectories first.
-    for (name, child) in &node.dirs {
-        let _ = writeln!(out, "{indent}{name}/");
-        render_into_tree_node(out, child, chains, ts_index, expand_children, depth + 1);
-    }
-
-    // Render files.
-    let mut sorted: Vec<&PathBuf> = node.files.iter().collect();
-    sorted.sort();
-
-    for path in sorted {
-        let Some(file_chains) = chains.get(path.as_path()) else {
-            continue;
-        };
-        if file_chains.is_empty() {
-            continue;
-        }
-
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let _ = writeln!(out, "{indent}{name}");
-
-        let children_set = build_children_set_for_file(ts_index, path);
-        let sym_depth = depth + 1;
-
-        render_chains_at_depth(
-            out,
-            file_chains,
-            &children_set,
-            expand_children,
-            ts_index,
-            path,
-            sym_depth,
-        );
-    }
 }
 
 /// Renders chains at a specific indentation depth.
