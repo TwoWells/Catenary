@@ -26,6 +26,11 @@ build-release:
 	@cargo build --release
 
 check:
+	@PINNED=$$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml); \
+	 LATEST=$$(rustup run stable rustc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1); \
+	 if [ -n "$$LATEST" ] && [ "$$PINNED" != "$$LATEST" ]; then \
+	   printf '\033[33mNote: rust-toolchain.toml pins %s, latest stable is %s\033[0m\n' "$$PINNED" "$$LATEST"; \
+	 fi
 	@cargo update --quiet
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
 	@cargo clippy --tests --features mockls --quiet -- -D warnings
