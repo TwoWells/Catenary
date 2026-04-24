@@ -111,6 +111,24 @@ pub struct ResponseError {
 pub const METHOD_NOT_FOUND: i64 = -32601;
 /// An internal error occurred.
 pub const INTERNAL_ERROR: i64 = -32603;
+/// The request was cancelled by the client.
+pub const REQUEST_CANCELLED: i64 = -32800;
+
+/// Error returned when an MCP request is cancelled via `notifications/cancelled`.
+#[derive(Debug, thiserror::Error)]
+#[error("request cancelled")]
+pub struct RequestCancelled;
+
+/// Parameters for `notifications/cancelled`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelledParams {
+    /// The ID of the request being cancelled.
+    pub request_id: RequestId,
+    /// Optional human-readable reason for the cancellation.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 /// MCP initialize request params.
 #[derive(Debug, Clone, Deserialize)]
@@ -515,6 +533,24 @@ mod tests {
         assert_eq!(result.roots.len(), 2);
         assert_eq!(result.roots[0].uri, "file:///tmp/a");
         assert_eq!(result.roots[1].name, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_cancelled_params_number_id() -> Result<()> {
+        let json = r#"{"requestId": 42}"#;
+        let params: CancelledParams = serde_json::from_str(json)?;
+        assert_eq!(params.request_id, RequestId::Number(42));
+        assert!(params.reason.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_cancelled_params_string_id() -> Result<()> {
+        let json = r#"{"requestId": "abc-123", "reason": "user cancelled"}"#;
+        let params: CancelledParams = serde_json::from_str(json)?;
+        assert_eq!(params.request_id, RequestId::String("abc-123".to_string()));
+        assert_eq!(params.reason.as_deref(), Some("user cancelled"));
         Ok(())
     }
 }

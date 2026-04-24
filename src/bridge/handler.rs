@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use super::filesystem_manager::FilesystemManager;
 
@@ -189,6 +190,7 @@ impl ToolHandler for McpRouter {
         name: &str,
         arguments: Option<serde_json::Value>,
         parent_id: Option<i64>,
+        cancel: &CancellationToken,
     ) -> Result<CallToolResult> {
         // Editing tools: no-op triggers. The PreToolUse hook enters editing
         // mode (start_editing) and the PostToolUse hook exits + runs batch
@@ -223,11 +225,11 @@ impl ToolHandler for McpRouter {
             "grep" => self
                 .toolbox
                 .runtime
-                .block_on(self.toolbox.grep.execute(&params, parent_id)),
+                .block_on(self.toolbox.grep.execute(&params, parent_id, cancel)),
             "glob" => self
                 .toolbox
                 .runtime
-                .block_on(self.toolbox.glob.execute(&params, parent_id)),
+                .block_on(self.toolbox.glob.execute(&params, parent_id, cancel)),
             _ => return Err(anyhow!("Unknown tool: {name}")),
         };
 

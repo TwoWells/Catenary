@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::instance_key::InstanceKey;
@@ -45,6 +46,8 @@ pub struct LspClient {
     server_version: Option<String>,
     /// Parent message ID for causation tracking (set before tool dispatch).
     parent_id: Option<i64>,
+    /// Cancellation token for the current MCP tool call.
+    cancel: CancellationToken,
     /// Per-client document state: URI → version.
     ///
     /// Tracks which documents are open on this client and their current
@@ -151,6 +154,7 @@ impl LspClient {
             server_command: program.to_string(),
             server_version: None,
             parent_id: None,
+            cancel: CancellationToken::new(),
             open_documents: HashMap::new(),
         })
     }
@@ -161,6 +165,14 @@ impl LspClient {
     /// until it is changed or cleared.
     pub const fn set_parent_id(&mut self, parent_id: Option<i64>) {
         self.parent_id = parent_id;
+    }
+
+    /// Sets the cancellation token for the current MCP tool call.
+    ///
+    /// The token is checked during [`Connection::request`] — if triggered,
+    /// the LSP request is aborted with `$/cancelRequest`.
+    pub fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel = token;
     }
 
     /// Returns an error if the server does not support the given capability.
@@ -177,7 +189,10 @@ impl LspClient {
     /// detection, returning the raw JSON response. On success, transitions
     /// `Probing` → `Healthy` (any successful response proves the server works).
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let result = self.server.request(method, params, self.parent_id).await?;
+        let result = self
+            .server
+            .request(method, params, self.parent_id, &self.cancel)
+            .await?;
         self.server.try_transition_probing_to_healthy();
         Ok(result)
     }

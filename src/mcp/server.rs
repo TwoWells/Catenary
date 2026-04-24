@@ -4,17 +4,23 @@
 //! MCP server implementation.
 
 use anyhow::{Context, Result, anyhow};
-use std::io::{BufRead, Write};
+use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use super::types::{
-    CallToolParams, CallToolResult, INTERNAL_ERROR, InitializeParams, InitializeResult,
-    ListToolsResult, METHOD_NOT_FOUND, Notification, Request, RequestId, Response, Root,
-    RootsListResult, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
+    CallToolParams, CallToolResult, CancelledParams, INTERNAL_ERROR, InitializeParams,
+    InitializeResult, ListToolsResult, METHOD_NOT_FOUND, Notification, REQUEST_CANCELLED, Request,
+    RequestCancelled, RequestId, Response, Root, RootsListResult, ServerCapabilities, ServerInfo,
+    Tool, ToolsCapability,
 };
 use crate::logging::LoggingServer;
+
+/// Map from MCP request ID to its cancellation token.
+type CancelMap = Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>;
 
 /// MCP protocol versions this server supports (newest first).
 const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
@@ -71,6 +77,10 @@ pub trait ToolHandler: Send + Sync {
     /// so LSP messages are correlated with the triggering MCP request
     /// in the monitor.
     ///
+    /// `cancel` is triggered when the MCP client sends
+    /// `notifications/cancelled` for this tool call. Implementations
+    /// should forward it to tool servers and LSP clients.
+    ///
     /// # Errors
     ///
     /// Returns an error if the tool call fails for reasons other than the tool itself reporting an error.
@@ -79,6 +89,7 @@ pub trait ToolHandler: Send + Sync {
         name: &str,
         arguments: Option<serde_json::Value>,
         parent_id: Option<i64>,
+        cancel: &CancellationToken,
     ) -> Result<CallToolResult>;
 }
 
@@ -116,6 +127,10 @@ pub struct McpServer<H: ToolHandler> {
     /// Correlation ID of the current incoming message, set per `dispatch_message`.
     /// Read by `handle_tools_call` to supply `parent_id` to the tool handler.
     current_correlation_id: i64,
+    /// Maps in-flight MCP request IDs to their cancellation tokens.
+    /// Shared with the stdin reader thread so `notifications/cancelled`
+    /// can trigger cancellation while a tool call blocks the main loop.
+    cancel_map: CancelMap,
 }
 
 impl<H: ToolHandler> McpServer<H> {
@@ -134,6 +149,7 @@ impl<H: ToolHandler> McpServer<H> {
             on_roots_changed: None,
             refresh_roots: Arc::new(AtomicBool::new(false)),
             current_correlation_id: 0,
+            cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -160,41 +176,33 @@ impl<H: ToolHandler> McpServer<H> {
 
     /// Runs the MCP server, reading from stdin and writing to stdout.
     ///
+    /// Spawns a background reader thread for stdin so that
+    /// `notifications/cancelled` can trigger cancellation of in-flight
+    /// tool calls while the main loop is blocked.
+    ///
     /// # Errors
     ///
     /// Returns an error if reading from stdin or writing to stdout fails.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "stdin/stdout locks must be held for the entire run loop"
-    )]
     pub fn run(&mut self) -> Result<()> {
-        let stdin = std::io::stdin();
-        let mut reader = stdin.lock();
         let stdout = std::io::stdout();
         let mut writer = stdout.lock();
 
         info!("MCP server starting, waiting for requests on stdin");
 
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .context("Failed to read from stdin")?;
-            if bytes_read == 0 {
-                break; // EOF
-            }
+        // Spawn a reader thread that feeds lines into a channel and
+        // triggers cancellation tokens for `notifications/cancelled`.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let cancel_map = self.cancel_map.clone();
+        let _reader_thread = std::thread::spawn(move || {
+            Self::stdin_reader_loop(&tx, &cancel_map);
+        });
 
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            trace!("Received: {}", trimmed);
+        while let Ok(line) = rx.recv() {
+            trace!("Received: {}", line);
 
             // Log incoming message
             let (correlation_id, method) =
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                     let method = json
                         .get("method")
                         .and_then(|m| m.as_str())
@@ -215,7 +223,7 @@ impl<H: ToolHandler> McpServer<H> {
                 };
 
             self.current_correlation_id = correlation_id;
-            self.dispatch_message(trimmed, &mut writer, correlation_id, &method)?;
+            self.dispatch_message(&line, &mut writer, correlation_id, &method)?;
 
             // Check if the hook server requested a roots refresh
             if self.refresh_roots.swap(false, Ordering::Acquire) {
@@ -224,7 +232,7 @@ impl<H: ToolHandler> McpServer<H> {
 
             // Check if we need to fetch roots
             if self.should_fetch_roots
-                && let Err(e) = self.fetch_roots(&mut reader, &mut writer)
+                && let Err(e) = self.fetch_roots(&rx, &mut writer)
             {
                 error!(source = "mcp.dispatch", "Failed to fetch roots: {}", e,);
             }
@@ -232,6 +240,69 @@ impl<H: ToolHandler> McpServer<H> {
 
         info!("MCP server shutting down (stdin closed)");
         Ok(())
+    }
+
+    /// Background thread that reads stdin and feeds lines into the
+    /// channel. Also detects `notifications/cancelled` and triggers
+    /// the matching cancellation token from the shared `cancel_map`.
+    fn stdin_reader_loop(tx: &std::sync::mpsc::Sender<String>, cancel_map: &CancelMap) {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut reader = std::io::BufReader::new(stdin.lock());
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    // Detect notifications/cancelled and trigger the
+                    // matching token before forwarding the message. This
+                    // ensures the token fires while the main loop is still
+                    // blocked inside `call_tool`.
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&trimmed)
+                        && json.get("method").and_then(|m| m.as_str())
+                            == Some("notifications/cancelled")
+                        && json.get("id").is_none()
+                    {
+                        Self::trigger_cancellation(&json, cancel_map);
+                    }
+
+                    if tx.send(trimmed).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extracts `requestId` from a `notifications/cancelled` message
+    /// and triggers the matching cancellation token.
+    fn trigger_cancellation(json: &serde_json::Value, cancel_map: &CancelMap) {
+        let Some(params) = json.get("params") else {
+            return;
+        };
+        let Ok(cancelled) = serde_json::from_value::<CancelledParams>(params.clone()) else {
+            return;
+        };
+        if let Ok(map) = cancel_map.lock()
+            && let Some(token) = map.get(&cancelled.request_id)
+        {
+            info!(
+                "MCP request {:?} cancelled{}",
+                cancelled.request_id,
+                cancelled
+                    .reason
+                    .as_deref()
+                    .map_or(String::new(), |r| format!(": {r}")),
+            );
+            token.cancel();
+        }
     }
 
     /// Dispatches a single message line, writing any response to `writer`.
@@ -344,7 +415,10 @@ impl<H: ToolHandler> McpServer<H> {
                 self.should_fetch_roots = true;
             }
             "notifications/cancelled" => {
-                debug!("Request cancelled");
+                // Cancellation is handled proactively by the reader
+                // thread (triggers the token while call_tool blocks).
+                // If we see it here, the tool call already finished.
+                debug!("notifications/cancelled received (tool call already complete)");
             }
             _ => {
                 debug!("Ignoring unknown notification: {}", notification.method);
@@ -436,12 +510,31 @@ impl<H: ToolHandler> McpServer<H> {
 
         debug!("Calling tool: {}", params.name);
 
+        // Register a cancellation token so the reader thread can
+        // trigger it if `notifications/cancelled` arrives for this
+        // request while the tool call is in progress.
+        let cancel = CancellationToken::new();
+        if let Ok(mut map) = self.cancel_map.lock() {
+            map.insert(request.id.clone(), cancel.clone());
+        }
+
         let parent_id = Some(self.current_correlation_id);
-        match self
+        let result = self
             .handler
-            .call_tool(&params.name, params.arguments, parent_id)
-        {
+            .call_tool(&params.name, params.arguments, parent_id, &cancel);
+
+        // Clean up regardless of outcome.
+        if let Ok(mut map) = self.cancel_map.lock() {
+            map.remove(&request.id);
+        }
+
+        match result {
             Ok(result) => Ok(Response::success(request.id, result)?),
+            Err(e) if e.is::<RequestCancelled>() => Ok(Response::error(
+                request.id,
+                REQUEST_CANCELLED,
+                "Request cancelled",
+            )),
             Err(e) => {
                 info!("Tool call failed: {}", e);
                 Ok(Response::success(
@@ -464,7 +557,11 @@ impl<H: ToolHandler> McpServer<H> {
     /// Handles interleaved client requests/notifications while waiting for
     /// the response. Uses `fetching_roots` guard to prevent recursion if
     /// `roots/list_changed` arrives during the fetch.
-    fn fetch_roots(&mut self, reader: &mut impl BufRead, writer: &mut impl Write) -> Result<()> {
+    fn fetch_roots(
+        &mut self,
+        inbox: &std::sync::mpsc::Receiver<String>,
+        writer: &mut impl Write,
+    ) -> Result<()> {
         if self.fetching_roots {
             debug!("Already fetching roots, skipping");
             return Ok(());
@@ -472,7 +569,7 @@ impl<H: ToolHandler> McpServer<H> {
         self.fetching_roots = true;
         self.should_fetch_roots = false;
 
-        let result = self.fetch_roots_inner(reader, writer);
+        let result = self.fetch_roots_inner(inbox, writer);
         self.fetching_roots = false;
         result
     }
@@ -480,7 +577,7 @@ impl<H: ToolHandler> McpServer<H> {
     /// Inner implementation of [`Self::fetch_roots`].
     fn fetch_roots_inner(
         &mut self,
-        reader: &mut impl BufRead,
+        inbox: &std::sync::mpsc::Receiver<String>,
         writer: &mut impl Write,
     ) -> Result<()> {
         let request_id = self.next_id();
@@ -516,27 +613,15 @@ impl<H: ToolHandler> McpServer<H> {
         // so they execute against the updated PathValidator.
         // Notifications are dispatched immediately.
         let mut buffered: Vec<(String, i64, String)> = Vec::new();
-        let mut line = String::new();
         loop {
-            line.clear();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .context("Failed to read from stdin during roots/list")?;
-            if bytes_read == 0 {
-                return Err(anyhow!(
-                    "stdin closed while waiting for roots/list response"
-                ));
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
+            let trimmed = inbox
+                .recv()
+                .map_err(|_| anyhow!("stdin closed while waiting for roots/list response"))?;
 
             trace!("Received (during roots/list wait): {}", trimmed);
 
             // Parse JSON once for disambiguation and logging
-            let json: serde_json::Value = serde_json::from_str(trimmed)
+            let json: serde_json::Value = serde_json::from_str(&trimmed)
                 .context("Failed to parse JSON during roots/list wait")?;
 
             // Response: has `id` + no `method` + (`result` or `error`)
@@ -592,9 +677,9 @@ impl<H: ToolHandler> McpServer<H> {
             // Requests (id + method) are buffered until roots are applied.
             // Notifications dispatch immediately.
             if json.get("id").is_some() && json.get("method").is_some() {
-                buffered.push((trimmed.to_string(), interleaved_id.0, method));
+                buffered.push((trimmed, interleaved_id.0, method));
             } else {
-                self.dispatch_message(trimmed, writer, interleaved_id.0, &method)?;
+                self.dispatch_message(&trimmed, writer, interleaved_id.0, &method)?;
             }
         }
     }
@@ -667,6 +752,7 @@ mod tests {
             name: &str,
             _arguments: Option<serde_json::Value>,
             _parent_id: Option<i64>,
+            _cancel: &CancellationToken,
         ) -> Result<CallToolResult> {
             match name {
                 "test_tool" => Ok(CallToolResult::text("Test result")),
@@ -897,9 +983,135 @@ mod tests {
         Ok(())
     }
 
+    // ── Cancellation tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_cancel_token_registered_during_tools_call() -> Result<()> {
+        let mut server = McpServer::new(TestHandler, LoggingServer::new());
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(42),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "test_tool",
+                "arguments": {}
+            })),
+        };
+
+        // After the call, the cancel map should be clean (entry removed).
+        let _response = server.handle_request(request)?;
+        assert!(
+            server
+                .cancel_map
+                .lock()
+                .map_err(|e| anyhow!("{e}"))?
+                .is_empty(),
+            "cancel map should be cleaned up after tool call"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cancelled_notification_triggers_token() {
+        let cancel_map: CancelMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let token = CancellationToken::new();
+        cancel_map
+            .lock()
+            .expect("lock")
+            .insert(RequestId::Number(42), token.clone());
+
+        let json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 42}
+        });
+
+        assert!(!token.is_cancelled());
+        McpServer::<TestHandler>::trigger_cancellation(&json, &cancel_map);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancelled_notification_no_match_is_noop() {
+        let cancel_map: CancelMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let token = CancellationToken::new();
+        cancel_map
+            .lock()
+            .expect("lock")
+            .insert(RequestId::Number(42), token.clone());
+
+        // Cancel a different request ID — should not trigger our token.
+        let json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 99}
+        });
+
+        McpServer::<TestHandler>::trigger_cancellation(&json, &cancel_map);
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancelled_tool_returns_request_cancelled_error() -> Result<()> {
+        /// A handler whose tool call blocks until the cancel token fires.
+        struct BlockingHandler;
+
+        impl ToolHandler for BlockingHandler {
+            fn list_tools(&self) -> Vec<Tool> {
+                Vec::new()
+            }
+
+            fn call_tool(
+                &self,
+                _name: &str,
+                _arguments: Option<serde_json::Value>,
+                _parent_id: Option<i64>,
+                cancel: &CancellationToken,
+            ) -> Result<CallToolResult> {
+                // Immediately pre-cancel the token to simulate a race.
+                cancel.cancel();
+                Err(RequestCancelled.into())
+            }
+        }
+
+        let mut server = McpServer::new(BlockingHandler, LoggingServer::new());
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "slow_tool",
+                "arguments": {}
+            })),
+        };
+
+        let response = server.handle_request(request)?;
+        assert!(
+            response.error.is_some(),
+            "should be a JSON-RPC error response"
+        );
+        let err = response.error.expect("error");
+        assert_eq!(err.code, REQUEST_CANCELLED);
+        Ok(())
+    }
+
+    /// Creates a channel pre-loaded with JSON messages, simulating stdin.
+    fn mock_inbox(messages: &[serde_json::Value]) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for msg in messages {
+            tx.send(serde_json::to_string(msg).expect("serialize"))
+                .expect("send");
+        }
+        drop(tx); // close after all messages sent
+        rx
+    }
+
     #[test]
     fn test_fetch_roots_parses_response() -> Result<()> {
-        use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
         let mut server = McpServer::new(TestHandler, LoggingServer::new());
@@ -927,11 +1139,10 @@ mod tests {
                 ]
             }
         });
-        let input = format!("{}\n", serde_json::to_string(&response_json)?);
-        let mut reader = Cursor::new(input.into_bytes());
+        let inbox = mock_inbox(&[response_json]);
         let mut writer: Vec<u8> = Vec::new();
 
-        server.fetch_roots(&mut reader, &mut writer)?;
+        server.fetch_roots(&inbox, &mut writer)?;
 
         let roots = received_roots.lock().map_err(|e| anyhow!("{e}"))?;
         assert_eq!(roots.len(), 2);
@@ -950,7 +1161,6 @@ mod tests {
 
     #[test]
     fn test_fetch_roots_buffers_interleaved_request() -> Result<()> {
-        use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
         let mut server = McpServer::new(TestHandler, LoggingServer::new());
@@ -979,15 +1189,10 @@ mod tests {
             "id": "catenary-0",
             "result": {"roots": [{"uri": "file:///tmp/test"}]}
         });
-        let input = format!(
-            "{}\n{}\n",
-            serde_json::to_string(&ping_request)?,
-            serde_json::to_string(&roots_response)?
-        );
-        let mut reader = Cursor::new(input.into_bytes());
+        let inbox = mock_inbox(&[ping_request, roots_response]);
         let mut writer: Vec<u8> = Vec::new();
 
-        server.fetch_roots(&mut reader, &mut writer)?;
+        server.fetch_roots(&inbox, &mut writer)?;
 
         // Verify roots were received
         let roots = received_roots.lock().map_err(|e| anyhow!("{e}"))?;
@@ -1013,8 +1218,6 @@ mod tests {
 
     #[test]
     fn test_fetch_roots_handles_error_response() -> Result<()> {
-        use std::io::Cursor;
-
         let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
@@ -1025,12 +1228,11 @@ mod tests {
             "id": "catenary-0",
             "error": {"code": -32601, "message": "roots/list not supported"}
         });
-        let input = format!("{}\n", serde_json::to_string(&error_response)?);
-        let mut reader = Cursor::new(input.into_bytes());
+        let inbox = mock_inbox(&[error_response]);
         let mut writer: Vec<u8> = Vec::new();
 
         // Should not error — error responses are non-fatal
-        server.fetch_roots(&mut reader, &mut writer)?;
+        server.fetch_roots(&inbox, &mut writer)?;
         assert!(!server.fetching_roots);
         Ok(())
     }
@@ -1078,17 +1280,15 @@ mod tests {
 
     #[test]
     fn test_fetching_roots_reset_on_error() -> Result<()> {
-        use std::io::Cursor;
-
         let mut server = McpServer::new(TestHandler, LoggingServer::new());
         initialize_server(&mut server, true)?;
         server.should_fetch_roots = true;
 
-        // Empty stdin — will cause EOF error during fetch
-        let mut reader = Cursor::new(Vec::new());
+        // Empty channel — will cause recv error during fetch
+        let inbox = mock_inbox(&[]);
         let mut writer: Vec<u8> = Vec::new();
 
-        let result = server.fetch_roots(&mut reader, &mut writer);
+        let result = server.fetch_roots(&inbox, &mut writer);
         assert!(result.is_err());
         // fetching_roots must be reset even on error
         assert!(!server.fetching_roots);

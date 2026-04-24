@@ -114,6 +114,7 @@ impl ToolServer for GrepServer {
         &self,
         params: &serde_json::Value,
         parent_id: Option<i64>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
         let input: GrepInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
@@ -150,7 +151,9 @@ impl ToolServer for GrepServer {
                 include_gitignored: input.include_gitignored,
                 include_hidden: input.include_hidden,
             };
-            let output = self.run(arm_input, parent_id, &dead_languages).await?;
+            let output = self
+                .run(arm_input, parent_id, &dead_languages, cancel)
+                .await?;
             if !output.is_empty() {
                 if !all_output.is_empty() {
                     all_output.push('\n');
@@ -175,6 +178,7 @@ impl GrepServer {
         input: GrepInput,
         parent_id: Option<i64>,
         dead_languages: &HashSet<String>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String> {
         debug!("Grep request: pattern={}", input.pattern);
 
@@ -315,7 +319,7 @@ impl GrepServer {
                     } else {
                         // Server alive — use prepareRename for keyword discrimination
                         let is_symbol = self
-                            .prepare_rename_check(&file_path, line_0, col, parent_id)
+                            .prepare_rename_check(&file_path, line_0, col, parent_id, cancel)
                             .await;
                         if is_symbol {
                             hits.push(GrepHit {
@@ -361,8 +365,11 @@ impl GrepServer {
                             continue;
                         }
                     };
+                    if cancel.is_cancelled() {
+                        return Err(crate::mcp::RequestCancelled.into());
+                    }
                     let enrichment = self
-                        .enrich_at_position(&hit.file, line_0, col, from_ts, parent_id)
+                        .enrich_at_position(&hit.file, line_0, col, from_ts, parent_id, cancel)
                         .await;
                     enrichments.push((hit, enrichment));
                 }
@@ -398,6 +405,7 @@ impl GrepServer {
         line_0: u32,
         col: u32,
         parent_id: Option<i64>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> bool {
         let servers = self
             .client_manager
@@ -415,6 +423,7 @@ impl GrepServer {
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
+            client.set_cancel_token(cancel.clone());
             let response = client.prepare_rename(&uri, line_0, col).await;
             client.close_tracked_document(&uri).await;
             drop(client);
@@ -450,11 +459,12 @@ impl GrepServer {
         col: u32,
         from_ts: bool,
         parent_id: Option<i64>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<SymbolEnrichment> {
         // If !from_ts, check prepareRename first. Null → keyword, return None.
         if !from_ts
             && !self
-                .prepare_rename_check(path, line_0, col, parent_id)
+                .prepare_rename_check(path, line_0, col, parent_id, cancel)
                 .await
         {
             return None;
@@ -513,16 +523,16 @@ impl GrepServer {
 
         // Run all enrichment methods with the document already open.
         let ref_lines = self
-            .fetch_references(path, line_0, col, parent_id, pre_uri)
+            .fetch_references(path, line_0, col, parent_id, pre_uri, cancel)
             .await;
         let (incoming_calls, outgoing_calls) = self
-            .fetch_call_hierarchy(path, line_0, col, parent_id, pre_uri)
+            .fetch_call_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
             .await;
         let implementations = self
-            .fetch_implementations(path, line_0, col, parent_id, pre_uri)
+            .fetch_implementations(path, line_0, col, parent_id, pre_uri, cancel)
             .await;
         let (supertypes, subtypes) = self
-            .fetch_type_hierarchy(path, line_0, col, parent_id, pre_uri)
+            .fetch_type_hierarchy(path, line_0, col, parent_id, pre_uri, cancel)
             .await;
 
         // Close the document once on each server.
@@ -554,6 +564,7 @@ impl GrepServer {
         col: u32,
         parent_id: Option<i64>,
         pre_opened_uri: Option<&str>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> HashMap<String, HashSet<u32>> {
         let servers = self
             .client_manager
@@ -578,6 +589,7 @@ impl GrepServer {
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
+            client.set_cancel_token(cancel.clone());
             let result = client.references(uri, line_0, col, true).await;
             if pre_opened_uri.is_none() {
                 client.close_tracked_document(uri).await;
@@ -618,6 +630,7 @@ impl GrepServer {
         col: u32,
         parent_id: Option<i64>,
         pre_opened_uri: Option<&str>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> (Vec<CallEdge>, Vec<CallEdge>) {
         let servers = self
             .client_manager
@@ -642,6 +655,7 @@ impl GrepServer {
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
+            client.set_cancel_token(cancel.clone());
             let prepare = client.prepare_call_hierarchy(uri, line_0, col).await;
             let result = match prepare {
                 Ok(Value::Array(ref items)) if !items.is_empty() => {
@@ -695,6 +709,7 @@ impl GrepServer {
         col: u32,
         parent_id: Option<i64>,
         pre_opened_uri: Option<&str>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<(String, u32)> {
         let servers = self
             .client_manager
@@ -719,6 +734,7 @@ impl GrepServer {
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
+            client.set_cancel_token(cancel.clone());
             let result = client.implementation(uri, line_0, col).await;
             if pre_opened_uri.is_none() {
                 client.close_tracked_document(uri).await;
@@ -758,6 +774,7 @@ impl GrepServer {
         col: u32,
         parent_id: Option<i64>,
         pre_opened_uri: Option<&str>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> (Vec<TypeEdge>, Vec<TypeEdge>) {
         let servers = self
             .client_manager
@@ -782,6 +799,7 @@ impl GrepServer {
 
             let mut client = client_mutex.lock().await;
             client.set_parent_id(parent_id);
+            client.set_cancel_token(cancel.clone());
             let prepare = client.prepare_type_hierarchy(uri, line_0, col).await;
             let result = match prepare {
                 Ok(Value::Array(ref items)) if !items.is_empty() => {

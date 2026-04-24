@@ -25,6 +25,12 @@ pub trait ToolServer: Send + Sync {
     /// through to `LspClient` request methods so LSP messages are
     /// correlated with their triggering MCP/hook request.
     ///
+    /// `cancel` is triggered when the MCP client sends
+    /// `notifications/cancelled` for the owning tool call.
+    /// Implementations should check it at natural boundaries and
+    /// return [`RequestCancelled`](crate::mcp::types::RequestCancelled)
+    /// when triggered.
+    ///
     /// # Errors
     ///
     /// Returns an error if the tool execution fails.
@@ -32,5 +38,6 @@ pub trait ToolServer: Send + Sync {
         &self,
         params: &serde_json::Value,
         parent_id: Option<i64>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<serde_json::Value>;
 }

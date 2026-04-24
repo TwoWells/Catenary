@@ -564,10 +564,11 @@ impl LspServer {
         method: &str,
         params: Value,
         parent_id: Option<i64>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value> {
         self.connection()
             .ok_or_else(|| anyhow::anyhow!("connection not established"))?
-            .request(method, params, parent_id)
+            .request(method, params, parent_id, cancel)
             .await
     }
 

@@ -15,9 +15,12 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info};
 
+use tokio_util::sync::CancellationToken;
+
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
 use super::server::LspServer;
 use crate::logging::LoggingServer;
+use crate::mcp::RequestCancelled;
 
 /// Tracks an in-flight request so we can annotate the response with
 /// the original method name and causation chain.
@@ -169,6 +172,10 @@ impl Connection {
     /// Falls back to a 30-second wall-clock timeout when the process
     /// monitor is unavailable (e.g., mockls in tests).
     /// Retries on `ContentModified` (-32801) or `RequestCancelled` (-32800).
+    ///
+    /// If `cancel` is triggered (MCP client cancelled the tool call),
+    /// sends `$/cancelRequest` to the LSP server and returns
+    /// [`RequestCancelled`].
     #[allow(
         clippy::too_many_lines,
         reason = "Request retry logic with failure detection"
@@ -178,6 +185,7 @@ impl Connection {
         method: &str,
         params: serde_json::Value,
         parent_id: Option<i64>,
+        cancel: &CancellationToken,
     ) -> Result<serde_json::Value> {
         let server = self
             .server
@@ -237,6 +245,13 @@ impl Connection {
                                     "[{}] server closed connection", self.language
                                 )),
                             }
+                        }
+                        () = cancel.cancelled() => {
+                            // MCP client cancelled the tool call.
+                            // Send $/cancelRequest and clean up.
+                            self.pending.lock().await.remove(&id);
+                            self.send_cancel_request(&id).await;
+                            break Err(RequestCancelled.into());
                         }
                         () = tokio::time::sleep(POLL_INTERVAL) => {
                             // Failure detection
@@ -359,6 +374,17 @@ impl Connection {
     /// PID of the server process.
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// Sends `$/cancelRequest` to the LSP server for a pending request.
+    async fn send_cancel_request(&self, id: &RequestId) {
+        let notification = super::protocol::NotificationMessage {
+            jsonrpc: "2.0".to_string(),
+            method: "$/cancelRequest".to_string(),
+            params: serde_json::json!({"id": id}),
+        };
+        let _ = self.send_message(&notification).await;
+        debug!("[{}] sent $/cancelRequest for {:?}", self.language, id);
     }
 
     /// Send a JSON-RPC message with Content-Length header.

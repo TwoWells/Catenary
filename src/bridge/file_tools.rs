@@ -574,6 +574,7 @@ impl ToolServer for GlobServer {
         &self,
         params: &serde_json::Value,
         _parent_id: Option<i64>,
+        _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
         let input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
