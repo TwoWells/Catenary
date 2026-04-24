@@ -1443,11 +1443,10 @@ fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager)
         .filter(|b| b.entries.is_none())
         .map(|b| b.pattern.len() + count_digits(b.count) + 5) // "pattern (N)\n"
         .sum();
-    let per_bucket_budget = if expanded_count > 0 {
-        budget.saturating_sub(bare_cost) / expanded_count
-    } else {
-        0
-    };
+    let per_bucket_budget = budget
+        .saturating_sub(bare_cost)
+        .checked_div(expanded_count)
+        .unwrap_or(0);
 
     let mut output = String::new();
 

@@ -858,7 +858,7 @@ async fn profile_intensity_large() -> Result<()> {
     let capabilities = {
         let mut guard = stdin.lock().await;
         tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             initialize_server(&mut guard, &mut reader, &root_uri),
         )
         .await

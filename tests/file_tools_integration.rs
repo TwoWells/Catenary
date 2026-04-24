@@ -827,7 +827,7 @@ fn test_lua_glob_pattern() -> Result<()> {
     // If this takes >60s, something is seriously wrong (4 files should not
     // take anywhere near the 120s seen in slow_glob.md)
     assert!(
-        elapsed < Duration::from_secs(60),
+        elapsed < Duration::from_mins(1),
         "Glob pattern took {elapsed:?} — possible stacked LSP timeouts"
     );
 
@@ -874,7 +874,7 @@ fn test_lua_glob_directory() -> Result<()> {
     assert!(text.contains("notes.txt"), "Should list notes.txt: {text}");
 
     assert!(
-        elapsed < Duration::from_secs(60),
+        elapsed < Duration::from_mins(1),
         "Directory glob took {elapsed:?} — possible stacked LSP timeouts"
     );
 

@@ -1075,7 +1075,7 @@ pub(crate) fn check_grammars_installed(colors: &ColorConfig) {
                 colors.red(&format!("✗ {scope} — missing {lib_filename}")),
             );
         } else {
-            println!("  {}", colors.red(&format!("✗ {scope} — missing tags.scm")),);
+            println!("  {}", colors.red(&format!("✗ {scope} — missing tags.scm")));
         }
     }
 }
