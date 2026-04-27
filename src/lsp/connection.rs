@@ -30,14 +30,13 @@ struct PendingRequest {
     sender: oneshot::Sender<ResponseMessage>,
 }
 
-/// Emit an LSP protocol event via `tracing::info!`.
+/// Emit an LSP protocol event at the given tracing level.
 ///
 /// Protocol routing is by `kind` field, not by level — `MessageDbSink`
 /// matches `kind in {lsp, mcp, hook}` regardless of tracing level.
-///
-/// Handles the optional `parent_id` field by branching into two macro
-/// invocations (tracing macros require static field sets).
+/// The level controls DB `level` column and TUI filtering threshold.
 fn emit_lsp_event(
+    level: tracing::Level,
     server_name: &str,
     method: &str,
     request_id: i64,
@@ -45,24 +44,51 @@ fn emit_lsp_event(
     payload: &str,
     msg: &str,
 ) {
-    if let Some(pid) = parent_id {
-        info!(
+    if level == tracing::Level::ERROR {
+        crate::emit_protocol_event!(
+            error,
             kind = "lsp",
             method = method,
             server = server_name,
             client = "catenary",
             request_id = request_id,
-            parent_id = pid,
+            parent_id = parent_id,
+            payload = payload,
+            "{msg}"
+        );
+    } else if level == tracing::Level::WARN {
+        crate::emit_protocol_event!(
+            warn,
+            kind = "lsp",
+            method = method,
+            server = server_name,
+            client = "catenary",
+            request_id = request_id,
+            parent_id = parent_id,
+            payload = payload,
+            "{msg}"
+        );
+    } else if level == tracing::Level::INFO {
+        crate::emit_protocol_event!(
+            info,
+            kind = "lsp",
+            method = method,
+            server = server_name,
+            client = "catenary",
+            request_id = request_id,
+            parent_id = parent_id,
             payload = payload,
             "{msg}"
         );
     } else {
-        info!(
+        crate::emit_protocol_event!(
+            debug,
             kind = "lsp",
             method = method,
             server = server_name,
             client = "catenary",
             request_id = request_id,
+            parent_id = parent_id,
             payload = payload,
             "{msg}"
         );
@@ -206,6 +232,7 @@ impl Connection {
             let correlation_id = self.logging.next_id();
             if let Ok(payload) = serde_json::to_value(&request) {
                 emit_lsp_event(
+                    tracing::Level::INFO,
                     &self.server_name,
                     method,
                     correlation_id.0,
@@ -341,6 +368,7 @@ impl Connection {
         let correlation_id = self.logging.next_id();
         if let Ok(payload) = serde_json::to_value(&notification) {
             emit_lsp_event(
+                tracing::Level::INFO,
                 &self.server_name,
                 method,
                 correlation_id.0,
@@ -459,6 +487,7 @@ impl Connection {
                         debug!("Received server request: {} (id: {})", method, id);
                         let inbound_id = logging.next_id();
                         emit_lsp_event(
+                            tracing::Level::INFO,
                             &server_name,
                             method,
                             inbound_id.0,
@@ -494,6 +523,7 @@ impl Connection {
                         // Log outbound response
                         if let Ok(response_json) = serde_json::to_value(&response) {
                             emit_lsp_event(
+                                tracing::Level::INFO,
                                 &server_name,
                                 method,
                                 inbound_id.0,
@@ -518,6 +548,7 @@ impl Connection {
                         // Notification — log inbound
                         let notif_id = logging.next_id();
                         emit_lsp_event(
+                            tracing::Level::INFO,
                             &server_name,
                             method,
                             notif_id.0,
@@ -536,6 +567,7 @@ impl Connection {
                         let mut pending = pending.lock().await;
                         if let Some(req) = pending.remove(id) {
                             emit_lsp_event(
+                                tracing::Level::INFO,
                                 &server_name,
                                 &req.method,
                                 req.correlation_id,

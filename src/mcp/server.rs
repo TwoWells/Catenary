@@ -25,14 +25,13 @@ type CancelMap = Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>;
 /// MCP protocol versions this server supports (newest first).
 const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
 
-/// Emit an MCP protocol event via `tracing::info!`.
+/// Emit an MCP protocol event at the given tracing level.
 ///
 /// Protocol routing is by `kind` field — `MessageDbSink` matches
 /// `kind in {lsp, mcp, hook}` regardless of tracing level.
-///
-/// Handles the optional `parent_id` field by branching into two macro
-/// invocations (tracing macros require static field sets).
+/// The level controls DB `level` column and TUI filtering threshold.
 fn emit_mcp_event(
+    level: tracing::Level,
     client_name: &str,
     method: &str,
     request_id: i64,
@@ -40,24 +39,51 @@ fn emit_mcp_event(
     payload: &str,
     msg: &str,
 ) {
-    if let Some(pid) = parent_id {
-        info!(
+    if level == tracing::Level::ERROR {
+        crate::emit_protocol_event!(
+            error,
             kind = "mcp",
             method = method,
             server = "catenary",
             client = client_name,
             request_id = request_id,
-            parent_id = pid,
+            parent_id = parent_id,
+            payload = payload,
+            "{msg}"
+        );
+    } else if level == tracing::Level::WARN {
+        crate::emit_protocol_event!(
+            warn,
+            kind = "mcp",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            parent_id = parent_id,
+            payload = payload,
+            "{msg}"
+        );
+    } else if level == tracing::Level::INFO {
+        crate::emit_protocol_event!(
+            info,
+            kind = "mcp",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            parent_id = parent_id,
             payload = payload,
             "{msg}"
         );
     } else {
-        info!(
+        crate::emit_protocol_event!(
+            debug,
             kind = "mcp",
             method = method,
             server = "catenary",
             client = client_name,
             request_id = request_id,
+            parent_id = parent_id,
             payload = payload,
             "{msg}"
         );
@@ -211,6 +237,7 @@ impl<H: ToolHandler> McpServer<H> {
                         .to_string();
                     let id = self.logging.next_id();
                     emit_mcp_event(
+                        tracing::Level::INFO,
                         &self.client_name,
                         &method,
                         id.0,
@@ -371,6 +398,7 @@ impl<H: ToolHandler> McpServer<H> {
 
         if let Some(rid) = request_id {
             emit_mcp_event(
+                tracing::Level::INFO,
                 &self.client_name,
                 method,
                 rid,
@@ -618,6 +646,7 @@ impl<H: ToolHandler> McpServer<H> {
         let outbound_id = self.logging.next_id();
         if let Ok(json) = serde_json::to_value(&request) {
             emit_mcp_event(
+                tracing::Level::INFO,
                 &self.client_name,
                 "roots/list",
                 outbound_id.0,
@@ -658,6 +687,7 @@ impl<H: ToolHandler> McpServer<H> {
                     // Log the response with request_id pointing to the outbound request
                     if let Ok(resp_json) = serde_json::to_value(&response) {
                         emit_mcp_event(
+                            tracing::Level::INFO,
                             &self.client_name,
                             "roots/list",
                             outbound_id.0,
@@ -688,6 +718,7 @@ impl<H: ToolHandler> McpServer<H> {
                 .to_string();
             let interleaved_id = self.logging.next_id();
             emit_mcp_event(
+                tracing::Level::INFO,
                 &self.client_name,
                 &method,
                 interleaved_id.0,
@@ -1423,6 +1454,7 @@ mod tests {
             .to_string();
         let id = server.logging.next_id();
         emit_mcp_event(
+            tracing::Level::INFO,
             &server.client_name,
             &method,
             id.0,

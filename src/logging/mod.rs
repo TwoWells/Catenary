@@ -90,6 +90,48 @@ impl From<&tracing::Level> for Severity {
     }
 }
 
+/// Emit a protocol event at a compile-time tracing level.
+///
+/// Tracing macros require the level to be a compile-time constant (`info!`,
+/// `debug!`, etc.). This macro accepts the level as an identifier and expands
+/// to the corresponding `tracing::$level!` call. The `parent_id` field is
+/// optional — tracing macros require static field sets, so the macro branches
+/// into two invocations.
+///
+/// Boundary components (`emit_lsp_event`, `emit_mcp_event`, `emit_hook_event`)
+/// fix `kind` and delegate here via a runtime match on [`tracing::Level`].
+#[doc(hidden)]
+#[macro_export]
+macro_rules! emit_protocol_event {
+    ($level:ident, kind = $kind:expr, method = $method:expr,
+     server = $server:expr, client = $client:expr,
+     request_id = $rid:expr, parent_id = $pid:expr,
+     payload = $payload:expr, $msg:expr) => {
+        if let Some(pid) = $pid {
+            tracing::$level!(
+                kind = $kind,
+                method = $method,
+                server = $server,
+                client = $client,
+                request_id = $rid,
+                parent_id = pid,
+                payload = $payload,
+                $msg
+            );
+        } else {
+            tracing::$level!(
+                kind = $kind,
+                method = $method,
+                server = $server,
+                client = $client,
+                request_id = $rid,
+                payload = $payload,
+                $msg
+            );
+        }
+    };
+}
+
 /// Structured representation of a single tracing event.
 ///
 /// Sinks receive a `&LogEvent<'_>` after the Layer extracts fields from the

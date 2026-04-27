@@ -30,14 +30,13 @@ use tracing::{debug, info, warn};
 use crate::bridge::HookRouter;
 use crate::bridge::toolbox::Toolbox;
 
-/// Emit a hook protocol event via `tracing::info!`.
+/// Emit a hook protocol event at the given tracing level.
 ///
 /// Protocol routing is by `kind` field — `MessageDbSink` matches
 /// `kind in {lsp, mcp, hook}` regardless of tracing level.
-///
-/// Handles the optional `parent_id` field by branching into two macro
-/// invocations (tracing macros require static field sets).
+/// The level controls DB `level` column and TUI filtering threshold.
 fn emit_hook_event(
+    level: tracing::Level,
     client_name: &str,
     method: &str,
     request_id: i64,
@@ -45,24 +44,51 @@ fn emit_hook_event(
     payload: &str,
     msg: &str,
 ) {
-    if let Some(pid) = parent_id {
-        info!(
+    if level == tracing::Level::ERROR {
+        crate::emit_protocol_event!(
+            error,
             kind = "hook",
             method = method,
             server = "catenary",
             client = client_name,
             request_id = request_id,
-            parent_id = pid,
+            parent_id = parent_id,
+            payload = payload,
+            "{msg}"
+        );
+    } else if level == tracing::Level::WARN {
+        crate::emit_protocol_event!(
+            warn,
+            kind = "hook",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            parent_id = parent_id,
+            payload = payload,
+            "{msg}"
+        );
+    } else if level == tracing::Level::INFO {
+        crate::emit_protocol_event!(
+            info,
+            kind = "hook",
+            method = method,
+            server = "catenary",
+            client = client_name,
+            request_id = request_id,
+            parent_id = parent_id,
             payload = payload,
             "{msg}"
         );
     } else {
-        info!(
+        crate::emit_protocol_event!(
+            debug,
             kind = "hook",
             method = method,
             server = "catenary",
             client = client_name,
             request_id = request_id,
+            parent_id = parent_id,
             payload = payload,
             "{msg}"
         );
@@ -335,6 +361,7 @@ impl HookServer {
 
         // Log incoming hook request
         emit_hook_event(
+            tracing::Level::INFO,
             &self.router.client_name,
             &method,
             id.0,
@@ -360,6 +387,7 @@ impl HookServer {
 
         // Log outgoing hook response
         emit_hook_event(
+            tracing::Level::INFO,
             &self.router.client_name,
             &method,
             id.0,
@@ -522,6 +550,7 @@ mod tests {
     /// Row from the messages table for test assertions.
     struct MsgRow {
         r#type: String,
+        level: String,
         method: String,
         client: String,
         request_id: Option<i64>,
@@ -581,17 +610,18 @@ mod tests {
     fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
         let c = conn.lock().expect("lock");
         c.prepare(
-            "SELECT type, method, client, request_id, parent_id \
+            "SELECT type, level, method, client, request_id, parent_id \
              FROM messages ORDER BY id",
         )
         .expect("prepare")
         .query_map([], |row| {
             Ok(MsgRow {
                 r#type: row.get(0)?,
-                method: row.get(1)?,
-                client: row.get(2)?,
-                request_id: row.get(3)?,
-                parent_id: row.get(4)?,
+                level: row.get(1)?,
+                method: row.get(2)?,
+                client: row.get(3)?,
+                request_id: row.get(4)?,
+                parent_id: row.get(5)?,
             })
         })
         .expect("query")
@@ -613,6 +643,7 @@ mod tests {
 
         let id = logging.next_id();
         emit_hook_event(
+            tracing::Level::INFO,
             "claude-code",
             "post-tool/diagnostics",
             id.0,
@@ -640,6 +671,7 @@ mod tests {
 
         // Incoming request
         emit_hook_event(
+            tracing::Level::INFO,
             "claude-code",
             "post-tool/diagnostics",
             id.0,
@@ -654,6 +686,7 @@ mod tests {
 
         // Outgoing response
         emit_hook_event(
+            tracing::Level::INFO,
             "claude-code",
             "post-tool/diagnostics",
             id.0,
@@ -682,6 +715,7 @@ mod tests {
 
         let id = logging.next_id();
         emit_hook_event(
+            tracing::Level::INFO,
             "host",
             "pre-agent/roots-sync",
             id.0,
@@ -691,6 +725,7 @@ mod tests {
         );
 
         emit_hook_event(
+            tracing::Level::INFO,
             "host",
             "pre-agent/roots-sync",
             id.0,
@@ -707,6 +742,88 @@ mod tests {
         );
         assert_eq!(rows[0].method, "pre-agent/roots-sync");
         assert_eq!(rows[0].client, "host");
+    }
+
+    // ── Level-aware emit tests ──────────────────────────────────────
+
+    #[test]
+    fn emit_at_debug_writes_debug_level() {
+        let (logging, conn, _guard) = setup_logging();
+
+        let id = logging.next_id();
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            "test",
+            "post-tool/diagnostics",
+            id.0,
+            None,
+            "{}",
+            "debug emit",
+        );
+
+        let rows = hook_messages(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, "debug");
+    }
+
+    #[test]
+    fn emit_at_info_writes_info_level() {
+        let (logging, conn, _guard) = setup_logging();
+
+        let id = logging.next_id();
+        emit_hook_event(
+            tracing::Level::INFO,
+            "test",
+            "post-tool/diagnostics",
+            id.0,
+            None,
+            "{}",
+            "info emit",
+        );
+
+        let rows = hook_messages(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, "info");
+    }
+
+    #[test]
+    fn emit_at_warn_writes_warn_level() {
+        let (logging, conn, _guard) = setup_logging();
+
+        let id = logging.next_id();
+        emit_hook_event(
+            tracing::Level::WARN,
+            "test",
+            "post-tool/diagnostics",
+            id.0,
+            None,
+            "{}",
+            "warn emit",
+        );
+
+        let rows = hook_messages(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, "warn");
+    }
+
+    #[test]
+    fn emit_at_error_writes_error_level() {
+        let (logging, conn, _guard) = setup_logging();
+
+        let id = logging.next_id();
+        emit_hook_event(
+            tracing::Level::ERROR,
+            "test",
+            "post-tool/diagnostics",
+            id.0,
+            None,
+            "{}",
+            "error emit",
+        );
+
+        let rows = hook_messages(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, "error");
     }
 
     // ── Envelope serialization tests ──────────────────────────────────
