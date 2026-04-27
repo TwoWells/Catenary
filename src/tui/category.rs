@@ -1,111 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Protocol categorization and collapse key computation for the display pipeline.
+//! Collapse key computation and display-specific helpers for the TUI pipeline.
 //!
-//! Pure functions that map protocol messages to grouping labels and collapse
-//! keys. Categories follow the LSP and MCP specs' own method groupings —
-//! explicit `match` on method strings, no regex or prefix matching.
+//! Category functions (`lsp_category`, `mcp_category`, `hook_category`) live in
+//! [`crate::protocol::category`] and are re-exported here for convenience.
+
+pub use crate::protocol::category::{hook_category, lsp_category, mcp_category};
 
 use crate::session::SessionMessage;
-
-// ── Category functions ───────────────────────────────────────────────────
-
-/// Categorize an LSP method.
-#[must_use]
-pub fn lsp_category(method: &str) -> &'static str {
-    match method {
-        // lifecycle
-        "initialize"
-        | "initialized"
-        | "shutdown"
-        | "exit"
-        | "client/registerCapability"
-        | "client/unregisterCapability"
-        | "$/setTrace"
-        | "$/logTrace" => "lifecycle",
-
-        // sync
-        "textDocument/didOpen"
-        | "textDocument/didChange"
-        | "textDocument/didSave"
-        | "textDocument/didClose"
-        | "textDocument/willSave"
-        | "textDocument/willSaveWaitUntil" => "sync",
-
-        // language
-        "textDocument/hover"
-        | "textDocument/definition"
-        | "textDocument/references"
-        | "textDocument/rename"
-        | "textDocument/prepareRename"
-        | "textDocument/implementation"
-        | "textDocument/typeDefinition"
-        | "textDocument/declaration"
-        | "textDocument/codeAction"
-        | "textDocument/documentSymbol"
-        | "textDocument/completion"
-        | "textDocument/signatureHelp"
-        | "textDocument/formatting"
-        | "textDocument/rangeFormatting"
-        | "textDocument/diagnostic"
-        | "textDocument/codeLens"
-        | "textDocument/documentHighlight"
-        | "textDocument/foldingRange"
-        | "textDocument/selectionRange"
-        | "textDocument/linkedEditingRange"
-        | "textDocument/semanticTokens/full"
-        | "textDocument/semanticTokens/range"
-        | "callHierarchy/incomingCalls"
-        | "callHierarchy/outgoingCalls"
-        | "textDocument/prepareCallHierarchy"
-        | "typeHierarchy/subtypes"
-        | "typeHierarchy/supertypes"
-        | "textDocument/prepareTypeHierarchy"
-        | "workspaceSymbol/resolve" => "language",
-
-        // window
-        "window/logMessage" | "window/showMessage" | "window/workDoneProgress/create" => "window",
-
-        // workspace
-        "workspace/symbol"
-        | "workspace/configuration"
-        | "workspace/didChangeConfiguration"
-        | "workspace/didChangeWatchedFiles"
-        | "workspace/didChangeWorkspaceFolders" => "workspace",
-
-        // progress
-        "$/progress" => "progress",
-
-        _ => "unknown",
-    }
-}
-
-/// Categorize an MCP method.
-#[must_use]
-pub fn mcp_category(method: &str) -> &'static str {
-    match method {
-        "initialize" | "notifications/initialized" => "init",
-        "tools/list" | "tools/call" => "tools",
-        "roots/list" | "notifications/roots/list_changed" => "roots",
-        "notifications/cancelled" => "cancelled",
-        _ => "unknown",
-    }
-}
-
-/// Categorize a hook method.
-///
-/// Matches on the action suffix (after the last `/`) so categories
-/// work with the full `namespace/action` method strings.
-#[must_use]
-pub fn hook_category(method: &str) -> &'static str {
-    match method.rsplit('/').next().unwrap_or(method) {
-        "diagnostics" => "diagnostics",
-        "roots-sync" => "sync",
-        "enforce-editing" | "require-release" | "clear-editing" => "lifecycle",
-        _ => "unknown",
-    }
-}
 
 // ── Collapse key ─────────────────────────────────────────────────────────
 

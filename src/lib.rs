@@ -26,6 +26,8 @@ pub mod logging;
 pub mod lsp;
 /// MCP server implementation and type definitions.
 pub mod mcp;
+/// Protocol classification shared by core and display layers.
+pub mod protocol;
 /// Session management and event broadcasting.
 pub mod session;
 /// Symbol index for workspace-wide symbol extraction.

@@ -15,6 +15,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info};
 
+use crate::protocol::category::{lsp_category, lsp_category_level, window_message_level};
+
 use tokio_util::sync::CancellationToken;
 
 use super::protocol::{self, RequestId, RequestMessage, ResponseError, ResponseMessage};
@@ -230,9 +232,10 @@ impl Connection {
             };
 
             let correlation_id = self.logging.next_id();
+            let level = lsp_category_level(lsp_category(method));
             if let Ok(payload) = serde_json::to_value(&request) {
                 emit_lsp_event(
-                    tracing::Level::INFO,
+                    level,
                     &self.server_name,
                     method,
                     correlation_id.0,
@@ -368,7 +371,7 @@ impl Connection {
         let correlation_id = self.logging.next_id();
         if let Ok(payload) = serde_json::to_value(&notification) {
             emit_lsp_event(
-                tracing::Level::INFO,
+                tracing::Level::DEBUG,
                 &self.server_name,
                 method,
                 correlation_id.0,
@@ -483,11 +486,11 @@ impl Connection {
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                     // Request or Notification
                     if let Some(id) = value.get("id") {
-                        // Server Request — log inbound
+                        // Server Request — always debug (server-initiated plumbing)
                         debug!("Received server request: {} (id: {})", method, id);
                         let inbound_id = logging.next_id();
                         emit_lsp_event(
-                            tracing::Level::INFO,
+                            tracing::Level::DEBUG,
                             &server_name,
                             method,
                             inbound_id.0,
@@ -520,10 +523,10 @@ impl Connection {
                             },
                         };
 
-                        // Log outbound response
+                        // Log outbound response (same level as request)
                         if let Ok(response_json) = serde_json::to_value(&response) {
                             emit_lsp_event(
-                                tracing::Level::INFO,
+                                tracing::Level::DEBUG,
                                 &server_name,
                                 method,
                                 inbound_id.0,
@@ -545,10 +548,20 @@ impl Connection {
                             }
                         }
                     } else {
-                        // Notification — log inbound
+                        // Notification — level determined by method
+                        let notif_level = match method {
+                            "window/logMessage" | "window/showMessage" => {
+                                let msg_type = value
+                                    .get("params")
+                                    .and_then(|p| p.get("type"))
+                                    .and_then(serde_json::Value::as_u64);
+                                window_message_level(msg_type)
+                            }
+                            _ => lsp_category_level(lsp_category(method)),
+                        };
                         let notif_id = logging.next_id();
                         emit_lsp_event(
-                            tracing::Level::INFO,
+                            notif_level,
                             &server_name,
                             method,
                             notif_id.0,
@@ -560,14 +573,15 @@ impl Connection {
                         server.on_notification(method, params);
                     }
                 } else if value.get("id").is_some() {
-                    // Response — log with method from pending map
+                    // Response — match the level of the outgoing request
                     if let Ok(response) = serde_json::from_value::<ResponseMessage>(value.clone())
                         && let Some(id) = &response.id
                     {
                         let mut pending = pending.lock().await;
                         if let Some(req) = pending.remove(id) {
+                            let resp_level = lsp_category_level(lsp_category(&req.method));
                             emit_lsp_event(
-                                tracing::Level::INFO,
+                                resp_level,
                                 &server_name,
                                 &req.method,
                                 req.correlation_id,

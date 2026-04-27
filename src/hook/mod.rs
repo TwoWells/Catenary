@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::HookRouter;
 use crate::bridge::toolbox::Toolbox;
+use crate::protocol::category::hook_category;
 
 /// Emit a hook protocol event at the given tracing level.
 ///
@@ -341,7 +342,11 @@ impl HookServer {
 
     /// Handles a single connection: reads a JSON request, extracts the method
     /// string, dispatches to the appropriate handler, logs both request and
-    /// response, and writes back the result.
+    /// response at the outcome-determined level, and writes back the result.
+    ///
+    /// Request logging is deferred until after dispatch so that both the
+    /// request and response are emitted at the same level. This prevents
+    /// asymmetric levels from breaking pair merge in the TUI.
     async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(&self, stream: S) -> Result<()> {
         let (reader, mut writer) = tokio::io::split(stream);
         let mut buf_reader = BufReader::new(reader);
@@ -359,19 +364,8 @@ impl HookServer {
         // Mint a correlation ID for this request/response pair
         let id = self.router.toolbox.logging.next_id();
 
-        // Log incoming hook request
-        emit_hook_event(
-            tracing::Level::INFO,
-            &self.router.client_name,
-            &method,
-            id.0,
-            None,
-            &raw.to_string(),
-            "incoming hook",
-        );
-
-        let request: HookRequest =
-            serde_json::from_value(raw).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
+        let request: HookRequest = serde_json::from_value(raw.clone())
+            .map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
         let result = self.router.dispatch(request, id.0);
 
@@ -385,9 +379,25 @@ impl HookServer {
             String::new()
         };
 
+        // Determine level from outcome and hook category.
+        // Hook allows (empty response) → debug, hook blocks/diagnostics → info.
+        // roots-sync is always debug regardless of outcome.
+        let level = Self::hook_outcome_level(&method, &envelope);
+
+        // Log incoming hook request (deferred — uses outcome-determined level)
+        emit_hook_event(
+            level,
+            &self.router.client_name,
+            &method,
+            id.0,
+            None,
+            &raw.to_string(),
+            "incoming hook",
+        );
+
         // Log outgoing hook response
         emit_hook_event(
-            tracing::Level::INFO,
+            level,
             &self.router.client_name,
             &method,
             id.0,
@@ -401,6 +411,24 @@ impl HookServer {
         writer.shutdown().await?;
 
         Ok(())
+    }
+
+    /// Determine the tracing level for a hook request/response pair
+    /// based on the method category and the dispatch outcome.
+    fn hook_outcome_level(method: &str, envelope: &HookResponseEnvelope) -> tracing::Level {
+        let category = hook_category(method);
+        match category {
+            // diagnostics / lifecycle: non-empty result → info, empty → debug
+            "diagnostics" | "lifecycle" => {
+                if envelope.result.is_some() {
+                    tracing::Level::INFO
+                } else {
+                    tracing::Level::DEBUG
+                }
+            }
+            // roots-sync, unknown, and everything else → debug
+            _ => tracing::Level::DEBUG,
+        }
     }
 }
 
@@ -917,5 +945,54 @@ mod tests {
             parsed["system_message"].as_str(),
             Some("─── background ───\n[err] pylsp crashed"),
         );
+    }
+
+    // ── Outcome-based level tests ──────────────────────────────────────
+
+    #[test]
+    fn hook_allow_emits_at_debug() {
+        // Empty envelope = allow (no result, no system_message)
+        let env = HookResponseEnvelope::default();
+        let level = HookServer::hook_outcome_level("pre-tool/enforce-editing", &env);
+        assert_eq!(level, tracing::Level::DEBUG);
+    }
+
+    #[test]
+    fn hook_block_emits_at_info() {
+        let env = HookResponseEnvelope {
+            result: Some(HookResult::Deny("call start_editing first".into())),
+            system_message: None,
+        };
+        let level = HookServer::hook_outcome_level("pre-tool/enforce-editing", &env);
+        assert_eq!(level, tracing::Level::INFO);
+    }
+
+    #[test]
+    fn hook_diagnostics_content_emits_at_info() {
+        let env = HookResponseEnvelope {
+            result: Some(HookResult::Content("error[E0308]: ...".into())),
+            system_message: None,
+        };
+        let level = HookServer::hook_outcome_level("post-tool/diagnostics", &env);
+        assert_eq!(level, tracing::Level::INFO);
+    }
+
+    #[test]
+    fn hook_diagnostics_clean_emits_at_debug() {
+        // Clean diagnostics return no result (empty response)
+        let env = HookResponseEnvelope::default();
+        let level = HookServer::hook_outcome_level("post-tool/diagnostics", &env);
+        assert_eq!(level, tracing::Level::DEBUG);
+    }
+
+    #[test]
+    fn hook_roots_sync_always_debug() {
+        // Even with a result, roots-sync is always debug
+        let env = HookResponseEnvelope {
+            result: Some(HookResult::Content("synced".into())),
+            system_message: None,
+        };
+        let level = HookServer::hook_outcome_level("pre-agent/roots-sync", &env);
+        assert_eq!(level, tracing::Level::DEBUG);
     }
 }

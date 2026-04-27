@@ -19,6 +19,17 @@ use super::types::{
 };
 use crate::logging::LoggingServer;
 
+/// Map an MCP method to its tracing severity level.
+///
+/// `tools/call` and `notifications/cancelled` are `info` (interesting signal).
+/// Everything else (initialize, tools/list, roots) is `debug` (plumbing).
+fn mcp_method_level(method: &str) -> tracing::Level {
+    match method {
+        "tools/call" | "notifications/cancelled" => tracing::Level::INFO,
+        _ => tracing::Level::DEBUG,
+    }
+}
+
 /// Map from MCP request ID to its cancellation token.
 type CancelMap = Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>;
 
@@ -237,7 +248,7 @@ impl<H: ToolHandler> McpServer<H> {
                         .to_string();
                     let id = self.logging.next_id();
                     emit_mcp_event(
-                        tracing::Level::INFO,
+                        mcp_method_level(&method),
                         &self.client_name,
                         &method,
                         id.0,
@@ -398,7 +409,7 @@ impl<H: ToolHandler> McpServer<H> {
 
         if let Some(rid) = request_id {
             emit_mcp_event(
-                tracing::Level::INFO,
+                mcp_method_level(method),
                 &self.client_name,
                 method,
                 rid,
@@ -646,7 +657,7 @@ impl<H: ToolHandler> McpServer<H> {
         let outbound_id = self.logging.next_id();
         if let Ok(json) = serde_json::to_value(&request) {
             emit_mcp_event(
-                tracing::Level::INFO,
+                mcp_method_level("roots/list"),
                 &self.client_name,
                 "roots/list",
                 outbound_id.0,
@@ -687,7 +698,7 @@ impl<H: ToolHandler> McpServer<H> {
                     // Log the response with request_id pointing to the outbound request
                     if let Ok(resp_json) = serde_json::to_value(&response) {
                         emit_mcp_event(
-                            tracing::Level::INFO,
+                            mcp_method_level("roots/list"),
                             &self.client_name,
                             "roots/list",
                             outbound_id.0,
@@ -718,7 +729,7 @@ impl<H: ToolHandler> McpServer<H> {
                 .to_string();
             let interleaved_id = self.logging.next_id();
             emit_mcp_event(
-                tracing::Level::INFO,
+                mcp_method_level(&method),
                 &self.client_name,
                 &method,
                 interleaved_id.0,
@@ -1353,6 +1364,7 @@ mod tests {
     /// Row from the messages table for test assertions.
     struct MsgRow {
         r#type: String,
+        level: String,
         method: String,
         client: String,
         request_id: Option<i64>,
@@ -1412,17 +1424,18 @@ mod tests {
     fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
         let c = conn.lock().expect("lock");
         c.prepare(
-            "SELECT type, method, client, request_id, parent_id \
+            "SELECT type, level, method, client, request_id, parent_id \
              FROM messages ORDER BY id",
         )
         .expect("prepare")
         .query_map([], |row| {
             Ok(MsgRow {
                 r#type: row.get(0)?,
-                method: row.get(1)?,
-                client: row.get(2)?,
-                request_id: row.get(3)?,
-                parent_id: row.get(4)?,
+                level: row.get(1)?,
+                method: row.get(2)?,
+                client: row.get(3)?,
+                request_id: row.get(4)?,
+                parent_id: row.get(5)?,
             })
         })
         .expect("query")
@@ -1454,7 +1467,7 @@ mod tests {
             .to_string();
         let id = server.logging.next_id();
         emit_mcp_event(
-            tracing::Level::INFO,
+            mcp_method_level(&method),
             &server.client_name,
             &method,
             id.0,
@@ -1613,6 +1626,64 @@ mod tests {
         assert_eq!(msgs[2].client, "claude-code");
         // The ping response (4th MCP message) should also have client = "claude-code"
         assert_eq!(msgs[3].client, "claude-code");
+        Ok(())
+    }
+
+    // ── Level-aware emit tests ──────────────────────────────────────
+
+    #[test]
+    fn test_mcp_tools_call_emits_at_info() -> Result<()> {
+        let (logging, conn, _guard) = setup_logging();
+        let mut server = McpServer::new(TestHandler, logging);
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(10),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "test_tool",
+                "arguments": {}
+            })),
+        };
+
+        let line = serde_json::to_string(&request)?;
+        let mut writer: Vec<u8> = Vec::new();
+        simulate_incoming(&mut server, &line, &mut writer)?;
+
+        let msgs = mcp_messages(&conn);
+        assert!(msgs.len() >= 2, "should have request + response");
+        assert_eq!(msgs[0].level, "info", "tools/call request should be info");
+        assert_eq!(msgs[1].level, "info", "tools/call response should be info");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mcp_initialize_emits_at_debug() -> Result<()> {
+        let (logging, conn, _guard) = setup_logging();
+        let mut server = McpServer::new(TestHandler, logging);
+
+        let request = Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(11),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"}
+            })),
+        };
+
+        let line = serde_json::to_string(&request)?;
+        let mut writer: Vec<u8> = Vec::new();
+        simulate_incoming(&mut server, &line, &mut writer)?;
+
+        let msgs = mcp_messages(&conn);
+        assert!(msgs.len() >= 2, "should have request + response");
+        assert_eq!(msgs[0].level, "debug", "initialize request should be debug");
+        assert_eq!(
+            msgs[1].level, "debug",
+            "initialize response should be debug"
+        );
         Ok(())
     }
 }
