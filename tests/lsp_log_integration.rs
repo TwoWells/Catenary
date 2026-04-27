@@ -9,118 +9,20 @@
 //! Integration tests for LSP message logging via `LoggingServer` + `MessageDbSink`.
 
 use anyhow::Result;
-use std::sync::Arc;
-use tempfile::tempdir;
-use tracing_subscriber::layer::SubscriberExt;
 
-use catenary_mcp::logging::LoggingServer;
-use catenary_mcp::logging::message_db::MessageDbSink;
+use catenary_mcp::logging::test_support::{
+    MsgRow, query_all_messages, setup_logging, spawn_initialized_client,
+};
 
 const MOCK_LANG_A: &str = "yX4Za";
-
-/// Row from the `messages` table with the fields we care about.
-struct MsgRow {
-    r#type: String,
-    method: String,
-    request_id: Option<i64>,
-    parent_id: Option<i64>,
-}
-
-/// Create a test DB with a `LoggingServer` backed by a `MessageDbSink`,
-/// installed as the thread-local tracing subscriber.
-///
-/// Returns the `LoggingServer` (for `LspClient::spawn`), the DB connection
-/// (for querying), and a guard that restores the previous subscriber on drop.
-fn setup_logging() -> (
-    LoggingServer,
-    Arc<std::sync::Mutex<rusqlite::Connection>>,
-    tracing::subscriber::DefaultGuard,
-) {
-    let conn = Arc::new(std::sync::Mutex::new(
-        rusqlite::Connection::open_in_memory().expect("open in-memory db"),
-    ));
-    conn.lock()
-        .expect("lock")
-        .execute_batch(
-            "CREATE TABLE sessions (
-                 id           TEXT PRIMARY KEY,
-                 pid          INTEGER NOT NULL,
-                 display_name TEXT NOT NULL,
-                 started_at   TEXT NOT NULL
-             );
-             INSERT INTO sessions (id, pid, display_name, started_at)
-                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
-             CREATE TABLE messages (
-                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id  TEXT NOT NULL,
-                 timestamp   TEXT NOT NULL,
-                 type        TEXT NOT NULL,
-                 level       TEXT NOT NULL DEFAULT 'info',
-                 method      TEXT NOT NULL,
-                 server      TEXT NOT NULL,
-                 client      TEXT NOT NULL,
-                 request_id  INTEGER,
-                 parent_id   INTEGER,
-                 payload     TEXT NOT NULL
-             );",
-        )
-        .expect("create schema");
-
-    let logging = LoggingServer::new();
-    let message_db = MessageDbSink::new(conn.clone(), "s1".into());
-    logging.activate(vec![message_db]);
-
-    let subscriber = tracing_subscriber::registry().with(logging.clone());
-    let guard = tracing::subscriber::set_default(subscriber);
-
-    (logging, conn, guard)
-}
-
-/// Query all messages from the test DB, ordered by id.
-fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-    let c = conn.lock().expect("lock");
-    c.prepare("SELECT type, method, request_id, parent_id FROM messages ORDER BY id")
-        .expect("prepare")
-        .query_map([], |row| {
-            Ok(MsgRow {
-                r#type: row.get(0)?,
-                method: row.get(1)?,
-                request_id: row.get(2)?,
-                parent_id: row.get(3)?,
-            })
-        })
-        .expect("query")
-        .filter_map(std::result::Result::ok)
-        .collect()
-}
-
-/// Spawn mockls with a `LoggingServer` and initialize it.
-async fn spawn_initialized_client(
-    logging: LoggingServer,
-) -> Result<(catenary_mcp::lsp::LspClient, tempfile::TempDir)> {
-    let dir = tempdir()?;
-    let bin = env!("CARGO_BIN_EXE_mockls");
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        bin,
-        &[MOCK_LANG_A],
-        MOCK_LANG_A,
-        MOCK_LANG_A,
-        logging,
-        None,
-        std::collections::HashMap::new(),
-    )?;
-
-    client.initialize(&[dir.path().to_path_buf()], None).await?;
-    Ok((client, dir))
-}
 
 /// Verify that a hover request/response pair is logged with correct
 /// correlation ID linking (both rows share the same `request_id`).
 #[tokio::test]
 async fn test_lsp_log_request_response() -> Result<()> {
     let (logging, conn, _guard) = setup_logging();
-    let (client, dir) = spawn_initialized_client(logging).await?;
+    let (client, dir) =
+        spawn_initialized_client(env!("CARGO_BIN_EXE_mockls"), logging, MOCK_LANG_A).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let MY_VAR\n")?;
@@ -131,7 +33,7 @@ async fn test_lsp_log_request_response() -> Result<()> {
         .await?;
     let _def = client.definition(&uri, 0, 4).await?;
 
-    let msgs = query_messages(&conn);
+    let msgs = query_all_messages(&conn);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/definition")
@@ -167,7 +69,8 @@ async fn test_lsp_log_request_response() -> Result<()> {
 #[tokio::test]
 async fn test_lsp_log_notification() -> Result<()> {
     let (logging, conn, _guard) = setup_logging();
-    let (client, dir) = spawn_initialized_client(logging).await?;
+    let (client, dir) =
+        spawn_initialized_client(env!("CARGO_BIN_EXE_mockls"), logging, MOCK_LANG_A).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let X\n")?;
@@ -175,7 +78,7 @@ async fn test_lsp_log_notification() -> Result<()> {
 
     client.did_open(&uri, MOCK_LANG_A, 1, "let X\n").await?;
 
-    let msgs = query_messages(&conn);
+    let msgs = query_all_messages(&conn);
     let did_open_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/didOpen")
@@ -195,7 +98,8 @@ async fn test_lsp_log_notification() -> Result<()> {
 #[tokio::test]
 async fn test_lsp_log_inbound_notification() -> Result<()> {
     let (logging, conn, _guard) = setup_logging();
-    let (client, dir) = spawn_initialized_client(logging).await?;
+    let (client, dir) =
+        spawn_initialized_client(env!("CARGO_BIN_EXE_mockls"), logging, MOCK_LANG_A).await?;
 
     // mockls publishes diagnostics for files with "error" in the content
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
@@ -209,7 +113,7 @@ async fn test_lsp_log_inbound_notification() -> Result<()> {
     // Give the server time to publish diagnostics
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let msgs = query_messages(&conn);
+    let msgs = query_all_messages(&conn);
     let diag_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/publishDiagnostics")
@@ -228,7 +132,8 @@ async fn test_lsp_log_inbound_notification() -> Result<()> {
 #[tokio::test]
 async fn test_lsp_log_parent_id() -> Result<()> {
     let (logging, conn, _guard) = setup_logging();
-    let (mut client, dir) = spawn_initialized_client(logging).await?;
+    let (mut client, dir) =
+        spawn_initialized_client(env!("CARGO_BIN_EXE_mockls"), logging, MOCK_LANG_A).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let MY_VAR\n")?;
@@ -244,7 +149,7 @@ async fn test_lsp_log_parent_id() -> Result<()> {
 
     let _def = client.definition(&uri, 0, 4).await?;
 
-    let msgs = query_messages(&conn);
+    let msgs = query_all_messages(&conn);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/definition")
@@ -269,7 +174,8 @@ async fn test_lsp_log_parent_id() -> Result<()> {
 #[tokio::test]
 async fn test_lsp_log_pending_method_annotation() -> Result<()> {
     let (logging, conn, _guard) = setup_logging();
-    let (client, dir) = spawn_initialized_client(logging).await?;
+    let (client, dir) =
+        spawn_initialized_client(env!("CARGO_BIN_EXE_mockls"), logging, MOCK_LANG_A).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let MY_VAR\n")?;
@@ -280,7 +186,7 @@ async fn test_lsp_log_pending_method_annotation() -> Result<()> {
         .await?;
     let _def = client.definition(&uri, 0, 4).await?;
 
-    let msgs = query_messages(&conn);
+    let msgs = query_all_messages(&conn);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/definition")

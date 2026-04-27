@@ -23,92 +23,13 @@
 //! make test T=logging_throughput
 //! ```
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use tempfile::tempdir;
-use tracing_subscriber::layer::SubscriberExt;
 
-use catenary_mcp::logging::LoggingServer;
-use catenary_mcp::logging::message_db::MessageDbSink;
+use catenary_mcp::logging::test_support::{message_count, setup_logging, spawn_initialized_client};
 
 const MOCK_LANG_A: &str = "yX4Za";
-
-/// Create a test DB with a `LoggingServer` backed by a `MessageDbSink`,
-/// installed as the thread-local tracing subscriber.
-fn setup_logging() -> (
-    LoggingServer,
-    Arc<std::sync::Mutex<rusqlite::Connection>>,
-    tracing::subscriber::DefaultGuard,
-) {
-    let conn = Arc::new(std::sync::Mutex::new(
-        rusqlite::Connection::open_in_memory().expect("open in-memory db"),
-    ));
-    conn.lock()
-        .expect("lock")
-        .execute_batch(
-            "CREATE TABLE sessions (
-                 id           TEXT PRIMARY KEY,
-                 pid          INTEGER NOT NULL,
-                 display_name TEXT NOT NULL,
-                 started_at   TEXT NOT NULL
-             );
-             INSERT INTO sessions (id, pid, display_name, started_at)
-                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
-             CREATE TABLE messages (
-                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id  TEXT NOT NULL,
-                 timestamp   TEXT NOT NULL,
-                 type        TEXT NOT NULL,
-                 level       TEXT NOT NULL DEFAULT 'info',
-                 method      TEXT NOT NULL,
-                 server      TEXT NOT NULL,
-                 client      TEXT NOT NULL,
-                 request_id  INTEGER,
-                 parent_id   INTEGER,
-                 payload     TEXT NOT NULL
-             );",
-        )
-        .expect("create schema");
-
-    let logging = LoggingServer::new();
-    let message_db = MessageDbSink::new(conn.clone(), "s1".into());
-    logging.activate(vec![message_db]);
-
-    let subscriber = tracing_subscriber::registry().with(logging.clone());
-    let guard = tracing::subscriber::set_default(subscriber);
-
-    (logging, conn, guard)
-}
-
-/// Spawn mockls with a `LoggingServer` and initialize it.
-async fn spawn_initialized_client(
-    logging: LoggingServer,
-) -> Result<(catenary_mcp::lsp::LspClient, tempfile::TempDir)> {
-    let dir = tempdir()?;
-    let bin = env!("CARGO_BIN_EXE_mockls");
-
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
-        bin,
-        &[MOCK_LANG_A],
-        MOCK_LANG_A,
-        MOCK_LANG_A,
-        logging,
-        None,
-        std::collections::HashMap::new(),
-    )?;
-
-    client.initialize(&[dir.path().to_path_buf()], None).await?;
-    Ok((client, dir))
-}
-
-/// Count total rows in the `messages` table.
-fn message_count(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> i64 {
-    let c = conn.lock().expect("lock");
-    c.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .expect("count messages")
-}
 
 /// End-to-end benchmark: hover + definition requests through mockls with
 /// `LoggingServer` + `MessageDbSink`.
@@ -119,7 +40,8 @@ fn message_count(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> i64 {
 #[tokio::test]
 async fn bench_lsp_message_throughput() -> Result<()> {
     let (logging, conn, _guard) = setup_logging();
-    let (client, dir) = spawn_initialized_client(logging).await?;
+    let (client, dir) =
+        spawn_initialized_client(env!("CARGO_BIN_EXE_mockls"), logging, MOCK_LANG_A).await?;
 
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "let MY_VAR\n")?;

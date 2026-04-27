@@ -16,85 +16,18 @@
 //! Each test uses `tracing::subscriber::with_default` (scoped per-test)
 //! to avoid global subscriber conflicts in parallel test execution.
 
-use std::sync::Arc;
-use std::sync::Mutex;
-
 use anyhow::Result;
 use tempfile::tempdir;
 use tracing_subscriber::layer::SubscriberExt;
 
 use catenary_mcp::logging::message_db::MessageDbSink;
 use catenary_mcp::logging::notification_queue::NotificationQueueSink;
+use catenary_mcp::logging::test_support::{
+    MsgRow, logging_test_db, message_count, query_all_messages,
+};
 use catenary_mcp::logging::{LoggingServer, Severity};
 
 const MOCK_LANG_A: &str = "yX4Za";
-
-// ── Helpers ────────────────────────────────────────────────────────────
-
-/// Create an in-memory DB with the `messages` table schema.
-fn test_db() -> Arc<Mutex<rusqlite::Connection>> {
-    let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-    conn.execute_batch(
-        "CREATE TABLE sessions (
-             id           TEXT PRIMARY KEY,
-             pid          INTEGER NOT NULL,
-             display_name TEXT NOT NULL,
-             started_at   TEXT NOT NULL
-         );
-         INSERT INTO sessions (id, pid, display_name, started_at)
-             VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
-         CREATE TABLE messages (
-             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-             session_id  TEXT NOT NULL,
-             timestamp   TEXT NOT NULL,
-             type        TEXT NOT NULL,
-             level       TEXT NOT NULL DEFAULT 'info',
-             method      TEXT NOT NULL,
-             server      TEXT NOT NULL,
-             client      TEXT NOT NULL,
-             request_id  INTEGER,
-             parent_id   INTEGER,
-             payload     TEXT NOT NULL
-         );",
-    )
-    .expect("create schema");
-    Arc::new(Mutex::new(conn))
-}
-
-/// Row projection from the `messages` table.
-struct MsgRow {
-    r#type: String,
-    method: String,
-    request_id: Option<i64>,
-    parent_id: Option<i64>,
-}
-
-/// Query all messages ordered by id.
-#[allow(
-    clippy::significant_drop_tightening,
-    reason = "MutexGuard must outlive the prepared statement"
-)]
-fn query_messages(conn: &Arc<Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-    let c = conn.lock().expect("lock");
-    c.prepare("SELECT type, method, request_id, parent_id FROM messages ORDER BY id")
-        .expect("prepare")
-        .query_map([], |row| {
-            Ok(MsgRow {
-                r#type: row.get(0)?,
-                method: row.get(1)?,
-                request_id: row.get(2)?,
-                parent_id: row.get(3)?,
-            })
-        })
-        .expect("query")
-        .filter_map(std::result::Result::ok)
-        .collect()
-}
-
-/// Count rows in the `messages` table.
-fn message_count(conn: &Arc<Mutex<rusqlite::Connection>>) -> usize {
-    query_messages(conn).len()
-}
 
 // ── Multi-sink dispatch ────────────────────────────────────────────────
 
@@ -102,7 +35,7 @@ fn message_count(conn: &Arc<Mutex<rusqlite::Connection>>) -> usize {
 /// respective events through a single `LoggingServer` Layer.
 #[test]
 fn multi_sink_dispatch_routes_correctly() {
-    let db = test_db();
+    let db = logging_test_db();
     let notifications = NotificationQueueSink::new(Severity::Warn);
     let message_db = MessageDbSink::new(db.clone(), "s1".into());
 
@@ -127,7 +60,7 @@ fn multi_sink_dispatch_routes_correctly() {
         tracing::debug!("verbose trace");
     });
 
-    let msgs = query_messages(&db);
+    let msgs = query_all_messages(&db);
 
     // All 3 events go to the unified message DB.
     assert_eq!(msgs.len(), 3, "expected 3 DB rows, got {}", msgs.len());
@@ -199,7 +132,7 @@ fn notification_dedup_through_layer() {
 /// MCP tool call's correlation ID appears as the LSP request's `parent_id`.
 #[tokio::test]
 async fn lsp_request_scope_chain() -> Result<()> {
-    let db = test_db();
+    let db = logging_test_db();
     let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
     server.activate(vec![message_db]);
@@ -233,7 +166,7 @@ async fn lsp_request_scope_chain() -> Result<()> {
 
     let _def = client.definition(&uri, 0, 4).await?;
 
-    let msgs = query_messages(&db);
+    let msgs = query_all_messages(&db);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/definition")
@@ -267,7 +200,7 @@ async fn lsp_request_scope_chain() -> Result<()> {
 /// `request_id` returns both the request and response rows.
 #[tokio::test]
 async fn pair_merge_still_works() -> Result<()> {
-    let db = test_db();
+    let db = logging_test_db();
     let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
     server.activate(vec![message_db]);
@@ -298,7 +231,7 @@ async fn pair_merge_still_works() -> Result<()> {
     let _def = client.definition(&uri, 0, 4).await?;
 
     // Find the definition request's correlation ID.
-    let msgs = query_messages(&db);
+    let msgs = query_all_messages(&db);
     let def_msgs: Vec<&MsgRow> = msgs
         .iter()
         .filter(|m| m.method == "textDocument/definition")
@@ -335,7 +268,7 @@ async fn pair_merge_still_works() -> Result<()> {
 /// get `type = "internal"`.
 #[test]
 fn unified_sink_type_column_correct() {
-    let db = test_db();
+    let db = logging_test_db();
     let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
 
@@ -353,7 +286,7 @@ fn unified_sink_type_column_correct() {
         tracing::info!("trace event 2");
     });
 
-    let msgs = query_messages(&db);
+    let msgs = query_all_messages(&db);
 
     let protocol_count = msgs
         .iter()
@@ -371,7 +304,7 @@ fn unified_sink_type_column_correct() {
 /// sinks on activation.
 #[test]
 fn bootstrap_buffer_drains_to_all_sinks() {
-    let db = test_db();
+    let db = logging_test_db();
     let notifications = NotificationQueueSink::new(Severity::Warn);
     let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();

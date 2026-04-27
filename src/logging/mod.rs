@@ -650,6 +650,157 @@ impl tracing::field::Visit for FieldVisitor {
     }
 }
 
+/// Shared logging test helpers.
+///
+/// Gated on `feature = "mockls"` so both in-crate unit tests and
+/// integration tests (which compile with `--features mockls`) share a
+/// single schema definition and query helpers.
+#[cfg(feature = "mockls")]
+#[doc(hidden)]
+#[allow(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate,
+    missing_docs,
+    reason = "test-only module, doc lints are noise"
+)]
+pub mod test_support {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::LoggingServer;
+    use super::message_db::MessageDbSink;
+
+    /// Row projection from the `messages` table.
+    pub struct MsgRow {
+        pub r#type: String,
+        pub level: String,
+        pub method: String,
+        pub client: String,
+        pub request_id: Option<i64>,
+        pub parent_id: Option<i64>,
+    }
+
+    /// Create an in-memory DB with `sessions` and `messages` table schema.
+    pub fn logging_test_db() -> Arc<Mutex<rusqlite::Connection>> {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id           TEXT PRIMARY KEY,
+                 pid          INTEGER NOT NULL,
+                 display_name TEXT NOT NULL,
+                 started_at   TEXT NOT NULL
+             );
+             INSERT INTO sessions (id, pid, display_name, started_at)
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
+             CREATE TABLE messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  TEXT NOT NULL,
+                 timestamp   TEXT NOT NULL,
+                 type        TEXT NOT NULL,
+                 level       TEXT NOT NULL DEFAULT 'info',
+                 method      TEXT NOT NULL,
+                 server      TEXT NOT NULL,
+                 client      TEXT NOT NULL,
+                 request_id  INTEGER,
+                 parent_id   INTEGER,
+                 payload     TEXT NOT NULL
+             );",
+        )
+        .expect("create schema");
+        Arc::new(Mutex::new(conn))
+    }
+
+    /// Create a `LoggingServer` with `MessageDbSink` backed by an in-memory
+    /// DB, installed as the thread-local tracing subscriber.
+    pub fn setup_logging() -> (
+        LoggingServer,
+        Arc<Mutex<rusqlite::Connection>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let conn = logging_test_db();
+
+        let logging = LoggingServer::new();
+        let message_db = MessageDbSink::new(conn.clone(), "s1".into());
+        logging.activate(vec![message_db]);
+
+        let subscriber = tracing_subscriber::registry().with(logging.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        (logging, conn, guard)
+    }
+
+    /// Query all messages ordered by id.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "MutexGuard must outlive the prepared statement"
+    )]
+    pub fn query_all_messages(conn: &Arc<Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
+        let c = conn.lock().expect("lock");
+        c.prepare(
+            "SELECT type, level, method, client, request_id, parent_id \
+             FROM messages ORDER BY id",
+        )
+        .expect("prepare")
+        .query_map([], |row| {
+            Ok(MsgRow {
+                r#type: row.get(0)?,
+                level: row.get(1)?,
+                method: row.get(2)?,
+                client: row.get(3)?,
+                request_id: row.get(4)?,
+                parent_id: row.get(5)?,
+            })
+        })
+        .expect("query")
+        .filter_map(std::result::Result::ok)
+        .collect()
+    }
+
+    /// Query protocol messages only (`type IN ('lsp', 'mcp', 'hook')`).
+    pub fn query_protocol_messages(conn: &Arc<Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
+        query_all_messages(conn)
+            .into_iter()
+            .filter(|m| matches!(m.r#type.as_str(), "lsp" | "mcp" | "hook"))
+            .collect()
+    }
+
+    /// Count total rows in the `messages` table.
+    pub fn message_count(conn: &Arc<Mutex<rusqlite::Connection>>) -> i64 {
+        let c = conn.lock().expect("lock");
+        c.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("count messages")
+    }
+
+    /// Spawn mockls with a `LoggingServer` and initialize it.
+    ///
+    /// Callers pass the mockls binary path via `env!("CARGO_BIN_EXE_mockls")`
+    /// (only available in integration test binaries, not library code).
+    pub async fn spawn_initialized_client(
+        bin: &str,
+        logging: LoggingServer,
+        lang: &str,
+    ) -> anyhow::Result<(crate::lsp::LspClient, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+
+        let mut client = crate::lsp::LspClient::spawn(
+            bin,
+            &[lang],
+            lang,
+            lang,
+            logging,
+            None,
+            std::collections::HashMap::new(),
+        )?;
+
+        client.initialize(&[dir.path().to_path_buf()], None).await?;
+        Ok((client, dir))
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

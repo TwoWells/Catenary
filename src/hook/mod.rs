@@ -575,91 +575,11 @@ mod tests {
 
     // ── Logging tests ───────────────────────────────────────────────────
 
-    /// Row from the messages table for test assertions.
-    struct MsgRow {
-        r#type: String,
-        level: String,
-        method: String,
-        client: String,
-        request_id: Option<i64>,
-        parent_id: Option<i64>,
-    }
-
-    /// Set up a `LoggingServer` with `MessageDbSink` backed by an
-    /// in-memory DB, installed as the thread-local tracing subscriber.
-    fn setup_logging() -> (
-        crate::logging::LoggingServer,
-        Arc<std::sync::Mutex<rusqlite::Connection>>,
-        tracing::subscriber::DefaultGuard,
-    ) {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let conn = Arc::new(std::sync::Mutex::new(
-            rusqlite::Connection::open_in_memory().expect("open in-memory db"),
-        ));
-        conn.lock()
-            .expect("lock")
-            .execute_batch(
-                "CREATE TABLE sessions (
-                     id           TEXT PRIMARY KEY,
-                     pid          INTEGER NOT NULL,
-                     display_name TEXT NOT NULL,
-                     started_at   TEXT NOT NULL
-                 );
-                 INSERT INTO sessions (id, pid, display_name, started_at)
-                     VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z');
-                 CREATE TABLE messages (
-                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                     session_id  TEXT NOT NULL,
-                     timestamp   TEXT NOT NULL,
-                     type        TEXT NOT NULL,
-                     level       TEXT NOT NULL DEFAULT 'info',
-                     method      TEXT NOT NULL,
-                     server      TEXT NOT NULL,
-                     client      TEXT NOT NULL,
-                     request_id  INTEGER,
-                     parent_id   INTEGER,
-                     payload     TEXT NOT NULL
-                 );",
-            )
-            .expect("create schema");
-
-        let logging = crate::logging::LoggingServer::new();
-        let message_db = crate::logging::message_db::MessageDbSink::new(conn.clone(), "s1".into());
-        logging.activate(vec![message_db]);
-
-        let subscriber = tracing_subscriber::registry().with(logging.clone());
-        let guard = tracing::subscriber::set_default(subscriber);
-
-        (logging, conn, guard)
-    }
-
-    /// Query all messages from the test DB, ordered by id.
-    fn query_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-        let c = conn.lock().expect("lock");
-        c.prepare(
-            "SELECT type, level, method, client, request_id, parent_id \
-             FROM messages ORDER BY id",
-        )
-        .expect("prepare")
-        .query_map([], |row| {
-            Ok(MsgRow {
-                r#type: row.get(0)?,
-                level: row.get(1)?,
-                method: row.get(2)?,
-                client: row.get(3)?,
-                request_id: row.get(4)?,
-                parent_id: row.get(5)?,
-            })
-        })
-        .expect("query")
-        .filter_map(std::result::Result::ok)
-        .collect()
-    }
+    use crate::logging::test_support::{MsgRow, query_all_messages, setup_logging};
 
     /// Filter to hook protocol rows only.
     fn hook_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
-        query_messages(conn)
+        query_all_messages(conn)
             .into_iter()
             .filter(|m| m.r#type == "hook")
             .collect()
