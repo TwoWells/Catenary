@@ -116,11 +116,19 @@ impl ToolServer for GrepServer {
         parent_id: Option<i64>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
-        let input: GrepInput = serde_json::from_value(params.clone())
+        let mut input: GrepInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         if input.pattern.is_empty() {
             return Err(anyhow!("pattern must be non-empty"));
+        }
+
+        // Explicit hidden targets (e.g. `.gitignore`, `.github/*`) should
+        // match without requiring `include_hidden`.
+        if let Some(ref glob) = input.glob
+            && ResolvedGlob::targets_hidden(glob)
+        {
+            input.include_hidden = true;
         }
 
         // Wait for all servers ready (grep doesn't target a specific file).

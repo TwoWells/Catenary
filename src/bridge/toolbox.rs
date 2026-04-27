@@ -86,6 +86,21 @@ impl ResolvedGlob {
         self.override_root.as_deref()
     }
 
+    /// Returns `true` if the pattern explicitly targets hidden files.
+    ///
+    /// A pattern is "explicit" when any path segment starts with `.`
+    /// (excluding the trivial `.` and `..` navigation components).
+    /// Examples: `.gitignore`, `.github/*.yml`, `.git*`.
+    ///
+    /// When this returns `true`, callers should force `include_hidden`
+    /// so that the directory walker does not skip the targeted entries.
+    #[must_use]
+    pub fn targets_hidden(pattern: &str) -> bool {
+        pattern
+            .split('/')
+            .any(|seg| seg.starts_with('.') && seg != "." && seg != "..")
+    }
+
     /// Extracts the longest directory prefix without glob metacharacters.
     fn base_dir(pattern: &str) -> PathBuf {
         let mut base = PathBuf::new();
@@ -410,6 +425,58 @@ mod tests {
     #[test]
     fn resolved_glob_invalid_pattern() {
         assert!(ResolvedGlob::new("[invalid").is_err());
+    }
+
+    // ── ResolvedGlob::targets_hidden ───────────────────────────────
+
+    #[test]
+    fn targets_hidden_dotfile() {
+        assert!(ResolvedGlob::targets_hidden(".gitignore"));
+    }
+
+    #[test]
+    fn targets_hidden_dotdir_glob() {
+        assert!(ResolvedGlob::targets_hidden(".github/*.yml"));
+    }
+
+    #[test]
+    fn targets_hidden_dot_prefix_glob() {
+        assert!(ResolvedGlob::targets_hidden(".git*"));
+    }
+
+    #[test]
+    fn targets_hidden_nested_dotdir() {
+        assert!(ResolvedGlob::targets_hidden("src/.hidden/foo.rs"));
+    }
+
+    #[test]
+    fn targets_hidden_dotfile_toml() {
+        assert!(ResolvedGlob::targets_hidden(".catenary.toml"));
+    }
+
+    #[test]
+    fn targets_hidden_broad_doublestar() {
+        assert!(!ResolvedGlob::targets_hidden("**/*.rs"));
+    }
+
+    #[test]
+    fn targets_hidden_broad_src() {
+        assert!(!ResolvedGlob::targets_hidden("src/**/*"));
+    }
+
+    #[test]
+    fn targets_hidden_broad_star() {
+        assert!(!ResolvedGlob::targets_hidden("**/*"));
+    }
+
+    #[test]
+    fn targets_hidden_dotdot_is_not_hidden() {
+        assert!(!ResolvedGlob::targets_hidden("../src/*.rs"));
+    }
+
+    #[test]
+    fn targets_hidden_single_dot_is_not_hidden() {
+        assert!(!ResolvedGlob::targets_hidden("./src/*.rs"));
     }
 
     // ── ResolvedGlob::is_match ────────────────────────────────────

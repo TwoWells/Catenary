@@ -377,6 +377,92 @@ fn test_glob_include_hidden() -> Result<()> {
     Ok(())
 }
 
+/// Grep with `glob=.gitignore` should find matches in `.gitignore`
+/// without requiring `include_hidden`. This is the motivating case
+/// for ticket misc/45.
+#[test]
+fn test_grep_explicit_hidden_glob_matches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(".gitignore"), "target/\nbuild/\n")?;
+    std::fs::write(dir.path().join("README.md"), "hello")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({ "pattern": "target", "glob": ".gitignore" }),
+    )?;
+    assert!(
+        text.contains("target"),
+        "grep glob=.gitignore should find 'target' without include_hidden: {text}"
+    );
+    Ok(())
+}
+
+/// Grep with a broad glob should still exclude hidden files by default.
+#[test]
+fn test_grep_broad_glob_excludes_hidden() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(".secret"), "password123\n")?;
+    std::fs::write(dir.path().join("visible.txt"), "password123\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text =
+        bridge.call_tool_text("grep", &json!({ "pattern": "password123", "glob": "**/*" }))?;
+    assert!(
+        text.contains("visible.txt"),
+        "Broad glob should find visible files: {text}"
+    );
+    assert!(
+        !text.contains(".secret"),
+        "Broad glob should not match hidden files without include_hidden: {text}"
+    );
+    Ok(())
+}
+
+/// Glob with an explicit hidden pattern (`.gitignore`) should match
+/// without `include_hidden`.
+#[test]
+fn test_glob_explicit_hidden_matches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(".gitignore"), "target/\n")?;
+    std::fs::write(dir.path().join("README.md"), "hello")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": ".gitignore" }))?;
+    assert!(
+        text.contains(".gitignore"),
+        "Explicit .gitignore glob should match without include_hidden: {text}"
+    );
+    Ok(())
+}
+
+/// Glob with an explicit hidden directory pattern (`.github/*`) should
+/// match without `include_hidden`.
+#[test]
+fn test_glob_explicit_hidden_dir_matches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gh = dir.path().join(".github");
+    std::fs::create_dir(&gh)?;
+    std::fs::write(gh.join("ci.yml"), "name: CI\n")?;
+    std::fs::write(dir.path().join("README.md"), "hello")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text("glob", &json!({ "pattern": ".github/*.yml" }))?;
+    assert!(
+        text.contains("ci.yml"),
+        "Explicit .github/*.yml glob should match without include_hidden: {text}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_glob_include_gitignored() -> Result<()> {
     let dir = tempfile::tempdir()?;

@@ -573,11 +573,19 @@ impl ToolServer for GlobServer {
         _parent_id: Option<i64>,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
-        let input: GlobInput = serde_json::from_value(params.clone())
+        let mut input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         let pattern = expand_tilde(&input.pattern);
         let path = resolve_path(&pattern)?;
+
+        // Explicit hidden targets (e.g. `.gitignore`, `.github/*`) should
+        // match without requiring `include_hidden`. Only applies to glob
+        // patterns — resolved file/directory paths go through different
+        // branches that don't need the override.
+        if !path.exists() && ResolvedGlob::targets_hidden(&pattern) {
+            input.include_hidden = true;
+        }
 
         tracing::debug!("glob: {pattern}");
 
