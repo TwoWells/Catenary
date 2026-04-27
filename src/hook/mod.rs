@@ -176,17 +176,10 @@ pub(crate) enum HookRequest {
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HookResult {
-    /// Diagnostic content for the model (may be `[clean]`, `[no language server]`,
-    /// `[diagnostics unavailable]`, or formatted diagnostic lines).
-    Content(String),
-    /// Internal error for the user (path resolution, LSP client failures, etc.).
-    Error(String),
     /// Deny with reason (pre-tool enforcement).
     Deny(String),
     /// Block with reason (post-agent enforcement).
     Block(String),
-    /// Diagnostic content with courtesy notice (another agent is editing).
-    Courtesy(String),
     /// Cleared editing state entries.
     Cleared(usize),
 }
@@ -443,30 +436,6 @@ mod tests {
     // ── Serialization tests ─────────────────────────────────────────────
 
     #[test]
-    fn hook_result_content_round_trip() {
-        let original = HookResult::Content("[clean]".into());
-        let json = serde_json::to_string(&original).expect("serialize");
-        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed, original);
-
-        let raw: serde_json::Value = serde_json::from_str(&json).expect("parse as value");
-        assert_eq!(raw["content"], "[clean]");
-        assert!(raw.get("error").is_none());
-    }
-
-    #[test]
-    fn hook_result_error_round_trip() {
-        let original = HookResult::Error("path resolution failed".into());
-        let json = serde_json::to_string(&original).expect("serialize");
-        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed, original);
-
-        let raw: serde_json::Value = serde_json::from_str(&json).expect("parse as value");
-        assert_eq!(raw["error"], "path resolution failed");
-        assert!(raw.get("content").is_none());
-    }
-
-    #[test]
     fn hook_result_deny_round_trip() {
         let original = HookResult::Deny("call start_editing first".into());
         let json = serde_json::to_string(&original).expect("serialize");
@@ -477,14 +446,6 @@ mod tests {
     #[test]
     fn hook_result_block_round_trip() {
         let original = HookResult::Block("call done_editing first".into());
-        let json = serde_json::to_string(&original).expect("serialize");
-        let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn hook_result_courtesy_round_trip() {
-        let original = HookResult::Courtesy("[clean]".into());
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: HookResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
@@ -779,12 +740,15 @@ mod tests {
     #[test]
     fn envelope_result_only() {
         let env = HookResponseEnvelope {
-            result: Some(HookResult::Content("[clean]".into())),
+            result: Some(HookResult::Deny("call start_editing first".into())),
             system_message: None,
         };
         let json = serde_json::to_string(&env).expect("serialize");
         let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.result, Some(HookResult::Content("[clean]".into())));
+        assert_eq!(
+            parsed.result,
+            Some(HookResult::Deny("call start_editing first".into()))
+        );
         assert!(parsed.system_message.is_none());
         // system_message should be absent from JSON (skip_serializing_if)
         let raw: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -888,9 +852,9 @@ mod tests {
     }
 
     #[test]
-    fn hook_diagnostics_content_emits_at_info() {
+    fn hook_diagnostics_result_emits_at_info() {
         let env = HookResponseEnvelope {
-            result: Some(HookResult::Content("error[E0308]: ...".into())),
+            result: Some(HookResult::Cleared(1)),
             system_message: None,
         };
         let level = HookServer::hook_outcome_level("post-tool/diagnostics", &env);
@@ -909,7 +873,7 @@ mod tests {
     fn hook_roots_sync_always_debug() {
         // Even with a result, roots-sync is always debug
         let env = HookResponseEnvelope {
-            result: Some(HookResult::Content("synced".into())),
+            result: Some(HookResult::Cleared(0)),
             system_message: None,
         };
         let level = HookServer::hook_outcome_level("pre-agent/roots-sync", &env);

@@ -402,59 +402,9 @@ pub fn run_post_tool(format: HostFormat) {
         request["session_id"] = serde_json::json!(sid);
     }
 
-    let lines = ipc_exchange(stream, &request);
-    format_post_tool_response(&lines, &file_path, format);
-}
-
-/// Format and print the IPC response from `post-tool/diagnostics`.
-fn format_post_tool_response(lines: &[String], file_path: &str, format: HostFormat) {
-    let Some(line) = lines.first() else {
-        return; // Empty response = suppress (self-editing)
-    };
-
-    let filename = std::path::Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(file_path);
-
-    // Parse as envelope (new format) or fall back to bare HookResult
-    // for compatibility during the migration window.
-    let result = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-        .ok()
-        .and_then(|env| env.result)
-        .or_else(|| serde_json::from_str::<crate::hook::HookResult>(line).ok());
-
-    let Some(result) = result else {
-        print!(
-            "{}",
-            format_diagnostics(&format!("{filename}\n\t{line}"), format, "PostToolUse")
-        );
-        return;
-    };
-
-    match result {
-        crate::hook::HookResult::Content(content) => {
-            print!(
-                "{}",
-                format_diagnostics(&format!("{filename}\n\t{content}"), format, "PostToolUse")
-            );
-        }
-        crate::hook::HookResult::Courtesy(content) => {
-            let courtesy = "\n\t[diagnostics for this file are being deferred by another agent]";
-            print!(
-                "{}",
-                format_diagnostics(
-                    &format!("{filename}\n\t{content}{courtesy}"),
-                    format,
-                    "PostToolUse"
-                )
-            );
-        }
-        crate::hook::HookResult::Error(msg) => {
-            print!("{}", notify_error(&msg, format));
-        }
-        _ => {} // unexpected variant for this hook
-    }
+    // Response is unused — the server only accumulates file paths
+    // during editing mode. Diagnostics are returned by `done_editing`.
+    let _ = ipc_exchange(stream, &request);
 }
 
 /// Refresh workspace roots (`UserPromptSubmit` / `BeforeAgent` hook handler).
@@ -606,32 +556,6 @@ fn check_shell_command(cmd: &str, format: HostFormat) -> Option<String> {
 
 // ── Formatting helpers ──────────────────────────────────────────────────
 
-/// Format diagnostic content for the model via `additionalContext`.
-///
-/// Both formats wrap content in a `hookSpecificOutput` JSON envelope
-/// so the host CLI can inject it into the model's context:
-///
-/// - Claude: includes `hookEventName` + `additionalContext` (required by
-///   the Claude Code hook contract).
-/// - Gemini: uses `additionalContext` only (no `hookEventName`).
-fn format_diagnostics(content: &str, format: HostFormat, hook_event: &str) -> String {
-    match format {
-        HostFormat::Gemini => serde_json::json!({
-            "hookSpecificOutput": {
-                "additionalContext": content
-            }
-        })
-        .to_string(),
-        HostFormat::Claude => serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": hook_event,
-                "additionalContext": content
-            }
-        })
-        .to_string(),
-    }
-}
-
 /// GitHub issues URL for user-facing bug report suggestions.
 const BUG_REPORT_URL: &str = "https://github.com/TwoWells/Catenary/issues";
 
@@ -672,70 +596,9 @@ fn format_error(message: &str, format: HostFormat) -> String {
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-#[allow(
-    clippy::similar_names,
-    reason = "content/context are distinct concepts in hook output tests"
-)]
 mod tests {
     use super::*;
     use anyhow::{Context, Result};
-
-    #[test]
-    fn test_format_diagnostics_claude() -> Result<()> {
-        let content = "error[E0308]: mismatched types\n  --> src/main.rs:5:10";
-        let output = format_diagnostics(content, HostFormat::Claude, "PostToolUse");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("claude format should produce valid JSON")?;
-
-        let hook_output = &parsed["hookSpecificOutput"];
-        assert_eq!(hook_output["hookEventName"], "PostToolUse");
-        let context = hook_output["additionalContext"]
-            .as_str()
-            .expect("additionalContext should be a string");
-        assert!(context.contains("error[E0308]: mismatched types"));
-        assert!(context.contains("  --> src/main.rs:5:10"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_diagnostics_gemini() -> Result<()> {
-        let content = "error[E0308]: mismatched types";
-        let output = format_diagnostics(content, HostFormat::Gemini, "PostToolUse");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("gemini format should produce valid JSON")?;
-
-        let context = parsed["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("additionalContext should be a string");
-        assert_eq!(context, content);
-        // Gemini format should NOT have hookEventName
-        assert!(parsed["hookSpecificOutput"]["hookEventName"].is_null());
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_diagnostics_gemini_multiline() -> Result<()> {
-        let content = "warning: unused variable\n  --> lib.rs:3:9";
-        let output = format_diagnostics(content, HostFormat::Gemini, "PostToolUse");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-        let context = parsed["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("additionalContext should be a string");
-        assert!(context.contains("warning: unused variable\n  --> lib.rs:3:9"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_diagnostics_claude_propagates_hook_event() -> Result<()> {
-        let content = "Added roots: /tmp/foo";
-        let output = format_diagnostics(content, HostFormat::Claude, "PreToolUse");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-
-        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-        Ok(())
-    }
 
     #[test]
     fn test_format_error_claude() -> Result<()> {
