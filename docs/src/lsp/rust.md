@@ -25,22 +25,26 @@ rustup component add rust-analyzer
 Add to `~/.config/catenary/config.toml`:
 
 ```toml
-[server.rust]
-command = "rust-analyzer"
+[server.rust-analyzer]
+command = "rustup"
+args = ["run", "stable", "rust-analyzer"]
 
-[server.rust.initialization_options]
+[server.rust-analyzer.initialization_options]
 check.command = "clippy"
 cargo.features = "all"
 diagnostics.disabled = ["inactive-code"]
 
 [language.rust]
-servers = ["rust"]
+servers = ["rust-analyzer"]
 ```
 
 ## Notes
 
 - rust-analyzer is the official Rust language server
 - Installing via rustup ensures it stays in sync with your Rust toolchain
+- Using `rustup run stable` avoids conflicts with project-level
+  `rust-toolchain.toml` files, which can pin a toolchain that doesn't
+  have rust-analyzer installed
 - First run on a project may take time to index (watch for "Indexing" status)
 
 ## Links

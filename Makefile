@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny mdbook rustdoc test test-ignored test-scripts release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check deny mdbook rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -48,10 +48,6 @@ rustdoc:
 # Run cargo-deny license and advisory checks
 deny:
 	@cargo deny --log-level error check
-
-# Run Python script tests
-test-scripts:
-	@python3 -m pytest scripts/test_constrained_bash.py -v 2>/dev/null || python3 scripts/test_constrained_bash.py
 
 # Run tests. Pass T= to filter, N= to repeat, e.g.: make test T=json_diagnostics N=5
 # Prefix with ! to exclude: make test T=\!flaky_test
