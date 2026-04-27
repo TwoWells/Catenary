@@ -234,6 +234,11 @@ impl Default for TuiConfig {
     }
 }
 
+/// Default diagnostics per page per file per server.
+const fn default_diagnostics_per_page() -> usize {
+    50
+}
+
 /// Per-tool configuration.
 ///
 /// Configures output budgets and tool-specific options. Each tool has its
@@ -247,13 +252,29 @@ impl Default for TuiConfig {
 /// budget = 2000
 /// outline_threshold = 200
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     /// Grep tool configuration.
     pub grep: GrepConfig,
     /// Glob tool configuration.
     pub glob: GlobConfig,
+    /// Diagnostics per page per file per server. When a file produces
+    /// more than this many diagnostics, higher-severity items are shown
+    /// first and a truncation summary is appended. Subsequent pages
+    /// are available via `done_editing { "page": N }`. Default: 50.
+    #[serde(default = "default_diagnostics_per_page")]
+    pub diagnostics_per_page: usize,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            grep: GrepConfig::default(),
+            glob: GlobConfig::default(),
+            diagnostics_per_page: default_diagnostics_per_page(),
+        }
+    }
 }
 
 impl ToolsConfig {
@@ -274,6 +295,10 @@ impl ToolsConfig {
                 "glob budget below minimum, clamping to 1000",
             );
             self.glob.budget = 1000;
+        }
+        if self.diagnostics_per_page == 0 {
+            tracing::warn!(min = 1, "diagnostics_per_page cannot be 0, clamping to 1",);
+            self.diagnostics_per_page = 1;
         }
     }
 }

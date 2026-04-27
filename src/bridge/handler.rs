@@ -200,12 +200,18 @@ impl ToolHandler for McpRouter {
                      While editing, Edit, Read, grep, and glob remain available. All other \
                      tools are blocked until done_editing returns.\n\n\
                      Output lists every modified file as diagnostics (errors/warnings), \
-                     clean, or N/A (no language server coverage)."
+                     clean, or N/A (no language server coverage). When truncated, a \
+                     [cursor: ...] token appears — pass it back to see the next page."
                         .to_string(),
                 ),
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "cursor": {
+                            "type": "string",
+                            "description": "Continuation token from a previous truncated result.",
+                        }
+                    },
                 }),
                 annotations: Some(serde_json::json!({
                     "readOnlyHint": true,
@@ -229,12 +235,30 @@ impl ToolHandler for McpRouter {
         // diagnostics (done_editing). The hooks own the state transitions
         // because they have the real agent_id from the host CLI.
         if name == "start_editing" {
+            self.toolbox.diagnostics.clear_cache();
             return Ok(CallToolResult::text(
                 "editing mode \u{2014} diagnostics deferred until done_editing",
             ));
         }
 
         if name == "done_editing" {
+            let cursor = arguments
+                .as_ref()
+                .and_then(|a| a.get("cursor"))
+                .and_then(serde_json::Value::as_str);
+
+            if let Some(token) = cursor {
+                // Serve from cache — no editing state change, no LSP.
+                let output = self
+                    .toolbox
+                    .diagnostics
+                    .get_cursor(token)
+                    .unwrap_or_else(|| {
+                        "invalid or expired cursor \u{2014} run done_editing first".into()
+                    });
+                return Ok(CallToolResult::text(output));
+            }
+
             let files = self.toolbox.editing.drain_all_and_clear();
             let entry_id = parent_id.unwrap_or(0);
             let output = self.toolbox.runtime.block_on(

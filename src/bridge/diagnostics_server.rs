@@ -24,10 +24,24 @@ use tracing::{debug, warn};
 
 /// Per-server diagnostics result from [`DiagnosticsServer::run_server_batch`].
 struct ServerDiagnostics {
-    /// Formatted diagnostic output for this server (empty if clean).
-    formatted: String,
-    /// Number of diagnostics from this server.
-    count: usize,
+    /// Formatted diagnostic entries (one per diagnostic, position order).
+    entries: Vec<String>,
+}
+
+/// Cached diagnostics for paging beyond page 1.
+struct DiagnosticsCache {
+    per_page: usize,
+    files: BTreeMap<String, CachedFile>,
+    clean: Vec<String>,
+    uncovered: Vec<String>,
+}
+
+/// Per-file cached entries for paging.
+struct CachedFile {
+    display: String,
+    /// All formatted entries, combined across all servers in
+    /// server-name order.
+    entries: Vec<String>,
 }
 
 /// Handles `PostToolUse` hook requests: file-change notification with LSP
@@ -36,6 +50,8 @@ pub struct DiagnosticsServer {
     client_manager: Arc<LspClientManager>,
     path_validator: Arc<RwLock<PathValidator>>,
     fs: Arc<FilesystemManager>,
+    /// Cached full diagnostics from the last batch run, for paging.
+    cache: std::sync::Mutex<Option<DiagnosticsCache>>,
 }
 
 impl DiagnosticsServer {
@@ -49,6 +65,7 @@ impl DiagnosticsServer {
             client_manager,
             path_validator,
             fs,
+            cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -72,8 +89,6 @@ impl DiagnosticsServer {
         reason = "Server grouping map is local and self-documenting"
     )]
     pub async fn process_files_batched(&self, files: &[PathBuf], entry_id: i64) -> String {
-        use std::fmt::Write;
-
         if files.is_empty() {
             return "[clean]\n".to_string();
         }
@@ -135,24 +150,34 @@ impl DiagnosticsServer {
                 .await;
         }
 
-        // ── Phase 3: format output ────────────────────────────────
-        let mut diagnostics_output = String::new();
+        // ── Phase 3: build cache and format page 1 ──────────────
+        let per_page = {
+            let config = self.client_manager.config();
+            config.tools.as_ref().map_or(50, |t| t.diagnostics_per_page)
+        };
+
+        let mut cached_files: BTreeMap<String, CachedFile> = BTreeMap::new();
         let mut clean: Vec<String> = Vec::new();
 
-        for (display, segments) in file_results.values() {
-            let total_count: usize = segments.iter().map(|s| s.count).sum();
-            if total_count == 0 {
+        for (key, (display, segments)) in &file_results {
+            let has_any = segments.iter().any(|s| !s.entries.is_empty());
+            if !has_any {
                 clean.push(display.clone());
-            } else {
-                _ = writeln!(diagnostics_output, "{display}:");
-                for seg in segments {
-                    if !seg.formatted.is_empty() {
-                        for line in seg.formatted.lines() {
-                            _ = writeln!(diagnostics_output, "\t{line}");
-                        }
-                    }
-                }
+                continue;
             }
+
+            let mut all_entries: Vec<String> = Vec::new();
+            for seg in segments {
+                all_entries.extend(seg.entries.iter().cloned());
+            }
+
+            cached_files.insert(
+                key.clone(),
+                CachedFile {
+                    display: display.clone(),
+                    entries: all_entries,
+                },
+            );
         }
 
         // Files that were validated but had no server results (all
@@ -164,15 +189,18 @@ impl DiagnosticsServer {
             }
         }
 
-        let mut output = String::new();
-        if !diagnostics_output.is_empty() {
-            output.push_str(&diagnostics_output);
-        }
-        if !clean.is_empty() {
-            _ = writeln!(output, "{}: clean", clean.join(", "));
-        }
-        if !uncovered.is_empty() {
-            _ = writeln!(output, "{}: N/A", uncovered.join(", "));
+        let cache = DiagnosticsCache {
+            per_page,
+            files: cached_files,
+            clean: clean.clone(),
+            uncovered: uncovered.clone(),
+        };
+
+        let output = format_page(&cache, 1);
+
+        // Store cache for subsequent pages.
+        if let Ok(mut guard) = self.cache.lock() {
+            *guard = Some(cache);
         }
 
         // ── Phase 4: mark_current ─────────────────────────────────
@@ -346,13 +374,9 @@ impl DiagnosticsServer {
                 }
             };
 
-            let fixes = if !diagnostics.is_empty() && has_code_actions {
-                collect_quick_fixes(&client, uri, &diagnostics).await
-            } else {
-                Vec::new()
-            };
-
-            // Apply per-server min_severity filter
+            // Apply per-server min_severity filter before quick-fix
+            // collection so we don't waste code-action requests on
+            // diagnostics that will be dropped.
             let min_severity = {
                 let config = self.client_manager.config();
                 config
@@ -362,42 +386,34 @@ impl DiagnosticsServer {
                     .and_then(crate::filter::parse_severity)
             };
 
-            let (diagnostics, fixes) = if let Some(threshold) = min_severity {
-                let mut filtered_diags = Vec::new();
-                let mut filtered_fixes = Vec::new();
-                for (diag, fix) in diagnostics
+            let diagnostics = if let Some(threshold) = min_severity {
+                diagnostics
                     .into_iter()
-                    .zip(fixes.into_iter().chain(std::iter::repeat_with(Vec::new)))
-                {
-                    if let Some(sev) = crate::lsp::extract::diagnostic_severity(&diag) {
-                        if crate::filter::severity_passes(sev, threshold) {
-                            filtered_diags.push(diag);
-                            filtered_fixes.push(fix);
-                        }
-                    } else {
-                        filtered_diags.push(diag);
-                        filtered_fixes.push(fix);
-                    }
-                }
-                (filtered_diags, filtered_fixes)
+                    .filter(|d| {
+                        crate::lsp::extract::diagnostic_severity(d)
+                            .is_none_or(|sev| crate::filter::severity_passes(sev, threshold))
+                    })
+                    .collect()
             } else {
-                (diagnostics, fixes)
+                diagnostics
+            };
+
+            let fixes = if !diagnostics.is_empty() && has_code_actions {
+                collect_quick_fixes(&client, uri, &diagnostics).await
+            } else {
+                Vec::new()
             };
 
             let filter = crate::filter::get_filter(&server_command);
-            let count = diagnostics.len();
-            let formatted = if diagnostics.is_empty() {
-                String::new()
-            } else {
-                format_diagnostics_compact(
-                    &diagnostics,
-                    &fixes,
-                    filter,
-                    &server_command,
-                    server_version.as_deref(),
-                    &lang_id,
-                )
-            };
+
+            let entries = format_diagnostics_entries(
+                &diagnostics,
+                &fixes,
+                filter,
+                &server_command,
+                server_version.as_deref(),
+                &lang_id,
+            );
 
             let key = path.to_string_lossy().to_string();
             let display = self.display_rel(&key);
@@ -405,7 +421,7 @@ impl DiagnosticsServer {
                 .entry(key)
                 .or_insert_with(|| (display, Vec::new()))
                 .1
-                .push(ServerDiagnostics { formatted, count });
+                .push(ServerDiagnostics { entries });
         }
 
         // ── Close all ──────────────────────────────────────────────
@@ -438,6 +454,33 @@ impl DiagnosticsServer {
                 )
             },
         )
+    }
+
+    /// Returns a formatted page of cached diagnostics.
+    ///
+    /// Page 1 is produced by [`Self::process_files_batched`]. Pages 2+
+    /// are served from the cache built during that call. Returns `None`
+    /// if the cache is empty (no prior `done_editing` call).
+    /// Serves a page of cached diagnostics identified by an opaque cursor.
+    ///
+    /// Returns `None` if the cursor is invalid or the cache is empty.
+    pub fn get_cursor(&self, token: &str) -> Option<String> {
+        let page = decode_cursor(token)?;
+        let guard = self.cache.lock().ok()?;
+        let cache = guard.as_ref()?;
+        let result = format_page(cache, page);
+        drop(guard);
+        Some(result)
+    }
+
+    /// Clears the diagnostics page cache.
+    ///
+    /// Called on `start_editing` so that stale pages from a previous
+    /// batch cannot be served during the new editing session.
+    pub fn clear_cache(&self) {
+        if let Ok(mut guard) = self.cache.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -513,22 +556,24 @@ async fn collect_quick_fixes(
     futures::future::join_all(futures).await
 }
 
-/// Formats diagnostics with line/column, severity, and optional quick-fix titles.
+/// Formats diagnostics as individual entry strings.
+///
+/// Each entry contains the line/column, severity, message, and optional
+/// quick-fix titles. Returns one string per diagnostic (may span multiple
+/// lines when fixes are present). Diagnostics whose noise-filtered message
+/// is empty are dropped.
 ///
 /// `fixes` is parallel to `diagnostics` — each entry contains the titles of
 /// quick-fix code actions for that diagnostic. Pass an empty slice when no
 /// fixes were collected.
-///
-/// Messages are passed through the provided [`crate::filter::DiagnosticFilter`] for noise
-/// stripping. Diagnostics whose filtered message is empty are dropped.
-pub(crate) fn format_diagnostics_compact(
+pub(crate) fn format_diagnostics_entries(
     diagnostics: &[Value],
     fixes: &[Vec<String>],
     filter: &dyn crate::filter::DiagnosticFilter,
     server_command: &str,
     server_version: Option<&str>,
     language_id: &str,
-) -> String {
+) -> Vec<String> {
     diagnostics
         .iter()
         .enumerate()
@@ -572,21 +617,198 @@ pub(crate) fn format_diagnostics_compact(
             }
 
             let mut result = if code.is_empty() {
-                format!("\t:{line}:{col} [{severity}] {source_str}: {message}")
+                format!(":{line}:{col} [{severity}] {source_str}: {message}")
             } else {
-                format!("\t:{line}:{col} [{severity}] {source_str}({code}): {message}")
+                format!(":{line}:{col} [{severity}] {source_str}({code}): {message}")
             };
 
             // Append indented fix lines
             if let Some(fix_titles) = fixes.get(i) {
                 for title in fix_titles {
                     use std::fmt::Write;
-                    let _ = write!(result, "\n\t\tfix: {title}");
+                    let _ = write!(result, "\n\tfix: {title}");
                 }
             }
 
             Some(result)
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
+}
+
+// ─── Cursor-based paging ──────────────────────────────────────────────
+
+/// Encodes an opaque cursor token from a 1-based page number.
+fn encode_cursor(page: usize) -> String {
+    format!("d{page}")
+}
+
+/// Decodes an opaque cursor token to a 1-based page number.
+fn decode_cursor(token: &str) -> Option<usize> {
+    token.strip_prefix('d')?.parse().ok()
+}
+
+/// Formats a page of diagnostics from the cache.
+///
+/// Appends `[cursor: ...]` at the end when more entries remain,
+/// matching the pattern used by Catenary's grep and glob tools.
+fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
+    use std::fmt::Write;
+
+    let per_page = cache.per_page;
+    let start = (page - 1) * per_page;
+    let mut diagnostics_output = String::new();
+    let mut clean_files: Vec<String> = Vec::new();
+    let mut has_more = false;
+
+    for cached in cache.files.values() {
+        let end = cached.entries.len().min(start + per_page);
+        if start >= cached.entries.len() {
+            continue;
+        }
+        let page_entries = &cached.entries[start..end];
+        if page_entries.is_empty() {
+            clean_files.push(cached.display.clone());
+            continue;
+        }
+
+        _ = writeln!(diagnostics_output, "{}:", cached.display);
+        for entry in page_entries {
+            for line in entry.lines() {
+                _ = writeln!(diagnostics_output, "\t{line}");
+            }
+        }
+
+        let remaining = cached.entries.len() - end;
+        if remaining > 0 {
+            has_more = true;
+            _ = writeln!(diagnostics_output, "\t... {remaining} more");
+        }
+    }
+
+    if page == 1 {
+        clean_files.extend(cache.clean.iter().cloned());
+    }
+
+    let mut output = String::new();
+    if !diagnostics_output.is_empty() {
+        output.push_str(&diagnostics_output);
+    }
+    if !clean_files.is_empty() {
+        _ = writeln!(output, "{}: clean", clean_files.join(", "));
+    }
+    if page == 1 && !cache.uncovered.is_empty() {
+        _ = writeln!(output, "{}: N/A", cache.uncovered.join(", "));
+    }
+    if has_more {
+        _ = writeln!(output, "[cursor: {}]", encode_cursor(page + 1));
+    }
+
+    if output.is_empty() && page > 1 {
+        output = "no more diagnostics\n".to_string();
+    }
+
+    output
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use super::*;
+
+    // ── cursor encode/decode tests ──────────────────────────────
+
+    #[test]
+    fn cursor_round_trip() {
+        assert_eq!(decode_cursor(&encode_cursor(2)), Some(2));
+        assert_eq!(decode_cursor(&encode_cursor(100)), Some(100));
+    }
+
+    #[test]
+    fn cursor_decode_invalid() {
+        assert_eq!(decode_cursor(""), None);
+        assert_eq!(decode_cursor("g5"), None); // glob cursor, not diag
+        assert_eq!(decode_cursor("abc"), None);
+    }
+
+    // ── format_page tests ─────────────────────────────────────────
+
+    fn make_cache(entries: Vec<String>, per_page: usize) -> DiagnosticsCache {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "/test/file.rs".to_string(),
+            CachedFile {
+                display: "file.rs".to_string(),
+                entries,
+            },
+        );
+        DiagnosticsCache {
+            per_page,
+            files,
+            clean: Vec::new(),
+            uncovered: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn format_page_single_page_no_cursor() {
+        let entries = vec![":1:1 [error] test: msg".to_string()];
+        let cache = make_cache(entries, 50);
+        let output = format_page(&cache, 1);
+        assert!(output.contains("file.rs:"), "output: {output}");
+        assert!(output.contains(":1:1 [error]"), "output: {output}");
+        assert!(!output.contains("[cursor:"), "output: {output}");
+    }
+
+    #[test]
+    fn format_page_truncation_emits_cursor() {
+        let entries: Vec<String> = (0..5)
+            .map(|i| format!(":{i}:1 [warning] test: msg {i}"))
+            .collect();
+        let cache = make_cache(entries, 3);
+        let output = format_page(&cache, 1);
+        assert!(output.contains("2 more"), "output: {output}");
+        assert!(output.contains("[cursor: d2]"), "output: {output}");
+        assert!(!output.contains("msg 3"), "output: {output}");
+    }
+
+    #[test]
+    fn format_page_second_page_no_cursor() {
+        let entries: Vec<String> = (0..5)
+            .map(|i| format!(":{i}:1 [warning] test: msg {i}"))
+            .collect();
+        let cache = make_cache(entries, 3);
+        let output = format_page(&cache, 2);
+        assert!(output.contains("msg 3"), "output: {output}");
+        assert!(output.contains("msg 4"), "output: {output}");
+        assert!(!output.contains("msg 0"), "output: {output}");
+        assert!(!output.contains("[cursor:"), "output: {output}");
+    }
+
+    #[test]
+    fn format_page_beyond_last() {
+        let entries = vec![":1:1 [error] test: msg".to_string()];
+        let cache = make_cache(entries, 50);
+        let output = format_page(&cache, 2);
+        assert_eq!(output, "no more diagnostics\n");
+    }
+
+    #[test]
+    fn format_page_clean_and_uncovered_on_page1_only() {
+        let cache = DiagnosticsCache {
+            per_page: 50,
+            files: BTreeMap::new(),
+            clean: vec!["clean.rs".to_string()],
+            uncovered: vec!["other.txt".to_string()],
+        };
+        let page1 = format_page(&cache, 1);
+        assert!(page1.contains("clean.rs: clean"), "page1: {page1}");
+        assert!(page1.contains("other.txt: N/A"), "page1: {page1}");
+
+        let page2 = format_page(&cache, 2);
+        assert!(!page2.contains("clean"), "page2: {page2}");
+        assert!(!page2.contains("N/A"), "page2: {page2}");
+    }
 }
