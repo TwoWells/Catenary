@@ -30,8 +30,8 @@ terminal, it runs as an MCP server. The startup sequence is:
    the IPC socket.
 
 5. **`Toolbox` assembly.** The application container is constructed:
-   - Logging sinks are created (notification queue, protocol DB, trace
-     DB) and `LoggingServer::activate()` is called. This drains the
+   - Logging sinks are created (notification queue, message DB) and
+     `LoggingServer::activate()` is called. This drains the
      bootstrap buffer through the sinks and switches to direct
      dispatch. From this point, all `tracing` events flow to the
      database.

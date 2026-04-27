@@ -42,10 +42,10 @@ all protocol logging:
   dispatches hook requests, returns responses.
 
 **`LoggingServer`** is the telemetry port. It is a `tracing` Layer
-that dispatches events to three sinks: a notification queue (for
-user-facing `systemMessage` delivery), a protocol database (for
-monitor visibility), and a trace database (for debugging). Every
-protocol message flows through it.
+that dispatches events to two sinks: a notification queue (for
+user-facing `systemMessage` delivery) and a message database (for
+monitor visibility, debugging, and TUI broadcast). Every protocol
+message flows through it.
 
 Tool servers (`GrepServer`, `GlobServer`, `DiagnosticsServer`) are the
 transformation layer. They receive application-level parameters, do
@@ -81,8 +81,7 @@ Agent ◄──MCP──► │  McpServer ──► McpRouter ──► ToolSer
 
   LoggingServer (tracing Layer) ─── dispatches all events to sinks:
     ├── NotificationQueueSink  (user-facing systemMessage)
-    ├── ProtocolDbSink         (messages table — monitor visibility)
-    └── TraceDbSink            (traces table — debugging)
+    └── MessageDbSink          (messages table + TUI broadcast)
 ```
 
 ## Shared infrastructure

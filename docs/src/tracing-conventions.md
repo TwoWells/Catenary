@@ -2,8 +2,8 @@
 
 Catenary uses the `tracing` crate for all logging and telemetry.
 `LoggingServer` subscribes to every `tracing` event and dispatches to
-multiple sinks: protocol-message DB, trace DB, user-notification queue,
-and TUI broadcast.
+two sinks: a message DB (protocol messages and internal traces, with
+TUI broadcast) and a user-notification queue.
 
 ## Severity guidelines
 
@@ -59,5 +59,5 @@ applicable so notifications with the same identity collapse.
 Protocol boundary components (`McpServer`, `Connection`/`LspServer`,
 `HookServer`) emit structured `tracing::info!()` events with `kind`,
 `method`, `request_id`, `parent_id`, and `payload` fields. These are
-routed to the protocol DB sink by the `kind` field and do not reach
+routed to the message DB sink by the `kind` field and do not reach
 the notification queue.

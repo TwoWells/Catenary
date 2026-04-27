@@ -56,7 +56,7 @@ sinks like any other.
 
 ### Sinks
 
-Post-activation, three sinks receive every tracing event:
+Post-activation, two sinks receive every tracing event:
 
 - **Notification queue** — severity-filtered (default `warn`),
   deduplicated. Accumulates user-facing notifications between drain
