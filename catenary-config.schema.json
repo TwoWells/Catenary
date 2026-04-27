@@ -3,6 +3,11 @@
   "title": "Catenary Configuration",
   "type": "object",
   "properties": {
+    "enabled": {
+      "type": "boolean",
+      "description": "Whether Catenary is enabled for this workspace. When false in .catenary.toml, the entire session is disabled: no tools, no servers, no hooks, no database writes. Only meaningful in project config (.catenary.toml), ignored in user config.",
+      "default": true
+    },
     "server": {
       "type": "object",
       "description": "Server definitions keyed by language ID (e.g., 'rust', 'python').",

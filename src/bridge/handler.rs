@@ -176,8 +176,11 @@ impl ToolHandler for McpRouter {
             Tool {
                 name: "start_editing".to_string(),
                 title: Some("Catenary: Start Editing".to_string()),
-                description: Some("Enter editing mode. Diagnostics are deferred until done_editing is called. \
-                     Call this before using Edit.".to_string()),
+                description: Some(
+                    "Enter editing mode. Diagnostics are deferred until done_editing is called. \
+                     Call this before using Edit."
+                        .to_string(),
+                ),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -192,11 +195,14 @@ impl ToolHandler for McpRouter {
             Tool {
                 name: "done_editing".to_string(),
                 title: Some("Catenary: Done Editing".to_string()),
-                description: Some("Exit editing mode and return LSP diagnostics for all modified files. \
+                description: Some(
+                    "Exit editing mode and return LSP diagnostics for all modified files. \
                      While editing, Edit, Read, grep, and glob remain available. All other \
                      tools are blocked until done_editing returns.\n\n\
                      Output lists every modified file as diagnostics (errors/warnings), \
-                     clean, or N/A (no language server coverage).".to_string()),
+                     clean, or N/A (no language server coverage)."
+                        .to_string(),
+                ),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},

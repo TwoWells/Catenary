@@ -364,19 +364,34 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
 }
 
 /// Top-level keys allowed in `.catenary.toml` project config files.
-const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["language", "server"];
+const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["enabled", "language", "server"];
 
 /// Per-root project configuration from `.catenary.toml`.
 ///
-/// Contains only `[language.*]` and `[server.*]` sections.
-/// All other sections are user-level only and rejected with
-/// a warning if present.
-#[derive(Debug, Clone, Default)]
+/// Contains `enabled` (session kill switch) plus `[language.*]` and
+/// `[server.*]` sections. All other sections are user-level only and
+/// rejected with a warning if present.
+#[derive(Debug, Clone)]
 pub struct ProjectConfig {
+    /// Whether Catenary is enabled for this workspace (default `true`).
+    ///
+    /// When `false` on the primary root, the entire session is disabled:
+    /// no tools, no servers, no hooks, no database writes.
+    pub enabled: bool,
     /// Language definitions from the project config.
     pub language: HashMap<String, LanguageConfig>,
     /// Server definitions from the project config.
     pub server: HashMap<String, ServerDef>,
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            language: HashMap::new(),
+            server: HashMap::new(),
+        }
+    }
 }
 
 /// Discovers and loads `.catenary.toml` at a workspace root.
@@ -394,6 +409,7 @@ pub struct ProjectConfig {
 /// - The file contains invalid TOML.
 /// - A `[language.*]` entry uses the removed `inherit` field.
 /// - A `[language.*]` entry contains inline server definition fields.
+#[allow(clippy::too_many_lines, reason = "sequential validation steps")]
 pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfig>> {
     let config_path = root.join(".catenary.toml");
     if !config_path.exists() {
@@ -455,6 +471,12 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
+    // Parse the `enabled` flag (default true).
+    let enabled = raw
+        .get("enabled")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+
     // Deserialize only the supported sections.
     let language: HashMap<String, LanguageConfig> = raw
         .get("language")
@@ -507,7 +529,11 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
-    Ok(Some(ProjectConfig { language, server }))
+    Ok(Some(ProjectConfig {
+        enabled,
+        language,
+        server,
+    }))
 }
 
 #[cfg(test)]
@@ -650,6 +676,48 @@ servers = ["pyright"]
         let config = result.expect("should load cleanly");
         assert_eq!(config.language.len(), 1);
         assert_eq!(config.server.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_enabled_true_default() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "\n[language.rust]\nservers = []\n",
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(config.enabled, "enabled should default to true");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_enabled_false() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join(".catenary.toml"), "enabled = false\n")?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(!config.enabled, "enabled should be false");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_enabled_true_explicit() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "enabled = true\n\n[language.rust]\nservers = []\n",
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(config.enabled);
 
         Ok(())
     }

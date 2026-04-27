@@ -138,6 +138,7 @@ impl HookRouter {
     /// Returns a [`DispatchResult`] with the handler's result and an optional
     /// `systemMessage` from the notification queue drain. The queue is drained
     /// only at stationary points (`SessionStart`, `Stop`/`AfterAgent` when allowing).
+    ///
     pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
         match request {
             HookRequest::PreAgentRootsSync {} => {

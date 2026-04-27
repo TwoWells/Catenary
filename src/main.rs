@@ -313,6 +313,20 @@ async fn run_server() -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Check primary root for `enabled = false` in `.catenary.toml`.
+    let disabled = roots
+        .first()
+        .and_then(|r| catenary_mcp::config::load_project_config(r).ok().flatten())
+        .is_some_and(|pc| !pc.enabled);
+
+    if disabled {
+        info!(
+            "Catenary disabled by .catenary.toml (enabled = false) in {}",
+            workspace_display
+        );
+        return run_disabled_server(logging).await;
+    }
+
     // Create session for observability
     let session = Arc::new(std::sync::Mutex::new(Session::create(&workspace_display)?));
     info!("Starting catenary multiplexing bridge");
@@ -451,6 +465,38 @@ async fn run_server() -> Result<()> {
     }
 
     mcp_result
+}
+
+/// Runs a minimal MCP server for disabled sessions.
+///
+/// When `.catenary.toml` has `enabled = false`, Catenary runs as a thin
+/// protocol stub: responds to MCP `initialize` and `tools/list` (empty),
+/// but creates no session, spawns no LSP servers, starts no hook IPC
+/// server, and writes nothing to the database. Hook CLI processes fail
+/// to connect and output nothing, so the host treats all hooks as "allow."
+async fn run_disabled_server(logging: LoggingServer) -> Result<()> {
+    /// Tool handler that exposes no tools.
+    struct DisabledHandler;
+
+    impl catenary_mcp::mcp::ToolHandler for DisabledHandler {
+        fn list_tools(&self) -> Vec<catenary_mcp::mcp::Tool> {
+            Vec::new()
+        }
+
+        fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Option<serde_json::Value>,
+            _parent_id: Option<i64>,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<catenary_mcp::mcp::CallToolResult> {
+            Err(anyhow::anyhow!("Catenary is disabled for this workspace"))
+        }
+    }
+
+    let mut server = McpServer::new(DisabledHandler, logging);
+    let mcp_task = tokio::task::spawn_blocking(move || server.run());
+    mcp_task.await?
 }
 
 #[cfg(test)]

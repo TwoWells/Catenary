@@ -79,6 +79,9 @@ sed = "Use {edit} instead"
 #
 # Project config amends the user config by default. Examples:
 #
+#   # Disable Catenary for this workspace entirely
+#   enabled = false
+#
 #   # Deny additional commands for this project
 #   [commands.deny]
 #   cargo = "Use make instead, suggest a target if needed"

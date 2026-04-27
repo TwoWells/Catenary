@@ -243,12 +243,30 @@ Classification precedence (highest first): shebang > filename > extension.
 ## Project Configuration
 
 Place a `.catenary.toml` in a workspace root to override language and
-server configuration for that root. Only `[language.*]` and `[server.*]`
-sections are allowed — all other sections (`[commands]`, `[notifications]`,
-`[icons]`, etc.) are user-level and belong in `~/.config/catenary/config.toml`.
+server configuration for that root. Supported fields are `enabled`,
+`[language.*]`, and `[server.*]` — all other sections (`[commands]`,
+`[notifications]`, `[icons]`, etc.) are user-level and belong in
+`~/.config/catenary/config.toml`.
 
 Project config is discovered when roots are added (at startup or via
 `/add-dir`). Changes to `.catenary.toml` require restarting the session.
+
+### Disabling Catenary
+
+Set `enabled = false` to turn Catenary off for a workspace:
+
+```toml
+# .catenary.toml
+enabled = false
+```
+
+When the primary workspace root has `enabled = false`, the entire session
+is disabled: no tools appear in `tools/list`, no LSP servers spawn, all
+hooks pass through, and no database rows are written. The MCP process
+still runs (the host starts it) but is invisible to the agent.
+
+This is useful for media collections, documentation repos, data
+directories, or any workspace where LSP is pure overhead.
 
 ### Merge Semantics
 
