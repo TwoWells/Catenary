@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::bridge::HookRouter;
 use crate::bridge::toolbox::Toolbox;
@@ -264,12 +264,12 @@ impl HookServer {
                         let server = server.clone();
                         tokio::spawn(async move {
                             if let Err(e) = server.handle_connection(stream).await {
-                                warn!("Notify connection error: {e}");
+                                debug!("Hook IPC connection error: {e}");
                             }
                         });
                     }
                     Err(e) => {
-                        debug!("Notify socket accept error: {e}");
+                        debug!("Hook IPC accept error: {e}");
                     }
                 }
             }
@@ -324,7 +324,7 @@ impl HookServer {
                 let srv = server_arc.clone();
                 tokio::spawn(async move {
                     if let Err(e) = srv.handle_connection(connected).await {
-                        warn!("Notify connection error: {e}");
+                        debug!("Hook IPC connection error: {e}");
                     }
                 });
             }

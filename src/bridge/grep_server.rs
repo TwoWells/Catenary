@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::filesystem_manager::FilesystemManager;
 use super::handler::display_path;
@@ -451,7 +451,7 @@ impl GrepServer {
     ///
     /// Uses priority chain dispatch: iterates servers that support rename
     /// in binding order, returns on the first definitive answer. Dispatch
-    /// errors are logged via `warn!()` and never surface in the tool result.
+    /// errors are logged via `debug!()` and never surface in the tool result.
     ///
     /// Returns `true` if the position is a symbol (or no capable server
     /// exists), `false` if keyword.
@@ -492,7 +492,7 @@ impl GrepServer {
                 Ok(v) if v.is_null() => return false, // null → keyword
                 Ok(_) => return true,                 // range → symbol
                 Err(e) => {
-                    warn!(source = "lsp.dispatch", "prepare_rename failed: {e}");
+                    debug!(source = "lsp.dispatch", "prepare_rename failed: {e}");
                 }
             }
         }
@@ -694,7 +694,7 @@ impl GrepServer {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(source = "lsp.dispatch", "references failed: {e}");
+                    debug!(source = "lsp.dispatch", "references failed: {e}");
                 }
             }
         }
@@ -766,7 +766,7 @@ impl GrepServer {
                 }
                 Ok(_) => None,
                 Err(e) => {
-                    warn!(
+                    debug!(
                         source = "lsp.dispatch",
                         "prepare_call_hierarchy failed: {e}"
                     );
@@ -846,7 +846,7 @@ impl GrepServer {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(source = "lsp.dispatch", "implementation failed: {e}");
+                    debug!(source = "lsp.dispatch", "implementation failed: {e}");
                 }
             }
         }
@@ -916,7 +916,7 @@ impl GrepServer {
                 }
                 Ok(_) => None,
                 Err(e) => {
-                    warn!(
+                    debug!(
                         source = "lsp.dispatch",
                         "prepare_type_hierarchy failed: {e}"
                     );

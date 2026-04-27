@@ -384,7 +384,11 @@ impl<H: ToolHandler> McpServer<H> {
                 // Notification, no response needed
             }
             Err(e) => {
-                warn!(source = "mcp.dispatch", "Error handling message: {}", e,);
+                warn!(
+                    source = "mcp.dispatch",
+                    method = method,
+                    "MCP {method} failed: {e}"
+                );
                 // Try to send error response if we can parse the id
                 if let Ok(req) = serde_json::from_str::<Request>(line) {
                     let response = Response::error(req.id, INTERNAL_ERROR, e.to_string());

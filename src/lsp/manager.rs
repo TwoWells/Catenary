@@ -269,7 +269,8 @@ impl LspClientManager {
                         warn!(
                             source = "lsp.lifecycle",
                             language = lang,
-                            "Failed to spawn per-root instance for {lang} at {}: {e}",
+                            server = server_name,
+                            "Failed to spawn per-root instance for {lang} ({server_name}) at {}: {e}",
                             root.display(),
                         );
                     }
@@ -285,7 +286,8 @@ impl LspClientManager {
                         warn!(
                             source = "lsp.lifecycle",
                             language = lang,
-                            "Failed to spawn project-scoped instance for {lang} at {}: {e}",
+                            server = server_name,
+                            "Failed to spawn project-scoped instance for {lang} ({server_name}) at {}: {e}",
                             root.display(),
                         );
                     }
@@ -643,7 +645,7 @@ impl LspClientManager {
             }
 
             if result.is_empty() && !lang_config.servers.is_empty() {
-                warn!(
+                info!(
                     source = "lsp.routing",
                     language = lang_id.as_str(),
                     "No server supports the requested capability for {lang_id} files",
@@ -1251,7 +1253,8 @@ impl LspClientManager {
                 warn!(
                     source = "lsp.lifecycle",
                     language = lang.as_str(),
-                    "Failed to spawn LSP server for {lang}: {e}",
+                    server = server_name.as_str(),
+                    "Failed to spawn LSP server for {lang} ({server_name}): {e}",
                 );
             }
         }
@@ -1404,7 +1407,8 @@ impl LspClientManager {
                         warn!(
                             source = "lsp.lifecycle",
                             language = lang.as_str(),
-                            "Failed to spawn instance for {lang} at {}: {e}",
+                            server = server_name.as_str(),
+                            "Failed to spawn instance for {lang} ({server_name}) at {}: {e}",
                             root.display(),
                         );
                     }

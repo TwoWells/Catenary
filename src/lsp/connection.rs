@@ -560,6 +560,19 @@ impl Connection {
                             _ => lsp_category_level(lsp_category(method)),
                         };
                         let notif_id = logging.next_id();
+                        let msg = match method {
+                            "window/logMessage" | "window/showMessage" => {
+                                let text = value
+                                    .get("params")
+                                    .and_then(|p| p.get("message"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("(no message)");
+                                format!("{server_name}: {text}")
+                            }
+                            _ => {
+                                format!("{server_name}: {method}")
+                            }
+                        };
                         emit_lsp_event(
                             notif_level,
                             &server_name,
@@ -567,7 +580,7 @@ impl Connection {
                             notif_id.0,
                             None,
                             &value.to_string(),
-                            "incoming notification",
+                            &msg,
                         );
                         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
                         server.on_notification(method, params);
