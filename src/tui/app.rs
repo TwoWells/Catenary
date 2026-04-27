@@ -39,6 +39,23 @@ pub enum InputMode {
     Visual,
 }
 
+/// Display level threshold for message queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelThreshold {
+    /// Show info, warn, error. Default.
+    Info,
+    /// Show everything including debug.
+    Debug,
+}
+
+impl LevelThreshold {
+    /// Whether to include debug-level messages in queries.
+    #[must_use]
+    pub const fn include_debug(self) -> bool {
+        matches!(self, Self::Debug)
+    }
+}
+
 /// Application state driving the TUI.
 pub struct App<'a> {
     /// Semantic color theme.
@@ -73,6 +90,8 @@ pub struct App<'a> {
     pub grid_layout: Option<PanelLayout>,
     /// Event tails keyed by session ID, for streaming new events into panels.
     pub tails: HashMap<String, Box<dyn MessageTail>>,
+    /// Current display level threshold.
+    pub level_threshold: LevelThreshold,
 }
 
 impl<'a> App<'a> {
@@ -139,6 +158,7 @@ impl<'a> App<'a> {
             grid_area: Rect::default(),
             grid_layout: None,
             tails: HashMap::new(),
+            level_threshold: LevelThreshold::Info,
         })
     }
 }

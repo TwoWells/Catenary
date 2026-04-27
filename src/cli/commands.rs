@@ -149,7 +149,7 @@ pub fn run_monitor(id: &str, raw: bool, nocolor: bool, filter: Option<&str>) -> 
 
     println!("Monitoring session {full_id} (Ctrl+C to stop)\n");
 
-    let mut reader = session::tail_messages_new(&full_id)?;
+    let mut reader = session::tail_messages_new(&full_id, true)?;
 
     // Track last progress key (server, title) for line collapsing.
     let mut last_progress: Option<(String, String)> = None;
@@ -243,7 +243,7 @@ pub fn run_status(id: &str) -> Result<()> {
 
     // Show recent messages
     println!("\nRecent messages:");
-    let messages = session::monitor_messages_with_conn(&conn, &session.id)?;
+    let messages = session::monitor_messages_with_conn(&conn, &session.id, true)?;
     let recent: Vec<_> = messages.iter().rev().take(10).collect();
 
     let colors = ColorConfig::new(false);

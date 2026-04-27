@@ -158,14 +158,15 @@ fn run_with_data_and_watcher(
         .iter()
         .map(|p| p.session_id.clone())
         .collect();
+    let include_debug = app.level_threshold.include_debug();
     for id in &panel_ids {
-        if let Ok(messages) = app.data.monitor_messages(id)
+        if let Ok(messages) = app.data.monitor_messages(id, include_debug)
             && let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == *id)
         {
             panel.load_messages(messages);
             panel.update_language_servers();
         }
-        if let Ok(tail) = app.data.create_message_tail(id) {
+        if let Ok(tail) = app.data.create_message_tail(id, include_debug) {
             app.tails.insert(id.clone(), tail);
         }
     }
@@ -535,16 +536,17 @@ fn check_new_sessions(app: &mut App<'_>) {
     // No override needed — the internal ID is the unique per-panel identifier.
 
     // Auto-open panels for new alive sessions.
+    let include_debug = app.level_threshold.include_debug();
     for id in &alive_ids {
         if app.grid.panel_for_session(id).is_none() {
             let idx = app.grid.open_panel(id.clone());
-            if let Ok(messages) = app.data.monitor_messages(id)
+            if let Ok(messages) = app.data.monitor_messages(id, include_debug)
                 && let Some(panel) = app.grid.panels.get_mut(idx)
             {
                 panel.load_messages(messages);
                 panel.update_language_servers();
             }
-            if let Ok(tail) = app.data.create_message_tail(id) {
+            if let Ok(tail) = app.data.create_message_tail(id, include_debug) {
                 app.tails.insert(id.clone(), tail);
             }
         }

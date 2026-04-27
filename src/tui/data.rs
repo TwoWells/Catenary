@@ -38,17 +38,30 @@ pub trait DataSource {
 
     /// Load all historical messages for a session.
     ///
+    /// When `include_debug` is false, messages with `level = "debug"` are
+    /// excluded from the result set.
+    ///
     /// # Errors
     ///
     /// Returns an error if the session does not exist or messages cannot be read.
-    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
+    fn monitor_messages(
+        &self,
+        session_id: &str,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>>;
 
     /// Create a tail reader for new messages (from current position onward).
+    ///
+    /// When `include_debug` is false, the tail skips debug-level messages.
     ///
     /// # Errors
     ///
     /// Returns an error if the session does not exist or the tail cannot be created.
-    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>>;
+    fn create_message_tail(
+        &self,
+        session_id: &str,
+        include_debug: bool,
+    ) -> Result<Box<dyn MessageTail>>;
 
     /// Delete a dead session's data.
     ///
@@ -213,12 +226,20 @@ impl DataSource for SqliteDataSource {
         Ok(sessions)
     }
 
-    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
-        session::monitor_messages_with_conn(&self.conn, session_id)
+    fn monitor_messages(
+        &self,
+        session_id: &str,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        session::monitor_messages_with_conn(&self.conn, session_id, include_debug)
     }
 
-    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
-        let tail = session::tail_messages_new(session_id)?;
+    fn create_message_tail(
+        &self,
+        session_id: &str,
+        include_debug: bool,
+    ) -> Result<Box<dyn MessageTail>> {
+        let tail = session::tail_messages_new(session_id, include_debug)?;
         Ok(Box::new(tail))
     }
 
@@ -297,20 +318,45 @@ impl DataSource for MockDataSource {
         Ok(rows)
     }
 
-    fn monitor_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
-        self.messages
+    fn monitor_messages(
+        &self,
+        session_id: &str,
+        include_debug: bool,
+    ) -> Result<Vec<SessionMessage>> {
+        let messages = self
+            .messages
             .get(session_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+        if include_debug {
+            Ok(messages)
+        } else {
+            Ok(messages
+                .into_iter()
+                .filter(|m| m.level != "debug")
+                .collect())
+        }
     }
 
-    fn create_message_tail(&self, session_id: &str) -> Result<Box<dyn MessageTail>> {
+    fn create_message_tail(
+        &self,
+        session_id: &str,
+        include_debug: bool,
+    ) -> Result<Box<dyn MessageTail>> {
         let messages = self
             .tail_messages
             .get(session_id)
             .cloned()
             .unwrap_or_default();
-        Ok(Box::new(MockMessageTail { messages }))
+        if include_debug {
+            Ok(Box::new(MockMessageTail { messages }))
+        } else {
+            let filtered = messages
+                .into_iter()
+                .filter(|m| m.level != "debug")
+                .collect();
+            Ok(Box::new(MockMessageTail { messages: filtered }))
+        }
     }
 
     fn delete_session(&self, _session_id: &str) -> Result<()> {
@@ -380,17 +426,7 @@ mod tests {
     }
 
     fn make_message(method: &str) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: "lsp".to_string(),
-            method: method.to_string(),
-            server: "rust-analyzer".to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: Utc::now(),
-            payload: serde_json::Value::Object(serde_json::Map::new()),
-        }
+        crate::session::test_support::message("lsp", method, "rust-analyzer")
     }
 
     // ── Mock tests ──────────────────────────────────────────────────
@@ -440,10 +476,10 @@ mod tests {
             tail_messages: HashMap::new(),
         };
 
-        let result = ds.monitor_messages("abc")?;
+        let result = ds.monitor_messages("abc", true)?;
         assert_eq!(result.len(), 3);
 
-        let err = ds.monitor_messages("nonexistent");
+        let err = ds.monitor_messages("nonexistent", true);
         assert!(err.is_err());
         Ok(())
     }
@@ -517,7 +553,7 @@ mod tests {
         let write_conn = crate::db::open_and_migrate_at(&path)?;
         insert_test_message(&write_conn, &id);
 
-        let messages = ds.monitor_messages(&id)?;
+        let messages = ds.monitor_messages(&id, true)?;
         assert!(!messages.is_empty(), "should have at least one message");
 
         drop(session);
@@ -534,7 +570,7 @@ mod tests {
 
         // Open a fresh connection for the tail (it takes ownership).
         let tail_conn = crate::db::open_at(&path)?;
-        let mut tail = crate::session::tail_messages_new_with_conn(tail_conn, &id)?;
+        let mut tail = crate::session::tail_messages_new_with_conn(tail_conn, &id, true)?;
 
         // No new messages since tail was created after any existing messages
         // (tail_messages_new starts from the current end).

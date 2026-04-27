@@ -199,20 +199,10 @@ pub(crate) fn log_level_label(collapse_key: &str) -> &'static str {
 )]
 mod tests {
     use super::*;
-    use crate::session::SessionMessage;
+    use crate::session::test_support::{message, message_with_payload};
 
     fn make_message(r#type: &str, method: &str, server: &str) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::json!({}),
-        }
+        message(r#type, method, server)
     }
 
     fn make_message_with_payload(
@@ -221,17 +211,7 @@ mod tests {
         server: &str,
         payload: serde_json::Value,
     ) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload,
-        }
+        message_with_payload(r#type, method, server, payload)
     }
 
     // ── Category tests ───────────────────────────────────────────────────

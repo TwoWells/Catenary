@@ -242,6 +242,7 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
         let filter_active = app.input_mode == InputMode::FilterInput;
         let filter_locked = app.filter.as_ref().is_some_and(|f| f.locked.is_some());
         let focused_on_bottom = app.focus == FocusedPane::Events;
+        let debug_active = app.level_threshold == super::app::LevelThreshold::Debug;
 
         if filter_active {
             if let Some(ref filter) = app.filter {
@@ -255,6 +256,7 @@ pub fn draw(frame: &mut Frame, app: &mut App<'_>) {
                 false,
                 filter_locked,
                 focused_on_bottom,
+                debug_active,
             );
         }
     }
@@ -383,7 +385,8 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                     app.grid.focus_panel(idx);
                     app.focus = FocusedPane::Events;
                     // Load messages for the panel.
-                    if let Ok(messages) = app.data.monitor_messages(&session_id)
+                    let include_debug = app.level_threshold.include_debug();
+                    if let Ok(messages) = app.data.monitor_messages(&session_id, include_debug)
                         && let Some(panel) = app.grid.panels.get_mut(idx)
                     {
                         panel.load_messages(messages);
@@ -391,7 +394,7 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                     }
                     // Create a tail if one doesn't already exist.
                     if !app.tails.contains_key(&session_id)
-                        && let Ok(tail) = app.data.create_message_tail(&session_id)
+                        && let Ok(tail) = app.data.create_message_tail(&session_id, include_debug)
                     {
                         app.tails.insert(session_id, tail);
                     }
@@ -485,6 +488,38 @@ pub fn handle_key_normal(app: &mut App<'_>, key: crossterm::event::KeyEvent) -> 
                 && let Some(panel) = app.grid.focused_panel_mut()
             {
                 panel.page_down(20);
+            }
+            true
+        }
+        KeyCode::Char('d') if app.focus == FocusedPane::Events => {
+            // Toggle level threshold between Info and Debug.
+            app.level_threshold = match app.level_threshold {
+                super::app::LevelThreshold::Info => super::app::LevelThreshold::Debug,
+                super::app::LevelThreshold::Debug => super::app::LevelThreshold::Info,
+            };
+            let include_debug = app.level_threshold.include_debug();
+
+            // Reload messages for all open panels with the new threshold.
+            let panel_ids: Vec<String> = app
+                .grid
+                .panels
+                .iter()
+                .map(|p| p.session_id.clone())
+                .collect();
+            for id in &panel_ids {
+                if let Ok(messages) = app.data.monitor_messages(id, include_debug)
+                    && let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == *id)
+                {
+                    panel.load_messages(messages);
+                }
+            }
+
+            // Recreate tails with the new threshold.
+            app.tails.clear();
+            for id in &panel_ids {
+                if let Ok(tail) = app.data.create_message_tail(id, include_debug) {
+                    app.tails.insert(id.clone(), tail);
+                }
             }
             true
         }
@@ -726,17 +761,7 @@ mod tests {
     }
 
     fn make_message(method: &str) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: "lsp".to_string(),
-            method: method.to_string(),
-            server: "rust-analyzer".to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::Value::Object(serde_json::Map::new()),
-        }
+        crate::session::test_support::message("lsp", method, "rust-analyzer")
     }
 
     fn make_mock_data(
@@ -800,7 +825,7 @@ mod tests {
             .map(|p| p.session_id.clone())
             .collect();
         for id in &panel_ids {
-            if let Ok(messages) = app.data.monitor_messages(id)
+            if let Ok(messages) = app.data.monitor_messages(id, true)
                 && let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == *id)
             {
                 panel.load_messages(messages);
@@ -956,5 +981,65 @@ mod tests {
         }
         // Cursor may be on workspace — that's fine if it's index 0.
         // The important thing is auto-open worked.
+    }
+
+    fn make_message_with_level(method: &str, level: &str) -> SessionMessage {
+        SessionMessage {
+            level: level.to_string(),
+            ..crate::session::test_support::message("lsp", method, "rust-analyzer")
+        }
+    }
+
+    #[test]
+    fn toggle_reloads_panels() {
+        use crate::tui::app::LevelThreshold;
+
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+
+        let sessions = vec![make_session("s1", "/ws/test", true)];
+        let messages = vec![
+            make_message_with_level("textDocument/hover", "info"),
+            make_message_with_level("textDocument/didOpen", "debug"),
+            make_message_with_level("window/logMessage", "warn"),
+        ];
+        let mut messages_map = HashMap::new();
+        messages_map.insert("s1".to_string(), messages);
+
+        let data = Box::new(make_mock_data(sessions, messages_map));
+        let mut app = App::new(&theme, &icons, data, 0.4).expect("App creation");
+
+        // Load messages at default (Info) threshold.
+        let include_debug = app.level_threshold.include_debug();
+        if let Ok(msgs) = app.data.monitor_messages("s1", include_debug)
+            && let Some(panel) = app.grid.panels.iter_mut().find(|p| p.session_id == "s1")
+        {
+            panel.load_messages(msgs);
+        }
+
+        // Default threshold: debug excluded → 2 messages.
+        assert_eq!(app.level_threshold, LevelThreshold::Info);
+        let count_info = app.grid.panels[0].messages.len();
+        assert_eq!(count_info, 2, "Info threshold should exclude debug");
+
+        // Press 'd' to toggle to Debug.
+        app.focus = FocusedPane::Events;
+        app.grid.focus_panel(0);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_key_normal(&mut app, key);
+
+        assert_eq!(app.level_threshold, LevelThreshold::Debug);
+        let count_debug = app.grid.panels[0].messages.len();
+        assert_eq!(count_debug, 3, "Debug threshold should include all");
+
+        // Press 'd' again to toggle back to Info.
+        handle_key_normal(&mut app, key);
+
+        assert_eq!(app.level_threshold, LevelThreshold::Info);
+        let count_back = app.grid.panels[0].messages.len();
+        assert_eq!(count_back, 2, "Back to Info should exclude debug again");
     }
 }

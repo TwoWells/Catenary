@@ -267,17 +267,7 @@ mod tests {
     }
 
     fn make_message(method: &str) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: "lsp".to_string(),
-            method: method.to_string(),
-            server: "rust-analyzer".to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::Value::Object(serde_json::Map::new()),
-        }
+        crate::session::test_support::message("lsp", method, "rust-analyzer")
     }
 
     /// Convert a ratatui buffer to a single string for assertion matching.

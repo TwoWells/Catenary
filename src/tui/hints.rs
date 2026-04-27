@@ -23,9 +23,11 @@ use super::theme::Theme;
 /// When `filter_active` is true, no hints are rendered (the filter bar
 /// occupies this space). When `filter_locked` is true, the quit hint `q ✘`
 /// is replaced with `Esc ▓` to indicate the locked filter can be cleared.
+/// When `debug_active` is true, `[debug]` is shown at the right end.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "terminal coordinates are always small"
+    clippy::fn_params_excessive_bools,
+    reason = "terminal coordinates are always small; render flags are independent display toggles"
 )]
 pub fn render_hints(
     area: Rect,
@@ -34,6 +36,7 @@ pub fn render_hints(
     filter_active: bool,
     filter_locked: bool,
     focused_on_bottom: bool,
+    debug_active: bool,
 ) {
     if area.width < 4 || area.height < 1 || filter_active {
         return;
@@ -91,9 +94,17 @@ pub fn render_hints(
         ("\u{2500}", "\u{2524}", "\u{251C}", "\u{2518}") // ─ ┤ ├ ┘
     };
 
+    // Debug indicator: " [debug]" = 8 columns.
+    let debug_label = " [debug]";
+    let debug_width = if debug_active {
+        UnicodeWidthStr::width(debug_label)
+    } else {
+        0
+    };
+
     // Compute left fill and right fill.
-    // Fill pattern: left_fill, left_cap, space, hints, space, right_cap, right_fill, corner
-    let inner_used = 1 + 1 + hints_text_width + 1 + 1 + 1; // left_cap, space, hints, space, right_cap, corner
+    // Fill pattern: left_fill, left_cap, space, hints, space, right_cap, right_fill, debug?, corner
+    let inner_used = 1 + 1 + hints_text_width + 1 + 1 + debug_width + 1; // left_cap, space, hints, space, right_cap, debug?, corner
     let fill_total = (area.width as usize).saturating_sub(inner_used);
     let fill_right = fill_total / 2;
     let fill_left = fill_total.saturating_sub(fill_right);
@@ -125,6 +136,11 @@ pub fn render_hints(
             h_line.repeat(fill_right),
             theme.border_unfocused,
         ));
+    }
+
+    // Debug indicator.
+    if debug_active {
+        spans.push(Span::styled(debug_label.to_string(), theme.muted));
     }
 
     // Corner.
@@ -212,7 +228,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, false, false, false);
+                render_hints(area, f.buffer_mut(), &theme, false, false, false, false);
             })
             .expect("draw");
 
@@ -232,7 +248,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, true, false, false);
+                render_hints(area, f.buffer_mut(), &theme, true, false, false, false);
             })
             .expect("draw");
 
@@ -258,7 +274,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, false, true, false);
+                render_hints(area, f.buffer_mut(), &theme, false, true, false, false);
             })
             .expect("draw");
 
@@ -284,7 +300,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_hints(area, f.buffer_mut(), &theme, false, false, true);
+                render_hints(area, f.buffer_mut(), &theme, false, false, true, false);
             })
             .expect("draw");
 
@@ -299,6 +315,48 @@ mod tests {
         assert!(
             content.contains('\u{251D}'),
             "expected heavy right cap '\u{251D}' in: {content}"
+        );
+    }
+
+    #[test]
+    fn test_hints_debug_indicator() {
+        let theme = Theme::new();
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, false, false, false, true);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            content.contains("[debug]"),
+            "expected '[debug]' indicator in: {content}"
+        );
+    }
+
+    #[test]
+    fn test_hints_no_debug_indicator_by_default() {
+        let theme = Theme::new();
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_hints(area, f.buffer_mut(), &theme, false, false, false, false);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let content = buffer_to_string(&buf);
+
+        assert!(
+            !content.contains("[debug]"),
+            "no '[debug]' indicator by default: {content}"
         );
     }
 }

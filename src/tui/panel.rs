@@ -755,18 +755,10 @@ mod tests {
         IconSet::from_config(IconConfig::default())
     }
 
+    use crate::session::test_support;
+
     fn make_message(r#type: &str, method: &str, server: &str) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::json!({}),
-        }
+        test_support::message(r#type, method, server)
     }
 
     /// Create N messages that never collapse (hook messages have `None` collapse key).
@@ -782,17 +774,7 @@ mod tests {
         server: &str,
         payload: serde_json::Value,
     ) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload,
-        }
+        test_support::message_with_payload(r#type, method, server, payload)
     }
 
     /// An LSP message with a non-empty payload (expandable).
@@ -1400,17 +1382,7 @@ mod tests {
         server: &str,
         request_id: Option<i64>,
     ) -> SessionMessage {
-        SessionMessage {
-            id,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::json!({}),
-        }
+        test_support::message_with_ids(id, r#type, method, server, request_id, None)
     }
 
     fn make_message_with_id_ts(
@@ -1423,15 +1395,10 @@ mod tests {
         payload: serde_json::Value,
     ) -> SessionMessage {
         SessionMessage {
-            id,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id,
-            parent_id: None,
             timestamp,
-            payload,
+            ..test_support::message_with_ids_payload(
+                id, r#type, method, server, request_id, None, payload,
+            )
         }
     }
 
@@ -1575,17 +1542,7 @@ mod tests {
         request_id: Option<i64>,
         parent_id: Option<i64>,
     ) -> SessionMessage {
-        SessionMessage {
-            id,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id,
-            parent_id,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::json!({}),
-        }
+        test_support::message_with_ids(id, r#type, method, server, request_id, parent_id)
     }
 
     #[test]
@@ -1962,17 +1919,9 @@ mod tests {
         parent_id: Option<i64>,
         payload: serde_json::Value,
     ) -> SessionMessage {
-        SessionMessage {
-            id,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id,
-            parent_id,
-            timestamp: chrono::Utc::now(),
-            payload,
-        }
+        test_support::message_with_ids_payload(
+            id, r#type, method, server, request_id, parent_id, payload,
+        )
     }
 
     #[test]

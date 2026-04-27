@@ -46,6 +46,8 @@ pub struct SessionMessage {
     pub id: i64,
     /// Protocol boundary: `mcp`, `lsp`, or `hook`.
     pub r#type: String,
+    /// Tracing severity: `debug`, `info`, `warn`, or `error`.
+    pub level: String,
     /// Protocol method (e.g., `textDocument/hover`, `tools/call`).
     pub method: String,
     /// Server endpoint name.
@@ -263,6 +265,7 @@ pub struct SqliteMessageTail {
     conn: Connection,
     session_id: String,
     last_id: i64,
+    include_debug: bool,
 }
 
 impl SqliteMessageTail {
@@ -272,29 +275,39 @@ impl SqliteMessageTail {
     ///
     /// Returns an error if reading from the database fails.
     pub fn try_next_message(&mut self) -> Result<Option<SessionMessage>> {
-        let result = self.conn.query_row(
-            "SELECT id, timestamp, type, method, server, client, \
+        let query = if self.include_debug {
+            "SELECT id, timestamp, type, level, method, server, client, \
              request_id, parent_id, payload FROM messages \
-             WHERE session_id = ?1 AND id > ?2 ORDER BY id LIMIT 1",
+             WHERE session_id = ?1 AND id > ?2 ORDER BY id LIMIT 1"
+        } else {
+            "SELECT id, timestamp, type, level, method, server, client, \
+             request_id, parent_id, payload FROM messages \
+             WHERE session_id = ?1 AND id > ?2 AND level != 'debug' \
+             ORDER BY id LIMIT 1"
+        };
+
+        let result = self.conn.query_row(
+            query,
             rusqlite::params![&self.session_id, self.last_id],
             |row| {
                 let id: i64 = row.get(0)?;
                 let ts: String = row.get(1)?;
                 let r#type: String = row.get(2)?;
-                let method: String = row.get(3)?;
-                let server: String = row.get(4)?;
-                let client: String = row.get(5)?;
-                let request_id: Option<i64> = row.get(6)?;
-                let parent_id: Option<i64> = row.get(7)?;
-                let payload: String = row.get(8)?;
+                let level: String = row.get(3)?;
+                let method: String = row.get(4)?;
+                let server: String = row.get(5)?;
+                let client: String = row.get(6)?;
+                let request_id: Option<i64> = row.get(7)?;
+                let parent_id: Option<i64> = row.get(8)?;
+                let payload: String = row.get(9)?;
                 Ok((
-                    id, ts, r#type, method, server, client, request_id, parent_id, payload,
+                    id, ts, r#type, level, method, server, client, request_id, parent_id, payload,
                 ))
             },
         );
 
         match result {
-            Ok((id, ts, r#type, method, server, client, request_id, parent_id, payload)) => {
+            Ok((id, ts, r#type, level, method, server, client, request_id, parent_id, payload)) => {
                 self.last_id = id;
                 let timestamp = DateTime::parse_from_rfc3339(&ts)
                     .with_context(|| format!("invalid message timestamp: {ts}"))?
@@ -304,6 +317,7 @@ impl SqliteMessageTail {
                 Ok(Some(SessionMessage {
                     id,
                     r#type,
+                    level,
                     method,
                     server,
                     client,
@@ -535,18 +549,27 @@ pub fn get_session_with_conn(conn: &Connection, id: &str) -> Result<Option<(Sess
 
 /// Load all messages for a session, ordered by id.
 ///
+/// When `include_debug` is false, messages with `level = 'debug'` are
+/// excluded from the result set.
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be queried.
 pub fn monitor_messages_with_conn(
     conn: &Connection,
     session_id: &str,
+    include_debug: bool,
 ) -> Result<Vec<SessionMessage>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, timestamp, type, method, server, client, \
+    let query = if include_debug {
+        "SELECT id, timestamp, type, level, method, server, client, \
          request_id, parent_id, payload FROM messages \
-         WHERE session_id = ?1 ORDER BY id",
-    )?;
+         WHERE session_id = ?1 ORDER BY id"
+    } else {
+        "SELECT id, timestamp, type, level, method, server, client, \
+         request_id, parent_id, payload FROM messages \
+         WHERE session_id = ?1 AND level != 'debug' ORDER BY id"
+    };
+    let mut stmt = conn.prepare(query)?;
     let mut rows = stmt.query([session_id])?;
     let mut messages = Vec::new();
 
@@ -554,12 +577,13 @@ pub fn monitor_messages_with_conn(
         let id: i64 = row.get(0)?;
         let ts: String = row.get(1)?;
         let r#type: String = row.get(2)?;
-        let method: String = row.get(3)?;
-        let server: String = row.get(4)?;
-        let client: String = row.get(5)?;
-        let request_id: Option<i64> = row.get(6)?;
-        let parent_id: Option<i64> = row.get(7)?;
-        let payload_str: String = row.get(8)?;
+        let level: String = row.get(3)?;
+        let method: String = row.get(4)?;
+        let server: String = row.get(5)?;
+        let client: String = row.get(6)?;
+        let request_id: Option<i64> = row.get(7)?;
+        let parent_id: Option<i64> = row.get(8)?;
+        let payload_str: String = row.get(9)?;
 
         if let Ok(timestamp) = DateTime::parse_from_rfc3339(&ts)
             && let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str)
@@ -567,6 +591,7 @@ pub fn monitor_messages_with_conn(
             messages.push(SessionMessage {
                 id,
                 r#type,
+                level,
                 method,
                 server,
                 client,
@@ -589,9 +614,9 @@ pub fn monitor_messages_with_conn(
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queried.
-pub fn tail_messages_new(id: &str) -> Result<SqliteMessageTail> {
+pub fn tail_messages_new(id: &str, include_debug: bool) -> Result<SqliteMessageTail> {
     let conn = crate::db::open()?;
-    tail_messages_new_with_conn(conn, id)
+    tail_messages_new_with_conn(conn, id, include_debug)
 }
 
 /// Tail only *new* messages from a session using an existing database connection.
@@ -601,7 +626,11 @@ pub fn tail_messages_new(id: &str) -> Result<SqliteMessageTail> {
 /// # Errors
 ///
 /// Returns an error if the database cannot be queried.
-pub fn tail_messages_new_with_conn(conn: Connection, id: &str) -> Result<SqliteMessageTail> {
+pub fn tail_messages_new_with_conn(
+    conn: Connection,
+    id: &str,
+    include_debug: bool,
+) -> Result<SqliteMessageTail> {
     let last_id: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
@@ -614,6 +643,7 @@ pub fn tail_messages_new_with_conn(conn: Connection, id: &str) -> Result<SqliteM
         conn,
         session_id: id.to_string(),
         last_id,
+        include_debug,
     })
 }
 
@@ -789,6 +819,90 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+// ── Test helpers (shared across crate) ──────────────────────────────
+
+/// Shared [`SessionMessage`] constructors for tests.
+///
+/// Centralizes struct construction so adding new fields is a one-line
+/// change instead of touching every test file.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::SessionMessage;
+    use chrono::Utc;
+
+    /// Build a `SessionMessage` with sensible defaults.
+    ///
+    /// `level` defaults to `"info"`, `request_id`/`parent_id` to `None`,
+    /// `client` to `"catenary"`, `payload` to `{}`.
+    #[must_use]
+    pub fn message(r#type: &str, method: &str, server: &str) -> SessionMessage {
+        SessionMessage {
+            id: 0,
+            r#type: r#type.to_string(),
+            level: "info".to_string(),
+            method: method.to_string(),
+            server: server.to_string(),
+            client: "catenary".to_string(),
+            request_id: None,
+            parent_id: None,
+            timestamp: Utc::now(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    /// Build a `SessionMessage` with a specific payload.
+    #[must_use]
+    pub fn message_with_payload(
+        r#type: &str,
+        method: &str,
+        server: &str,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            payload,
+            ..message(r#type, method, server)
+        }
+    }
+
+    /// Build a `SessionMessage` with explicit `id`, `request_id`, and `parent_id`.
+    #[must_use]
+    pub fn message_with_ids(
+        id: i64,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        request_id: Option<i64>,
+        parent_id: Option<i64>,
+    ) -> SessionMessage {
+        SessionMessage {
+            id,
+            request_id,
+            parent_id,
+            ..message(r#type, method, server)
+        }
+    }
+
+    /// Build a `SessionMessage` with explicit `id`, `request_id`, `parent_id`, and payload.
+    #[must_use]
+    pub fn message_with_ids_payload(
+        id: i64,
+        r#type: &str,
+        method: &str,
+        server: &str,
+        request_id: Option<i64>,
+        parent_id: Option<i64>,
+        payload: serde_json::Value,
+    ) -> SessionMessage {
+        SessionMessage {
+            id,
+            request_id,
+            parent_id,
+            payload,
+            ..message(r#type, method, server)
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -850,6 +964,35 @@ mod tests {
             ],
         )
         .expect("insert test message");
+        conn.last_insert_rowid()
+    }
+
+    /// Insert a test message with an explicit `level` column.
+    fn insert_test_message_with_level(
+        conn: &Connection,
+        session_id: &str,
+        r#type: &str,
+        level: &str,
+        method: &str,
+        server: &str,
+        payload: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, timestamp, type, level, method, server, client, \
+              request_id, parent_id, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'catenary', NULL, NULL, ?7)",
+            rusqlite::params![
+                session_id,
+                "2026-01-01T00:00:00.000Z",
+                r#type,
+                level,
+                method,
+                server,
+                payload,
+            ],
+        )
+        .expect("insert test message with level");
         conn.last_insert_rowid()
     }
 
@@ -1158,7 +1301,7 @@ mod tests {
             r#"{"method":"textDocument/hover"}"#,
         );
 
-        let messages = monitor_messages_with_conn(&conn, "s1")?;
+        let messages = monitor_messages_with_conn(&conn, "s1", true)?;
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].r#type, "lsp");
@@ -1196,7 +1339,7 @@ mod tests {
 
         // Open tail — should start from current end.
         let tail_conn = crate::db::open_at(&path)?;
-        let mut tail = tail_messages_new_with_conn(tail_conn, "s1")?;
+        let mut tail = tail_messages_new_with_conn(tail_conn, "s1", true)?;
 
         // Nothing new yet.
         assert!(
@@ -1276,6 +1419,155 @@ mod tests {
         let langs = active_languages_with_conn(&conn, "s1")?;
 
         assert_eq!(langs, vec!["rust-analyzer", "typescript-language-server"]);
+
+        Ok(())
+    }
+
+    // ── Level filtering tests ──────────────────────────────────────────
+
+    #[test]
+    fn default_threshold_excludes_debug() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        insert_test_message_with_level(
+            &conn,
+            "s1",
+            "lsp",
+            "info",
+            "textDocument/hover",
+            "ra",
+            "{}",
+        );
+        insert_test_message_with_level(
+            &conn,
+            "s1",
+            "lsp",
+            "debug",
+            "textDocument/didOpen",
+            "ra",
+            "{}",
+        );
+        insert_test_message_with_level(&conn, "s1", "lsp", "warn", "window/logMessage", "ra", "{}");
+
+        let messages = monitor_messages_with_conn(&conn, "s1", false)?;
+        assert_eq!(messages.len(), 2, "debug messages should be excluded");
+        assert_eq!(messages[0].method, "textDocument/hover");
+        assert_eq!(messages[1].method, "window/logMessage");
+
+        Ok(())
+    }
+
+    #[test]
+    fn debug_threshold_includes_all() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        insert_test_message_with_level(
+            &conn,
+            "s1",
+            "lsp",
+            "info",
+            "textDocument/hover",
+            "ra",
+            "{}",
+        );
+        insert_test_message_with_level(
+            &conn,
+            "s1",
+            "lsp",
+            "debug",
+            "textDocument/didOpen",
+            "ra",
+            "{}",
+        );
+        insert_test_message_with_level(&conn, "s1", "lsp", "warn", "window/logMessage", "ra", "{}");
+
+        let messages = monitor_messages_with_conn(&conn, "s1", true)?;
+        assert_eq!(messages.len(), 3, "all levels should be included");
+
+        Ok(())
+    }
+
+    #[test]
+    fn tail_respects_threshold() -> Result<()> {
+        let (_dir, path, conn) = test_db();
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        // Open tail with Info threshold (exclude debug).
+        let tail_conn = crate::db::open_at(&path)?;
+        let mut tail = tail_messages_new_with_conn(tail_conn, "s1", false)?;
+
+        // Insert a debug message — should be skipped.
+        insert_test_message_with_level(
+            &conn,
+            "s1",
+            "lsp",
+            "debug",
+            "textDocument/didOpen",
+            "ra",
+            "{}",
+        );
+        assert!(
+            tail.try_next_message()?.is_none(),
+            "debug messages should be skipped with Info threshold"
+        );
+
+        // Insert an info message — should appear.
+        insert_test_message_with_level(
+            &conn,
+            "s1",
+            "lsp",
+            "info",
+            "textDocument/hover",
+            "ra",
+            "{}",
+        );
+        let msg = tail.try_next_message()?;
+        assert!(msg.is_some(), "info messages should pass Info threshold");
+        assert_eq!(msg.expect("verified Some").method, "textDocument/hover");
+
+        Ok(())
+    }
+
+    #[test]
+    fn level_field_round_trips() -> Result<()> {
+        let (_dir, _path, conn) = test_db();
+
+        conn.execute(
+            "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('s1', 1, 'test', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        insert_test_message_with_level(
+            &conn,
+            "s1",
+            "lsp",
+            "debug",
+            "textDocument/hover",
+            "ra",
+            "{}",
+        );
+
+        let messages = monitor_messages_with_conn(&conn, "s1", true)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].level, "debug");
 
         Ok(())
     }

@@ -490,6 +490,7 @@ mod tests {
 
     use super::*;
     use crate::session::SessionMessage;
+    use crate::session::test_support;
 
     fn make_message_with_payload(
         r#type: &str,
@@ -497,17 +498,7 @@ mod tests {
         server: &str,
         payload: serde_json::Value,
     ) -> SessionMessage {
-        SessionMessage {
-            id: 0,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload,
-        }
+        test_support::message_with_payload(r#type, method, server, payload)
     }
 
     fn make_message_with_id(
@@ -517,17 +508,7 @@ mod tests {
         server: &str,
         request_id: Option<i64>,
     ) -> SessionMessage {
-        SessionMessage {
-            id,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::json!({}),
-        }
+        test_support::message_with_ids(id, r#type, method, server, request_id, None)
     }
 
     fn make_message_with_id_parent(
@@ -538,17 +519,7 @@ mod tests {
         request_id: Option<i64>,
         parent_id: Option<i64>,
     ) -> SessionMessage {
-        SessionMessage {
-            id,
-            r#type: r#type.to_string(),
-            method: method.to_string(),
-            server: server.to_string(),
-            client: "catenary".to_string(),
-            request_id,
-            parent_id,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::json!({}),
-        }
+        test_support::message_with_ids(id, r#type, method, server, request_id, parent_id)
     }
 
     fn make_progress_message(server: &str, token: &str) -> SessionMessage {

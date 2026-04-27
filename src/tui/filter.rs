@@ -415,16 +415,15 @@ mod tests {
     }
 
     fn make_message(method: &str) -> SessionMessage {
+        use crate::session::SessionMessage;
         SessionMessage {
-            id: 0,
-            r#type: "mcp".to_string(),
-            method: method.to_string(),
-            server: "catenary".to_string(),
             client: "claude-code".to_string(),
-            request_id: None,
-            parent_id: None,
-            timestamp: chrono::Utc::now(),
-            payload: serde_json::json!({"params": {"name": method}}),
+            ..crate::session::test_support::message_with_payload(
+                "mcp",
+                method,
+                "catenary",
+                serde_json::json!({"params": {"name": method}}),
+            )
         }
     }
 
