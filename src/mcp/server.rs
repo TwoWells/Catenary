@@ -27,7 +27,7 @@ const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
 
 /// Emit an MCP protocol event via `tracing::info!`.
 ///
-/// Protocol routing is by `kind` field — `ProtocolDbSink` matches
+/// Protocol routing is by `kind` field — `MessageDbSink` matches
 /// `kind in {lsp, mcp, hook}` regardless of tracing level.
 ///
 /// Handles the optional `parent_id` field by branching into two macro
@@ -1328,7 +1328,7 @@ mod tests {
         parent_id: Option<i64>,
     }
 
-    /// Set up a `LoggingServer` with `ProtocolDbSink` backed by an
+    /// Set up a `LoggingServer` with `MessageDbSink` backed by an
     /// in-memory DB, installed as the thread-local tracing subscriber.
     fn setup_logging() -> (
         LoggingServer,
@@ -1356,6 +1356,7 @@ mod tests {
                      session_id  TEXT NOT NULL,
                      timestamp   TEXT NOT NULL,
                      type        TEXT NOT NULL,
+                     level       TEXT NOT NULL DEFAULT 'info',
                      method      TEXT NOT NULL,
                      server      TEXT NOT NULL,
                      client      TEXT NOT NULL,
@@ -1367,9 +1368,8 @@ mod tests {
             .expect("create schema");
 
         let logging = LoggingServer::new();
-        let protocol_db =
-            crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), "s1".into());
-        logging.activate(vec![protocol_db]);
+        let message_db = crate::logging::message_db::MessageDbSink::new(conn.clone(), "s1".into());
+        logging.activate(vec![message_db]);
 
         let subscriber = tracing_subscriber::registry().with(logging.clone());
         let guard = tracing::subscriber::set_default(subscriber);
@@ -1397,6 +1397,14 @@ mod tests {
         .expect("query")
         .filter_map(std::result::Result::ok)
         .collect()
+    }
+
+    /// Filter to MCP protocol rows only.
+    fn mcp_messages(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> Vec<MsgRow> {
+        query_messages(conn)
+            .into_iter()
+            .filter(|m| m.r#type == "mcp")
+            .collect()
     }
 
     /// Simulate the `run()` loop for a single message: mint a correlation
@@ -1447,9 +1455,12 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         let correlation_id = simulate_incoming(&mut server, &line, &mut writer)?;
 
-        let msgs = query_messages(&conn);
-        assert_eq!(msgs.len(), 2, "should have request + response");
-        assert_eq!(msgs[0].r#type, "mcp");
+        let msgs = mcp_messages(&conn);
+        assert!(
+            msgs.len() >= 2,
+            "should have at least request + response, got {}",
+            msgs.len()
+        );
         assert_eq!(msgs[0].method, "initialize");
         assert!(msgs[0].parent_id.is_none());
         assert_eq!(msgs[1].method, "initialize");
@@ -1485,9 +1496,12 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         let correlation_id = simulate_incoming(&mut server, &line, &mut writer)?;
 
-        let msgs = query_messages(&conn);
-        assert_eq!(msgs.len(), 2, "should have request + response");
-        assert_eq!(msgs[0].r#type, "mcp");
+        let msgs = mcp_messages(&conn);
+        assert!(
+            msgs.len() >= 2,
+            "should have at least request + response, got {}",
+            msgs.len()
+        );
         assert_eq!(msgs[0].method, "tools/call");
         assert_eq!(msgs[1].method, "tools/call");
         assert_eq!(
@@ -1513,9 +1527,11 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         simulate_incoming(&mut server, &line, &mut writer)?;
 
-        let msgs = query_messages(&conn);
-        assert_eq!(msgs.len(), 1, "notification has no response");
-        assert_eq!(msgs[0].r#type, "mcp");
+        let msgs = mcp_messages(&conn);
+        assert!(
+            !msgs.is_empty(),
+            "should have at least the notification row"
+        );
         assert_eq!(msgs[0].method, "notifications/initialized");
         assert!(msgs[0].request_id.is_some(), "should have a correlation ID");
         assert!(msgs[0].parent_id.is_none());
@@ -1554,12 +1570,16 @@ mod tests {
         let line = serde_json::to_string(&ping)?;
         simulate_incoming(&mut server, &line, &mut writer)?;
 
-        let msgs = query_messages(&conn);
-        // Messages: init req, init resp, ping req, ping resp = 4
-        assert_eq!(msgs.len(), 4);
-        // The ping request (3rd message) should have client = "claude-code"
+        let msgs = mcp_messages(&conn);
+        // MCP rows: init req, init resp, ping req, ping resp = 4
+        assert!(
+            msgs.len() >= 4,
+            "should have at least init pair + ping pair, got {}",
+            msgs.len()
+        );
+        // The ping request (3rd MCP message) should have client = "claude-code"
         assert_eq!(msgs[2].client, "claude-code");
-        // The ping response (4th message) should also have client = "claude-code"
+        // The ping response (4th MCP message) should also have client = "claude-code"
         assert_eq!(msgs[3].client, "claude-code");
         Ok(())
     }

@@ -32,7 +32,7 @@ struct PendingRequest {
 
 /// Emit an LSP protocol event via `tracing::info!`.
 ///
-/// Protocol routing is by `kind` field, not by level — `ProtocolDbSink`
+/// Protocol routing is by `kind` field, not by level — `MessageDbSink`
 /// matches `kind in {lsp, mcp, hook}` regardless of tracing level.
 ///
 /// Handles the optional `parent_id` field by branching into two macro

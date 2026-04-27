@@ -31,11 +31,11 @@ use tempfile::tempdir;
 use tracing_subscriber::layer::SubscriberExt;
 
 use catenary_mcp::logging::LoggingServer;
-use catenary_mcp::logging::protocol_db::ProtocolDbSink;
+use catenary_mcp::logging::message_db::MessageDbSink;
 
 const MOCK_LANG_A: &str = "yX4Za";
 
-/// Create a test DB with a `LoggingServer` backed by a `ProtocolDbSink`,
+/// Create a test DB with a `LoggingServer` backed by a `MessageDbSink`,
 /// installed as the thread-local tracing subscriber.
 fn setup_logging() -> (
     LoggingServer,
@@ -61,6 +61,7 @@ fn setup_logging() -> (
                  session_id  TEXT NOT NULL,
                  timestamp   TEXT NOT NULL,
                  type        TEXT NOT NULL,
+                 level       TEXT NOT NULL DEFAULT 'info',
                  method      TEXT NOT NULL,
                  server      TEXT NOT NULL,
                  client      TEXT NOT NULL,
@@ -72,8 +73,8 @@ fn setup_logging() -> (
         .expect("create schema");
 
     let logging = LoggingServer::new();
-    let protocol_db = ProtocolDbSink::new(conn.clone(), "s1".into());
-    logging.activate(vec![protocol_db]);
+    let message_db = MessageDbSink::new(conn.clone(), "s1".into());
+    logging.activate(vec![message_db]);
 
     let subscriber = tracing_subscriber::registry().with(logging.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -110,7 +111,7 @@ fn message_count(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> i64 {
 }
 
 /// End-to-end benchmark: hover + definition requests through mockls with
-/// `LoggingServer` + `ProtocolDbSink`.
+/// `LoggingServer` + `MessageDbSink`.
 ///
 /// Prints throughput numbers. Does not assert a hard regression bound
 /// because absolute timing varies by machine — the synthetic bench

@@ -23,9 +23,8 @@ use anyhow::Result;
 use tempfile::tempdir;
 use tracing_subscriber::layer::SubscriberExt;
 
+use catenary_mcp::logging::message_db::MessageDbSink;
 use catenary_mcp::logging::notification_queue::NotificationQueueSink;
-use catenary_mcp::logging::protocol_db::ProtocolDbSink;
-use catenary_mcp::logging::trace_db::TraceDbSink;
 use catenary_mcp::logging::{LoggingServer, Severity};
 
 const MOCK_LANG_A: &str = "yX4Za";
@@ -49,6 +48,7 @@ fn test_db() -> Arc<Mutex<rusqlite::Connection>> {
              session_id  TEXT NOT NULL,
              timestamp   TEXT NOT NULL,
              type        TEXT NOT NULL,
+             level       TEXT NOT NULL DEFAULT 'info',
              method      TEXT NOT NULL,
              server      TEXT NOT NULL,
              client      TEXT NOT NULL,
@@ -98,21 +98,20 @@ fn message_count(conn: &Arc<Mutex<rusqlite::Connection>>) -> usize {
 
 // ── Multi-sink dispatch ────────────────────────────────────────────────
 
-/// Verify that all three sinks (notification queue, protocol DB, trace DB)
-/// receive their respective events through a single `LoggingServer` Layer.
+/// Verify that both sinks (notification queue, message DB) receive their
+/// respective events through a single `LoggingServer` Layer.
 #[test]
 fn multi_sink_dispatch_routes_correctly() {
     let db = test_db();
     let notifications = NotificationQueueSink::new(Severity::Warn);
-    let protocol_db = ProtocolDbSink::new(db.clone(), "s1".into());
-    let trace_db = TraceDbSink::new(db.clone(), "s1".into());
+    let message_db = MessageDbSink::new(db.clone(), "s1".into());
 
     let server = LoggingServer::new();
     let subscriber = tracing_subscriber::registry().with(server.clone());
     tracing::subscriber::with_default(subscriber, || {
-        server.activate(vec![notifications.clone(), protocol_db, trace_db]);
+        server.activate(vec![notifications.clone(), message_db]);
 
-        // Protocol event (kind="lsp") → protocol DB only, not trace DB.
+        // Protocol event (kind="lsp") → message DB with type "lsp".
         tracing::info!(
             kind = "lsp",
             method = "textDocument/hover",
@@ -121,26 +120,25 @@ fn multi_sink_dispatch_routes_correctly() {
             "outgoing"
         );
 
-        // Warn event without kind → trace DB + notification queue.
+        // Warn event without kind → message DB with type "internal" + notification queue.
         tracing::warn!(source = "lsp.lifecycle", "server crashed");
 
-        // Debug event without kind → trace DB only (below notification threshold).
+        // Debug event without kind → message DB with type "internal" only (below notification threshold).
         tracing::debug!("verbose trace");
     });
 
     let msgs = query_messages(&db);
 
-    // Protocol DB: 1 lsp event. Trace DB: 2 events (warn + debug).
-    // Total DB rows: 3.
+    // All 3 events go to the unified message DB.
     assert_eq!(msgs.len(), 3, "expected 3 DB rows, got {}", msgs.len());
 
     // Protocol event is type "lsp".
     assert_eq!(msgs[0].r#type, "lsp");
     assert_eq!(msgs[0].method, "textDocument/hover");
 
-    // Trace events are type "warn" and "debug".
-    assert_eq!(msgs[1].r#type, "warn");
-    assert_eq!(msgs[2].r#type, "debug");
+    // Internal events are type "internal".
+    assert_eq!(msgs[1].r#type, "internal");
+    assert_eq!(msgs[2].r#type, "internal");
 
     // Notification queue: 1 warn event.
     let drained = notifications.drain();
@@ -202,9 +200,9 @@ fn notification_dedup_through_layer() {
 #[tokio::test]
 async fn lsp_request_scope_chain() -> Result<()> {
     let db = test_db();
-    let protocol_db = ProtocolDbSink::new(db.clone(), "s1".into());
+    let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
-    server.activate(vec![protocol_db]);
+    server.activate(vec![message_db]);
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -270,9 +268,9 @@ async fn lsp_request_scope_chain() -> Result<()> {
 #[tokio::test]
 async fn pair_merge_still_works() -> Result<()> {
     let db = test_db();
-    let protocol_db = ProtocolDbSink::new(db.clone(), "s1".into());
+    let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
-    server.activate(vec![protocol_db]);
+    server.activate(vec![message_db]);
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -332,18 +330,18 @@ async fn pair_merge_still_works() -> Result<()> {
     Ok(())
 }
 
-/// Verify that trace DB and protocol DB don't overlap: protocol events
-/// go only to protocol DB, non-protocol events go only to trace DB.
+/// Verify that the unified sink routes all events without duplication:
+/// protocol events get `type = "lsp"|"mcp"|"hook"`, internal events
+/// get `type = "internal"`.
 #[test]
-fn sink_routing_no_overlap() {
+fn unified_sink_type_column_correct() {
     let db = test_db();
-    let protocol_db = ProtocolDbSink::new(db.clone(), "s1".into());
-    let trace_db = TraceDbSink::new(db.clone(), "s1".into());
+    let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
     tracing::subscriber::with_default(subscriber, || {
-        server.activate(vec![protocol_db, trace_db]);
+        server.activate(vec![message_db]);
 
         // 3 protocol events.
         for kind in &["lsp", "mcp", "hook"] {
@@ -361,14 +359,11 @@ fn sink_routing_no_overlap() {
         .iter()
         .filter(|m| matches!(m.r#type.as_str(), "lsp" | "mcp" | "hook"))
         .count();
-    let trace_count = msgs
-        .iter()
-        .filter(|m| matches!(m.r#type.as_str(), "warn" | "info"))
-        .count();
+    let internal_count = msgs.iter().filter(|m| m.r#type == "internal").count();
 
     assert_eq!(protocol_count, 3, "3 protocol events");
-    assert_eq!(trace_count, 2, "2 trace events");
-    assert_eq!(msgs.len(), 5, "no overlap or duplication");
+    assert_eq!(internal_count, 2, "2 internal events");
+    assert_eq!(msgs.len(), 5, "no duplication");
 }
 
 /// Verify that `LoggingServer::buffered_len` reports correctly during
@@ -378,7 +373,7 @@ fn sink_routing_no_overlap() {
 fn bootstrap_buffer_drains_to_all_sinks() {
     let db = test_db();
     let notifications = NotificationQueueSink::new(Severity::Warn);
-    let trace_db = TraceDbSink::new(db.clone(), "s1".into());
+    let message_db = MessageDbSink::new(db.clone(), "s1".into());
     let server = LoggingServer::new();
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
@@ -389,11 +384,11 @@ fn bootstrap_buffer_drains_to_all_sinks() {
         assert_eq!(server.buffered_len(), 2);
 
         // Activate: buffer drains to sinks.
-        server.activate(vec![notifications.clone(), trace_db]);
+        server.activate(vec![notifications.clone(), message_db]);
         assert_eq!(server.buffered_len(), 0);
     });
 
-    // Trace DB got both events.
+    // Message DB got both events.
     assert_eq!(message_count(&db), 2);
 
     // Notification queue got both (both are warn, distinct keys).

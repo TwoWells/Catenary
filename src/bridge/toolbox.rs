@@ -158,12 +158,10 @@ impl Toolbox {
             .map_or_else(SeverityConfig::default, |n| n.threshold)
             .into();
         let notifications = NotificationQueueSink::new(threshold);
-        let protocol_db =
-            crate::logging::protocol_db::ProtocolDbSink::new(conn.clone(), instance_id.clone());
-        let trace_db = crate::logging::trace_db::TraceDbSink::new(conn, instance_id.clone());
+        let message_db = crate::logging::message_db::MessageDbSink::new(conn, instance_id.clone());
 
         // Activate — drains bootstrap buffer, enables direct dispatch.
-        logging.activate(vec![notifications.clone(), protocol_db, trace_db]);
+        logging.activate(vec![notifications.clone(), message_db]);
 
         let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
