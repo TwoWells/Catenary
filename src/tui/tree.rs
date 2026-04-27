@@ -404,6 +404,7 @@ const CHEATSHEET: &[(&str, &str)] = &[
     ("z", "center cursor"),
     ("v", "visual select"),
     ("y", "yank (copy)"),
+    ("d", "toggle debug level"),
     ("f/F", "filter / global"),
     ("Del", "delete session"),
     ("?", "toggle this help"),
