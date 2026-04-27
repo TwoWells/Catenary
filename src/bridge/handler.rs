@@ -77,11 +77,23 @@ pub(super) fn display_path(file: &str, fs: &FilesystemManager) -> String {
 
 impl ToolHandler for McpRouter {
     fn list_tools(&self) -> Vec<Tool> {
+        let grep_budget = self.toolbox.grep.budget;
+        let glob_budget = self.toolbox.glob.budget;
+        let outline_threshold = self.toolbox.glob.outline_threshold;
+
         vec![
             Tool {
                 name: "grep".to_string(),
-                title: Some("Grep".to_string()),
-                description: Some("Search for a pattern across the workspace. Queries the tree-sitter symbol index and ripgrep in parallel. Returns symbols with structural context and navigation edges.\n\nPATTERN (required)\nRegex pattern. Supports `|` for alternation (e.g., `foo|bar`). Matched against symbol names and file contents.\n\nGLOB\nGlob pattern to narrow the search scope. Only files matching the glob are searched. See the glob tool for pattern syntax.\n\nEXCLUDE\nGlob pattern to exclude from matches.\n\nINCLUDE_GITIGNORED (default: false)\nInclude files ignored by `.gitignore` in the search.\n\nINCLUDE_HIDDEN (default: false)\nInclude hidden files (dotfiles) in the search.\n\nOUTPUT\nOutput fits a fixed character budget to protect your context window. Broad queries produce more matches than the budget can show at full detail, so the tool reduces detail automatically. Narrow your pattern or add a glob to get richer results.".to_string()),
+                title: Some("Catenary: Grep".to_string()),
+                description: Some(format!(
+                    "Search for a pattern across the workspace. Queries the LSP symbol index \
+                     and ripgrep in parallel. Use `|` for alternation (e.g., `foo|bar`). \
+                     Scope with `glob` and `exclude` to narrow the file set.\n\n\
+                     Output fits a {grep_budget}-character budget. Broad queries produce more \
+                     matches than the budget can show at full detail, so the tool reduces \
+                     detail automatically. Narrow your pattern or add a glob to get richer \
+                     results."
+                )),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -117,8 +129,17 @@ impl ToolHandler for McpRouter {
             },
             Tool {
                 name: "glob".to_string(),
-                title: Some("Glob".to_string()),
-                description: Some("Browse the workspace and navigate code structure.\n\nPATTERN (required)\n  File path      single file with outline (src/main.rs)\n  Directory      immediate children (src/bridge/)\n  Glob pattern   recursive file tree (src/**/*.rs)\n\n  Glob syntax:\n    *        any characters within a path segment\n    **       zero or more path segments\n    ?        single character\n    {a,b}    alternation\n    [abc]    character class\n\n  Directory output shows immediate children. Glob pattern output\n  renders a nested directory tree \u{2014} directories as structural nodes,\n  files indented under their parent.\n\nEXCLUDE\n  Glob pattern to filter out matching entries from the results.\n  Patterns without a path separator match the filename anywhere\n  in the tree (e.g. exclude=\"test_*\" excludes all test_* files).\n\nCURSOR\n  Continuation token from a previous result. Use this to page\n  through oversized results. All other parameters must match the\n  original call.\n\nOUTPUT\n  Output fits a fixed character budget to protect your context\n  window. Large directories are bucketed into drillable glob\n  patterns.\n\n  Files over 200 lines include a defensive outline \u{2014} a map of\n  top-level symbols to help you navigate without reading the\n  entire file. Files under 200 lines show name and line count\n  only. Each symbol includes its line range.\n\n  When many large files share identical structure, the outline\n  is shown once for the group with bounding ranges.\n\n  Single files always include the outline regardless of size\n  (subject to user configuration).\n\n  Symbols:\n    :start-end <Kind> Name\n    :start-end <Kind> Name/     (has children)\n\n  Entry flags (square brackets, distinct from <Kind>):\n    [symbols available]   structural navigation works\n    [gitignored]          entry is gitignored\n    [broken]              symlink target missing\n    [snapshot]            restore sidecar file\n\nINCLUDE_GITIGNORED (default: false)\n  Include files and directories ignored by .gitignore.\n\nINCLUDE_HIDDEN (default: false)\n  Include hidden files and directories (dotfiles).".to_string()),
+                title: Some("Catenary: Glob".to_string()),
+                description: Some(format!(
+                    "Browse the workspace. Auto-detects intent: file path \u{2192} symbol outline, \
+                     directory path \u{2192} listing with symbols, glob pattern \u{2192} matching files \
+                     with symbols. Always shows outline-level symbols (structs, classes, enums, \
+                     interfaces, modules, constants).\n\n\
+                     Output fits a {glob_budget}-character budget. Large directories are \
+                     bucketed into drillable glob patterns. Files over {outline_threshold} \
+                     lines include a defensive outline \u{2014} a map of top-level symbols with \
+                     line ranges. Single files always include the outline regardless of size."
+                )),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -154,8 +175,9 @@ impl ToolHandler for McpRouter {
             },
             Tool {
                 name: "start_editing".to_string(),
-                title: Some("Start Editing".to_string()),
-                description: Some("Enter editing mode. Diagnostics are suppressed on all subsequent Edit/Write calls until done_editing is called. Call this before using Edit.".to_string()),
+                title: Some("Catenary: Start Editing".to_string()),
+                description: Some("Enter editing mode. Diagnostics are deferred until done_editing is called. \
+                     Call this before using Edit.".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -169,8 +191,12 @@ impl ToolHandler for McpRouter {
             },
             Tool {
                 name: "done_editing".to_string(),
-                title: Some("Done Editing".to_string()),
-                description: Some("Exit editing mode and return LSP diagnostics for all modified files. Must be called after start_editing before using non-Edit tools.\n\nOutput lists every modified file in one of three categories:\n- Diagnostics: file path followed by indented errors/warnings.\n- Clean: files where the language server found no issues (grouped on one line).\n- N/A: files with no language server coverage (grouped on one line).\n\nFile paths are relative to the workspace root.".to_string()),
+                title: Some("Catenary: Done Editing".to_string()),
+                description: Some("Exit editing mode and return LSP diagnostics for all modified files. \
+                     While editing, Edit, Read, grep, and glob remain available. All other \
+                     tools are blocked until done_editing returns.\n\n\
+                     Output lists every modified file as diagnostics (errors/warnings), \
+                     clean, or N/A (no language server coverage).".to_string()),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},
