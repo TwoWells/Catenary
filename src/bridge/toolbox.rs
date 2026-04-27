@@ -255,6 +255,26 @@ impl Toolbox {
         self.fs_manager.resolve_root(path).is_some()
     }
 
+    /// Returns `true` if the path has known LSP coverage for diagnostics.
+    ///
+    /// A file has coverage if it is within a workspace root (tiers 1–2)
+    /// OR its language has a server with a positive single-file cache
+    /// entry (tier 3). Files with uncached or negative-cached languages
+    /// return `false` — the editing gate should not impose friction
+    /// until we know the server works in single-file mode.
+    #[must_use]
+    pub fn has_lsp_coverage(&self, path: &Path) -> bool {
+        if self.fs_manager.resolve_root(path).is_some() {
+            return true;
+        }
+        let lang = self.fs_manager.language_id(path).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        });
+        lang.is_some_and(|id| self.client_manager.has_single_file_coverage(&id))
+    }
+
     /// Diffs the filesystem and notifies servers with matching file watcher
     /// registrations. Delegates to [`LspClientManager::notify_file_changes`].
     pub async fn notify_file_changes(&self) {

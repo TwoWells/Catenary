@@ -94,6 +94,12 @@ pub struct LspClientManager {
     /// not be held across `.await` points.
     project_configs: std::sync::Mutex<HashMap<PathBuf, crate::config::ProjectConfig>>,
     clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
+    /// Negative cache for single-file server initialization failures.
+    /// Contains `(language_id, server_name)` pairs where the server is
+    /// configured with `single_file = true` but rejected null-workspace
+    /// initialization at runtime. Uses `std::sync::Mutex` — reads are
+    /// fast and non-contended.
+    pub(crate) single_file_failures: std::sync::Mutex<HashSet<(String, String)>>,
     logging: LoggingServer,
     fs: Arc<FilesystemManager>,
 }
@@ -109,6 +115,7 @@ impl LspClientManager {
             config,
             project_configs: std::sync::Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            single_file_failures: std::sync::Mutex::new(HashSet::new()),
             logging,
             fs,
         }
@@ -387,6 +394,29 @@ impl LspClientManager {
         }
     }
 
+    /// Returns whether any server for this language is configured for
+    /// single-file mode (`single_file = true` in `[server.*]`).
+    ///
+    /// Used by the hook layer to decide whether out-of-root edits
+    /// should be gated by `start_editing`. Servers that failed at
+    /// runtime (negative cache) are excluded.
+    #[must_use]
+    pub fn has_single_file_coverage(&self, lang: &str) -> bool {
+        let Some(lang_config) = self.config.resolve_language(lang) else {
+            return false;
+        };
+        let failures = self
+            .single_file_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lang_config.servers.iter().any(|binding| {
+            let Some(def) = self.config.server.get(&binding.name) else {
+                return false;
+            };
+            def.single_file && !failures.contains(&(lang.to_string(), binding.name.clone()))
+        })
+    }
+
     /// Returns the current workspace roots.
     pub fn roots(&self) -> Vec<PathBuf> {
         self.fs.roots()
@@ -533,6 +563,12 @@ impl LspClientManager {
             self.shutdown_root_instances(removed).await;
         }
 
+        // Shut down single-file servers and clear the cache — root
+        // changes may have brought previously-unrooted files into scope
+        // of workspace or per-root instances. Single-file servers are
+        // lazily re-spawned on the next request if still needed.
+        self.shutdown_single_file_instances().await;
+
         // Spawn instances for added roots.
         if !to_add.is_empty() {
             self.spawn_for_added_roots(&to_add).await;
@@ -573,56 +609,71 @@ impl LspClientManager {
             return Vec::new();
         };
 
-        // Resolve owning workspace root.
-        let Some(root) = self.fs.resolve_root(path) else {
-            return Vec::new();
-        };
-
         // Look up language config.
         let Some(lang_config) = self.config.resolve_language(&lang_id) else {
             return Vec::new();
         };
 
-        let clients = self.clients.lock().await;
-        let mut result = Vec::new();
+        // Resolve owning workspace root. If unrooted, fall through to
+        // tier 3 (single-file servers).
+        if let Some(root) = self.fs.resolve_root(path) {
+            // Tiers 1–2: rooted file lookup.
+            let clients = self.clients.lock().await;
+            let mut result = Vec::new();
 
+            for binding in &lang_config.servers {
+                let Some(server_def) = self.config.server.get(&binding.name) else {
+                    continue;
+                };
+                if !file_matches_patterns(path, &server_def.compiled_patterns) {
+                    continue;
+                }
+                let Some(client) = find_instance(&clients, &lang_id, &binding.name, &root) else {
+                    continue;
+                };
+                let locked = client.lock().await;
+                if !locked.is_alive() {
+                    continue;
+                }
+                if !capability(locked.server()) {
+                    continue;
+                }
+                drop(locked);
+                result.push(client);
+            }
+
+            if result.is_empty() && !lang_config.servers.is_empty() {
+                warn!(
+                    source = "lsp.routing",
+                    language = lang_id.as_str(),
+                    "No server supports the requested capability for {lang_id} files",
+                );
+            }
+
+            return result;
+        }
+
+        // Tier 3: single-file servers for unrooted files.
+        let mut result = Vec::new();
         for binding in &lang_config.servers {
-            // Look up the ServerDef for file_patterns.
             let Some(server_def) = self.config.server.get(&binding.name) else {
                 continue;
             };
-
-            // file_patterns filter: if non-empty, filename must match.
             if !file_matches_patterns(path, &server_def.compiled_patterns) {
                 continue;
             }
-
-            // Instance lookup: tries Root(root) then Workspace.
-            let Some(client) = find_instance(&clients, &lang_id, &binding.name, &root) else {
+            let Some(client) = self
+                .ensure_single_file_server(&lang_id, &binding.name)
+                .await
+            else {
                 continue;
             };
-
-            // Liveness check.
             let locked = client.lock().await;
-            if !locked.is_alive() {
-                continue;
-            }
-
-            // Capability check (conservatively false for uninitialized servers).
-            if !capability(locked.server()) {
+            if !locked.is_alive() || !capability(locked.server()) {
                 continue;
             }
             drop(locked);
-
             result.push(client);
-        }
-
-        if result.is_empty() && !lang_config.servers.is_empty() {
-            warn!(
-                source = "lsp.routing",
-                language = lang_id.as_str(),
-                "No server supports the requested capability for {lang_id} files",
-            );
         }
 
         result
@@ -634,6 +685,7 @@ impl LspClientManager {
     /// binding, waits for each to reach Ready or terminal state.
     /// Dead servers don't block — they return immediately. Servers
     /// that haven't been spawned yet are skipped (not spawned).
+    /// Unrooted files wait on single-file servers (tier 3).
     pub async fn wait_ready_for_path(&self, path: &Path) {
         // Detect language: primary (FilesystemManager) then fallback (raw extension).
         let Some(lang_id) = self.fs.language_id(path).or_else(|| {
@@ -644,24 +696,40 @@ impl LspClientManager {
             return;
         };
 
-        // Resolve owning workspace root — unrooted files skip waiting.
-        let Some(root) = self.fs.resolve_root(path) else {
-            return;
-        };
-
         // Look up language config — unconfigured languages skip.
         let Some(lang_config) = self.config.resolve_language(&lang_id) else {
             return;
         };
 
         // Collect matching instances under the lock, then release before waiting.
+        #[allow(
+            clippy::option_if_let_else,
+            reason = "if/else clearer than map_or_else here"
+        )]
         let to_wait: Vec<Arc<Mutex<LspClient>>> = {
             let clients = self.clients.lock().await;
-            lang_config
-                .servers
-                .iter()
-                .filter_map(|binding| find_instance(&clients, &lang_id, &binding.name, &root))
-                .collect()
+            if let Some(root) = self.fs.resolve_root(path) {
+                // Tiers 1–2: rooted file.
+                lang_config
+                    .servers
+                    .iter()
+                    .filter_map(|binding| find_instance(&clients, &lang_id, &binding.name, &root))
+                    .collect()
+            } else {
+                // Tier 3: single-file servers.
+                lang_config
+                    .servers
+                    .iter()
+                    .filter_map(|binding| {
+                        let sf_key = InstanceKey::new(
+                            lang_id.clone(),
+                            binding.name.clone(),
+                            Scope::SingleFile,
+                        );
+                        clients.get(&sf_key).cloned()
+                    })
+                    .collect()
+            }
         };
 
         for client_mutex in to_wait {
@@ -845,6 +913,133 @@ impl LspClientManager {
         drop(clients);
 
         Ok((key, client_mutex))
+    }
+
+    /// Spawns a single-file server with null workspace.
+    ///
+    /// Sends `initialize` with `rootUri: null` and
+    /// `workspaceFolders: null`. If the server initializes successfully,
+    /// inserts a `Scope::SingleFile` client. If initialization fails,
+    /// negative-caches the `(lang, server)` pair.
+    ///
+    /// Only call for servers with `single_file = true` in config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server definition is missing from config
+    /// or the server rejects null-workspace initialization.
+    async fn spawn_single_file(
+        &self,
+        server_name: &str,
+        lang: &str,
+    ) -> Result<Arc<Mutex<LspClient>>> {
+        let server_def = self
+            .config
+            .server
+            .get(server_name)
+            .ok_or_else(|| anyhow!("Server '{server_name}' not found in [server.*] config"))?
+            .clone();
+
+        let mut clients = self.clients.lock().await;
+
+        // Double-check: another task may have spawned while we waited.
+        let sf_key = InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::SingleFile);
+        if let Some(existing) = clients.get(&sf_key) {
+            if existing.lock().await.is_alive() {
+                return Ok(existing.clone());
+            }
+            anyhow::bail!("Single-file LSP server '{server_name}' ({lang}) is dead");
+        }
+
+        info!(
+            "Spawning single-file LSP server for {lang}: {} {}",
+            server_def.command,
+            server_def.args.join(" ")
+        );
+
+        let args: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
+        let mut client = LspClient::spawn(
+            &server_def.command,
+            &args,
+            lang,
+            server_name,
+            self.logging.clone(),
+            server_def.settings.clone(),
+            HashMap::new(),
+        )?;
+
+        // Initialize with null workspace (single-file mode per LSP spec).
+        if let Err(e) = client
+            .initialize(&[], server_def.initialization_options.clone())
+            .await
+        {
+            info!(
+                source = "lsp.lifecycle",
+                language = lang,
+                server = server_name,
+                "Server '{server_name}' rejected single-file mode: {e}",
+            );
+            self.single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((lang.to_string(), server_name.to_string()));
+            return Err(e);
+        }
+
+        client.server().set_scope(Scope::SingleFile);
+
+        let client_mutex = Arc::new(Mutex::new(client));
+        clients.insert(sf_key, client_mutex.clone());
+        drop(clients);
+
+        Ok(client_mutex)
+    }
+
+    /// Returns a single-file server for the given language and server,
+    /// spawning one if needed.
+    ///
+    /// Only considers servers with `single_file = true` in config.
+    /// Checks the negative cache first — if the server previously
+    /// rejected null-workspace initialization, returns `None` without
+    /// a spawn attempt. Returns `None` for dead servers (tombstones).
+    async fn ensure_single_file_server(
+        &self,
+        lang: &str,
+        server_name: &str,
+    ) -> Option<Arc<Mutex<LspClient>>> {
+        // Config gate: only servers with single_file = true.
+        let def = self.config.server.get(server_name)?;
+        if !def.single_file {
+            return None;
+        }
+
+        // Check negative cache.
+        {
+            let failures = self
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if failures.contains(&(lang.to_string(), server_name.to_string())) {
+                return None;
+            }
+        }
+
+        // Check for existing instance.
+        {
+            let clients = self.clients.lock().await;
+            let sf_key =
+                InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::SingleFile);
+            if let Some(existing) = clients.get(&sf_key) {
+                if existing.lock().await.is_alive() {
+                    return Some(existing.clone());
+                }
+                // Dead — don't retry.
+                return None;
+            }
+        }
+
+        // No failure and no existing instance — try to spawn.
+        self.spawn_single_file(server_name, lang).await.ok()
     }
 
     /// Get-then-spawn composition.
@@ -1067,6 +1262,21 @@ impl LspClientManager {
         self.clients.lock().await.clone()
     }
 
+    /// Returns a snapshot of rooted clients only (excluding single-file
+    /// servers).
+    ///
+    /// Single-file servers have no project context and are excluded from
+    /// workspace-wide fan-out operations (grep, workspace/symbol).
+    pub async fn rooted_clients(&self) -> HashMap<InstanceKey, Arc<Mutex<LspClient>>> {
+        self.clients
+            .lock()
+            .await
+            .iter()
+            .filter(|(k, _)| k.scope != Scope::SingleFile)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Returns status of all active servers.
     pub async fn all_server_status(&self) -> Vec<ServerStatus> {
         let clients = self.clients.lock().await.clone();
@@ -1116,6 +1326,38 @@ impl LspClientManager {
                 }
             }
         }
+    }
+
+    /// Shuts down all single-file server instances and clears the
+    /// single-file cache.
+    ///
+    /// Called when workspace roots change — previously-unrooted files may
+    /// now be covered by workspace or per-root instances. Single-file
+    /// servers are lazily re-spawned on the next request if still needed.
+    async fn shutdown_single_file_instances(&self) {
+        let mut clients = self.clients.lock().await;
+        let sf_keys: Vec<InstanceKey> = clients
+            .keys()
+            .filter(|k| k.scope == Scope::SingleFile)
+            .cloned()
+            .collect();
+        for key in sf_keys {
+            if let Some(client_mutex) = clients.remove(&key) {
+                info!("Shutting down single-file instance {}", key);
+                let mut client = client_mutex.lock().await;
+                if client.is_alive()
+                    && let Err(e) = client.shutdown().await
+                {
+                    info!("Failed to shutdown single-file instance {}: {}", key, e);
+                }
+            }
+        }
+        drop(clients);
+
+        self.single_file_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Spawns instances for newly added roots.
@@ -1187,6 +1429,10 @@ impl LspClientManager {
 
         let mut notified = 0u32;
         for (key, client_mutex) in &clients {
+            // Single-file servers have no project context — skip.
+            if key.scope == Scope::SingleFile {
+                continue;
+            }
             let client = client_mutex.lock().await;
             if !client.is_alive() {
                 continue;
@@ -1515,11 +1761,7 @@ mod tests {
             ServerDef {
                 command: bin.to_string_lossy().to_string(),
                 args: vec![MOCK_LANG_A.to_string()],
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         let mut language = HashMap::new();
@@ -1551,11 +1793,7 @@ mod tests {
             ServerDef {
                 command: bin.to_string_lossy().to_string(),
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         let mut language = HashMap::new();
@@ -1593,8 +1831,7 @@ mod tests {
                     initialization_options: None,
                     settings: None,
                     min_severity: None,
-                    file_patterns: Vec::new(),
-                    compiled_patterns: Vec::new(),
+                    ..ServerDef::default()
                 },
             );
         }
@@ -1633,8 +1870,7 @@ mod tests {
                     initialization_options: None,
                     settings: None,
                     min_severity: None,
-                    file_patterns: Vec::new(),
-                    compiled_patterns: Vec::new(),
+                    ..ServerDef::default()
                 },
             );
         }
@@ -1669,11 +1905,7 @@ mod tests {
             ServerDef {
                 command: bin.to_string_lossy().to_string(),
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         server.insert(
@@ -1681,11 +1913,7 @@ mod tests {
             ServerDef {
                 command: bin.to_string_lossy().to_string(),
                 args: vec![MOCK_LANG_A.to_string()],
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         let mut language = HashMap::new();
@@ -1870,11 +2098,8 @@ mod tests {
                     MOCK_LANG_A.to_string(),
                     "--send-configuration-request".to_string(),
                 ],
-                initialization_options: None,
                 settings: Some(serde_json::json!({"mockls": {"key": "value"}})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         let mut language = HashMap::new();
@@ -2651,6 +2876,7 @@ mod tests {
                 compiled_patterns: vec![
                     crate::lsp::glob::LspGlob::new(&pattern).expect("valid glob"),
                 ],
+                ..ServerDef::default()
             },
         );
         let mut language = HashMap::new();
@@ -2706,6 +2932,7 @@ mod tests {
                 compiled_patterns: vec![
                     crate::lsp::glob::LspGlob::new(&pattern).expect("valid glob"),
                 ],
+                ..ServerDef::default()
             },
         );
         let mut language = HashMap::new();
@@ -2760,6 +2987,7 @@ mod tests {
                 compiled_patterns: vec![
                     crate::lsp::glob::LspGlob::new(&pattern).expect("valid glob"),
                 ],
+                ..ServerDef::default()
             },
         );
         let mut language = HashMap::new();
@@ -2836,9 +3064,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_servers_outside_roots() {
+    async fn test_get_servers_outside_roots_spawns_single_file() {
+        // Files outside all roots get a single-file server (tier 3)
+        // when the server is configured with single_file = true.
         let manager = LspClientManager::new(
-            mockls_config(),
+            mockls_single_file_config(),
             test_logging(),
             test_fs_with_roots(&["/tmp"]),
         );
@@ -2847,7 +3077,20 @@ mod tests {
         let servers = manager
             .get_servers(&path, LspServer::supports_document_symbols)
             .await;
-        assert!(servers.is_empty(), "file outside roots should return empty");
+        assert_eq!(
+            servers.len(),
+            1,
+            "file outside roots should get single-file server"
+        );
+
+        // Verify it's a SingleFile instance.
+        let clients = manager.clients().await;
+        assert!(
+            clients
+                .keys()
+                .any(|k| k.scope == Scope::SingleFile && k.language_id == MOCK_LANG_A),
+            "should have a single-file instance"
+        );
     }
 
     #[tokio::test]
@@ -3544,11 +3787,8 @@ mod tests {
             ServerDef {
                 command: String::new(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"key": "value"})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         manager
@@ -3576,11 +3816,8 @@ mod tests {
             ServerDef {
                 command: "rust-analyzer".to_string(),
                 args: vec!["--log-level".to_string(), "info".to_string()],
-                initialization_options: None,
                 settings: Some(serde_json::json!({"check": {"command": "clippy"}, "cargo": {"features": ["a"]}})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -3594,11 +3831,8 @@ mod tests {
             ServerDef {
                 command: String::new(), // empty = inherit from user
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"check": {"command": "check"}, "new_key": true})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         manager
@@ -3630,11 +3864,8 @@ mod tests {
             ServerDef {
                 command: "rust-analyzer".to_string(),
                 args: vec!["--log-level".to_string(), "info".to_string()],
-                initialization_options: None,
                 settings: Some(serde_json::json!({"key": "user"})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -3647,11 +3878,9 @@ mod tests {
             ServerDef {
                 command: "custom-ra".to_string(),
                 args: vec!["--custom".to_string()],
-                initialization_options: None,
                 settings: Some(serde_json::json!({"key": "project"})),
                 min_severity: Some("warning".to_string()),
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         manager
@@ -3678,11 +3907,8 @@ mod tests {
             ServerDef {
                 command: "rust-analyzer".to_string(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"key": "user"})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -3705,11 +3931,8 @@ mod tests {
             ServerDef {
                 command: "ra".to_string(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"a": 1, "b": {"c": 2}})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -3722,11 +3945,8 @@ mod tests {
             ServerDef {
                 command: String::new(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"b": {"d": 3}})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         manager
@@ -3751,11 +3971,8 @@ mod tests {
             ServerDef {
                 command: "ra".to_string(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"base": true})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -3770,11 +3987,8 @@ mod tests {
             ServerDef {
                 command: String::new(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"override_a": true})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         // root_b has project config but no settings for "ra"
@@ -3806,11 +4020,7 @@ mod tests {
             ServerDef {
                 command: "ra".to_string(),
                 args: Vec::new(),
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -3964,11 +4174,8 @@ mod tests {
             ServerDef {
                 command: bin.to_string_lossy().to_string(),
                 args: vec![MOCK_LANG_A.to_string()],
-                initialization_options: None,
                 settings: Some(serde_json::json!({"user_key": true})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         config.language.insert(
@@ -3995,11 +4202,8 @@ mod tests {
             ServerDef {
                 command: String::new(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"project_key": true})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         manager
@@ -4335,11 +4539,8 @@ mod tests {
             ServerDef {
                 command: String::new(),
                 args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"override": true})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         manager
@@ -4427,6 +4628,392 @@ mod tests {
         Ok(())
     }
 
+    /// Config with mockls that accepts null-workspace (single-file mode).
+    fn mockls_single_file_config() -> Config {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-sf");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                single_file: true,
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
+            },
+        );
+        Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        }
+    }
+
+    /// Config with mockls that rejects null-workspace initialization.
+    fn mockls_reject_null_workspace_config() -> Config {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-rnw");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                command: bin.to_string_lossy().to_string(),
+                args: vec![
+                    MOCK_LANG_A.to_string(),
+                    "--reject-null-workspace".to_string(),
+                ],
+                single_file: true,
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(server_name)],
+                ..LanguageConfig::default()
+            },
+        );
+        Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tui: None,
+            tools: None,
+            resolved_commands: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_file_spawn_accepts_null_workspace() -> Result<()> {
+        // mockls without --reject-null-workspace accepts single-file mode.
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let client = manager.spawn_single_file(&server_name, MOCK_LANG_A).await?;
+        assert!(client.lock().await.is_alive());
+
+        // Verify scope is SingleFile.
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1);
+        let key = clients.keys().next().expect("should have one client");
+        assert_eq!(key.scope, Scope::SingleFile);
+        assert_eq!(key.language_id, MOCK_LANG_A);
+
+        // No failure should be cached (server accepted).
+        assert!(
+            !manager
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&(MOCK_LANG_A.to_string(), server_name)),
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_single_file_spawn_rejects_null_workspace() -> Result<()> {
+        // mockls with --reject-null-workspace rejects single-file mode.
+        let config = mockls_reject_null_workspace_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let result = manager.spawn_single_file(&server_name, MOCK_LANG_A).await;
+        assert!(result.is_err(), "Should fail with null workspace rejection");
+
+        // Negative cache should be set.
+        assert!(
+            manager
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&(MOCK_LANG_A.to_string(), server_name)),
+        );
+
+        // No client should be stored.
+        assert!(manager.clients().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_single_file_negative_cache_prevents_retry() -> Result<()> {
+        // After negative cache, ensure_single_file_server returns None
+        // without attempting to spawn.
+        let config = mockls_reject_null_workspace_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        // First attempt — spawns and fails.
+        let first = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_name)
+            .await;
+        assert!(first.is_none());
+
+        // Second attempt — should return None from cache without spawning.
+        let second = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_name)
+            .await;
+        assert!(second.is_none());
+
+        // Still no clients.
+        assert!(manager.clients().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_single_file_positive_cache_returns_same_handle() -> Result<()> {
+        // After positive spawn, ensure_single_file_server returns the
+        // same handle on subsequent calls.
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let first = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_name)
+            .await
+            .expect("should spawn");
+        let second = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_name)
+            .await
+            .expect("should return cached");
+
+        assert!(Arc::ptr_eq(&first, &second), "Should be the same handle");
+        assert_eq!(manager.clients().await.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_falls_through_to_single_file() -> Result<()> {
+        // File outside all roots → tier 3 single-file server spawned.
+        let config = mockls_single_file_config();
+
+        // No roots — every file is unrooted.
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let path = PathBuf::from(format!("/some/random/file.{MOCK_LANG_A}"));
+        let servers = manager.get_servers(&path, LspServer::supports_hover).await;
+        assert_eq!(servers.len(), 1, "Should have spawned a single-file server");
+
+        // Verify it's a SingleFile instance.
+        let clients = manager.clients().await;
+        let key = clients.keys().next().expect("should have one client");
+        assert_eq!(key.scope, Scope::SingleFile);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_unrooted_rejects_returns_empty() -> Result<()> {
+        // File outside all roots, server rejects null workspace → empty.
+        let config = mockls_reject_null_workspace_config();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let path = PathBuf::from(format!("/some/random/file.{MOCK_LANG_A}"));
+        let servers = manager.get_servers(&path, LspServer::supports_hover).await;
+        assert!(
+            servers.is_empty(),
+            "Should return empty when server rejects"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rooted_clients_excludes_single_file() -> Result<()> {
+        // rooted_clients() should not include single-file servers.
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers[0]
+            .name
+            .clone();
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let _ = manager.spawn_single_file(&server_name, MOCK_LANG_A).await?;
+        assert_eq!(manager.clients().await.len(), 1);
+        assert!(
+            manager.rooted_clients().await.is_empty(),
+            "Single-file servers should be excluded from rooted_clients"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_single_file_root_added_routes_to_workspace() -> Result<()> {
+        // After a root is added for a path previously served by a
+        // single-file server, get_servers routes to the workspace instance.
+        // sync_roots cleans up single-file servers.
+        let config = mockls_single_file_config();
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let file_path = root.path().join(format!("test.{MOCK_LANG_A}"));
+        std::fs::write(&file_path, "content").expect("write");
+
+        // Start with no roots — file gets single-file server.
+        let fs = test_fs();
+        let manager = LspClientManager::new(config, test_logging(), fs.clone());
+
+        let servers = manager
+            .get_servers(&file_path, LspServer::supports_hover)
+            .await;
+        assert_eq!(servers.len(), 1);
+
+        // Verify single-file instance exists.
+        assert_eq!(
+            count_scope(&manager.clients().await, MOCK_LANG_A, "single_file"),
+            1
+        );
+
+        // Add the root via sync_roots — this shuts down single-file
+        // instances and clears failure cache.
+        manager.sync_roots(vec![root.path().to_path_buf()]).await?;
+
+        // Single-file instance should be cleaned up.
+        assert_eq!(
+            count_scope(&manager.clients().await, MOCK_LANG_A, "single_file"),
+            0,
+            "Single-file server should be shut down after root added"
+        );
+
+        // Failure cache should be cleared.
+        assert!(
+            manager
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "Failure cache should be cleared after sync_roots"
+        );
+
+        // Spawn the rooted server and verify get_servers routes there.
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let servers = manager
+            .get_servers(&file_path, LspServer::supports_hover)
+            .await;
+        assert_eq!(servers.len(), 1);
+
+        // The returned client should be rooted, not single-file.
+        let clients = manager.clients().await;
+        assert!(
+            clients.keys().all(|k| k.scope != Scope::SingleFile),
+            "No single-file instances should remain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_single_file_different_languages_independent() -> Result<()> {
+        // Two different languages outside roots → independent single-file
+        // servers with independent cache entries.
+        let bin = mockls_bin();
+        let lang_b = "qR7bZ";
+        let server_a = format!("mockls-{MOCK_LANG_A}-sf2");
+        let server_b = format!("mockls-{lang_b}-sf2");
+        let mut config = test_config();
+        for (name, lang) in [(&server_a, MOCK_LANG_A), (&server_b, lang_b)] {
+            config.server.insert(
+                name.clone(),
+                ServerDef {
+                    command: bin.to_string_lossy().to_string(),
+                    args: vec![lang.to_string()],
+                    initialization_options: None,
+                    settings: None,
+                    min_severity: None,
+                    single_file: true,
+                    file_patterns: Vec::new(),
+                    compiled_patterns: Vec::new(),
+                },
+            );
+            config.language.insert(
+                lang.to_string(),
+                LanguageConfig {
+                    servers: vec![ServerBinding::new(name.clone())],
+                    ..LanguageConfig::default()
+                },
+            );
+        }
+
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        // Spawn single-file for language A.
+        let client_a = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_a)
+            .await
+            .expect("should spawn for lang A");
+        assert!(client_a.lock().await.is_alive());
+
+        // Spawn single-file for language B.
+        let client_b = manager
+            .ensure_single_file_server(lang_b, &server_b)
+            .await
+            .expect("should spawn for lang B");
+        assert!(client_b.lock().await.is_alive());
+
+        // Should be different instances.
+        assert!(!Arc::ptr_eq(&client_a, &client_b));
+        assert_eq!(manager.clients().await.len(), 2);
+
+        // Neither should be in the failure cache.
+        assert!(
+            manager
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_did_change_configuration_notification() -> Result<()> {
         // did_change_configuration sends notification with empty settings.
@@ -4442,11 +5029,8 @@ mod tests {
                     MOCK_LANG_A.to_string(),
                     "--send-configuration-request".to_string(),
                 ],
-                initialization_options: None,
                 settings: Some(serde_json::json!({"key": "value"})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         config.language.insert(

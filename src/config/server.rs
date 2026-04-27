@@ -13,9 +13,10 @@ use crate::lsp::glob::LspGlob;
 /// Defined in `[server.*]` config sections, referenced by name from
 /// `[language.*]` entries. This is adapter-level config consumed by
 /// the LSP client layer — the routing core never sees it directly.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct ServerDef {
     /// The command to execute (e.g., "rust-analyzer", "clangd").
+    #[serde(default)]
     pub command: String,
 
     /// Arguments to pass to the command.
@@ -36,6 +37,16 @@ pub struct ServerDef {
     /// When absent, all severities are delivered.
     #[serde(default)]
     pub min_severity: Option<String>,
+
+    /// Whether this server supports single-file mode (tier 3).
+    ///
+    /// When `true`, the server may be spawned with `rootUri: null` and
+    /// `workspaceFolders: null` for files outside all workspace roots.
+    /// Servers like `bash-language-server` work well without a project
+    /// root; servers like `rust-analyzer` require one and should leave
+    /// this `false` (the default).
+    #[serde(default)]
+    pub single_file: bool,
 
     /// Glob patterns to filter which files this server handles
     /// within its language. Matched against the filename (not path).

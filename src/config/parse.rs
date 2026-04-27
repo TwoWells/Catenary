@@ -350,11 +350,7 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                     ServerDef {
                         command: program.to_string(),
                         args: cmd_args,
-                        initialization_options: None,
-                        settings: None,
-                        min_severity: None,
-                        file_patterns: Vec::new(),
-                        compiled_patterns: Vec::new(),
+                        ..ServerDef::default()
                     },
                     LanguageConfig {
                         servers: vec![ServerBinding::new(server_name)],

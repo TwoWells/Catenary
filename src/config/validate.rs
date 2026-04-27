@@ -153,11 +153,7 @@ mod tests {
             ServerDef {
                 command: "unused-server-bin".to_string(),
                 args: Vec::new(),
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -177,13 +173,8 @@ mod tests {
         project.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: String::new(), // settings-only
-                args: Vec::new(),
-                initialization_options: None,
                 settings: Some(serde_json::json!({"key": "value"})),
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 
@@ -203,11 +194,7 @@ mod tests {
             ServerDef {
                 command: "my-server-bin".to_string(),
                 args: Vec::new(),
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
         project.language.insert(
@@ -233,11 +220,7 @@ mod tests {
             ServerDef {
                 command: "custom-ra".to_string(),
                 args: Vec::new(),
-                initialization_options: None,
-                settings: None,
-                min_severity: None,
-                file_patterns: Vec::new(),
-                compiled_patterns: Vec::new(),
+                ..ServerDef::default()
             },
         );
 

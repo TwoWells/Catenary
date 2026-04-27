@@ -184,6 +184,39 @@ Here, `termux-ls` only receives PKGBUILD and `*.ebuild` files.
 For a PKGBUILD file, both servers are active — `termux-ls` is tried
 first (higher priority), with `bash-ls` as fallback.
 
+### Single-file Mode
+
+`single_file = true` on `[server.*]` enables tier 3 routing: files
+outside all workspace roots get a dedicated server instance with
+`rootUri: null` and `workspaceFolders: null` (per the LSP spec's
+single-file semantics). The server operates on individual documents
+without workspace context.
+
+```toml
+[server.bash-ls]
+command = "bash-language-server"
+args = ["start"]
+single_file = true
+```
+
+Servers configured with `single_file = true` also gate out-of-root
+edits with `start_editing`/`done_editing`, so agents receive diagnostics
+for files outside the workspace. If the server rejects null-workspace
+initialization at runtime, the failure is cached and the server is not
+retried for the remainder of the session.
+
+Default is `false`. Servers that require a project root (Cargo.toml,
+tsconfig.json, etc.) should leave this unset.
+
+**Why config-driven, not auto-detected?** The LSP spec allows `rootUri`
+to be null, and most servers accept it — but "accepts initialization"
+doesn't mean "works well." `rust-analyzer` initialises with null
+workspace and enters detached-file mode, but provides heavily degraded
+results. `bash-language-server` works fine. There is no LSP capability
+flag that distinguishes these cases. Neovim's `nvim-lspconfig` uses the
+same approach: a per-server `single_file_support` flag, opt-in, set by
+the server config maintainers who know which servers handle it well.
+
 ### Custom Languages
 
 Define a custom language by adding a `[language.*]` entry with

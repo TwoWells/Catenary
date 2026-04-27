@@ -39,7 +39,14 @@ pub fn initialize(
     roots: &[(&str, &str)],
     initialization_options: Option<&Value>,
 ) -> Value {
-    let workspace_folders = folder_array(roots);
+    // Per the LSP spec: null workspaceFolders means "single file open,
+    // no workspace." An empty array means "workspace open, no folders
+    // configured." Use null for single-file mode.
+    let workspace_folders: Value = if roots.is_empty() {
+        Value::Null
+    } else {
+        json!(folder_array(roots))
+    };
     let root_uri = roots.first().map_or(Value::Null, |(uri, _)| json!(uri));
 
     let mut params = json!({

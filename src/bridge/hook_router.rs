@@ -257,9 +257,13 @@ impl HookRouter {
                 ))
             }
         } else if is_edit_tool(tool_name) {
-            // Files outside workspace roots are not Catenary's concern — no
-            // diagnostics will be produced, so the editing gate is pointless.
-            if file_path.is_some_and(|p| !self.toolbox.is_within_roots(Path::new(p))) {
+            // Skip the editing gate for files without known LSP coverage.
+            // In-root files always have coverage. Out-of-root files have
+            // coverage only after a single-file server has successfully
+            // initialized (positive cache). Files with no cache entry or
+            // a negative cache entry skip the gate — no diagnostics would
+            // be produced, so requiring start_editing is pointless.
+            if file_path.is_some_and(|p| !self.toolbox.has_lsp_coverage(Path::new(p))) {
                 return None;
             }
             Some(HookResult::Deny("call start_editing before editing".into()))
@@ -281,11 +285,11 @@ impl HookRouter {
         tool_name: Option<&str>,
     ) -> Option<HookResult> {
         if self.toolbox.editing.is_editing(agent_id) && tool_name.is_some_and(is_edit_tool) {
-            // Only accumulate files within workspace roots — files outside
-            // roots have no LSP coverage, so processing them in done_editing
-            // is wasted work.
+            // Only accumulate files with known LSP coverage — files
+            // without coverage have no server to produce diagnostics,
+            // so processing them in done_editing is wasted work.
             let path = Path::new(file_path);
-            if self.toolbox.is_within_roots(path) {
+            if self.toolbox.has_lsp_coverage(path) {
                 self.toolbox
                     .editing
                     .add_file(agent_id, PathBuf::from(file_path));
@@ -617,6 +621,166 @@ mod tests {
         router.handle_file_accumulation(&in_root, "", Some("Edit"));
         let files = router.toolbox.editing.drain_files("");
         assert_eq!(files.len(), 1, "in-root file should be accumulated");
+    }
+
+    // ── Single-file cache scope boundary tests ─────────────────────────
+
+    /// Fake language ID matching the manager tests. Files with extension
+    /// `.yX4Za` resolve to this via the raw-extension fallback in
+    /// `language_id()`.
+    const SF_LANG: &str = "yX4Za";
+    const SF_SERVER: &str = "mockls-sf";
+
+    /// Build a config with a single language+server for single-file
+    /// cache tests. No real LSP binary needed — these tests only check
+    /// cache-driven routing in the hook layer.
+    fn sf_test_config() -> Config {
+        use crate::config::{LanguageConfig, ServerBinding, ServerDef};
+
+        let mut config = Config::default();
+        config.server.insert(
+            SF_SERVER.to_string(),
+            ServerDef {
+                command: "mockls".to_string(),
+                args: vec![SF_LANG.to_string()],
+                initialization_options: None,
+                settings: None,
+                min_severity: None,
+                single_file: true,
+                file_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+            },
+        );
+        config.language.insert(
+            SF_LANG.to_string(),
+            LanguageConfig {
+                servers: vec![ServerBinding::new(SF_SERVER.to_string())],
+                ..LanguageConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Create a `HookRouter` with `single_file = true` in config.
+    /// When `failed` is true, injects a negative-cache entry so the
+    /// server appears to have rejected null-workspace initialization.
+    fn test_router_with_sf_config(failed: bool) -> TestHookRouter {
+        let (dir, _path, conn) = test_db();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let config = sf_test_config();
+        let logging = crate::logging::LoggingServer::new();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = runtime.handle().clone();
+
+        let instance_id: Arc<str> = "test-session".into();
+        let toolbox = Arc::new(Toolbox::new(
+            config,
+            vec![],
+            logging,
+            conn.clone(),
+            instance_id.clone(),
+            handle,
+        ));
+
+        if failed {
+            toolbox
+                .client_manager
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((SF_LANG.to_string(), SF_SERVER.to_string()));
+        }
+
+        let refresh_roots = Arc::new(AtomicBool::new(false));
+        let router = HookRouter::new(
+            toolbox,
+            refresh_roots,
+            conn,
+            instance_id,
+            "test".to_string(),
+        );
+
+        TestHookRouter {
+            _dir: dir,
+            _runtime: runtime,
+            router,
+        }
+    }
+
+    #[test]
+    fn test_enforce_editing_gates_out_of_root_with_single_file_config() {
+        // single_file = true, no failure → server expected to work → gate.
+        let router = test_router_with_sf_config(false);
+        let path = format!("/outside/file.{SF_LANG}");
+        let result = router.handle_enforce_editing("Edit", Some(&path), None, "");
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("expected Deny for single_file out-of-root edit, got {result:?}");
+        };
+        assert!(reason.contains("start_editing"));
+    }
+
+    #[test]
+    fn test_enforce_editing_skips_out_of_root_with_runtime_failure() {
+        // single_file = true but server rejected at runtime → skip gate.
+        let router = test_router_with_sf_config(true);
+        let path = format!("/outside/file.{SF_LANG}");
+        let result = router.handle_enforce_editing("Edit", Some(&path), None, "");
+        assert!(
+            result.is_none(),
+            "runtime-failed out-of-root edit should be allowed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_enforce_editing_skips_out_of_root_without_single_file_config() {
+        // No single_file config at all → skip gate.
+        let router = test_router();
+        let result = router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, "");
+        assert!(
+            result.is_none(),
+            "out-of-root edit without single_file config should be allowed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_file_accumulation_includes_out_of_root_with_single_file_config() {
+        // single_file = true, no failure → file should be accumulated.
+        let router = test_router_with_sf_config(false);
+        router.handle_enforce_editing(START_EDITING, None, None, "");
+
+        let path = format!("/outside/file.{SF_LANG}");
+        router.handle_file_accumulation(&path, "", Some("Edit"));
+        let files = router.toolbox.editing.drain_files("");
+        assert_eq!(
+            files.len(),
+            1,
+            "single_file out-of-root file should be accumulated"
+        );
+    }
+
+    #[test]
+    fn test_file_accumulation_skips_out_of_root_with_runtime_failure() {
+        // single_file = true but runtime failure → file should NOT be accumulated.
+        let router = test_router_with_sf_config(true);
+        router.handle_enforce_editing(START_EDITING, None, None, "");
+
+        let path = format!("/outside/file.{SF_LANG}");
+        router.handle_file_accumulation(&path, "", Some("Edit"));
+        let files = router.toolbox.editing.drain_files("");
+        assert!(
+            files.is_empty(),
+            "runtime-failed out-of-root file should not be accumulated"
+        );
     }
 
     // ── Filesystem Bash allowlist tests ──────────────────────────────────

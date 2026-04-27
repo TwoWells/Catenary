@@ -188,6 +188,12 @@ struct Args {
     /// files before settling (batch: "N open" vs sequential: "1 open").
     #[arg(long)]
     report_open_count: bool,
+
+    /// Reject initialization when no workspace root is provided (rootUri
+    /// is null and workspaceFolders is empty). Returns an `InitializeError`
+    /// to test single-file mode negative caching.
+    #[arg(long)]
+    reject_null_workspace: bool,
 }
 
 /// A JSON-RPC request.
@@ -436,6 +442,27 @@ impl MockServer {
                 if let Some(ref path) = self.args.log_init_params {
                     let json = serde_json::to_string_pretty(&request.params).unwrap_or_default();
                     let _ = std::fs::write(path, json);
+                }
+                // Reject null-workspace initialization if configured.
+                if self.args.reject_null_workspace {
+                    let root_null = request.params.get("rootUri").is_none_or(Value::is_null);
+                    let folders_empty = request
+                        .params
+                        .get("workspaceFolders")
+                        .and_then(Value::as_array)
+                        .is_none_or(Vec::is_empty);
+                    if root_null && folders_empty {
+                        self.send_response(&Response {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32002,
+                                message: "mockls: workspace root required".to_string(),
+                            }),
+                        });
+                        return;
+                    }
                 }
                 Some(self.handle_initialize(&request.params))
             }
@@ -2323,6 +2350,7 @@ mod tests {
             watcher_glob: "**/*".to_string(),
             watcher_kind: None,
             report_open_count: false,
+            reject_null_workspace: false,
         }
     }
 

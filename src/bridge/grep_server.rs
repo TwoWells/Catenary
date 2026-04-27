@@ -127,8 +127,10 @@ impl ToolServer for GrepServer {
         self.client_manager.wait_ready_all().await;
 
         // Collect dead languages so the pipeline can skip prepareRename for them.
+        // Exclude single-file servers — they have no project context for
+        // workspace-wide search.
         let mut dead_languages: HashSet<String> = HashSet::new();
-        let clients = self.client_manager.clients().await;
+        let clients = self.client_manager.rooted_clients().await;
         for (key, client_mutex) in &clients {
             if !client_mutex.lock().await.is_alive() {
                 debug!(
