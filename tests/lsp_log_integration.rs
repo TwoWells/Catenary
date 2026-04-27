@@ -129,28 +129,28 @@ async fn test_lsp_log_request_response() -> Result<()> {
     client
         .did_open(&uri, MOCK_LANG_A, 1, "let MY_VAR\n")
         .await?;
-    let _hover = client.hover(&uri, 0, 4).await?;
+    let _def = client.definition(&uri, 0, 4).await?;
 
     let msgs = query_messages(&conn);
-    let hover_msgs: Vec<&MsgRow> = msgs
+    let def_msgs: Vec<&MsgRow> = msgs
         .iter()
-        .filter(|m| m.method == "textDocument/hover")
+        .filter(|m| m.method == "textDocument/definition")
         .collect();
 
     assert!(
-        hover_msgs.len() >= 2,
-        "expected at least 2 hover messages (request + response), got {}",
-        hover_msgs.len()
+        def_msgs.len() >= 2,
+        "expected at least 2 definition messages (request + response), got {}",
+        def_msgs.len()
     );
 
     // All should be "lsp" type
-    for m in &hover_msgs {
+    for m in &def_msgs {
         assert_eq!(m.r#type, "lsp");
     }
 
     // Both request and response carry the same correlation ID as request_id
-    let request = hover_msgs[0];
-    let response = hover_msgs[1];
+    let request = def_msgs[0];
+    let response = def_msgs[1];
     assert!(
         request.request_id.is_some(),
         "request should have a correlation ID as request_id"
@@ -242,24 +242,24 @@ async fn test_lsp_log_parent_id() -> Result<()> {
     let parent_id = 42_i64;
     client.set_parent_id(Some(parent_id));
 
-    let _hover = client.hover(&uri, 0, 4).await?;
+    let _def = client.definition(&uri, 0, 4).await?;
 
     let msgs = query_messages(&conn);
-    let hover_msgs: Vec<&MsgRow> = msgs
+    let def_msgs: Vec<&MsgRow> = msgs
         .iter()
-        .filter(|m| m.method == "textDocument/hover")
+        .filter(|m| m.method == "textDocument/definition")
         .collect();
 
     assert!(
-        hover_msgs.len() >= 2,
-        "expected at least 2 hover messages (request + response), got {}",
-        hover_msgs.len(),
+        def_msgs.len() >= 2,
+        "expected at least 2 definition messages (request + response), got {}",
+        def_msgs.len(),
     );
 
     // Request carries the MCP parent_id
-    assert_eq!(hover_msgs[0].parent_id, Some(parent_id));
+    assert_eq!(def_msgs[0].parent_id, Some(parent_id));
     // Response parent_id is the correlation ID (self-referential pair)
-    assert_eq!(hover_msgs[1].parent_id, hover_msgs[1].request_id);
+    assert_eq!(def_msgs[1].parent_id, def_msgs[1].request_id);
 
     Ok(())
 }
@@ -278,20 +278,23 @@ async fn test_lsp_log_pending_method_annotation() -> Result<()> {
     client
         .did_open(&uri, MOCK_LANG_A, 1, "let MY_VAR\n")
         .await?;
-    let _hover = client.hover(&uri, 0, 4).await?;
+    let _def = client.definition(&uri, 0, 4).await?;
 
     let msgs = query_messages(&conn);
-    let hover_msgs: Vec<&MsgRow> = msgs
+    let def_msgs: Vec<&MsgRow> = msgs
         .iter()
-        .filter(|m| m.method == "textDocument/hover")
+        .filter(|m| m.method == "textDocument/definition")
         .collect();
 
-    assert!(hover_msgs.len() >= 2, "expected at least 2 hover messages");
+    assert!(
+        def_msgs.len() >= 2,
+        "expected at least 2 definition messages"
+    );
 
-    // The response (second message) should have method="textDocument/hover"
+    // The response (second message) should have method="textDocument/definition"
     // even though JSON-RPC responses don't carry a method field.
     assert_eq!(
-        hover_msgs[1].method, "textDocument/hover",
+        def_msgs[1].method, "textDocument/definition",
         "response should be annotated with the request method from the pending map"
     );
 

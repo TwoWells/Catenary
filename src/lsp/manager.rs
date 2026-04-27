@@ -3102,7 +3102,7 @@ mod tests {
         );
 
         let servers = manager
-            .get_servers(Path::new("/tmp/test.xyz"), LspServer::supports_hover)
+            .get_servers(Path::new("/tmp/test.xyz"), LspServer::supports_references)
             .await;
         assert!(servers.is_empty(), "unknown language should return empty");
     }
@@ -4835,7 +4835,9 @@ mod tests {
         let manager = LspClientManager::new(config, test_logging(), test_fs());
 
         let path = PathBuf::from(format!("/some/random/file.{MOCK_LANG_A}"));
-        let servers = manager.get_servers(&path, LspServer::supports_hover).await;
+        let servers = manager
+            .get_servers(&path, LspServer::supports_references)
+            .await;
         assert_eq!(servers.len(), 1, "Should have spawned a single-file server");
 
         // Verify it's a SingleFile instance.
@@ -4854,7 +4856,9 @@ mod tests {
         let manager = LspClientManager::new(config, test_logging(), test_fs());
 
         let path = PathBuf::from(format!("/some/random/file.{MOCK_LANG_A}"));
-        let servers = manager.get_servers(&path, LspServer::supports_hover).await;
+        let servers = manager
+            .get_servers(&path, LspServer::supports_references)
+            .await;
         assert!(
             servers.is_empty(),
             "Should return empty when server rejects"
@@ -4902,7 +4906,7 @@ mod tests {
         let manager = LspClientManager::new(config, test_logging(), fs.clone());
 
         let servers = manager
-            .get_servers(&file_path, LspServer::supports_hover)
+            .get_servers(&file_path, LspServer::supports_references)
             .await;
         assert_eq!(servers.len(), 1);
 
@@ -4936,7 +4940,7 @@ mod tests {
         // Spawn the rooted server and verify get_servers routes there.
         let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
         let servers = manager
-            .get_servers(&file_path, LspServer::supports_hover)
+            .get_servers(&file_path, LspServer::supports_references)
             .await;
         assert_eq!(servers.len(), 1);
 

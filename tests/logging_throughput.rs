@@ -134,8 +134,8 @@ async fn bench_lsp_message_throughput() -> Result<()> {
     let rounds = 100;
     let start = Instant::now();
     for _ in 0..rounds {
-        let _hover = client.hover(&uri, 0, 4).await?;
         let _def = client.definition(&uri, 0, 4).await?;
+        let _refs = client.references(&uri, 0, 4, true).await?;
     }
     let elapsed = start.elapsed();
 

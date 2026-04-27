@@ -231,31 +231,31 @@ async fn lsp_request_scope_chain() -> Result<()> {
     let mcp_correlation = server.next_id();
     client.set_parent_id(Some(mcp_correlation.0));
 
-    let _hover = client.hover(&uri, 0, 4).await?;
+    let _def = client.definition(&uri, 0, 4).await?;
 
     let msgs = query_messages(&db);
-    let hover_msgs: Vec<&MsgRow> = msgs
+    let def_msgs: Vec<&MsgRow> = msgs
         .iter()
-        .filter(|m| m.method == "textDocument/hover")
+        .filter(|m| m.method == "textDocument/definition")
         .collect();
 
     assert!(
-        hover_msgs.len() >= 2,
+        def_msgs.len() >= 2,
         "expected request + response, got {}",
-        hover_msgs.len()
+        def_msgs.len()
     );
 
     // Request carries the MCP parent_id.
     assert_eq!(
-        hover_msgs[0].parent_id,
+        def_msgs[0].parent_id,
         Some(mcp_correlation.0),
         "request parent_id should be the MCP correlation ID"
     );
 
     // Both carry the same request_id (pair-merge key).
-    assert!(hover_msgs[0].request_id.is_some());
+    assert!(def_msgs[0].request_id.is_some());
     assert_eq!(
-        hover_msgs[0].request_id, hover_msgs[1].request_id,
+        def_msgs[0].request_id, def_msgs[1].request_id,
         "request and response should share request_id"
     );
 

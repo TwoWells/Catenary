@@ -467,17 +467,6 @@ impl LspClient {
         .await
     }
 
-    /// Gets hover information (signature, documentation) for a position.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or times out.
-    pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
-        self.require_capability("textDocument/hover", LspServer::supports_hover)?;
-        self.request("textDocument/hover", params::hover(uri, line, character))
-            .await
-    }
-
     /// Tests whether a position is a renameable symbol.
     ///
     /// Returns a non-null `Value` for symbols, `Value::Null` for keywords

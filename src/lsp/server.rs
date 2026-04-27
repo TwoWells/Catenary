@@ -44,7 +44,6 @@ pub struct LspServer {
 
     supports_pull_diagnostics: AtomicBool,
     supports_text_document_sync: OnceLock<bool>,
-    supports_hover: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
     supports_references: OnceLock<bool>,
     supports_document_symbols: OnceLock<bool>,
@@ -143,7 +142,6 @@ impl LspServer {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
             supports_text_document_sync: OnceLock::new(),
-            supports_hover: OnceLock::new(),
             supports_definition: OnceLock::new(),
             supports_references: OnceLock::new(),
             supports_document_symbols: OnceLock::new(),
@@ -314,7 +312,6 @@ impl LspServer {
         let _ = self
             .supports_text_document_sync
             .set(has("textDocumentSync"));
-        let _ = self.supports_hover.set(has("hoverProvider"));
         let _ = self.supports_definition.set(has("definitionProvider"));
         let _ = self.supports_references.set(has("referencesProvider"));
         let _ = self
@@ -389,11 +386,6 @@ impl LspServer {
         self.supports_pull_diagnostics
             .store(false, Ordering::SeqCst);
         info!("pull diagnostics downgraded to push-only");
-    }
-
-    /// Returns whether the server advertises `hoverProvider`.
-    pub fn supports_hover(&self) -> bool {
-        self.supports_hover.get().copied().unwrap_or(false)
     }
 
     /// Returns whether the server advertises `definitionProvider`.
@@ -1115,7 +1107,6 @@ mod tests {
     fn before_set_capabilities_nothing_supported() {
         let server = test_server();
         assert!(!server.supports_pull_diagnostics());
-        assert!(!server.supports_hover());
         assert!(!server.supports_workspace_symbols());
         // capabilities() returns empty object
         assert_eq!(server.capabilities(), &json!({}));
@@ -1179,7 +1170,6 @@ mod tests {
     #[test]
     fn explicit_false_not_supported() {
         let server = server_with_caps(json!({
-            "hoverProvider": false,
             "definitionProvider": false,
             "referencesProvider": false,
             "documentSymbolProvider": false,
@@ -1191,7 +1181,6 @@ mod tests {
             "typeHierarchyProvider": false,
             "codeActionProvider": false,
         }));
-        assert!(!server.supports_hover());
         assert!(!server.supports_definition());
         assert!(!server.supports_references());
         assert!(!server.supports_document_symbols());
@@ -1207,7 +1196,6 @@ mod tests {
     #[test]
     fn empty_capabilities_nothing_supported() {
         let server = server_with_caps(json!({}));
-        assert!(!server.supports_hover());
         assert!(!server.supports_definition());
         assert!(!server.supports_references());
         assert!(!server.supports_document_symbols());
@@ -1224,7 +1212,6 @@ mod tests {
     #[test]
     fn supports_all_capabilities() {
         let server = server_with_caps(json!({
-            "hoverProvider": true,
             "definitionProvider": true,
             "referencesProvider": true,
             "documentSymbolProvider": true,
@@ -1236,7 +1223,6 @@ mod tests {
             "typeHierarchyProvider": true,
             "codeActionProvider": true,
         }));
-        assert!(server.supports_hover());
         assert!(server.supports_definition());
         assert!(server.supports_references());
         assert!(server.supports_document_symbols());

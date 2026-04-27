@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 // ── Private helpers ─────────────────────────────────────────────────
 
-/// Builds `TextDocumentPositionParams` — shared by hover, definition,
+/// Builds `TextDocumentPositionParams` — shared by definition,
 /// type definition, implementation, prepare rename, and hierarchy prepares.
 fn text_document_position(uri: &str, line: u32, character: u32) -> Value {
     json!({
@@ -216,12 +216,6 @@ pub fn workspace_symbols(query: &str) -> Value {
 }
 
 // ── Text document requests (position-based) ─────────────────────────
-
-/// Builds `HoverParams`.
-#[must_use]
-pub fn hover(uri: &str, line: u32, character: u32) -> Value {
-    text_document_position(uri, line, character)
-}
 
 /// Builds `DefinitionParams`.
 #[must_use]
@@ -557,19 +551,6 @@ mod tests {
     }
 
     // ── Position-based requests ─────────────────────────────────────
-
-    #[test]
-    fn hover_golden() {
-        let ours = hover("file:///foo.rs", 10, 5);
-
-        assert_eq!(
-            ours,
-            json!({
-                "textDocument": { "uri": "file:///foo.rs" },
-                "position": { "line": 10, "character": 5 }
-            })
-        );
-    }
 
     #[test]
     fn definition_golden() {
