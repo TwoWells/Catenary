@@ -764,7 +764,14 @@ impl LspServer {
                 self.handle_unregister_capability(params);
                 Ok(Value::Null)
             }
-            "window/workDoneProgress/create" | "window/showMessageRequest" => Ok(Value::Null),
+            // workspace/diagnostic/refresh: server asks client to re-pull
+            // diagnostics for open documents. No-op — document lifecycle
+            // is transient (open/settle/save/settle/retrieve/close within
+            // done_editing), so there is no stale cache to invalidate.
+            // Mid-batch, the settle pipeline already waits for quiescence.
+            "window/workDoneProgress/create"
+            | "window/showMessageRequest"
+            | "workspace/diagnostic/refresh" => Ok(Value::Null),
             _ => Err(RpcError {
                 code: -32601,
                 message: format!("Method '{method}' not supported by client"),

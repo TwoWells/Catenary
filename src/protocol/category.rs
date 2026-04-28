@@ -117,8 +117,8 @@ pub fn lsp_category_level(category: &str) -> tracing::Level {
     }
 }
 
-/// Determine the tracing level for an incoming `window/logMessage` or
-/// `window/showMessage` notification based on the LSP `MessageType`.
+/// Determine the tracing level for an incoming `window/showMessage`
+/// notification based on the LSP `MessageType`.
 ///
 /// `MessageType` enum: 1=error, 2=warning, 3=info, 4=log.
 #[must_use]

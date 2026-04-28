@@ -549,39 +549,80 @@ impl Connection {
                         }
                     } else {
                         // Notification — level determined by method
-                        let notif_level = match method {
-                            "window/logMessage" | "window/showMessage" => {
-                                let msg_type = value
-                                    .get("params")
-                                    .and_then(|p| p.get("type"))
-                                    .and_then(serde_json::Value::as_u64);
-                                window_message_level(msg_type)
-                            }
-                            _ => lsp_category_level(lsp_category(method)),
-                        };
                         let notif_id = logging.next_id();
-                        let msg = match method {
-                            "window/logMessage" | "window/showMessage" => {
-                                let text = value
-                                    .get("params")
-                                    .and_then(|p| p.get("message"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("(no message)");
-                                format!("{server_name}: {text}")
+                        if method == "window/logMessage" {
+                            // Server telemetry — always info to stay out of
+                            // notification drain (warn threshold). Original
+                            // LSP MessageType preserved as lsp_level for
+                            // future TUI filtering.
+                            let msg_type = value
+                                .get("params")
+                                .and_then(|p| p.get("type"))
+                                .and_then(serde_json::Value::as_u64);
+                            let text = value
+                                .get("params")
+                                .and_then(|p| p.get("message"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("(no message)");
+                            let payload_str = value.to_string();
+                            if let Some(lsp_level) = msg_type {
+                                tracing::info!(
+                                    kind = "lsp",
+                                    method = method,
+                                    server = server_name.as_str(),
+                                    client = "catenary",
+                                    request_id = notif_id.0,
+                                    payload = payload_str.as_str(),
+                                    source = "lsp.logging",
+                                    lsp_level = lsp_level,
+                                    "{server_name}: {text}"
+                                );
+                            } else {
+                                tracing::info!(
+                                    kind = "lsp",
+                                    method = method,
+                                    server = server_name.as_str(),
+                                    client = "catenary",
+                                    request_id = notif_id.0,
+                                    payload = payload_str.as_str(),
+                                    source = "lsp.logging",
+                                    "{server_name}: {text}"
+                                );
                             }
-                            _ => {
-                                format!("{server_name}: {method}")
-                            }
-                        };
-                        emit_lsp_event(
-                            notif_level,
-                            &server_name,
-                            method,
-                            notif_id.0,
-                            None,
-                            &value.to_string(),
-                            &msg,
-                        );
+                        } else {
+                            let notif_level = match method {
+                                "window/showMessage" => {
+                                    let msg_type = value
+                                        .get("params")
+                                        .and_then(|p| p.get("type"))
+                                        .and_then(serde_json::Value::as_u64);
+                                    window_message_level(msg_type)
+                                }
+                                _ => lsp_category_level(lsp_category(method)),
+                            };
+                            let msg = match method {
+                                "window/showMessage" => {
+                                    let text = value
+                                        .get("params")
+                                        .and_then(|p| p.get("message"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("(no message)");
+                                    format!("{server_name}: {text}")
+                                }
+                                _ => {
+                                    format!("{server_name}: {method}")
+                                }
+                            };
+                            emit_lsp_event(
+                                notif_level,
+                                &server_name,
+                                method,
+                                notif_id.0,
+                                None,
+                                &value.to_string(),
+                                &msg,
+                            );
+                        }
                         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
                         server.on_notification(method, params);
                     }
