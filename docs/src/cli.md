@@ -102,3 +102,12 @@ catenary gc --session 029ba740
 ### `catenary doctor`
 
 Verify language servers and hook installation. See [Installation](installation.md#verify).
+
+Pass a server name for verbose single-server diagnostics:
+
+```sh
+catenary doctor rust-analyzer
+```
+
+Verbose mode prints the resolved command, binary path, stderr capture,
+full `initialize` request/response JSON, and capabilities list.

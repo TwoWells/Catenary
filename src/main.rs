@@ -71,14 +71,15 @@ enum Command {
     Config,
 
     /// Check language server health. Tests all configured servers by default.
-    /// Pass a path to scope to a specific workspace.
+    /// Pass a server name for verbose single-server diagnostics.
     Doctor {
-        /// Workspace root to scope the check. When provided, only tests
-        /// servers for languages detected in this directory.
-        path: Option<PathBuf>,
+        /// Server name for verbose single-server mode (matches [server.*]
+        /// config keys). When omitted, tests all servers with one-line
+        /// summaries.
+        server: Option<String>,
 
-        /// Root directory to check for `.catenary.toml` project config.
-        /// Defaults to the current working directory.
+        /// Workspace root for the probe and `.catenary.toml` project
+        /// config lookup. Defaults to the current working directory.
         #[arg(long, default_value = ".")]
         root: PathBuf,
 
@@ -211,13 +212,16 @@ async fn main() -> Result<()> {
         }) => cli::commands::run_monitor(&id, raw, nocolor, filter.as_deref()),
         Some(Command::Status { id }) => cli::commands::run_status(&id),
         Some(Command::Doctor {
-            path,
+            server,
             root,
             nocolor,
             diff,
         }) => {
-            let roots: Vec<PathBuf> = path.into_iter().collect();
-            cli::doctor::run_doctor(&roots, &root, nocolor, diff).await
+            if let Some(server_name) = server {
+                cli::doctor::run_doctor_single(&server_name, &root, nocolor).await
+            } else {
+                cli::doctor::run_doctor(&root, nocolor, diff).await
+            }
         }
         Some(Command::Hook { command }) => {
             match command {

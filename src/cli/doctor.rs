@@ -8,10 +8,10 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::cli::ColorConfig;
 use crate::lsp;
 
@@ -27,25 +27,16 @@ const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `c
      `[commands]` in your Catenary config instead. \
      Run `catenary config` to generate a recommended template.";
 
-/// Run the doctor command: check language server health.
-///
-/// When `roots` is empty, tests all configured language servers. When
-/// roots are provided, only tests servers for languages detected in
-/// those directories.
+/// Run the doctor command: check all configured language servers.
 ///
 /// # Errors
 ///
-/// Returns an error if the configuration cannot be loaded or roots cannot be resolved.
+/// Returns an error if the configuration cannot be loaded.
 #[allow(
     clippy::too_many_lines,
     reason = "Doctor command has sequential output logic"
 )]
-pub async fn run_doctor(
-    roots: &[PathBuf],
-    project_root: &Path,
-    nocolor: bool,
-    show_diff: bool,
-) -> Result<()> {
+pub async fn run_doctor(project_root: &Path, nocolor: bool, show_diff: bool) -> Result<()> {
     let colors = ColorConfig::new(nocolor);
 
     // Print version header
@@ -65,34 +56,11 @@ pub async fn run_doctor(
         }
     };
 
-    // Resolve workspace roots (if provided)
-    let resolved_roots: Option<Vec<PathBuf>> = if roots.is_empty() {
-        None
-    } else {
-        Some(
-            roots
-                .iter()
-                .map(|r| r.canonicalize())
-                .collect::<std::io::Result<Vec<_>>>()?,
-        )
-    };
-
     // Print config header
     let config_source = std::env::var("CATENARY_CONFIG")
         .ok()
         .unwrap_or_else(|| "default paths".to_string());
     println!("{} {}", colors.bold("Config:"), config_source);
-    if let Some(ref resolved) = resolved_roots {
-        println!(
-            "{} {}",
-            colors.bold("Roots: "),
-            resolved
-                .iter()
-                .map(|r| r.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
     println!();
 
     // Validation errors
@@ -148,20 +116,6 @@ pub async fn run_doctor(
         return Ok(());
     }
 
-    // Detect which languages have files in the workspace (only when roots provided)
-    let detected: Option<HashSet<String>> = resolved_roots.as_ref().map(|roots| {
-        let configured_keys: HashSet<&str> = config
-            .language
-            .iter()
-            .filter(|(_, lc)| !lc.servers.is_empty())
-            .map(|(k, _)| k.as_str())
-            .collect();
-        let classification =
-            crate::bridge::filesystem_manager::ClassificationTables::from_config(&config);
-        let fs = FilesystemManager::with_classification(classification);
-        fs.detect_workspace_languages(roots, &configured_keys)
-    });
-
     // ── Servers section ──────────────────────────────────────────────
     // Spawn each unique server once, collect capabilities.
     let mut server_names: Vec<&str> = config.server.keys().map(String::as_str).collect();
@@ -205,9 +159,8 @@ pub async fn run_doctor(
             }
         };
 
-        let init_roots = resolved_roots.as_deref().unwrap_or(&[]);
         match client
-            .initialize(init_roots, server_def.initialization_options.clone())
+            .initialize(&[], server_def.initialization_options.clone())
             .await
         {
             Ok(result) => {
@@ -261,19 +214,6 @@ pub async fn run_doctor(
 
     for (lang, target) in &lang_entries {
         let lang_display = format!("  {lang:<max_lang_width$}");
-
-        // Check if any files for this language exist (only when roots provided)
-        if let Some(ref det) = detected
-            && !det.contains(*lang)
-        {
-            println!(
-                "{}  {}",
-                colors.dim(&lang_display),
-                colors.dim(&format!("→ {target}  - skipped (no matching files)")),
-            );
-            continue;
-        }
-
         println!("{lang_display}  → {target}");
         // Show capabilities from the server, indented
         if let Some(tools) = server_capabilities.get(target)
@@ -308,6 +248,233 @@ pub async fn run_doctor(
         println!("{}:", colors.bold("Suggestions"));
         for suggestion in &suggestions {
             println!("  {}", colors.dim(suggestion));
+        }
+    }
+
+    Ok(())
+}
+
+/// Maximum number of stderr lines to capture in verbose doctor mode.
+const STDERR_MAX_LINES: usize = 50;
+
+/// Run the doctor command for a single server with verbose output.
+///
+/// Probes the named server and prints detailed diagnostic information:
+/// resolved command, binary check, stderr capture, initialize exchange,
+/// capabilities summary, and exit status.
+///
+/// # Errors
+///
+/// Returns an error if the configuration cannot be loaded.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Verbose doctor has sequential output sections"
+)]
+pub async fn run_doctor_single(
+    server_name: &str,
+    project_root: &Path,
+    nocolor: bool,
+) -> Result<()> {
+    let colors = ColorConfig::new(nocolor);
+
+    println!("Catenary {}", env!("CATENARY_VERSION"));
+    println!();
+
+    let config = match crate::config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{}", colors.red(&format!("✗ Config error: {e:#}")));
+            return Ok(());
+        }
+    };
+
+    // Merge project config if present
+    let merged_config = match crate::config::load_project_config(
+        &project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf()),
+    ) {
+        Ok(Some(pc)) => {
+            let mut merged = config.clone();
+            for (k, v) in pc.server {
+                merged.server.entry(k).or_insert(v);
+            }
+            merged
+        }
+        _ => config,
+    };
+
+    // Look up server
+    let Some(server_def) = merged_config.server.get(server_name) else {
+        println!(
+            "{}\n",
+            colors.red(&format!("✗ Unknown server: '{server_name}'")),
+        );
+        let mut available: Vec<&str> = merged_config.server.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        println!("Available servers:");
+        for name in &available {
+            println!("  {name}");
+        }
+        return Ok(());
+    };
+
+    // ── 1. Resolved command ─────────────────────────────────────────
+    let command = server_def.command.as_str();
+    let args_display = if server_def.args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", server_def.args.join(" "))
+    };
+    println!("{}:", colors.bold("Command"));
+    println!("  {command}{args_display}");
+    println!();
+
+    // ── 2. Binary check ────────────────────────────────────────────
+    println!("{}:", colors.bold("Binary"));
+    if let Some(path) = resolve_binary(command) {
+        println!("  {} {}", colors.green("✓"), path.display());
+    } else {
+        println!(
+            "  {}",
+            colors.red(&format!("✗ {command}: command not found")),
+        );
+        return Ok(());
+    }
+    println!();
+
+    // ── 3. Spawn ──────────────────────────────────────────────────
+    println!("{}:", colors.bold("Spawn"));
+    let args_refs: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
+    let spawn_result = lsp::LspClient::spawn_for_doctor(
+        command,
+        &args_refs,
+        server_name,
+        server_name,
+        crate::logging::LoggingServer::new(),
+    );
+
+    let (mut client, child_stderr) = match spawn_result {
+        Ok(pair) => {
+            println!("  {} process started", colors.green("✓"));
+            pair
+        }
+        Err(e) => {
+            println!("  {}", colors.red(&format!("✗ spawn failed: {e}")));
+            return Ok(());
+        }
+    };
+
+    // Start stderr reader task
+    let stderr_task = child_stderr.map(|stderr| {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            let mut output = Vec::new();
+            while output.len() < STDERR_MAX_LINES {
+                match lines.next_line().await {
+                    Ok(Some(line)) => output.push(line),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            output
+        })
+    });
+
+    println!();
+
+    // ── 4. Initialize exchange ──────────────────────────────────────
+    let resolved_roots: Vec<PathBuf> = project_root
+        .canonicalize()
+        .map(|r| vec![r])
+        .unwrap_or_default();
+
+    // Build init params for display
+    let workspace_folders: Vec<(String, String)> = resolved_roots
+        .iter()
+        .map(|root| {
+            let uri = format!("file://{}", root.display());
+            let name = root.file_name().map_or_else(
+                || "workspace".to_string(),
+                |s| s.to_string_lossy().to_string(),
+            );
+            (uri, name)
+        })
+        .collect();
+    let folder_refs: Vec<(&str, &str)> = workspace_folders
+        .iter()
+        .map(|(uri, name)| (uri.as_str(), name.as_str()))
+        .collect();
+    let init_params = lsp::params::initialize(
+        std::process::id(),
+        &folder_refs,
+        server_def.initialization_options.as_ref(),
+    );
+
+    println!("{}:", colors.bold("Initialize request"));
+    if let Ok(pretty) = serde_json::to_string_pretty(&init_params) {
+        for line in pretty.lines() {
+            println!("  {line}");
+        }
+    }
+    println!();
+
+    println!("{}:", colors.bold("Initialize response"));
+    match client
+        .initialize(&resolved_roots, server_def.initialization_options.clone())
+        .await
+    {
+        Ok(result) => {
+            if let Ok(pretty) = serde_json::to_string_pretty(&result) {
+                for line in pretty.lines() {
+                    println!("  {line}");
+                }
+            }
+            println!();
+
+            // ── 5. Capabilities summary ─────────────────────────────
+            let tools =
+                extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
+            println!("{}:", colors.bold("Capabilities"));
+            if tools.is_empty() {
+                println!("  {}", colors.dim("(none)"));
+            } else {
+                for tool in &tools {
+                    println!("  {} {tool}", colors.green("✓"));
+                }
+            }
+        }
+        Err(e) => {
+            println!("  {}", colors.red(&format!("✗ initialize failed: {e}")));
+        }
+    }
+
+    // ── 6. Shutdown ────────────────────────────────────────────────
+    let _ = client.shutdown().await;
+    println!();
+
+    // ── 7. Server stderr ───────────────────────────────────────────
+    if let Some(task) = stderr_task {
+        // Give the task a moment to finish collecting output
+        let lines = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+
+        if !lines.is_empty() {
+            println!("{}:", colors.bold("Server stderr"));
+            for line in &lines {
+                println!("  {line}");
+            }
+            if lines.len() >= STDERR_MAX_LINES {
+                println!(
+                    "  {}",
+                    colors.dim(&format!("(truncated at {STDERR_MAX_LINES} lines)"))
+                );
+            }
+            println!();
         }
     }
 
@@ -590,14 +757,24 @@ fn collect_suggestions(
 
 /// Checks whether a binary can be found on `$PATH`.
 fn binary_exists(command: &str) -> bool {
+    resolve_binary(command).is_some()
+}
+
+/// Resolves a binary command to its full path on `$PATH`.
+///
+/// Returns `None` if the binary cannot be found.
+fn resolve_binary(command: &str) -> Option<PathBuf> {
     // If the command contains a path separator, check it directly
     if command.contains('/') {
-        return std::path::Path::new(command).exists();
+        let p = PathBuf::from(command);
+        return if p.exists() { Some(p) } else { None };
     }
 
     // Search PATH
     let path_var = std::env::var("PATH").unwrap_or_default();
-    std::env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(command))
+        .find(|p| p.is_file())
 }
 
 /// Extracts Catenary tool names from LSP server capabilities.

@@ -77,7 +77,7 @@ impl LspClient {
         settings: Option<serde_json::Value>,
         settings_per_root: HashMap<PathBuf, serde_json::Value>,
     ) -> Result<Self> {
-        Self::spawn_inner(
+        let (client, _) = Self::spawn_inner(
             program,
             args,
             language_id,
@@ -86,10 +86,12 @@ impl LspClient {
             Stdio::inherit(),
             settings,
             settings_per_root,
-        )
+        )?;
+        Ok(client)
     }
 
-    /// Spawns the LSP server with stderr suppressed (for `catenary doctor`).
+    /// Spawns the LSP server with stderr suppressed (for `catenary doctor`
+    /// summary mode).
     ///
     /// # Errors
     ///
@@ -101,13 +103,41 @@ impl LspClient {
         server_name: &str,
         logging: LoggingServer,
     ) -> Result<Self> {
-        Self::spawn_inner(
+        let (client, _) = Self::spawn_inner(
             program,
             args,
             language_id,
             server_name,
             logging,
             Stdio::null(),
+            None,
+            HashMap::new(),
+        )?;
+        Ok(client)
+    }
+
+    /// Spawns the LSP server with stderr piped for capture (for
+    /// `catenary doctor <server>` verbose mode).
+    ///
+    /// Returns the client and the stderr handle for the caller to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server process cannot be spawned.
+    pub fn spawn_for_doctor(
+        program: &str,
+        args: &[&str],
+        language_id: &str,
+        server_name: &str,
+        logging: LoggingServer,
+    ) -> Result<(Self, Option<tokio::process::ChildStderr>)> {
+        Self::spawn_inner(
+            program,
+            args,
+            language_id,
+            server_name,
+            logging,
+            Stdio::piped(),
             None,
             HashMap::new(),
         )
@@ -126,7 +156,7 @@ impl LspClient {
         stderr: Stdio,
         settings: Option<serde_json::Value>,
         settings_per_root: HashMap<PathBuf, serde_json::Value>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Option<tokio::process::ChildStderr>)> {
         let server = Arc::new(LspServer::new(
             language_id.to_string(),
             server_name.to_string(),
@@ -134,7 +164,7 @@ impl LspClient {
             settings_per_root,
         ));
 
-        let connection = super::connection::Connection::new(
+        let (connection, child_stderr) = super::connection::Connection::new(
             program,
             args,
             stderr,
@@ -145,18 +175,21 @@ impl LspClient {
         )?;
         server.set_connection(connection);
 
-        Ok(Self {
-            server,
-            encoding: "utf-16".to_string(), // Default per spec
-            spawn_time: Instant::now(),
-            supports_workspace_folders: false,
-            wants_did_save: false,
-            server_command: program.to_string(),
-            server_version: None,
-            parent_id: None,
-            cancel: CancellationToken::new(),
-            open_documents: HashMap::new(),
-        })
+        Ok((
+            Self {
+                server,
+                encoding: "utf-16".to_string(), // Default per spec
+                spawn_time: Instant::now(),
+                supports_workspace_folders: false,
+                wants_did_save: false,
+                server_command: program.to_string(),
+                server_version: None,
+                parent_id: None,
+                cancel: CancellationToken::new(),
+                open_documents: HashMap::new(),
+            },
+            child_stderr,
+        ))
     }
 
     /// Sets the parent message ID for causation tracking.

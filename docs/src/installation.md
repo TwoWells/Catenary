@@ -66,12 +66,18 @@ For each configured server, `doctor` reports:
 | `command not found` | Binary not on `$PATH` |
 | `spawn failed` | Binary found but process failed to start |
 | `initialize failed` | Process started but LSP handshake failed |
-| `skipped` | No files for this language in the workspace |
 
 Use `--root` to check a different workspace:
 
 ```bash
 catenary doctor --root /path/to/project
+```
+
+For detailed diagnostics on a single server (resolved command, stderr
+capture, full init request/response, capabilities):
+
+```bash
+catenary doctor rust-analyzer
 ```
 
 ## Next Steps

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info};
 
@@ -136,7 +136,7 @@ impl Connection {
         language: String,
         logging: LoggingServer,
         server_name: &str,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Option<ChildStderr>)> {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -161,6 +161,7 @@ impl Connection {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("stdout not captured"))?;
+        let child_stderr = child.stderr.take();
 
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =
@@ -179,19 +180,22 @@ impl Connection {
             server_name.to_string(),
         ));
 
-        Ok(Self {
-            child,
-            stdin,
-            pending,
-            alive,
-            next_id: AtomicI64::new(1),
-            server: weak_server,
-            language,
-            logging,
-            server_name: server_name.to_string(),
-            monitor: std::sync::Mutex::new(monitor),
-            _reader_handle: reader_handle,
-        })
+        Ok((
+            Self {
+                child,
+                stdin,
+                pending,
+                alive,
+                next_id: AtomicI64::new(1),
+                server: weak_server,
+                language,
+                logging,
+                server_name: server_name.to_string(),
+                monitor: std::sync::Mutex::new(monitor),
+                _reader_handle: reader_handle,
+            },
+            child_stderr,
+        ))
     }
 
     /// Send a request and wait for the response with failure detection.

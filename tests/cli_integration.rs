@@ -622,3 +622,175 @@ fn test_doctor_suggests_commands_when_config_exists_without_commands() -> Result
     );
     Ok(())
 }
+
+// ── catenary doctor single-server mode ──────────────────────────
+
+#[test]
+fn test_doctor_single_server_found() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.mockls-test]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"test\"]\n\n\
+             [language.test]\n\
+             servers = [\"mockls-test\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "mockls-test", "--nocolor"]);
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should show verbose sections
+    assert!(
+        stdout.contains("Command:"),
+        "verbose doctor should show Command section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Binary:"),
+        "verbose doctor should show Binary section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Spawn:"),
+        "verbose doctor should show Spawn section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Initialize request:"),
+        "verbose doctor should show Initialize request section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Initialize response:"),
+        "verbose doctor should show Initialize response section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Capabilities:"),
+        "verbose doctor should show Capabilities section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(mockls_bin),
+        "verbose doctor should show resolved binary path, got:\n{stdout}"
+    );
+
+    // Should NOT show the summary-mode sections
+    assert!(
+        !stdout.contains("Hooks:"),
+        "verbose doctor should not show Hooks section, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Languages:"),
+        "verbose doctor should not show Languages section, got:\n{stdout}"
+    );
+
+    assert!(
+        output.status.success(),
+        "doctor single-server should exit 0, got: {}",
+        output.status
+    );
+    Ok(())
+}
+
+#[test]
+fn test_doctor_single_server_not_found() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.mockls-test]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"test\"]\n\n\
+             [language.test]\n\
+             servers = [\"mockls-test\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "nonexistent-server", "--nocolor"]);
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("Unknown server: 'nonexistent-server'"),
+        "should report unknown server, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Available servers:"),
+        "should list available servers, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mockls-test"),
+        "should include mockls-test in available servers, got:\n{stdout}"
+    );
+
+    assert!(
+        output.status.success(),
+        "doctor unknown server should still exit 0, got: {}",
+        output.status
+    );
+    Ok(())
+}
+
+#[test]
+fn test_doctor_no_args_unchanged() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = tmp.path().join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[server.mockls-test]\n\
+             command = \"{mockls_bin}\"\n\
+             args = [\"test\"]\n\n\
+             [language.test]\n\
+             servers = [\"mockls-test\"]\n"
+        ),
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.args(["doctor", "--nocolor"]);
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Summary mode should show the standard sections
+    assert!(
+        stdout.contains("Servers:"),
+        "summary doctor should show Servers section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Languages:"),
+        "summary doctor should show Languages section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Hooks:"),
+        "summary doctor should show Hooks section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Command filter:"),
+        "summary doctor should show Command filter section, got:\n{stdout}"
+    );
+
+    assert!(
+        output.status.success(),
+        "doctor no-args should exit 0, got: {}",
+        output.status
+    );
+    Ok(())
+}
