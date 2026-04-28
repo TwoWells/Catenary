@@ -542,7 +542,18 @@ fn extract_shell_command(
 /// client, and returns the guidance message if the command is denied.
 fn check_shell_command(cmd: &str, format: HostFormat) -> Option<String> {
     let config = crate::config::Config::load().ok()?;
-    let resolved = config.resolved_commands?;
+    check_command_against_config(cmd, format, &config)
+}
+
+/// Check a shell command against a pre-loaded config's denylist.
+///
+/// Returns the guidance message if the command is denied, `None` otherwise.
+fn check_command_against_config(
+    cmd: &str,
+    format: HostFormat,
+    config: &crate::config::Config,
+) -> Option<String> {
+    let resolved = config.resolved_commands.as_ref()?;
     if resolved.deny.is_empty() && resolved.deny_when_first.is_empty() {
         return None;
     }
@@ -550,7 +561,7 @@ fn check_shell_command(cmd: &str, format: HostFormat) -> Option<String> {
         HostFormat::Claude => "claude",
         HostFormat::Gemini => "gemini",
     };
-    crate::cli::command_filter::check_command(cmd, &resolved)
+    crate::cli::command_filter::check_command(cmd, resolved)
         .map(|msg| crate::cli::command_filter::resolve_templates(&msg, client))
 }
 
@@ -720,14 +731,17 @@ mod tests {
 
     // ── check_shell_command tests ──���────────────────────────────────
     //
-    // These test the integration function. Config loading in tests will
-    // produce an empty resolved_commands (no config files), so these
-    // verify the no-op path. The full deny/allow logic is tested in
-    // command_filter::tests and config::tests.
+    // These test the command filter with a known config to avoid
+    // picking up the user's real config. The full deny/allow logic
+    // is tested in command_filter::tests and config::tests.
 
     #[test]
-    fn check_shell_command_no_config_allows_all() {
+    fn check_command_no_config_allows_all() {
         // With no config files, resolved_commands is None → no denial.
-        assert!(check_shell_command("cat file.txt", HostFormat::Claude).is_none());
+        let config =
+            crate::config::Config::load_from_sources(&[]).expect("empty sources should succeed");
+        assert!(
+            check_command_against_config("cat file.txt", HostFormat::Claude, &config).is_none()
+        );
     }
 }

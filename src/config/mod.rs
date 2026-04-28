@@ -387,7 +387,7 @@ impl Config {
     /// Sources are merged in order (later overrides earlier). Environment
     /// variable overrides and validation are applied after merging.
     #[cfg(test)]
-    fn load_from_sources(sources: &[std::path::PathBuf]) -> Result<Self> {
+    pub(crate) fn load_from_sources(sources: &[std::path::PathBuf]) -> Result<Self> {
         parse::load_from_sources(sources)
     }
 
