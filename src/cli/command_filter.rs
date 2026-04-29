@@ -385,27 +385,6 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
     }
 }
 
-/// Resolve template variables in guidance messages for a specific client.
-///
-/// Replaces `{read}`, `{edit}`, `{catenary_grep}`, `{catenary_glob}` with
-/// client-specific tool names.
-#[must_use]
-#[allow(
-    clippy::literal_string_with_formatting_args,
-    reason = "template variable placeholders, not format args"
-)]
-pub fn resolve_templates(msg: &str, client: &str) -> String {
-    let (read, edit) = match client {
-        "gemini" => ("read_file", "edit_file"),
-        _ => ("Read", "Edit"),
-    };
-
-    msg.replace("{read}", read)
-        .replace("{edit}", edit)
-        .replace("{catenary_grep}", "Catenary's grep")
-        .replace("{catenary_glob}", "Catenary's glob")
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -699,29 +678,6 @@ mod tests {
         let rules = basic_rules();
         assert!(check_command("./grep foo bar", &rules).is_some());
         assert!(check_command("../bin/grep foo bar", &rules).is_some());
-    }
-
-    // ── Template variables ───────────────────────────────────────────
-
-    #[test]
-    fn resolve_templates_claude() {
-        let msg = "Use {read} instead of cat, {edit} instead of sed";
-        let resolved = resolve_templates(msg, "claude");
-        assert_eq!(resolved, "Use Read instead of cat, Edit instead of sed");
-    }
-
-    #[test]
-    fn resolve_templates_gemini() {
-        let msg = "Use {read} instead";
-        let resolved = resolve_templates(msg, "gemini");
-        assert_eq!(resolved, "Use read_file instead");
-    }
-
-    #[test]
-    fn resolve_templates_catenary_tools() {
-        let msg = "Use {catenary_grep} or {catenary_glob}";
-        let resolved = resolve_templates(msg, "claude");
-        assert_eq!(resolved, "Use Catenary's grep or Catenary's glob");
     }
 
     // ── Regression tests (ported from Python) ────────────────────────

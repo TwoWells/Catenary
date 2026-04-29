@@ -440,7 +440,7 @@ pub fn run_pre_agent(format: HostFormat) {
 /// Editing state enforcement and command filtering (`PreToolUse` / `BeforeTool`
 /// hook handler).
 ///
-/// Checks shell commands against the configured denylist before forwarding
+/// Checks shell commands against the configured allowlist before forwarding
 /// to the session for editing state enforcement. Denied commands are rejected
 /// immediately without contacting the session.
 ///
