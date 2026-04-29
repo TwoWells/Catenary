@@ -187,12 +187,13 @@ Two components split protocol concerns from application logic:
 
 ### Hook methods
 
-Five hook methods, each corresponding to a host CLI lifecycle event:
+Six hook methods, each corresponding to a host CLI lifecycle event:
 
 | Method | Host event | Purpose |
 |--------|-----------|---------|
-| `pre-agent/roots-sync` | `UserPromptSubmit` / `BeforeAgent` | Refresh workspace roots via MCP `roots/list` |
-| `pre-tool/enforce-editing` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
+| `pre-agent/turn-start` | `UserPromptSubmit` / `BeforeAgent` | Increment the turn counter (debounce boundary) |
+| `pre-tool/editing-state` | `PreToolUse` / `BeforeTool` | Editing state enforcement — deny or allow a tool call |
+| `pre-tool/command-denied` | `PreToolUse` / `BeforeTool` | Command filter debounce — full or short denial message |
 | `post-tool/diagnostics` | `PostToolUse` / `AfterTool` | Accumulate modified file paths during editing mode |
 | `post-agent/require-release` | `Stop` / `AfterAgent` | Force `done_editing` if the agent stops while editing |
 | `session-start/clear-editing` | `SessionStart` | Clear stale editing state from a previous agent context |

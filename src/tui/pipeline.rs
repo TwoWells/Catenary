@@ -1306,7 +1306,7 @@ mod tests {
         // notifications — the exact scenario that produced jitter.
         let messages = vec![
             // hook pre-tool
-            make_message_with_id_parent(1, "hook", "pre-tool/enforce-editing", "", Some(800), None),
+            make_message_with_id_parent(1, "hook", "pre-tool/editing-state", "", Some(800), None),
             // MCP grep request (scope parent)
             make_message_with_id_parent(2, "mcp", "tools/call", "", Some(900), None),
             // LSP children of grep

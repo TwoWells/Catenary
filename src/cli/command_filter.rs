@@ -238,11 +238,12 @@ fn check_against_allowlist(
     // Check if command is in the unconditional allow list.
     if rules.allow.contains(name) {
         // Check subcommand deny: e.g., git is allowed but `git grep` is denied.
+        // Returns the full denied form (e.g., "git grep") for clear denial messages.
         if let Some(sub) = subcommand
             && let Some(denied_subs) = rules.deny.get(name)
             && denied_subs.contains(sub)
         {
-            return Some(name.to_string());
+            return Some(format!("{name} {sub}"));
         }
         return None;
     }
@@ -383,6 +384,65 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
             names.push(name.to_string());
         }
     }
+}
+
+/// Format the full denial response with the complete allowlist configuration.
+///
+/// Used on the first denial in a new turn (or after a config change) to give
+/// the agent full visibility into its allowed command surface.
+///
+/// Lists are sorted alphabetically. Sections with no entries are omitted.
+/// The denied command is always named in the opening line.
+#[must_use]
+pub fn format_denial_full(denied_cmd: &str, commands: &ResolvedCommands) -> String {
+    let mut parts = vec![format!(
+        "`{denied_cmd}` isn't allowed by the current Catenary configuration."
+    )];
+
+    if !commands.allow.is_empty() {
+        let mut sorted: Vec<&str> = commands.allow.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        parts.push(format!("Allowed: {}", sorted.join(", ")));
+    }
+
+    if !commands.pipeline.is_empty() {
+        let mut sorted: Vec<&str> = commands.pipeline.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        parts.push(format!(
+            "Allowed in pipelines (not first): {}",
+            sorted.join(", ")
+        ));
+    }
+
+    if !commands.deny.is_empty() {
+        let mut denied_pairs: Vec<String> = Vec::new();
+        for (cmd, subs) in &commands.deny {
+            let mut sorted_subs: Vec<&str> = subs.iter().map(String::as_str).collect();
+            sorted_subs.sort_unstable();
+            for sub in sorted_subs {
+                denied_pairs.push(format!("{cmd} {sub}"));
+            }
+        }
+        denied_pairs.sort_unstable();
+        parts.push(format!("Denied subcommands: {}", denied_pairs.join(", ")));
+    }
+
+    if let Some(ref build) = commands.build {
+        parts.push(format!("Build tool: {build}"));
+    }
+
+    parts.join("\n")
+}
+
+/// Format the short denial response for subsequent denials in the same turn.
+///
+/// After the full config has been shown once in a turn, subsequent denials
+/// use this shorter form to reduce noise.
+#[must_use]
+pub fn format_denial_short(denied_cmd: &str) -> String {
+    format!(
+        "`{denied_cmd}` isn't allowed — see earlier message for the current Catenary command configuration."
+    )
 }
 
 #[cfg(test)]
@@ -1247,5 +1307,114 @@ mod tests {
     fn extract_names_empty() {
         let names = extract_command_names("");
         assert!(names.is_empty());
+    }
+
+    // ── Denial format tests ────────────────────────────────────────────
+
+    #[test]
+    fn format_full_all_sections() {
+        let rules = python_equivalent_rules();
+        let msg = format_denial_full("ls", &rules);
+
+        assert!(msg.starts_with("`ls` isn't allowed"), "opening line");
+        assert!(msg.contains("Allowed:"), "allow section");
+        assert!(
+            msg.contains("Allowed in pipelines (not first):"),
+            "pipeline section"
+        );
+        assert!(msg.contains("Denied subcommands:"), "deny section");
+        assert!(msg.contains("Build tool: make"), "build section");
+    }
+
+    #[test]
+    fn format_full_sorted_alphabetically() {
+        let rules = python_equivalent_rules();
+        let msg = format_denial_full("ls", &rules);
+
+        // Extract the Allowed line and verify sorting.
+        let allowed_line = msg
+            .lines()
+            .find(|l| l.starts_with("Allowed:"))
+            .expect("Allowed line");
+        let items: Vec<&str> = allowed_line
+            .strip_prefix("Allowed: ")
+            .expect("prefix")
+            .split(", ")
+            .collect();
+        let mut sorted = items.clone();
+        sorted.sort_unstable();
+        assert_eq!(items, sorted, "allow list should be sorted");
+    }
+
+    #[test]
+    fn format_full_omits_empty_sections() {
+        let rules = ResolvedCommands {
+            allow: HashSet::from(["git".into()]),
+            pipeline: HashSet::new(),
+            deny: HashMap::new(),
+            build: None,
+            client_enforcement_only: false,
+        };
+        let msg = format_denial_full("ls", &rules);
+
+        assert!(msg.contains("Allowed: git"));
+        assert!(
+            !msg.contains("Allowed in pipelines"),
+            "empty pipeline should be omitted"
+        );
+        assert!(
+            !msg.contains("Denied subcommands"),
+            "empty deny should be omitted"
+        );
+        assert!(
+            !msg.contains("Build tool"),
+            "absent build should be omitted"
+        );
+    }
+
+    #[test]
+    fn format_full_deny_pairs_sorted() {
+        let rules = ResolvedCommands {
+            allow: HashSet::from(["git".into(), "sqlite3".into()]),
+            pipeline: HashSet::new(),
+            deny: HashMap::from([
+                (
+                    "git".into(),
+                    HashSet::from(["ls-files".into(), "grep".into(), "ls-tree".into()]),
+                ),
+                ("sqlite3".into(), HashSet::from(["-cmd".into()])),
+            ]),
+            build: None,
+            client_enforcement_only: false,
+        };
+        let msg = format_denial_full("ls", &rules);
+
+        let deny_line = msg
+            .lines()
+            .find(|l| l.starts_with("Denied subcommands:"))
+            .expect("deny line");
+        let items: Vec<&str> = deny_line
+            .strip_prefix("Denied subcommands: ")
+            .expect("prefix")
+            .split(", ")
+            .collect();
+        let mut sorted = items.clone();
+        sorted.sort_unstable();
+        assert_eq!(items, sorted, "deny pairs should be sorted");
+    }
+
+    #[test]
+    fn format_short_contains_command() {
+        let msg = format_denial_short("cargo");
+        assert!(msg.contains("`cargo`"));
+        assert!(msg.contains("see earlier message"));
+    }
+
+    #[test]
+    fn check_command_denied_subcommand_returns_full_form() {
+        let rules = python_equivalent_rules();
+        // git grep should return "git grep", not just "git".
+        let denied = check_command("git grep foo", &rules);
+        assert_eq!(denied.as_deref(), Some("git grep"));
     }
 }

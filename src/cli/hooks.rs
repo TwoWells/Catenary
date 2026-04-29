@@ -440,9 +440,11 @@ pub fn run_pre_agent(format: HostFormat) {
 /// Editing state enforcement and command filtering (`PreToolUse` / `BeforeTool`
 /// hook handler).
 ///
-/// Checks shell commands against the configured allowlist before forwarding
-/// to the session for editing state enforcement. Denied commands are rejected
-/// immediately without contacting the session.
+/// Checks shell commands against the configured allowlist (client-side),
+/// then forwards to the session for editing state enforcement. When a
+/// command is denied, queries the session for debounce state to decide
+/// between a full config dump or a short message. Falls back to a static
+/// full dump if the session is unreachable.
 ///
 /// Silently succeeds on any error to avoid breaking the host CLI's flow.
 pub fn run_pre_tool(format: HostFormat) {
@@ -459,15 +461,19 @@ pub fn run_pre_tool(format: HostFormat) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // ── Command filter (runs before acquire lock checks) ──────────
+    // ── Client-side command filter ───────────────────────────────
+    // Runs before IPC — catches denied commands even when the session
+    // is unreachable.
     if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
-        && let Some(reason) = check_shell_command(&shell_cmd, format)
+        && let Some((denied, resolved)) = check_shell_command(&shell_cmd)
     {
+        let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+        let reason = query_denial_format(&hook_json, session_id, &denied, &resolved);
         print!("{}", format_deny(&reason, format));
         return;
     }
 
-    // ── Editing state enforcement (IPC to session) ────────────────
+    // ── Editing state enforcement (IPC to session) ───────────────
     let Ok(conn) = db::open_and_migrate() else {
         return;
     };
@@ -486,7 +492,7 @@ pub fn run_pre_tool(format: HostFormat) {
     let shell_cmd = extract_shell_command(&hook_json, tool_name, format);
 
     let mut request = serde_json::json!({
-        "method": "pre-tool/enforce-editing",
+        "method": "pre-tool/editing-state",
         "tool_name": tool_name,
         "agent_id": agent_id,
     });
@@ -507,6 +513,62 @@ pub fn run_pre_tool(format: HostFormat) {
         && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
     {
         print!("{}", format_deny(reason, format));
+    }
+}
+
+/// Check a shell command against the configured allowlist.
+///
+/// Returns the denied command name and the resolved config on denial,
+/// or `None` if the command is allowed. The caller uses both to format
+/// the denial message.
+fn check_shell_command(cmd: &str) -> Option<(String, crate::config::ResolvedCommands)> {
+    let config = crate::config::Config::load().ok()?;
+    let resolved = config.resolved_commands?;
+    if !resolved.is_active() {
+        return None;
+    }
+    let denied = crate::cli::command_filter::check_command(cmd, &resolved)?;
+    Some((denied, resolved))
+}
+
+/// Query the session for denial debounce state and format the message.
+///
+/// Sends `pre-tool/command-denied` to the session. If the session returns
+/// a result, formats a full config dump. Otherwise formats a short message.
+/// Falls back to a full dump if the session is unreachable.
+fn query_denial_format(
+    hook_json: &serde_json::Value,
+    session_id: Option<&str>,
+    denied_cmd: &str,
+    resolved: &crate::config::ResolvedCommands,
+) -> String {
+    let full_dump = || crate::cli::command_filter::format_denial_full(denied_cmd, resolved);
+
+    let Ok(conn) = db::open_and_migrate() else {
+        return full_dump();
+    };
+    let Some(catenary_sid) = find_session_id(hook_json, &conn) else {
+        return full_dump();
+    };
+    let endpoint = notify_endpoint(&catenary_sid);
+    let Some(stream) = notify_connect(&endpoint) else {
+        return full_dump();
+    };
+
+    let mut request = serde_json::json!({"method": "pre-tool/command-denied"});
+    if let Some(sid) = session_id {
+        request["session_id"] = serde_json::json!(sid);
+    }
+
+    let lines = ipc_exchange(stream, &request);
+
+    if let Some(line) = lines.first()
+        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+        && envelope.result.is_some()
+    {
+        full_dump()
+    } else {
+        crate::cli::command_filter::format_denial_short(denied_cmd)
     }
 }
 
@@ -533,31 +595,6 @@ fn extract_shell_command(
         .and_then(|ti| ti.get("command"))
         .and_then(|c| c.as_str())
         .map(String::from)
-}
-
-/// Check a shell command against the configured allowlist.
-///
-/// Loads the merged config and returns the denied command name if the
-/// command is not allowed.
-fn check_shell_command(cmd: &str, format: HostFormat) -> Option<String> {
-    let config = crate::config::Config::load().ok()?;
-    check_command_against_config(cmd, format, &config)
-}
-
-/// Check a shell command against a pre-loaded config's allowlist.
-///
-/// Returns the denied command name if the command is not allowed, `None`
-/// otherwise.
-fn check_command_against_config(
-    cmd: &str,
-    _format: HostFormat,
-    config: &crate::config::Config,
-) -> Option<String> {
-    let resolved = config.resolved_commands.as_ref()?;
-    if !resolved.is_active() {
-        return None;
-    }
-    crate::cli::command_filter::check_command(cmd, resolved)
 }
 
 // ── Formatting helpers ──────────────────────────────────────────────────
@@ -722,21 +759,5 @@ mod tests {
             "tool_input": {}
         });
         assert!(extract_shell_command(&json, "Bash", HostFormat::Claude).is_none());
-    }
-
-    // ── check_shell_command tests ──���────────────────────────────────
-    //
-    // These test the command filter with a known config to avoid
-    // picking up the user's real config. The full deny/allow logic
-    // is tested in command_filter::tests and config::tests.
-
-    #[test]
-    fn check_command_no_config_allows_all() {
-        // With no config files, resolved_commands is None → no denial.
-        let config =
-            crate::config::Config::load_from_sources(&[]).expect("empty sources should succeed");
-        assert!(
-            check_command_against_config("cat file.txt", HostFormat::Claude, &config).is_none()
-        );
     }
 }

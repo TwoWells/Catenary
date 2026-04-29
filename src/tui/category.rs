@@ -250,7 +250,8 @@ mod tests {
     fn test_hook_category_methods() {
         assert_eq!(hook_category("post-tool/diagnostics"), "diagnostics");
         assert_eq!(hook_category("pre-agent/turn-start"), "lifecycle");
-        assert_eq!(hook_category("pre-tool/enforce-editing"), "lifecycle");
+        assert_eq!(hook_category("pre-tool/editing-state"), "lifecycle");
+        assert_eq!(hook_category("pre-tool/command-denied"), "lifecycle");
         assert_eq!(hook_category("post-agent/require-release"), "lifecycle");
         assert_eq!(hook_category("session-start/clear-editing"), "lifecycle");
         assert_eq!(hook_category("unknown/method"), "unknown");

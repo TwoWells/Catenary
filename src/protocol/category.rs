@@ -98,7 +98,9 @@ pub fn mcp_category(method: &str) -> &'static str {
 pub fn hook_category(method: &str) -> &'static str {
     match method.rsplit('/').next().unwrap_or(method) {
         "diagnostics" => "diagnostics",
-        "turn-start" | "enforce-editing" | "require-release" | "clear-editing" => "lifecycle",
+        "turn-start" | "editing-state" | "command-denied" | "require-release" | "clear-editing" => {
+            "lifecycle"
+        }
         _ => "unknown",
     }
 }
@@ -179,7 +181,8 @@ mod tests {
     fn hook_category_methods() {
         assert_eq!(hook_category("post-tool/diagnostics"), "diagnostics");
         assert_eq!(hook_category("pre-agent/turn-start"), "lifecycle");
-        assert_eq!(hook_category("pre-tool/enforce-editing"), "lifecycle");
+        assert_eq!(hook_category("pre-tool/editing-state"), "lifecycle");
+        assert_eq!(hook_category("pre-tool/command-denied"), "lifecycle");
         assert_eq!(hook_category("post-agent/require-release"), "lifecycle");
         assert_eq!(hook_category("session-start/clear-editing"), "lifecycle");
         assert_eq!(hook_category("unknown/method"), "unknown");

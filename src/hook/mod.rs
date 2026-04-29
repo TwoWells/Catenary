@@ -107,7 +107,7 @@ pub(crate) enum HookRequest {
     PreAgent {},
 
     /// Editing state enforcement: deny or allow a tool call.
-    #[serde(rename = "pre-tool/enforce-editing")]
+    #[serde(rename = "pre-tool/editing-state")]
     PreTool {
         /// Host CLI tool name (e.g., "Edit", "Write", `"write_file"`).
         tool_name: String,
@@ -124,6 +124,18 @@ pub(crate) enum HookRequest {
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,
+        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
+    /// Command filter debounce query: should the denial be full or short?
+    ///
+    /// Sent by the client after it denies a command locally. The server
+    /// checks the turn counter and config version and returns a result
+    /// if a full config dump is needed, or no result for a short message.
+    #[serde(rename = "pre-tool/command-denied")]
+    CommandDenied {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
         session_id: Option<String>,
@@ -459,9 +471,9 @@ mod tests {
         let req: HookRequest = serde_json::from_str(json).expect("turn-start");
         assert!(matches!(req, HookRequest::PreAgent {}));
 
-        // pre-tool/enforce-editing with all fields
-        let json = r#"{"method": "pre-tool/enforce-editing", "tool_name": "Edit", "file_path": "/tmp/foo.rs", "agent_id": "", "session_id": "abc123"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("enforce-editing");
+        // pre-tool/editing-state with all fields
+        let json = r#"{"method": "pre-tool/editing-state", "tool_name": "Edit", "file_path": "/tmp/foo.rs", "agent_id": "", "session_id": "abc123"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("editing-state");
         let HookRequest::PreTool {
             tool_name,
             file_path,
@@ -478,9 +490,9 @@ mod tests {
         assert_eq!(agent_id, "");
         assert_eq!(session_id.as_deref(), Some("abc123"));
 
-        // pre-tool/enforce-editing with command (Bash tool)
-        let json = r#"{"method": "pre-tool/enforce-editing", "tool_name": "Bash", "command": "rm -rf target/", "agent_id": ""}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("enforce-editing with command");
+        // pre-tool/editing-state with command (Bash tool)
+        let json = r#"{"method": "pre-tool/editing-state", "tool_name": "Bash", "command": "rm -rf target/", "agent_id": ""}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("editing-state with command");
         let HookRequest::PreTool { command, .. } = req else {
             unreachable!("expected PreTool");
         };
@@ -523,6 +535,22 @@ mod tests {
             unreachable!("expected SessionStart");
         };
         assert_eq!(session_id.as_deref(), Some("uuid-123"));
+
+        // pre-tool/command-denied
+        let json = r#"{"method": "pre-tool/command-denied", "session_id": "abc123"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("command-denied");
+        let HookRequest::CommandDenied { session_id } = req else {
+            unreachable!("expected CommandDenied");
+        };
+        assert_eq!(session_id.as_deref(), Some("abc123"));
+
+        // pre-tool/command-denied minimal (no session_id)
+        let json = r#"{"method": "pre-tool/command-denied"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("command-denied minimal");
+        assert!(matches!(
+            req,
+            HookRequest::CommandDenied { session_id: None }
+        ));
     }
 
     // ── Logging tests ───────────────────────────────────────────────────
@@ -828,7 +856,7 @@ mod tests {
     fn hook_allow_emits_at_debug() {
         // Empty envelope = allow (no result, no system_message)
         let env = HookResponseEnvelope::default();
-        let level = HookServer::hook_outcome_level("pre-tool/enforce-editing", &env);
+        let level = HookServer::hook_outcome_level("pre-tool/editing-state", &env);
         assert_eq!(level, tracing::Level::DEBUG);
     }
 
@@ -838,7 +866,7 @@ mod tests {
             result: Some(HookResult::Deny("call start_editing first".into())),
             system_message: None,
         };
-        let level = HookServer::hook_outcome_level("pre-tool/enforce-editing", &env);
+        let level = HookServer::hook_outcome_level("pre-tool/editing-state", &env);
         assert_eq!(level, tracing::Level::INFO);
     }
 

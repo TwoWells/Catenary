@@ -311,7 +311,7 @@ impl BridgeProcess {
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/enforce-editing",
+                "method": "pre-tool/editing-state",
                 "tool_name": "start_editing",
                 "agent_id": ""
             }),
@@ -361,7 +361,7 @@ impl BridgeProcess {
         ipc_request(
             &socket_path,
             &json!({
-                "method": "pre-tool/enforce-editing",
+                "method": "pre-tool/editing-state",
                 "tool_name": "start_editing",
                 "agent_id": ""
             }),

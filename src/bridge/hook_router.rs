@@ -108,6 +108,13 @@ pub struct DispatchResult {
 pub struct HookRouter {
     pub(crate) toolbox: Arc<Toolbox>,
     turn_counter: AtomicU64,
+    /// Last turn number where a full config dump was shown on denial.
+    last_config_dump_turn: AtomicU64,
+    /// Monotonic config version — bumped when merged command config changes
+    /// (e.g., root addition expands the allowlist).
+    config_version: AtomicU64,
+    /// Config version at the time of the last full dump.
+    last_config_dump_version: AtomicU64,
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     instance_id: Arc<str>,
     /// Host CLI client name (e.g., `"host"`, `"claude-code"`).
@@ -126,6 +133,11 @@ impl HookRouter {
         Self {
             toolbox,
             turn_counter: AtomicU64::new(0),
+            // Initialized to MAX so the first denial always triggers a full
+            // config dump (turn 0 != MAX).
+            last_config_dump_turn: AtomicU64::new(u64::MAX),
+            config_version: AtomicU64::new(0),
+            last_config_dump_version: AtomicU64::new(u64::MAX),
             conn,
             instance_id,
             client_name,
@@ -135,11 +147,44 @@ impl HookRouter {
     /// Returns the current turn number.
     ///
     /// Incremented each time the pre-agent hook fires (once per user
-    /// prompt / agent turn). Used by command filtering (workstream 19)
-    /// for per-turn debounce.
-    #[allow(dead_code, reason = "API for workstream 19 (Allow)")]
+    /// prompt / agent turn). Used by command filtering for per-turn debounce.
+    #[cfg(test)]
     pub(crate) fn turn(&self) -> u64 {
         self.turn_counter.load(Ordering::Acquire)
+    }
+
+    /// Bump the config version counter.
+    ///
+    /// Called when the merged command config changes (e.g., root addition
+    /// expands the allowlist). Forces the next denial to show a full config
+    /// dump regardless of turn.
+    #[allow(
+        dead_code,
+        reason = "API for workstream 19 ticket 03 (project scoping)"
+    )]
+    pub(crate) fn bump_config_version(&self) {
+        self.config_version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Check whether the next command denial should show a full config dump.
+    ///
+    /// Returns `true` if the full dump is needed (first denial in a new turn
+    /// or config version changed), `false` for a short message.
+    fn should_show_full_dump(&self) -> bool {
+        let current_turn = self.turn_counter.load(Ordering::Acquire);
+        let current_version = self.config_version.load(Ordering::Acquire);
+        let last_dump_turn = self.last_config_dump_turn.load(Ordering::Acquire);
+        let last_dump_version = self.last_config_dump_version.load(Ordering::Acquire);
+
+        if current_turn != last_dump_turn || current_version != last_dump_version {
+            self.last_config_dump_turn
+                .store(current_turn, Ordering::Release);
+            self.last_config_dump_version
+                .store(current_version, Ordering::Release);
+            true
+        } else {
+            false
+        }
     }
 
     /// Dispatches a parsed hook request to the appropriate handler.
@@ -173,6 +218,20 @@ impl HookRouter {
                         command.as_deref(),
                         &agent_id,
                     ),
+                    system_message: None,
+                }
+            }
+            HookRequest::CommandDenied { session_id } => {
+                self.store_client_session_id(session_id.as_deref());
+                // Result present → client should show full config dump.
+                // Result absent → client should show short message.
+                let result = if self.should_show_full_dump() {
+                    Some(HookResult::Deny(String::new()))
+                } else {
+                    None
+                };
+                DispatchResult {
+                    result,
                     system_message: None,
                 }
             }
@@ -1256,5 +1315,78 @@ mod tests {
 
         router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
         assert_eq!(router.turn(), 2);
+    }
+
+    // ── Command denied debounce tests ──────────────────────────────
+
+    fn dispatch_command_denied(router: &HookRouter) -> DispatchResult {
+        router.dispatch(
+            crate::hook::HookRequest::CommandDenied { session_id: None },
+            0,
+        )
+    }
+
+    #[test]
+    fn command_denied_first_returns_full() {
+        let router = test_router();
+        // First denial is always full (last_config_dump_turn starts at
+        // u64::MAX, which never matches turn_counter).
+        let result = dispatch_command_denied(&router);
+        assert!(
+            result.result.is_some(),
+            "first denial should signal full dump"
+        );
+    }
+
+    #[test]
+    fn command_denied_second_returns_short() {
+        let router = test_router();
+        // First denial → full (stores current turn).
+        dispatch_command_denied(&router);
+
+        // Second denial in same turn → short.
+        let result = dispatch_command_denied(&router);
+        assert!(
+            result.result.is_none(),
+            "subsequent denial should signal short message"
+        );
+    }
+
+    #[test]
+    fn command_denied_new_turn_resets_to_full() {
+        let router = test_router();
+        // First denial → full.
+        dispatch_command_denied(&router);
+
+        // Second denial → short.
+        let result = dispatch_command_denied(&router);
+        assert!(result.result.is_none());
+
+        // Advance turn, next denial → full again.
+        router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
+        let result = dispatch_command_denied(&router);
+        assert!(
+            result.result.is_some(),
+            "new turn should reset to full dump"
+        );
+    }
+
+    #[test]
+    fn command_denied_config_version_forces_full() {
+        let router = test_router();
+        // First denial → full.
+        dispatch_command_denied(&router);
+
+        // Second denial → short.
+        let result = dispatch_command_denied(&router);
+        assert!(result.result.is_none());
+
+        // Bump config version → full again.
+        router.bump_config_version();
+        let result = dispatch_command_denied(&router);
+        assert!(
+            result.result.is_some(),
+            "config version change should force full dump"
+        );
     }
 }
