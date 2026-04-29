@@ -1129,10 +1129,28 @@ fn check_command_filter_config(colors: &ColorConfig, config: &crate::config::Con
                 colors.green(&format!(
                     "✓ {total} command{} allowed{}",
                     if total == 1 { "" } else { "s" },
-                    resolved
-                        .build
-                        .as_ref()
-                        .map_or(String::new(), |b| format!(", build tool: {b}")),
+                    resolved.default_build.as_ref().map_or_else(
+                        || {
+                            if resolved.build.is_empty() {
+                                String::new()
+                            } else {
+                                let mut tools: Vec<&str> = resolved
+                                    .build
+                                    .values()
+                                    .map(String::as_str)
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .into_iter()
+                                    .collect();
+                                tools.sort_unstable();
+                                format!(
+                                    ", build tool{}: {}",
+                                    if tools.len() == 1 { "" } else { "s" },
+                                    tools.join(", ")
+                                )
+                            }
+                        },
+                        |b| format!(", build tool: {b}"),
+                    ),
                 )),
             );
         }

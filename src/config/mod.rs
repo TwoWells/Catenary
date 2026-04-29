@@ -1798,7 +1798,7 @@ git = ["grep", "ls-files"]
         let resolved = config
             .resolved_commands
             .expect("resolved_commands should be Some");
-        assert_eq!(resolved.build.as_deref(), Some("make"));
+        assert_eq!(resolved.default_build.as_deref(), Some("make"));
         assert_eq!(resolved.allow.len(), 3);
         assert!(resolved.allow.contains("git"));
         assert!(resolved.allow.contains("gh"));
@@ -2037,7 +2037,7 @@ build = "npm"
         assert!(git_deny.contains("grep"));
         assert!(git_deny.contains("ls-files"));
         // Explicit overrides build
-        assert_eq!(resolved.build.as_deref(), Some("npm"));
+        assert_eq!(resolved.default_build.as_deref(), Some("npm"));
 
         Ok(())
     }

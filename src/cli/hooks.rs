@@ -463,9 +463,10 @@ pub fn run_pre_tool(format: HostFormat) {
 
     // ── Client-side command filter ───────────────────────────────
     // Runs before IPC — catches denied commands even when the session
-    // is unreachable.
+    // is unreachable. Merges with cwd's project config for per-root
+    // build tool support. Full multi-root check is session-side (03a).
     if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
-        && let Some((denied, resolved)) = check_shell_command(&shell_cmd)
+        && let Some((denied, resolved)) = check_shell_command(&hook_json, &shell_cmd)
     {
         let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
         let reason = query_denial_format(&hook_json, session_id, &denied, &resolved);
@@ -518,17 +519,73 @@ pub fn run_pre_tool(format: HostFormat) {
 
 /// Check a shell command against the configured allowlist.
 ///
+/// Loads user config, then merges with the `cwd`'s project config (if any)
+/// for per-root `build` tool support. This is a client-side fallback — the
+/// full session-side check (all roots, dynamically-added roots) is handled
+/// by `pre-tool/check-command` IPC in ticket 03a.
+///
 /// Returns the denied command name and the resolved config on denial,
 /// or `None` if the command is allowed. The caller uses both to format
 /// the denial message.
-fn check_shell_command(cmd: &str) -> Option<(String, crate::config::ResolvedCommands)> {
+fn check_shell_command(
+    hook_json: &serde_json::Value,
+    cmd: &str,
+) -> Option<(String, crate::config::ResolvedCommands)> {
     let config = crate::config::Config::load().ok()?;
-    let resolved = config.resolved_commands?;
+    let mut resolved = config.resolved_commands?;
+    if resolved.client_enforcement_only {
+        return None;
+    }
+
+    // Merge with cwd's project config for per-root build support.
+    // Walk up from cwd to find the nearest `.catenary.toml` — cwd is
+    // typically a subdirectory of the workspace root.
+    // This covers the common single-root case and "agent is in the right
+    // directory" case. Multi-root coverage requires the session-side check.
+    let cwd = hook_json
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+    if let Some(ref cwd_path) = cwd
+        && let Some((root, pc)) = find_project_config(cwd_path)
+    {
+        let mut project_commands = std::collections::HashMap::new();
+        if let Some(cmds) = pc.commands {
+            project_commands.insert(root.clone(), cmds);
+        }
+        resolved = resolved.merge_project_commands(std::slice::from_ref(&root), &project_commands);
+    }
+
     if !resolved.is_active() {
         return None;
     }
-    let denied = crate::cli::command_filter::check_command(cmd, &resolved)?;
+
+    let denied = crate::cli::command_filter::check_command(cmd, &resolved, cwd.as_deref())?;
     Some((denied, resolved))
+}
+
+/// Walk up from `cwd` to find the nearest `.catenary.toml`.
+///
+/// Stops at the user's home directory — a project config above `$HOME`
+/// would be unusual, and walking into `/` is wasteful.
+///
+/// Returns `(root_path, ProjectConfig)` if found. Errors are silently
+/// ignored — a broken project config should not prevent the command
+/// filter from running with the user config.
+fn find_project_config(cwd: &std::path::Path) -> Option<(PathBuf, crate::config::ProjectConfig)> {
+    let home = dirs::home_dir();
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if let Ok(Some(pc)) = crate::config::load_project_config(d) {
+            return Some((d.to_path_buf(), pc));
+        }
+        // Stop at home directory.
+        if home.as_deref() == Some(d) {
+            break;
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// Query the session for denial debounce state and format the message.

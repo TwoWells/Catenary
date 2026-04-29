@@ -364,13 +364,14 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
 }
 
 /// Top-level keys allowed in `.catenary.toml` project config files.
-const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["enabled", "language", "server"];
+const PROJECT_CONFIG_ALLOWED_KEYS: &[&str] = &["enabled", "language", "server", "commands"];
 
 /// Per-root project configuration from `.catenary.toml`.
 ///
-/// Contains `enabled` (session kill switch) plus `[language.*]` and
-/// `[server.*]` sections. All other sections are user-level only and
-/// rejected with a warning if present.
+/// Contains `enabled` (session kill switch), `[language.*]` and
+/// `[server.*]` sections, and an optional `[commands]` section.
+/// Disabled roots (`enabled = false`) still contribute `[commands]`
+/// config (both `build` and `allow`) but not LSP config.
 #[derive(Debug, Clone)]
 pub struct ProjectConfig {
     /// Whether Catenary is enabled for this workspace (default `true`).
@@ -382,6 +383,12 @@ pub struct ProjectConfig {
     pub language: HashMap<String, LanguageConfig>,
     /// Server definitions from the project config.
     pub server: HashMap<String, ServerDef>,
+    /// Command filter configuration from the project config.
+    ///
+    /// `build` is per-root (each root can have its own build tool).
+    /// `allow` replaces the user's list for this root's contribution.
+    /// `pipeline` and `deny` follow the same replacement semantics.
+    pub commands: Option<CommandsConfig>,
 }
 
 impl Default for ProjectConfig {
@@ -390,6 +397,7 @@ impl Default for ProjectConfig {
             enabled: true,
             language: HashMap::new(),
             server: HashMap::new(),
+            commands: None,
         }
     }
 }
@@ -529,10 +537,42 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
+    // Parse and validate [commands] section.
+    let commands_config: Option<CommandsConfig> = raw
+        .get("commands")
+        .map(|v| {
+            toml::Value::try_into(v.clone()).with_context(|| {
+                format!(
+                    "Failed to parse [commands] in project config: {}",
+                    config_path.display()
+                )
+            })
+        })
+        .transpose()?;
+
+    if let Some(ref cmds) = commands_config {
+        let (errors, warnings) = commands::validate(cmds);
+        if !errors.is_empty() {
+            bail!(
+                "Project config {} [commands] errors:\n{}",
+                config_path.display(),
+                errors.join("\n"),
+            );
+        }
+        for warning in warnings {
+            tracing::warn!(
+                source = "config.project",
+                path = %config_path.display(),
+                "{warning}",
+            );
+        }
+    }
+
     Ok(Some(ProjectConfig {
         enabled,
         language,
         server,
+        commands: commands_config,
     }))
 }
 
@@ -637,16 +677,13 @@ command = "rust-analyzer"
         let dir = tempdir()?;
         fs::write(
             dir.path().join(".catenary.toml"),
-            r#"
-[commands.deny]
-cat = "Use read"
-
+            r"
 [tui]
 auto_add_sessions = false
 
 [language.rust]
 servers = []
-"#,
+",
         )?;
 
         // Should succeed (warnings only, not errors) but the unsupported
@@ -733,5 +770,128 @@ servers = ["pyright"]
                 source.display(),
             );
         }
+    }
+
+    // ── Project config [commands] tests ─────────────────────────────
+
+    #[test]
+    fn test_load_project_config_with_commands() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[commands]
+build = "npm"
+allow = ["git", "gh"]
+
+[commands.deny]
+git = ["grep"]
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        let cmds = config.commands.expect("commands should be present");
+        assert_eq!(cmds.build.as_deref(), Some("npm"));
+        assert_eq!(cmds.allow.as_ref().expect("allow").len(), 2);
+        let deny = cmds.deny.as_ref().expect("deny");
+        assert!(
+            deny.get("git")
+                .expect("git deny")
+                .contains(&"grep".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_commands_only() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[commands]
+build = "make"
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(config.enabled, "enabled defaults to true");
+        assert!(config.language.is_empty());
+        assert!(config.server.is_empty());
+        assert!(config.commands.is_some());
+        assert_eq!(
+            config.commands.expect("commands").build.as_deref(),
+            Some("make"),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_disabled_with_commands() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+enabled = false
+
+[commands]
+build = "make"
+allow = ["git"]
+"#,
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(!config.enabled);
+        let cmds = config.commands.expect("commands present despite disabled");
+        assert_eq!(cmds.build.as_deref(), Some("make"));
+        assert!(
+            cmds.allow
+                .as_ref()
+                .expect("allow")
+                .contains(&"git".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_project_config_commands_validation_error() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            r#"
+[commands]
+client_enforcement_only = true
+allow = ["git"]
+"#,
+        )
+        .expect("write");
+
+        let result = load_project_config(dir.path());
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("client_enforcement_only"),
+            "error should mention client_enforcement_only: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_no_commands() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "\n[language.rust]\nservers = []\n",
+        )?;
+
+        let result = load_project_config(dir.path())?;
+        let config = result.expect("should find project config");
+        assert!(config.commands.is_none());
+
+        Ok(())
     }
 }

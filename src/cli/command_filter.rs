@@ -224,14 +224,15 @@ fn check_against_allowlist(
     has_heredoc: bool,
     pipe_pos: usize,
     rules: &ResolvedCommands,
+    cwd: Option<&std::path::Path>,
 ) -> Option<String> {
     // Heredoc exception: command is reading from stdin, not files.
     if has_heredoc {
         return None;
     }
 
-    // Build tool is always allowed.
-    if rules.build.as_deref() == Some(name) {
+    // Build tool is always allowed (per-root lookup with default fallback).
+    if rules.build_for_cwd(cwd) == Some(name) {
         return None;
     }
 
@@ -263,9 +264,17 @@ fn check_against_allowlist(
 
 /// Check all commands in a shell command string against the allowlist rules.
 ///
+/// `cwd` is used for per-root `build` tool lookup. Pass `None` when no
+/// working directory is available (falls back to the user-level default
+/// build tool).
+///
 /// Returns the denied command name for the first denied command, or `None`
 /// if all commands are allowed.
-pub fn check_command(cmd: &str, rules: &ResolvedCommands) -> Option<String> {
+pub fn check_command(
+    cmd: &str,
+    rules: &ResolvedCommands,
+    cwd: Option<&std::path::Path>,
+) -> Option<String> {
     let cmd_string = strip_heredoc_bodies(cmd);
     let cmd_string = strip_echo_separators(&cmd_string);
 
@@ -285,7 +294,7 @@ pub fn check_command(cmd: &str, rules: &ResolvedCommands) -> Option<String> {
                     .or_else(|| m.get(2))
                     .or_else(|| m.get(3))
                     .map_or("", |g| g.as_str().trim());
-                if let Some(reason) = check_command(inner, rules) {
+                if let Some(reason) = check_command(inner, rules, cwd) {
                     return Some(reason);
                 }
             }
@@ -316,7 +325,7 @@ pub fn check_command(cmd: &str, rules: &ResolvedCommands) -> Option<String> {
             let subcommand = if rest.len() > 1 { Some(rest[1]) } else { None };
 
             if let Some(denied) =
-                check_against_allowlist(name, subcommand, has_heredoc, pipe_pos, rules)
+                check_against_allowlist(name, subcommand, has_heredoc, pipe_pos, rules, cwd)
             {
                 return Some(denied);
             }
@@ -427,8 +436,21 @@ pub fn format_denial_full(denied_cmd: &str, commands: &ResolvedCommands) -> Stri
         parts.push(format!("Denied subcommands: {}", denied_pairs.join(", ")));
     }
 
-    if let Some(ref build) = commands.build {
-        parts.push(format!("Build tool: {build}"));
+    // Collect unique build tools across all roots + default.
+    let mut build_tools: Vec<&str> = commands
+        .build
+        .values()
+        .map(String::as_str)
+        .chain(commands.default_build.as_deref())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    build_tools.sort_unstable();
+
+    if build_tools.len() == 1 {
+        parts.push(format!("Build tool: {}", build_tools[0]));
+    } else if build_tools.len() > 1 {
+        parts.push(format!("Build tools: {}", build_tools.join(", ")));
     }
 
     parts.join("\n")
@@ -498,8 +520,9 @@ mod tests {
                 "git".into(),
                 HashSet::from(["grep".into(), "ls-files".into(), "ls-tree".into()]),
             )]),
-            build: Some("make".into()),
+            default_build: Some("make".into()),
             client_enforcement_only: false,
+            ..ResolvedCommands::default()
         }
     }
 
@@ -518,8 +541,9 @@ mod tests {
                 "git".into(),
                 HashSet::from(["grep".into(), "ls-files".into(), "ls-tree".into()]),
             )]),
-            build: Some("make".into()),
+            default_build: Some("make".into()),
             client_enforcement_only: false,
+            ..ResolvedCommands::default()
         }
     }
 
@@ -528,26 +552,26 @@ mod tests {
     #[test]
     fn deny_command_returns_name() {
         let rules = basic_rules();
-        let result = check_command("cat file.txt", &rules);
+        let result = check_command("cat file.txt", &rules, None);
         assert_eq!(result.as_deref(), Some("cat"));
     }
 
     #[test]
     fn allowed_command_returns_none() {
         let rules = basic_rules();
-        assert!(check_command("make check", &rules).is_none());
+        assert!(check_command("make check", &rules, None).is_none());
     }
 
     #[test]
     fn pipeline_at_position_zero_denied() {
         let rules = basic_rules();
-        assert!(check_command("grep pattern file", &rules).is_some());
+        assert!(check_command("grep pattern file", &rules, None).is_some());
     }
 
     #[test]
     fn pipeline_mid_pipeline_allowed() {
         let rules = basic_rules();
-        assert!(check_command("echo foo | grep bar", &rules).is_none());
+        assert!(check_command("echo foo | grep bar", &rules, None).is_none());
     }
 
     // ── Pipeline-safe ────────────────────────────────────────────────
@@ -555,26 +579,26 @@ mod tests {
     #[test]
     fn grep_standalone_denied() {
         let rules = basic_rules();
-        assert!(check_command("grep pattern file", &rules).is_some());
+        assert!(check_command("grep pattern file", &rules, None).is_some());
     }
 
     #[test]
     fn grep_mid_pipeline_allowed() {
         let rules = basic_rules();
-        assert!(check_command("echo foo | grep bar", &rules).is_none());
+        assert!(check_command("echo foo | grep bar", &rules, None).is_none());
     }
 
     #[test]
     fn multi_stage_pipeline_allowed() {
         let rules = python_equivalent_rules();
-        assert!(check_command("git log | sort", &rules).is_none());
+        assert!(check_command("git log | sort", &rules, None).is_none());
     }
 
     #[test]
     fn denied_source_blocks_pipeline() {
         let rules = basic_rules();
-        assert!(check_command("cat file | grep foo", &rules).is_some());
-        assert!(check_command("ls | grep foo", &rules).is_some());
+        assert!(check_command("cat file | grep foo", &rules, None).is_some());
+        assert!(check_command("ls | grep foo", &rules, None).is_some());
     }
 
     // ── Heredoc exception ────────────────────────────────────────────
@@ -582,13 +606,13 @@ mod tests {
     #[test]
     fn cat_heredoc_allowed() {
         let rules = basic_rules();
-        assert!(check_command("cat <<EOF\nhello\nEOF", &rules).is_none());
+        assert!(check_command("cat <<EOF\nhello\nEOF", &rules, None).is_none());
     }
 
     #[test]
     fn cat_file_denied() {
         let rules = basic_rules();
-        assert!(check_command("cat file.txt", &rules).is_some());
+        assert!(check_command("cat file.txt", &rules, None).is_some());
     }
 
     #[test]
@@ -596,13 +620,13 @@ mod tests {
         // head is not in allow, but heredoc exception applies.
         let mut rules = ResolvedCommands::default();
         rules.allow.insert("git".to_string());
-        assert!(check_command("head <<'MARKER'\nhello\nMARKER", &rules).is_none());
+        assert!(check_command("head <<'MARKER'\nhello\nMARKER", &rules, None).is_none());
     }
 
     #[test]
     fn sed_heredoc_allowed() {
         let rules = basic_rules();
-        assert!(check_command("sed 's/foo/bar/' <<EOF\nhello\nEOF", &rules).is_none());
+        assert!(check_command("sed 's/foo/bar/' <<EOF\nhello\nEOF", &rules, None).is_none());
     }
 
     #[test]
@@ -610,14 +634,14 @@ mod tests {
         // grep has an unquoted positional arg before <<, so the heredoc
         // exception does NOT fire. grep is in pipeline → denied at pos 0.
         let rules = basic_rules();
-        assert!(check_command("grep pattern <<EOF\nhello\nEOF", &rules).is_some());
+        assert!(check_command("grep pattern <<EOF\nhello\nEOF", &rules, None).is_some());
     }
 
     #[test]
     fn heredoc_narrowing_file_arg_before_heredoc() {
         // Adversarial: file operand before << prevents the exception.
         let rules = basic_rules();
-        assert!(check_command("cat file.txt <<EOF\nhello\nEOF", &rules).is_some());
+        assert!(check_command("cat file.txt <<EOF\nhello\nEOF", &rules, None).is_some());
     }
 
     // ── Subshell recursion ───────────────────────────────────────────
@@ -625,25 +649,25 @@ mod tests {
     #[test]
     fn subshell_cat_denied() {
         let rules = basic_rules();
-        assert!(check_command("echo $(cat file)", &rules).is_some());
+        assert!(check_command("echo $(cat file)", &rules, None).is_some());
     }
 
     #[test]
     fn subshell_grep_in_sequential_denied() {
         let rules = basic_rules();
-        assert!(check_command("make test && $(grep -r pattern .)", &rules).is_some());
+        assert!(check_command("make test && $(grep -r pattern .)", &rules, None).is_some());
     }
 
     #[test]
     fn backtick_cat_denied() {
         let rules = basic_rules();
-        assert!(check_command("`cat file`", &rules).is_some());
+        assert!(check_command("`cat file`", &rules, None).is_some());
     }
 
     #[test]
     fn process_substitution_cat_denied() {
         let rules = basic_rules();
-        assert!(check_command("diff <(cat file1) <(cat file2)", &rules).is_some());
+        assert!(check_command("diff <(cat file1) <(cat file2)", &rules, None).is_some());
     }
 
     // ── Quote-aware splitting ────────────────────────────────────────
@@ -651,25 +675,25 @@ mod tests {
     #[test]
     fn awk_pattern_not_split_on_and() {
         let rules = python_equivalent_rules();
-        assert!(check_command("make test | awk '/a/ && /b/' | sort", &rules).is_none());
+        assert!(check_command("make test | awk '/a/ && /b/' | sort", &rules, None).is_none());
     }
 
     #[test]
     fn git_commit_message_not_split_on_semicolon() {
         let rules = basic_rules();
-        assert!(check_command("git commit -m \"foo; bar\"", &rules).is_none());
+        assert!(check_command("git commit -m \"foo; bar\"", &rules, None).is_none());
     }
 
     #[test]
     fn git_commit_message_not_split_on_and() {
         let rules = basic_rules();
-        assert!(check_command("git commit -m \"foo && bar\"", &rules).is_none());
+        assert!(check_command("git commit -m \"foo && bar\"", &rules, None).is_none());
     }
 
     #[test]
     fn pipe_inside_single_quotes_not_split() {
         let rules = python_equivalent_rules();
-        assert!(check_command("make test | awk '/a|b/ {print}'", &rules).is_none());
+        assert!(check_command("make test | awk '/a|b/ {print}'", &rules, None).is_none());
     }
 
     // ── Subcommand deny ──────────────────────────────────────────────
@@ -677,26 +701,26 @@ mod tests {
     #[test]
     fn git_grep_denied() {
         let rules = basic_rules();
-        assert!(check_command("git grep pattern", &rules).is_some());
+        assert!(check_command("git grep pattern", &rules, None).is_some());
     }
 
     #[test]
     fn git_commit_allowed() {
         let rules = basic_rules();
-        assert!(check_command("git commit -m \"message\"", &rules).is_none());
+        assert!(check_command("git commit -m \"message\"", &rules, None).is_none());
     }
 
     #[test]
     fn git_ls_files_denied() {
         let rules = basic_rules();
-        assert!(check_command("git ls-files", &rules).is_some());
+        assert!(check_command("git ls-files", &rules, None).is_some());
     }
 
     #[test]
     fn cargo_not_allowed() {
         let rules = basic_rules();
-        assert!(check_command("cargo test", &rules).is_some());
-        assert!(check_command("cargo clippy", &rules).is_some());
+        assert!(check_command("cargo test", &rules, None).is_some());
+        assert!(check_command("cargo clippy", &rules, None).is_some());
     }
 
     // ── Env var prefix ───────────────────────────────────────────────
@@ -704,19 +728,19 @@ mod tests {
     #[test]
     fn env_var_prefix_allowed() {
         let rules = basic_rules();
-        assert!(check_command("DEBUG=1 make test", &rules).is_none());
+        assert!(check_command("DEBUG=1 make test", &rules, None).is_none());
     }
 
     #[test]
     fn env_var_prefix_denied() {
         let rules = basic_rules();
-        assert!(check_command("RUST_LOG=debug cargo test", &rules).is_some());
+        assert!(check_command("RUST_LOG=debug cargo test", &rules, None).is_some());
     }
 
     #[test]
     fn multiple_env_vars_denied() {
         let rules = basic_rules();
-        assert!(check_command("A=1 B=2 cat file", &rules).is_some());
+        assert!(check_command("A=1 B=2 cat file", &rules, None).is_some());
     }
 
     // ── Full path ────────────────────────────────────────────────────
@@ -724,20 +748,20 @@ mod tests {
     #[test]
     fn full_path_grep_denied() {
         let rules = basic_rules();
-        assert!(check_command("/usr/bin/grep pattern", &rules).is_some());
+        assert!(check_command("/usr/bin/grep pattern", &rules, None).is_some());
     }
 
     #[test]
     fn full_path_cat_denied() {
         let rules = basic_rules();
-        assert!(check_command("/bin/cat file.txt", &rules).is_some());
+        assert!(check_command("/bin/cat file.txt", &rules, None).is_some());
     }
 
     #[test]
     fn relative_path_denied() {
         let rules = basic_rules();
-        assert!(check_command("./grep foo bar", &rules).is_some());
-        assert!(check_command("../bin/grep foo bar", &rules).is_some());
+        assert!(check_command("./grep foo bar", &rules, None).is_some());
+        assert!(check_command("../bin/grep foo bar", &rules, None).is_some());
     }
 
     // ── Regression tests (ported from Python) ────────────────────────
@@ -749,169 +773,169 @@ mod tests {
         #[test]
         fn make() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make check", &rules).is_none());
+            assert!(check_command("make check", &rules, None).is_none());
         }
 
         #[test]
         fn git() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git status", &rules).is_none());
-            assert!(check_command("git log --oneline", &rules).is_none());
-            assert!(check_command("git commit -m 'fix bug'", &rules).is_none());
+            assert!(check_command("git status", &rules, None).is_none());
+            assert!(check_command("git log --oneline", &rules, None).is_none());
+            assert!(check_command("git commit -m 'fix bug'", &rules, None).is_none());
         }
 
         #[test]
         fn gh() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh pr list", &rules).is_none());
-            assert!(check_command("gh issue view 123", &rules).is_none());
+            assert!(check_command("gh pr list", &rules, None).is_none());
+            assert!(check_command("gh issue view 123", &rules, None).is_none());
         }
 
         #[test]
         fn sleep() {
             let rules = python_equivalent_rules();
-            assert!(check_command("sleep 5", &rules).is_none());
+            assert!(check_command("sleep 5", &rules, None).is_none());
         }
 
         #[test]
         fn cp_mv() {
             let rules = python_equivalent_rules();
-            assert!(check_command("cp foo bar", &rules).is_none());
-            assert!(check_command("mv foo bar", &rules).is_none());
+            assert!(check_command("cp foo bar", &rules, None).is_none());
+            assert!(check_command("mv foo bar", &rules, None).is_none());
         }
 
         #[test]
         fn env_prefix_allowed() {
             let rules = python_equivalent_rules();
-            assert!(check_command("DEBUG=1 make check", &rules).is_none());
-            assert!(check_command("RUST_LOG=debug make test", &rules).is_none());
+            assert!(check_command("DEBUG=1 make check", &rules, None).is_none());
+            assert!(check_command("RUST_LOG=debug make test", &rules, None).is_none());
         }
 
         // TestDenied
         #[test]
         fn cat_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("cat file.txt", &rules).is_some());
+            assert!(check_command("cat file.txt", &rules, None).is_some());
         }
 
         #[test]
         fn grep_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("grep foo bar.rs", &rules).is_some());
+            assert!(check_command("grep foo bar.rs", &rules, None).is_some());
         }
 
         #[test]
         fn ls_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("ls -la", &rules).is_some());
+            assert!(check_command("ls -la", &rules, None).is_some());
         }
 
         #[test]
         fn find_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("find . -name '*.rs'", &rules).is_some());
+            assert!(check_command("find . -name '*.rs'", &rules, None).is_some());
         }
 
         #[test]
         fn cargo_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("cargo build", &rules).is_some());
-            assert!(check_command("cargo test", &rules).is_some());
-            assert!(check_command("cargo build 2>&1", &rules).is_some());
+            assert!(check_command("cargo build", &rules, None).is_some());
+            assert!(check_command("cargo test", &rules, None).is_some());
+            assert!(check_command("cargo build 2>&1", &rules, None).is_some());
         }
 
         #[test]
         fn full_path_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("/usr/bin/grep foo bar", &rules).is_some());
-            assert!(check_command("/bin/cat file.txt", &rules).is_some());
+            assert!(check_command("/usr/bin/grep foo bar", &rules, None).is_some());
+            assert!(check_command("/bin/cat file.txt", &rules, None).is_some());
         }
 
         #[test]
         fn env_prefix_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("DEBUG=1 cargo test", &rules).is_some());
+            assert!(check_command("DEBUG=1 cargo test", &rules, None).is_some());
         }
 
         // TestGitDeniedSubcommands
         #[test]
         fn git_grep_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git grep foo", &rules).is_some());
+            assert!(check_command("git grep foo", &rules, None).is_some());
         }
 
         #[test]
         fn git_ls_files_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git ls-files", &rules).is_some());
+            assert!(check_command("git ls-files", &rules, None).is_some());
         }
 
         #[test]
         fn git_ls_tree_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git ls-tree HEAD", &rules).is_some());
+            assert!(check_command("git ls-tree HEAD", &rules, None).is_some());
         }
 
         #[test]
         fn git_log_allowed() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git log --oneline", &rules).is_none());
+            assert!(check_command("git log --oneline", &rules, None).is_none());
         }
 
         #[test]
         fn git_diff_allowed() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git diff HEAD", &rules).is_none());
+            assert!(check_command("git diff HEAD", &rules, None).is_none());
         }
 
         // TestPipeline
         #[test]
         fn grep_mid_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh pr list | grep foo", &rules).is_none());
+            assert!(check_command("gh pr list | grep foo", &rules, None).is_none());
         }
 
         #[test]
         fn head_mid_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh issue list | head -20", &rules).is_none());
+            assert!(check_command("gh issue list | head -20", &rules, None).is_none());
         }
 
         #[test]
         fn tail_mid_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git log --oneline | tail -5", &rules).is_none());
+            assert!(check_command("git log --oneline | tail -5", &rules, None).is_none());
         }
 
         #[test]
         fn jq_mid_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh pr view --json title | jq .title", &rules).is_none());
+            assert!(check_command("gh pr view --json title | jq .title", &rules, None).is_none());
         }
 
         #[test]
         fn wc_mid_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh issue list | wc -l", &rules).is_none());
+            assert!(check_command("gh issue list | wc -l", &rules, None).is_none());
         }
 
         #[test]
         fn multi_stage_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh pr list | grep open | head -5", &rules).is_none());
+            assert!(check_command("gh pr list | grep open | head -5", &rules, None).is_none());
         }
 
         #[test]
         fn grep_standalone_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("grep foo bar.rs", &rules).is_some());
+            assert!(check_command("grep foo bar.rs", &rules, None).is_some());
         }
 
         #[test]
         fn denied_source_blocks_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("cat file | grep foo", &rules).is_some());
-            assert!(check_command("ls | grep foo", &rules).is_some());
+            assert!(check_command("cat file | grep foo", &rules, None).is_some());
+            assert!(check_command("ls | grep foo", &rules, None).is_some());
         }
 
         // TestHeredoc
@@ -919,7 +943,12 @@ mod tests {
         fn git_commit_heredoc() {
             let rules = python_equivalent_rules();
             assert!(
-                check_command("git commit -m \"$(cat <<'EOF'\nmessage\nEOF\n)\"", &rules).is_none()
+                check_command(
+                    "git commit -m \"$(cat <<'EOF'\nmessage\nEOF\n)\"",
+                    &rules,
+                    None
+                )
+                .is_none()
             );
         }
 
@@ -929,7 +958,8 @@ mod tests {
             assert!(
                 check_command(
                     "gh pr create --body \"$(cat <<'EOF'\nbody text\nEOF\n)\"",
-                    &rules
+                    &rules,
+                    None
                 )
                 .is_none()
             );
@@ -945,7 +975,7 @@ mod tests {
                         - Add chmod +x to script (missing execute bit)\n\
                         EOF\n\
                         )\"";
-            assert!(check_command(cmd, &rules).is_none());
+            assert!(check_command(cmd, &rules, None).is_none());
         }
 
         #[test]
@@ -955,51 +985,51 @@ mod tests {
                         fix(hook): missing execute bit was silently allowing blocked commands through)\n\
                         EOF\n\
                         )\"";
-            assert!(check_command(cmd, &rules).is_none());
+            assert!(check_command(cmd, &rules, None).is_none());
         }
 
         #[test]
         fn cat_file_still_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("cat file.txt", &rules).is_some());
+            assert!(check_command("cat file.txt", &rules, None).is_some());
         }
 
         // TestSubshell
         #[test]
         fn subshell_cat_standalone() {
             let rules = python_equivalent_rules();
-            assert!(check_command("$(cat Makefile)", &rules).is_some());
+            assert!(check_command("$(cat Makefile)", &rules, None).is_some());
         }
 
         #[test]
         fn subshell_cat_in_git_arg() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git commit -m \"$(cat file)\"", &rules).is_some());
+            assert!(check_command("git commit -m \"$(cat file)\"", &rules, None).is_some());
         }
 
         #[test]
         fn backtick_grep() {
             let rules = python_equivalent_rules();
-            assert!(check_command("`grep foo bar`", &rules).is_some());
+            assert!(check_command("`grep foo bar`", &rules, None).is_some());
         }
 
         #[test]
         fn backtick_cat() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make build `cat args.txt`", &rules).is_some());
+            assert!(check_command("make build `cat args.txt`", &rules, None).is_some());
         }
 
         // TestProcessSubstitution
         #[test]
         fn cat_inside_process_sub_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git diff <(cat file1) <(cat file2)", &rules).is_some());
+            assert!(check_command("git diff <(cat file1) <(cat file2)", &rules, None).is_some());
         }
 
         #[test]
         fn grep_inside_process_sub_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git diff <(grep foo bar)", &rules).is_some());
+            assert!(check_command("git diff <(grep foo bar)", &rules, None).is_some());
         }
 
         #[test]
@@ -1008,7 +1038,8 @@ mod tests {
             assert!(
                 check_command(
                     "git diff <(git show HEAD:src/main.rs) <(git show HEAD~1:src/main.rs)",
-                    &rules
+                    &rules,
+                    None
                 )
                 .is_none()
             );
@@ -1018,162 +1049,162 @@ mod tests {
         #[test]
         fn and_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make build && cat file", &rules).is_some());
+            assert!(check_command("make build && cat file", &rules, None).is_some());
         }
 
         #[test]
         fn semicolon_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git status; ls", &rules).is_some());
+            assert!(check_command("git status; ls", &rules, None).is_some());
         }
 
         #[test]
         fn or_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make check || cargo test", &rules).is_some());
+            assert!(check_command("make check || cargo test", &rules, None).is_some());
         }
 
         #[test]
         fn both_allowed() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git fetch && make check", &rules).is_none());
+            assert!(check_command("git fetch && make check", &rules, None).is_none());
         }
 
         // TestAdversarial
         #[test]
         fn env_var_before_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("FOO=0 grep foo bar", &rules).is_some());
+            assert!(check_command("FOO=0 grep foo bar", &rules, None).is_some());
         }
 
         #[test]
         fn multiple_env_vars_before_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("A=1 B=2 cat file", &rules).is_some());
+            assert!(check_command("A=1 B=2 cat file", &rules, None).is_some());
         }
 
         #[test]
         fn env_var_before_denied_full_path() {
             let rules = python_equivalent_rules();
-            assert!(check_command("PATH=/tmp /usr/bin/grep foo bar", &rules).is_some());
+            assert!(check_command("PATH=/tmp /usr/bin/grep foo bar", &rules, None).is_some());
         }
 
         #[test]
         fn subshell_with_internal_spaces() {
             let rules = python_equivalent_rules();
-            assert!(check_command("$( cat file )", &rules).is_some());
+            assert!(check_command("$( cat file )", &rules, None).is_some());
         }
 
         #[test]
         fn nested_subshell() {
             let rules = python_equivalent_rules();
-            assert!(check_command("$(echo $(cat file))", &rules).is_some());
+            assert!(check_command("$(echo $(cat file))", &rules, None).is_some());
         }
 
         #[test]
         fn subshell_in_pipeline_position() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh pr list | $(cat file)", &rules).is_some());
+            assert!(check_command("gh pr list | $(cat file)", &rules, None).is_some());
         }
 
         #[test]
         fn subshell_grep_in_pipeline() {
             let rules = python_equivalent_rules();
-            assert!(check_command("gh pr list | $(grep foo bar.rs)", &rules).is_some());
+            assert!(check_command("gh pr list | $(grep foo bar.rs)", &rules, None).is_some());
         }
 
         #[test]
         fn backtick_in_git_arg() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git commit -m \"`cat file`\"", &rules).is_some());
+            assert!(check_command("git commit -m \"`cat file`\"", &rules, None).is_some());
         }
 
         #[test]
         fn semicolon_leading_subshell() {
             let rules = python_equivalent_rules();
-            assert!(check_command("; $(head file)", &rules).is_some());
+            assert!(check_command("; $(head file)", &rules, None).is_some());
         }
 
         #[test]
         fn semicolon_then_cat_subshell() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make check; $(cat Makefile)", &rules).is_some());
+            assert!(check_command("make check; $(cat Makefile)", &rules, None).is_some());
         }
 
         #[test]
         fn semicolon_then_grep() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git status; grep foo bar", &rules).is_some());
+            assert!(check_command("git status; grep foo bar", &rules, None).is_some());
         }
 
         #[test]
         fn herestring_with_subshell_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("head -5 <<< $(cat /etc/passwd)", &rules).is_some());
+            assert!(check_command("head -5 <<< $(cat /etc/passwd)", &rules, None).is_some());
         }
 
         #[test]
         fn logical_or_both_checked() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make check || grep foo bar", &rules).is_some());
+            assert!(check_command("make check || grep foo bar", &rules, None).is_some());
         }
 
         #[test]
         fn relative_path_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("./grep foo bar", &rules).is_some());
-            assert!(check_command("../bin/grep foo bar", &rules).is_some());
+            assert!(check_command("./grep foo bar", &rules, None).is_some());
+            assert!(check_command("../bin/grep foo bar", &rules, None).is_some());
         }
 
         #[test]
         fn git_diff_process_substitution_denied() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git diff <(cat file1) <(cat file2)", &rules).is_some());
+            assert!(check_command("git diff <(cat file1) <(cat file2)", &rules, None).is_some());
         }
 
         // TestQuotedOperators
         #[test]
         fn awk_with_and_in_pattern() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make test | awk '/a/ && /b/' | sort", &rules).is_none());
+            assert!(check_command("make test | awk '/a/ && /b/' | sort", &rules, None).is_none());
         }
 
         #[test]
         fn pipe_inside_single_quotes() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make test | awk '/a|b/ {print}'", &rules).is_none());
+            assert!(check_command("make test | awk '/a|b/ {print}'", &rules, None).is_none());
         }
 
         #[test]
         fn semicolon_inside_single_quotes() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make ARGS='a;b;c' test", &rules).is_none());
+            assert!(check_command("make ARGS='a;b;c' test", &rules, None).is_none());
         }
 
         #[test]
         fn and_inside_double_quotes() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git commit -m \"foo && bar\"", &rules).is_none());
+            assert!(check_command("git commit -m \"foo && bar\"", &rules, None).is_none());
         }
 
         #[test]
         fn pipe_inside_double_quotes() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git commit -m \"a | b\"", &rules).is_none());
+            assert!(check_command("git commit -m \"a | b\"", &rules, None).is_none());
         }
 
         #[test]
         fn semicolon_inside_double_quotes() {
             let rules = python_equivalent_rules();
-            assert!(check_command("git commit -m \"a; b\"", &rules).is_none());
+            assert!(check_command("git commit -m \"a; b\"", &rules, None).is_none());
         }
 
         #[test]
         fn unquoted_operators_still_split() {
             let rules = python_equivalent_rules();
-            assert!(check_command("make build && cat file", &rules).is_some());
-            assert!(check_command("make build; ls .", &rules).is_some());
-            assert!(check_command("cat file | grep foo", &rules).is_some());
+            assert!(check_command("make build && cat file", &rules, None).is_some());
+            assert!(check_command("make build; ls .", &rules, None).is_some());
+            assert!(check_command("cat file | grep foo", &rules, None).is_some());
         }
     }
 
@@ -1350,10 +1381,7 @@ mod tests {
     fn format_full_omits_empty_sections() {
         let rules = ResolvedCommands {
             allow: HashSet::from(["git".into()]),
-            pipeline: HashSet::new(),
-            deny: HashMap::new(),
-            build: None,
-            client_enforcement_only: false,
+            ..ResolvedCommands::default()
         };
         let msg = format_denial_full("ls", &rules);
 
@@ -1376,7 +1404,6 @@ mod tests {
     fn format_full_deny_pairs_sorted() {
         let rules = ResolvedCommands {
             allow: HashSet::from(["git".into(), "sqlite3".into()]),
-            pipeline: HashSet::new(),
             deny: HashMap::from([
                 (
                     "git".into(),
@@ -1384,8 +1411,7 @@ mod tests {
                 ),
                 ("sqlite3".into(), HashSet::from(["-cmd".into()])),
             ]),
-            build: None,
-            client_enforcement_only: false,
+            ..ResolvedCommands::default()
         };
         let msg = format_denial_full("ls", &rules);
 
@@ -1414,7 +1440,7 @@ mod tests {
     fn check_command_denied_subcommand_returns_full_form() {
         let rules = python_equivalent_rules();
         // git grep should return "git grep", not just "git".
-        let denied = check_command("git grep foo", &rules);
+        let denied = check_command("git grep foo", &rules, None);
         assert_eq!(denied.as_deref(), Some("git grep"));
     }
 }
