@@ -510,7 +510,7 @@ fn test_config_outputs_valid_toml() -> Result<()> {
 }
 
 #[test]
-fn test_config_contains_deny_sections() -> Result<()> {
+fn test_config_contains_allowlist_sections() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
@@ -520,12 +520,17 @@ fn test_config_contains_deny_sections() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
-        stdout.contains("[commands.deny]"),
-        "output should contain [commands.deny]"
+        stdout.contains("# [commands]"),
+        "output should contain commented-out [commands] section"
+    );
+    assert!(stdout.contains("allow"), "output should contain allow key");
+    assert!(
+        stdout.contains("pipeline"),
+        "output should contain pipeline key"
     );
     assert!(
-        stdout.contains("[commands.deny_when_first]"),
-        "output should contain [commands.deny_when_first]"
+        stdout.contains("client_enforcement_only"),
+        "output should contain client_enforcement_only option"
     );
     Ok(())
 }

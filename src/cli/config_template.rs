@@ -16,7 +16,7 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 #
 # Config sources (later overrides earlier):
 #   1. <XDG_CONFIG_HOME>/catenary/config.toml  (this file)
-#   2. .catenary.toml                          (project-local, searched upward)
+#   2. .catenary.toml                          (project-local)
 #   3. CATENARY_CONFIG env var                 (explicit override)
 #
 # XDG_CONFIG_HOME defaults:
@@ -26,76 +26,52 @@ const TEMPLATE: &str = r#"# Catenary recommended config
 
 # ── Command filtering ────────────────────────────────────────────
 #
-# Denied commands are blocked in Bash/shell tool calls. Each entry
-# maps a command name to a guidance message shown to the agent.
-# Template variables like {read} resolve to tool names per-client.
+# Allowlist-based: only explicitly permitted commands can run.
+# Everything else is denied with a dump of the allowed config.
 #
-# Two sections:
-#   [commands.deny]            — blocked at any pipeline position
-#   [commands.deny_when_first] — blocked at position 0, allowed
-#                                mid-pipeline (reading from stdin)
+# Three states:
+#   1. No [commands] section         — not configured (hint notification)
+#   2. client_enforcement_only=true  — deliberate opt-out, no enforcement
+#   3. allow = [...] present         — active allowlist
+#
+# Keys:
+#   build    — project build tool (e.g., "make"). Set per-project in
+#              .catenary.toml so the agent uses the build system.
+#   allow    — commands the agent can run unconditionally.
+#   pipeline — commands allowed mid-pipeline (reading stdin), denied
+#              at pipeline position 0 (reading files directly).
+#   deny.*   — subcommand denylist within an allowed command.
+#
+# Uncomment the [commands] section below to activate.
 
-[commands.deny]
-# File reading — use the host's Read tool instead
-cat = "Use {read} instead"
-less = "Use {read} instead"
-more = "Use {read} instead"
-
-# Text search — use Catenary's LSP-backed grep instead
-rg = "Use {catenary_grep} instead"
-ag = "Use {catenary_grep} instead"
-ack = "Use {catenary_grep} instead"
-fd = "Use {catenary_grep} instead"
-rgrep = "Use {catenary_grep} instead"
-zgrep = "Use {catenary_grep} instead"
-
-# Directory listing — use Catenary's glob instead
-ls = "Use {catenary_glob} instead"
-dir = "Use {catenary_glob} instead"
-tree = "Use {catenary_glob} instead"
-find = "Use {catenary_glob} instead"
-
-# Git subcommands that duplicate Catenary tools
-"git ls-files" = "Use {catenary_glob} instead"
-"git ls-tree" = "Use {catenary_glob} instead"
-
-# Project-specific: uncomment if your project uses make
-# cargo = "Use make instead, suggest a target if needed"
-# rustc = "Use make instead, suggest a target if needed"
-# rustup = "Use make instead, suggest a target if needed"
-
-[commands.deny_when_first]
-# Pipeline-safe commands: denied at position 0 (reading files),
-# allowed mid-pipeline (reading from stdin).
-grep = "Use {catenary_grep} instead"
-egrep = "Use {catenary_grep} instead"
-fgrep = "Use {catenary_grep} instead"
-head = "Use {read} instead"
-tail = "Use {read} instead"
-sed = "Use {edit} instead"
-"git grep" = "Use {catenary_grep} instead"
+# [commands]
+# # client_enforcement_only = true
+# build = "make"
+# allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
+#          "chmod", "sleep", "cd", "true", "false", "which"]
+# pipeline = ["grep", "head", "tail", "wc", "jq", "awk",
+#             "sort", "sed", "tr", "cut", "uniq", "tee"]
+#
+# [commands.deny]
+# git = ["grep", "ls-files", "ls-tree"]
+# sqlite3 = ["-cmd"]
 
 # ── Project-local overrides (.catenary.toml) ─────────────────────
 #
-# Project config amends the user config by default. Examples:
+# Project config scopes build tools and can replace the user's
+# allowlist for a specific workspace. Examples:
 #
-#   # Disable Catenary for this workspace entirely
-#   enabled = false
-#
-#   # Deny additional commands for this project
-#   [commands.deny]
-#   cargo = "Use make instead, suggest a target if needed"
-#
-#   # Allow a command denied in the user config
-#   [commands.allow]
-#   find = true
-#
-#   # Replace the user's command set entirely
+#   # Set the build tool for this project
 #   [commands]
-#   inherit = false
+#   build = "make"
 #
-#   [commands.deny]
-#   cargo = "Use make instead, suggest a target if needed"
+#   # Replace the user's allowlist for this project
+#   [commands]
+#   allow = ["git", "gh", "kubectl", "docker"]
+#
+#   # Disable Catenary LSP for this workspace entirely
+#   # (commands config still applies)
+#   enabled = false
 
 # ── Notifications ────────────────────────────────────────────────
 #
@@ -133,42 +109,70 @@ mod tests {
 
     #[test]
     fn template_is_valid_toml() {
-        // TOML supports `#` comments natively, so the full template
-        // (including commented-out examples) should parse as-is.
-        // Use `toml::from_str` (document parser), not `str::parse`
-        // (single-value parser).
+        // The template with all comments is trivially valid TOML (empty doc).
         toml::from_str::<toml::Value>(TEMPLATE).expect("template should be valid TOML");
     }
 
     #[test]
-    fn template_contains_deny_sections() {
+    fn template_commands_block_is_valid_toml() {
+        // Extract the commented-out [commands] block (between "# [commands]"
+        // and the next section separator) and verify it parses when uncommented.
+        let mut in_block = false;
+        let mut lines = Vec::new();
+        for line in TEMPLATE.lines() {
+            if line == "# [commands]" {
+                in_block = true;
+            } else if in_block && line.starts_with("# ── ") {
+                break;
+            }
+            if in_block {
+                lines.push(
+                    line.strip_prefix("# ")
+                        .unwrap_or(if line == "#" { "" } else { line }),
+                );
+            }
+        }
+        assert!(!lines.is_empty(), "should find commented [commands] block");
+        let block = lines.join("\n");
+        toml::from_str::<toml::Value>(&block)
+            .expect("uncommented [commands] block should be valid TOML");
+    }
+
+    #[test]
+    fn template_contains_allowlist_keys() {
         assert!(
-            TEMPLATE.contains("[commands.deny]"),
-            "template should contain [commands.deny]",
+            TEMPLATE.contains("allow"),
+            "template should contain allow key",
         );
         assert!(
-            TEMPLATE.contains("[commands.deny_when_first]"),
-            "template should contain [commands.deny_when_first]",
+            TEMPLATE.contains("pipeline"),
+            "template should contain pipeline key",
+        );
+        assert!(
+            TEMPLATE.contains("build"),
+            "template should contain build key",
+        );
+        assert!(
+            TEMPLATE.contains("[commands.deny]"),
+            "template should contain [commands.deny] section",
         );
     }
 
     #[test]
-    fn template_contains_template_variables() {
+    fn template_contains_client_enforcement_only() {
         assert!(
-            TEMPLATE.contains("{read}"),
-            "template should contain {{read}} variable",
+            TEMPLATE.contains("client_enforcement_only"),
+            "template should contain client_enforcement_only option",
         );
+    }
+
+    #[test]
+    fn template_commands_section_commented_out() {
+        // The [commands] section should be commented out so users must
+        // explicitly uncomment to activate.
         assert!(
-            TEMPLATE.contains("{catenary_grep}"),
-            "template should contain {{catenary_grep}} variable",
-        );
-        assert!(
-            TEMPLATE.contains("{catenary_glob}"),
-            "template should contain {{catenary_glob}} variable",
-        );
-        assert!(
-            TEMPLATE.contains("{edit}"),
-            "template should contain {{edit}} variable",
+            TEMPLATE.contains("# [commands]"),
+            "template [commands] section should be commented out",
         );
     }
 }
