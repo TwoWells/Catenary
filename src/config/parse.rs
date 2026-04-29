@@ -273,9 +273,9 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
 /// source's explicit setting survives an unrelated later source.
 ///
 /// **Commands** (`commands`): layered merge via `ResolvedCommands::merge`.
-/// `allow` removes keys, `deny`/`deny_when_first` add/override keys,
-/// `inherit = false` replaces entirely. The raw `CommandsConfig` is
-/// consumed and not stored on `Config`.
+/// `allow` and `pipeline` replace; `deny` entries merge per-command;
+/// `build` overwrites; `client_enforcement_only` is sticky. The raw
+/// `CommandsConfig` is consumed and not stored on `Config`.
 fn merge(config: &mut Config, other: RawConfig) {
     if other.log_retention_days != default_log_retention_days() {
         config.log_retention_days = other.log_retention_days;

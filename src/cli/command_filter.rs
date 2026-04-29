@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Shell command parser for denylist-based command filtering.
+//! Shell command parser for allowlist-based command filtering.
 //!
-//! Checks Bash commands against a [`ResolvedCommands`] set. Reimplements
+//! Checks Bash commands against a [`ResolvedCommands`] allowlist. Reimplements
 //! all parsing logic from `scripts/constrained_bash.py` in Rust: pipeline
 //! position tracking, subshell recursion, heredoc exception, quote-aware
-//! splitting, env var prefix skipping, full path stripping, and compound
-//! subcommand matching.
+//! splitting, env var prefix skipping, full path stripping, and subcommand
+//! deny matching.
 
 #[allow(
     clippy::expect_used,
@@ -209,30 +209,60 @@ fn shell_split(s: &str) -> Vec<String> {
     tokens.into_iter().map(String::from).collect()
 }
 
-/// Look up a command in a deny map, checking compound key first.
+/// Check whether a command is denied by the allowlist rules.
 ///
-/// Returns the guidance message if the command is denied, `None` otherwise.
-/// The heredoc exception suppresses denial when the command reads from stdin.
-fn lookup_deny(
+/// A command is denied if:
+/// 1. It is not in `allow` or `pipeline` (and not the `build` tool).
+/// 2. It is in `pipeline` but at pipe position 0.
+/// 3. It is in `allow` but the specific subcommand is in `deny.<cmd>`.
+///
+/// The heredoc exception suppresses denial for commands reading from stdin.
+/// Returns the denied command name if denied, `None` if allowed.
+fn check_against_allowlist(
     name: &str,
-    compound_key: Option<&str>,
+    subcommand: Option<&str>,
     has_heredoc: bool,
-    map: &std::collections::HashMap<String, String>,
+    pipe_pos: usize,
+    rules: &ResolvedCommands,
 ) -> Option<String> {
+    // Heredoc exception: command is reading from stdin, not files.
     if has_heredoc {
         return None;
     }
-    if let Some(key) = compound_key
-        && let Some(msg) = map.get(key)
-    {
-        return Some(msg.clone());
+
+    // Build tool is always allowed.
+    if rules.build.as_deref() == Some(name) {
+        return None;
     }
-    map.get(name).cloned()
+
+    // Check if command is in the unconditional allow list.
+    if rules.allow.contains(name) {
+        // Check subcommand deny: e.g., git is allowed but `git grep` is denied.
+        if let Some(sub) = subcommand
+            && let Some(denied_subs) = rules.deny.get(name)
+            && denied_subs.contains(sub)
+        {
+            return Some(name.to_string());
+        }
+        return None;
+    }
+
+    // Check if command is in the pipeline list.
+    if rules.pipeline.contains(name) {
+        // Pipeline commands are only allowed mid-pipeline (not at position 0).
+        if pipe_pos == 0 {
+            return Some(name.to_string());
+        }
+        return None;
+    }
+
+    // Not in any allow list — denied.
+    Some(name.to_string())
 }
 
-/// Check all commands in a shell command string against the deny rules.
+/// Check all commands in a shell command string against the allowlist rules.
 ///
-/// Returns the guidance message for the first denied command, or `None`
+/// Returns the denied command name for the first denied command, or `None`
 /// if all commands are allowed.
 pub fn check_command(cmd: &str, rules: &ResolvedCommands) -> Option<String> {
     let cmd_string = strip_heredoc_bodies(cmd);
@@ -275,25 +305,19 @@ pub fn check_command(cmd: &str, rules: &ResolvedCommands) -> Option<String> {
                 .unwrap_or(token_refs[cmd_idx]);
 
             let rest = &token_refs[cmd_idx..];
-            let has_heredoc = rest.iter().any(|t| t.starts_with("<<"));
-            let compound_key = if rest.len() > 1 {
-                Some(format!("{name} {}", rest[1]))
-            } else {
-                None
-            };
-            let compound_ref = compound_key.as_deref();
+            // Heredoc exception: only when `<<` is the first argument after
+            // the command name. Quoted arguments (like sed patterns) are
+            // invisible here because mask_quotes already collapsed them,
+            // so `sed 's/foo/bar/' <<EOF` tokenizes as `["sed", "<<EOF"]`.
+            // This prevents `rm -rf target/ <<EOF` from bypassing the
+            // allowlist while preserving the `cat <<'EOF'` commit pattern.
+            let has_heredoc = rest.get(1).is_some_and(|t| t.starts_with("<<"));
+            let subcommand = if rest.len() > 1 { Some(rest[1]) } else { None };
 
-            // Check deny (always blocked, any pipeline position).
-            if let Some(msg) = lookup_deny(name, compound_ref, has_heredoc, &rules.deny) {
-                return Some(msg);
-            }
-
-            // Check deny_when_first (blocked at pipe position 0 only).
-            if pipe_pos == 0
-                && let Some(msg) =
-                    lookup_deny(name, compound_ref, has_heredoc, &rules.deny_when_first)
+            if let Some(denied) =
+                check_against_allowlist(name, subcommand, has_heredoc, pipe_pos, rules)
             {
-                return Some(msg);
+                return Some(denied);
             }
         }
     }
@@ -388,109 +412,85 @@ pub fn resolve_templates(msg: &str, client: &str) -> String {
     reason = "tests use expect for readable assertions"
 )]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
 
     /// Build a rule set matching the Python script's behavior for regression tests.
-    /// Maps the Python script's allowlist + `PIPELINE_SAFE` model into the
-    /// denylist model. Commands in Python's `PIPELINE_SAFE` go into
-    /// `deny_when_first`; all other denied commands go into `deny`.
+    ///
+    /// The Python script used an allowlist model — this recreates those rules
+    /// using the new `ResolvedCommands` allowlist structure.
     fn python_equivalent_rules() -> ResolvedCommands {
         ResolvedCommands {
-            deny: HashMap::from([
-                ("cat".into(), "Use the Read tool instead.".into()),
-                ("less".into(), "Use the Read tool instead.".into()),
-                ("more".into(), "Use the Read tool instead.".into()),
-                ("rg".into(), "Use Catenary's grep tool instead.".into()),
-                ("ag".into(), "Use Catenary's grep tool instead.".into()),
-                ("ack".into(), "Use Catenary's grep tool instead.".into()),
-                ("fd".into(), "Use Catenary's grep tool instead.".into()),
-                ("rgrep".into(), "Use Catenary's grep tool instead.".into()),
-                ("zgrep".into(), "Use Catenary's grep tool instead.".into()),
-                ("ls".into(), "Use Catenary's glob tool instead.".into()),
-                ("dir".into(), "Use Catenary's glob tool instead.".into()),
-                ("tree".into(), "Use Catenary's glob tool instead.".into()),
-                ("find".into(), "Use Catenary's glob tool instead.".into()),
-                (
-                    "cargo".into(),
-                    "Use a make target instead. If no target exists, suggest one.".into(),
-                ),
-                (
-                    "rustc".into(),
-                    "Use a make target instead. If no target exists, suggest one.".into(),
-                ),
-                (
-                    "rustup".into(),
-                    "Use a make target instead. If no target exists, suggest one.".into(),
-                ),
-                (
-                    "prettier".into(),
-                    "Use a make target instead. If no target exists, suggest one.".into(),
-                ),
-                (
-                    "git grep".into(),
-                    "Use Catenary's grep or glob tools instead.".into(),
-                ),
-                (
-                    "git ls-files".into(),
-                    "Use Catenary's grep or glob tools instead.".into(),
-                ),
-                (
-                    "git ls-tree".into(),
-                    "Use Catenary's grep or glob tools instead.".into(),
-                ),
-                ("echo".into(), "Not available.".into()),
+            allow: HashSet::from([
+                "make".into(),
+                "git".into(),
+                "gh".into(),
+                "cp".into(),
+                "mv".into(),
+                "rm".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "chmod".into(),
+                "sleep".into(),
+                "cd".into(),
+                "true".into(),
+                "false".into(),
+                "which".into(),
+                "diff".into(),
             ]),
-            // Python PIPELINE_SAFE: denied at position 0, allowed mid-pipeline.
-            deny_when_first: HashMap::from([
-                ("grep".into(), "Use Catenary's grep tool instead.".into()),
-                ("egrep".into(), "Use Catenary's grep tool instead.".into()),
-                ("fgrep".into(), "Use Catenary's grep tool instead.".into()),
-                ("head".into(), "Use the Read tool instead.".into()),
-                ("tail".into(), "Use the Read tool instead.".into()),
-                ("sed".into(), "Use the Edit tool instead.".into()),
-                ("awk".into(), "Not available in constrained mode.".into()),
-                ("sort".into(), "Not available in constrained mode.".into()),
-                ("jq".into(), "Not available in constrained mode.".into()),
-                ("wc".into(), "Not available in constrained mode.".into()),
-                ("tr".into(), "Not available in constrained mode.".into()),
-                ("cut".into(), "Not available in constrained mode.".into()),
-                ("uniq".into(), "Not available in constrained mode.".into()),
-                ("tee".into(), "Not available in constrained mode.".into()),
+            pipeline: HashSet::from([
+                "grep".into(),
+                "egrep".into(),
+                "fgrep".into(),
+                "head".into(),
+                "tail".into(),
+                "sed".into(),
+                "awk".into(),
+                "sort".into(),
+                "jq".into(),
+                "wc".into(),
+                "tr".into(),
+                "cut".into(),
+                "uniq".into(),
+                "tee".into(),
             ]),
+            deny: HashMap::from([(
+                "git".into(),
+                HashSet::from(["grep".into(), "ls-files".into(), "ls-tree".into()]),
+            )]),
+            build: Some("make".into()),
+            client_enforcement_only: false,
         }
     }
 
     /// Minimal rule set for targeted tests.
     fn basic_rules() -> ResolvedCommands {
         ResolvedCommands {
-            deny: HashMap::from([
-                ("cat".into(), "Use Read instead".into()),
-                ("ls".into(), "Use Catenary's glob instead".into()),
-                ("find".into(), "Use Catenary's glob instead".into()),
-                ("cargo".into(), "Use make instead".into()),
-                ("git ls-files".into(), "Use Catenary's glob instead".into()),
-                ("git ls-tree".into(), "Use Catenary's glob instead".into()),
-                ("cargo test".into(), "Use make test instead".into()),
+            allow: HashSet::from([
+                "make".into(),
+                "git".into(),
+                "gh".into(),
+                "echo".into(),
+                "diff".into(),
             ]),
-            deny_when_first: HashMap::from([
-                ("grep".into(), "Use Catenary's grep instead".into()),
-                ("egrep".into(), "Use Catenary's grep instead".into()),
-                ("fgrep".into(), "Use Catenary's grep instead".into()),
-                ("sed".into(), "Use Edit instead".into()),
-                ("git grep".into(), "Use Catenary's grep instead".into()),
-            ]),
+            pipeline: HashSet::from(["grep".into(), "egrep".into(), "fgrep".into(), "sed".into()]),
+            deny: HashMap::from([(
+                "git".into(),
+                HashSet::from(["grep".into(), "ls-files".into(), "ls-tree".into()]),
+            )]),
+            build: Some("make".into()),
+            client_enforcement_only: false,
         }
     }
 
     // ── Deny basics ──────────────────────────────────────────────────
 
     #[test]
-    fn deny_command_returns_guidance() {
+    fn deny_command_returns_name() {
         let rules = basic_rules();
         let result = check_command("cat file.txt", &rules);
-        assert_eq!(result.as_deref(), Some("Use Read instead"));
+        assert_eq!(result.as_deref(), Some("cat"));
     }
 
     #[test]
@@ -500,13 +500,13 @@ mod tests {
     }
 
     #[test]
-    fn deny_when_first_at_position_zero() {
+    fn pipeline_at_position_zero_denied() {
         let rules = basic_rules();
         assert!(check_command("grep pattern file", &rules).is_some());
     }
 
     #[test]
-    fn deny_when_first_mid_pipeline_allowed() {
+    fn pipeline_mid_pipeline_allowed() {
         let rules = basic_rules();
         assert!(check_command("echo foo | grep bar", &rules).is_none());
     }
@@ -554,10 +554,9 @@ mod tests {
 
     #[test]
     fn head_heredoc_quoted_marker_allowed() {
-        let rules = ResolvedCommands {
-            deny: HashMap::from([("head".into(), "Use Read".into())]),
-            deny_when_first: HashMap::new(),
-        };
+        // head is not in allow, but heredoc exception applies.
+        let mut rules = ResolvedCommands::default();
+        rules.allow.insert("git".to_string());
         assert!(check_command("head <<'MARKER'\nhello\nMARKER", &rules).is_none());
     }
 
@@ -568,9 +567,18 @@ mod tests {
     }
 
     #[test]
-    fn heredoc_applies_to_all_denied_commands() {
+    fn heredoc_narrowing_unquoted_arg_before_heredoc() {
+        // grep has an unquoted positional arg before <<, so the heredoc
+        // exception does NOT fire. grep is in pipeline → denied at pos 0.
         let rules = basic_rules();
-        assert!(check_command("grep pattern <<EOF\nhello\nEOF", &rules).is_none());
+        assert!(check_command("grep pattern <<EOF\nhello\nEOF", &rules).is_some());
+    }
+
+    #[test]
+    fn heredoc_narrowing_file_arg_before_heredoc() {
+        // Adversarial: file operand before << prevents the exception.
+        let rules = basic_rules();
+        assert!(check_command("cat file.txt <<EOF\nhello\nEOF", &rules).is_some());
     }
 
     // ── Subshell recursion ───────────────────────────────────────────
@@ -646,17 +654,9 @@ mod tests {
     }
 
     #[test]
-    fn cargo_test_compound_denied() {
+    fn cargo_not_allowed() {
         let rules = basic_rules();
         assert!(check_command("cargo test", &rules).is_some());
-    }
-
-    #[test]
-    fn cargo_clippy_with_bare_cargo_deny() {
-        let rules = ResolvedCommands {
-            deny: HashMap::from([("cargo".into(), "Use make".into())]),
-            deny_when_first: HashMap::new(),
-        };
         assert!(check_command("cargo clippy", &rules).is_some());
     }
 

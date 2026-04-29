@@ -535,33 +535,29 @@ fn extract_shell_command(
         .map(String::from)
 }
 
-/// Check a shell command against the configured denylist.
+/// Check a shell command against the configured allowlist.
 ///
-/// Loads the merged config, resolves template variables for the current
-/// client, and returns the guidance message if the command is denied.
+/// Loads the merged config and returns the denied command name if the
+/// command is not allowed.
 fn check_shell_command(cmd: &str, format: HostFormat) -> Option<String> {
     let config = crate::config::Config::load().ok()?;
     check_command_against_config(cmd, format, &config)
 }
 
-/// Check a shell command against a pre-loaded config's denylist.
+/// Check a shell command against a pre-loaded config's allowlist.
 ///
-/// Returns the guidance message if the command is denied, `None` otherwise.
+/// Returns the denied command name if the command is not allowed, `None`
+/// otherwise.
 fn check_command_against_config(
     cmd: &str,
-    format: HostFormat,
+    _format: HostFormat,
     config: &crate::config::Config,
 ) -> Option<String> {
     let resolved = config.resolved_commands.as_ref()?;
-    if resolved.deny.is_empty() && resolved.deny_when_first.is_empty() {
+    if !resolved.is_active() {
         return None;
     }
-    let client = match format {
-        HostFormat::Claude => "claude",
-        HostFormat::Gemini => "gemini",
-    };
     crate::cli::command_filter::check_command(cmd, resolved)
-        .map(|msg| crate::cli::command_filter::resolve_templates(&msg, client))
 }
 
 // ── Formatting helpers ──────────────────────────────────────────────────

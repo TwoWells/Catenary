@@ -117,8 +117,8 @@ pub struct Config {
     /// Merged command filter after layered resolution.
     ///
     /// Built incrementally during config loading. `None` when no source
-    /// specified `[commands]`. Each layer's `allow`/`deny`/`inherit`
-    /// semantics are applied in order.
+    /// specified `[commands]`. Each layer's fields overwrite when present;
+    /// `allow` and `pipeline` are replaced, `deny` entries merge per-command.
     pub resolved_commands: Option<ResolvedCommands>,
 }
 
@@ -1784,12 +1784,13 @@ extensions = ["xyz"]
         fs::write(
             &path,
             r#"
-[commands.deny]
-cat = "Use {read} instead"
-"git ls-files" = "Use {catenary_glob} instead"
+[commands]
+build = "make"
+allow = ["git", "gh", "cp"]
+pipeline = ["grep", "head", "tail"]
 
-[commands.deny_when_first]
-grep = "Use {catenary_grep} instead"
+[commands.deny]
+git = ["grep", "ls-files"]
 "#,
         )?;
 
@@ -1797,17 +1798,16 @@ grep = "Use {catenary_grep} instead"
         let resolved = config
             .resolved_commands
             .expect("resolved_commands should be Some");
-        assert_eq!(resolved.deny.len(), 2);
-        assert_eq!(resolved.deny.get("cat").expect("cat"), "Use {read} instead",);
-        assert_eq!(
-            resolved.deny.get("git ls-files").expect("git ls-files"),
-            "Use {catenary_glob} instead",
-        );
-        assert_eq!(resolved.deny_when_first.len(), 1);
-        assert_eq!(
-            resolved.deny_when_first.get("grep").expect("grep"),
-            "Use {catenary_grep} instead",
-        );
+        assert_eq!(resolved.build.as_deref(), Some("make"));
+        assert_eq!(resolved.allow.len(), 3);
+        assert!(resolved.allow.contains("git"));
+        assert!(resolved.allow.contains("gh"));
+        assert!(resolved.allow.contains("cp"));
+        assert_eq!(resolved.pipeline.len(), 3);
+        assert!(resolved.pipeline.contains("grep"));
+        let git_deny = resolved.deny.get("git").expect("git deny");
+        assert!(git_deny.contains("grep"));
+        assert!(git_deny.contains("ls-files"));
 
         Ok(())
     }
@@ -1825,17 +1825,16 @@ grep = "Use {catenary_grep} instead"
     }
 
     #[test]
-    fn commands_project_allow_removes_from_user() -> anyhow::Result<()> {
+    fn commands_project_allow_replaces_user() -> anyhow::Result<()> {
         let dir = tempdir()?;
 
         let user = dir.path().join("user.toml");
         fs::write(
             &user,
             r#"
-[commands.deny]
-cat = "Use {read}"
-tail = "Use {read}"
-cargo = "Use make"
+[commands]
+allow = ["git", "gh", "cp"]
+pipeline = ["grep"]
 "#,
         )?;
 
@@ -1844,10 +1843,7 @@ cargo = "Use make"
             &project,
             r#"
 [commands]
-allow = ["cargo"]
-
-[commands.deny]
-pip = "Use make"
+allow = ["git", "gh", "kubectl"]
 "#,
         )?;
 
@@ -1855,14 +1851,13 @@ pip = "Use make"
         let resolved = config
             .resolved_commands
             .expect("resolved_commands should be Some");
-        // cargo removed by project allow
-        assert!(!resolved.deny.contains_key("cargo"));
-        // cat and tail preserved from user
-        assert!(resolved.deny.contains_key("cat"));
-        assert!(resolved.deny.contains_key("tail"));
-        // pip added by project
-        assert!(resolved.deny.contains_key("pip"));
-        assert_eq!(resolved.deny.len(), 3);
+        // Project replaces user's allow list
+        assert!(resolved.allow.contains("git"));
+        assert!(resolved.allow.contains("gh"));
+        assert!(resolved.allow.contains("kubectl"));
+        assert!(!resolved.allow.contains("cp"));
+        // User's pipeline preserved (project didn't specify pipeline)
+        assert!(resolved.pipeline.contains("grep"));
 
         Ok(())
     }
@@ -1875,8 +1870,8 @@ pip = "Use make"
         fs::write(
             &user,
             r#"
-[commands.deny]
-cat = "Use {read}"
+[commands]
+allow = ["git", "gh"]
 "#,
         )?;
 
@@ -1887,109 +1882,44 @@ cat = "Use {read}"
         let resolved = config
             .resolved_commands
             .expect("resolved_commands should be Some");
-        assert!(resolved.deny.contains_key("cat"));
+        assert!(resolved.allow.contains("git"));
+        assert!(resolved.allow.contains("gh"));
 
         Ok(())
     }
 
     #[test]
-    fn commands_inherit_false_replaces() -> anyhow::Result<()> {
+    fn commands_client_enforcement_only() -> anyhow::Result<()> {
         let dir = tempdir()?;
-
-        let user = dir.path().join("user.toml");
+        let path = dir.path().join("config.toml");
         fs::write(
-            &user,
-            r#"
-[commands.deny]
-cat = "Use {read}"
-tail = "Use {read}"
-"#,
-        )?;
-
-        let project = dir.path().join("project.toml");
-        fs::write(
-            &project,
-            r#"
+            &path,
+            r"
 [commands]
-inherit = false
-
-[commands.deny]
-pip = "Use make"
-"#,
+client_enforcement_only = true
+",
         )?;
 
-        let config = Config::load_from_sources(&[user, project])?;
+        let config = Config::load_from_sources(&[path])?;
         let resolved = config
             .resolved_commands
             .expect("resolved_commands should be Some");
-        // User's entries discarded
-        assert!(!resolved.deny.contains_key("cat"));
-        assert!(!resolved.deny.contains_key("tail"));
-        // Only project's entry
-        assert_eq!(resolved.deny.len(), 1);
-        assert!(resolved.deny.contains_key("pip"));
+        assert!(resolved.client_enforcement_only);
+        assert!(!resolved.is_active());
 
         Ok(())
     }
 
     #[test]
-    fn commands_bare_compound_collision_rejected() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            r#"
-[commands.deny]
-cargo = "Use make"
-"cargo test" = "Use make test"
-"#,
-        )
-        .expect("write config");
-
-        let result = Config::load_from_sources(&[path]);
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
-        assert!(
-            err.contains("cargo") && err.contains("cargo test"),
-            "error should mention both keys: {err}",
-        );
-    }
-
-    #[test]
-    fn commands_cross_section_duplicate_rejected() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            r#"
-[commands.deny]
-grep = "Use {catenary_grep}"
-
-[commands.deny_when_first]
-grep = "Use {catenary_grep}"
-"#,
-        )
-        .expect("write config");
-
-        let result = Config::load_from_sources(&[path]);
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
-        assert!(err.contains("grep"), "error should mention grep: {err}");
-    }
-
-    #[test]
-    fn commands_inherit_false_with_allow_rejected() {
+    fn commands_client_enforcement_only_with_allow_rejected() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
             r#"
 [commands]
-inherit = false
-allow = ["cat"]
-
-[commands.deny]
-cat = "Use {read}"
+client_enforcement_only = true
+allow = ["git"]
 "#,
         )
         .expect("write config");
@@ -1998,23 +1928,21 @@ cat = "Use {read}"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("inherit = false") && err.contains("allow"),
-            "error should mention inherit=false + allow: {err}",
+            err.contains("client_enforcement_only"),
+            "error should mention client_enforcement_only: {err}",
         );
     }
 
     #[test]
-    fn commands_allow_deny_contradiction_rejected() {
+    fn commands_allow_pipeline_overlap_rejected() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
             r#"
 [commands]
-allow = ["cat"]
-
-[commands.deny]
-cat = "Use {read}"
+allow = ["grep", "git"]
+pipeline = ["grep"]
 "#,
         )
         .expect("write config");
@@ -2023,8 +1951,33 @@ cat = "Use {read}"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("cat") && err.contains("allow") && err.contains("deny"),
-            "error should mention contradictory cat: {err}",
+            err.contains("grep") && err.contains("allow") && err.contains("pipeline"),
+            "error should mention grep in both lists: {err}",
+        );
+    }
+
+    #[test]
+    fn commands_deny_not_in_allow_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[commands]
+allow = ["git"]
+
+[commands.deny]
+sqlite3 = ["-cmd"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.expect_err("should error"));
+        assert!(
+            err.contains("sqlite3") && err.contains("not in `allow`"),
+            "error should mention sqlite3 not in allow: {err}",
         );
     }
 
@@ -2036,13 +1989,13 @@ cat = "Use {read}"
         fs::write(
             &user,
             r#"
-[commands.deny]
-cat = "Use {read}"
-tail = "Use {read}"
-cargo = "Use make"
+[commands]
+build = "make"
+allow = ["git", "gh", "cp"]
+pipeline = ["grep", "head"]
 
-[commands.deny_when_first]
-grep = "Use {catenary_grep}"
+[commands.deny]
+git = ["grep"]
 "#,
         )?;
 
@@ -2051,10 +2004,10 @@ grep = "Use {catenary_grep}"
             &project,
             r#"
 [commands]
-allow = ["cargo"]
+allow = ["git", "gh", "kubectl"]
 
 [commands.deny]
-pip = "Use make"
+git = ["ls-files"]
 "#,
         )?;
 
@@ -2063,7 +2016,7 @@ pip = "Use make"
             &explicit,
             r#"
 [commands]
-allow = ["tail"]
+build = "npm"
 "#,
         )?;
 
@@ -2071,16 +2024,20 @@ allow = ["tail"]
         let resolved = config
             .resolved_commands
             .expect("resolved_commands should be Some");
-        // cat: from user, never removed
-        assert!(resolved.deny.contains_key("cat"));
-        // tail: from user, removed by explicit
-        assert!(!resolved.deny.contains_key("tail"));
-        // cargo: from user, removed by project
-        assert!(!resolved.deny.contains_key("cargo"));
-        // pip: added by project
-        assert!(resolved.deny.contains_key("pip"));
-        // grep: from user, never removed
-        assert!(resolved.deny_when_first.contains_key("grep"));
+        // Project replaces user's allow
+        assert!(resolved.allow.contains("git"));
+        assert!(resolved.allow.contains("gh"));
+        assert!(resolved.allow.contains("kubectl"));
+        assert!(!resolved.allow.contains("cp"));
+        // User's pipeline preserved
+        assert!(resolved.pipeline.contains("grep"));
+        assert!(resolved.pipeline.contains("head"));
+        // Deny entries merged across layers
+        let git_deny = resolved.deny.get("git").expect("git deny");
+        assert!(git_deny.contains("grep"));
+        assert!(git_deny.contains("ls-files"));
+        // Explicit overrides build
+        assert_eq!(resolved.build.as_deref(), Some("npm"));
 
         Ok(())
     }

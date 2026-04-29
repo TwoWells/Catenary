@@ -59,27 +59,34 @@
     },
     "commands": {
       "type": "object",
-      "description": "Denylist-based command filtering. Commands not in the deny list are allowed.",
+      "description": "Allowlist-based command filtering. Only explicitly allowed commands can be run.",
       "properties": {
-        "inherit": {
+        "client_enforcement_only": {
           "type": "boolean",
-          "description": "Inherit user config (project config only). When false, the project's deny sections replace the user's entirely.",
-          "default": true
+          "description": "Deliberate opt-out of Catenary enforcement. No hint notification, no enforcement.",
+          "default": false
+        },
+        "build": {
+          "type": "string",
+          "description": "The project's build tool (e.g., 'make'). Always allowed."
         },
         "allow": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Commands to un-deny (project config only). Removes commands from the inherited deny and deny_when_first sets."
+          "description": "Commands the agent can run unconditionally."
+        },
+        "pipeline": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands allowed mid-pipeline only (denied at pipe position 0)."
         },
         "deny": {
           "type": "object",
-          "description": "Always-deny commands. Each key is a command name (or quoted 'command subcommand'), each value is a guidance message.",
-          "additionalProperties": { "type": "string" }
-        },
-        "deny_when_first": {
-          "type": "object",
-          "description": "Deny-when-first commands. Denied at pipe position 0, allowed mid-pipeline. Each key is a command name, each value is a guidance message.",
-          "additionalProperties": { "type": "string" }
+          "description": "Subcommand denylist within allowed commands. Each key is a command name, each value is an array of denied subcommands.",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
         }
       }
     }

@@ -1116,17 +1116,27 @@ fn check_legacy_script(colors: &ColorConfig, client: &str, settings_rel: &str) {
 /// Report the status of the built-in command filter configuration.
 fn check_command_filter_config(colors: &ColorConfig, config: &crate::config::Config) {
     match &config.resolved_commands {
-        Some(resolved) => {
-            let total = resolved.deny.len() + resolved.deny_when_first.len();
+        Some(resolved) if resolved.client_enforcement_only => {
+            println!(
+                "  {}",
+                colors.dim("client_enforcement_only — Catenary enforcement disabled"),
+            );
+        }
+        Some(resolved) if resolved.is_active() => {
+            let total = resolved.allow.len() + resolved.pipeline.len();
             println!(
                 "  {}",
                 colors.green(&format!(
-                    "✓ {total} command{} configured",
+                    "✓ {total} command{} allowed{}",
                     if total == 1 { "" } else { "s" },
+                    resolved
+                        .build
+                        .as_ref()
+                        .map_or(String::new(), |b| format!(", build tool: {b}")),
                 )),
             );
         }
-        None => {
+        Some(_) | None => {
             println!(
                 "  {}",
                 colors.dim("no [commands] section — all shell commands allowed"),
