@@ -461,17 +461,22 @@ pub fn run_pre_tool(format: HostFormat) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // ── Client-side command filter ───────────────────────────────
-    // Runs before IPC — catches denied commands even when the session
-    // is unreachable. Merges with cwd's project config for per-root
-    // build tool support. Full multi-root check is session-side (03a).
-    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format)
-        && let Some((denied, resolved)) = check_shell_command(&hook_json, &shell_cmd)
-    {
-        let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
-        let reason = query_denial_format(&hook_json, session_id, &denied, &resolved);
-        print!("{}", format_deny(&reason, format));
-        return;
+    // ── Command filter ──────────────────────────────────────────
+    // Try session-side check first (full multi-root merged config).
+    // Fall back to client-side check (user config + cwd's project
+    // config) when the session is unreachable.
+    if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
+        if let Some(reason) = ipc_check_command(&hook_json, &shell_cmd) {
+            print!("{}", format_deny(&reason, format));
+            return;
+        }
+        // IPC failed or session unreachable — try client-side.
+        if let Some((denial, resolved)) = check_shell_command(&hook_json, &shell_cmd) {
+            let reason =
+                crate::cli::command_filter::format_denial_full(&denial.command, &resolved, &denial);
+            print!("{}", format_deny(&reason, format));
+            return;
+        }
     }
 
     // ── Editing state enforcement (IPC to session) ───────────────
@@ -524,13 +529,15 @@ pub fn run_pre_tool(format: HostFormat) {
 /// full session-side check (all roots, dynamically-added roots) is handled
 /// by `pre-tool/check-command` IPC in ticket 03a.
 ///
-/// Returns the denied command name and the resolved config on denial,
-/// or `None` if the command is allowed. The caller uses both to format
-/// the denial message.
+/// Returns a [`Denial`](crate::cli::command_filter::Denial) and the resolved
+/// config on denial, or `None` if the command is allowed.
 fn check_shell_command(
     hook_json: &serde_json::Value,
     cmd: &str,
-) -> Option<(String, crate::config::ResolvedCommands)> {
+) -> Option<(
+    crate::cli::command_filter::Denial,
+    crate::config::ResolvedCommands,
+)> {
     let config = crate::config::Config::load().ok()?;
     let mut resolved = config.resolved_commands?;
     if resolved.client_enforcement_only {
@@ -560,8 +567,8 @@ fn check_shell_command(
         return None;
     }
 
-    let denied = crate::cli::command_filter::check_command(cmd, &resolved, cwd.as_deref())?;
-    Some((denied, resolved))
+    let denial = crate::cli::command_filter::check_command(cmd, &resolved, cwd.as_deref())?;
+    Some((denial, resolved))
 }
 
 /// Walk up from `cwd` to find the nearest `.catenary.toml`.
@@ -588,44 +595,38 @@ fn find_project_config(cwd: &std::path::Path) -> Option<(PathBuf, crate::config:
     None
 }
 
-/// Query the session for denial debounce state and format the message.
+/// Session-side command check via IPC.
 ///
-/// Sends `pre-tool/command-denied` to the session. If the session returns
-/// a result, formats a full config dump. Otherwise formats a short message.
-/// Falls back to a full dump if the session is unreachable.
-fn query_denial_format(
-    hook_json: &serde_json::Value,
-    session_id: Option<&str>,
-    denied_cmd: &str,
-    resolved: &crate::config::ResolvedCommands,
-) -> String {
-    let full_dump = || crate::cli::command_filter::format_denial_full(denied_cmd, resolved);
-
-    let Ok(conn) = db::open_and_migrate() else {
-        return full_dump();
-    };
-    let Some(catenary_sid) = find_session_id(hook_json, &conn) else {
-        return full_dump();
-    };
+/// Sends `pre-tool/check-command` with the shell command and cwd. The
+/// session evaluates against the merged allowlist (all roots, all project
+/// configs) and handles debounce. Returns the denial reason string on
+/// denial, `None` on allow or IPC failure.
+fn ipc_check_command(hook_json: &serde_json::Value, shell_cmd: &str) -> Option<String> {
+    let conn = db::open_and_migrate().ok()?;
+    let catenary_sid = find_session_id(hook_json, &conn)?;
     let endpoint = notify_endpoint(&catenary_sid);
-    let Some(stream) = notify_connect(&endpoint) else {
-        return full_dump();
-    };
+    let stream = notify_connect(&endpoint)?;
 
-    let mut request = serde_json::json!({"method": "pre-tool/command-denied"});
+    let cwd = hook_json.get("cwd").and_then(|v| v.as_str());
+    let session_id = hook_json.get("session_id").and_then(|v| v.as_str());
+
+    let mut request = serde_json::json!({
+        "method": "pre-tool/check-command",
+        "command": shell_cmd,
+    });
+    if let Some(c) = cwd {
+        request["cwd"] = serde_json::json!(c);
+    }
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
 
     let lines = ipc_exchange(stream, &request);
-
-    if let Some(line) = lines.first()
-        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-        && envelope.result.is_some()
-    {
-        full_dump()
-    } else {
-        crate::cli::command_filter::format_denial_short(denied_cmd)
+    let line = lines.first()?;
+    let envelope = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line).ok()?;
+    match envelope.result {
+        Some(crate::hook::HookResult::Deny(reason)) => Some(reason),
+        _ => None,
     }
 }
 

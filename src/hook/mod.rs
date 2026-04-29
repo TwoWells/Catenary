@@ -129,13 +129,19 @@ pub(crate) enum HookRequest {
         session_id: Option<String>,
     },
 
-    /// Command filter debounce query: should the denial be full or short?
+    /// Session-side command check with debounce.
     ///
-    /// Sent by the client after it denies a command locally. The server
-    /// checks the turn counter and config version and returns a result
-    /// if a full config dump is needed, or no result for a short message.
-    #[serde(rename = "pre-tool/command-denied")]
-    CommandDenied {
+    /// Evaluates the shell command against the merged allowlist (user
+    /// config + all project configs for current roots). On denial,
+    /// applies turn-based debounce: first denial in a turn returns
+    /// the full config dump, subsequent denials return a short message.
+    #[serde(rename = "pre-tool/check-command")]
+    CheckCommand {
+        /// The shell command string to evaluate.
+        command: String,
+        /// Working directory from the hook payload (for per-root build lookup).
+        #[serde(default)]
+        cwd: Option<String>,
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
         session_id: Option<String>,
@@ -536,20 +542,27 @@ mod tests {
         };
         assert_eq!(session_id.as_deref(), Some("uuid-123"));
 
-        // pre-tool/command-denied
-        let json = r#"{"method": "pre-tool/command-denied", "session_id": "abc123"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("command-denied");
-        let HookRequest::CommandDenied { session_id } = req else {
-            unreachable!("expected CommandDenied");
+        // pre-tool/check-command
+        let json = r#"{"method": "pre-tool/check-command", "command": "cargo test", "cwd": "/project", "session_id": "abc123"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("check-command");
+        let HookRequest::CheckCommand {
+            command,
+            cwd,
+            session_id,
+        } = req
+        else {
+            unreachable!("expected CheckCommand");
         };
+        assert_eq!(command, "cargo test");
+        assert_eq!(cwd.as_deref(), Some("/project"));
         assert_eq!(session_id.as_deref(), Some("abc123"));
 
-        // pre-tool/command-denied minimal (no session_id)
-        let json = r#"{"method": "pre-tool/command-denied"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("command-denied minimal");
+        // pre-tool/check-command minimal (only command required)
+        let json = r#"{"method": "pre-tool/check-command", "command": "ls"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("check-command minimal");
         assert!(matches!(
             req,
-            HookRequest::CommandDenied { session_id: None }
+            HookRequest::CheckCommand { command, cwd: None, session_id: None } if command == "ls"
         ));
     }
 

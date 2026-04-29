@@ -110,9 +110,6 @@ pub struct HookRouter {
     turn_counter: AtomicU64,
     /// Last turn number where a full config dump was shown on denial.
     last_config_dump_turn: AtomicU64,
-    /// Monotonic config version — bumped when merged command config changes
-    /// (e.g., root addition expands the allowlist).
-    config_version: AtomicU64,
     /// Config version at the time of the last full dump.
     last_config_dump_version: AtomicU64,
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
@@ -136,7 +133,6 @@ impl HookRouter {
             // Initialized to MAX so the first denial always triggers a full
             // config dump (turn 0 != MAX).
             last_config_dump_turn: AtomicU64::new(u64::MAX),
-            config_version: AtomicU64::new(0),
             last_config_dump_version: AtomicU64::new(u64::MAX),
             conn,
             instance_id,
@@ -155,15 +151,11 @@ impl HookRouter {
 
     /// Bump the config version counter.
     ///
-    /// Called when the merged command config changes (e.g., root addition
-    /// expands the allowlist). Forces the next denial to show a full config
-    /// dump regardless of turn.
-    #[allow(
-        dead_code,
-        reason = "API for workstream 19 ticket 03 (project scoping)"
-    )]
+    /// Delegates to `Toolbox::config_version`. Forces the next denial
+    /// to show a full config dump regardless of turn.
+    #[cfg(test)]
     pub(crate) fn bump_config_version(&self) {
-        self.config_version.fetch_add(1, Ordering::AcqRel);
+        self.toolbox.config_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Check whether the next command denial should show a full config dump.
@@ -172,7 +164,7 @@ impl HookRouter {
     /// or config version changed), `false` for a short message.
     fn should_show_full_dump(&self) -> bool {
         let current_turn = self.turn_counter.load(Ordering::Acquire);
-        let current_version = self.config_version.load(Ordering::Acquire);
+        let current_version = self.toolbox.config_version.load(Ordering::Acquire);
         let last_dump_turn = self.last_config_dump_turn.load(Ordering::Acquire);
         let last_dump_version = self.last_config_dump_version.load(Ordering::Acquire);
 
@@ -184,6 +176,48 @@ impl HookRouter {
             true
         } else {
             false
+        }
+    }
+
+    /// Evaluate a shell command against the session's merged allowlist.
+    ///
+    /// Builds the merged `ResolvedCommands` from user config + all project
+    /// configs for current roots. If the command is denied, applies debounce:
+    /// full config dump on the first denial in a turn, short message on
+    /// subsequent denials.
+    fn handle_check_command(&self, command: &str, cwd: Option<&str>) -> DispatchResult {
+        let Some(resolved) = self.toolbox.merged_commands() else {
+            return DispatchResult {
+                result: None,
+                system_message: None,
+            };
+        };
+
+        if !resolved.is_active() {
+            return DispatchResult {
+                result: None,
+                system_message: None,
+            };
+        }
+
+        let cwd_path = cwd.map(std::path::Path::new);
+        let Some(denial) = crate::cli::command_filter::check_command(command, &resolved, cwd_path)
+        else {
+            return DispatchResult {
+                result: None,
+                system_message: None,
+            };
+        };
+
+        let message = if self.should_show_full_dump() {
+            crate::cli::command_filter::format_denial_full(&denial.command, &resolved, &denial)
+        } else {
+            crate::cli::command_filter::format_denial_short(&denial.command)
+        };
+
+        DispatchResult {
+            result: Some(HookResult::Deny(message)),
+            system_message: None,
         }
     }
 
@@ -221,19 +255,13 @@ impl HookRouter {
                     system_message: None,
                 }
             }
-            HookRequest::CommandDenied { session_id } => {
+            HookRequest::CheckCommand {
+                command,
+                cwd,
+                session_id,
+            } => {
                 self.store_client_session_id(session_id.as_deref());
-                // Result present → client should show full config dump.
-                // Result absent → client should show short message.
-                let result = if self.should_show_full_dump() {
-                    Some(HookResult::Deny(String::new()))
-                } else {
-                    None
-                };
-                DispatchResult {
-                    result,
-                    system_message: None,
-                }
+                self.handle_check_command(&command, cwd.as_deref())
             }
             HookRequest::PostTool {
                 file,
@@ -1317,76 +1345,161 @@ mod tests {
         assert_eq!(router.turn(), 2);
     }
 
-    // ── Command denied debounce tests ──────────────────────────────
+    // ── Command check + debounce tests ────────────────────────────
 
-    fn dispatch_command_denied(router: &HookRouter) -> DispatchResult {
+    /// Create a test router with an active command allowlist.
+    ///
+    /// Allows only `git` — any other command (e.g., `cargo`) is denied.
+    fn test_router_with_commands() -> TestHookRouter {
+        let (dir, _path, conn) = test_db();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO sessions (id, pid, display_name, started_at) \
+                 VALUES ('test-session', 1, 'test', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert session");
+
+        let config = Config {
+            resolved_commands: Some(crate::config::ResolvedCommands {
+                allow: std::collections::HashSet::from(["git".into()]),
+                ..crate::config::ResolvedCommands::default()
+            }),
+            ..Config::default()
+        };
+        let logging = crate::logging::LoggingServer::new();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = runtime.handle().clone();
+        let instance_id: Arc<str> = "test-session".into();
+        let toolbox = Arc::new(Toolbox::new(
+            config,
+            vec![],
+            logging,
+            conn.clone(),
+            instance_id.clone(),
+            handle,
+        ));
+        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
+        TestHookRouter {
+            _dir: dir,
+            _runtime: runtime,
+            router,
+        }
+    }
+
+    fn dispatch_check_denied(router: &HookRouter) -> DispatchResult {
         router.dispatch(
-            crate::hook::HookRequest::CommandDenied { session_id: None },
+            crate::hook::HookRequest::CheckCommand {
+                command: "cargo test".to_string(),
+                cwd: None,
+                session_id: None,
+            },
+            0,
+        )
+    }
+
+    fn dispatch_check_allowed(router: &HookRouter) -> DispatchResult {
+        router.dispatch(
+            crate::hook::HookRequest::CheckCommand {
+                command: "git status".to_string(),
+                cwd: None,
+                session_id: None,
+            },
             0,
         )
     }
 
     #[test]
-    fn command_denied_first_returns_full() {
-        let router = test_router();
-        // First denial is always full (last_config_dump_turn starts at
-        // u64::MAX, which never matches turn_counter).
-        let result = dispatch_command_denied(&router);
-        assert!(
-            result.result.is_some(),
-            "first denial should signal full dump"
-        );
-    }
-
-    #[test]
-    fn command_denied_second_returns_short() {
-        let router = test_router();
-        // First denial → full (stores current turn).
-        dispatch_command_denied(&router);
-
-        // Second denial in same turn → short.
-        let result = dispatch_command_denied(&router);
+    fn check_command_allowed_returns_none() {
+        let router = test_router_with_commands();
+        let result = dispatch_check_allowed(&router);
         assert!(
             result.result.is_none(),
-            "subsequent denial should signal short message"
+            "allowed command should return no result"
         );
     }
 
     #[test]
-    fn command_denied_new_turn_resets_to_full() {
-        let router = test_router();
-        // First denial → full.
-        dispatch_command_denied(&router);
+    fn check_command_denied_first_returns_full() {
+        let router = test_router_with_commands();
+        let result = dispatch_check_denied(&router);
+        let Some(HookResult::Deny(msg)) = result.result else {
+            unreachable!("expected Deny, got {:?}", result.result);
+        };
+        assert!(
+            msg.contains("cargo"),
+            "full dump should name denied command"
+        );
+        assert!(
+            msg.contains("Allowed:"),
+            "full dump should list allowed commands"
+        );
+    }
 
-        // Second denial → short.
-        let result = dispatch_command_denied(&router);
-        assert!(result.result.is_none());
+    #[test]
+    fn check_command_denied_second_returns_short() {
+        let router = test_router_with_commands();
+        // First denial → full (stores current turn).
+        dispatch_check_denied(&router);
+
+        // Second denial in same turn → short.
+        let result = dispatch_check_denied(&router);
+        let Some(HookResult::Deny(msg)) = result.result else {
+            unreachable!("expected Deny, got {:?}", result.result);
+        };
+        assert!(
+            msg.contains("see earlier message"),
+            "subsequent denial should be short"
+        );
+    }
+
+    #[test]
+    fn check_command_new_turn_resets_to_full() {
+        let router = test_router_with_commands();
+        dispatch_check_denied(&router);
+        dispatch_check_denied(&router); // short
 
         // Advance turn, next denial → full again.
         router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
-        let result = dispatch_command_denied(&router);
+        let result = dispatch_check_denied(&router);
+        let Some(HookResult::Deny(msg)) = result.result else {
+            unreachable!("expected Deny, got {:?}", result.result);
+        };
         assert!(
-            result.result.is_some(),
+            msg.contains("Allowed:"),
             "new turn should reset to full dump"
         );
     }
 
     #[test]
-    fn command_denied_config_version_forces_full() {
-        let router = test_router();
-        // First denial → full.
-        dispatch_command_denied(&router);
-
-        // Second denial → short.
-        let result = dispatch_command_denied(&router);
-        assert!(result.result.is_none());
+    fn check_command_config_version_forces_full() {
+        let router = test_router_with_commands();
+        dispatch_check_denied(&router);
+        dispatch_check_denied(&router); // short
 
         // Bump config version → full again.
         router.bump_config_version();
-        let result = dispatch_command_denied(&router);
+        let result = dispatch_check_denied(&router);
+        let Some(HookResult::Deny(msg)) = result.result else {
+            unreachable!("expected Deny, got {:?}", result.result);
+        };
         assert!(
-            result.result.is_some(),
+            msg.contains("Allowed:"),
             "config version change should force full dump"
+        );
+    }
+
+    #[test]
+    fn check_command_no_config_returns_none() {
+        // Default router has no [commands] → check-command returns allow.
+        let router = test_router();
+        let result = dispatch_check_denied(&router);
+        assert!(
+            result.result.is_none(),
+            "no commands config should return no result"
         );
     }
 }

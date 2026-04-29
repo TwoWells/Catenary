@@ -262,21 +262,37 @@ fn check_against_allowlist(
     Some(name.to_string())
 }
 
+/// Result of a command check that was denied.
+#[derive(Debug)]
+pub struct Denial {
+    /// The denied command name (e.g., `"cargo"`, `"git grep"`).
+    pub command: String,
+    /// Whether an unresolvable `cd` target (variable, command substitution)
+    /// was encountered before the denied command. When `true`, the effective
+    /// cwd may be stale and the denial may be a false positive.
+    pub unresolved_cd: bool,
+}
+
 /// Check all commands in a shell command string against the allowlist rules.
 ///
 /// `cwd` is used for per-root `build` tool lookup. Pass `None` when no
 /// working directory is available (falls back to the user-level default
 /// build tool).
 ///
-/// Returns the denied command name for the first denied command, or `None`
-/// if all commands are allowed.
+/// Returns a [`Denial`] for the first denied command, or `None` if all
+/// commands are allowed.
 pub fn check_command(
     cmd: &str,
     rules: &ResolvedCommands,
     cwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<Denial> {
     let cmd_string = strip_heredoc_bodies(cmd);
     let cmd_string = strip_echo_separators(&cmd_string);
+
+    // Track effective cwd across sequential segments for per-root
+    // build tool resolution. Updated when `cd <path>` is encountered.
+    let mut effective_cwd: Option<std::path::PathBuf> = cwd.map(std::path::PathBuf::from);
+    let mut saw_unresolved_cd = false;
 
     let sequential = quote_aware_split(&cmd_string, &SEQ_SPLIT_RE);
     for seq in sequential {
@@ -294,8 +310,8 @@ pub fn check_command(
                     .or_else(|| m.get(2))
                     .or_else(|| m.get(3))
                     .map_or("", |g| g.as_str().trim());
-                if let Some(reason) = check_command(inner, rules, cwd) {
-                    return Some(reason);
+                if let Some(denial) = check_command(inner, rules, effective_cwd.as_deref()) {
+                    return Some(denial);
                 }
             }
 
@@ -324,15 +340,94 @@ pub fn check_command(
             let has_heredoc = rest.get(1).is_some_and(|t| t.starts_with("<<"));
             let subcommand = if rest.len() > 1 { Some(rest[1]) } else { None };
 
-            if let Some(denied) =
-                check_against_allowlist(name, subcommand, has_heredoc, pipe_pos, rules, cwd)
+            if let Some(denied) = check_against_allowlist(
+                name,
+                subcommand,
+                has_heredoc,
+                pipe_pos,
+                rules,
+                effective_cwd.as_deref(),
+            ) {
+                return Some(Denial {
+                    command: denied,
+                    unresolved_cd: saw_unresolved_cd,
+                });
+            }
+
+            // Track `cd` to update effective cwd for subsequent segments.
+            if name == "cd"
+                && let Some(target) = subcommand
             {
-                return Some(denied);
+                let resolved = resolve_cd_target(target, effective_cwd.as_deref());
+                if is_unresolvable_cd_target(target) {
+                    saw_unresolved_cd = true;
+                }
+                effective_cwd = resolved;
             }
         }
     }
 
     None
+}
+
+/// Whether a `cd` target contains patterns we can't resolve.
+fn is_unresolvable_cd_target(target: &str) -> bool {
+    target.starts_with('$')
+        || target.starts_with('`')
+        || target.contains("$(")
+        || (target.starts_with('~') && target != "~" && !target.starts_with("~/"))
+}
+
+/// Resolve a `cd` target path against the current effective cwd.
+///
+/// Handles absolute paths, relative paths, and `~/path` expansion.
+/// Returns `None` for unresolvable paths (variables, command substitutions,
+/// `~user`).
+fn resolve_cd_target(
+    target: &str,
+    effective_cwd: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    // Skip unresolvable patterns: variables, command substitutions, ~user
+    if target.starts_with('$') || target.starts_with('`') || target.contains("$(") {
+        return effective_cwd.map(std::path::PathBuf::from);
+    }
+
+    let path = if target == "~" {
+        dirs::home_dir()?
+    } else if let Some(rest) = target.strip_prefix("~/") {
+        dirs::home_dir()?.join(rest)
+    } else if target.starts_with('~') {
+        // ~user — can't resolve
+        return effective_cwd.map(std::path::PathBuf::from);
+    } else if std::path::Path::new(target).is_absolute() {
+        std::path::PathBuf::from(target)
+    } else {
+        // Relative path — resolve against effective cwd
+        let base = effective_cwd?;
+        base.join(target)
+    };
+
+    // Normalize `.` and `..` components without touching the filesystem.
+    // `canonicalize()` would fail on non-existent paths.
+    Some(normalize_path(&path))
+}
+
+/// Normalize a path by resolving `.` and `..` components lexically.
+///
+/// Unlike `canonicalize()`, this does not touch the filesystem — it works
+/// on non-existent paths. Does not resolve symlinks.
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {} // skip `.`
+            std::path::Component::ParentDir => {
+                normalized.pop(); // resolve `..`
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 /// Extract all command names from a shell command string.
@@ -403,7 +498,11 @@ fn collect_command_names(cmd: &str, names: &mut Vec<String>) {
 /// Lists are sorted alphabetically. Sections with no entries are omitted.
 /// The denied command is always named in the opening line.
 #[must_use]
-pub fn format_denial_full(denied_cmd: &str, commands: &ResolvedCommands) -> String {
+pub fn format_denial_full(
+    denied_cmd: &str,
+    commands: &ResolvedCommands,
+    denial: &Denial,
+) -> String {
     let mut parts = vec![format!(
         "`{denied_cmd}` isn't allowed by the current Catenary configuration."
     )];
@@ -451,6 +550,16 @@ pub fn format_denial_full(denied_cmd: &str, commands: &ResolvedCommands) -> Stri
         parts.push(format!("Build tool: {}", build_tools[0]));
     } else if build_tools.len() > 1 {
         parts.push(format!("Build tools: {}", build_tools.join(", ")));
+    }
+
+    if denial.unresolved_cd {
+        parts.push(
+            "Note: a `cd` target in this command could not be resolved (variable or \
+             command substitution). The build tool check used the original working \
+             directory. If the destination has a `.catenary.toml` with a configured \
+             build command, run `cd` as a separate command first."
+                .to_string(),
+        );
     }
 
     parts.join("\n")
@@ -553,7 +662,7 @@ mod tests {
     fn deny_command_returns_name() {
         let rules = basic_rules();
         let result = check_command("cat file.txt", &rules, None);
-        assert_eq!(result.as_deref(), Some("cat"));
+        assert_eq!(result.as_ref().map(|d| d.command.as_str()), Some("cat"));
     }
 
     #[test]
@@ -1342,10 +1451,17 @@ mod tests {
 
     // ── Denial format tests ────────────────────────────────────────────
 
+    fn no_cd_denial(cmd: &str) -> Denial {
+        Denial {
+            command: cmd.to_string(),
+            unresolved_cd: false,
+        }
+    }
+
     #[test]
     fn format_full_all_sections() {
         let rules = python_equivalent_rules();
-        let msg = format_denial_full("ls", &rules);
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
 
         assert!(msg.starts_with("`ls` isn't allowed"), "opening line");
         assert!(msg.contains("Allowed:"), "allow section");
@@ -1360,7 +1476,7 @@ mod tests {
     #[test]
     fn format_full_sorted_alphabetically() {
         let rules = python_equivalent_rules();
-        let msg = format_denial_full("ls", &rules);
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
 
         // Extract the Allowed line and verify sorting.
         let allowed_line = msg
@@ -1383,7 +1499,7 @@ mod tests {
             allow: HashSet::from(["git".into()]),
             ..ResolvedCommands::default()
         };
-        let msg = format_denial_full("ls", &rules);
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
 
         assert!(msg.contains("Allowed: git"));
         assert!(
@@ -1413,7 +1529,7 @@ mod tests {
             ]),
             ..ResolvedCommands::default()
         };
-        let msg = format_denial_full("ls", &rules);
+        let msg = format_denial_full("ls", &rules, &no_cd_denial("ls"));
 
         let deny_line = msg
             .lines()
@@ -1441,6 +1557,178 @@ mod tests {
         let rules = python_equivalent_rules();
         // git grep should return "git grep", not just "git".
         let denied = check_command("git grep foo", &rules, None);
-        assert_eq!(denied.as_deref(), Some("git grep"));
+        assert_eq!(
+            denied.as_ref().map(|d| d.command.as_str()),
+            Some("git grep"),
+        );
+    }
+
+    // ── cd resolution tests ──────────────────────────────────────────
+
+    /// Rules with per-root build tools for cd resolution tests.
+    fn cd_rules() -> ResolvedCommands {
+        ResolvedCommands {
+            allow: HashSet::from(["git".into(), "cd".into()]),
+            build: HashMap::from([
+                (std::path::PathBuf::from("/project/a"), "make".into()),
+                (std::path::PathBuf::from("/project/b"), "npm".into()),
+            ]),
+            ..ResolvedCommands::default()
+        }
+    }
+
+    #[test]
+    fn cd_absolute_updates_effective_cwd() {
+        let rules = cd_rules();
+        // npm is the build tool for /project/b — allowed after cd.
+        assert!(
+            check_command(
+                "cd /project/b && npm install",
+                &rules,
+                Some(std::path::Path::new("/project/a"))
+            )
+            .is_none(),
+            "npm should be allowed after cd to /project/b",
+        );
+    }
+
+    #[test]
+    fn cd_absolute_denies_wrong_build() {
+        let rules = cd_rules();
+        // make is NOT the build tool for /project/b.
+        assert_eq!(
+            check_command(
+                "cd /project/b && make check",
+                &rules,
+                Some(std::path::Path::new("/project/a"))
+            )
+            .as_ref()
+            .map(|d| d.command.as_str()),
+            Some("make"),
+        );
+    }
+
+    #[test]
+    fn cd_relative_resolves_against_cwd() {
+        let rules = cd_rules();
+        // Starting at /project, cd b → /project/b, npm is build tool there.
+        assert!(
+            check_command(
+                "cd b && npm install",
+                &rules,
+                Some(std::path::Path::new("/project"))
+            )
+            .is_none(),
+        );
+    }
+
+    #[test]
+    fn cd_tilde_expands_home() {
+        // Just verify resolve_cd_target handles ~ correctly.
+        let result = resolve_cd_target("~/projects", Some(std::path::Path::new("/tmp")));
+        let home = dirs::home_dir().expect("HOME");
+        assert_eq!(result, Some(home.join("projects")));
+    }
+
+    #[test]
+    fn cd_variable_preserves_cwd() {
+        // Can't resolve $VAR — effective cwd stays unchanged.
+        let result = resolve_cd_target("$PROJECT", Some(std::path::Path::new("/original")));
+        assert_eq!(result, Some(std::path::PathBuf::from("/original")));
+    }
+
+    #[test]
+    fn cd_parent_normalized() {
+        let rules = cd_rules();
+        // cd /project/b/../a → /project/a, make is build tool there.
+        assert!(
+            check_command(
+                "cd /project/b/../a && make check",
+                &rules,
+                Some(std::path::Path::new("/tmp")),
+            )
+            .is_none(),
+        );
+    }
+
+    #[test]
+    fn without_cd_uses_original_cwd() {
+        let rules = cd_rules();
+        // No cd — cwd is /project/a, make is the build tool.
+        assert!(
+            check_command(
+                "make check",
+                &rules,
+                Some(std::path::Path::new("/project/a"))
+            )
+            .is_none()
+        );
+        // npm is NOT the build tool for /project/a.
+        assert!(
+            check_command(
+                "npm install",
+                &rules,
+                Some(std::path::Path::new("/project/a"))
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn cd_unresolved_variable_flags_denial() {
+        let rules = cd_rules();
+        // cd $PROJECT_DIR can't be resolved — denial should flag it.
+        let denial = check_command(
+            "cd $PROJECT_DIR && npm install",
+            &rules,
+            Some(std::path::Path::new("/project/a")),
+        )
+        .expect("should deny npm");
+        assert!(
+            denial.unresolved_cd,
+            "denial should flag unresolved cd target"
+        );
+        assert_eq!(denial.command, "npm");
+    }
+
+    #[test]
+    fn cd_resolved_does_not_flag() {
+        let rules = cd_rules();
+        // cd /project/b resolves fine — denial (if any) should not flag.
+        let denial = check_command(
+            "cd /project/b && make check",
+            &rules,
+            Some(std::path::Path::new("/project/a")),
+        )
+        .expect("make denied in /project/b");
+        assert!(!denial.unresolved_cd, "resolved cd should not flag");
+    }
+
+    #[test]
+    fn format_full_includes_unresolved_cd_note() {
+        let rules = cd_rules();
+        let denial = Denial {
+            command: "npm".into(),
+            unresolved_cd: true,
+        };
+        let msg = format_denial_full("npm", &rules, &denial);
+        assert!(
+            msg.contains("could not be resolved"),
+            "should include unresolved cd note: {msg}",
+        );
+    }
+
+    #[test]
+    fn format_full_omits_note_when_resolved() {
+        let rules = cd_rules();
+        let denial = Denial {
+            command: "npm".into(),
+            unresolved_cd: false,
+        };
+        let msg = format_denial_full("npm", &rules, &denial);
+        assert!(
+            !msg.contains("could not be resolved"),
+            "should not include note when resolved: {msg}",
+        );
     }
 }

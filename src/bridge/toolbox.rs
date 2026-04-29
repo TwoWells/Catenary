@@ -125,6 +125,12 @@ impl ResolvedGlob {
 /// [`super::handler::LspBridgeHandler`] holds an `Arc<Toolbox>` and handles
 /// protocol boundary concerns (health checks, readiness, dispatch routing).
 pub struct Toolbox {
+    /// Session-wide configuration (shared with `LspClientManager`).
+    pub config: Arc<Config>,
+    /// Monotonic config version — bumped when merged command config changes
+    /// (e.g., root addition expands the allowlist). Read by `HookRouter`
+    /// for debounce invalidation.
+    pub config_version: std::sync::atomic::AtomicU64,
     /// Grep tool server.
     pub grep: GrepServer,
     /// Glob tool server.
@@ -166,6 +172,8 @@ impl Toolbox {
         instance_id: Arc<str>,
         runtime: Handle,
     ) -> Self {
+        let config = Arc::new(config);
+
         // Construct logging sinks.
         let threshold = config
             .notifications
@@ -204,7 +212,7 @@ impl Toolbox {
 
         let path_validator = Arc::new(RwLock::new(PathValidator::new(roots)));
         let client_manager = Arc::new(LspClientManager::new(
-            config,
+            config.clone(),
             logging.clone(),
             fs_manager.clone(),
         ));
@@ -243,6 +251,8 @@ impl Toolbox {
             outline_suppress,
         };
         Self {
+            config,
+            config_version: std::sync::atomic::AtomicU64::new(0),
             grep,
             glob,
             diagnostics,
@@ -256,6 +266,19 @@ impl Toolbox {
             instance_id,
             runtime,
         }
+    }
+
+    /// Builds the merged command filter from user config + all project configs.
+    ///
+    /// Returns `None` when no `[commands]` section is configured. The merged
+    /// result reflects the current workspace roots and project configs —
+    /// adding a root expands the allow surface.
+    #[must_use]
+    pub fn merged_commands(&self) -> Option<crate::config::ResolvedCommands> {
+        let base = self.config.resolved_commands.as_ref()?;
+        let roots = self.client_manager.roots();
+        let project_commands = self.client_manager.project_commands();
+        Some(base.merge_project_commands(&roots, &project_commands))
     }
 
     /// Returns `true` if the path is within any known workspace root.
@@ -312,6 +335,11 @@ impl Toolbox {
         // async work), then reacts to the diff.
         self.client_manager.sync_roots(roots.clone()).await?;
         self.path_validator.write().await.update_roots(roots);
+
+        // Root changes may expand the merged command allowlist —
+        // bump config version so the next denial shows a fresh full dump.
+        self.config_version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         // Fire-and-forget: spawn_all is pre-warming, not a gate.
         // Tool calls that need a server will trigger spawning on demand.

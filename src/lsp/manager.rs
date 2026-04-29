@@ -88,7 +88,7 @@ fn file_matches_patterns(path: &Path, patterns: &[LspGlob]) -> bool {
 /// lifecycle. Document versioning and open/close tracking live on each
 /// [`LspClient`] — each server sees an independent monotonic version sequence.
 pub struct LspClientManager {
-    config: Config,
+    config: Arc<Config>,
     /// Per-root project configs from `.catenary.toml`. Keyed by root path.
     /// Uses `std::sync::Mutex` — reads are fast, non-contended, and must
     /// not be held across `.await` points.
@@ -110,7 +110,12 @@ impl LspClientManager {
     /// Workspace roots are sourced from the shared [`FilesystemManager`] —
     /// call [`FilesystemManager::set_roots`] before constructing this manager.
     #[must_use]
-    pub fn new(config: Config, logging: LoggingServer, fs: Arc<FilesystemManager>) -> Self {
+    pub fn new(
+        config: impl Into<Arc<Config>>,
+        logging: LoggingServer,
+        fs: Arc<FilesystemManager>,
+    ) -> Self {
+        let config = config.into();
         Self {
             config,
             project_configs: std::sync::Mutex::new(HashMap::new()),
@@ -122,8 +127,23 @@ impl LspClientManager {
     }
 
     /// Returns a reference to the configuration.
-    pub const fn config(&self) -> &Config {
+    pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Extracts `CommandsConfig` from each loaded project config.
+    ///
+    /// Returns a map from root path to the project's `[commands]` section.
+    /// Roots without a `[commands]` section are omitted.
+    pub fn project_commands(&self) -> HashMap<PathBuf, crate::config::CommandsConfig> {
+        let configs = self
+            .project_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        configs
+            .iter()
+            .filter_map(|(root, pc)| pc.commands.clone().map(|cmds| (root.clone(), cmds)))
+            .collect()
     }
 
     /// Spawns LSP servers for languages detected in the workspace.
@@ -1706,7 +1726,7 @@ mod tests {
         fs
     }
 
-    fn test_config() -> Config {
+    fn test_config_raw() -> Config {
         Config {
             language: HashMap::new(),
             server: HashMap::new(),
@@ -1717,6 +1737,10 @@ mod tests {
             tools: None,
             resolved_commands: None,
         }
+    }
+
+    fn test_config() -> Arc<Config> {
+        Arc::new(test_config_raw())
     }
 
     /// Test helper: spawns the first server for a language using the first root.
@@ -1756,7 +1780,7 @@ mod tests {
         test_exe.unwrap_or_else(|| PathBuf::from("mockls"))
     }
 
-    fn mockls_config() -> Config {
+    fn mockls_config() -> Arc<Config> {
         let bin = mockls_bin();
         let server_name = format!("mockls-{MOCK_LANG_A}");
         let mut server = HashMap::new();
@@ -1776,7 +1800,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        Config {
+        Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -1785,10 +1809,10 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        }
+        })
     }
 
-    fn mockls_workspace_folders_config() -> Config {
+    fn mockls_workspace_folders_config() -> Arc<Config> {
         let bin = mockls_bin();
         let server_name = format!("mockls-{MOCK_LANG_A}-wf");
         let mut server = HashMap::new();
@@ -1808,7 +1832,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        Config {
+        Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -1817,11 +1841,11 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        }
+        })
     }
 
     /// Config with two legacy mockls servers for the same language.
-    fn mockls_multi_server_config() -> Config {
+    fn mockls_multi_server_config() -> Arc<Config> {
         let bin = mockls_bin();
         let server_a = format!("mockls-{MOCK_LANG_A}-a");
         let server_b = format!("mockls-{MOCK_LANG_A}-b");
@@ -1847,7 +1871,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        Config {
+        Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -1856,11 +1880,11 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        }
+        })
     }
 
     /// Config with two workspace-folders-capable mockls servers for the same language.
-    fn mockls_multi_server_workspace_config() -> Config {
+    fn mockls_multi_server_workspace_config() -> Arc<Config> {
         let bin = mockls_bin();
         let server_a = format!("mockls-{MOCK_LANG_A}-wf-a");
         let server_b = format!("mockls-{MOCK_LANG_A}-wf-b");
@@ -1886,7 +1910,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        Config {
+        Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -1895,11 +1919,11 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        }
+        })
     }
 
     /// Config with one workspace-capable and one legacy mockls for the same language.
-    fn mockls_mixed_capability_config() -> Config {
+    fn mockls_mixed_capability_config() -> Arc<Config> {
         let bin = mockls_bin();
         let server_ws = format!("mockls-{MOCK_LANG_A}-ws");
         let server_legacy = format!("mockls-{MOCK_LANG_A}-leg");
@@ -1931,7 +1955,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        Config {
+        Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -1940,7 +1964,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        }
+        })
     }
 
     #[tokio::test]
@@ -2114,7 +2138,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        let config = Config {
+        let config = Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -2123,7 +2147,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        };
+        });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
 
@@ -2891,7 +2915,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        let config = Config {
+        let config = Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -2900,7 +2924,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        };
+        });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
         let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
@@ -2947,7 +2971,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        let config = Config {
+        let config = Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -2956,7 +2980,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        };
+        });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
         let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
@@ -3002,7 +3026,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        let config = Config {
+        let config = Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -3011,7 +3035,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        };
+        });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
         let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
@@ -3814,7 +3838,7 @@ mod tests {
 
     #[test]
     fn test_effective_server_def_merge() {
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
@@ -3862,7 +3886,7 @@ mod tests {
 
     #[test]
     fn test_effective_server_def_full_override() {
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
@@ -3905,7 +3929,7 @@ mod tests {
 
     #[test]
     fn test_effective_server_def_no_project() {
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
@@ -3929,7 +3953,7 @@ mod tests {
 
     #[test]
     fn test_effective_settings_merge() {
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             "ra".to_string(),
             ServerDef {
@@ -3969,7 +3993,7 @@ mod tests {
 
     #[test]
     fn test_collect_per_root_settings() {
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             "ra".to_string(),
             ServerDef {
@@ -4018,7 +4042,7 @@ mod tests {
 
     #[test]
     fn test_collect_per_root_settings_no_configs() {
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             "ra".to_string(),
             ServerDef {
@@ -4172,7 +4196,7 @@ mod tests {
         // effective_server_def.
         let bin = mockls_bin();
         let server_name = format!("mockls-{MOCK_LANG_A}-ps");
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             server_name.clone(),
             ServerDef {
@@ -4633,7 +4657,7 @@ mod tests {
     }
 
     /// Config with mockls that accepts null-workspace (single-file mode).
-    fn mockls_single_file_config() -> Config {
+    fn mockls_single_file_config() -> Arc<Config> {
         let bin = mockls_bin();
         let server_name = format!("mockls-{MOCK_LANG_A}-sf");
         let mut server = HashMap::new();
@@ -4654,7 +4678,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        Config {
+        Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -4663,11 +4687,11 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        }
+        })
     }
 
     /// Config with mockls that rejects null-workspace initialization.
-    fn mockls_reject_null_workspace_config() -> Config {
+    fn mockls_reject_null_workspace_config() -> Arc<Config> {
         let bin = mockls_bin();
         let server_name = format!("mockls-{MOCK_LANG_A}-rnw");
         let mut server = HashMap::new();
@@ -4691,7 +4715,7 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        Config {
+        Arc::new(Config {
             language,
             server,
             log_retention_days: 7,
@@ -4700,7 +4724,7 @@ mod tests {
             tui: None,
             tools: None,
             resolved_commands: None,
-        }
+        })
     }
 
     #[tokio::test]
@@ -4966,7 +4990,7 @@ mod tests {
         let lang_b = "qR7bZ";
         let server_a = format!("mockls-{MOCK_LANG_A}-sf2");
         let server_b = format!("mockls-{lang_b}-sf2");
-        let mut config = test_config();
+        let mut config = test_config_raw();
         for (name, lang) in [(&server_a, MOCK_LANG_A), (&server_b, lang_b)] {
             config.server.insert(
                 name.clone(),
@@ -5028,7 +5052,7 @@ mod tests {
         // mockls with --send-configuration-request will respond to it.
         let bin = mockls_bin();
         let server_name = format!("mockls-{MOCK_LANG_A}-dcc");
-        let mut config = test_config();
+        let mut config = test_config_raw();
         config.server.insert(
             server_name.clone(),
             ServerDef {
