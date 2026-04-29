@@ -3094,10 +3094,14 @@ fn test_grep_tier1_enriched() -> Result<()> {
         .as_str()
         .context("Missing text")?;
 
-    // Name header at depth 0
+    // Root header followed by name at depth 0
     assert!(
-        text.starts_with("caller_t1"),
-        "Expected name at depth 0, got:\n{text}"
+        text.starts_with("Root: "),
+        "Expected Root: header, got:\n{text}"
+    );
+    assert!(
+        text.contains("\ncaller_t1\n"),
+        "Expected caller_t1 name group, got:\n{text}"
     );
     // Grammar path: tree-sitter kind label
     assert!(
@@ -3542,19 +3546,20 @@ fn test_grep_tier1_name_grouping() -> Result<()> {
         .context("Missing text")?;
 
     let lines: Vec<&str> = text.lines().collect();
-    // First line: bare name at depth 0 (no leading tab)
+    // First line: Root: header
     assert!(
-        !lines.is_empty() && !lines[0].starts_with('\t'),
-        "Expected name at depth 0 (no tab), got:\n{text}"
+        !lines.is_empty() && lines[0].starts_with("Root: "),
+        "Expected Root: header in first line, got:\n{text}"
     );
+    // Second line: bare name at depth 0 (no leading tab)
     assert!(
-        lines[0].contains("grouped_sym"),
-        "Expected name in first line, got:\n{text}"
+        lines.len() > 1 && lines[1].contains("grouped_sym") && !lines[1].starts_with('\t'),
+        "Expected name at depth 0 in second line, got:\n{text}"
     );
-    // Second line: definition indented (leading tab)
-    if lines.len() > 1 {
+    // Third line: definition indented (leading tab)
+    if lines.len() > 2 {
         assert!(
-            lines[1].starts_with('\t'),
+            lines[2].starts_with('\t'),
             "Expected indented definition line, got:\n{text}"
         );
     }

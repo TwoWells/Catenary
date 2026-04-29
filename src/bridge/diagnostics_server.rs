@@ -15,7 +15,7 @@ use crate::lsp::state::ServerLifecycle;
 use crate::lsp::{LspClient, LspClientManager};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -32,16 +32,25 @@ struct ServerDiagnostics {
 struct DiagnosticsCache {
     per_page: usize,
     files: BTreeMap<String, CachedFile>,
-    clean: Vec<String>,
-    uncovered: Vec<String>,
+    clean: Vec<TrackedEntry>,
+    uncovered: Vec<TrackedEntry>,
 }
 
 /// Per-file cached entries for paging.
 struct CachedFile {
     display: String,
+    /// Owning workspace root, or `None` for out-of-root files.
+    root: Option<PathBuf>,
     /// All formatted entries, combined across all servers in
     /// server-name order.
     entries: Vec<String>,
+}
+
+/// Entry with root tracking for root-grouped output.
+#[derive(Clone)]
+struct TrackedEntry {
+    display: String,
+    root: Option<PathBuf>,
 }
 
 /// Handles `PostToolUse` hook requests: file-change notification with LSP
@@ -98,7 +107,7 @@ impl DiagnosticsServer {
 
         // ── Phase 1: resolve + canonicalize ────────────────────────
         let mut canonical_paths: Vec<PathBuf> = Vec::new();
-        let mut uncovered: Vec<String> = Vec::new();
+        let mut uncovered: Vec<TrackedEntry> = Vec::new();
 
         // Server → list of canonical paths.
         // Keyed by server name for stable (alphabetical) iteration order.
@@ -112,18 +121,27 @@ impl DiagnosticsServer {
             // Resolve to absolute if needed (drain_all_and_clear
             // already returns absolute paths, but be defensive).
             let Ok(path) = resolve_path(&file_str) else {
-                uncovered.push(self.display_rel(&file_str));
+                uncovered.push(TrackedEntry {
+                    display: self.display_rel(&file_str),
+                    root: self.fs.resolve_root(file),
+                });
                 continue;
             };
 
             let Ok(canonical) = validator.validate_read(&path) else {
-                uncovered.push(self.display_rel(&file_str));
+                uncovered.push(TrackedEntry {
+                    display: self.display_rel(&file_str),
+                    root: self.fs.resolve_root(&path),
+                });
                 continue;
             };
 
             let clients = self.client_manager.diagnostic_servers(&canonical).await;
             if clients.is_empty() {
-                uncovered.push(self.display_rel(&canonical.to_string_lossy()));
+                uncovered.push(TrackedEntry {
+                    display: self.display_rel(&canonical.to_string_lossy()),
+                    root: self.fs.resolve_root(&canonical),
+                });
                 continue;
             }
 
@@ -157,12 +175,15 @@ impl DiagnosticsServer {
         };
 
         let mut cached_files: BTreeMap<String, CachedFile> = BTreeMap::new();
-        let mut clean: Vec<String> = Vec::new();
+        let mut clean: Vec<TrackedEntry> = Vec::new();
 
         for (key, (display, segments)) in &file_results {
             let has_any = segments.iter().any(|s| !s.entries.is_empty());
             if !has_any {
-                clean.push(display.clone());
+                clean.push(TrackedEntry {
+                    display: display.clone(),
+                    root: self.fs.resolve_root(std::path::Path::new(key)),
+                });
                 continue;
             }
 
@@ -175,6 +196,7 @@ impl DiagnosticsServer {
                 key.clone(),
                 CachedFile {
                     display: display.clone(),
+                    root: self.fs.resolve_root(std::path::Path::new(key)),
                     entries: all_entries,
                 },
             );
@@ -185,7 +207,10 @@ impl DiagnosticsServer {
         for cp in &canonical_paths {
             let key = cp.to_string_lossy().to_string();
             if !file_results.contains_key(&key) {
-                clean.push(self.display_rel(&key));
+                clean.push(TrackedEntry {
+                    display: self.display_rel(&key),
+                    root: self.fs.resolve_root(cp),
+                });
             }
         }
 
@@ -649,16 +674,24 @@ fn decode_cursor(token: &str) -> Option<usize> {
 
 /// Formats a page of diagnostics from the cache.
 ///
+/// Groups output by workspace root with `Root:` / `OutOfRoots:` headers.
 /// Appends `[cursor: ...]` at the end when more entries remain,
 /// matching the pattern used by Catenary's grep and glob tools.
+#[allow(clippy::too_many_lines, reason = "Root-grouped formatting pipeline")]
 fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
     use std::fmt::Write;
 
     let per_page = cache.per_page;
     let start = (page - 1) * per_page;
-    let mut diagnostics_output = String::new();
-    let mut clean_files: Vec<String> = Vec::new();
     let mut has_more = false;
+
+    // Per-root collected data.
+    let mut root_diags: BTreeMap<&PathBuf, String> = BTreeMap::new();
+    let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
+    let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
+    let mut oor_diags = String::new();
+    let mut oor_clean: Vec<&str> = Vec::new();
+    let mut oor_uncovered: Vec<&str> = Vec::new();
 
     for cached in cache.files.values() {
         let end = cached.entries.len().min(start + per_page);
@@ -667,38 +700,102 @@ fn format_page(cache: &DiagnosticsCache, page: usize) -> String {
         }
         let page_entries = &cached.entries[start..end];
         if page_entries.is_empty() {
-            clean_files.push(cached.display.clone());
+            match &cached.root {
+                Some(r) => root_clean.entry(r).or_default().push(&cached.display),
+                None => oor_clean.push(&cached.display),
+            }
             continue;
         }
 
-        _ = writeln!(diagnostics_output, "{}:", cached.display);
+        let diags = cached
+            .root
+            .as_ref()
+            .map_or(&mut oor_diags, |r| root_diags.entry(r).or_default());
+        _ = writeln!(diags, "{}:", cached.display);
         for entry in page_entries {
             for line in entry.lines() {
-                _ = writeln!(diagnostics_output, "\t{line}");
+                _ = writeln!(diags, "\t{line}");
             }
         }
-
         let remaining = cached.entries.len() - end;
         if remaining > 0 {
             has_more = true;
-            _ = writeln!(diagnostics_output, "\t... {remaining} more");
+            _ = writeln!(diags, "\t... {remaining} more");
         }
     }
 
     if page == 1 {
-        clean_files.extend(cache.clean.iter().cloned());
+        for entry in &cache.clean {
+            match &entry.root {
+                Some(r) => root_clean.entry(r).or_default().push(&entry.display),
+                None => oor_clean.push(&entry.display),
+            }
+        }
+        for entry in &cache.uncovered {
+            match &entry.root {
+                Some(r) => root_uncovered.entry(r).or_default().push(&entry.display),
+                None => oor_uncovered.push(&entry.display),
+            }
+        }
     }
 
+    // Collect all roots with any content.
+    let mut all_roots: BTreeSet<&PathBuf> = BTreeSet::new();
+    all_roots.extend(root_diags.keys());
+    all_roots.extend(root_clean.keys());
+    all_roots.extend(root_uncovered.keys());
+
     let mut output = String::new();
-    if !diagnostics_output.is_empty() {
-        output.push_str(&diagnostics_output);
+
+    for root in &all_roots {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        _ = writeln!(output, "Root: {}", root.display());
+        if let Some(diags) = root_diags.get(root) {
+            output.push_str(diags);
+        }
+        if let Some(clean) = root_clean.get(root)
+            && !clean.is_empty()
+        {
+            _ = writeln!(output, "clean:");
+            for f in clean {
+                _ = writeln!(output, "\t{f}");
+            }
+        }
+        if let Some(uncov) = root_uncovered.get(root)
+            && !uncov.is_empty()
+        {
+            _ = writeln!(output, "N/A:");
+            for f in uncov {
+                _ = writeln!(output, "\t{f}");
+            }
+        }
     }
-    if !clean_files.is_empty() {
-        _ = writeln!(output, "{}: clean", clean_files.join(", "));
+
+    let has_oor = !oor_diags.is_empty() || !oor_clean.is_empty() || !oor_uncovered.is_empty();
+    if has_oor {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        _ = writeln!(output, "OutOfRoots:");
+        if !oor_diags.is_empty() {
+            output.push_str(&oor_diags);
+        }
+        if !oor_clean.is_empty() {
+            _ = writeln!(output, "clean:");
+            for f in &oor_clean {
+                _ = writeln!(output, "\t{f}");
+            }
+        }
+        if !oor_uncovered.is_empty() {
+            _ = writeln!(output, "N/A:");
+            for f in &oor_uncovered {
+                _ = writeln!(output, "\t{f}");
+            }
+        }
     }
-    if page == 1 && !cache.uncovered.is_empty() {
-        _ = writeln!(output, "{}: N/A", cache.uncovered.join(", "));
-    }
+
     if has_more {
         _ = writeln!(output, "[cursor: {}]", encode_cursor(page + 1));
     }
@@ -741,6 +838,7 @@ mod tests {
             "/test/file.rs".to_string(),
             CachedFile {
                 display: "file.rs".to_string(),
+                root: Some(PathBuf::from("/test")),
                 entries,
             },
         );
@@ -757,6 +855,7 @@ mod tests {
         let entries = vec![":1:1 [error] test: msg".to_string()];
         let cache = make_cache(entries, 50);
         let output = format_page(&cache, 1);
+        assert!(output.contains("Root: /test"), "output: {output}");
         assert!(output.contains("file.rs:"), "output: {output}");
         assert!(output.contains(":1:1 [error]"), "output: {output}");
         assert!(!output.contains("[cursor:"), "output: {output}");
@@ -769,6 +868,7 @@ mod tests {
             .collect();
         let cache = make_cache(entries, 3);
         let output = format_page(&cache, 1);
+        assert!(output.contains("Root: /test"), "output: {output}");
         assert!(output.contains("2 more"), "output: {output}");
         assert!(output.contains("[cursor: d2]"), "output: {output}");
         assert!(!output.contains("msg 3"), "output: {output}");
@@ -797,18 +897,96 @@ mod tests {
 
     #[test]
     fn format_page_clean_and_uncovered_on_page1_only() {
+        let root = PathBuf::from("/test");
         let cache = DiagnosticsCache {
             per_page: 50,
             files: BTreeMap::new(),
-            clean: vec!["clean.rs".to_string()],
-            uncovered: vec!["other.txt".to_string()],
+            clean: vec![TrackedEntry {
+                display: "clean.rs".to_string(),
+                root: Some(root.clone()),
+            }],
+            uncovered: vec![TrackedEntry {
+                display: "other.txt".to_string(),
+                root: Some(root),
+            }],
         };
         let page1 = format_page(&cache, 1);
-        assert!(page1.contains("clean.rs: clean"), "page1: {page1}");
-        assert!(page1.contains("other.txt: N/A"), "page1: {page1}");
+        assert!(page1.contains("Root: /test"), "page1: {page1}");
+        assert!(page1.contains("clean:"), "page1: {page1}");
+        assert!(page1.contains("\tclean.rs"), "page1: {page1}");
+        assert!(page1.contains("N/A:"), "page1: {page1}");
+        assert!(page1.contains("\tother.txt"), "page1: {page1}");
 
         let page2 = format_page(&cache, 2);
         assert!(!page2.contains("clean"), "page2: {page2}");
         assert!(!page2.contains("N/A"), "page2: {page2}");
+    }
+
+    #[test]
+    fn format_page_multi_root_grouping() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "/alpha/src/lib.rs".to_string(),
+            CachedFile {
+                display: "src/lib.rs".to_string(),
+                root: Some(PathBuf::from("/alpha")),
+                entries: vec![":1:1 [error] test: alpha error".to_string()],
+            },
+        );
+        files.insert(
+            "/beta/src/lib.rs".to_string(),
+            CachedFile {
+                display: "src/lib.rs".to_string(),
+                root: Some(PathBuf::from("/beta")),
+                entries: vec![":5:1 [warning] test: beta warning".to_string()],
+            },
+        );
+        let cache = DiagnosticsCache {
+            per_page: 50,
+            files,
+            clean: vec![TrackedEntry {
+                display: "src/main.rs".to_string(),
+                root: Some(PathBuf::from("/alpha")),
+            }],
+            uncovered: Vec::new(),
+        };
+        let output = format_page(&cache, 1);
+        // Roots appear alphabetically.
+        let alpha_pos = output.find("Root: /alpha").expect("missing /alpha");
+        let beta_pos = output.find("Root: /beta").expect("missing /beta");
+        assert!(alpha_pos < beta_pos, "output: {output}");
+        assert!(output.contains("alpha error"), "output: {output}");
+        assert!(output.contains("beta warning"), "output: {output}");
+        // Clean under alpha root.
+        assert!(output.contains("clean:"), "output: {output}");
+        assert!(output.contains("\tsrc/main.rs"), "output: {output}");
+    }
+
+    #[test]
+    fn format_page_out_of_root() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "/tmp/scratch.rs".to_string(),
+            CachedFile {
+                display: "/tmp/scratch.rs".to_string(),
+                root: None,
+                entries: vec![":3:1 [warning] test: oor warning".to_string()],
+            },
+        );
+        let cache = DiagnosticsCache {
+            per_page: 50,
+            files,
+            clean: Vec::new(),
+            uncovered: vec![TrackedEntry {
+                display: "/tmp/notes.txt".to_string(),
+                root: None,
+            }],
+        };
+        let output = format_page(&cache, 1);
+        assert!(output.contains("OutOfRoots:"), "output: {output}");
+        assert!(output.contains("oor warning"), "output: {output}");
+        assert!(output.contains("N/A:"), "output: {output}");
+        assert!(output.contains("\t/tmp/notes.txt"), "output: {output}");
+        assert!(!output.contains("Root:"), "output: {output}");
     }
 }

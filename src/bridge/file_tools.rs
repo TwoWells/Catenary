@@ -700,7 +700,27 @@ impl GlobServer {
     )]
     fn handle_glob_file(&self, path: &Path, after_line: Option<u32>) -> String {
         let mut result = String::new();
-        let display = path.to_string_lossy();
+
+        // Root header.
+        let root = self.fs_manager.resolve_root(path);
+        let display = root.as_ref().map_or_else(
+            || path.to_string_lossy().to_string(),
+            |r| {
+                path.strip_prefix(r).map_or_else(
+                    |_| path.to_string_lossy().to_string(),
+                    |rel| rel.to_string_lossy().to_string(),
+                )
+            },
+        );
+        match &root {
+            Some(r) => {
+                let _ = writeln!(result, "Root: {}", r.display());
+            }
+            None => {
+                let _ = writeln!(result, "OutOfRoots:");
+            }
+        }
+
         let metadata = std::fs::metadata(path).ok();
 
         // Detect snapshot or broken symlink.
@@ -926,14 +946,28 @@ impl GlobServer {
         self.ensure_symbols(&file_paths).await;
 
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
-        Ok(select_dir_tier(
+        let tier_output = select_dir_tier(
             &entries,
             self.budget,
             ts_guard.as_deref(),
             self.outline_threshold,
             &self.outline_suppress,
             &self.fs_manager,
-        ))
+        );
+
+        // Root header.
+        let root = self.fs_manager.resolve_root(&canonical);
+        let mut result = String::new();
+        match &root {
+            Some(r) => {
+                let _ = writeln!(result, "Root: {}", r.display());
+            }
+            None => {
+                let _ = writeln!(result, "OutOfRoots:");
+            }
+        }
+        result.push_str(&tier_output);
+        Ok(result)
     }
 
     /// Glob pattern match across workspace roots with tree output.
@@ -1018,38 +1052,55 @@ impl GlobServer {
             return Ok("No matches found".to_string());
         }
 
-        // Build tree structure from matched files.
-        let mut root_node = DirNode::new();
-        let mut flat_names: Vec<String> = Vec::with_capacity(matched_files.len());
+        // Group by search root and build one tree per group.
+        let mut grouped: BTreeMap<&PathBuf, Vec<&(PathBuf, PathBuf, bool)>> = BTreeMap::new();
+        for entry in &matched_files {
+            grouped.entry(&entry.1).or_default().push(entry);
+        }
 
-        for (abs_path, root, gitignored) in &matched_files {
-            let rel = abs_path.strip_prefix(root).unwrap_or(abs_path);
-            let rel_str = rel.to_string_lossy();
-            let components: Vec<&str> = rel_str.split('/').collect();
+        let mut sections: Vec<GlobSection> = Vec::new();
+        for (root, entries) in &grouped {
+            let mut node = DirNode::new();
+            let mut flat_names = Vec::new();
+            let mut files = Vec::new();
 
-            let metadata = std::fs::metadata(abs_path).ok();
-            let file_name = components.last().unwrap_or(&"").to_string();
-            let snap = is_snapshot(&file_name);
+            for (abs_path, _, gitignored) in entries.iter().copied() {
+                let rel = abs_path.strip_prefix(root).unwrap_or(abs_path);
+                let rel_str = rel.to_string_lossy();
+                let components: Vec<&str> = rel_str.split('/').collect();
 
-            let (line_count, binary_size) = if snap {
-                (None, None)
-            } else {
-                self.file_info(abs_path, metadata.as_ref())
-            };
+                let metadata = std::fs::metadata(abs_path).ok();
+                let file_name = components.last().unwrap_or(&"").to_string();
+                let snap = is_snapshot(&file_name);
 
-            flat_names.push(file_name.clone());
+                let (line_count, binary_size) = if snap {
+                    (None, None)
+                } else {
+                    self.file_info(abs_path, metadata.as_ref())
+                };
 
-            root_node.insert(
-                &components,
-                FileNode {
-                    name: file_name,
-                    abs_path: abs_path.clone(),
-                    line_count,
-                    binary_size,
-                    is_gitignored: *gitignored,
-                    is_snapshot: snap,
-                },
-            );
+                flat_names.push(file_name.clone());
+                files.push((abs_path.clone(), (*root).clone(), *gitignored));
+
+                node.insert(
+                    &components,
+                    FileNode {
+                        name: file_name,
+                        abs_path: abs_path.clone(),
+                        line_count,
+                        binary_size,
+                        is_gitignored: *gitignored,
+                        is_snapshot: snap,
+                    },
+                );
+            }
+
+            sections.push(GlobSection {
+                root: (*root).clone(),
+                node,
+                flat_names,
+                files,
+            });
         }
 
         // Populate symbol index for matched files.
@@ -1059,61 +1110,110 @@ impl GlobServer {
             .await;
         self.ensure_symbols(&abs_paths).await;
 
-        // Tier selection: promote from bottom.
+        // Global tier selection: promote from bottom across all roots.
         let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
         let ts_ref = ts_guard.as_deref();
 
-        // 1. Tier 3 (bucketed) — always fits.
-        let tier3 = render_bucketed(&flat_names, self.budget);
+        // Root header overhead: not counted against the content budget.
+        let header_overhead: usize = sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let header = format!("Root: {}\n", s.root.display());
+                let separator = usize::from(i > 0); // blank line between sections
+                header.len() + separator
+            })
+            .sum();
+        let content_budget = self.budget.saturating_sub(header_overhead);
 
-        // 2. Tier 2 (tree listing with flags) — promote if fits.
-        let mut tier2 = String::new();
-        root_node.render_tier2(
-            &mut tier2,
-            0,
-            ts_ref,
-            self.outline_threshold,
-            &self.outline_suppress,
-            &self.fs_manager,
-        );
-        if tier2.len() > self.budget {
-            return Ok(tier3);
+        // Helper: assemble root headers around per-section content.
+        let assemble = |per_section: &[String]| -> String {
+            let mut out = String::new();
+            for (s, content) in sections.iter().zip(per_section) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                let _ = writeln!(out, "Root: {}", s.root.display());
+                out.push_str(content);
+            }
+            out
+        };
+
+        // Tier 3 (bucketed) — always fits.
+        let t3: Vec<String> = sections
+            .iter()
+            .map(|s| render_bucketed(&s.flat_names, content_budget))
+            .collect();
+
+        // Tier 2 (tree listing with flags) — promote if content fits.
+        let t2: Vec<String> = sections
+            .iter()
+            .map(|s| {
+                let mut out = String::new();
+                s.node.render_tier2(
+                    &mut out,
+                    0,
+                    ts_ref,
+                    self.outline_threshold,
+                    &self.outline_suppress,
+                    &self.fs_manager,
+                );
+                out
+            })
+            .collect();
+        let t2_content: usize = t2.iter().map(String::len).sum();
+        if t2_content > content_budget {
+            return Ok(assemble(&t3));
         }
 
-        // 3. Tier 1 (tree listing with maps) — promote if eligible.
+        // Tier 1 (tree listing with maps) — promote if has content and fits.
         if let Some(idx) = ts_ref {
-            let abs_paths: Vec<PathBuf> = matched_files.iter().map(|(p, _, _)| p.clone()).collect();
-            let eligible: Vec<&Path> = abs_paths
+            let t1: Vec<String> = sections
                 .iter()
-                .filter(|p| {
-                    is_map_eligible(
-                        p,
-                        &matched_files,
-                        self.outline_threshold,
-                        &self.outline_suppress,
-                        idx,
-                        &self.fs_manager,
-                    )
+                .map(|s| {
+                    let group_abs: Vec<PathBuf> =
+                        s.files.iter().map(|(p, _, _)| p.clone()).collect();
+                    let eligible: Vec<&Path> = group_abs
+                        .iter()
+                        .filter(|p| {
+                            is_map_eligible(
+                                p,
+                                &s.files,
+                                self.outline_threshold,
+                                &self.outline_suppress,
+                                idx,
+                                &self.fs_manager,
+                            )
+                        })
+                        .map(PathBuf::as_path)
+                        .collect();
+
+                    if eligible.is_empty() {
+                        return String::new();
+                    }
+                    let Ok(outline) = idx.query_outline_batch(&eligible) else {
+                        return String::new();
+                    };
+                    if outline.is_empty() {
+                        return String::new();
+                    }
+
+                    let children_sets = build_children_sets(idx, &eligible);
+                    let sa_paths = build_sa_paths(&s.files, idx);
+                    let mut out = String::new();
+                    s.node
+                        .render_tier1(&mut out, 0, &outline, &children_sets, &sa_paths, idx);
+                    out
                 })
-                .map(PathBuf::as_path)
                 .collect();
 
-            if !eligible.is_empty()
-                && let Ok(outline) = idx.query_outline_batch(&eligible)
-                && !outline.is_empty()
-            {
-                let children_sets = build_children_sets(idx, &eligible);
-                let sa_paths = build_sa_paths(&matched_files, idx);
-
-                let mut tier1 = String::new();
-                root_node.render_tier1(&mut tier1, 0, &outline, &children_sets, &sa_paths, idx);
-                if tier1.len() <= self.budget {
-                    return Ok(tier1);
-                }
+            let t1_content: usize = t1.iter().map(String::len).sum();
+            if t1_content > 0 && t1_content <= content_budget {
+                return Ok(assemble(&t1));
             }
         }
 
-        Ok(tier2)
+        Ok(assemble(&t2))
     }
 
     /// Extracts file info: `(line_count, binary_size)`.
@@ -2443,6 +2543,16 @@ fn render_bucketed(file_names: &[String], budget: usize) -> String {
     result
 }
 
+// ─── Root-grouped assembly ───────────────────────────────────────────
+
+/// Per-root tree and metadata for glob pattern tier selection.
+struct GlobSection {
+    root: PathBuf,
+    node: DirNode,
+    flat_names: Vec<String>,
+    files: Vec<(PathBuf, PathBuf, bool)>,
+}
+
 // ─── Cursor-based paging ──────────────────────────────────────────────
 
 /// Encodes a cursor token from a 0-based line number.
@@ -2498,4 +2608,82 @@ fn build_sa_paths(
         .filter(|(p, _, _)| symbol_index.has_symbols_for(p))
         .map(|(p, _, _)| p.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn test_per_root_tier2_rendering() {
+        let root = PathBuf::from("/test/root");
+        let mut node = DirNode::new();
+
+        // Insert two files at root level.
+        node.insert(
+            &["main.rs"],
+            FileNode {
+                name: "main.rs".to_string(),
+                abs_path: PathBuf::from("/test/root/main.rs"),
+                line_count: Some(10),
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+        node.insert(
+            &["lib.rs"],
+            FileNode {
+                name: "lib.rs".to_string(),
+                abs_path: PathBuf::from("/test/root/lib.rs"),
+                line_count: Some(5),
+                binary_size: None,
+                is_gitignored: false,
+                is_snapshot: false,
+            },
+        );
+
+        let sections = vec![GlobSection {
+            root: root.clone(),
+            node,
+            flat_names: vec!["main.rs".to_string(), "lib.rs".to_string()],
+            files: vec![
+                (PathBuf::from("/test/root/main.rs"), root.clone(), false),
+                (PathBuf::from("/test/root/lib.rs"), root, false),
+            ],
+        }];
+
+        // Render tier 2.
+        let mut tier2 = String::new();
+        for s in &sections {
+            if !tier2.is_empty() {
+                tier2.push('\n');
+            }
+            let _ = writeln!(tier2, "Root: {}", s.root.display());
+            s.node.render_tier2(
+                &mut tier2,
+                0,
+                None,
+                200,
+                &[],
+                // Use a minimal FilesystemManager — render_tier2 only uses
+                // it for outline_suppress checking, which we pass empty.
+                &FilesystemManager::new(),
+            );
+        }
+
+        assert!(
+            tier2.contains("main.rs"),
+            "tier2 should contain main.rs: {tier2}"
+        );
+        assert!(
+            tier2.contains("lib.rs"),
+            "tier2 should contain lib.rs: {tier2}"
+        );
+        assert!(
+            tier2.contains("Root: /test/root"),
+            "tier2 should contain Root header: {tier2}"
+        );
+    }
 }

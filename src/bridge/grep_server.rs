@@ -406,9 +406,15 @@ impl GrepServer {
             return Ok(String::new());
         }
 
+        // Partition by root for grouped output.
+        let (root_groups, oor_hits) = partition_hits_by_root(&hits, &self.fs_manager);
+        let all_refs: Vec<&GrepHit> = hits.iter().collect();
+
         // Promote-from-bottom tier selection with enrichment.
-        let output = if estimate_tier2_lower_bound(&hits, &self.fs_manager) <= self.budget {
-            let tier2 = render_tier2(&hits, &self.fs_manager);
+        let output = if estimate_tier2_lower_bound(&all_refs, &self.fs_manager) <= self.budget {
+            let tier2 = render_grouped(&root_groups, &oor_hits, |h| {
+                render_tier2(h, &self.fs_manager)
+            });
             if tier2.len() <= self.budget {
                 // Tier 2 fits — run enrichment for each symbol hit.
                 let mut enrichments: Vec<(&GrepHit, Option<SymbolEnrichment>)> = Vec::new();
@@ -439,10 +445,14 @@ impl GrepServer {
                 )
                 .unwrap_or(tier2)
             } else {
-                render_tier3(&hits, self.budget, &self.fs_manager)
+                render_grouped(&root_groups, &oor_hits, |h| {
+                    render_tier3(h, self.budget, &self.fs_manager)
+                })
             }
         } else {
-            render_tier3(&hits, self.budget, &self.fs_manager)
+            render_grouped(&root_groups, &oor_hits, |h| {
+                render_tier3(h, self.budget, &self.fs_manager)
+            })
         };
         Ok(output)
     }
@@ -1047,11 +1057,12 @@ fn select_and_render_tier(
     budget: usize,
     fs_manager: &FilesystemManager,
 ) -> String {
+    let refs: Vec<&GrepHit> = hits.iter().collect();
     // Cheap lower-bound estimate for tier 2 size: unique name lengths +
     // unique path lengths + per-hit overhead. If the lower bound already
     // exceeds the budget, tier 2 definitely won't fit.
-    if estimate_tier2_lower_bound(hits, fs_manager) <= budget {
-        let tier2 = render_tier2(hits, fs_manager);
+    if estimate_tier2_lower_bound(&refs, fs_manager) <= budget {
+        let tier2 = render_tier2(&refs, fs_manager);
         if tier2.len() <= budget {
             // Stub: emit tier 2. (07a replaces with enrichment attempt.)
             return tier2;
@@ -1059,7 +1070,7 @@ fn select_and_render_tier(
     }
 
     // Tier 2 doesn't fit — fall back to tier 3 (bucketed)
-    render_tier3(hits, budget, fs_manager)
+    render_tier3(&refs, budget, fs_manager)
 }
 
 // ─── Tier 1: Enriched rendering ─────────────────────────────────────────
@@ -1080,9 +1091,67 @@ fn render_tier1(
 ) -> Option<String> {
     use std::fmt::Write;
 
+    // Group enrichments by root.
+    let mut root_items: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    let mut oor_items: Vec<usize> = Vec::new();
+    for (i, (hit, _)) in enrichments.iter().enumerate() {
+        match fs_manager.resolve_root(&hit.file) {
+            Some(root) => root_items.entry(root).or_default().push(i),
+            None => oor_items.push(i),
+        }
+    }
+
+    let mut output = String::new();
+
+    for (root, indices) in &root_items {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "Root: {}", root.display());
+        render_tier1_section(enrichments, indices, symbol_index, fs_manager, &mut output);
+    }
+    if !oor_items.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "OutOfRoots:");
+        render_tier1_section(
+            enrichments,
+            &oor_items,
+            symbol_index,
+            fs_manager,
+            &mut output,
+        );
+    }
+
+    let trimmed_len = output.trim_end().len();
+    output.truncate(trimmed_len);
+
+    if output.len() <= budget {
+        Some(output)
+    } else {
+        None
+    }
+}
+
+/// Renders a single root section for tier 1 enriched output.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Tier 1 renders six navigation sections per symbol"
+)]
+fn render_tier1_section(
+    enrichments: &[(&GrepHit, Option<SymbolEnrichment>)],
+    indices: &[usize],
+    symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
+    fs_manager: &FilesystemManager,
+    output: &mut String,
+) {
+    use std::fmt::Write;
+
     // Step 1: Group by bare name at depth 0.
     let mut by_name: BTreeMap<String, Vec<(&GrepHit, &Option<SymbolEnrichment>)>> = BTreeMap::new();
-    for (hit, enrichment) in enrichments {
+    for &i in indices {
+        let (hit, enrichment) = &enrichments[i];
         let name = match &hit.classification {
             HitClass::Symbol { symbol } => symbol.name.clone(),
             _ => hit.matched_text.clone(),
@@ -1104,7 +1173,8 @@ fn render_tier1(
         // section lists it). First writer wins — if two definitions both
         // list the same location, the first one encountered dominates.
         let mut labeled_locs: HashMap<(String, u32), (String, u32)> = HashMap::new();
-        for (hit, enrichment) in enrichments {
+        for &i in indices {
+            let (hit, enrichment) = &enrichments[i];
             let Some(e) = enrichment else { continue };
             let hit_file = hit.file.to_string_lossy().to_string();
             let hit_line = match &hit.classification {
@@ -1148,7 +1218,6 @@ fn render_tier1(
     };
 
     // Step 4: Render each name group.
-    let mut output = String::new();
 
     for (name, group) in &by_name {
         let visible: Vec<&(&GrepHit, &Option<SymbolEnrichment>)> = group
@@ -1434,26 +1503,17 @@ fn render_tier1(
             }
         }
     }
-
-    let trimmed_len = output.trim_end().len();
-    output.truncate(trimmed_len);
-
-    if output.len() <= budget {
-        Some(output)
-    } else {
-        None
-    }
 }
 
 /// Lower-bound estimate for tier 2 rendered size.
 ///
 /// Sums unique name lengths, unique relative path lengths, and a
 /// per-hit minimum overhead. Avoids building the full output string.
-fn estimate_tier2_lower_bound(hits: &[GrepHit], fs_manager: &FilesystemManager) -> usize {
+fn estimate_tier2_lower_bound(hits: &[&GrepHit], fs_manager: &FilesystemManager) -> usize {
     let mut unique_names: HashSet<&str> = HashSet::new();
     let mut unique_paths: HashSet<String> = HashSet::new();
 
-    for hit in hits {
+    for &hit in hits {
         let name = match &hit.classification {
             HitClass::Symbol { symbol } => symbol.name.as_str(),
             _ => hit.matched_text.as_str(),
@@ -1476,7 +1536,7 @@ fn estimate_tier2_lower_bound(hits: &[GrepHit], fs_manager: &FilesystemManager) 
 ///
 /// Hits grouped by extracted name, then by directory and file, each with
 /// enclosing tree-sitter structure and span.
-fn render_tier2(hits: &[GrepHit], fs_manager: &FilesystemManager) -> String {
+fn render_tier2(hits: &[&GrepHit], fs_manager: &FilesystemManager) -> String {
     use std::fmt::Write;
 
     let by_name = group_hits_by_name(hits);
@@ -1515,7 +1575,7 @@ fn render_tier2(hits: &[GrepHit], fs_manager: &FilesystemManager) -> String {
 /// the bucket tries file-level detail first, then falls back to directory
 /// counts. Bare-handle buckets (from the bucketing module's own
 /// degradation) are rendered as-is.
-fn render_tier3(hits: &[GrepHit], budget: usize, fs_manager: &FilesystemManager) -> String {
+fn render_tier3(hits: &[&GrepHit], budget: usize, fs_manager: &FilesystemManager) -> String {
     use std::fmt::Write;
 
     let text_to_hits = group_hits_by_name(hits);
@@ -1648,9 +1708,9 @@ fn render_bucket_dir_counts(
 }
 
 /// Groups hits by extracted identifier name (`BTreeMap` for stable order).
-fn group_hits_by_name(hits: &[GrepHit]) -> BTreeMap<String, Vec<&GrepHit>> {
+fn group_hits_by_name<'a>(hits: &[&'a GrepHit]) -> BTreeMap<String, Vec<&'a GrepHit>> {
     let mut by_name: BTreeMap<String, Vec<&GrepHit>> = BTreeMap::new();
-    for hit in hits {
+    for &hit in hits {
         let key = match &hit.classification {
             HitClass::Symbol { symbol } => symbol.name.clone(),
             _ => hit.matched_text.clone(),
@@ -1742,6 +1802,54 @@ fn format_span(start_0: u32, end_0: u32) -> String {
     } else {
         format!(":{start_1}-{end_1}")
     }
+}
+
+// ─── Root grouping ───────────────────────────────────────────────────
+
+/// Partitions grep hits by workspace root.
+///
+/// Returns `(root_groups, out_of_root)` where `root_groups` is sorted
+/// alphabetically by root path.
+fn partition_hits_by_root<'a>(
+    hits: &'a [GrepHit],
+    fs_manager: &FilesystemManager,
+) -> (BTreeMap<PathBuf, Vec<&'a GrepHit>>, Vec<&'a GrepHit>) {
+    let mut roots: BTreeMap<PathBuf, Vec<&GrepHit>> = BTreeMap::new();
+    let mut oor: Vec<&GrepHit> = Vec::new();
+    for hit in hits {
+        match fs_manager.resolve_root(&hit.file) {
+            Some(root) => roots.entry(root).or_default().push(hit),
+            None => oor.push(hit),
+        }
+    }
+    (roots, oor)
+}
+
+/// Renders per-root sections with `Root:` / `OutOfRoots:` headers.
+fn render_grouped(
+    root_groups: &BTreeMap<PathBuf, Vec<&GrepHit>>,
+    oor_hits: &[&GrepHit],
+    render_section: impl Fn(&[&GrepHit]) -> String,
+) -> String {
+    use std::fmt::Write;
+    let mut output = String::new();
+    for (root, hits) in root_groups {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "Root: {}", root.display());
+        output.push_str(&render_section(hits));
+    }
+    if !oor_hits.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "OutOfRoots:");
+        output.push_str(&render_section(oor_hits));
+    }
+    let trimmed_len = output.trim_end().len();
+    output.truncate(trimmed_len);
+    output
 }
 
 /// Splits a relative path into `(directory/, filename)`.
@@ -2172,7 +2280,7 @@ mod tests {
     #[test]
     fn test_tier2_structure_heatmap() {
         let fs = test_fs("/project");
-        let hits = vec![
+        let hits = [
             sym_hit(
                 "/project/tests/a.rs",
                 287,
@@ -2188,7 +2296,8 @@ mod tests {
             sym_hit("/project/src/handler.rs", 1085, "test_glob", "function"),
         ];
 
-        let output = render_tier2(&hits, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier2(&refs, &fs);
 
         // Names grouped at column 0
         assert!(
@@ -2216,12 +2325,13 @@ mod tests {
     #[test]
     fn test_tier2_no_grammar() {
         let fs = test_fs("/project");
-        let hits = vec![
+        let hits = [
             bare_ref_hit("/project/data/notes.txt", 5, "pattern"),
             prepare_rename_hit("/project/data/other.txt", 10, "pattern"),
         ];
 
-        let output = render_tier2(&hits, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier2(&refs, &fs);
 
         // Bare hit lines (no enclosing structure)
         assert!(output.contains(":6"), "missing bare line: {output}");
@@ -2233,7 +2343,7 @@ mod tests {
     #[test]
     fn test_tier2_reference_with_enclosing() {
         let fs = test_fs("/project");
-        let hits = vec![ref_hit(
+        let hits = [ref_hit(
             "/project/src/main.rs",
             100,
             "handle",
@@ -2243,7 +2353,8 @@ mod tests {
             120,
         )];
 
-        let output = render_tier2(&hits, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier2(&refs, &fs);
 
         assert!(output.contains("<Function>"), "missing kind: {output}");
         assert!(
@@ -2332,7 +2443,8 @@ mod tests {
             ));
         }
 
-        let output = render_tier3(&hits, 500, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier3(&refs, 500, &fs);
 
         // Should produce bucketed prefixes
         let has_wildcard = output.contains('*');
@@ -2357,7 +2469,8 @@ mod tests {
             ));
         }
 
-        let output = render_tier3(&hits, 100, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier3(&refs, 100, &fs);
 
         // Should contain counts in parentheses (bare handle format)
         assert!(
@@ -2396,7 +2509,8 @@ mod tests {
         }
 
         // Budget large enough for dir counts on both, not file detail
-        let output = render_tier3(&hits, 300, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier3(&refs, 300, &fs);
 
         // Both clusters should appear in the output
         let has_alpha = output.contains("alpha");
@@ -2439,7 +2553,8 @@ mod tests {
         }
 
         // The estimate should be well over 100
-        let estimate = estimate_tier2_lower_bound(&hits, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let estimate = estimate_tier2_lower_bound(&refs, &fs);
         assert!(
             estimate > 100,
             "estimate should exceed tiny budget, got {estimate}"
@@ -2540,13 +2655,14 @@ mod tests {
     #[test]
     fn test_no_blank_lines_in_tier2() {
         let fs = test_fs("/project");
-        let hits = vec![
+        let hits = [
             sym_hit("/project/src/a.rs", 10, "alpha", "function"),
             sym_hit("/project/src/b.rs", 20, "beta", "function"),
             sym_hit("/project/src/c.rs", 30, "gamma", "function"),
         ];
 
-        let output = render_tier2(&hits, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier2(&refs, &fs);
 
         // No blank lines (consecutive \n\n) in output
         assert!(
@@ -2577,7 +2693,8 @@ mod tests {
             ));
         }
 
-        let output = render_tier3(&hits, 2000, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier3(&refs, 2000, &fs);
 
         assert!(
             !output.contains("\n\n"),
@@ -2601,7 +2718,8 @@ mod tests {
             ));
         }
 
-        let output = render_tier3(&hits, 2000, &fs);
+        let refs: Vec<&GrepHit> = hits.iter().collect();
+        let output = render_tier3(&refs, 2000, &fs);
 
         // Every line should be either:
         // - a bucket handle (contains * or is a name)
