@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn test_hook_category_methods() {
         assert_eq!(hook_category("post-tool/diagnostics"), "diagnostics");
-        assert_eq!(hook_category("pre-agent/roots-sync"), "sync");
+        assert_eq!(hook_category("pre-agent/turn-start"), "lifecycle");
         assert_eq!(hook_category("pre-tool/enforce-editing"), "lifecycle");
         assert_eq!(hook_category("post-agent/require-release"), "lifecycle");
         assert_eq!(hook_category("session-start/clear-editing"), "lifecycle");

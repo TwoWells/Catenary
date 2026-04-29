@@ -18,8 +18,6 @@ use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use std::sync::atomic::AtomicBool;
-
 use catenary_mcp::bridge::McpRouter;
 use catenary_mcp::cli::{self, HostFormat, QueryFormat};
 use catenary_mcp::logging::LoggingServer;
@@ -144,7 +142,7 @@ enum Command {
 /// Hook subcommands invoked by host CLI hooks.
 #[derive(Subcommand, Debug)]
 enum HookCommand {
-    /// Pre-agent: refresh workspace roots (`UserPromptSubmit` / `BeforeAgent`).
+    /// Pre-agent: signal turn start (`UserPromptSubmit` / `BeforeAgent`).
     #[command(name = "pre-agent")]
     PreAgent {
         /// Output format: "claude" or "gemini".
@@ -368,7 +366,6 @@ async fn run_server() -> Result<()> {
     toolbox.spawn_all().await;
 
     // Start the hook server for PostToolUse/PreToolUse hook integration
-    let refresh_roots_flag = Arc::new(AtomicBool::new(false));
     let hook_conn = session
         .lock()
         .map_err(|_| anyhow::anyhow!("mutex poisoned"))?
@@ -376,7 +373,6 @@ async fn run_server() -> Result<()> {
         .clone();
     let hook_server = catenary_mcp::hook::HookServer::new(
         toolbox.clone(),
-        refresh_roots_flag.clone(),
         hook_conn,
         instance_id,
         "host".to_string(),
@@ -399,7 +395,6 @@ async fn run_server() -> Result<()> {
     let session_for_callback = session.clone();
     let runtime_for_roots = tokio::runtime::Handle::current();
     let mut mcp_server = McpServer::new(handler, toolbox_for_roots.logging.clone())
-        .with_refresh_roots(refresh_roots_flag)
         .on_client_info(Box::new(move |name: &str, version: &str| {
             if let Ok(mut session) = session_for_callback.lock() {
                 session.set_client_info(name, version);

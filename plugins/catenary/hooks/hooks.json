@@ -1,5 +1,5 @@
 {
-  "description": "LSP diagnostics, editing state enforcement, and root sync via catenary hooks",
+  "description": "LSP diagnostics, editing state enforcement, and turn tracking via catenary hooks",
   "hooks": {
     "SessionStart": [
       {

@@ -20,7 +20,6 @@ use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -103,13 +102,13 @@ fn emit_hook_event(
 #[derive(Debug, Deserialize)]
 #[serde(tag = "method")]
 pub(crate) enum HookRequest {
-    /// Refresh workspace roots via MCP `roots/list`.
-    #[serde(rename = "pre-agent/roots-sync")]
-    PreAgentRootsSync {},
+    /// Turn boundary signal (fires at each user prompt / agent turn start).
+    #[serde(rename = "pre-agent/turn-start")]
+    PreAgent {},
 
     /// Editing state enforcement: deny or allow a tool call.
     #[serde(rename = "pre-tool/enforce-editing")]
-    PreToolEnforceEditing {
+    PreTool {
         /// Host CLI tool name (e.g., "Edit", "Write", `"write_file"`).
         tool_name: String,
         /// Absolute path to the target file. Used for scope boundary
@@ -132,7 +131,7 @@ pub(crate) enum HookRequest {
 
     /// LSP diagnostics for a changed file.
     #[serde(rename = "post-tool/diagnostics")]
-    PostToolDiagnostics {
+    PostTool {
         /// Absolute path to the changed file.
         file: String,
         /// Name of the host CLI tool that triggered the hook.
@@ -150,7 +149,7 @@ pub(crate) enum HookRequest {
 
     /// Force `done_editing` before the agent stops.
     #[serde(rename = "post-agent/require-release")]
-    PostAgentRequireRelease {
+    PostAgent {
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,
@@ -161,7 +160,7 @@ pub(crate) enum HookRequest {
 
     /// Clear stale editing state on session start.
     #[serde(rename = "session-start/clear-editing")]
-    SessionStartClearEditing {
+    SessionStart {
         /// Host CLI session ID (Claude Code / Gemini CLI UUID).
         #[serde(default)]
         session_id: Option<String>,
@@ -218,18 +217,11 @@ impl HookServer {
     #[must_use]
     pub fn new(
         toolbox: Arc<Toolbox>,
-        refresh_roots: Arc<AtomicBool>,
         conn: Arc<Mutex<Connection>>,
         instance_id: Arc<str>,
         client_name: String,
     ) -> Self {
-        let router = Arc::new(HookRouter::new(
-            toolbox,
-            refresh_roots,
-            conn,
-            instance_id,
-            client_name,
-        ));
+        let router = Arc::new(HookRouter::new(toolbox, conn, instance_id, client_name));
         Self { router }
     }
 
@@ -374,7 +366,6 @@ impl HookServer {
 
         // Determine level from outcome and hook category.
         // Hook allows (empty response) → debug, hook blocks/diagnostics → info.
-        // roots-sync is always debug regardless of outcome.
         let level = Self::hook_outcome_level(&method, &envelope);
 
         // Log incoming hook request (deferred — uses outcome-determined level)
@@ -419,7 +410,7 @@ impl HookServer {
                     tracing::Level::DEBUG
                 }
             }
-            // roots-sync, unknown, and everything else → debug
+            // unknown and everything else → debug
             _ => tracing::Level::DEBUG,
         }
     }
@@ -463,15 +454,15 @@ mod tests {
 
     #[test]
     fn test_hook_request_tagged_deserialization() {
-        // pre-agent/roots-sync
-        let json = r#"{"method": "pre-agent/roots-sync"}"#;
-        let req: HookRequest = serde_json::from_str(json).expect("roots-sync");
-        assert!(matches!(req, HookRequest::PreAgentRootsSync {}));
+        // pre-agent/turn-start
+        let json = r#"{"method": "pre-agent/turn-start"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("turn-start");
+        assert!(matches!(req, HookRequest::PreAgent {}));
 
         // pre-tool/enforce-editing with all fields
         let json = r#"{"method": "pre-tool/enforce-editing", "tool_name": "Edit", "file_path": "/tmp/foo.rs", "agent_id": "", "session_id": "abc123"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("enforce-editing");
-        let HookRequest::PreToolEnforceEditing {
+        let HookRequest::PreTool {
             tool_name,
             file_path,
             command,
@@ -479,7 +470,7 @@ mod tests {
             session_id,
         } = req
         else {
-            unreachable!("expected PreToolEnforceEditing");
+            unreachable!("expected PreTool");
         };
         assert_eq!(tool_name, "Edit");
         assert_eq!(file_path.as_deref(), Some("/tmp/foo.rs"));
@@ -490,8 +481,8 @@ mod tests {
         // pre-tool/enforce-editing with command (Bash tool)
         let json = r#"{"method": "pre-tool/enforce-editing", "tool_name": "Bash", "command": "rm -rf target/", "agent_id": ""}"#;
         let req: HookRequest = serde_json::from_str(json).expect("enforce-editing with command");
-        let HookRequest::PreToolEnforceEditing { command, .. } = req else {
-            unreachable!("expected PreToolEnforceEditing");
+        let HookRequest::PreTool { command, .. } = req else {
+            unreachable!("expected PreTool");
         };
         assert_eq!(command.as_deref(), Some("rm -rf target/"));
 
@@ -499,8 +490,8 @@ mod tests {
         let json =
             r#"{"method": "post-tool/diagnostics", "file": "/tmp/test.rs", "tool": "Write"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("diagnostics");
-        let HookRequest::PostToolDiagnostics { file, tool, .. } = req else {
-            unreachable!("expected PostToolDiagnostics");
+        let HookRequest::PostTool { file, tool, .. } = req else {
+            unreachable!("expected PostTool");
         };
         assert_eq!(file, "/tmp/test.rs");
         assert_eq!(tool.as_deref(), Some("Write"));
@@ -508,8 +499,8 @@ mod tests {
         // post-tool/diagnostics without optional fields
         let json = r#"{"method": "post-tool/diagnostics", "file": "/tmp/test.rs"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("diagnostics minimal");
-        let HookRequest::PostToolDiagnostics { tool, .. } = req else {
-            unreachable!("expected PostToolDiagnostics");
+        let HookRequest::PostTool { tool, .. } = req else {
+            unreachable!("expected PostTool");
         };
         assert!(tool.is_none());
 
@@ -517,19 +508,19 @@ mod tests {
         let json =
             r#"{"method": "post-agent/require-release", "agent_id": "", "stop_hook_active": true}"#;
         let req: HookRequest = serde_json::from_str(json).expect("require-release");
-        let HookRequest::PostAgentRequireRelease {
+        let HookRequest::PostAgent {
             stop_hook_active, ..
         } = req
         else {
-            unreachable!("expected PostAgentRequireRelease");
+            unreachable!("expected PostAgent");
         };
         assert!(stop_hook_active);
 
         // session-start/clear-editing
         let json = r#"{"method": "session-start/clear-editing", "session_id": "uuid-123"}"#;
         let req: HookRequest = serde_json::from_str(json).expect("clear-editing");
-        let HookRequest::SessionStartClearEditing { session_id } = req else {
-            unreachable!("expected SessionStartClearEditing");
+        let HookRequest::SessionStart { session_id } = req else {
+            unreachable!("expected SessionStart");
         };
         assert_eq!(session_id.as_deref(), Some("uuid-123"));
     }
@@ -619,24 +610,24 @@ mod tests {
     }
 
     #[test]
-    fn hook_roots_sync_writes_protocol_row() {
+    fn hook_turn_start_writes_protocol_row() {
         let (logging, conn, _guard) = setup_logging();
 
         let id = logging.next_id();
         emit_hook_event(
             tracing::Level::INFO,
             "host",
-            "pre-agent/roots-sync",
+            "pre-agent/turn-start",
             id.0,
             None,
-            &serde_json::json!({"method": "pre-agent/roots-sync"}).to_string(),
+            &serde_json::json!({"method": "pre-agent/turn-start"}).to_string(),
             "incoming hook",
         );
 
         emit_hook_event(
             tracing::Level::INFO,
             "host",
-            "pre-agent/roots-sync",
+            "pre-agent/turn-start",
             id.0,
             Some(id.0),
             "",
@@ -649,7 +640,7 @@ mod tests {
             "should have at least request + response, got {}",
             rows.len()
         );
-        assert_eq!(rows[0].method, "pre-agent/roots-sync");
+        assert_eq!(rows[0].method, "pre-agent/turn-start");
         assert_eq!(rows[0].client, "host");
     }
 
@@ -870,13 +861,13 @@ mod tests {
     }
 
     #[test]
-    fn hook_roots_sync_always_debug() {
-        // Even with a result, roots-sync is always debug
+    fn hook_turn_start_debug_without_result() {
+        // turn-start with no result → debug (lifecycle category, empty result)
         let env = HookResponseEnvelope {
-            result: Some(HookResult::Cleared(0)),
+            result: None,
             system_message: None,
         };
-        let level = HookServer::hook_outcome_level("pre-agent/roots-sync", &env);
+        let level = HookServer::hook_outcome_level("pre-agent/turn-start", &env);
         assert_eq!(level, tracing::Level::DEBUG);
     }
 }

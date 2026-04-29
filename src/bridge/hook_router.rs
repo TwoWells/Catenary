@@ -4,13 +4,13 @@
 //! Application dispatch for hook requests.
 //!
 //! `HookRouter` owns all hook method handlers and application logic
-//! (editing state enforcement, diagnostics dispatch, root refresh signaling).
+//! (editing state enforcement, diagnostics dispatch, turn tracking).
 //! Mirrors the [`super::handler::McpRouter`] pattern: protocol boundary
 //! delegates to router, router delegates to [`super::toolbox::Toolbox`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use super::toolbox::Toolbox;
@@ -104,10 +104,10 @@ pub struct DispatchResult {
 /// Routes parsed [`HookRequest`] values to the appropriate handler and
 /// returns an optional [`HookResult`]. Holds all shared application state
 /// needed by hook handlers: editing state (via [`super::editing_manager::EditingManager`]
-/// on [`Toolbox`]), and root refresh signaling.
+/// on [`Toolbox`]) and a turn counter for per-turn debounce.
 pub struct HookRouter {
     pub(crate) toolbox: Arc<Toolbox>,
-    refresh_roots: Arc<AtomicBool>,
+    turn_counter: AtomicU64,
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     instance_id: Arc<str>,
     /// Host CLI client name (e.g., `"host"`, `"claude-code"`).
@@ -119,18 +119,27 @@ impl HookRouter {
     #[must_use]
     pub const fn new(
         toolbox: Arc<Toolbox>,
-        refresh_roots: Arc<AtomicBool>,
         conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
         instance_id: Arc<str>,
         client_name: String,
     ) -> Self {
         Self {
             toolbox,
-            refresh_roots,
+            turn_counter: AtomicU64::new(0),
             conn,
             instance_id,
             client_name,
         }
+    }
+
+    /// Returns the current turn number.
+    ///
+    /// Incremented each time the pre-agent hook fires (once per user
+    /// prompt / agent turn). Used by command filtering (workstream 19)
+    /// for per-turn debounce.
+    #[allow(dead_code, reason = "API for workstream 19 (Allow)")]
+    pub(crate) fn turn(&self) -> u64 {
+        self.turn_counter.load(Ordering::Acquire)
     }
 
     /// Dispatches a parsed hook request to the appropriate handler.
@@ -141,15 +150,15 @@ impl HookRouter {
     ///
     pub(crate) fn dispatch(&self, request: HookRequest, _entry_id: i64) -> DispatchResult {
         match request {
-            HookRequest::PreAgentRootsSync {} => {
-                debug!("Hook: refresh roots requested");
-                self.refresh_roots.store(true, Ordering::Release);
+            HookRequest::PreAgent {} => {
+                let turn = self.turn_counter.fetch_add(1, Ordering::AcqRel) + 1;
+                debug!(turn, "Hook: turn start");
                 DispatchResult {
                     result: None,
                     system_message: None,
                 }
             }
-            HookRequest::PreToolEnforceEditing {
+            HookRequest::PreTool {
                 tool_name,
                 file_path,
                 command,
@@ -167,7 +176,7 @@ impl HookRouter {
                     system_message: None,
                 }
             }
-            HookRequest::PostToolDiagnostics {
+            HookRequest::PostTool {
                 file,
                 tool,
                 agent_id,
@@ -180,7 +189,7 @@ impl HookRouter {
                     system_message: None,
                 }
             }
-            HookRequest::PostAgentRequireRelease {
+            HookRequest::PostAgent {
                 agent_id,
                 stop_hook_active,
             } => {
@@ -196,7 +205,7 @@ impl HookRouter {
                     system_message,
                 }
             }
-            HookRequest::SessionStartClearEditing { session_id } => {
+            HookRequest::SessionStart { session_id } => {
                 self.store_client_session_id(session_id.as_deref());
                 let result = self.handle_clear_editing();
                 // Drain at stationary point: session start.
@@ -702,14 +711,7 @@ mod tests {
                 .insert((SF_LANG.to_string(), SF_SERVER.to_string()));
         }
 
-        let refresh_roots = Arc::new(AtomicBool::new(false));
-        let router = HookRouter::new(
-            toolbox,
-            refresh_roots,
-            conn,
-            instance_id,
-            "test".to_string(),
-        );
+        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
 
         TestHookRouter {
             _dir: dir,
@@ -929,15 +931,7 @@ mod tests {
             instance_id.clone(),
             handle,
         ));
-        let refresh_roots = Arc::new(AtomicBool::new(false));
-
-        let router = HookRouter::new(
-            toolbox,
-            refresh_roots,
-            conn,
-            instance_id,
-            "test".to_string(),
-        );
+        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
 
         TestHookRouter {
             _dir: dir,
@@ -978,15 +972,8 @@ mod tests {
             instance_id.clone(),
             handle,
         ));
-        let refresh_roots = Arc::new(AtomicBool::new(false));
 
-        let router = HookRouter::new(
-            toolbox,
-            refresh_roots,
-            conn,
-            instance_id,
-            "test".to_string(),
-        );
+        let router = HookRouter::new(toolbox, conn, instance_id, "test".to_string());
 
         (
             TestHookRouter {
@@ -1025,7 +1012,7 @@ mod tests {
         assert_eq!(router.toolbox.notifications.len(), 1);
 
         let result = router.dispatch(
-            crate::hook::HookRequest::SessionStartClearEditing { session_id: None },
+            crate::hook::HookRequest::SessionStart { session_id: None },
             0,
         );
         assert!(
@@ -1045,7 +1032,7 @@ mod tests {
 
         // Not editing → allow → should drain.
         let result = router.dispatch(
-            crate::hook::HookRequest::PostAgentRequireRelease {
+            crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
                 stop_hook_active: false,
             },
@@ -1071,7 +1058,7 @@ mod tests {
         );
 
         let result = router.dispatch(
-            crate::hook::HookRequest::PostAgentRequireRelease {
+            crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
                 stop_hook_active: false,
             },
@@ -1098,7 +1085,7 @@ mod tests {
         );
 
         let result = router.dispatch(
-            crate::hook::HookRequest::PreToolEnforceEditing {
+            crate::hook::HookRequest::PreTool {
                 tool_name: "Read".to_string(),
                 file_path: None,
                 command: None,
@@ -1125,7 +1112,7 @@ mod tests {
 
         // First stop: block (editing active) — queue preserved.
         let result = router.dispatch(
-            crate::hook::HookRequest::PostAgentRequireRelease {
+            crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
                 stop_hook_active: false,
             },
@@ -1144,7 +1131,7 @@ mod tests {
 
         // Second stop: retry (stop_hook_active) — force-clears editing, allows, drains.
         let result = router.dispatch(
-            crate::hook::HookRequest::PostAgentRequireRelease {
+            crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
                 stop_hook_active: true,
             },
@@ -1178,7 +1165,7 @@ mod tests {
 
         // Block — queue preserved.
         let result = router.dispatch(
-            crate::hook::HookRequest::PostAgentRequireRelease {
+            crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
                 stop_hook_active: false,
             },
@@ -1199,7 +1186,7 @@ mod tests {
 
         // Retry-allow: drain should contain exactly one notification.
         let result = router.dispatch(
-            crate::hook::HookRequest::PostAgentRequireRelease {
+            crate::hook::HookRequest::PostAgent {
                 agent_id: String::new(),
                 stop_hook_active: true,
             },
@@ -1242,7 +1229,7 @@ mod tests {
         );
 
         let result = router.dispatch(
-            crate::hook::HookRequest::PostToolDiagnostics {
+            crate::hook::HookRequest::PostTool {
                 file: "/tmp/test.rs".to_string(),
                 tool: Some("Edit".to_string()),
                 agent_id: String::new(),
@@ -1255,5 +1242,19 @@ mod tests {
             "post-tool should not drain"
         );
         assert_eq!(router.toolbox.notifications.len(), 1);
+    }
+
+    // ── Turn counter tests ────────────────────────────────────────────
+
+    #[test]
+    fn turn_counter_increments_on_dispatch() {
+        let router = test_router();
+        assert_eq!(router.turn(), 0);
+
+        router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
+        assert_eq!(router.turn(), 1);
+
+        router.dispatch(crate::hook::HookRequest::PreAgent {}, 0);
+        assert_eq!(router.turn(), 2);
     }
 }

@@ -7,7 +7,6 @@ use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -159,8 +158,6 @@ pub struct McpServer<H: ToolHandler> {
     next_outbound_id: i64,
     /// Callback invoked when roots change.
     on_roots_changed: Option<RootsChangedCallback>,
-    /// Shared flag set by `HookServer` when a `PreToolUse` hook fires.
-    refresh_roots: Arc<AtomicBool>,
     /// Correlation ID of the current incoming message, set per `dispatch_message`.
     /// Read by `handle_tools_call` to supply `parent_id` to the tool handler.
     current_correlation_id: i64,
@@ -184,7 +181,6 @@ impl<H: ToolHandler> McpServer<H> {
             fetching_roots: false,
             next_outbound_id: 0,
             on_roots_changed: None,
-            refresh_roots: Arc::new(AtomicBool::new(false)),
             current_correlation_id: 0,
             cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -201,13 +197,6 @@ impl<H: ToolHandler> McpServer<H> {
     #[must_use]
     pub fn on_roots_changed(mut self, callback: RootsChangedCallback) -> Self {
         self.on_roots_changed = Some(callback);
-        self
-    }
-
-    /// Set a shared flag that the hook server uses to request a `roots/list` fetch.
-    #[must_use]
-    pub fn with_refresh_roots(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.refresh_roots = flag;
         self
     }
 
@@ -276,11 +265,6 @@ impl<H: ToolHandler> McpServer<H> {
                 && let Ok(mut map) = self.cancel_map.lock()
             {
                 map.remove(rid);
-            }
-
-            // Check if the hook server requested a roots refresh
-            if self.refresh_roots.swap(false, Ordering::Acquire) {
-                self.should_fetch_roots = true;
             }
 
             // Check if we need to fetch roots

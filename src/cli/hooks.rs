@@ -407,11 +407,10 @@ pub fn run_post_tool(format: HostFormat) {
     let _ = ipc_exchange(stream, &request);
 }
 
-/// Refresh workspace roots (`UserPromptSubmit` / `BeforeAgent` hook handler).
+/// Signal turn start (`UserPromptSubmit` / `BeforeAgent` hook handler).
 ///
-/// Sends a `pre-agent/roots-sync` IPC request to the running Catenary session
-/// so `/add-dir` workspace additions are picked up. Runs once per user prompt
-/// rather than on every tool call.
+/// Sends a `pre-agent/turn-start` IPC request to the running Catenary session
+/// to increment the turn counter. Fires once per user prompt / agent turn.
 ///
 /// Silently succeeds on any error to avoid breaking the host CLI's flow.
 pub fn run_pre_agent(format: HostFormat) {
@@ -432,7 +431,7 @@ pub fn run_pre_agent(format: HostFormat) {
     if let Some(catenary_sid) = find_session_id(&hook_json, &conn) {
         let endpoint = notify_endpoint(&catenary_sid);
         if let Some(stream) = notify_connect(&endpoint) {
-            let request = serde_json::json!({"method": "pre-agent/roots-sync"});
+            let request = serde_json::json!({"method": "pre-agent/turn-start"});
             let _ = ipc_exchange(stream, &request);
         }
     }
