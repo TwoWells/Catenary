@@ -1,5 +1,9 @@
 # Catenary
 
+> **Archived (October 2026).** Catenary is retired and no longer maintained. These docs
+> describe the last release. The reasons are at the top of the
+> [repository README](https://github.com/TwoWells/Catenary#status-archived-october-2026).
+
 Catenary gives AI coding agents LSP-powered code intelligence. It
 manages a pool of language servers and exposes them through CLI commands
 and hooks — search, diagnostics, and navigation without shell-based text

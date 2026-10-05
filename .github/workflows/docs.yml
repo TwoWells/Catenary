@@ -45,14 +45,49 @@ jobs:
       - name: Prepare site directory
         run: mkdir -p site/stable site/dev
 
+      # Archive banner (October 2026): injected into BOTH builds so the
+      # stable site (built from the last tag) carries it too.
+      - name: Write archive banner assets
+        run: |
+          mkdir -p banner
+          cat > banner/archived-banner.css <<'CSS'
+          .archived-banner {
+            background: #4a1d1d;
+            color: #fff;
+            text-align: center;
+            padding: 0.5em;
+            font-size: 0.9em;
+            position: sticky;
+            top: 0;
+            z-index: 1001;
+          }
+          .archived-banner a { color: #fff; text-decoration: underline; }
+          CSS
+          cat > banner/archived-banner.js <<'JS'
+          (function() {
+            var banner = document.createElement('div');
+            banner.className = 'archived-banner';
+            banner.innerHTML = 'Catenary was archived in October 2026 and is no longer ' +
+              'maintained. These docs describe the last release. ' +
+              '<a href="https://github.com/TwoWells/Catenary#status-archived-october-2026">' +
+              'Why, in the README.</a>';
+            document.body.prepend(banner);
+          })();
+          JS
       - name: Build stable docs (latest tag)
         run: |
           LATEST_TAG=$(git tag --sort=-v:refname | head -1)
           echo "Building stable docs from $LATEST_TAG"
           git checkout "$LATEST_TAG" -- docs/
+          cp banner/archived-banner.css banner/archived-banner.js docs/src/
+          cat >> docs/book.toml <<'TOML'
+          additional-css = ["src/archived-banner.css"]
+          additional-js = ["src/archived-banner.js"]
+          TOML
           mdbook build docs
           cp -r docs/book/* site/stable/
           git checkout HEAD -- docs/
+          rm -f docs/src/archived-banner.css docs/src/archived-banner.js
 
       - name: Build dev docs (current ref)
         run: |
@@ -78,14 +113,16 @@ jobs:
             document.body.prepend(banner);
           })();
           JS
+          cp banner/archived-banner.css banner/archived-banner.js docs/src/
           cat >> docs/book.toml <<'TOML'
-          additional-css = ["src/dev-banner.css"]
-          additional-js = ["src/dev-banner.js"]
+          additional-css = ["src/dev-banner.css", "src/archived-banner.css"]
+          additional-js = ["src/dev-banner.js", "src/archived-banner.js"]
           TOML
           mdbook build docs
           cp -r docs/book/* site/dev/
           git checkout HEAD -- docs/book.toml
           rm -f docs/src/dev-banner.css docs/src/dev-banner.js
+          rm -f docs/src/archived-banner.css docs/src/archived-banner.js
 
       - name: Create root redirect
         run: |
