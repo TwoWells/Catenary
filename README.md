@@ -10,6 +10,92 @@
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-8A2BE2.svg?style=flat-square)](https://modelcontextprotocol.io/)
 [![GitHub Discussions](https://img.shields.io/github/discussions/TwoWells/Catenary?style=flat-square&color=008080&logo=github)](https://github.com/TwoWells/Catenary/discussions)
 
+## Status: archived (October 2026)
+
+I'm retiring Catenary. The idea worked. The implementation is the part
+that stopped making sense to maintain.
+
+The idea was that you get better behavior out of a coding agent by
+construction than by instruction: take the generic tools off the menu,
+put one code-intelligent surface in front of the agent, and enforce it
+with a hook. The agent follows the workflow when there's no other path.
+That held up for me in daily use across every project I run, and the
+post-mortems on this year's agent incidents, the PocketOS database
+deletion in April and the Hugging Face breach in July, came to the same
+conclusion: the controls have to live where the agent can't reach them.
+
+It didn't start out that way. Catenary began as language-server access
+over MCP: hover, definitions, references and diagnostics as tools an
+agent could call. Agents didn't reach for them on their own. So I did
+two things. I shrank the surface: instead of a dozen LSP tools, two
+commands the agent already had habits for, a grep and an ls, enriched
+with what the language server knows. And I added deny lists in the
+clients to steer agents toward them. Then I moved the deny list into
+Catenary itself, and that's where the hook came from. Once Catenary
+owned the list it could do fine-grained allowlists, denying some forms
+of a command while allowing others, which in turn needed a proper bash
+parser.
+
+The lists kept growing, because the hook wasn't only a gatekeeper.
+Catenary tracked which files an agent had touched so it could insist on
+a diagnostics check afterward. That meant inferring intent from
+commands, telling a perl one-liner that edits a file apart from one that
+runs arbitrary code. It meant keeping state per agent, which meant
+giving each agent an identity and carrying it through the hooks over
+IPC. Each layer made sense when I added it. Taken together it's a lot of
+code, and somewhere in there I started seeing code as a liability to be
+maintained rather than an asset.
+
+Catenary was built with Catenary. Every session that wrote this code ran
+through it, from the first hook on, and I didn't write a line of it by
+hand. What I did instead was hold the line on the engineering: clippy on
+pedantic, mutation testing, every regression pinned with a test, and
+every breakage I hit while dogfooding enshrined in one. And I read the
+plans instead of the code. The planning repo ended up the same size as
+the codebase, and since the code was rewritten so often, the plans and
+the tests were the real source. Git on the code was snapshots.
+
+The maintenance cost came from both sides of the hook. The agent clients
+Catenary sits in front of move fast. Hook systems, permission models and
+tool surfaces change month to month, and a third-party layer between an
+agent and its host has to chase every one of those releases. The
+original plan had an answer for that, a client of my own, so I'd control
+both ends. That isn't possible with the subscription plans most
+individuals use, and individuals are who Catenary was for. On the other
+side, every language server needed its own exceptions, and Catenary
+ended up with a blessed list of servers, each with its own known
+behaviors to work around. So Catenary is a plugin trying to be a client,
+and I don't see the effort to keep it there as worth my time.
+
+Meanwhile the clients started shipping the important pieces themselves:
+permission allowlists and language-server integration. Once the platform
+does what your tool was for, the right move is to let it.
+
+I learned a lot from this one. An agent running as you treats
+restrictions as obstacles, not guardrails. It will find the path you
+didn't close. It's also easy to over-restrict, and every rule you add
+makes the agent a little less useful. If you actually need the agent
+kept out of something, the answer is a real sandbox, not a smarter deny
+list. A layer that sits in front of every tool call is on the critical
+path of every session: when Catenary broke, it failed shut and blocked
+work. And the limit turned out to be review, not code. Dispatching whole
+features means one person reviewing a team's output, and the stronger
+the model, the more arrives finished and built upon before anyone has
+looked at it. Process organizes that reading. Nothing shrinks it.
+
+What's still going: [Lattice](https://github.com/TwoWells/Lattice), the
+markdown linter that grew out of this work, is maintained. And the way
+of working Catenary came from, enforce by construction, instrument
+everything, retire on evidence, is how I run my other projects. The code
+stays up as a reference: a daemon that multiplexes many agents onto a
+shared pool of language servers, a PreToolUse allowlist whose denials
+point at the sanctioned alternative, resolve-or-deny writes, and an
+edit-debt gate for diagnostics. The last release, the Homebrew formula
+and the AUR packages are left as they were. None of it is maintained.
+
+— Mark Wells, October 2026
+---
+
 Catenary hands an AI coding agent a small, opinionated set of
 code-intelligent commands — and a hook that keeps it on them. Reach for
 `grep` and you're redirected to `catenary grep`; reach for `ls` or `find`
